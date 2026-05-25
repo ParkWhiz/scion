@@ -2813,16 +2813,41 @@ func TestHandleGitHubWebhook_NoAppropriateProjectCommentBack(t *testing.T) {
 	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
 	srv.mu.Unlock()
 
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-inappropriate-1",
+		Slug:   "broker-inappropriate-1",
+		Name:   "Broker Inappropriate 1",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
 	// Create a private project with no active agents matching the branch (so it's inappropriate)
 	project := &store.Project{
-		ID:                   "proj-inappropriate-1",
-		Name:                 "Proj Inappropriate 1",
-		Slug:                 "proj-inappropriate-1",
-		GitRemote:            "https://github.com/acme/widgets.git",
-		Visibility:           "private",
-		GitHubInstallationID: &instID,
-		Created:              time.Now(),
-		Updated:              time.Now(),
+		ID:                     "proj-inappropriate-1",
+		Name:                   "Proj Inappropriate 1",
+		Slug:                   "proj-inappropriate-1",
+		GitRemote:              "https://github.com/acme/widgets.git",
+		Visibility:             "private",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
