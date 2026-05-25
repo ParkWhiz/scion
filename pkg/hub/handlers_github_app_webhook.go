@@ -1467,7 +1467,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				if implementText == "" {
 					implementText = prompt
 				}
-				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. Implement the plan referenced in GitHub Issue #%d for this repository. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", repoFull, prNum, prNum, implementText)
+				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. Implement the plan referenced in GitHub Issue #%d for this repository. To locate the implementation plan, use the GitHub CLI 'gh' or the GitHub API to fetch and inspect the full description of Issue #%d as well as all of its comments. Once you find the plan details in the comments or description, implement it in this workspace. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", repoFull, prNum, prNum, prNum, implementText)
 				labels["github-action"] = "implement"
 			}
 
