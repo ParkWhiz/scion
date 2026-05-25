@@ -1111,8 +1111,20 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		msgText := body
 		if cmd == "/review" {
 			msgText = "Command: /review. Please perform a code review on the changes in this pull request and submit your comments."
+			slog.Info("Routing command to active agent in project/grove",
+				"command", cmd,
+				"project_id", p.ID,
+				"project_name", p.Name,
+				"agent_id", activeAgent.ID,
+			)
 		} else if cmd == "/validate" {
 			msgText = "Command: /validate. Please run validation checks, execute the validation instructions, and report back on the correctness of this pull request."
+			slog.Info("Routing command to active agent in project/grove",
+				"command", cmd,
+				"project_id", p.ID,
+				"project_name", p.Name,
+				"agent_id", activeAgent.ID,
+			)
 		}
 
 		msg := &messages.StructuredMessage{
@@ -1211,6 +1223,15 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 			if template == "" {
 				template = "default"
+			}
+
+			if command == "/review" || command == "/validate" {
+				slog.Info("Launching fallback agent for command",
+					"command", command,
+					"project_id", proj.ID,
+					"project_name", proj.Name,
+					"template_used", template,
+				)
 			}
 
 			// C: Construct a new agent creation request
