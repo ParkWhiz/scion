@@ -21,12 +21,16 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -69,6 +73,10 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	eventType := r.Header.Get("X-GitHub-Event")
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 
+	if s.config.Debug {
+		slog.Debug("GitHub webhook received", "event", eventType, "delivery_id", deliveryID)
+	}
+
 	slog.Info("GitHub webhook received",
 		"event", eventType,
 		"delivery_id", deliveryID,
@@ -86,6 +94,18 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 
 	case "installation_repositories":
 		s.handleInstallationRepositoriesWebhook(w, r, body)
+		return
+
+	case "issue_comment":
+		s.handleIssueCommentWebhook(w, r, body)
+		return
+
+	case "pull_request_review_comment":
+		s.handlePullRequestReviewCommentWebhook(w, r, body)
+		return
+
+	case "pull_request_review":
+		s.handlePullRequestReviewWebhook(w, r, body)
 		return
 
 	default:
@@ -835,4 +855,718 @@ func (s *Server) MintGitHubAppTokenForProject(ctx context.Context, project *stor
 	}
 
 	return s.mintGitHubAppToken(ctx, project)
+}
+
+type webhookIssueCommentEvent struct {
+	Action string `json:"action"` // created, edited, deleted
+	Issue  struct {
+		Number      int64  `json:"number"`
+		HTMLURL     string `json:"html_url"`
+		PullRequest *struct {
+			URL string `json:"url"`
+		} `json:"pull_request"`
+	} `json:"issue"`
+	Comment struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	} `json:"comment"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+}
+
+type webhookPullRequestReviewCommentEvent struct {
+	Action      string `json:"action"` // created, edited, deleted
+	PullRequest struct {
+		Number  int64  `json:"number"`
+		HTMLURL string `json:"html_url"`
+	} `json:"pull_request"`
+	Comment struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	} `json:"comment"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+}
+
+type webhookPullRequestReviewEvent struct {
+	Action      string `json:"action"` // submitted, edited, dismissed
+	PullRequest struct {
+		Number  int64  `json:"number"`
+		HTMLURL string `json:"html_url"`
+	} `json:"pull_request"`
+	Review struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	} `json:"review"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+}
+
+// handleIssueCommentWebhook handles "issue_comment" events.
+func (s *Server) handleIssueCommentWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
+	var event webhookIssueCommentEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		if s.config.Debug {
+			slog.Debug("handleIssueCommentWebhook: failed to unmarshal", "error", err)
+		}
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
+		return
+	}
+
+	if event.Issue.PullRequest == nil || event.Action != "created" {
+		if s.config.Debug {
+			slog.Debug("handleIssueCommentWebhook: ignoring event", "action", event.Action, "is_pr", event.Issue.PullRequest != nil)
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "not a new PR comment"})
+		return
+	}
+
+	if s.config.Debug {
+		slog.Debug("handleIssueCommentWebhook: processing comment", "repo", event.Repository.FullName, "pr", event.Issue.Number)
+	}
+	s.processComment(r.Context(), "issue_comment", event.Repository.FullName, event.Issue.Number, event.Comment.ID, event.Comment.Body, event.Sender.Login, event.Installation.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handlePullRequestReviewCommentWebhook handles "pull_request_review_comment" events.
+func (s *Server) handlePullRequestReviewCommentWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
+	var event webhookPullRequestReviewCommentEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		if s.config.Debug {
+			slog.Debug("handlePullRequestReviewCommentWebhook: failed to unmarshal", "error", err)
+		}
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
+		return
+	}
+
+	if event.Action != "created" {
+		if s.config.Debug {
+			slog.Debug("handlePullRequestReviewCommentWebhook: ignoring event", "action", event.Action)
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "non-created PR review comment"})
+		return
+	}
+
+	if s.config.Debug {
+		slog.Debug("handlePullRequestReviewCommentWebhook: processing comment", "repo", event.Repository.FullName, "pr", event.PullRequest.Number)
+	}
+	s.processComment(r.Context(), "pull_request_review_comment", event.Repository.FullName, event.PullRequest.Number, event.Comment.ID, event.Comment.Body, event.Sender.Login, event.Installation.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handlePullRequestReviewWebhook handles "pull_request_review" events.
+func (s *Server) handlePullRequestReviewWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
+	var event webhookPullRequestReviewEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		if s.config.Debug {
+			slog.Debug("handlePullRequestReviewWebhook: failed to unmarshal", "error", err)
+		}
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
+		return
+	}
+
+	if event.Action != "submitted" || event.Review.Body == "" {
+		if s.config.Debug {
+			slog.Debug("handlePullRequestReviewWebhook: ignoring event", "action", event.Action, "has_body", event.Review.Body != "")
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "review not submitted or empty body"})
+		return
+	}
+
+	if s.config.Debug {
+		slog.Debug("handlePullRequestReviewWebhook: processing comment", "repo", event.Repository.FullName, "pr", event.PullRequest.Number)
+	}
+	s.processComment(r.Context(), "pull_request_review", event.Repository.FullName, event.PullRequest.Number, event.Review.ID, event.Review.Body, event.Sender.Login, event.Installation.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// parseCommand extracts commands starting with "/" from a comment body.
+func parseCommand(body string) string {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "/review") {
+		return "/review"
+	}
+	if strings.Contains(lower, "/validate") {
+		return "/validate"
+	}
+	if strings.Contains(lower, "/fix") {
+		return "/fix"
+	}
+	return ""
+}
+
+// extractTextAfterCommand returns the substring of body that comes after the given command.
+func extractTextAfterCommand(body, command string) string {
+	idx := strings.Index(strings.ToLower(body), command)
+	if idx == -1 {
+		return ""
+	}
+	text := body[idx+len(command):]
+	return strings.TrimSpace(text)
+}
+
+// processComment checks for mentions of "@scion" and resolves corresponding projects.
+func (s *Server) processComment(ctx context.Context, eventType, repoFullName string, prNumber, commentID int64, body string, senderLogin string, installationID int64) {
+	if !strings.Contains(strings.ToLower(body), "@scion") {
+		if s.config.Debug {
+			slog.Debug("No @scion mention in comment", "repo", repoFullName, "pr", prNumber, "comment_id", commentID)
+		}
+		return
+	}
+
+	cmd := parseCommand(body)
+	if s.config.Debug {
+		slog.Debug("processComment: detected @scion mention", "event_type", eventType, "repo", repoFullName, "command", cmd)
+	}
+
+	slog.Info("Detected @scion mention in comment!",
+		"event_type", eventType,
+		"repo", repoFullName,
+		"pr", prNumber,
+		"comment_id", commentID,
+		"sender", senderLogin,
+	)
+
+	// Resolve project associated with repo
+	projects, err := s.findProjectsForRepository(ctx, repoFullName)
+	if err != nil {
+		if s.config.Debug {
+			slog.Debug("processComment: failed to find projects for repo", "repo", repoFullName, "error", err)
+		}
+		slog.Error("Failed to find projects for repository", "repo", repoFullName, "error", err)
+		return
+	}
+
+	if len(projects) == 0 {
+		if s.config.Debug {
+			slog.Debug("processComment: no projects matched for repo", "repo", repoFullName, "installation_id", installationID)
+		}
+		slog.Warn("No project matched with the repository", "repo", repoFullName)
+		if installationID != 0 {
+			client, err := s.getGitHubAppClient()
+			if err != nil {
+				slog.Error("Failed to get GitHub App client to post unmatched project comment", "error", err)
+				return
+			}
+			parts := strings.SplitN(repoFullName, "/", 2)
+			if len(parts) == 2 {
+				owner, repo := parts[0], parts[1]
+				var errMsg string
+				if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
+					errMsg = fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the PR's target branch), or\n2. A **public project with isolated agents** available for this repository.", cmd)
+				} else {
+					errMsg = "No matching project or grove was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
+				}
+				if s.config.Debug {
+					slog.Debug("processComment: posting unmatched project comment", "owner", owner, "repo", repo)
+				}
+				if err := client.PostIssueComment(ctx, installationID, owner, repo, prNumber, errMsg); err != nil {
+					slog.Error("Failed to post unmatched project comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err)
+				} else {
+					slog.Info("Posted unmatched project comment to GitHub", "repo", repoFullName, "pr", prNumber)
+				}
+			}
+		}
+		return
+	}
+
+	// Try to resolve the head branch first from any available project
+	var prBranch string
+	for _, p := range projects {
+		if p.GitHubInstallationID != nil {
+			branch, err := s.fetchPRHeadBranch(ctx, p, repoFullName, prNumber)
+			if err == nil && branch != "" {
+				prBranch = branch
+				break
+			}
+		}
+	}
+
+	// For /review, /validate, and /fix, ensure we have an appropriate project.
+	// An appropriate project is either branch-specific (has agents matching prBranch)
+	// or is a public project with isolated agents.
+	if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
+		hasAppropriateProject := false
+
+		// 1. Check for branch-specific project (branchMatchCandidates)
+		if prBranch != "" {
+			for _, proj := range projects {
+				agents, err := s.store.ListAgents(ctx, store.AgentFilter{ProjectID: proj.ID}, store.ListOptions{Limit: 1000})
+				if err == nil {
+					for _, agent := range agents.Items {
+						if agent.AppliedConfig != nil && agent.AppliedConfig.Branch == prBranch {
+							hasAppropriateProject = true
+							break
+						}
+					}
+				}
+				if hasAppropriateProject {
+					break
+				}
+			}
+		}
+
+		// 2. Check for public project with isolated agents
+		if !hasAppropriateProject {
+			if s.selectByPublicAndIsolated(projects) != nil {
+				hasAppropriateProject = true
+			}
+		}
+
+		if !hasAppropriateProject {
+			slog.Warn("No appropriate project found for command", "command", cmd, "repo", repoFullName, "pr", prNumber)
+			if installationID != 0 {
+				client, err := s.getGitHubAppClient()
+				if err == nil {
+					parts := strings.SplitN(repoFullName, "/", 2)
+					if len(parts) == 2 {
+						owner, repo := parts[0], parts[1]
+						guidanceMsg := fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the branch `%s`), or\n2. A **public project with isolated agents** available for this repository.", cmd, prBranch)
+						if err := client.PostIssueComment(ctx, installationID, owner, repo, prNumber, guidanceMsg); err != nil {
+							slog.Error("Failed to post project fallback guidance comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err)
+						} else {
+							slog.Info("Posted project fallback guidance comment to GitHub", "repo", repoFullName, "pr", prNumber)
+						}
+					}
+				} else {
+					slog.Error("Failed to get GitHub App client to post guidance comment", "error", err)
+				}
+			}
+			return
+		}
+	}
+
+	// Use our prioritisation helper to select the single best project
+	p := s.resolveBestProjectForPR(ctx, projects, prBranch)
+
+	if s.config.Debug {
+		slog.Debug("processComment: matched project", "id", p.ID, "name", p.Name, "git_remote", p.GitRemote)
+	}
+	slog.Info("Matched comment mention to Scion Project",
+		"project_id", p.ID,
+		"project_name", p.Name,
+		"git_remote", p.GitRemote,
+	)
+
+	// Resolve the target template based on environment variables or Scion hierarchy
+	var targetTemplate string
+	if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
+		var activeProfileEnv map[string]string
+		var defaultTemplateFromSettings string
+		if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil {
+			defaultTemplateFromSettings = settings.DefaultTemplate
+			profileName := settings.ActiveProfile
+			if profileName == "" {
+				profileName = "local"
+			}
+			if profile, ok := settings.Profiles[profileName]; ok {
+				activeProfileEnv = profile.Env
+			}
+		}
+
+		// Load environment variables defined in the Hub database (scope project or hub)
+		dbEnv := make(map[string]string)
+		if projEnvVars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: store.ScopeProject, ScopeID: p.ID}); err == nil {
+			for _, ev := range projEnvVars {
+				if ev.Value != "" {
+					dbEnv[ev.Key] = ev.Value
+				}
+			}
+		}
+		if s.hubID != "" {
+			if hubEnvVars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: s.hubID}); err == nil {
+				for _, ev := range hubEnvVars {
+					if _, ok := dbEnv[ev.Key]; !ok && ev.Value != "" {
+						dbEnv[ev.Key] = ev.Value
+					}
+				}
+			}
+		}
+		if hubEnvVars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: "hub"}); err == nil {
+			for _, ev := range hubEnvVars {
+				if _, ok := dbEnv[ev.Key]; !ok && ev.Value != "" {
+					dbEnv[ev.Key] = ev.Value
+				}
+			}
+		}
+
+		lookup := func(key string) string {
+			// 1. Try project-level annotations first
+			if p.Annotations != nil {
+				if val, ok := p.Annotations[key]; ok && val != "" {
+					return val
+				}
+				lowerKey := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
+				if val, ok := p.Annotations[lowerKey]; ok && val != "" {
+					return val
+				}
+			}
+			// 2. Try project-level labels
+			if p.Labels != nil {
+				if val, ok := p.Labels[key]; ok && val != "" {
+					return val
+				}
+				lowerKey := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
+				if val, ok := p.Labels[lowerKey]; ok && val != "" {
+					return val
+				}
+			}
+			// 3. Try database-defined environment variables (project and hub scope)
+			if val, ok := dbEnv[key]; ok && val != "" {
+				return val
+			}
+			// 4. Try Scion server config / active profile environment variables
+			if activeProfileEnv != nil {
+				if val, ok := activeProfileEnv[key]; ok && val != "" {
+					return val
+				}
+			}
+			// 5. Fall back to process environment variables
+			return os.Getenv(key)
+		}
+
+		if cmd == "/review" {
+			targetTemplate = lookup("SCION_REVIEW_TEMPLATE")
+		} else if cmd == "/validate" {
+			targetTemplate = lookup("SCION_VALIDATE_TEMPLATE")
+		} else if cmd == "/fix" {
+			targetTemplate = lookup("SCION_FIX_TEMPLATE")
+		}
+		if targetTemplate == "" {
+			targetTemplate = defaultTemplateFromSettings
+		}
+		if targetTemplate == "" {
+			targetTemplate = "default"
+		}
+	}
+
+	// 1. Look for an active (running) agent labeled with this PR (unless command is /review or /validate)
+	var activeAgent *store.Agent
+	if cmd != "/review" && cmd != "/validate" {
+		var err error
+		activeAgent, err = s.findActiveAgentForPR(ctx, p.ID, prNumber, repoFullName)
+		if err != nil {
+			slog.Error("Failed to query active agents for PR", "project", p.ID, "pr", prNumber, "error", err)
+			return
+		}
+
+		// Only route /fix to an active agent if its template matches the targetTemplate
+		if cmd == "/fix" && activeAgent != nil {
+			if activeAgent.Template != targetTemplate {
+				slog.Info("Active agent template mismatch for /fix command. Spawning a new agent with matching template instead.",
+					"active_agent_id", activeAgent.ID,
+					"active_agent_template", activeAgent.Template,
+					"required_template", targetTemplate,
+				)
+				activeAgent = nil
+			}
+		}
+	}
+
+	if activeAgent != nil {
+		// --- PATH A: Route to existing active agent ---
+		slog.Info("Routing GitHub mention to active agent", "agent_id", activeAgent.ID, "pr", prNumber)
+
+		msgText := body
+		if cmd == "/fix" {
+			fixText := extractTextAfterCommand(body, "/fix")
+			if fixText != "" {
+				msgText = fixText + " Please also comment in the GitHub PR explaining the changes made for a human reviewer."
+			} else {
+				msgText = "Please implement a fix as requested and comment in the GitHub PR explaining the changes made for a human reviewer."
+			}
+			slog.Info("Routing /fix command to active agent in project/grove",
+				"command", cmd,
+				"project_id", p.ID,
+				"project_name", p.Name,
+				"agent_id", activeAgent.ID,
+				"fix_instruction", msgText,
+			)
+		}
+
+		msg := &messages.StructuredMessage{
+			Version:     messages.Version,
+			Timestamp:   time.Now().UTC().Format(time.RFC3339),
+			Sender:      "user:github-" + senderLogin,
+			Recipient:   "agent:" + activeAgent.Slug,
+			RecipientID: activeAgent.ID,
+			Msg:         msgText,
+			Type:        messages.TypeInstruction,
+		}
+
+		// Publish to the message broker proxy
+		if s.messageBrokerProxy != nil {
+			if err := s.messageBrokerProxy.PublishMessage(ctx, p.ID, msg); err != nil {
+				slog.Error("Failed to publish PR comment to agent", "agent_id", activeAgent.ID, "error", err)
+			}
+		} else {
+			slog.Info("Message broker proxy not initialized, falling back to direct dispatch", "agent_id", activeAgent.ID)
+
+			// 1. Create and persist message
+			storeMsg := &store.Message{
+				ID:          api.NewUUID(),
+				ProjectID:   p.ID,
+				Sender:      msg.Sender,
+				SenderID:    msg.SenderID,
+				Recipient:   msg.Recipient,
+				RecipientID: msg.RecipientID,
+				Msg:         msg.Msg,
+				Type:        msg.Type,
+				AgentID:     activeAgent.ID,
+				CreatedAt:   time.Now(),
+			}
+			if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
+				slog.Error("Failed to persist fallback message", "error", err)
+			}
+
+			// 2. Publish SSE event
+			s.events.PublishUserMessage(ctx, storeMsg)
+
+			// 3. Dispatch to runtime broker via agent dispatcher
+			dispatcher := s.GetDispatcher()
+			if dispatcher != nil && activeAgent.RuntimeBrokerID != "" {
+				if err := dispatcher.DispatchAgentMessage(ctx, activeAgent, msgText, false, msg); err != nil {
+					slog.Error("Failed to dispatch PR comment to runtime broker", "agent_id", activeAgent.ID, "error", err)
+				} else {
+					slog.Info("Successfully dispatched PR comment directly to agent", "agent_id", activeAgent.ID)
+				}
+			} else {
+				slog.Error("Direct dispatch failed: dispatcher or runtime broker ID not available", "agent_id", activeAgent.ID)
+			}
+		}
+	} else {
+		// --- PATH B: Spawn a new agent ---
+		slog.Info("Spawning new agent in project", "project", p.ID, "pr", prNumber, "command", cmd)
+
+		// Resolve branch ref in a background goroutine so we don't block the webhook response
+		go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string, template string) {
+			bgCtx := context.Background()
+
+			// A: Fetch the head branch name from GitHub if we don't already have it
+			branch := prBranch
+			var err error
+			if branch == "" {
+				branch, err = s.fetchPRHeadBranch(bgCtx, proj, repoFull, prNum)
+				if err != nil {
+					slog.Error("Failed to fetch branch ref from GitHub", "repo", repoFull, "pr", prNum, "error", err)
+					return
+				}
+			}
+
+			taskDesc := prompt
+			labels := map[string]string{
+				"github-pr":   strconv.FormatInt(prNum, 10),
+				"github-repo": repoFull,
+			}
+			if command == "/review" {
+				taskDesc = fmt.Sprintf("Perform a complete code review for Pull Request #%d on repository %s. Inspect the changes on branch %s, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub.", prNum, repoFull, branch)
+				labels["github-action"] = "review"
+			} else if command == "/validate" {
+				taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s and report the validation results back to GitHub.", prNum, repoFull)
+				labels["github-action"] = "validate"
+			} else if command == "/fix" {
+				fixText := extractTextAfterCommand(prompt, "/fix")
+				if fixText != "" {
+					taskDesc = fmt.Sprintf("Implement the following fix for Pull Request #%d on repository %s: %s Please also comment in the GitHub PR explaining the changes made for a human reviewer.", prNum, repoFull, fixText)
+				} else {
+					taskDesc = fmt.Sprintf("Implement a fix for Pull Request #%d on repository %s and comment in the GitHub PR explaining the changes made for a human reviewer.", prNum, repoFull)
+				}
+				labels["github-action"] = "fix"
+			}
+
+			if command == "/review" || command == "/validate" || command == "/fix" {
+				slog.Info("Launching agent for command",
+					"command", command,
+					"project_id", proj.ID,
+					"project_name", proj.Name,
+					"template_used", template,
+				)
+			}
+
+			// C: Construct a new agent creation request
+			req := CreateAgentRequest{
+				Name:      fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().UnixNano()/1e6),
+				ProjectID: proj.ID,
+				Branch:    branch,
+				Task:      taskDesc,
+				Labels:    labels,
+				Template:  template,
+			}
+
+			// C: Provision and start the agent
+			slog.Info("Starting dynamic agent dispatch", "name", req.Name, "branch", req.Branch)
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
+
+			createdBy := "system:github-webhook"
+			creatorName := "GitHub Webhook"
+			notifySubscriberType := store.SubscriberTypeUser
+			notifySubscriberID := ""
+			ancestry := []string{"system:github-webhook"}
+
+			s.createAgentInProject(w, r, req, proj.ID, createdBy, creatorName, ancestry, notifySubscriberType, notifySubscriberID)
+
+			if w.Code >= 400 {
+				slog.Error("Failed to spawn dynamic agent from webhook", "project_id", proj.ID, "status", w.Code, "body", w.Body.String())
+			} else {
+				slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
+			}
+		}(p, prNumber, repoFullName, senderLogin, body, cmd, targetTemplate)
+	}
+}
+
+// resolveBestProjectForPR implements a multi-tier prioritisation strategy to select the single best project for a PR comment webhook.
+func (s *Server) resolveBestProjectForPR(ctx context.Context, projects []store.Project, prBranch string) store.Project {
+	if len(projects) == 0 {
+		return store.Project{}
+	}
+
+	// Priority 1: Branch Match (Tier 1)
+	if prBranch != "" {
+		var branchMatchCandidates []store.Project
+		for _, p := range projects {
+			// Query agents for this project
+			agents, err := s.store.ListAgents(ctx, store.AgentFilter{ProjectID: p.ID}, store.ListOptions{Limit: 1000})
+			if err != nil {
+				slog.Error("resolveBestProjectForPR: failed to list agents for project", "project_id", p.ID, "error", err)
+				continue
+			}
+			for _, agent := range agents.Items {
+				if agent.AppliedConfig != nil && agent.AppliedConfig.Branch == prBranch {
+					branchMatchCandidates = append(branchMatchCandidates, p)
+					break
+				}
+			}
+		}
+		if len(branchMatchCandidates) > 0 {
+			if s.config.Debug {
+				slog.Debug("resolveBestProjectForPR: found branch match candidates", "branch", prBranch, "count", len(branchMatchCandidates))
+			}
+			// Prefer public + isolated within branch match candidates if there are multiple, otherwise fall back to the first.
+			best := s.selectByPublicAndIsolated(branchMatchCandidates)
+			if best != nil {
+				return *best
+			}
+			return branchMatchCandidates[0]
+		}
+	}
+
+	// Priority 2: Public & Isolated Workspaces (Tier 2)
+	best := s.selectByPublicAndIsolated(projects)
+	if best != nil {
+		if s.config.Debug {
+			slog.Debug("resolveBestProjectForPR: selected project by public and isolated workspace", "project_id", best.ID, "name", best.Name)
+		}
+		return *best
+	}
+
+	// Priority 3: Fallback (first candidate)
+	if s.config.Debug {
+		slog.Debug("resolveBestProjectForPR: fallback to first matching project", "project_id", projects[0].ID, "name", projects[0].Name)
+	}
+	return projects[0]
+}
+
+func (s *Server) selectByPublicAndIsolated(projects []store.Project) *store.Project {
+	for _, p := range projects {
+		if p.Visibility == store.VisibilityPublic && !p.IsSharedWorkspace() {
+			return &p
+		}
+	}
+	return nil
+}
+
+// findActiveAgentForPR queries the store for running agents matching the PR number and repo labels.
+func (s *Server) findActiveAgentForPR(ctx context.Context, projectID string, prNumber int64, repoFullName string) (*store.Agent, error) {
+	result, err := s.store.ListAgents(ctx, store.AgentFilter{ProjectID: projectID, Phase: "running"}, store.ListOptions{Limit: 1000})
+	if err != nil {
+		return nil, err
+	}
+
+	prStr := strconv.FormatInt(prNumber, 10)
+	repoLower := strings.ToLower(repoFullName)
+
+	for i := range result.Items {
+		agent := &result.Items[i]
+		if agent.Labels != nil {
+			agentPR := agent.Labels["github-pr"]
+			agentRepo := strings.ToLower(agent.Labels["github-repo"])
+			if agentPR == prStr && agentRepo == repoLower {
+				return agent, nil
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+// fetchPRHeadBranch calls the internal getGitHubAppClient to fetch the PR metadata and retrieve the head branch name.
+func (s *Server) fetchPRHeadBranch(ctx context.Context, project store.Project, repoFullName string, prNumber int64) (string, error) {
+	if project.GitHubInstallationID == nil {
+		return "", fmt.Errorf("project %s has no GitHub App installation ID", project.ID)
+	}
+
+	client, err := s.getGitHubAppClient()
+	if err != nil {
+		return "", fmt.Errorf("failed to get GitHub App client: %w", err)
+	}
+
+	parts := strings.SplitN(repoFullName, "/", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid repository full name: %s", repoFullName)
+	}
+	owner, repo := parts[0], parts[1]
+
+	pr, err := client.GetPullRequest(ctx, *project.GitHubInstallationID, owner, repo, prNumber)
+	if err != nil {
+		return "", err
+	}
+
+	if pr.Head.Ref == "" {
+		return "", fmt.Errorf("empty head branch ref in pull request response")
+	}
+
+	return pr.Head.Ref, nil
+}
+
+// findProjectsForRepository looks up projects in the store matching the given repository.
+func (s *Server) findProjectsForRepository(ctx context.Context, repoFullName string) ([]store.Project, error) {
+	projects, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 10000})
+	if err != nil {
+		return nil, err
+	}
+
+	var matched []store.Project
+	repoLower := strings.ToLower(repoFullName)
+	for _, project := range projects.Items {
+		if project.GitRemote == "" {
+			continue
+		}
+		ownerRepo := extractOwnerRepo(project.GitRemote)
+		if strings.ToLower(ownerRepo) == repoLower {
+			matched = append(matched, project)
+		}
+	}
+	return matched, nil
 }
