@@ -1246,6 +1246,32 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				}
 			}
 
+			// Load environment variables defined in the Hub database (scope project or hub)
+			dbEnv := make(map[string]string)
+			if projEnvVars, err := s.store.ListEnvVars(bgCtx, store.EnvVarFilter{Scope: store.ScopeProject, ScopeID: proj.ID}); err == nil {
+				for _, ev := range projEnvVars {
+					if ev.Value != "" {
+						dbEnv[ev.Key] = ev.Value
+					}
+				}
+			}
+			if s.hubID != "" {
+				if hubEnvVars, err := s.store.ListEnvVars(bgCtx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: s.hubID}); err == nil {
+					for _, ev := range hubEnvVars {
+						if _, ok := dbEnv[ev.Key]; !ok && ev.Value != "" {
+							dbEnv[ev.Key] = ev.Value
+						}
+					}
+				}
+			}
+			if hubEnvVars, err := s.store.ListEnvVars(bgCtx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: "hub"}); err == nil {
+				for _, ev := range hubEnvVars {
+					if _, ok := dbEnv[ev.Key]; !ok && ev.Value != "" {
+						dbEnv[ev.Key] = ev.Value
+					}
+				}
+			}
+
 			lookup := func(key string) string {
 				// 1. Try project-level annotations first
 				if proj.Annotations != nil {
@@ -1267,13 +1293,17 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 						return val
 					}
 				}
-				// 3. Try Scion server config / active profile environment variables
+				// 3. Try database-defined environment variables (project and hub scope)
+				if val, ok := dbEnv[key]; ok && val != "" {
+					return val
+				}
+				// 4. Try Scion server config / active profile environment variables
 				if activeProfileEnv != nil {
 					if val, ok := activeProfileEnv[key]; ok && val != "" {
 						return val
 					}
 				}
-				// 4. Fall back to process environment variables
+				// 5. Fall back to process environment variables
 				return os.Getenv(key)
 			}
 

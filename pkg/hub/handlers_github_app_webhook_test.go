@@ -2229,6 +2229,174 @@ profiles:
 	}
 }
 
+func TestHandleGitHubWebhook_TemplateResolution_Database(t *testing.T) {
+	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations/123/access_tokens" {
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"token":      "ghs_access_token_abc",
+				"expires_at": expiresAt,
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/pulls/101" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"number": 101,
+				"head": map[string]interface{}{
+					"ref": "my-cool-feature-branch",
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_val_db", Slug: "my-db-validate-tpl", Name: "My DB Validate Template",
+		Harness: "claude", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: now, Updated: now,
+	}); err != nil {
+		t.Fatalf("failed to create custom validate template: %v", err)
+	}
+
+	// Create the hub-scoped env var under the "hub" scopeID
+	if err := s.CreateEnvVar(ctx, &store.EnvVar{
+		ID:      "envvar-val-db-1",
+		Key:     "SCION_VALIDATE_TEMPLATE",
+		Value:   "my-db-validate-tpl",
+		Scope:   store.ScopeHub,
+		ScopeID: "hub",
+		Created: now,
+		Updated: now,
+	}); err != nil {
+		t.Fatalf("failed to create hub-scoped env var: %v", err)
+	}
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(123)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-srvtpl-2",
+		Slug:   "broker-srvtpl-2",
+		Name:   "Broker SrvTpl 2",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	project := &store.Project{
+		ID:                     "proj-srvtpl-2",
+		Name:                   "Proj SrvTpl 2",
+		Slug:                   "proj-srvtpl-2",
+		GitRemote:              "https://github.com/acme/widgets.git",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   brokerObj.ID,
+		BrokerName: brokerObj.Name,
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := s.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	payloadVal := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   111,
+			"body": "Hey @scion /validate please!",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder123",
+		},
+	}
+
+	payloadBytesVal := mustJSON(t, payloadVal)
+	sigVal := signWebhookPayload(payloadBytesVal, "test-webhook-secret")
+
+	reqVal := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytesVal))
+	reqVal.Header.Set("X-GitHub-Event", "issue_comment")
+	reqVal.Header.Set("X-Hub-Signature-256", sigVal)
+
+	recVal := httptest.NewRecorder()
+	srv.handleGitHubWebhook(recVal, reqVal)
+
+	if recVal.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recVal.Code, recVal.Body.String())
+	}
+
+	var spawnedValAgent *store.Agent
+	for i := 0; i < 20; i++ {
+		agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: project.ID, Phase: "created"}, store.ListOptions{Limit: 100})
+		if err == nil {
+			for _, item := range agents.Items {
+				if item.Labels["github-action"] == "validate" {
+					spawnedValAgent = &item
+					break
+				}
+			}
+		}
+		if spawnedValAgent != nil {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	if spawnedValAgent == nil {
+		t.Fatal("timed out waiting for validate agent to be spawned")
+	}
+
+	if spawnedValAgent.Template != "my-db-validate-tpl" {
+		t.Errorf("expected template to be %q, got %q", "my-db-validate-tpl", spawnedValAgent.Template)
+	}
+}
+
 func generateTestWebhookKey(t *testing.T) []byte {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
