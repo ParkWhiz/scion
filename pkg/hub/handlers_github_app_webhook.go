@@ -1110,6 +1110,98 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		"git_remote", p.GitRemote,
 	)
 
+	// Resolve the target template based on environment variables or Scion hierarchy
+	var targetTemplate string
+	if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
+		var activeProfileEnv map[string]string
+		var defaultTemplateFromSettings string
+		if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil {
+			defaultTemplateFromSettings = settings.DefaultTemplate
+			profileName := settings.ActiveProfile
+			if profileName == "" {
+				profileName = "local"
+			}
+			if profile, ok := settings.Profiles[profileName]; ok {
+				activeProfileEnv = profile.Env
+			}
+		}
+
+		// Load environment variables defined in the Hub database (scope project or hub)
+		dbEnv := make(map[string]string)
+		if projEnvVars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: store.ScopeProject, ScopeID: p.ID}); err == nil {
+			for _, ev := range projEnvVars {
+				if ev.Value != "" {
+					dbEnv[ev.Key] = ev.Value
+				}
+			}
+		}
+		if s.hubID != "" {
+			if hubEnvVars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: s.hubID}); err == nil {
+				for _, ev := range hubEnvVars {
+					if _, ok := dbEnv[ev.Key]; !ok && ev.Value != "" {
+						dbEnv[ev.Key] = ev.Value
+					}
+				}
+			}
+		}
+		if hubEnvVars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: "hub"}); err == nil {
+			for _, ev := range hubEnvVars {
+				if _, ok := dbEnv[ev.Key]; !ok && ev.Value != "" {
+					dbEnv[ev.Key] = ev.Value
+				}
+			}
+		}
+
+		lookup := func(key string) string {
+			// 1. Try project-level annotations first
+			if p.Annotations != nil {
+				if val, ok := p.Annotations[key]; ok && val != "" {
+					return val
+				}
+				lowerKey := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
+				if val, ok := p.Annotations[lowerKey]; ok && val != "" {
+					return val
+				}
+			}
+			// 2. Try project-level labels
+			if p.Labels != nil {
+				if val, ok := p.Labels[key]; ok && val != "" {
+					return val
+				}
+				lowerKey := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
+				if val, ok := p.Labels[lowerKey]; ok && val != "" {
+					return val
+				}
+			}
+			// 3. Try database-defined environment variables (project and hub scope)
+			if val, ok := dbEnv[key]; ok && val != "" {
+				return val
+			}
+			// 4. Try Scion server config / active profile environment variables
+			if activeProfileEnv != nil {
+				if val, ok := activeProfileEnv[key]; ok && val != "" {
+					return val
+				}
+			}
+			// 5. Fall back to process environment variables
+			return os.Getenv(key)
+		}
+
+		if cmd == "/review" {
+			targetTemplate = lookup("SCION_REVIEW_TEMPLATE")
+		} else if cmd == "/validate" {
+			targetTemplate = lookup("SCION_VALIDATE_TEMPLATE")
+		} else if cmd == "/fix" {
+			targetTemplate = lookup("SCION_FIX_TEMPLATE")
+		}
+		if targetTemplate == "" {
+			targetTemplate = defaultTemplateFromSettings
+		}
+		if targetTemplate == "" {
+			targetTemplate = "default"
+		}
+	}
+
 	// 1. Look for an active (running) agent labeled with this PR (unless command is /review or /validate)
 	var activeAgent *store.Agent
 	if cmd != "/review" && cmd != "/validate" {
@@ -1118,6 +1210,18 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		if err != nil {
 			slog.Error("Failed to query active agents for PR", "project", p.ID, "pr", prNumber, "error", err)
 			return
+		}
+
+		// Only route /fix to an active agent if its template matches the targetTemplate
+		if cmd == "/fix" && activeAgent != nil {
+			if activeAgent.Template != targetTemplate {
+				slog.Info("Active agent template mismatch for /fix command. Spawning a new agent with matching template instead.",
+					"active_agent_id", activeAgent.ID,
+					"active_agent_template", activeAgent.Template,
+					"required_template", targetTemplate,
+				)
+				activeAgent = nil
+			}
 		}
 	}
 
@@ -1197,7 +1301,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		slog.Info("Spawning new agent in project", "project", p.ID, "pr", prNumber, "command", cmd)
 
 		// Resolve branch ref in a background goroutine so we don't block the webhook response
-		go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string) {
+		go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string, template string) {
 			bgCtx := context.Background()
 
 			// A: Fetch the head branch name from GitHub if we don't already have it
@@ -1230,96 +1334,6 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					taskDesc = fmt.Sprintf("Implement a fix for Pull Request #%d on repository %s.", prNum, repoFull)
 				}
 				labels["github-action"] = "fix"
-			}
-
-			// B: Resolve template based on environment variables or Scion hierarchy
-			var activeProfileEnv map[string]string
-			var defaultTemplateFromSettings string
-			if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil {
-				defaultTemplateFromSettings = settings.DefaultTemplate
-				profileName := settings.ActiveProfile
-				if profileName == "" {
-					profileName = "local"
-				}
-				if profile, ok := settings.Profiles[profileName]; ok {
-					activeProfileEnv = profile.Env
-				}
-			}
-
-			// Load environment variables defined in the Hub database (scope project or hub)
-			dbEnv := make(map[string]string)
-			if projEnvVars, err := s.store.ListEnvVars(bgCtx, store.EnvVarFilter{Scope: store.ScopeProject, ScopeID: proj.ID}); err == nil {
-				for _, ev := range projEnvVars {
-					if ev.Value != "" {
-						dbEnv[ev.Key] = ev.Value
-					}
-				}
-			}
-			if s.hubID != "" {
-				if hubEnvVars, err := s.store.ListEnvVars(bgCtx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: s.hubID}); err == nil {
-					for _, ev := range hubEnvVars {
-						if _, ok := dbEnv[ev.Key]; !ok && ev.Value != "" {
-							dbEnv[ev.Key] = ev.Value
-						}
-					}
-				}
-			}
-			if hubEnvVars, err := s.store.ListEnvVars(bgCtx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: "hub"}); err == nil {
-				for _, ev := range hubEnvVars {
-					if _, ok := dbEnv[ev.Key]; !ok && ev.Value != "" {
-						dbEnv[ev.Key] = ev.Value
-					}
-				}
-			}
-
-			lookup := func(key string) string {
-				// 1. Try project-level annotations first
-				if proj.Annotations != nil {
-					if val, ok := proj.Annotations[key]; ok && val != "" {
-						return val
-					}
-					lowerKey := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
-					if val, ok := proj.Annotations[lowerKey]; ok && val != "" {
-						return val
-					}
-				}
-				// 2. Try project-level labels
-				if proj.Labels != nil {
-					if val, ok := proj.Labels[key]; ok && val != "" {
-						return val
-					}
-					lowerKey := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
-					if val, ok := proj.Labels[lowerKey]; ok && val != "" {
-						return val
-					}
-				}
-				// 3. Try database-defined environment variables (project and hub scope)
-				if val, ok := dbEnv[key]; ok && val != "" {
-					return val
-				}
-				// 4. Try Scion server config / active profile environment variables
-				if activeProfileEnv != nil {
-					if val, ok := activeProfileEnv[key]; ok && val != "" {
-						return val
-					}
-				}
-				// 5. Fall back to process environment variables
-				return os.Getenv(key)
-			}
-
-			template := ""
-			if command == "/review" {
-				template = lookup("SCION_REVIEW_TEMPLATE")
-			} else if command == "/validate" {
-				template = lookup("SCION_VALIDATE_TEMPLATE")
-			} else if command == "/fix" {
-				template = lookup("SCION_FIX_TEMPLATE")
-			}
-			if template == "" {
-				template = defaultTemplateFromSettings
-			}
-			if template == "" {
-				template = "default"
 			}
 
 			if command == "/review" || command == "/validate" || command == "/fix" {
@@ -1359,7 +1373,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			} else {
 				slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
 			}
-		}(p, prNumber, repoFullName, senderLogin, body, cmd)
+		}(p, prNumber, repoFullName, senderLogin, body, cmd, targetTemplate)
 	}
 }
 
