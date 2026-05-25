@@ -1233,6 +1233,19 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 
 			// B: Resolve template based on environment variables or Scion hierarchy
+			var activeProfileEnv map[string]string
+			var defaultTemplateFromSettings string
+			if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil {
+				defaultTemplateFromSettings = settings.DefaultTemplate
+				profileName := settings.ActiveProfile
+				if profileName == "" {
+					profileName = "local"
+				}
+				if profile, ok := settings.Profiles[profileName]; ok {
+					activeProfileEnv = profile.Env
+				}
+			}
+
 			lookup := func(key string) string {
 				// 1. Try project-level annotations first
 				if proj.Annotations != nil {
@@ -1254,7 +1267,13 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 						return val
 					}
 				}
-				// 3. Fall back to process environment variables
+				// 3. Try Scion server config / active profile environment variables
+				if activeProfileEnv != nil {
+					if val, ok := activeProfileEnv[key]; ok && val != "" {
+						return val
+					}
+				}
+				// 4. Fall back to process environment variables
 				return os.Getenv(key)
 			}
 
@@ -1267,9 +1286,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				template = lookup("SCION_FIX_TEMPLATE")
 			}
 			if template == "" {
-				if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil && settings.DefaultTemplate != "" {
-					template = settings.DefaultTemplate
-				}
+				template = defaultTemplateFromSettings
 			}
 			if template == "" {
 				template = "default"

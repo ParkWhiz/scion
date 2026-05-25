@@ -30,6 +30,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -2050,6 +2052,180 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 
 	if spawnedValidateAgent.Template != "my-custom-validate-tpl" {
 		t.Errorf("expected template to be %q, got %q", "my-custom-validate-tpl", spawnedValidateAgent.Template)
+	}
+}
+
+func TestHandleGitHubWebhook_TemplateResolution_ServerConfig(t *testing.T) {
+	// Isolate HOME so config.LoadEffectiveSettings finds our temporary settings.yaml
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	globalDir := filepath.Join(tempHome, ".scion")
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		t.Fatalf("failed to create global settings dir: %v", err)
+	}
+	settingsYAML := `schema_version: "1"
+active_profile: local
+profiles:
+  local:
+    env:
+      SCION_REVIEW_TEMPLATE: my-server-config-review-tpl
+`
+	if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(settingsYAML), 0644); err != nil {
+		t.Fatalf("failed to write settings file: %v", err)
+	}
+
+	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations/123/access_tokens" {
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"token":      "ghs_access_token_abc",
+				"expires_at": expiresAt,
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/pulls/101" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"number": 101,
+				"head": map[string]interface{}{
+					"ref": "my-cool-feature-branch",
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_review_server", Slug: "my-server-config-review-tpl", Name: "My Server Config Review Template",
+		Harness: "claude", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: now, Updated: now,
+	}); err != nil {
+		t.Fatalf("failed to create custom review template: %v", err)
+	}
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(123)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-srvtpl-1",
+		Slug:   "broker-srvtpl-1",
+		Name:   "Broker SrvTpl 1",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	project := &store.Project{
+		ID:                     "proj-srvtpl-1",
+		Name:                   "Proj SrvTpl 1",
+		Slug:                   "proj-srvtpl-1",
+		GitRemote:              "https://github.com/acme/widgets.git",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   brokerObj.ID,
+		BrokerName: brokerObj.Name,
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := s.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	payloadReview := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   111,
+			"body": "Hey @scion /review please!",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder123",
+		},
+	}
+
+	payloadBytesReview := mustJSON(t, payloadReview)
+	sigReview := signWebhookPayload(payloadBytesReview, "test-webhook-secret")
+
+	reqReview := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytesReview))
+	reqReview.Header.Set("X-GitHub-Event", "issue_comment")
+	reqReview.Header.Set("X-Hub-Signature-256", sigReview)
+
+	recReview := httptest.NewRecorder()
+	srv.handleGitHubWebhook(recReview, reqReview)
+
+	if recReview.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recReview.Code, recReview.Body.String())
+	}
+
+	var spawnedReviewAgent *store.Agent
+	for i := 0; i < 20; i++ {
+		agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: project.ID, Phase: "created"}, store.ListOptions{Limit: 100})
+		if err == nil {
+			for _, item := range agents.Items {
+				if item.Labels["github-action"] == "review" {
+					spawnedReviewAgent = &item
+					break
+				}
+			}
+		}
+		if spawnedReviewAgent != nil {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	if spawnedReviewAgent == nil {
+		t.Fatal("timed out waiting for review agent to be spawned")
+	}
+
+	if spawnedReviewAgent.Template != "my-server-config-review-tpl" {
+		t.Errorf("expected template to be %q, got %q", "my-server-config-review-tpl", spawnedReviewAgent.Template)
 	}
 }
 
