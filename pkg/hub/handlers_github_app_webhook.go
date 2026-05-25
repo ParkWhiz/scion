@@ -1072,7 +1072,12 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			parts := strings.SplitN(repoFullName, "/", 2)
 			if len(parts) == 2 {
 				owner, repo := parts[0], parts[1]
-				errMsg := "No matching project or grove was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
+				var errMsg string
+				if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
+					errMsg = fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the PR's target branch), or\n2. A **public project with isolated agents** available for this repository.", cmd)
+				} else {
+					errMsg = "No matching project or grove was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
+				}
 				if s.config.Debug {
 					slog.Debug("processComment: posting unmatched project comment", "owner", owner, "repo", repo)
 				}
@@ -1095,6 +1100,60 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				prBranch = branch
 				break
 			}
+		}
+	}
+
+	// For /review, /validate, and /fix, ensure we have an appropriate project.
+	// An appropriate project is either branch-specific (has agents matching prBranch)
+	// or is a public project with isolated agents.
+	if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
+		hasAppropriateProject := false
+
+		// 1. Check for branch-specific project (branchMatchCandidates)
+		if prBranch != "" {
+			for _, proj := range projects {
+				agents, err := s.store.ListAgents(ctx, store.AgentFilter{ProjectID: proj.ID}, store.ListOptions{Limit: 1000})
+				if err == nil {
+					for _, agent := range agents.Items {
+						if agent.AppliedConfig != nil && agent.AppliedConfig.Branch == prBranch {
+							hasAppropriateProject = true
+							break
+						}
+					}
+				}
+				if hasAppropriateProject {
+					break
+				}
+			}
+		}
+
+		// 2. Check for public project with isolated agents
+		if !hasAppropriateProject {
+			if s.selectByPublicAndIsolated(projects) != nil {
+				hasAppropriateProject = true
+			}
+		}
+
+		if !hasAppropriateProject {
+			slog.Warn("No appropriate project found for command", "command", cmd, "repo", repoFullName, "pr", prNumber)
+			if installationID != 0 {
+				client, err := s.getGitHubAppClient()
+				if err == nil {
+					parts := strings.SplitN(repoFullName, "/", 2)
+					if len(parts) == 2 {
+						owner, repo := parts[0], parts[1]
+						guidanceMsg := fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the branch `%s`), or\n2. A **public project with isolated agents** available for this repository.", cmd, prBranch)
+						if err := client.PostIssueComment(ctx, installationID, owner, repo, prNumber, guidanceMsg); err != nil {
+							slog.Error("Failed to post project fallback guidance comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err)
+						} else {
+							slog.Info("Posted project fallback guidance comment to GitHub", "repo", repoFullName, "pr", prNumber)
+						}
+					}
+				} else {
+					slog.Error("Failed to get GitHub App client to post guidance comment", "error", err)
+				}
+			}
+			return
 		}
 	}
 

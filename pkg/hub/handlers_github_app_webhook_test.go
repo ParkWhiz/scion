@@ -32,6 +32,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1414,6 +1415,7 @@ func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
 		Name:                   "Proj Review Fallback 1",
 		Slug:                   "proj-review-fallback-1",
 		GitRemote:              "https://github.com/acme/widgets.git",
+		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -1745,6 +1747,7 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 		Name:                   "Proj Validate Fallback 1",
 		Slug:                   "proj-validate-fallback-1",
 		GitRemote:              "https://github.com/acme/widgets.git",
+		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -1912,6 +1915,7 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 		Name:                   "Proj Tpl 1",
 		Slug:                   "proj-tpl-1",
 		GitRemote:              "https://github.com/acme/widgets.git",
+		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2150,6 +2154,7 @@ profiles:
 		Name:                   "Proj SrvTpl 1",
 		Slug:                   "proj-srvtpl-1",
 		GitRemote:              "https://github.com/acme/widgets.git",
+		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2318,6 +2323,7 @@ func TestHandleGitHubWebhook_TemplateResolution_Database(t *testing.T) {
 		Name:                   "Proj SrvTpl 2",
 		Slug:                   "proj-srvtpl-2",
 		GitRemote:              "https://github.com/acme/widgets.git",
+		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2545,6 +2551,7 @@ func TestHandleGitHubWebhook_FixAndSpawnBypass(t *testing.T) {
 		Name:                 "Project Fix 1",
 		Slug:                 "project-fix-1",
 		GitRemote:            "https://github.com/acme/widgets.git",
+		Visibility:           store.VisibilityPublic,
 		GitHubInstallationID: &inst.InstallationID,
 		Created:              time.Now(),
 		Updated:              time.Now(),
@@ -2660,6 +2667,7 @@ func TestHandleGitHubWebhook_FixAndSpawnBypass_Mismatch(t *testing.T) {
 		Name:                 "Project Fix 2",
 		Slug:                 "project-fix-2",
 		GitRemote:            "https://github.com/acme/widgets.git",
+		Visibility:           store.VisibilityPublic,
 		GitHubInstallationID: &inst.InstallationID,
 		Created:              time.Now(),
 		Updated:              time.Now(),
@@ -2747,5 +2755,122 @@ func TestHandleGitHubWebhook_FixAndSpawnBypass_Mismatch(t *testing.T) {
 		t.Fatalf("active agent should NOT have received a message because template mismatched, got: %v", msg)
 	case <-time.After(500 * time.Millisecond):
 		// Success! No message routed to the mismatched agent.
+	}
+}
+
+func TestHandleGitHubWebhook_NoAppropriateProjectCommentBack(t *testing.T) {
+	var commentBody string
+	var commentMutex sync.Mutex
+
+	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations/123/access_tokens" {
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"token":      "ghs_access_token_abc",
+				"expires_at": expiresAt,
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/pulls/101" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"number": 101,
+				"head": map[string]interface{}{
+					"ref": "my-cool-feature-branch",
+				},
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/issues/101/comments" {
+			var reqData map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			commentMutex.Lock()
+			commentBody = reqData["body"]
+			commentMutex.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 789,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(123)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	// Create a private project with no active agents matching the branch (so it's inappropriate)
+	project := &store.Project{
+		ID:                   "proj-inappropriate-1",
+		Name:                 "Proj Inappropriate 1",
+		Slug:                 "proj-inappropriate-1",
+		GitRemote:            "https://github.com/acme/widgets.git",
+		Visibility:           "private",
+		GitHubInstallationID: &instID,
+		Created:              time.Now(),
+		Updated:              time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	payload := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   111,
+			"body": "Hey @scion /review please!",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder123",
+		},
+		"installation": map[string]interface{}{
+			"id": 123,
+		},
+	}
+
+	payloadBytes := mustJSON(t, payload)
+	sig := signWebhookPayload(payloadBytes, "test-webhook-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var finalComment string
+	commentMutex.Lock()
+	finalComment = commentBody
+	commentMutex.Unlock()
+
+	if !strings.Contains(finalComment, "No appropriate Scion project/grove could be found") || !strings.Contains(finalComment, "my-cool-feature-branch") {
+		t.Errorf("expected guidance comment containing command info and branch name, got %q", finalComment)
 	}
 }
