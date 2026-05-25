@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -1110,7 +1111,39 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					slog.Error("Failed to publish PR comment to agent", "agent_id", activeAgent.ID, "error", err)
 				}
 			} else {
-				slog.Error("Message broker proxy not initialized on Server")
+				slog.Info("Message broker proxy not initialized, falling back to direct dispatch", "agent_id", activeAgent.ID)
+
+				// 1. Create and persist message
+				storeMsg := &store.Message{
+					ID:          api.NewUUID(),
+					ProjectID:   p.ID,
+					Sender:      msg.Sender,
+					SenderID:    msg.SenderID,
+					Recipient:   msg.Recipient,
+					RecipientID: msg.RecipientID,
+					Msg:         msg.Msg,
+					Type:        msg.Type,
+					AgentID:     activeAgent.ID,
+					CreatedAt:   time.Now(),
+				}
+				if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
+					slog.Error("Failed to persist fallback message", "error", err)
+				}
+
+				// 2. Publish SSE event
+				s.events.PublishUserMessage(ctx, storeMsg)
+
+				// 3. Dispatch to runtime broker via agent dispatcher
+				dispatcher := s.GetDispatcher()
+				if dispatcher != nil && activeAgent.RuntimeBrokerID != "" {
+					if err := dispatcher.DispatchAgentMessage(ctx, activeAgent, msgText, false, msg); err != nil {
+						slog.Error("Failed to dispatch PR comment to runtime broker", "agent_id", activeAgent.ID, "error", err)
+					} else {
+						slog.Info("Successfully dispatched PR comment directly to agent", "agent_id", activeAgent.ID)
+					}
+				} else {
+					slog.Error("Direct dispatch failed: dispatcher or runtime broker ID not available", "agent_id", activeAgent.ID)
+				}
 			}
 		} else {
 			// --- PATH B: Spawn a new agent fallback ---
