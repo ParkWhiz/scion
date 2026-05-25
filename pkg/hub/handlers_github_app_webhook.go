@@ -930,7 +930,7 @@ func (s *Server) handleIssueCommentWebhook(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	s.processComment(r.Context(), "issue_comment", event.Repository.FullName, event.Issue.Number, event.Comment.ID, event.Comment.Body, event.Sender.Login)
+	s.processComment(r.Context(), "issue_comment", event.Repository.FullName, event.Issue.Number, event.Comment.ID, event.Comment.Body, event.Sender.Login, event.Installation.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -947,7 +947,7 @@ func (s *Server) handlePullRequestReviewCommentWebhook(w http.ResponseWriter, r 
 		return
 	}
 
-	s.processComment(r.Context(), "pull_request_review_comment", event.Repository.FullName, event.PullRequest.Number, event.Comment.ID, event.Comment.Body, event.Sender.Login)
+	s.processComment(r.Context(), "pull_request_review_comment", event.Repository.FullName, event.PullRequest.Number, event.Comment.ID, event.Comment.Body, event.Sender.Login, event.Installation.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -964,7 +964,7 @@ func (s *Server) handlePullRequestReviewWebhook(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	s.processComment(r.Context(), "pull_request_review", event.Repository.FullName, event.PullRequest.Number, event.Review.ID, event.Review.Body, event.Sender.Login)
+	s.processComment(r.Context(), "pull_request_review", event.Repository.FullName, event.PullRequest.Number, event.Review.ID, event.Review.Body, event.Sender.Login, event.Installation.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -978,7 +978,7 @@ func parseCommand(body string) string {
 }
 
 // processComment checks for mentions of "@scion" and resolves corresponding projects.
-func (s *Server) processComment(ctx context.Context, eventType, repoFullName string, prNumber, commentID int64, body string, senderLogin string) {
+func (s *Server) processComment(ctx context.Context, eventType, repoFullName string, prNumber, commentID int64, body string, senderLogin string, installationID int64) {
 	if !strings.Contains(strings.ToLower(body), "@scion") {
 		slog.Debug("No @scion mention in comment", "repo", repoFullName, "pr", prNumber, "comment_id", commentID)
 		return
@@ -1003,6 +1003,23 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 
 	if len(projects) == 0 {
 		slog.Warn("No project matched with the repository", "repo", repoFullName)
+		if installationID != 0 {
+			client, err := s.getGitHubAppClient()
+			if err != nil {
+				slog.Error("Failed to get GitHub App client to post unmatched project comment", "error", err)
+				return
+			}
+			parts := strings.SplitN(repoFullName, "/", 2)
+			if len(parts) == 2 {
+				owner, repo := parts[0], parts[1]
+				errMsg := "No matching project or grove was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
+				if err := client.PostIssueComment(ctx, installationID, owner, repo, prNumber, errMsg); err != nil {
+					slog.Error("Failed to post unmatched project comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err)
+				} else {
+					slog.Info("Posted unmatched project comment to GitHub", "repo", repoFullName, "pr", prNumber)
+				}
+			}
+		}
 		return
 	}
 

@@ -1473,6 +1473,97 @@ func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
 	}
 }
 
+func TestHandleGitHubWebhook_UnmatchedProjectCommentBack(t *testing.T) {
+	var commentBody string
+	var commentMutex sync.Mutex
+
+	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations/456/access_tokens" {
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"token":      "ghs_unmatched_access_token",
+				"expires_at": expiresAt,
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/unmatched/issues/101/comments" {
+			var reqData map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			commentMutex.Lock()
+			commentBody = reqData["body"]
+			commentMutex.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 789,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, _ := webhookTestServer(t)
+
+	pemBytes := generateTestWebhookKey(t)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	payload := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/unmatched/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   111,
+			"body": "Hey @scion can you review?",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/unmatched",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder123",
+		},
+		"installation": map[string]interface{}{
+			"id": 456,
+		},
+	}
+
+	payloadBytes := mustJSON(t, payload)
+	sig := signWebhookPayload(payloadBytes, "test-webhook-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var finalComment string
+	commentMutex.Lock()
+	finalComment = commentBody
+	commentMutex.Unlock()
+
+	expectedMsg := "No matching project or grove was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
+	if finalComment != expectedMsg {
+		t.Errorf("expected comment %q, got %q", expectedMsg, finalComment)
+	}
+}
+
 func generateTestWebhookKey(t *testing.T) []byte {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)

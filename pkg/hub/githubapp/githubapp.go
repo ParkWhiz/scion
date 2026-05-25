@@ -762,3 +762,51 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64, owner
 
 	return &pr, nil
 }
+
+// PostIssueComment posts a comment on an issue or pull request.
+// It uses an installation access token.
+func (c *Client) PostIssueComment(ctx context.Context, installationID int64, owner, repo string, number int64, body string) error {
+	// First mint a token for this installation with Issues write permissions
+	token, err := c.MintInstallationToken(ctx, installationID, []string{repo}, TokenPermissions{Issues: "write"})
+	if err != nil {
+		return fmt.Errorf("failed to mint token for comment: %w", err)
+	}
+
+	reqBody := map[string]string{
+		"body": body,
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", c.apiBaseURL, owner, repo, number)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	c.trackRateLimit(resp)
+
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("failed to post comment (status %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}

@@ -2849,6 +2849,9 @@ func TestCreateAgentProjectSlugInitializesScionDir(t *testing.T) {
 	if err := os.MkdirAll(projectPath, 0755); err != nil {
 		t.Fatalf("failed to create test grove dir: %v", err)
 	}
+	if evalPath, err := filepath.EvalSymlinks(projectPath); err == nil {
+		projectPath = evalPath
+	}
 
 	// Verify .scion does NOT exist yet
 	scionDir := filepath.Join(projectPath, ".scion")
