@@ -1789,7 +1789,7 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 		t.Fatal("timed out waiting for fallback agent to be spawned")
 	}
 
-	expectedTask := "Validate the changes for Pull Request #101 on repository acme/widgets. Check out branch my-cool-feature-branch, execute the validation instructions, and report the validation results back to GitHub."
+	expectedTask := "Validate the changes for Pull Request #101 on repository acme/widgets and report the validation results back to GitHub."
 	if spawnedAgent.AppliedConfig == nil {
 		t.Fatal("expected spawned agent to have AppliedConfig, got nil")
 	}

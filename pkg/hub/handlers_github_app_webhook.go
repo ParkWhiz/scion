@@ -1174,7 +1174,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					taskDesc = fmt.Sprintf("Perform a complete code review for Pull Request #%d on repository %s. Inspect the changes on branch %s, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub.", prNum, repoFull, branch)
 					labels["github-action"] = "review"
 				} else if command == "/validate" {
-					taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s. Check out branch %s, execute the validation instructions, and report the validation results back to GitHub.", prNum, repoFull, branch)
+					taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s and report the validation results back to GitHub.", prNum, repoFull, branch)
 					labels["github-action"] = "validate"
 				}
 
