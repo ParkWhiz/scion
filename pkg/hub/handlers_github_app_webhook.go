@@ -968,6 +968,15 @@ func (s *Server) handlePullRequestReviewWebhook(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// parseCommand extracts commands starting with "/" from a comment body.
+func parseCommand(body string) string {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "/review") {
+		return "/review"
+	}
+	return ""
+}
+
 // processComment checks for mentions of "@scion" and resolves corresponding projects.
 func (s *Server) processComment(ctx context.Context, eventType, repoFullName string, prNumber, commentID int64, body string, senderLogin string) {
 	if !strings.Contains(strings.ToLower(body), "@scion") {
@@ -982,6 +991,8 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		"comment_id", commentID,
 		"sender", senderLogin,
 	)
+
+	cmd := parseCommand(body)
 
 	// Resolve project associated with repo
 	projects, err := s.findProjectsForRepository(ctx, repoFullName)
@@ -1013,13 +1024,18 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			// --- PATH A: Route to existing active agent ---
 			slog.Info("Routing GitHub mention to active agent", "agent_id", activeAgent.ID, "pr", prNumber)
 
+			msgText := body
+			if cmd == "/review" {
+				msgText = "Command: /review. Please perform a code review on the changes in this pull request and submit your comments."
+			}
+
 			msg := &messages.StructuredMessage{
 				Version:     messages.Version,
 				Timestamp:   time.Now().UTC().Format(time.RFC3339),
 				Sender:      "user:github-" + senderLogin,
 				Recipient:   "agent:" + activeAgent.Slug,
 				RecipientID: activeAgent.ID,
-				Msg:         body,
+				Msg:         msgText,
 				Type:        messages.TypeInstruction,
 			}
 
@@ -1036,7 +1052,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			slog.Info("No active agent found. Spawning dynamic fallback agent", "project", p.ID, "pr", prNumber)
 
 			// Resolve branch ref in a background goroutine so we don't block the webhook response
-			go func(proj store.Project, prNum int64, repoFull, sender string, prompt string) {
+			go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string) {
 				bgCtx := context.Background()
 
 				// A: Fetch the head branch name from GitHub
@@ -1046,12 +1062,17 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					return
 				}
 
+				taskDesc := prompt
+				if command == "/review" {
+					taskDesc = fmt.Sprintf("Perform a complete code review for Pull Request #%d on repository %s. Inspect the changes on branch %s, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub.", prNum, repoFull, branch)
+				}
+
 				// B: Construct a new agent creation request
 				req := CreateAgentRequest{
 					Name:      fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().Unix()),
 					ProjectID: proj.ID,
 					Branch:    branch,
-					Task:      prompt,
+					Task:      taskDesc,
 					Labels: map[string]string{
 						"github-pr":   strconv.FormatInt(prNum, 10),
 						"github-repo": repoFull,
@@ -1076,7 +1097,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				} else {
 					slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
 				}
-			}(p, prNumber, repoFullName, senderLogin, body)
+			}(p, prNumber, repoFullName, senderLogin, body, cmd)
 		}
 	}
 }

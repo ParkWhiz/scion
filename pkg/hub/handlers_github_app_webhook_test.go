@@ -1239,6 +1239,240 @@ func TestHandleGitHubWebhook_StrategyD_Fallback(t *testing.T) {
 	}
 }
 
+func TestHandleGitHubWebhook_ReviewCommand_ActiveAgent(t *testing.T) {
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	project := &store.Project{
+		ID:        "proj-review-active-1",
+		Name:      "Proj Review Active 1",
+		Slug:      "proj-review-active-1",
+		GitRemote: "https://github.com/acme/widgets.git",
+		Created:   time.Now(),
+		Updated:   time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	agent := &store.Agent{
+		ID:        "agent-review-active-1",
+		Name:      "Agent Review Active 1",
+		Slug:      "agent-review-active-1",
+		ProjectID: project.ID,
+		Phase:     "running",
+		Labels: map[string]string{
+			"github-pr":   "101",
+			"github-repo": "acme/widgets",
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateAgent(ctx, agent); err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	pub := NewChannelEventPublisher()
+	srv.SetEventPublisher(pub)
+	b := broker.NewInProcessBroker(slog.Default())
+	srv.StartMessageBroker(b)
+
+	msgCh := make(chan *messages.StructuredMessage, 10)
+	topic := broker.TopicAgentMessages(project.ID, agent.Slug)
+	_, err := b.Subscribe(topic, func(ctx context.Context, top string, msg *messages.StructuredMessage) {
+		msgCh <- msg
+	})
+	if err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	payload := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   111,
+			"body": "Hey @scion /review please!",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "octocat",
+		},
+	}
+
+	payloadBytes := mustJSON(t, payload)
+	sig := signWebhookPayload(payloadBytes, "test-webhook-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	select {
+	case msg := <-msgCh:
+		expected := "Command: /review. Please perform a code review on the changes in this pull request and submit your comments."
+		if msg.Msg != expected {
+			t.Errorf("expected message %q, got %q", expected, msg.Msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for routed message")
+	}
+}
+
+func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
+	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations/123/access_tokens" {
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"token":      "ghs_access_token_abc",
+				"expires_at": expiresAt,
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/pulls/101" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"number": 101,
+				"head": map[string]interface{}{
+					"ref": "my-cool-feature-branch",
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(123)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-review-fallback-1",
+		Slug:   "broker-review-fallback-1",
+		Name:   "Broker Review Fallback 1",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	project := &store.Project{
+		ID:                     "proj-review-fallback-1",
+		Name:                   "Proj Review Fallback 1",
+		Slug:                   "proj-review-fallback-1",
+		GitRemote:              "https://github.com/acme/widgets.git",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   brokerObj.ID,
+		BrokerName: brokerObj.Name,
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := s.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	payload := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   111,
+			"body": "Hey @scion /review please!",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder123",
+		},
+	}
+
+	payloadBytes := mustJSON(t, payload)
+	sig := signWebhookPayload(payloadBytes, "test-webhook-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var spawnedAgent *store.Agent
+	for i := 0; i < 20; i++ {
+		agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: project.ID}, store.ListOptions{Limit: 100})
+		if err == nil && len(agents.Items) > 0 {
+			spawnedAgent = &agents.Items[0]
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	if spawnedAgent == nil {
+		t.Fatal("timed out waiting for fallback agent to be spawned")
+	}
+
+	expectedTask := "Perform a complete code review for Pull Request #101 on repository acme/widgets. Inspect the changes on branch my-cool-feature-branch, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub."
+	if spawnedAgent.AppliedConfig == nil {
+		t.Fatal("expected spawned agent to have AppliedConfig, got nil")
+	}
+	if spawnedAgent.AppliedConfig.Task != expectedTask {
+		t.Errorf("expected task %q, got %q", expectedTask, spawnedAgent.AppliedConfig.Task)
+	}
+}
+
 func generateTestWebhookKey(t *testing.T) []byte {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
