@@ -2184,3 +2184,116 @@ func TestResolveBestProject_PublicIsolatedFallback(t *testing.T) {
 		t.Errorf("expected best project to be %s (public + isolated), got %s", pB.ID, best.ID)
 	}
 }
+
+func TestHandleGitHubWebhook_FixAndSpawnBypass(t *testing.T) {
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	// Create installation
+	inst := &store.GitHubInstallation{
+		InstallationID: 12345,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Status:         store.GitHubInstallationStatusActive,
+	}
+	if err := s.CreateGitHubInstallation(ctx, inst); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	// Create project
+	p := &store.Project{
+		ID:                   "project-fix-1",
+		Name:                 "Project Fix 1",
+		Slug:                 "project-fix-1",
+		GitRemote:            "https://github.com/acme/widgets.git",
+		GitHubInstallationID: &inst.InstallationID,
+		Created:              time.Now(),
+		Updated:              time.Now(),
+	}
+	if err := s.CreateProject(ctx, p); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Create an active running agent
+	agent := &store.Agent{
+		ID:        "agent-active-fix",
+		Name:      "Agent Active Fix",
+		Slug:      "agent-active-fix",
+		ProjectID: p.ID,
+		Phase:     "running",
+		Labels: map[string]string{
+			"github-pr":   "101",
+			"github-repo": "acme/widgets",
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateAgent(ctx, agent); err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	// Start Message Broker on the Server
+	pub := NewChannelEventPublisher()
+	srv.SetEventPublisher(pub)
+	b := broker.NewInProcessBroker(slog.Default())
+	srv.StartMessageBroker(b)
+
+	// Subscribe to the agent's message topic
+	msgCh := make(chan *messages.StructuredMessage, 10)
+	topic := broker.TopicAgentMessages(p.ID, agent.Slug)
+	_, err := b.Subscribe(topic, func(ctx context.Context, top string, msg *messages.StructuredMessage) {
+		msgCh <- msg
+	})
+	if err != nil {
+		t.Fatalf("failed to subscribe to broker: %v", err)
+	}
+
+	// Test 1: Send /fix command, should be routed to active agent
+	payload := mustJSON(t, map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   555,
+			"body": "@scion /fix resolve the crash in main.go",
+		},
+		"repository": map[string]interface{}{
+			"id":        1,
+			"full_name": "acme/widgets",
+			"name":      "widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "dev1",
+		},
+		"installation": map[string]interface{}{
+			"id": 12345,
+		},
+	})
+
+	sig := signWebhookPayload(payload, "test-webhook-secret")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify the active agent received the exact fix instructions
+	select {
+	case msg := <-msgCh:
+		if msg.Msg != "resolve the crash in main.go" {
+			t.Errorf("expected msg to be 'resolve the crash in main.go', got %q", msg.Msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("timed out waiting for message routing on active agent /fix")
+	}
+}

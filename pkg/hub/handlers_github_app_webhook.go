@@ -1010,7 +1010,20 @@ func parseCommand(body string) string {
 	if strings.Contains(lower, "/validate") {
 		return "/validate"
 	}
+	if strings.Contains(lower, "/fix") {
+		return "/fix"
+	}
 	return ""
+}
+
+// extractTextAfterCommand returns the substring of body that comes after the given command.
+func extractTextAfterCommand(body, command string) string {
+	idx := strings.Index(strings.ToLower(body), command)
+	if idx == -1 {
+		return ""
+	}
+	text := body[idx+len(command):]
+	return strings.TrimSpace(text)
 }
 
 // processComment checks for mentions of "@scion" and resolves corresponding projects.
@@ -1097,11 +1110,15 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		"git_remote", p.GitRemote,
 	)
 
-	// 1. Look for an active (running) agent labeled with this PR
-	activeAgent, err := s.findActiveAgentForPR(ctx, p.ID, prNumber, repoFullName)
-	if err != nil {
-		slog.Error("Failed to query active agents for PR", "project", p.ID, "pr", prNumber, "error", err)
-		return
+	// 1. Look for an active (running) agent labeled with this PR (unless command is /review or /validate)
+	var activeAgent *store.Agent
+	if cmd != "/review" && cmd != "/validate" {
+		var err error
+		activeAgent, err = s.findActiveAgentForPR(ctx, p.ID, prNumber, repoFullName)
+		if err != nil {
+			slog.Error("Failed to query active agents for PR", "project", p.ID, "pr", prNumber, "error", err)
+			return
+		}
 	}
 
 	if activeAgent != nil {
@@ -1109,21 +1126,19 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		slog.Info("Routing GitHub mention to active agent", "agent_id", activeAgent.ID, "pr", prNumber)
 
 		msgText := body
-		if cmd == "/review" {
-			msgText = "Command: /review. Please perform a code review on the changes in this pull request and submit your comments."
-			slog.Info("Routing command to active agent in project/grove",
+		if cmd == "/fix" {
+			fixText := extractTextAfterCommand(body, "/fix")
+			if fixText != "" {
+				msgText = fixText
+			} else {
+				msgText = "Please implement a fix as requested."
+			}
+			slog.Info("Routing /fix command to active agent in project/grove",
 				"command", cmd,
 				"project_id", p.ID,
 				"project_name", p.Name,
 				"agent_id", activeAgent.ID,
-			)
-		} else if cmd == "/validate" {
-			msgText = "Command: /validate. Please run validation checks, execute the validation instructions, and report back on the correctness of this pull request."
-			slog.Info("Routing command to active agent in project/grove",
-				"command", cmd,
-				"project_id", p.ID,
-				"project_name", p.Name,
-				"agent_id", activeAgent.ID,
+				"fix_instruction", msgText,
 			)
 		}
 
@@ -1178,8 +1193,8 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 		}
 	} else {
-		// --- PATH B: Spawn a new agent fallback ---
-		slog.Info("No active agent found. Spawning dynamic fallback agent", "project", p.ID, "pr", prNumber)
+		// --- PATH B: Spawn a new agent ---
+		slog.Info("Spawning new agent in project", "project", p.ID, "pr", prNumber, "command", cmd)
 
 		// Resolve branch ref in a background goroutine so we don't block the webhook response
 		go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string) {
@@ -1207,6 +1222,14 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			} else if command == "/validate" {
 				taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s and report the validation results back to GitHub.", prNum, repoFull)
 				labels["github-action"] = "validate"
+			} else if command == "/fix" {
+				fixText := extractTextAfterCommand(prompt, "/fix")
+				if fixText != "" {
+					taskDesc = fmt.Sprintf("Implement the following fix for Pull Request #%d on repository %s: %s", prNum, repoFull, fixText)
+				} else {
+					taskDesc = fmt.Sprintf("Implement a fix for Pull Request #%d on repository %s.", prNum, repoFull)
+				}
+				labels["github-action"] = "fix"
 			}
 
 			// B: Resolve template based on environment variables or Scion hierarchy
@@ -1215,6 +1238,8 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				template = os.Getenv("SCION_REVIEW_TEMPLATE")
 			} else if command == "/validate" {
 				template = os.Getenv("SCION_VALIDATE_TEMPLATE")
+			} else if command == "/fix" {
+				template = os.Getenv("SCION_FIX_TEMPLATE")
 			}
 			if template == "" {
 				if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil && settings.DefaultTemplate != "" {
@@ -1225,8 +1250,8 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				template = "default"
 			}
 
-			if command == "/review" || command == "/validate" {
-				slog.Info("Launching fallback agent for command",
+			if command == "/review" || command == "/validate" || command == "/fix" {
+				slog.Info("Launching agent for command",
 					"command", command,
 					"project_id", proj.ID,
 					"project_name", proj.Name,
