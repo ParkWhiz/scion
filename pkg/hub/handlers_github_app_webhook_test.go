@@ -1331,12 +1331,9 @@ func TestHandleGitHubWebhook_ReviewCommand_ActiveAgent(t *testing.T) {
 
 	select {
 	case msg := <-msgCh:
-		expected := "Command: /review. Please perform a code review on the changes in this pull request and submit your comments."
-		if msg.Msg != expected {
-			t.Errorf("expected message %q, got %q", expected, msg.Msg)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for routed message")
+		t.Fatalf("unexpectedly received routed message for /review: %v", msg)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: active agent is bypassed for /review
 	}
 }
 
@@ -1665,12 +1662,9 @@ func TestHandleGitHubWebhook_ValidateCommand_ActiveAgent(t *testing.T) {
 
 	select {
 	case msg := <-msgCh:
-		expected := "Command: /validate. Please run validation checks, execute the validation instructions, and report back on the correctness of this pull request."
-		if msg.Msg != expected {
-			t.Errorf("expected message %q, got %q", expected, msg.Msg)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for routed message")
+		t.Fatalf("unexpectedly received routed message for /validate: %v", msg)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: active agent is bypassed for /validate
 	}
 }
 

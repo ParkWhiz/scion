@@ -1233,13 +1233,38 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 
 			// B: Resolve template based on environment variables or Scion hierarchy
+			lookup := func(key string) string {
+				// 1. Try project-level annotations first
+				if proj.Annotations != nil {
+					if val, ok := proj.Annotations[key]; ok && val != "" {
+						return val
+					}
+					lowerKey := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
+					if val, ok := proj.Annotations[lowerKey]; ok && val != "" {
+						return val
+					}
+				}
+				// 2. Try project-level labels
+				if proj.Labels != nil {
+					if val, ok := proj.Labels[key]; ok && val != "" {
+						return val
+					}
+					lowerKey := strings.ToLower(strings.ReplaceAll(key, "_", "-"))
+					if val, ok := proj.Labels[lowerKey]; ok && val != "" {
+						return val
+					}
+				}
+				// 3. Fall back to process environment variables
+				return os.Getenv(key)
+			}
+
 			template := ""
 			if command == "/review" {
-				template = os.Getenv("SCION_REVIEW_TEMPLATE")
+				template = lookup("SCION_REVIEW_TEMPLATE")
 			} else if command == "/validate" {
-				template = os.Getenv("SCION_VALIDATE_TEMPLATE")
+				template = lookup("SCION_VALIDATE_TEMPLATE")
 			} else if command == "/fix" {
-				template = os.Getenv("SCION_FIX_TEMPLATE")
+				template = lookup("SCION_FIX_TEMPLATE")
 			}
 			if template == "" {
 				if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil && settings.DefaultTemplate != "" {
