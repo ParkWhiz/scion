@@ -96,6 +96,10 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		s.handleInstallationRepositoriesWebhook(w, r, body)
 		return
 
+	case "issues":
+		s.handleIssuesWebhook(w, r, body)
+		return
+
 	case "issue_comment":
 		s.handleIssueCommentWebhook(w, r, body)
 		return
@@ -923,6 +927,50 @@ type webhookPullRequestReviewEvent struct {
 	} `json:"installation"`
 }
 
+type webhookIssuesEvent struct {
+	Action string `json:"action"` // opened, edited, etc.
+	Issue  struct {
+		Number  int64  `json:"number"`
+		HTMLURL string `json:"html_url"`
+		Body    string `json:"body"`
+	} `json:"issue"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+}
+
+// handleIssuesWebhook handles "issues" events.
+func (s *Server) handleIssuesWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
+	var event webhookIssuesEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		if s.config.Debug {
+			slog.Debug("handleIssuesWebhook: failed to unmarshal", "error", err.Error())
+		}
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
+		return
+	}
+
+	if event.Action != "opened" {
+		if s.config.Debug {
+			slog.Debug("handleIssuesWebhook: ignoring action", "action", event.Action)
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "not opened action"})
+		return
+	}
+
+	if s.config.Debug {
+		slog.Debug("handleIssuesWebhook: processing issue", "repo", event.Repository.FullName, "issue", event.Issue.Number)
+	}
+	s.processComment(r.Context(), "issues", event.Repository.FullName, event.Issue.Number, 0, event.Issue.Body, event.Sender.Login, event.Installation.ID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 // handleIssueCommentWebhook handles "issue_comment" events.
 func (s *Server) handleIssueCommentWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
 	var event webhookIssueCommentEvent
@@ -934,11 +982,14 @@ func (s *Server) handleIssueCommentWebhook(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if event.Issue.PullRequest == nil || event.Action != "created" {
+	isPlanOrImplementComment := strings.Contains(strings.ToLower(event.Comment.Body), "@scion") &&
+		(strings.Contains(strings.ToLower(event.Comment.Body), "/plan") || strings.Contains(strings.ToLower(event.Comment.Body), "/implement"))
+
+	if (event.Issue.PullRequest == nil && !isPlanOrImplementComment) || event.Action != "created" {
 		if s.config.Debug {
-			slog.Debug("handleIssueCommentWebhook: ignoring event", "action", event.Action, "is_pr", event.Issue.PullRequest != nil)
+			slog.Debug("handleIssueCommentWebhook: ignoring event", "action", event.Action, "is_pr", event.Issue.PullRequest != nil, "is_plan_or_implement", isPlanOrImplementComment)
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "not a new PR comment"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "not a new PR comment or /plan /implement issue comment"})
 		return
 	}
 
@@ -1012,6 +1063,12 @@ func parseCommand(body string) string {
 	}
 	if strings.Contains(lower, "/fix") {
 		return "/fix"
+	}
+	if strings.Contains(lower, "/plan") {
+		return "/plan"
+	}
+	if strings.Contains(lower, "/implement") {
+		return "/implement"
 	}
 	return ""
 }
@@ -1171,7 +1228,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 
 	// Resolve the target template based on environment variables or Scion hierarchy
 	var targetTemplate string
-	if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
+	if cmd == "/review" || cmd == "/validate" || cmd == "/fix" || cmd == "/plan" || cmd == "/implement" {
 		var activeProfileEnv map[string]string
 		var defaultTemplateFromSettings string
 		if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil {
@@ -1252,6 +1309,10 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			targetTemplate = lookup("SCION_VALIDATE_TEMPLATE")
 		} else if cmd == "/fix" {
 			targetTemplate = lookup("SCION_FIX_TEMPLATE")
+		} else if cmd == "/plan" {
+			targetTemplate = lookup("SCION_PLAN_TEMPLATE")
+		} else if cmd == "/implement" {
+			targetTemplate = lookup("SCION_IMPLEMENT_TEMPLATE")
 		}
 		if targetTemplate == "" {
 			targetTemplate = defaultTemplateFromSettings
@@ -1366,7 +1427,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			// A: Fetch the head branch name from GitHub if we don't already have it
 			branch := prBranch
 			var err error
-			if branch == "" {
+			if branch == "" && command != "/plan" && command != "/implement" {
 				branch, err = s.fetchPRHeadBranch(bgCtx, proj, repoFull, prNum)
 				if err != nil {
 					slog.Error("Failed to fetch branch ref from GitHub", "repo", repoFull, "pr", prNum, "error", err)
@@ -1376,8 +1437,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 
 			taskDesc := prompt
 			labels := map[string]string{
-				"github-pr":   strconv.FormatInt(prNum, 10),
-				"github-repo": repoFull,
+				"github-pr":    strconv.FormatInt(prNum, 10),
+				"github-issue": strconv.FormatInt(prNum, 10),
+				"github-repo":  repoFull,
 			}
 			if command == "/review" {
 				taskDesc = fmt.Sprintf("Perform a complete code review for Pull Request #%d on repository %s. Inspect the changes on branch %s, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub.", prNum, repoFull, branch)
@@ -1393,9 +1455,23 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					taskDesc = fmt.Sprintf("Implement a fix for Pull Request #%d on repository %s and comment in the GitHub PR explaining the changes made for a human reviewer.", prNum, repoFull)
 				}
 				labels["github-action"] = "fix"
+			} else if command == "/plan" {
+				planText := extractTextAfterCommand(prompt, "/plan")
+				if planText == "" {
+					planText = prompt
+				}
+				taskDesc = fmt.Sprintf("You must ONLY plan the changes requested. Do NOT execute or apply any code changes. Write a detailed design and implementation plan, then post the complete plan back to the GitHub Issue #%d in repository %s using a comment. The requested item to plan is: %s", prNum, repoFull, planText)
+				labels["github-action"] = "plan"
+			} else if command == "/implement" {
+				implementText := extractTextAfterCommand(prompt, "/implement")
+				if implementText == "" {
+					implementText = prompt
+				}
+				taskDesc = fmt.Sprintf("Implement the plan referenced in GitHub Issue #%d for repository %s. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", prNum, repoFull, prNum, implementText)
+				labels["github-action"] = "implement"
 			}
 
-			if command == "/review" || command == "/validate" || command == "/fix" {
+			if command == "/review" || command == "/validate" || command == "/fix" || command == "/plan" || command == "/implement" {
 				slog.Info("Launching agent for command",
 					"command", command,
 					"project_id", proj.ID,
@@ -1404,9 +1480,14 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				)
 			}
 
+			agentName := fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().UnixNano()/1e6)
+			if command == "/plan" || command == "/implement" {
+				agentName = fmt.Sprintf("issue-%d-agent-%d", prNum, time.Now().UnixNano()/1e6)
+			}
+
 			// C: Construct a new agent creation request
 			req := CreateAgentRequest{
-				Name:      fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().UnixNano()/1e6),
+				Name:      agentName,
 				ProjectID: proj.ID,
 				Branch:    branch,
 				Task:      taskDesc,
