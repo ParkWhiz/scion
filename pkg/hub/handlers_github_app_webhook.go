@@ -1460,14 +1460,14 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				if planText == "" {
 					planText = prompt
 				}
-				taskDesc = fmt.Sprintf("You must ONLY plan the changes requested. Do NOT execute or apply any code changes. Write a detailed design and implementation plan, then post the complete plan back to the GitHub Issue #%d in repository %s using a comment. The requested item to plan is: %s", prNum, repoFull, planText)
+				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. You must ONLY plan the changes requested based on the codebase in this workspace. Do NOT execute or apply any code changes. Write a detailed design and implementation plan, then post the complete plan back to the GitHub Issue #%d in repository %s using a comment. The requested item to plan is: %s", repoFull, prNum, repoFull, planText)
 				labels["github-action"] = "plan"
 			} else if command == "/implement" {
 				implementText := extractTextAfterCommand(prompt, "/implement")
 				if implementText == "" {
 					implementText = prompt
 				}
-				taskDesc = fmt.Sprintf("Implement the plan referenced in GitHub Issue #%d for repository %s. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", prNum, repoFull, prNum, implementText)
+				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. Implement the plan referenced in GitHub Issue #%d for this repository. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", repoFull, prNum, prNum, implementText)
 				labels["github-action"] = "implement"
 			}
 
