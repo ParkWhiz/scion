@@ -1073,159 +1073,237 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		return
 	}
 
+	// Try to resolve the head branch first from any available project
+	var prBranch string
 	for _, p := range projects {
-		if s.config.Debug {
-			slog.Debug("processComment: matched project", "id", p.ID, "name", p.Name, "git_remote", p.GitRemote)
-		}
-		slog.Info("Matched comment mention to Scion Project",
-			"project_id", p.ID,
-			"project_name", p.Name,
-			"git_remote", p.GitRemote,
-		)
-
-		// 1. Look for an active (running) agent labeled with this PR
-		activeAgent, err := s.findActiveAgentForPR(ctx, p.ID, prNumber, repoFullName)
-		if err != nil {
-			slog.Error("Failed to query active agents for PR", "project", p.ID, "pr", prNumber, "error", err)
-			continue
-		}
-
-		if activeAgent != nil {
-			// --- PATH A: Route to existing active agent ---
-			slog.Info("Routing GitHub mention to active agent", "agent_id", activeAgent.ID, "pr", prNumber)
-
-			msgText := body
-			if cmd == "/review" {
-				msgText = "Command: /review. Please perform a code review on the changes in this pull request and submit your comments."
-			} else if cmd == "/validate" {
-				msgText = "Command: /validate. Please run validation checks, execute the validation instructions, and report back on the correctness of this pull request."
+		if p.GitHubInstallationID != nil {
+			branch, err := s.fetchPRHeadBranch(ctx, p, repoFullName, prNumber)
+			if err == nil && branch != "" {
+				prBranch = branch
+				break
 			}
+		}
+	}
 
-			msg := &messages.StructuredMessage{
-				Version:     messages.Version,
-				Timestamp:   time.Now().UTC().Format(time.RFC3339),
-				Sender:      "user:github-" + senderLogin,
-				Recipient:   "agent:" + activeAgent.Slug,
-				RecipientID: activeAgent.ID,
-				Msg:         msgText,
-				Type:        messages.TypeInstruction,
-			}
+	// Use our prioritisation helper to select the single best project
+	p := s.resolveBestProjectForPR(ctx, projects, prBranch)
 
-			// Publish to the message broker proxy
-			if s.messageBrokerProxy != nil {
-				if err := s.messageBrokerProxy.PublishMessage(ctx, p.ID, msg); err != nil {
-					slog.Error("Failed to publish PR comment to agent", "agent_id", activeAgent.ID, "error", err)
-				}
-			} else {
-				slog.Info("Message broker proxy not initialized, falling back to direct dispatch", "agent_id", activeAgent.ID)
+	if s.config.Debug {
+		slog.Debug("processComment: matched project", "id", p.ID, "name", p.Name, "git_remote", p.GitRemote)
+	}
+	slog.Info("Matched comment mention to Scion Project",
+		"project_id", p.ID,
+		"project_name", p.Name,
+		"git_remote", p.GitRemote,
+	)
 
-				// 1. Create and persist message
-				storeMsg := &store.Message{
-					ID:          api.NewUUID(),
-					ProjectID:   p.ID,
-					Sender:      msg.Sender,
-					SenderID:    msg.SenderID,
-					Recipient:   msg.Recipient,
-					RecipientID: msg.RecipientID,
-					Msg:         msg.Msg,
-					Type:        msg.Type,
-					AgentID:     activeAgent.ID,
-					CreatedAt:   time.Now(),
-				}
-				if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
-					slog.Error("Failed to persist fallback message", "error", err)
-				}
+	// 1. Look for an active (running) agent labeled with this PR
+	activeAgent, err := s.findActiveAgentForPR(ctx, p.ID, prNumber, repoFullName)
+	if err != nil {
+		slog.Error("Failed to query active agents for PR", "project", p.ID, "pr", prNumber, "error", err)
+		return
+	}
 
-				// 2. Publish SSE event
-				s.events.PublishUserMessage(ctx, storeMsg)
+	if activeAgent != nil {
+		// --- PATH A: Route to existing active agent ---
+		slog.Info("Routing GitHub mention to active agent", "agent_id", activeAgent.ID, "pr", prNumber)
 
-				// 3. Dispatch to runtime broker via agent dispatcher
-				dispatcher := s.GetDispatcher()
-				if dispatcher != nil && activeAgent.RuntimeBrokerID != "" {
-					if err := dispatcher.DispatchAgentMessage(ctx, activeAgent, msgText, false, msg); err != nil {
-						slog.Error("Failed to dispatch PR comment to runtime broker", "agent_id", activeAgent.ID, "error", err)
-					} else {
-						slog.Info("Successfully dispatched PR comment directly to agent", "agent_id", activeAgent.ID)
-					}
-				} else {
-					slog.Error("Direct dispatch failed: dispatcher or runtime broker ID not available", "agent_id", activeAgent.ID)
-				}
+		msgText := body
+		if cmd == "/review" {
+			msgText = "Command: /review. Please perform a code review on the changes in this pull request and submit your comments."
+		} else if cmd == "/validate" {
+			msgText = "Command: /validate. Please run validation checks, execute the validation instructions, and report back on the correctness of this pull request."
+		}
+
+		msg := &messages.StructuredMessage{
+			Version:     messages.Version,
+			Timestamp:   time.Now().UTC().Format(time.RFC3339),
+			Sender:      "user:github-" + senderLogin,
+			Recipient:   "agent:" + activeAgent.Slug,
+			RecipientID: activeAgent.ID,
+			Msg:         msgText,
+			Type:        messages.TypeInstruction,
+		}
+
+		// Publish to the message broker proxy
+		if s.messageBrokerProxy != nil {
+			if err := s.messageBrokerProxy.PublishMessage(ctx, p.ID, msg); err != nil {
+				slog.Error("Failed to publish PR comment to agent", "agent_id", activeAgent.ID, "error", err)
 			}
 		} else {
-			// --- PATH B: Spawn a new agent fallback ---
-			slog.Info("No active agent found. Spawning dynamic fallback agent", "project", p.ID, "pr", prNumber)
+			slog.Info("Message broker proxy not initialized, falling back to direct dispatch", "agent_id", activeAgent.ID)
 
-			// Resolve branch ref in a background goroutine so we don't block the webhook response
-			go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string) {
-				bgCtx := context.Background()
+			// 1. Create and persist message
+			storeMsg := &store.Message{
+				ID:          api.NewUUID(),
+				ProjectID:   p.ID,
+				Sender:      msg.Sender,
+				SenderID:    msg.SenderID,
+				Recipient:   msg.Recipient,
+				RecipientID: msg.RecipientID,
+				Msg:         msg.Msg,
+				Type:        msg.Type,
+				AgentID:     activeAgent.ID,
+				CreatedAt:   time.Now(),
+			}
+			if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
+				slog.Error("Failed to persist fallback message", "error", err)
+			}
 
-				// A: Fetch the head branch name from GitHub
-				branch, err := s.fetchPRHeadBranch(bgCtx, proj, repoFull, prNum)
+			// 2. Publish SSE event
+			s.events.PublishUserMessage(ctx, storeMsg)
+
+			// 3. Dispatch to runtime broker via agent dispatcher
+			dispatcher := s.GetDispatcher()
+			if dispatcher != nil && activeAgent.RuntimeBrokerID != "" {
+				if err := dispatcher.DispatchAgentMessage(ctx, activeAgent, msgText, false, msg); err != nil {
+					slog.Error("Failed to dispatch PR comment to runtime broker", "agent_id", activeAgent.ID, "error", err)
+				} else {
+					slog.Info("Successfully dispatched PR comment directly to agent", "agent_id", activeAgent.ID)
+				}
+			} else {
+				slog.Error("Direct dispatch failed: dispatcher or runtime broker ID not available", "agent_id", activeAgent.ID)
+			}
+		}
+	} else {
+		// --- PATH B: Spawn a new agent fallback ---
+		slog.Info("No active agent found. Spawning dynamic fallback agent", "project", p.ID, "pr", prNumber)
+
+		// Resolve branch ref in a background goroutine so we don't block the webhook response
+		go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string) {
+			bgCtx := context.Background()
+
+			// A: Fetch the head branch name from GitHub if we don't already have it
+			branch := prBranch
+			var err error
+			if branch == "" {
+				branch, err = s.fetchPRHeadBranch(bgCtx, proj, repoFull, prNum)
 				if err != nil {
 					slog.Error("Failed to fetch branch ref from GitHub", "repo", repoFull, "pr", prNum, "error", err)
 					return
 				}
+			}
 
-				taskDesc := prompt
-				labels := map[string]string{
-					"github-pr":   strconv.FormatInt(prNum, 10),
-					"github-repo": repoFull,
-				}
-				if command == "/review" {
-					taskDesc = fmt.Sprintf("Perform a complete code review for Pull Request #%d on repository %s. Inspect the changes on branch %s, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub.", prNum, repoFull, branch)
-					labels["github-action"] = "review"
-				} else if command == "/validate" {
-					taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s and report the validation results back to GitHub.", prNum, repoFull)
-					labels["github-action"] = "validate"
-				}
+			taskDesc := prompt
+			labels := map[string]string{
+				"github-pr":   strconv.FormatInt(prNum, 10),
+				"github-repo": repoFull,
+			}
+			if command == "/review" {
+				taskDesc = fmt.Sprintf("Perform a complete code review for Pull Request #%d on repository %s. Inspect the changes on branch %s, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub.", prNum, repoFull, branch)
+				labels["github-action"] = "review"
+			} else if command == "/validate" {
+				taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s and report the validation results back to GitHub.", prNum, repoFull)
+				labels["github-action"] = "validate"
+			}
 
-				// B: Resolve template based on environment variables or Scion hierarchy
-				template := ""
-				if command == "/review" {
-					template = os.Getenv("SCION_REVIEW_TEMPLATE")
-				} else if command == "/validate" {
-					template = os.Getenv("SCION_VALIDATE_TEMPLATE")
+			// B: Resolve template based on environment variables or Scion hierarchy
+			template := ""
+			if command == "/review" {
+				template = os.Getenv("SCION_REVIEW_TEMPLATE")
+			} else if command == "/validate" {
+				template = os.Getenv("SCION_VALIDATE_TEMPLATE")
+			}
+			if template == "" {
+				if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil && settings.DefaultTemplate != "" {
+					template = settings.DefaultTemplate
 				}
-				if template == "" {
-					if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil && settings.DefaultTemplate != "" {
-						template = settings.DefaultTemplate
-					}
+			}
+			if template == "" {
+				template = "default"
+			}
+
+			// C: Construct a new agent creation request
+			req := CreateAgentRequest{
+				Name:      fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().UnixNano()/1e6),
+				ProjectID: proj.ID,
+				Branch:    branch,
+				Task:      taskDesc,
+				Labels:    labels,
+				Template:  template,
+			}
+
+			// C: Provision and start the agent
+			slog.Info("Starting dynamic agent dispatch", "name", req.Name, "branch", req.Branch)
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
+
+			createdBy := "system:github-webhook"
+			creatorName := "GitHub Webhook"
+			notifySubscriberType := store.SubscriberTypeUser
+			notifySubscriberID := ""
+			ancestry := []string{"system:github-webhook"}
+
+			s.createAgentInProject(w, r, req, proj.ID, createdBy, creatorName, ancestry, notifySubscriberType, notifySubscriberID)
+
+			if w.Code >= 400 {
+				slog.Error("Failed to spawn dynamic agent from webhook", "project_id", proj.ID, "status", w.Code, "body", w.Body.String())
+			} else {
+				slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
+			}
+		}(p, prNumber, repoFullName, senderLogin, body, cmd)
+	}
+}
+
+// resolveBestProjectForPR implements a multi-tier prioritisation strategy to select the single best project for a PR comment webhook.
+func (s *Server) resolveBestProjectForPR(ctx context.Context, projects []store.Project, prBranch string) store.Project {
+	if len(projects) == 0 {
+		return store.Project{}
+	}
+
+	// Priority 1: Branch Match (Tier 1)
+	if prBranch != "" {
+		var branchMatchCandidates []store.Project
+		for _, p := range projects {
+			// Query agents for this project
+			agents, err := s.store.ListAgents(ctx, store.AgentFilter{ProjectID: p.ID}, store.ListOptions{Limit: 1000})
+			if err != nil {
+				slog.Error("resolveBestProjectForPR: failed to list agents for project", "project_id", p.ID, "error", err)
+				continue
+			}
+			for _, agent := range agents.Items {
+				if agent.AppliedConfig != nil && agent.AppliedConfig.Branch == prBranch {
+					branchMatchCandidates = append(branchMatchCandidates, p)
+					break
 				}
-				if template == "" {
-					template = "default"
-				}
-
-				// C: Construct a new agent creation request
-				req := CreateAgentRequest{
-					Name:      fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().UnixNano()/1e6),
-					ProjectID: proj.ID,
-					Branch:    branch,
-					Task:      taskDesc,
-					Labels:    labels,
-					Template:  template,
-				}
-
-				// C: Provision and start the agent
-				slog.Info("Starting dynamic agent dispatch", "name", req.Name, "branch", req.Branch)
-				w := httptest.NewRecorder()
-				r := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
-
-				createdBy := "system:github-webhook"
-				creatorName := "GitHub Webhook"
-				notifySubscriberType := store.SubscriberTypeUser
-				notifySubscriberID := ""
-				ancestry := []string{"system:github-webhook"}
-
-				s.createAgentInProject(w, r, req, proj.ID, createdBy, creatorName, ancestry, notifySubscriberType, notifySubscriberID)
-
-				if w.Code >= 400 {
-					slog.Error("Failed to spawn dynamic agent from webhook", "project_id", proj.ID, "status", w.Code, "body", w.Body.String())
-				} else {
-					slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
-				}
-			}(p, prNumber, repoFullName, senderLogin, body, cmd)
+			}
+		}
+		if len(branchMatchCandidates) > 0 {
+			if s.config.Debug {
+				slog.Debug("resolveBestProjectForPR: found branch match candidates", "branch", prBranch, "count", len(branchMatchCandidates))
+			}
+			// Prefer public + isolated within branch match candidates if there are multiple, otherwise fall back to the first.
+			best := s.selectByPublicAndIsolated(branchMatchCandidates)
+			if best != nil {
+				return *best
+			}
+			return branchMatchCandidates[0]
 		}
 	}
+
+	// Priority 2: Public & Isolated Workspaces (Tier 2)
+	best := s.selectByPublicAndIsolated(projects)
+	if best != nil {
+		if s.config.Debug {
+			slog.Debug("resolveBestProjectForPR: selected project by public and isolated workspace", "project_id", best.ID, "name", best.Name)
+		}
+		return *best
+	}
+
+	// Priority 3: Fallback (first candidate)
+	if s.config.Debug {
+		slog.Debug("resolveBestProjectForPR: fallback to first matching project", "project_id", projects[0].ID, "name", projects[0].Name)
+	}
+	return projects[0]
+}
+
+func (s *Server) selectByPublicAndIsolated(projects []store.Project) *store.Project {
+	for _, p := range projects {
+		if p.Visibility == store.VisibilityPublic && !p.IsSharedWorkspace() {
+			return &p
+		}
+	}
+	return nil
 }
 
 // findActiveAgentForPR queries the store for running agents matching the PR number and repo labels.

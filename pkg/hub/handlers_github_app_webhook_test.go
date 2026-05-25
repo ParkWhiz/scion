@@ -2071,3 +2071,116 @@ func generateTestWebhookKey(t *testing.T) []byte {
 	})
 	return pemData
 }
+
+func TestResolveBestProject_BranchMatch(t *testing.T) {
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	pA := &store.Project{
+		ID:        "project-a",
+		Name:      "Project A",
+		Slug:      "project-a",
+		GitRemote: "https://github.com/acme/widgets.git",
+		Created:   time.Now(),
+		Updated:   time.Now(),
+	}
+	pB := &store.Project{
+		ID:        "project-b",
+		Name:      "Project B",
+		Slug:      "project-b",
+		GitRemote: "https://github.com/acme/widgets.git",
+		Created:   time.Now(),
+		Updated:   time.Now(),
+	}
+
+	if err := s.CreateProject(ctx, pA); err != nil {
+		t.Fatalf("failed to create project A: %v", err)
+	}
+	if err := s.CreateProject(ctx, pB); err != nil {
+		t.Fatalf("failed to create project B: %v", err)
+	}
+
+	// Create an agent under pB with AppliedConfig.Branch matching target branch
+	agent := &store.Agent{
+		ID:        "agent-b",
+		Name:      "Agent B",
+		Slug:      "agent-b",
+		ProjectID: pB.ID,
+		AppliedConfig: &store.AgentAppliedConfig{
+			Branch: "feature-xyz",
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateAgent(ctx, agent); err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	projects := []store.Project{*pA, *pB}
+	best := srv.resolveBestProjectForPR(ctx, projects, "feature-xyz")
+
+	if best.ID != pB.ID {
+		t.Errorf("expected best project to be %s, got %s", pB.ID, best.ID)
+	}
+}
+
+func TestResolveBestProject_PublicIsolatedFallback(t *testing.T) {
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	// pA is private
+	pA := &store.Project{
+		ID:         "project-a",
+		Name:       "Project A",
+		Slug:       "project-a",
+		GitRemote:  "https://github.com/acme/widgets.git",
+		Visibility: "private",
+		Created:    time.Now(),
+		Updated:    time.Now(),
+	}
+
+	// pB is public and has isolated workspaces enabled (!IsSharedWorkspace() i.e. not shared)
+	pB := &store.Project{
+		ID:         "project-b",
+		Name:       "Project B",
+		Slug:       "project-b",
+		GitRemote:  "https://github.com/acme/widgets.git",
+		Visibility: store.VisibilityPublic,
+		Labels: map[string]string{
+			store.LabelWorkspaceMode: store.WorkspaceModePerAgent,
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+
+	// pC is public but has a shared workspace (IsSharedWorkspace() is true)
+	pC := &store.Project{
+		ID:         "project-c",
+		Name:       "Project C",
+		Slug:       "project-c",
+		GitRemote:  "https://github.com/acme/widgets.git",
+		Visibility: store.VisibilityPublic,
+		Labels: map[string]string{
+			store.LabelWorkspaceMode: store.WorkspaceModeShared,
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+
+	if err := s.CreateProject(ctx, pA); err != nil {
+		t.Fatalf("failed to create project A: %v", err)
+	}
+	if err := s.CreateProject(ctx, pB); err != nil {
+		t.Fatalf("failed to create project B: %v", err)
+	}
+	if err := s.CreateProject(ctx, pC); err != nil {
+		t.Fatalf("failed to create project C: %v", err)
+	}
+
+	projects := []store.Project{*pA, *pC, *pB}
+	best := srv.resolveBestProjectForPR(ctx, projects, "feature-xyz")
+
+	if best.ID != pB.ID {
+		t.Errorf("expected best project to be %s (public + isolated), got %s", pB.ID, best.ID)
+	}
+}
