@@ -2629,8 +2629,9 @@ func TestHandleGitHubWebhook_FixAndSpawnBypass(t *testing.T) {
 	// Verify the active agent received the exact fix instructions
 	select {
 	case msg := <-msgCh:
-		if msg.Msg != "resolve the crash in main.go" {
-			t.Errorf("expected msg to be 'resolve the crash in main.go', got %q", msg.Msg)
+		expectedMsg := "resolve the crash in main.go Please also comment in the GitHub PR explaining the changes made for a human reviewer."
+		if msg.Msg != expectedMsg {
+			t.Errorf("expected msg to be %q, got %q", expectedMsg, msg.Msg)
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("timed out waiting for message routing on active agent /fix")

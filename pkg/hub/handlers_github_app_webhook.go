@@ -1233,9 +1233,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		if cmd == "/fix" {
 			fixText := extractTextAfterCommand(body, "/fix")
 			if fixText != "" {
-				msgText = fixText
+				msgText = fixText + " Please also comment in the GitHub PR explaining the changes made for a human reviewer."
 			} else {
-				msgText = "Please implement a fix as requested."
+				msgText = "Please implement a fix as requested and comment in the GitHub PR explaining the changes made for a human reviewer."
 			}
 			slog.Info("Routing /fix command to active agent in project/grove",
 				"command", cmd,
@@ -1329,9 +1329,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			} else if command == "/fix" {
 				fixText := extractTextAfterCommand(prompt, "/fix")
 				if fixText != "" {
-					taskDesc = fmt.Sprintf("Implement the following fix for Pull Request #%d on repository %s: %s", prNum, repoFull, fixText)
+					taskDesc = fmt.Sprintf("Implement the following fix for Pull Request #%d on repository %s: %s Please also comment in the GitHub PR explaining the changes made for a human reviewer.", prNum, repoFull, fixText)
 				} else {
-					taskDesc = fmt.Sprintf("Implement a fix for Pull Request #%d on repository %s.", prNum, repoFull)
+					taskDesc = fmt.Sprintf("Implement a fix for Pull Request #%d on repository %s and comment in the GitHub PR explaining the changes made for a human reviewer.", prNum, repoFull)
 				}
 				labels["github-action"] = "fix"
 			}
