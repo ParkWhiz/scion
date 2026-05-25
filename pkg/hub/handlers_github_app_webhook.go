@@ -1006,6 +1006,9 @@ func parseCommand(body string) string {
 	if strings.Contains(lower, "/review") {
 		return "/review"
 	}
+	if strings.Contains(lower, "/validate") {
+		return "/validate"
+	}
 	return ""
 }
 
@@ -1093,6 +1096,8 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			msgText := body
 			if cmd == "/review" {
 				msgText = "Command: /review. Please perform a code review on the changes in this pull request and submit your comments."
+			} else if cmd == "/validate" {
+				msgText = "Command: /validate. Please run validation checks, execute the validation instructions, and report back on the correctness of this pull request."
 			}
 
 			msg := &messages.StructuredMessage{
@@ -1161,8 +1166,16 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				}
 
 				taskDesc := prompt
+				labels := map[string]string{
+					"github-pr":   strconv.FormatInt(prNum, 10),
+					"github-repo": repoFull,
+				}
 				if command == "/review" {
 					taskDesc = fmt.Sprintf("Perform a complete code review for Pull Request #%d on repository %s. Inspect the changes on branch %s, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub.", prNum, repoFull, branch)
+					labels["github-action"] = "review"
+				} else if command == "/validate" {
+					taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s. Check out branch %s, execute the validation instructions, and report the validation results back to GitHub.", prNum, repoFull, branch)
+					labels["github-action"] = "validate"
 				}
 
 				// B: Construct a new agent creation request
@@ -1171,10 +1184,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					ProjectID: proj.ID,
 					Branch:    branch,
 					Task:      taskDesc,
-					Labels: map[string]string{
-						"github-pr":   strconv.FormatInt(prNum, 10),
-						"github-repo": repoFull,
-					},
+					Labels:    labels,
 				}
 
 				// C: Provision and start the agent
