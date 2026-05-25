@@ -1081,8 +1081,8 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				if s.config.Debug {
 					slog.Debug("processComment: posting unmatched project comment", "owner", owner, "repo", repo)
 				}
-				if err := client.PostIssueComment(ctx, installationID, owner, repo, prNumber, errMsg); err != nil {
-					slog.Error("Failed to post unmatched project comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err)
+				if err := s.postPRCommentWithFallback(ctx, client, installationID, owner, repo, prNumber, errMsg); err != nil {
+					slog.Error("Failed to post unmatched project comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err.Error())
 				} else {
 					slog.Info("Posted unmatched project comment to GitHub", "repo", repoFullName, "pr", prNumber)
 				}
@@ -1143,14 +1143,14 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					if len(parts) == 2 {
 						owner, repo := parts[0], parts[1]
 						guidanceMsg := fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the branch `%s`), or\n2. A **public project with isolated agents** available for this repository.", cmd, prBranch)
-						if err := client.PostIssueComment(ctx, installationID, owner, repo, prNumber, guidanceMsg); err != nil {
-							slog.Error("Failed to post project fallback guidance comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err)
+						if err := s.postPRCommentWithFallback(ctx, client, installationID, owner, repo, prNumber, guidanceMsg); err != nil {
+							slog.Error("Failed to post project fallback guidance comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err.Error())
 						} else {
 							slog.Info("Posted project fallback guidance comment to GitHub", "repo", repoFullName, "pr", prNumber)
 						}
 					}
 				} else {
-					slog.Error("Failed to get GitHub App client to post guidance comment", "error", err)
+					slog.Error("Failed to get GitHub App client to post guidance comment", "error", err.Error())
 				}
 			}
 			return
@@ -1569,4 +1569,76 @@ func (s *Server) findProjectsForRepository(ctx context.Context, repoFullName str
 		}
 	}
 	return matched, nil
+}
+
+// postPRCommentWithFallback attempts to post a PR comment using the client's PostIssueComment (Issues: write permission).
+// If that fails (e.g. because Issues permission is not granted), it falls back to posting a top-level Pull Request Review
+// of type COMMENT (PullRequests: write permission, which is always granted to Scion).
+func (s *Server) postPRCommentWithFallback(ctx context.Context, client *githubapp.Client, installationID int64, owner, repo string, prNumber int64, body string) error {
+	// 1. Try standard Issue Comment
+	err := client.PostIssueComment(ctx, installationID, owner, repo, prNumber, body)
+	if err == nil {
+		return nil
+	}
+
+	slog.Info("PostIssueComment failed, attempting fallback to PR review comment",
+		"owner", owner,
+		"repo", repo,
+		"pr", prNumber,
+		"error", err.Error(),
+	)
+
+	// 2. Mint installation token with PullRequests write permission
+	token, mintErr := client.MintInstallationToken(ctx, installationID, []string{repo}, githubapp.TokenPermissions{PullRequests: "write"})
+	if mintErr != nil {
+		return fmt.Errorf("PostIssueComment failed (%s) and fallback token mint failed: %w", err.Error(), mintErr)
+	}
+
+	// 3. Resolve API base URL
+	s.mu.RLock()
+	apiBaseURL := s.config.GitHubAppConfig.APIBaseURL
+	s.mu.RUnlock()
+	if apiBaseURL == "" {
+		apiBaseURL = "https://api.github.com"
+	}
+	apiBaseURL = strings.TrimRight(apiBaseURL, "/")
+
+	// 4. Construct PR Review request
+	reqBody := map[string]string{
+		"body":  body,
+		"event": "COMMENT",
+	}
+	bodyBytes, marshalErr := json.Marshal(reqBody)
+	if marshalErr != nil {
+		return marshalErr
+	}
+
+	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/reviews", apiBaseURL, owner, repo, prNumber)
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(bodyBytes)))
+	if reqErr != nil {
+		return reqErr
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token.Token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	resp, respErr := httpClient.Do(req)
+	if respErr != nil {
+		return fmt.Errorf("PostIssueComment failed (%s) and fallback HTTP request failed: %w", err.Error(), respErr)
+	}
+	defer resp.Body.Close()
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("failed to read fallback response: %w", readErr)
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("PostIssueComment failed (%s) and fallback post PR review comment failed (status %d): %s", err.Error(), resp.StatusCode, string(respBody))
+	}
+
+	return nil
 }

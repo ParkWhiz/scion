@@ -2899,3 +2899,165 @@ func TestHandleGitHubWebhook_NoAppropriateProjectCommentBack(t *testing.T) {
 		t.Errorf("expected guidance comment containing command info and branch name, got %q", finalComment)
 	}
 }
+
+func TestHandleGitHubWebhook_FallbackToPRReviewComment(t *testing.T) {
+	var commentBody string
+	var commentMutex sync.Mutex
+	var issuesCalled bool
+	var reviewsCalled bool
+
+	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations/123/access_tokens" {
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"token":      "ghs_access_token_abc",
+				"expires_at": expiresAt,
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/pulls/101" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"number": 101,
+				"head": map[string]interface{}{
+					"ref": "my-cool-feature-branch",
+				},
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/issues/101/comments" {
+			// Fail standard issue comments (representing missing Issues write permission)
+			issuesCalled = true
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"message": "Resource not accessible by integration",
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/pulls/101/reviews" {
+			var reqData map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			commentMutex.Lock()
+			reviewsCalled = true
+			commentBody = reqData["body"]
+			commentMutex.Unlock()
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": 999,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(123)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-inappropriate-1",
+		Slug:   "broker-inappropriate-1",
+		Name:   "Broker Inappropriate 1",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	// Create a private project with no active agents matching the branch (so it's inappropriate)
+	project := &store.Project{
+		ID:                     "proj-inappropriate-1",
+		Name:                   "Proj Inappropriate 1",
+		Slug:                   "proj-inappropriate-1",
+		GitRemote:              "https://github.com/acme/widgets.git",
+		Visibility:             "private",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	payload := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   111,
+			"body": "Hey @scion /review please!",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder123",
+		},
+		"installation": map[string]interface{}{
+			"id": 123,
+		},
+	}
+
+	payloadBytes := mustJSON(t, payload)
+	sig := signWebhookPayload(payloadBytes, "test-webhook-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if !issuesCalled {
+		t.Errorf("expected standard issues comment endpoint to be attempted")
+	}
+
+	if !reviewsCalled {
+		t.Errorf("expected fallback pulls reviews endpoint to be called when issues comment fails")
+	}
+
+	var finalComment string
+	commentMutex.Lock()
+	finalComment = commentBody
+	commentMutex.Unlock()
+
+	if !strings.Contains(finalComment, "No appropriate Scion project/grove could be found") || !strings.Contains(finalComment, "my-cool-feature-branch") {
+		t.Errorf("expected fallback review comment containing command info and branch name, got %q", finalComment)
+	}
+}
