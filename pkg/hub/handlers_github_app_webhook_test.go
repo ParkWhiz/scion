@@ -1138,6 +1138,15 @@ func TestHandleGitHubWebhook_StrategyD_Fallback(t *testing.T) {
 		t.Fatalf("failed to create broker: %v", err)
 	}
 
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_default", Slug: "default", Name: "Default Template",
+		Harness: "gemini", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: time.Now(), Updated: time.Now(),
+	}); err != nil {
+		t.Fatalf("failed to create default template: %v", err)
+	}
+
 	// Create a mock installation first to satisfy the project's foreign key constraint
 	installation := &store.GitHubInstallation{
 		InstallationID: instID,
@@ -1376,6 +1385,15 @@ func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_default", Slug: "default", Name: "Default Template",
+		Harness: "gemini", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: time.Now(), Updated: time.Now(),
+	}); err != nil {
+		t.Fatalf("failed to create default template: %v", err)
 	}
 
 	installation := &store.GitHubInstallation{
@@ -1703,6 +1721,15 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 		t.Fatalf("failed to create broker: %v", err)
 	}
 
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_default", Slug: "default", Name: "Default Template",
+		Harness: "gemini", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: time.Now(), Updated: time.Now(),
+	}); err != nil {
+		t.Fatalf("failed to create default template: %v", err)
+	}
+
 	installation := &store.GitHubInstallation{
 		InstallationID: instID,
 		AccountLogin:   "acme",
@@ -1798,6 +1825,237 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 	}
 	if spawnedAgent.Labels == nil || spawnedAgent.Labels["github-action"] != "validate" {
 		t.Errorf("expected github-action label to be validate, got %v", spawnedAgent.Labels)
+	}
+}
+
+func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
+	t.Setenv("SCION_REVIEW_TEMPLATE", "my-custom-review-tpl")
+	t.Setenv("SCION_VALIDATE_TEMPLATE", "my-custom-validate-tpl")
+
+	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations/123/access_tokens" {
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"token":      "ghs_access_token_abc",
+				"expires_at": expiresAt,
+			})
+			return
+		}
+		if r.URL.Path == "/repos/acme/widgets/pulls/101" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"number": 101,
+				"head": map[string]interface{}{
+					"ref": "my-cool-feature-branch",
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	now := time.Now()
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_review1", Slug: "my-custom-review-tpl", Name: "My Custom Review Template",
+		Harness: "claude", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: now, Updated: now,
+	}); err != nil {
+		t.Fatalf("failed to create custom review template: %v", err)
+	}
+
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_validate1", Slug: "my-custom-validate-tpl", Name: "My Custom Validate Template",
+		Harness: "gemini", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: now, Updated: now,
+	}); err != nil {
+		t.Fatalf("failed to create custom validate template: %v", err)
+	}
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(123)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-tpl-1",
+		Slug:   "broker-tpl-1",
+		Name:   "Broker Tpl 1",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	project := &store.Project{
+		ID:                     "proj-tpl-1",
+		Name:                   "Proj Tpl 1",
+		Slug:                   "proj-tpl-1",
+		GitRemote:              "https://github.com/acme/widgets.git",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   brokerObj.ID,
+		BrokerName: brokerObj.Name,
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := s.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	// 1. Trigger /review
+	payloadReview := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   111,
+			"body": "Hey @scion /review please!",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder123",
+		},
+	}
+
+	payloadBytesReview := mustJSON(t, payloadReview)
+	sigReview := signWebhookPayload(payloadBytesReview, "test-webhook-secret")
+
+	reqReview := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytesReview))
+	reqReview.Header.Set("X-GitHub-Event", "issue_comment")
+	reqReview.Header.Set("X-Hub-Signature-256", sigReview)
+
+	recReview := httptest.NewRecorder()
+	srv.handleGitHubWebhook(recReview, reqReview)
+
+	if recReview.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recReview.Code, recReview.Body.String())
+	}
+
+	var spawnedReviewAgent *store.Agent
+	for i := 0; i < 20; i++ {
+		agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: project.ID, Phase: "created"}, store.ListOptions{Limit: 100})
+		if err == nil {
+			for _, item := range agents.Items {
+				if item.Labels["github-action"] == "review" {
+					spawnedReviewAgent = &item
+					break
+				}
+			}
+		}
+		if spawnedReviewAgent != nil {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	if spawnedReviewAgent == nil {
+		t.Fatal("timed out waiting for review agent to be spawned")
+	}
+
+	if spawnedReviewAgent.Template != "my-custom-review-tpl" {
+		t.Errorf("expected template to be %q, got %q", "my-custom-review-tpl", spawnedReviewAgent.Template)
+	}
+
+	// Sleep to ensure a different Unix timestamp for /validate
+	time.Sleep(1100 * time.Millisecond)
+
+	// 2. Trigger /validate
+	payloadValidate := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number": 101,
+			"pull_request": map[string]interface{}{
+				"url": "https://api.github.com/repos/acme/widgets/pulls/101",
+			},
+		},
+		"comment": map[string]interface{}{
+			"id":   112,
+			"body": "Hey @scion /validate please!",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder123",
+		},
+	}
+
+	payloadBytesValidate := mustJSON(t, payloadValidate)
+	sigValidate := signWebhookPayload(payloadBytesValidate, "test-webhook-secret")
+
+	reqValidate := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytesValidate))
+	reqValidate.Header.Set("X-GitHub-Event", "issue_comment")
+	reqValidate.Header.Set("X-Hub-Signature-256", sigValidate)
+
+	recValidate := httptest.NewRecorder()
+	srv.handleGitHubWebhook(recValidate, reqValidate)
+
+	if recValidate.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", recValidate.Code, recValidate.Body.String())
+	}
+
+	var spawnedValidateAgent *store.Agent
+	for i := 0; i < 20; i++ {
+		agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: project.ID, Phase: "created"}, store.ListOptions{Limit: 100})
+		if err == nil {
+			for _, item := range agents.Items {
+				if item.Labels["github-action"] == "validate" {
+					spawnedValidateAgent = &item
+					break
+				}
+			}
+		}
+		if spawnedValidateAgent != nil {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	if spawnedValidateAgent == nil {
+		t.Fatal("timed out waiting for validate agent to be spawned")
+	}
+
+	if spawnedValidateAgent.Template != "my-custom-validate-tpl" {
+		t.Errorf("expected template to be %q, got %q", "my-custom-validate-tpl", spawnedValidateAgent.Template)
 	}
 }
 

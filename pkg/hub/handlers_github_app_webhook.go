@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -1174,17 +1175,34 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					taskDesc = fmt.Sprintf("Perform a complete code review for Pull Request #%d on repository %s. Inspect the changes on branch %s, identify bugs, style issues, or architectural improvements, and post review comments back to GitHub.", prNum, repoFull, branch)
 					labels["github-action"] = "review"
 				} else if command == "/validate" {
-					taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s and report the validation results back to GitHub.", prNum, repoFull, branch)
+					taskDesc = fmt.Sprintf("Validate the changes for Pull Request #%d on repository %s and report the validation results back to GitHub.", prNum, repoFull)
 					labels["github-action"] = "validate"
 				}
 
-				// B: Construct a new agent creation request
+				// B: Resolve template based on environment variables or Scion hierarchy
+				template := ""
+				if command == "/review" {
+					template = os.Getenv("SCION_REVIEW_TEMPLATE")
+				} else if command == "/validate" {
+					template = os.Getenv("SCION_VALIDATE_TEMPLATE")
+				}
+				if template == "" {
+					if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil && settings.DefaultTemplate != "" {
+						template = settings.DefaultTemplate
+					}
+				}
+				if template == "" {
+					template = "default"
+				}
+
+				// C: Construct a new agent creation request
 				req := CreateAgentRequest{
-					Name:      fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().Unix()),
+					Name:      fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().UnixNano()/1e6),
 					ProjectID: proj.ID,
 					Branch:    branch,
 					Task:      taskDesc,
 					Labels:    labels,
+					Template:  template,
 				}
 
 				// C: Provision and start the agent
