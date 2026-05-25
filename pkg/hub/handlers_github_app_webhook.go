@@ -71,7 +71,9 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	eventType := r.Header.Get("X-GitHub-Event")
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 
-	fmt.Printf("[DEBUG] GitHub webhook received. Event: %s, Delivery ID: %s\n", eventType, deliveryID)
+	if s.config.Debug {
+		slog.Debug("GitHub webhook received", "event", eventType, "delivery_id", deliveryID)
+	}
 
 	slog.Info("GitHub webhook received",
 		"event", eventType,
@@ -923,18 +925,24 @@ type webhookPullRequestReviewEvent struct {
 func (s *Server) handleIssueCommentWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
 	var event webhookIssueCommentEvent
 	if err := json.Unmarshal(body, &event); err != nil {
-		fmt.Printf("[DEBUG] handleIssueCommentWebhook: failed to unmarshal: %v\n", err)
+		if s.config.Debug {
+			slog.Debug("handleIssueCommentWebhook: failed to unmarshal", "error", err)
+		}
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
 		return
 	}
 
 	if event.Issue.PullRequest == nil || event.Action != "created" {
-		fmt.Printf("[DEBUG] handleIssueCommentWebhook: ignoring event (action: %s, isPR: %t)\n", event.Action, event.Issue.PullRequest != nil)
+		if s.config.Debug {
+			slog.Debug("handleIssueCommentWebhook: ignoring event", "action", event.Action, "is_pr", event.Issue.PullRequest != nil)
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "not a new PR comment"})
 		return
 	}
 
-	fmt.Printf("[DEBUG] handleIssueCommentWebhook: processing comment on %s PR #%d\n", event.Repository.FullName, event.Issue.Number)
+	if s.config.Debug {
+		slog.Debug("handleIssueCommentWebhook: processing comment", "repo", event.Repository.FullName, "pr", event.Issue.Number)
+	}
 	s.processComment(r.Context(), "issue_comment", event.Repository.FullName, event.Issue.Number, event.Comment.ID, event.Comment.Body, event.Sender.Login, event.Installation.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -943,18 +951,24 @@ func (s *Server) handleIssueCommentWebhook(w http.ResponseWriter, r *http.Reques
 func (s *Server) handlePullRequestReviewCommentWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
 	var event webhookPullRequestReviewCommentEvent
 	if err := json.Unmarshal(body, &event); err != nil {
-		fmt.Printf("[DEBUG] handlePullRequestReviewCommentWebhook: failed to unmarshal: %v\n", err)
+		if s.config.Debug {
+			slog.Debug("handlePullRequestReviewCommentWebhook: failed to unmarshal", "error", err)
+		}
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
 		return
 	}
 
 	if event.Action != "created" {
-		fmt.Printf("[DEBUG] handlePullRequestReviewCommentWebhook: ignoring event (action: %s)\n", event.Action)
+		if s.config.Debug {
+			slog.Debug("handlePullRequestReviewCommentWebhook: ignoring event", "action", event.Action)
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "non-created PR review comment"})
 		return
 	}
 
-	fmt.Printf("[DEBUG] handlePullRequestReviewCommentWebhook: processing comment on %s PR #%d\n", event.Repository.FullName, event.PullRequest.Number)
+	if s.config.Debug {
+		slog.Debug("handlePullRequestReviewCommentWebhook: processing comment", "repo", event.Repository.FullName, "pr", event.PullRequest.Number)
+	}
 	s.processComment(r.Context(), "pull_request_review_comment", event.Repository.FullName, event.PullRequest.Number, event.Comment.ID, event.Comment.Body, event.Sender.Login, event.Installation.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -963,18 +977,24 @@ func (s *Server) handlePullRequestReviewCommentWebhook(w http.ResponseWriter, r 
 func (s *Server) handlePullRequestReviewWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
 	var event webhookPullRequestReviewEvent
 	if err := json.Unmarshal(body, &event); err != nil {
-		fmt.Printf("[DEBUG] handlePullRequestReviewWebhook: failed to unmarshal: %v\n", err)
+		if s.config.Debug {
+			slog.Debug("handlePullRequestReviewWebhook: failed to unmarshal", "error", err)
+		}
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
 		return
 	}
 
 	if event.Action != "submitted" || event.Review.Body == "" {
-		fmt.Printf("[DEBUG] handlePullRequestReviewWebhook: ignoring event (action: %s, hasBody: %t)\n", event.Action, event.Review.Body != "")
+		if s.config.Debug {
+			slog.Debug("handlePullRequestReviewWebhook: ignoring event", "action", event.Action, "has_body", event.Review.Body != "")
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "reason": "review not submitted or empty body"})
 		return
 	}
 
-	fmt.Printf("[DEBUG] handlePullRequestReviewWebhook: processing comment on %s PR #%d\n", event.Repository.FullName, event.PullRequest.Number)
+	if s.config.Debug {
+		slog.Debug("handlePullRequestReviewWebhook: processing comment", "repo", event.Repository.FullName, "pr", event.PullRequest.Number)
+	}
 	s.processComment(r.Context(), "pull_request_review", event.Repository.FullName, event.PullRequest.Number, event.Review.ID, event.Review.Body, event.Sender.Login, event.Installation.ID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -991,12 +1011,16 @@ func parseCommand(body string) string {
 // processComment checks for mentions of "@scion" and resolves corresponding projects.
 func (s *Server) processComment(ctx context.Context, eventType, repoFullName string, prNumber, commentID int64, body string, senderLogin string, installationID int64) {
 	if !strings.Contains(strings.ToLower(body), "@scion") {
-		slog.Debug("No @scion mention in comment", "repo", repoFullName, "pr", prNumber, "comment_id", commentID)
+		if s.config.Debug {
+			slog.Debug("No @scion mention in comment", "repo", repoFullName, "pr", prNumber, "comment_id", commentID)
+		}
 		return
 	}
 
 	cmd := parseCommand(body)
-	fmt.Printf("[DEBUG] processComment: detected @scion mention in %s on repo %s. Command parsed: '%s'\n", eventType, repoFullName, cmd)
+	if s.config.Debug {
+		slog.Debug("processComment: detected @scion mention", "event_type", eventType, "repo", repoFullName, "command", cmd)
+	}
 
 	slog.Info("Detected @scion mention in comment!",
 		"event_type", eventType,
@@ -1009,13 +1033,17 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 	// Resolve project associated with repo
 	projects, err := s.findProjectsForRepository(ctx, repoFullName)
 	if err != nil {
-		fmt.Printf("[DEBUG] processComment: failed to find projects for repo %s: %v\n", repoFullName, err)
+		if s.config.Debug {
+			slog.Debug("processComment: failed to find projects for repo", "repo", repoFullName, "error", err)
+		}
 		slog.Error("Failed to find projects for repository", "repo", repoFullName, "error", err)
 		return
 	}
 
 	if len(projects) == 0 {
-		fmt.Printf("[DEBUG] processComment: no projects matched for repo %s (installationID: %d)\n", repoFullName, installationID)
+		if s.config.Debug {
+			slog.Debug("processComment: no projects matched for repo", "repo", repoFullName, "installation_id", installationID)
+		}
 		slog.Warn("No project matched with the repository", "repo", repoFullName)
 		if installationID != 0 {
 			client, err := s.getGitHubAppClient()
@@ -1027,7 +1055,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			if len(parts) == 2 {
 				owner, repo := parts[0], parts[1]
 				errMsg := "No matching project or grove was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
-				fmt.Printf("[DEBUG] processComment: posting unmatched project comment to %s/%s\n", owner, repo)
+				if s.config.Debug {
+					slog.Debug("processComment: posting unmatched project comment", "owner", owner, "repo", repo)
+				}
 				if err := client.PostIssueComment(ctx, installationID, owner, repo, prNumber, errMsg); err != nil {
 					slog.Error("Failed to post unmatched project comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err)
 				} else {
@@ -1039,7 +1069,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 	}
 
 	for _, p := range projects {
-		fmt.Printf("[DEBUG] processComment: matched project ID: %s, Name: %s, GitRemote: %s\n", p.ID, p.Name, p.GitRemote)
+		if s.config.Debug {
+			slog.Debug("processComment: matched project", "id", p.ID, "name", p.Name, "git_remote", p.GitRemote)
+		}
 		slog.Info("Matched comment mention to Scion Project",
 			"project_id", p.ID,
 			"project_name", p.Name,
