@@ -70,6 +70,7 @@ func DefaultTokenPermissions() TokenPermissions {
 		PullRequests: "write",
 		Issues:       "write",
 		Metadata:     "read",
+		Issues:       "write",
 	}
 }
 
