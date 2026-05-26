@@ -1322,9 +1322,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		}
 	}
 
-	// 1. Look for an active (running) agent labeled with this PR (unless command is /review or /validate)
+	// 1. Look for an active (running) agent labeled with this PR (unless command is /review, /validate, /plan, or /implement)
 	var activeAgent *store.Agent
-	if cmd != "/review" && cmd != "/validate" {
+	if cmd != "/review" && cmd != "/validate" && cmd != "/plan" && cmd != "/implement" {
 		var err error
 		activeAgent, err = s.findActiveAgentForPR(ctx, p.ID, prNumber, repoFullName)
 		if err != nil {
@@ -1421,7 +1421,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		slog.Info("Spawning new agent in project", "project", p.ID, "pr", prNumber, "command", cmd)
 
 		// Resolve branch ref in a background goroutine so we don't block the webhook response
-		go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string, template string) {
+		go func(proj store.Project, prNum int64, repoFull, sender string, prompt string, command string, template string, installID int64) {
 			bgCtx := context.Background()
 
 			// A: Fetch the head branch name from GitHub if we don't already have it
@@ -1512,8 +1512,24 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				slog.Error("Failed to spawn dynamic agent from webhook", "project_id", proj.ID, "status", w.Code, "body", w.Body.String())
 			} else {
 				slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
+
+				if command == "/implement" {
+					client, err := s.getGitHubAppClient()
+					if err == nil {
+						parts := strings.SplitN(repoFull, "/", 2)
+						if len(parts) == 2 {
+							owner, repo := parts[0], parts[1]
+							confirmMsg := fmt.Sprintf("🤖 Scion has successfully received your request and started implementing the plan for Issue #%d.", prNum)
+							if err := s.postPRCommentWithFallback(bgCtx, client, installID, owner, repo, prNum, confirmMsg); err != nil {
+								slog.Error("Failed to post implementation start confirmation to GitHub", "repo", repoFull, "pr", prNum, "error", err)
+							} else {
+								slog.Info("Posted implementation start confirmation to GitHub", "repo", repoFull, "pr", prNum)
+							}
+						}
+					}
+				}
 			}
-		}(p, prNumber, repoFullName, senderLogin, body, cmd, targetTemplate)
+		}(p, prNumber, repoFullName, senderLogin, body, cmd, targetTemplate, installationID)
 	}
 }
 
