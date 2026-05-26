@@ -3061,3 +3061,281 @@ func TestHandleGitHubWebhook_FallbackToPRReviewComment(t *testing.T) {
 		t.Errorf("expected fallback review comment containing command info and branch name, got %q", finalComment)
 	}
 }
+
+func TestHandleGitHubWebhook_PlanCommand(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(124)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-plan-1",
+		Slug:   "broker-plan-1",
+		Name:   "Broker Plan 1",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/plan-widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	project := &store.Project{
+		ID:                     "proj-plan-1",
+		Name:                   "Proj Plan 1",
+		Slug:                   "proj-plan-1",
+		GitRemote:              "https://github.com/acme/plan-widgets.git",
+		Visibility:             "public",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_default_plan", Slug: "default", Name: "Default Template",
+		Harness: "gemini", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: time.Now(), Updated: time.Now(),
+	}); err != nil {
+		t.Fatalf("failed to create default template: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   brokerObj.ID,
+		BrokerName: brokerObj.Name,
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := s.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	// Payload 1: Issues event ("opened")
+	payload := map[string]interface{}{
+		"action": "opened",
+		"issue": map[string]interface{}{
+			"number":   201,
+			"html_url": "https://github.com/acme/plan-widgets/issues/201",
+			"body":     "Hello @scion /plan refactoring database layers",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/plan-widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "planner1",
+		},
+		"installation": map[string]interface{}{
+			"id": 124,
+		},
+	}
+
+	payloadBytes := mustJSON(t, payload)
+	sig := signWebhookPayload(payloadBytes, "test-webhook-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issues")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Wait up to 2 seconds for background agent spawning goroutine
+	var spawnedAgent *store.Agent
+	for i := 0; i < 20; i++ {
+		agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: "proj-plan-1"}, store.ListOptions{})
+		if err == nil && len(agents.Items) > 0 {
+			spawnedAgent = &agents.Items[0]
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if spawnedAgent == nil {
+		t.Fatalf("expected background goroutine to spawn agent, but none was found")
+	}
+
+	if !strings.HasPrefix(spawnedAgent.Name, "issue-201-agent-") {
+		t.Errorf("expected agent name starting with 'issue-201-agent-', got %q", spawnedAgent.Name)
+	}
+
+	if spawnedAgent.Labels["github-action"] != "plan" {
+		t.Errorf("expected label github-action='plan', got %q", spawnedAgent.Labels["github-action"])
+	}
+
+	if !strings.Contains(spawnedAgent.AppliedConfig.Task, "ONLY plan the changes") || !strings.Contains(spawnedAgent.AppliedConfig.Task, "refactoring database layers") {
+		t.Errorf("expected planning specific task description, got %q", spawnedAgent.AppliedConfig.Task)
+	}
+}
+
+func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ghServer.Close()
+
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(125)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
+	srv.mu.Unlock()
+
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-implement-1",
+		Slug:   "broker-implement-1",
+		Name:   "Broker Implement 1",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/implement-widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	project := &store.Project{
+		ID:                     "proj-implement-1",
+		Name:                   "Proj Implement 1",
+		Slug:                   "proj-implement-1",
+		GitRemote:              "https://github.com/acme/implement-widgets.git",
+		Visibility:             "public",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_default_implement", Slug: "default", Name: "Default Template",
+		Harness: "gemini", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: time.Now(), Updated: time.Now(),
+	}); err != nil {
+		t.Fatalf("failed to create default template: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   brokerObj.ID,
+		BrokerName: brokerObj.Name,
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := s.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	// Payload 2: Issue comment on a non-PR issue containing @scion and /implement
+	payload := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number":       301,
+			"html_url":     "https://github.com/acme/implement-widgets/issues/301",
+			"pull_request": nil, // Non-PR issue comment!
+		},
+		"comment": map[string]interface{}{
+			"id":   555,
+			"body": "Hey @scion /implement the design doc from #201",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/implement-widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "coder456",
+		},
+		"installation": map[string]interface{}{
+			"id": 125,
+		},
+	}
+
+	payloadBytes := mustJSON(t, payload)
+	sig := signWebhookPayload(payloadBytes, "test-webhook-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Wait up to 2 seconds for background agent spawning goroutine
+	var spawnedAgent *store.Agent
+	for i := 0; i < 20; i++ {
+		agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: "proj-implement-1"}, store.ListOptions{})
+		if err == nil && len(agents.Items) > 0 {
+			spawnedAgent = &agents.Items[0]
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if spawnedAgent == nil {
+		t.Fatalf("expected background goroutine to spawn agent, but none was found")
+	}
+
+	if !strings.HasPrefix(spawnedAgent.Name, "issue-301-agent-") {
+		t.Errorf("expected agent name starting with 'issue-301-agent-', got %q", spawnedAgent.Name)
+	}
+
+	if spawnedAgent.Labels["github-action"] != "implement" {
+		t.Errorf("expected label github-action='implement', got %q", spawnedAgent.Labels["github-action"])
+	}
+
+	if !strings.Contains(spawnedAgent.AppliedConfig.Task, "Implement the plan referenced in") || !strings.Contains(spawnedAgent.AppliedConfig.Task, "the design doc from #201") {
+		t.Errorf("expected implementation specific task description, got %q", spawnedAgent.AppliedConfig.Task)
+	}
+}
