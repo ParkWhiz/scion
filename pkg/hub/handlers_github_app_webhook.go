@@ -1460,14 +1460,14 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				if planText == "" {
 					planText = prompt
 				}
-				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. You must ONLY plan the changes requested based on the codebase in this workspace. Do NOT execute or apply any code changes. Write a detailed design and implementation plan, then post the complete plan back to the GitHub Issue #%d in repository %s using a comment. The requested item to plan is: %s", repoFull, prNum, repoFull, planText)
+				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. You must ONLY plan the changes requested based on the codebase in this workspace. Do NOT execute or apply any code changes. To allow revising or refining any existing plans based on user feedback, use the GitHub CLI 'gh' or the GitHub API to fetch and inspect the full description of Issue #%d as well as all of its comments. If an existing plan is already present in the comments, incorporate any feedback or requests from the comments and write a revised, complete design and implementation plan, then post it back to GitHub Issue #%d using a comment. The requested planning instruction is: %s", repoFull, prNum, prNum, planText)
 				labels["github-action"] = "plan"
 			} else if command == "/implement" {
 				implementText := extractTextAfterCommand(prompt, "/implement")
 				if implementText == "" {
 					implementText = prompt
 				}
-				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. Implement the plan referenced in GitHub Issue #%d for this repository. To locate the implementation plan, use the GitHub CLI 'gh' or the GitHub API to fetch and inspect the full description of Issue #%d as well as all of its comments. Once you find the plan details in the comments or description, implement it in this workspace. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", repoFull, prNum, prNum, prNum, implementText)
+				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. Implement the plan referenced in GitHub Issue #%d for this repository. To locate the plan, use the GitHub CLI 'gh' or the GitHub API to fetch and inspect the full description of Issue #%d as well as all of its comments. If the plan has been updated or revised in subsequent comments, make sure to use the most recently posted (latest revised) version of the plan for execution. Once you find and parse the correct plan details, implement them in this workspace. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", repoFull, prNum, prNum, prNum, implementText)
 				labels["github-action"] = "implement"
 			}
 
