@@ -3186,8 +3186,8 @@ func TestHandleGitHubWebhook_PlanCommand(t *testing.T) {
 		t.Fatalf("expected background goroutine to spawn agent, but none was found")
 	}
 
-	if !strings.HasPrefix(spawnedAgent.Name, "issue-201-agent-") {
-		t.Errorf("expected agent name starting with 'issue-201-agent-', got %q", spawnedAgent.Name)
+	if spawnedAgent.Name != "issue-201-agent-planner" {
+		t.Errorf("expected agent name 'issue-201-agent-planner', got %q", spawnedAgent.Name)
 	}
 
 	if spawnedAgent.Labels["github-action"] != "plan" {
@@ -3327,8 +3327,8 @@ func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
 		t.Fatalf("expected background goroutine to spawn agent, but none was found")
 	}
 
-	if !strings.HasPrefix(spawnedAgent.Name, "issue-301-agent-") {
-		t.Errorf("expected agent name starting with 'issue-301-agent-', got %q", spawnedAgent.Name)
+	if spawnedAgent.Name != "issue-301-agent-implementer" {
+		t.Errorf("expected agent name 'issue-301-agent-implementer', got %q", spawnedAgent.Name)
 	}
 
 	if spawnedAgent.Labels["github-action"] != "implement" {

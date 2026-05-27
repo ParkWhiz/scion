@@ -1496,8 +1496,10 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 
 			agentName := fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().UnixNano()/1e6)
-			if command == "/plan" || command == "/implement" {
-				agentName = fmt.Sprintf("issue-%d-agent-%d", prNum, time.Now().UnixNano()/1e6)
+			if command == "/plan" {
+				agentName = fmt.Sprintf("issue-%d-agent-planner", prNum)
+			} else if command == "/implement" {
+				agentName = fmt.Sprintf("issue-%d-agent-implementer", prNum)
 			}
 
 			// C: Construct a new agent creation request
