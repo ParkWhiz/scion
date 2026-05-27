@@ -1528,6 +1528,12 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			} else {
 				slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
 
+				var agentID string
+				var createResp CreateAgentResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &createResp); err == nil && createResp.Agent != nil {
+					agentID = createResp.Agent.ID
+				}
+
 				if command == "/implement" || command == "/plan" {
 					client, err := s.getGitHubAppClient()
 					if err == nil {
@@ -1540,6 +1546,12 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 							} else {
 								confirmMsg = fmt.Sprintf("🤖 Scion has successfully received your request and started implementing the plan for Issue #%d.", prNum)
 							}
+
+							if agentID != "" && s.config.HubEndpoint != "" {
+								link := fmt.Sprintf("%s/agents/%s", strings.TrimSuffix(s.config.HubEndpoint, "/"), agentID)
+								confirmMsg += fmt.Sprintf("\n\nYou can view the agent's progress [here](%s).", link)
+							}
+
 							if err := s.postPRCommentWithFallback(bgCtx, client, installID, owner, repo, prNum, confirmMsg); err != nil {
 								slog.Error("Failed to post starting confirmation to GitHub", "command", command, "repo", repoFull, "pr", prNum, "error", err)
 							} else {
