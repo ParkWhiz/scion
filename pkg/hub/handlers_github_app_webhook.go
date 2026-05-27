@@ -1513,17 +1513,22 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			} else {
 				slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
 
-				if command == "/implement" {
+				if command == "/implement" || command == "/plan" {
 					client, err := s.getGitHubAppClient()
 					if err == nil {
 						parts := strings.SplitN(repoFull, "/", 2)
 						if len(parts) == 2 {
 							owner, repo := parts[0], parts[1]
-							confirmMsg := fmt.Sprintf("🤖 Scion has successfully received your request and started implementing the plan for Issue #%d.", prNum)
-							if err := s.postPRCommentWithFallback(bgCtx, client, installID, owner, repo, prNum, confirmMsg); err != nil {
-								slog.Error("Failed to post implementation start confirmation to GitHub", "repo", repoFull, "pr", prNum, "error", err)
+							var confirmMsg string
+							if command == "/plan" {
+								confirmMsg = fmt.Sprintf("🤖 Scion has successfully received your request and started planning the changes for Issue #%d.", prNum)
 							} else {
-								slog.Info("Posted implementation start confirmation to GitHub", "repo", repoFull, "pr", prNum)
+								confirmMsg = fmt.Sprintf("🤖 Scion has successfully received your request and started implementing the plan for Issue #%d.", prNum)
+							}
+							if err := s.postPRCommentWithFallback(bgCtx, client, installID, owner, repo, prNum, confirmMsg); err != nil {
+								slog.Error("Failed to post starting confirmation to GitHub", "command", command, "repo", repoFull, "pr", prNum, "error", err)
+							} else {
+								slog.Info("Posted starting confirmation to GitHub", "command", command, "repo", repoFull, "pr", prNum)
 							}
 						}
 					}
