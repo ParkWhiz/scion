@@ -3339,3 +3339,155 @@ func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
 		t.Errorf("expected implementation specific task description, got %q", spawnedAgent.AppliedConfig.Task)
 	}
 }
+
+func TestHandleGitHubWebhook_PlanCommand_ActiveAgent(t *testing.T) {
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	pemBytes := generateTestWebhookKey(t)
+	instID := int64(124)
+
+	srv.mu.Lock()
+	srv.config.GitHubAppConfig.AppID = 42
+	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
+	srv.mu.Unlock()
+
+	brokerObj := &store.RuntimeBroker{
+		ID:     "broker-plan-active-1",
+		Slug:   "broker-plan-active-1",
+		Name:   "Broker Plan Active 1",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	installation := &store.GitHubInstallation{
+		InstallationID: instID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/plan-widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	project := &store.Project{
+		ID:                     "proj-plan-active-1",
+		Name:                   "Proj Plan Active 1",
+		Slug:                   "proj-plan-active-1",
+		GitRemote:              "https://github.com/acme/plan-widgets.git",
+		Visibility:             "public",
+		GitHubInstallationID:   &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID,
+		Created:                time.Now(),
+		Updated:                time.Now(),
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: "tmpl_default_plan_active", Slug: "default", Name: "Default Template",
+		Harness: "gemini", Scope: "global",
+		Visibility: store.VisibilityPublic, Status: "active",
+		Created: time.Now(), Updated: time.Now(),
+	}); err != nil {
+		t.Fatalf("failed to create default template: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   brokerObj.ID,
+		BrokerName: brokerObj.Name,
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := s.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	// Pre-create an active running agent labeled with the issue
+	activeAgent := &store.Agent{
+		ID:        "agent-plan-active-1",
+		Slug:      "agent-plan-active-1",
+		Name:      "agent-plan-active-1",
+		ProjectID: project.ID,
+		Template:  "default",
+		Phase:     "running",
+		Labels: map[string]string{
+			"github-pr":    "201",
+			"github-issue": "201",
+			"github-repo":  "acme/plan-widgets",
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateAgent(ctx, activeAgent); err != nil {
+		t.Fatalf("failed to create active agent: %v", err)
+	}
+
+	// Payload: Issue comment on issue 201 containing @scion and /plan
+	payload := map[string]interface{}{
+		"action": "created",
+		"issue": map[string]interface{}{
+			"number":       201,
+			"html_url":     "https://github.com/acme/plan-widgets/issues/201",
+			"pull_request": nil,
+		},
+		"comment": map[string]interface{}{
+			"id":   666,
+			"body": "Hey @scion /plan please refine to use Postgres",
+		},
+		"repository": map[string]interface{}{
+			"full_name": "acme/plan-widgets",
+		},
+		"sender": map[string]interface{}{
+			"login": "planner1",
+		},
+		"installation": map[string]interface{}{
+			"id": 124,
+		},
+	}
+
+	payloadBytes := mustJSON(t, payload)
+	sig := signWebhookPayload(payloadBytes, "test-webhook-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", sig)
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify that a message was created and sent to the active agent instead of spawning a new agent
+	messages, err := s.ListMessages(ctx, store.MessageFilter{AgentID: activeAgent.ID}, store.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list messages: %v", err)
+	}
+
+	if len(messages.Items) == 0 {
+		t.Fatalf("expected message to be routed to active agent, but none was found")
+	}
+
+	msg := messages.Items[0]
+	if !strings.Contains(msg.Msg, "Please refine/revise the plan based on the following feedback: please refine to use Postgres") {
+		t.Errorf("expected plan revision instruction in message, got %q", msg.Msg)
+	}
+
+	// Ensure no other agent was spawned
+	agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: project.ID}, store.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list agents: %v", err)
+	}
+	if len(agents.Items) != 1 {
+		t.Errorf("expected exactly 1 agent to exist, but found %d", len(agents.Items))
+	}
+}

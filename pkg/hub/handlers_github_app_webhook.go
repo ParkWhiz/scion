@@ -1322,9 +1322,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		}
 	}
 
-	// 1. Look for an active (running) agent labeled with this PR (unless command is /review, /validate, /plan, or /implement)
+	// 1. Look for an active (running) agent labeled with this PR (unless command is /review, /validate, or /implement)
 	var activeAgent *store.Agent
-	if cmd != "/review" && cmd != "/validate" && cmd != "/plan" && cmd != "/implement" {
+	if cmd != "/review" && cmd != "/validate" && cmd != "/implement" {
 		var err error
 		activeAgent, err = s.findActiveAgentForPR(ctx, p.ID, prNumber, repoFullName)
 		if err != nil {
@@ -1332,10 +1332,11 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			return
 		}
 
-		// Only route /fix to an active agent if its template matches the targetTemplate
-		if cmd == "/fix" && activeAgent != nil {
+		// Only route /fix and /plan to an active agent if its template matches the targetTemplate
+		if (cmd == "/fix" || cmd == "/plan") && activeAgent != nil {
 			if activeAgent.Template != targetTemplate {
-				slog.Info("Active agent template mismatch for /fix command. Spawning a new agent with matching template instead.",
+				slog.Info("Active agent template mismatch for command. Spawning a new agent with matching template instead.",
+					"command", cmd,
 					"active_agent_id", activeAgent.ID,
 					"active_agent_template", activeAgent.Template,
 					"required_template", targetTemplate,
@@ -1363,6 +1364,20 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				"project_name", p.Name,
 				"agent_id", activeAgent.ID,
 				"fix_instruction", msgText,
+			)
+		} else if cmd == "/plan" {
+			planText := extractTextAfterCommand(body, "/plan")
+			if planText != "" {
+				msgText = fmt.Sprintf("Please refine/revise the plan based on the following feedback: %s", planText)
+			} else {
+				msgText = "Please refine/revise the plan based on the discussion above."
+			}
+			slog.Info("Routing /plan command to active agent in project/grove",
+				"command", cmd,
+				"project_id", p.ID,
+				"project_name", p.Name,
+				"agent_id", activeAgent.ID,
+				"plan_instruction", msgText,
 			)
 		}
 
