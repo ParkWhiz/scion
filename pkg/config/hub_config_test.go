@@ -589,12 +589,12 @@ func TestApplyEnvOverridesCommaSeparatedLists(t *testing.T) {
 	}
 }
 
-func TestLoadServerMode_Production(t *testing.T) {
+func TestLoadServerMode_Hosted(t *testing.T) {
 	dir := t.TempDir()
 	settingsPath := filepath.Join(dir, "settings.yaml")
 	err := os.WriteFile(settingsPath, []byte(`schema_version: "1"
 server:
-  mode: production
+  mode: hosted
   hub:
     port: 9810
 `), 0644)
@@ -608,8 +608,57 @@ server:
 	if !found {
 		t.Fatal("expected to find server config in settings.yaml")
 	}
+	if gc.Mode != "hosted" {
+		t.Errorf("expected mode 'hosted', got %q", gc.Mode)
+	}
+}
+
+func TestLoadServerMode_LegacyProduction(t *testing.T) {
+	// The legacy value "production" should still be parsed from config.
+	// LoadServerMode normalizes it to "hosted", but loadServerFromSettingsFile
+	// returns the raw value.
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "settings.yaml")
+	err := os.WriteFile(settingsPath, []byte(`schema_version: "1"
+server:
+  mode: production
+  hub:
+    port: 9810
+`), 0644)
+	if err != nil {
+		t.Fatalf("failed to write settings.yaml: %v", err)
+	}
+
+	gc, found := loadServerFromSettingsFile(dir)
+	if !found {
+		t.Fatal("expected to find server config in settings.yaml")
+	}
 	if gc.Mode != "production" {
-		t.Errorf("expected mode 'production', got %q", gc.Mode)
+		t.Errorf("expected raw mode 'production' (legacy), got %q", gc.Mode)
+	}
+}
+
+func TestLoadServerMode_Normalization(t *testing.T) {
+	// Verify that LoadServerMode() normalizes the legacy "production" value
+	// to "hosted" at the public API level.
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", originalHome)
+	os.Setenv("HOME", tmpDir)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	if err := os.MkdirAll(globalScionDir, 0755); err != nil {
+		t.Fatalf("failed to create global scion dir: %v", err)
+	}
+
+	settingsContent := "schema_version: \"1\"\nserver:\n  mode: production\n"
+	if err := os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(settingsContent), 0644); err != nil {
+		t.Fatalf("failed to write settings.yaml: %v", err)
+	}
+
+	mode := LoadServerMode()
+	if mode != "hosted" {
+		t.Errorf("expected normalized mode 'hosted', got %q", mode)
 	}
 }
 
