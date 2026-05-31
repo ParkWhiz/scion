@@ -2786,7 +2786,7 @@ func (s *Server) handleGroupMessage(w http.ResponseWriter, r *http.Request, anch
 				CreatedAt:     time.Now(),
 			}
 			if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
-				s.messageLog.Error("Failed to persist set message", "recipient", recipStr, "error", err)
+				s.messageLog.Error("Failed to persist group message", "recipient", recipStr, "error", err)
 			}
 			s.events.PublishUserMessage(ctx, storeMsg)
 
@@ -2879,7 +2879,7 @@ func (s *Server) handleGroupMessage(w http.ResponseWriter, r *http.Request, anch
 				CreatedAt:   time.Now(),
 			}
 			if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
-				s.messageLog.Error("Failed to persist set message", "recipient", recipStr, "error", err)
+				s.messageLog.Error("Failed to persist group message", "recipient", recipStr, "error", err)
 			}
 			s.events.PublishUserMessage(ctx, storeMsg)
 
@@ -2888,7 +2888,7 @@ func (s *Server) handleGroupMessage(w http.ResponseWriter, r *http.Request, anch
 		}
 	}
 
-	s.logMessage("set message dispatched",
+	s.logMessage("group message dispatched",
 		"project_id", projectID,
 		"group_id", groupID,
 		"total", len(recipients),
