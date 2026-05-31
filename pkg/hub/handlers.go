@@ -790,7 +790,7 @@ func (s *Server) createAgentInProject(
 		}
 	}
 
-	// Hub-native/shared-workspace project remote broker support: if the project has
+	// Hub-managed/shared-workspace project remote broker support: if the project has
 	// a managed workspace and the workspace path is set, upload it to GCS so
 	// a remote broker can download it.
 	if (project.GitRemote == "" || project.IsSharedWorkspace()) && agent.AppliedConfig != nil && agent.AppliedConfig.Workspace != "" {
@@ -4263,7 +4263,7 @@ func (s *Server) initHubManagedProject(project *store.Project) error {
 		return fmt.Errorf("failed to create .scion directory: %w", err)
 	}
 
-	// Seed default settings.yaml directly in scionDir. Hub-native projects
+	// Seed default settings.yaml directly in scionDir. Hub-managed projects
 	// bypass InitProject (which uses split storage for git repos) and keep
 	// all configuration in-place.
 	settingsPath := filepath.Join(scionDir, "settings.yaml")
@@ -4295,7 +4295,7 @@ func (s *Server) initHubManagedProject(project *store.Project) error {
 }
 
 // cloneSharedWorkspaceProject performs the host-side git clone for a shared-workspace
-// git project. It clones the repository into the hub-native workspace path and
+// git project. It clones the repository into the hub-managed workspace path and
 // seeds the .scion project structure on top. If the clone fails, the workspace
 // directory is cleaned up and an error is returned.
 func (s *Server) cloneSharedWorkspaceProject(ctx context.Context, project *store.Project) error {
@@ -4441,7 +4441,7 @@ func (s *Server) syncWorkspaceOnStop(ctx context.Context, agent *store.Agent) {
 
 	project, err := s.store.GetProject(ctx, agent.ProjectID)
 	if err != nil || (project.GitRemote != "" && !project.IsSharedWorkspace()) {
-		return // Not hub-native/shared-workspace or project not found
+		return // Not hub-managed/shared-workspace or project not found
 	}
 
 	// Check if broker is co-located (embedded or has local path)
@@ -4648,7 +4648,7 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 
 		// Add as project provider. When the project already existed and the
 		// broker is already a provider, preserve the existing localPath to
-		// avoid converting a hub-native git project into a linked project.
+		// avoid converting a hub-managed git project into a linked project.
 		localPath := req.Path
 		if !created {
 			if existingProvider, err := s.store.GetProjectProvider(ctx, project.ID, broker.ID); err == nil {
@@ -4744,7 +4744,7 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 
 		// Add as project provider. When the project already existed and the
 		// broker is already a provider, preserve the existing localPath to
-		// avoid converting a hub-native git project into a linked project.
+		// avoid converting a hub-managed git project into a linked project.
 		localPath := req.Path
 		if !created {
 			if existingProvider, err := s.store.GetProjectProvider(ctx, project.ID, broker.ID); err == nil {
@@ -5814,7 +5814,7 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, id string
 	// Clean up project-scoped harness configs (best-effort), including storage files.
 	s.deleteProjectHarnessConfigs(ctx, id)
 
-	// For hub-native and shared-workspace projects, notify provider brokers to clean up
+	// For hub-managed and shared-workspace projects, notify provider brokers to clean up
 	// their local project directories. This must run before DeleteProject because
 	// the cascade deletes the project_providers we need to enumerate.
 	if project.GitRemote == "" || project.IsSharedWorkspace() {
@@ -5826,7 +5826,7 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 
-	// For hub-native and shared-workspace projects, remove the filesystem directory.
+	// For hub-managed and shared-workspace projects, remove the filesystem directory.
 	if (project.GitRemote == "" || project.IsSharedWorkspace()) && project.Slug != "" {
 		if projectPath, err := hubManagedProjectPath(project.Slug); err == nil {
 			if err := util.RemoveAllSafe(projectPath); err != nil {
@@ -9890,7 +9890,7 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 		"totalProviders", len(allProviders),
 		"onlineProviders", len(availableBrokers),
 		"defaultBroker", project.DefaultRuntimeBrokerID,
-		"isHubNative", project.GitRemote == "")
+		"isHubManaged", project.GitRemote == "")
 
 	// Convert to summary for error responses, marking and prioritizing the default broker
 	brokerSummaries := make([]RuntimeBrokerSummary, 0, len(availableBrokers))
