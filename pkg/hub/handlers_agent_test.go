@@ -1409,6 +1409,81 @@ func TestCreateAgent_DuplicateSlugStopped_ResumeAllowed(t *testing.T) {
 	assert.False(t, disp.deleteCalled, "agent should not be deleted on resume")
 }
 
+// TestCreateAgent_ResumeFromStoppedStatus verifies that sending Resume=true for a
+// stopped agent restarts it in-place (preserving the agent ID and record) rather
+// than deleting and recreating it.
+func TestCreateAgent_ResumeFromStoppedStatus(t *testing.T) {
+	disp := &createAgentDispatcher{createPhase: string(state.PhaseRunning)}
+	srv, s, project := setupCreateAgentServer(t, disp)
+	ctx := context.Background()
+
+	// Pre-create an agent in "stopped" status
+	stoppedAgent := &store.Agent{
+		ID:              "agent-resume-stopped",
+		Slug:            "resume-stopped-agent",
+		Name:            "resume-stopped-agent",
+		ProjectID:       project.ID,
+		RuntimeBrokerID: "broker-create",
+		Phase:           string(state.PhaseStopped),
+	}
+	require.NoError(t, s.CreateAgent(ctx, stoppedAgent))
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents", CreateAgentRequest{
+		Name:      "resume-stopped-agent",
+		ProjectID: project.ID,
+		Resume:    true,
+		Task:      "resume after stop",
+	})
+
+	require.Equal(t, http.StatusOK, rec.Code,
+		"resuming a stopped agent should return 200 (existing agent reused)")
+
+	// The original agent should still exist in the store
+	agent, err := s.GetAgent(ctx, "agent-resume-stopped")
+	require.NoError(t, err, "original agent should still exist after resume")
+	assert.Equal(t, string(state.PhaseRunning), agent.Phase, "resumed agent should be in running phase")
+
+	// DispatchAgentStart should have been called (not delete+create)
+	assert.True(t, disp.startCalled, "DispatchAgentStart should be called for resume")
+	assert.False(t, disp.deleteCalled, "DispatchAgentDelete should NOT be called for resume")
+}
+
+// TestCreateAgent_StartFromStoppedStatus_NoResume verifies that without Resume=true,
+// a stopped agent is still deleted and recreated (the existing behavior).
+func TestCreateAgent_StartFromStoppedStatus_NoResume(t *testing.T) {
+	disp := &createAgentDispatcher{createPhase: string(state.PhaseRunning)}
+	srv, s, project := setupCreateAgentServer(t, disp)
+	ctx := context.Background()
+
+	// Pre-create an agent in "stopped" status
+	stoppedAgent := &store.Agent{
+		ID:              "agent-start-stopped",
+		Slug:            "start-stopped-agent",
+		Name:            "start-stopped-agent",
+		ProjectID:       project.ID,
+		RuntimeBrokerID: "broker-create",
+		Phase:           string(state.PhaseStopped),
+	}
+	require.NoError(t, s.CreateAgent(ctx, stoppedAgent))
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents", CreateAgentRequest{
+		Name:      "start-stopped-agent",
+		ProjectID: project.ID,
+		// Resume is NOT set — this is a "start" not a "resume"
+		Task: "restart after stop",
+	})
+
+	require.Equal(t, http.StatusCreated, rec.Code,
+		"starting (not resuming) a stopped agent should recreate with 201")
+
+	// The old agent should be deleted
+	_, err := s.GetAgent(ctx, "agent-start-stopped")
+	assert.ErrorIs(t, err, store.ErrNotFound, "old stopped agent should be deleted when not resuming")
+
+	// DispatchAgentDelete should have been called
+	assert.True(t, disp.deleteCalled, "DispatchAgentDelete should be called when not resuming")
+}
+
 // TestAgentCreate_LocalTemplateWithLocalBroker tests that agent creation succeeds
 // when a template is not found on the Hub but the target broker has local filesystem
 // access (LocalPath is set), allowing the template to be resolved locally by the broker.
@@ -2529,6 +2604,42 @@ func TestCreateProjectAgent_ResumeFromStoppedStatus(t *testing.T) {
 		"resuming a stopped project agent should return 200 (existing agent reused)")
 
 	agent, err := s.GetAgent(ctx, tid("project-agent-resume-stopped"))
+	require.NoError(t, err, "original project agent should still exist after resume")
+	assert.Equal(t, string(state.PhaseRunning), agent.Phase, "resumed agent should be in running phase")
+
+	assert.True(t, disp.startCalled, "DispatchAgentStart should be called for resume")
+	assert.False(t, disp.deleteCalled, "DispatchAgentDelete should NOT be called for resume")
+}
+
+// TestCreateProjectAgent_ResumeFromStoppedStatus verifies that sending Resume=true
+// for a stopped project-scoped agent restarts it in-place, preserving the agent record.
+func TestCreateProjectAgent_ResumeFromStoppedStatus(t *testing.T) {
+	disp := &createAgentDispatcher{createPhase: string(state.PhaseRunning)}
+	srv, s, project := setupCreateAgentServer(t, disp)
+	ctx := context.Background()
+
+	stoppedAgent := &store.Agent{
+		ID:              "project-agent-resume-stopped",
+		Slug:            "resume-stopped-project-agent",
+		Name:            "resume-stopped-project-agent",
+		ProjectID:       project.ID,
+		RuntimeBrokerID: "broker-create",
+		Phase:           string(state.PhaseStopped),
+	}
+	require.NoError(t, s.CreateAgent(ctx, stoppedAgent))
+
+	rec := doRequest(t, srv, http.MethodPost,
+		fmt.Sprintf("/api/v1/projects/%s/agents", project.ID),
+		CreateAgentRequest{
+			Name:   "resume-stopped-project-agent",
+			Resume: true,
+			Task:   "resume after stop",
+		})
+
+	require.Equal(t, http.StatusOK, rec.Code,
+		"resuming a stopped project agent should return 200 (existing agent reused)")
+
+	agent, err := s.GetAgent(ctx, "project-agent-resume-stopped")
 	require.NoError(t, err, "original project agent should still exist after resume")
 	assert.Equal(t, string(state.PhaseRunning), agent.Phase, "resumed agent should be in running phase")
 
