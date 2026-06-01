@@ -92,6 +92,21 @@ export class ScionPageProjectSettings extends LitElement {
   private deleteLoading = false;
 
   @state()
+  private hcImportLoading = false;
+
+  @state()
+  private hcImportError: string | null = null;
+
+  @state()
+  private hcImportSuccess: string | null = null;
+
+  @state()
+  private hcImportUrl = '';
+
+  @state()
+  private hcImportMode: 'url' | 'workspace' = 'url';
+
+  @state()
   private membersGroup: AdminGroup | null = null;
 
   @state()

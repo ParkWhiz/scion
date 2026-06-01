@@ -9420,6 +9420,24 @@ func (s *Server) getHarnessConfigFromTemplate(template *store.Template, fallback
 	return fallback
 }
 
+// lookupHarnessConfigRecord resolves a harness-config reference (name or slug)
+// to its Hub record, checking project scope first then global — the same
+// precedence the broker uses for on-disk lookup. Returns nil if not found.
+func (s *Server) lookupHarnessConfigRecord(ctx context.Context, projectID, ref string) *store.HarnessConfig {
+	if ref == "" {
+		return nil
+	}
+	if projectID != "" {
+		if hc, err := s.store.GetHarnessConfigBySlug(ctx, ref, store.HarnessConfigScopeProject, projectID); err == nil && hc != nil {
+			return hc
+		}
+	}
+	if hc, err := s.store.GetHarnessConfigBySlug(ctx, ref, store.HarnessConfigScopeGlobal, ""); err == nil && hc != nil {
+		return hc
+	}
+	return nil
+}
+
 // buildAppliedConfig constructs an AgentAppliedConfig from a CreateAgentRequest.
 // When req.Config is a ScionConfig, its fields are extracted into the applied config
 // and the full ScionConfig is preserved as InlineConfig for threading to the broker.
