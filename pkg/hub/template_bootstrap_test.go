@@ -948,6 +948,112 @@ func TestImportTemplatesFromWorkspace_MultipleTemplates(t *testing.T) {
 	}
 }
 
+// TestImportTemplatesFromWorkspace_ParallelManyTemplates exercises the Phase-4
+// bounded-pool parallelism: importing more templates than the per-resource
+// worker bound, each with several files, must import every resource exactly
+// once, preserve discovery order in the returned list, and upload all files.
+// Run under `go test -race` this also guards the storage/store concurrency
+// assumptions the parallel loop relies on.
+func TestImportTemplatesFromWorkspace_ParallelManyTemplates(t *testing.T) {
+	srv, s, project, wsRoot := setupWorkspaceProject(t, "ws-parallel")
+	ctx := context.Background()
+
+	// More templates than resourceImportConcurrency so the bounded pool actually
+	// queues work; os.ReadDir returns entries sorted by name, so zero-padded
+	// names give a deterministic discovery order to assert against.
+	const n = 12
+	want := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("tmpl-%02d", i)
+		want = append(want, name)
+		dir := filepath.Join(wsRoot, "templates", name)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "scion-agent.yaml"), []byte("harness: claude\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		// A few files each, to also exercise per-file upload parallelism.
+		for _, f := range []string{"README.md", "home/.bashrc", "system-prompt.md"} {
+			full := filepath.Join(dir, f)
+			if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, []byte(name+":"+f), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	imported, err := srv.importTemplatesFromWorkspace(ctx, project, "/templates")
+	if err != nil {
+		t.Fatalf("import failed: %v", err)
+	}
+
+	// Every template imported exactly once, in discovery order.
+	if len(imported) != n {
+		t.Fatalf("expected %d imported, got %d: %v", n, len(imported), imported)
+	}
+	for i := range want {
+		if imported[i] != want[i] {
+			t.Fatalf("imported order mismatch at %d: got %q want %q (full: %v)", i, imported[i], want[i], imported)
+		}
+	}
+
+	result, err := s.ListTemplates(ctx, store.TemplateFilter{ProjectID: project.ID}, store.ListOptions{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TotalCount != n {
+		t.Fatalf("expected %d templates in store, got %d", n, result.TotalCount)
+	}
+}
+
+// TestImportTemplatesFromWorkspace_SkipsHiddenDirs verifies discovery ignores
+// hidden/system directories (.git, .github, .scion) when scanning a parent
+// directory for resources, importing only the real template and not reporting
+// the hidden dirs as skipped.
+func TestImportTemplatesFromWorkspace_SkipsHiddenDirs(t *testing.T) {
+	srv, s, project, wsRoot := setupWorkspaceProject(t, "ws-hidden")
+	ctx := context.Background()
+
+	base := filepath.Join(wsRoot, "templates")
+	// A real template plus hidden/system dirs that must be ignored.
+	tmpl := filepath.Join(base, "real-template")
+	if err := os.MkdirAll(tmpl, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpl, "scion-agent.yaml"), []byte("harness: claude\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, hidden := range []string{".git", ".github", ".scion"} {
+		d := filepath.Join(base, hidden)
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+		// Put a file inside so the dir is non-empty (e.g. .git/config).
+		if err := os.WriteFile(filepath.Join(d, "config"), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	imported, err := srv.importTemplatesFromWorkspace(ctx, project, "/templates")
+	if err != nil {
+		t.Fatalf("import failed: %v", err)
+	}
+	if len(imported) != 1 || imported[0] != "real-template" {
+		t.Fatalf("expected [real-template], got %v", imported)
+	}
+
+	result, err := s.ListTemplates(ctx, store.TemplateFilter{ProjectID: project.ID}, store.ListOptions{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TotalCount != 1 {
+		t.Fatalf("expected 1 template, got %d", result.TotalCount)
+	}
+}
+
 func TestBootstrapTemplatesFromDir_ImportsDefaultHarnessConfig(t *testing.T) {
 	srv, s, _ := testTemplateBootstrapServer(t)
 	ctx := context.Background()
@@ -1156,6 +1262,100 @@ system_prompt: system-prompt.md
 	// Verify files uploaded to storage
 	if len(stor.objects) != 3 {
 		t.Errorf("expected 3 files uploaded to storage, got %d", len(stor.objects))
+	}
+}
+
+// TestImportHarnessConfigsFromRemote_WithProjectGithubToken exercises the
+// GITHUB_TOKEN secret fallback for harness-config remote import. Before the
+// Phase-1 refactor routed both kinds through the shared fetch path, the
+// harness-config remote import skipped this fallback (it only minted GitHub App
+// tokens). This test guards that the fallback is now applied.
+func TestImportHarnessConfigsFromRemote_WithProjectGithubToken(t *testing.T) {
+	srv, s, stor := testTemplateBootstrapServer(t)
+	ctx := context.Background()
+
+	projectID := "test-project-id"
+	project := &store.Project{
+		ID:        projectID,
+		Name:      "test-project",
+		Slug:      "test-project",
+		GitRemote: "https://github.com/chiefkarlin/scion-experiments",
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save GITHUB_TOKEN secret via local secret backend.
+	srv.SetSecretBackend(secret.NewLocalBackend(s, ""))
+	if _, _, err := srv.GetSecretBackend().Set(ctx, &secret.SetSecretInput{
+		Name:       "GITHUB_TOKEN",
+		Value:      "my-secret-token-12345",
+		SecretType: secret.TypeEnvironment,
+		Scope:      secret.ScopeProject,
+		ScopeID:    projectID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hijack the HTTP client's Transport to mock the tarball fetch.
+	// NOTE: mutates http.DefaultClient.Transport globally; MUST NOT run in parallel.
+	oldTransport := http.DefaultClient.Transport
+	defer func() { http.DefaultClient.Transport = oldTransport }()
+
+	var capturedAuthHeader string
+	http.DefaultClient.Transport = &mockRoundTripper{
+		roundTrip: func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host != "github.com" {
+				return nil, fmt.Errorf("unexpected request to host: %s", req.URL.Host)
+			}
+			capturedAuthHeader = req.Header.Get("Authorization")
+
+			var buf bytes.Buffer
+			gzw := gzip.NewWriter(&buf)
+			tw := tar.NewWriter(gzw)
+			files := map[string]string{
+				"scion-experiments-main/harness-configs/my-config/config.yaml": "harness: claude\n",
+				"scion-experiments-main/harness-configs/my-config/CLAUDE.md":   "# Claude instructions",
+			}
+			for name, body := range files {
+				if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0600, Size: int64(len(body))}); err != nil {
+					return nil, err
+				}
+				if _, err := tw.Write([]byte(body)); err != nil {
+					return nil, err
+				}
+			}
+			if err := tw.Close(); err != nil {
+				return nil, err
+			}
+			if err := gzw.Close(); err != nil {
+				return nil, err
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(buf.Bytes()))}, nil
+		},
+	}
+
+	imported, err := srv.importHarnessConfigsFromRemote(ctx, projectID, "https://github.com/chiefkarlin/scion-experiments/tree/main/harness-configs")
+	if err != nil {
+		t.Fatalf("importHarnessConfigsFromRemote failed: %v", err)
+	}
+
+	if len(imported) != 1 || imported[0] != "my-config" {
+		t.Errorf("expected imported harness-configs [my-config], got %v", imported)
+	}
+	if capturedAuthHeader != "Bearer my-secret-token-12345" {
+		t.Errorf("expected Authorization header 'Bearer my-secret-token-12345', got %q", capturedAuthHeader)
+	}
+
+	existing, err := s.GetHarnessConfigBySlug(ctx, "my-config", store.HarnessConfigScopeProject, projectID)
+	if err != nil {
+		t.Fatalf("expected harness-config saved to store: %v", err)
+	}
+	if existing.Harness != "claude" {
+		t.Errorf("expected harness 'claude', got %q", existing.Harness)
+	}
+	if len(stor.objects) != 2 {
+		t.Errorf("expected 2 files uploaded to storage, got %d", len(stor.objects))
 	}
 }
 
