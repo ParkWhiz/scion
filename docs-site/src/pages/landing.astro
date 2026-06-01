@@ -191,6 +191,66 @@ const base = import.meta.env.BASE_URL;
       background: var(--bg-primary);
     }
 
+    .pipeline-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 1rem;
+      position: relative;
+    }
+
+    .pipeline-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 1.5rem;
+      text-align: center;
+      transition: border-color 0.2s ease, transform 0.2s ease;
+      position: relative;
+    }
+
+    .pipeline-card:hover {
+      border-color: var(--accent-green-dim);
+      transform: translateY(-2px);
+    }
+
+    .pipeline-num {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--accent-green-dim);
+      color: var(--accent-green);
+      font-weight: 600;
+      font-size: 0.85rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .pipeline-card h3 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 0.25rem;
+    }
+
+    .pipeline-card .pipeline-label {
+      font-size: 0.8rem;
+      color: var(--accent-emerald);
+      margin-bottom: 0.5rem;
+    }
+
+    .pipeline-card p.pipeline-body {
+      font-size: 0.82rem;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    /* Feature grid */
+    .features {
+      background: var(--bg-primary);
+    }
+
     .feature-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -284,7 +344,9 @@ const base = import.meta.env.BASE_URL;
 
     /* How it works */
     .how-it-works {
-      background: var(--bg-primary);
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border-subtle);
+      border-bottom: 1px solid var(--border-subtle);
     }
 
     .steps {
@@ -371,6 +433,12 @@ const base = import.meta.env.BASE_URL;
     }
 
     /* Responsive */
+    @media (max-width: 900px) {
+      .pipeline-grid {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+
     @media (max-width: 640px) {
       .hero { padding: 3rem 1.5rem 2rem; }
       .hero-subtitle { font-size: 1.1rem; }
