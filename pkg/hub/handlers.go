@@ -2215,6 +2215,8 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
 
 	// Build a structured message for external dispatch paths.
 	structuredMsg := &messages.StructuredMessage{
+		Version:     messages.Version,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
 		Sender:      storeMsg.Sender,
 		SenderID:    storeMsg.SenderID,
 		Recipient:   storeMsg.Recipient,
@@ -2449,6 +2451,9 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 		if structuredMsg.Type == "" {
 			structuredMsg.Type = messages.TypeInstruction
 		}
+		if structuredMsg.Channel == "" && GetAgentIdentityFromContext(ctx) == nil {
+			structuredMsg.Channel = "web"
+		}
 	} else if req.Message != "" {
 		plainMessage = req.Message
 		// Build a structured message from the plain text so that downstream
@@ -2465,6 +2470,9 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 		}
 		structuredMsg = messages.NewInstruction(sender, "agent:"+id, plainMessage)
 		structuredMsg.SenderID = senderID
+		if GetAgentIdentityFromContext(ctx) == nil {
+			structuredMsg.Channel = "web"
+		}
 	} else {
 		ValidationError(w, "message or structured_message is required", nil)
 		return
