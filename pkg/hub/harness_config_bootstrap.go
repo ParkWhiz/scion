@@ -16,14 +16,15 @@ package hub
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 )
 
 // BootstrapHarnessConfigsFromDir imports or updates local harness configs from
@@ -81,7 +82,7 @@ func (s *Server) BootstrapHarnessConfigsFromDir(ctx context.Context, harnessConf
 			}
 			imported++
 		} else {
-			changed, err := s.syncExistingHarnessConfig(ctx, existing, dirPath, hcDir, stor)
+			changed, err := s.syncExistingHarnessConfig(ctx, existing, dirPath, hcDir, stor, false)
 			if err != nil {
 				s.templateLog.Warn("harness config bootstrap: failed to sync config, skipping",
 					"config", name, "error", err)
@@ -107,140 +108,176 @@ func (s *Server) bootstrapSingleHarnessConfig(ctx context.Context, name, dirPath
 	return s.bootstrapSingleHarnessConfigScoped(ctx, name, dirPath, hcDir, stor, store.HarnessConfigScopeGlobal, "")
 }
 
-func (s *Server) bootstrapSingleHarnessConfigScoped(ctx context.Context, name, dirPath string, hcDir *config.HarnessConfigDir, stor storage.Storage, scope, scopeID string) error {
-	files, err := transfer.CollectFiles(dirPath, nil)
-	if err != nil {
-		return err
-	}
-
-	slug := api.Slugify(name)
-	storagePath := storage.HarnessConfigStoragePath(scope, scopeID, slug)
-
-	hc := &store.HarnessConfig{
-		ID:            api.NewUUID(),
-		Name:          name,
-		Slug:          slug,
-		Harness:       hcDir.Config.Harness,
-		Scope:         scope,
-		ScopeID:       scopeID,
-		Status:        store.HarnessConfigStatusPending,
-		StoragePath:   storagePath,
-		StorageBucket: stor.Bucket(),
-		StorageURI:    storage.HarnessConfigStorageURI(stor.Bucket(), scope, scopeID, slug),
-		Visibility:    store.VisibilityPublic,
-	}
-
-	if err := s.store.CreateHarnessConfig(ctx, hc); err != nil {
-		return err
-	}
-
-	var hcFiles []store.TemplateFile
-	for _, fi := range files {
-		objectPath := storagePath + "/" + fi.Path
-
-		f, err := os.Open(fi.FullPath)
-		if err != nil {
-			s.templateLog.Warn("harness config bootstrap: failed to open file, skipping",
-				"file", fi.Path, "error", err)
-			continue
-		}
-
-		_, err = stor.Upload(ctx, objectPath, f, storage.UploadOptions{})
-		f.Close()
-		if err != nil {
-			s.templateLog.Warn("harness config bootstrap: failed to upload file, skipping",
-				"file", fi.Path, "error", err)
-			continue
-		}
-
-		hcFiles = append(hcFiles, store.TemplateFile{
-			Path: fi.Path,
-			Size: fi.Size,
-			Hash: fi.Hash,
-			Mode: fi.Mode,
-		})
-	}
-
-	contentHash := computeContentHash(hcFiles)
-	hc.Files = hcFiles
-	hc.ContentHash = contentHash
-	hc.Status = store.HarnessConfigStatusActive
-
-	if err := s.store.UpdateHarnessConfig(ctx, hc); err != nil {
-		return err
-	}
-
-	s.templateLog.Info("harness config bootstrap: imported config",
-		"name", name, "files", len(hcFiles), "harness", hcDir.Config.Harness)
-	return nil
+// bootstrapSingleHarnessConfigScoped delegates to the shared ResourceStore
+// (§7.3). stor is unused — the store resolves the backend itself — but is kept
+// in the signature to match the bundled-import call sites.
+func (s *Server) bootstrapSingleHarnessConfigScoped(ctx context.Context, name, dirPath string, hcDir *config.HarnessConfigDir, _ storage.Storage, scope, scopeID string) error {
+	_, err := s.harnessConfigStore(hcDir.Config.Harness).Bootstrap(ctx, name, dirPath, scope, scopeID, false)
+	return err
 }
 
-// syncExistingHarnessConfig checks if a local harness config directory has
-// changed compared to what is stored in the database. If so, it re-uploads
-// the files and updates the database record. Returns true if an update occurred.
-func (s *Server) syncExistingHarnessConfig(ctx context.Context, existing *store.HarnessConfig, dirPath string, hcDir *config.HarnessConfigDir, stor storage.Storage) (bool, error) {
-	files, err := transfer.CollectFiles(dirPath, nil)
+// isHarnessConfigDir reports whether dir looks like a harness-config directory,
+// i.e. it contains a config.yaml file. Analogous to
+// templateimport.IsScionTemplate (which checks for scion-agent.yaml).
+func isHarnessConfigDir(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "config.yaml"))
+	return err == nil && !info.IsDir()
+}
+
+// importHarnessConfigsFromRemote fetches a remote source URL, discovers
+// harness-configs within it, and registers each one into the Hub store scoped to
+// the given project. Returns the names of all configs imported or updated.
+func (s *Server) importHarnessConfigsFromRemote(ctx context.Context, projectID, sourceURL string) ([]string, error) {
+	if !config.IsRemoteURI(sourceURL) {
+		return nil, fmt.Errorf("source must be a remote URI (http://, https://, or rclone)")
+	}
+
+	stor := s.GetStorage()
+	if stor == nil {
+		return nil, fmt.Errorf("harness-config storage is not configured")
+	}
+
+	// If the project has a GitHub App installation, mint a token for authenticated access.
+	var authToken string
+	project, err := s.store.GetProject(ctx, projectID)
+	if err == nil && project != nil && project.GitHubInstallationID != nil {
+		if token, _, mintErr := s.MintGitHubAppTokenForProject(ctx, project); mintErr == nil && token != "" {
+			authToken = token
+		}
+	}
+
+	// Fetch to a temporary directory.
+	cachePath, err := config.FetchRemoteTemplate(ctx, sourceURL, authToken)
 	if err != nil {
-		return false, err
+		return nil, fmt.Errorf("failed to fetch remote harness-configs: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(cachePath) }()
+
+	dirs, err := discoverHarnessConfigDirs(cachePath)
+	if err != nil {
+		return nil, err
+	}
+	if len(dirs) == 0 {
+		return nil, fmt.Errorf("no scion harness-configs found at %s", sourceURL)
 	}
 
-	var hcFiles []store.TemplateFile
-	for _, fi := range files {
-		hcFiles = append(hcFiles, store.TemplateFile{
-			Path: fi.Path,
-			Size: fi.Size,
-			Hash: fi.Hash,
-			Mode: fi.Mode,
-		})
-	}
-	newHash := computeContentHash(hcFiles)
+	return s.importHarnessConfigDirs(ctx, dirs, projectID), nil
+}
 
-	if newHash == existing.ContentHash {
-		return false, nil
+// importHarnessConfigsFromWorkspace imports harness-configs from a path within
+// the project's workspace filesystem. The workspacePath is relative to the
+// project's workspace root (e.g. "/.scion/harness-configs").
+func (s *Server) importHarnessConfigsFromWorkspace(ctx context.Context, project *store.Project, workspacePath string) ([]string, error) {
+	stor := s.GetStorage()
+	if stor == nil {
+		return nil, fmt.Errorf("harness-config storage is not configured")
 	}
 
-	s.templateLog.Info("harness config bootstrap: local config changed, re-syncing",
-		"config", existing.Name, "oldHash", existing.ContentHash, "newHash", newHash)
-
-	storagePath := existing.StoragePath
-	if storagePath == "" {
-		storagePath = storage.HarnessConfigStoragePath(existing.Scope, "", existing.Slug)
+	// Resolve the project's workspace root on disk.
+	projectRoot, err := s.resolveProjectWebDAVPath(ctx, project)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve project workspace: %w", err)
 	}
 
-	var uploadedFiles []store.TemplateFile
-	for _, fi := range files {
-		objectPath := storagePath + "/" + fi.Path
+	// Clean and join the workspace path to the project root.
+	rel := strings.TrimPrefix(filepath.Clean(workspacePath), "/")
+	configsDir := filepath.Join(projectRoot, rel)
 
-		f, err := os.Open(fi.FullPath)
+	// Validate the resolved path is within the project root.
+	absRoot, _ := filepath.Abs(projectRoot)
+	absDir, _ := filepath.Abs(configsDir)
+	relPath, err := filepath.Rel(absRoot, absDir)
+	if err != nil || strings.HasPrefix(relPath, "..") {
+		return nil, fmt.Errorf("workspace path must be within the project workspace")
+	}
+
+	info, err := os.Stat(configsDir)
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("workspace path not found or not a directory: %s", workspacePath)
+	}
+
+	dirs, err := discoverHarnessConfigDirs(configsDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(dirs) == 0 {
+		return nil, fmt.Errorf("no scion harness-configs found at workspace path %s", workspacePath)
+	}
+
+	return s.importHarnessConfigDirs(ctx, dirs, project.ID), nil
+}
+
+// harnessConfigDir pairs a config's directory name with its on-disk path.
+type harnessConfigDir struct{ name, path string }
+
+// discoverHarnessConfigDirs returns the harness-config directories at root. If
+// root itself is a harness-config it is returned directly; otherwise its
+// immediate subdirectories are scanned.
+func discoverHarnessConfigDirs(root string) ([]harnessConfigDir, error) {
+	if isHarnessConfigDir(root) {
+		return []harnessConfigDir{{filepath.Base(root), root}}, nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var dirs []harnessConfigDir
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		if isHarnessConfigDir(dir) {
+			dirs = append(dirs, harnessConfigDir{entry.Name(), dir})
+		}
+	}
+	return dirs, nil
+}
+
+// importHarnessConfigDirs imports or force-syncs each discovered harness-config
+// directory into the project scope. Configs that fail to load or import are
+// logged and skipped. Returns the names successfully imported or updated.
+func (s *Server) importHarnessConfigDirs(ctx context.Context, dirs []harnessConfigDir, projectID string) []string {
+	stor := s.GetStorage()
+	var imported []string
+	for _, hc := range dirs {
+		hcDir, err := config.LoadHarnessConfigDir(hc.path)
 		if err != nil {
-			s.templateLog.Warn("harness config bootstrap: failed to open file, skipping",
-				"file", fi.Path, "error", err)
+			s.templateLog.Warn("harness-config import: failed to load config, skipping",
+				"config", hc.name, "error", err)
 			continue
 		}
 
-		_, err = stor.Upload(ctx, objectPath, f, storage.UploadOptions{})
-		f.Close()
-		if err != nil {
-			s.templateLog.Warn("harness config bootstrap: failed to upload file, skipping",
-				"file", fi.Path, "error", err)
+		slug := api.Slugify(hc.name)
+		existing, err := s.store.GetHarnessConfigBySlug(ctx, slug, store.HarnessConfigScopeProject, projectID)
+		if err != nil && err != store.ErrNotFound {
+			s.templateLog.Warn("harness-config import: failed to look up config, skipping",
+				"config", hc.name, "error", err)
 			continue
 		}
 
-		uploadedFiles = append(uploadedFiles, store.TemplateFile{
-			Path: fi.Path,
-			Size: fi.Size,
-			Hash: fi.Hash,
-			Mode: fi.Mode,
-		})
+		if existing == nil {
+			if err := s.bootstrapSingleHarnessConfigScoped(ctx, hc.name, hc.path, hcDir, stor, store.HarnessConfigScopeProject, projectID); err != nil {
+				s.templateLog.Warn("harness-config import: failed to import config, skipping",
+					"config", hc.name, "error", err)
+				continue
+			}
+		} else {
+			if _, err := s.syncExistingHarnessConfig(ctx, existing, hc.path, hcDir, stor, true); err != nil {
+				s.templateLog.Warn("harness-config import: failed to sync config, skipping",
+					"config", hc.name, "error", err)
+				continue
+			}
+		}
+		imported = append(imported, hc.name)
 	}
+	return imported
+}
 
-	existing.Files = uploadedFiles
-	existing.ContentHash = newHash
-	existing.Harness = hcDir.Config.Harness
-
-	if err := s.store.UpdateHarnessConfig(ctx, existing); err != nil {
-		return false, err
-	}
-
-	return true, nil
+// syncExistingHarnessConfig re-syncs a local harness config directory through
+// the shared ResourceStore. Returns true if the stored content changed. When
+// force is true the config is re-uploaded and storage reconciled even if the
+// content hash is unchanged (used by direct imports).
+func (s *Server) syncExistingHarnessConfig(ctx context.Context, existing *store.HarnessConfig, dirPath string, hcDir *config.HarnessConfigDir, _ storage.Storage, force bool) (bool, error) {
+	return s.harnessConfigStore(hcDir.Config.Harness).Bootstrap(ctx, existing.Name, dirPath, existing.Scope, existing.ScopeID, force)
 }

@@ -34,10 +34,10 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
-	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
+	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub"
 	scionplugin "github.com/GoogleCloudPlatform/scion/pkg/plugin"
@@ -1193,6 +1193,13 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		InMemoryCredentials:  inMemoryCreds,
 		BrokerAuthEnabled:    true,
 		BrokerAuthStrictMode: true,
+	}
+
+	// In co-located mode, hand the broker the Hub's storage backend so that a
+	// local filesystem backend is read directly (zero-copy) instead of being
+	// hydrated over HTTP. A non-local backend is left for cache-based hydration.
+	if inMemoryCreds != nil && hubSrv != nil {
+		rhCfg.ColocatedStorage = hubSrv.GetStorage()
 	}
 
 	rhSrv := runtimebroker.New(rhCfg, mgr, rt)

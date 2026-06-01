@@ -24,9 +24,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/templateimport"
-	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 )
 
 // BootstrapTemplatesFromDir imports or updates local templates from a directory
@@ -111,207 +109,20 @@ func (s *Server) BootstrapTemplatesFromDir(ctx context.Context, templatesDir str
 // the aggregate content hash already matches what is stored. The bool return
 // reports whether the resulting ContentHash differed from what was previously
 // stored.
+//
+// This now delegates to the shared ResourceStore (§7.3); the template-specific
+// behavior (harness detection, DefaultHarnessConfig backfill, bundled
+// harness-config import) lives in templatePersistence.
 func (s *Server) syncExistingTemplate(ctx context.Context, existing *store.Template, templatePath string, force bool) (bool, error) {
-	stor := s.GetStorage()
-
-	// Collect current files from disk
-	files, err := transfer.CollectFiles(templatePath, nil)
-	if err != nil {
-		return false, err
-	}
-
-	if !force {
-		var preview []store.TemplateFile
-		for _, fi := range files {
-			preview = append(preview, store.TemplateFile{
-				Path: fi.Path,
-				Size: fi.Size,
-				Hash: fi.Hash,
-				Mode: fi.Mode,
-			})
-		}
-		hashMatch := computeContentHash(preview) == existing.ContentHash
-
-		// Even when content hasn't changed, backfill DefaultHarnessConfig
-		// for templates imported before that field existed.
-		if hashMatch && existing.DefaultHarnessConfig == "" {
-			cfgInfo := detectHarnessFromConfig(templatePath, existing.Name)
-			if cfgInfo.DefaultHarnessConfig != "" {
-				existing.DefaultHarnessConfig = cfgInfo.DefaultHarnessConfig
-				existing.Harness = cfgInfo.Harness
-				_ = s.store.UpdateTemplate(ctx, existing)
-				s.importTemplateHarnessConfigs(ctx, templatePath, existing.Scope, existing.ScopeID)
-				s.templateLog.Info("template bootstrap: backfilled defaultHarnessConfig",
-					"template", existing.Name, "defaultHarnessConfig", cfgInfo.DefaultHarnessConfig)
-			}
-		}
-
-		if hashMatch {
-			return false, nil
-		}
-	}
-
-	storagePath := existing.StoragePath
-	if storagePath == "" {
-		storagePath = storage.TemplateStoragePath(existing.Scope, existing.ScopeID, existing.Slug)
-	}
-
-	var uploadedFiles []store.TemplateFile
-	newPaths := make(map[string]struct{}, len(files))
-	for _, fi := range files {
-		objectPath := storagePath + "/" + fi.Path
-
-		f, err := os.Open(fi.FullPath)
-		if err != nil {
-			s.templateLog.Warn("template bootstrap: failed to open file, skipping",
-				"file", fi.Path, "error", err)
-			continue
-		}
-
-		_, err = stor.Upload(ctx, objectPath, f, storage.UploadOptions{})
-		f.Close()
-		if err != nil {
-			s.templateLog.Warn("template bootstrap: failed to upload file, skipping",
-				"file", fi.Path, "error", err)
-			continue
-		}
-
-		uploadedFiles = append(uploadedFiles, store.TemplateFile{
-			Path: fi.Path,
-			Size: fi.Size,
-			Hash: fi.Hash,
-			Mode: fi.Mode,
-		})
-		newPaths[objectPath] = struct{}{}
-	}
-
-	// Reconcile storage: delete objects under the template's prefix that are
-	// no longer in the new manifest, so removed files don't linger.
-	if listResult, err := stor.List(ctx, storage.ListOptions{Prefix: storagePath + "/"}); err != nil {
-		s.templateLog.Warn("template bootstrap: failed to list storage for reconcile",
-			"template", existing.Name, "prefix", storagePath, "error", err)
-	} else {
-		for _, obj := range listResult.Objects {
-			if _, keep := newPaths[obj.Name]; keep {
-				continue
-			}
-			if err := stor.Delete(ctx, obj.Name); err != nil {
-				s.templateLog.Warn("template bootstrap: failed to delete stale object",
-					"template", existing.Name, "object", obj.Name, "error", err)
-			}
-		}
-	}
-
-	newHash := computeContentHash(uploadedFiles)
-	changed := newHash != existing.ContentHash
-
-	if changed {
-		s.templateLog.Info("template bootstrap: template re-synced",
-			"template", existing.Name, "oldHash", existing.ContentHash, "newHash", newHash)
-	}
-
-	// Update the database record with new files and hash
-	existing.Files = uploadedFiles
-	existing.ContentHash = newHash
-	cfgInfo := detectHarnessFromConfig(templatePath, existing.Name)
-	existing.Harness = cfgInfo.Harness
-	existing.DefaultHarnessConfig = cfgInfo.DefaultHarnessConfig
-
-	if err := s.store.UpdateTemplate(ctx, existing); err != nil {
-		return false, err
-	}
-
-	// Re-import any harness-configs bundled inside the template
-	s.importTemplateHarnessConfigs(ctx, templatePath, existing.Scope, existing.ScopeID)
-
-	return changed, nil
+	return s.templateStore().Bootstrap(ctx, existing.Name, templatePath, existing.Scope, existing.ScopeID, force)
 }
 
 // bootstrapSingleTemplate imports one local template directory into the
 // Hub's database and storage backend under the given scope and projectID.
 // For global templates pass store.TemplateScopeGlobal and "".
 func (s *Server) bootstrapSingleTemplate(ctx context.Context, name, templatePath, scope, projectID string) error {
-	stor := s.GetStorage()
-
-	// Collect files from the template directory
-	files, err := transfer.CollectFiles(templatePath, nil)
-	if err != nil {
-		return err
-	}
-
-	// Detect harness type and default harness config from the template config
-	cfgInfo := detectHarnessFromConfig(templatePath, name)
-
-	slug := api.Slugify(name)
-
-	// Create a pending template record
-	storagePath := storage.TemplateStoragePath(scope, projectID, slug)
-	tmpl := &store.Template{
-		ID:                   api.NewUUID(),
-		Name:                 name,
-		Slug:                 slug,
-		Harness:              cfgInfo.Harness,
-		DefaultHarnessConfig: cfgInfo.DefaultHarnessConfig,
-		Scope:                scope,
-		ScopeID:              projectID,
-		ProjectID:            projectID, // deprecated alias kept for compatibility
-		Status:               store.TemplateStatusPending,
-		StoragePath:          storagePath,
-		StorageBucket:        stor.Bucket(),
-		StorageURI:           storage.TemplateStorageURI(stor.Bucket(), scope, projectID, slug),
-		Visibility:           store.VisibilityPrivate,
-	}
-
-	if err := s.store.CreateTemplate(ctx, tmpl); err != nil {
-		return err
-	}
-
-	// Upload each file to storage
-	var templateFiles []store.TemplateFile
-	for _, fi := range files {
-		objectPath := storagePath + "/" + fi.Path
-
-		f, err := os.Open(fi.FullPath)
-		if err != nil {
-			s.templateLog.Warn("template bootstrap: failed to open file, skipping",
-				"file", fi.Path, "error", err)
-			continue
-		}
-
-		_, err = stor.Upload(ctx, objectPath, f, storage.UploadOptions{})
-		f.Close()
-		if err != nil {
-			s.templateLog.Warn("template bootstrap: failed to upload file, skipping",
-				"file", fi.Path, "error", err)
-			continue
-		}
-
-		templateFiles = append(templateFiles, store.TemplateFile{
-			Path: fi.Path,
-			Size: fi.Size,
-			Hash: fi.Hash,
-			Mode: fi.Mode,
-		})
-	}
-
-	// Compute content hash and activate the template
-	contentHash := computeContentHash(templateFiles)
-	tmpl.Files = templateFiles
-	tmpl.ContentHash = contentHash
-	tmpl.Status = store.TemplateStatusActive
-
-	if err := s.store.UpdateTemplate(ctx, tmpl); err != nil {
-		return err
-	}
-
-	s.templateLog.Info("template bootstrap: imported template",
-		"name", name, "files", len(templateFiles), "harness", cfgInfo.Harness,
-		"defaultHarnessConfig", cfgInfo.DefaultHarnessConfig)
-
-	// Import any harness-configs bundled inside the template
-	s.importTemplateHarnessConfigs(ctx, templatePath, scope, projectID)
-
-	return nil
+	_, err := s.templateStore().Bootstrap(ctx, name, templatePath, scope, projectID, false)
+	return err
 }
 
 // templateConfigInfo holds the harness type and default harness config name
@@ -420,7 +231,7 @@ func (s *Server) importTemplateHarnessConfigs(ctx context.Context, templatePath,
 			s.templateLog.Info("template harness-config import: imported config",
 				"config", name, "harness", hcDirCfg.Config.Harness, "scope", hcScope)
 		} else {
-			if _, err := s.syncExistingHarnessConfig(ctx, existing, dirPath, hcDirCfg, stor); err != nil {
+			if _, err := s.syncExistingHarnessConfig(ctx, existing, dirPath, hcDirCfg, stor, false); err != nil {
 				s.templateLog.Warn("template harness-config import: failed to sync, skipping",
 					"config", name, "error", err)
 			}
@@ -455,7 +266,7 @@ func (s *Server) importTemplatesFromRemote(ctx context.Context, projectID, sourc
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch remote templates: %w", err)
 	}
-	defer os.RemoveAll(cachePath)
+	defer func() { _ = os.RemoveAll(cachePath) }()
 
 	// Collect template directories to import
 	type templateDir struct{ name, path string }

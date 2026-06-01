@@ -35,6 +35,7 @@ import '../shared/gcp-service-account-list.js';
 import '../shared/scheduled-event-list.js';
 import '../shared/subscription-manager.js';
 import '../shared/schedule-list.js';
+import '../shared/resource-list.js';
 
 
 interface ProjectResourceSpec {
@@ -91,12 +92,6 @@ export class ScionPageProjectSettings extends LitElement {
 
 
   @state()
-  private templates: Template[] = [];
-
-  @state()
-  private templatesLoading = true;
-
-  @state()
   private syncLoading = false;
 
   @state()
@@ -110,6 +105,21 @@ export class ScionPageProjectSettings extends LitElement {
 
   @state()
   private importMode: 'url' | 'workspace' = 'url';
+
+  @state()
+  private hcImportLoading = false;
+
+  @state()
+  private hcImportError: string | null = null;
+
+  @state()
+  private hcImportSuccess: string | null = null;
+
+  @state()
+  private hcImportUrl = '';
+
+  @state()
+  private hcImportMode: 'url' | 'workspace' = 'url';
 
   @state()
   private membersGroup: AdminGroup | null = null;
@@ -735,8 +745,15 @@ export class ScionPageProjectSettings extends LitElement {
         this.projectId = match[1];
       }
     }
+    // Deep-link a specific Resources tab via ?tab= (e.g. ?tab=templates), used by
+    // the resource detail pages' "back" links.
+    if (typeof window !== 'undefined') {
+      const tab = new URLSearchParams(window.location.search).get('tab');
+      if (tab) {
+        this.activeResourcesTab = tab;
+      }
+    }
     void this.loadProject().then(() => this.loadMembersGroup());
-    void this.loadTemplates();
     void this.loadDropdownTemplates();
     void this.loadSettings();
     void this.loadHubTelemetryDefault();
@@ -809,21 +826,19 @@ export class ScionPageProjectSettings extends LitElement {
     }
   }
 
-  private async loadTemplates(): Promise<void> {
-    this.templatesLoading = true;
-    try {
-      const response = await apiFetch(
-        `/api/v1/templates?scope=project&projectId=${encodeURIComponent(this.projectId)}&status=active`
-      );
-      if (response.ok) {
-        const data = (await response.json()) as { templates?: Template[] } | Template[];
-        this.templates = Array.isArray(data) ? data : data.templates || [];
-      }
-    } catch (err) {
-      console.error('Failed to load templates:', err);
-    } finally {
-      this.templatesLoading = false;
-    }
+  /** Refresh the templates list component (e.g. after an import). */
+  private refreshTemplatesList(): void {
+    const list = this.shadowRoot?.querySelector('#templates-resource-list') as
+      | import('../shared/resource-list.js').ScionResourceList
+      | null;
+    void list?.load();
+  }
+
+  private refreshHarnessConfigsList(): void {
+    const list = this.shadowRoot?.querySelector('#harness-configs-resource-list') as
+      | import('../shared/resource-list.js').ScionResourceList
+      | null;
+    void list?.load();
   }
 
   private async loadDropdownTemplates(): Promise<void> {
@@ -1028,13 +1043,47 @@ export class ScionPageProjectSettings extends LitElement {
       }
 
       const data = (await response.json()) as { templates: string[]; count: number };
-      await Promise.all([this.loadTemplates(), this.loadDropdownTemplates()]);
+      this.refreshTemplatesList();
+      await this.loadDropdownTemplates();
       this.syncSuccess = `${data.count} template${data.count !== 1 ? 's' : ''} imported successfully.`;
     } catch (err) {
       console.error('Failed to import templates:', err);
       this.syncError = err instanceof Error ? err.message : 'Failed to import templates';
     } finally {
       this.syncLoading = false;
+    }
+  }
+
+  private async handleImportHarnessConfigs(): Promise<void> {
+    this.hcImportLoading = true;
+    this.hcImportError = null;
+    this.hcImportSuccess = null;
+
+    try {
+      const body =
+        this.hcImportMode === 'workspace'
+          ? { workspacePath: this.hcImportUrl || '/.scion/harness-configs' }
+          : { sourceUrl: this.hcImportUrl };
+      const response = await apiFetch(`/api/v1/projects/${this.projectId}/import-harness-configs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          await extractApiError(response, `Failed to import harness-configs: HTTP ${response.status}`)
+        );
+      }
+
+      const data = (await response.json()) as { harnessConfigs: string[]; count: number };
+      this.refreshHarnessConfigsList();
+      this.hcImportSuccess = `${data.count} harness-config${data.count !== 1 ? 's' : ''} imported successfully.`;
+    } catch (err) {
+      console.error('Failed to import harness-configs:', err);
+      this.hcImportError = err instanceof Error ? err.message : 'Failed to import harness-configs';
+    } finally {
+      this.hcImportLoading = false;
     }
   }
 
@@ -1757,6 +1806,7 @@ export class ScionPageProjectSettings extends LitElement {
           <sl-tab slot="nav" panel="secrets" ?active=${this.activeResourcesTab === 'secrets'}>Secrets</sl-tab>
           <sl-tab slot="nav" panel="shared-dirs" ?active=${this.activeResourcesTab === 'shared-dirs'}>Shared Directories</sl-tab>
           <sl-tab slot="nav" panel="templates" ?active=${this.activeResourcesTab === 'templates'}>Templates</sl-tab>
+          <sl-tab slot="nav" panel="harness-configs" ?active=${this.activeResourcesTab === 'harness-configs'}>Harness Configs</sl-tab>
           <sl-tab slot="nav" panel="gcp-sa" ?active=${this.activeResourcesTab === 'gcp-sa'}>GCP Service Accounts</sl-tab>
 
           <sl-tab-panel name="env-vars">
@@ -1784,6 +1834,10 @@ export class ScionPageProjectSettings extends LitElement {
 
           <sl-tab-panel name="templates">
             ${this.renderTemplatesContent()}
+          </sl-tab-panel>
+
+          <sl-tab-panel name="harness-configs">
+            ${this.renderHarnessConfigsContent()}
           </sl-tab-panel>
 
           <sl-tab-panel name="gcp-sa">
@@ -1890,37 +1944,120 @@ export class ScionPageProjectSettings extends LitElement {
             </div>
           `
         : ''}
-      ${this.templatesLoading && !this.syncLoading
-        ? html`<div class="empty-templates"><sl-spinner></sl-spinner></div>`
-        : this.templates.length > 0
+      <scion-resource-list
+        id="templates-resource-list"
+        kind="template"
+        scope="project"
+        .scopeId=${this.projectId}
+        detailBasePath="/projects/${this.projectId}"
+      ></scion-resource-list>
+    `;
+  }
+
+  private renderHarnessConfigsContent() {
+    const canSync = canAny(this.project!._capabilities, 'update', 'manage');
+    return html`
+      <div class="section-header" style="margin-bottom: 1rem;">
+        <div class="section-header-text">
+          <p style="margin: 0;">
+            Project-scoped harness configurations imported into the Hub. Open one to browse
+            and edit its files.
+          </p>
+        </div>
+        ${canSync
           ? html`
-              <div class="template-list">
-                ${this.templates.map(
-                  (t) => html`
-                    <a href="/projects/${this.projectId}/templates/${t.id}" class="template-item" style="text-decoration: none; color: inherit; cursor: pointer;">
-                      <sl-icon name="file-earmark-code"></sl-icon>
-                      <div class="template-info">
-                        <div class="template-name">${t.displayName || t.name}</div>
-                        ${t.description
-                          ? html`<div class="template-meta">${t.description}</div>`
-                          : ''}
-                      </div>
-                      ${t.harness ? html`<span class="template-badge">${t.harness}</span>` : ''}
-                      <sl-icon name="chevron-right" style="color: var(--sl-color-neutral-400); font-size: 0.875rem;"></sl-icon>
-                    </a>
-                  `
-                )}
-              </div>
+              <sl-button
+                size="small"
+                variant="default"
+                ?loading=${this.hcImportLoading}
+                ?disabled=${this.hcImportLoading || (this.hcImportMode === 'url' && !this.hcImportUrl)}
+                @click=${() => this.handleImportHarnessConfigs()}
+              >
+                <sl-icon slot="prefix" name="download"></sl-icon>
+                Import Harness Configs
+              </sl-button>
             `
-          : html`
-              <div class="empty-templates">
-                <sl-icon name="file-earmark"></sl-icon>
-                <p>No project templates imported yet.</p>
-                ${canSync
-                  ? html`<p>Enter a source above and click "Import Templates" to import.</p>`
-                  : ''}
+          : ''}
+      </div>
+      ${canSync
+        ? html`
+            <div style="margin-bottom: 1rem;">
+              <sl-radio-group
+                size="small"
+                value=${this.hcImportMode}
+                style="margin-bottom: 0.5rem;"
+                @sl-change=${(e: Event) => {
+                  this.hcImportMode = (e.target as HTMLInputElement).value as 'url' | 'workspace';
+                  this.hcImportUrl = '';
+                  this.hcImportError = null;
+                  this.hcImportSuccess = null;
+                  if (this.hcImportMode === 'url' && this.project?.gitRemote) {
+                    this.hcImportUrl = this.project.gitRemote;
+                  }
+                }}
+              >
+                <sl-radio-button value="url">Import from URL</sl-radio-button>
+                <sl-radio-button value="workspace">Import from workspace</sl-radio-button>
+              </sl-radio-group>
+              <sl-input
+                placeholder=${this.hcImportMode === 'workspace'
+                  ? '/.scion/harness-configs'
+                  : 'https://github.com/org/repo/tree/main/.scion/harness-configs'}
+                size="small"
+                clearable
+                .value=${this.hcImportUrl}
+                ?disabled=${this.hcImportLoading}
+                @sl-input=${(e: Event) => {
+                  this.hcImportUrl = (e.target as HTMLInputElement).value;
+                }}
+                @sl-clear=${() => {
+                  this.hcImportUrl = '';
+                }}
+              >
+                <sl-icon slot="prefix" name=${this.hcImportMode === 'workspace' ? 'folder' : 'github'}></sl-icon>
+              </sl-input>
+              <div style="margin-top: 0.25rem; font-size: 0.75rem; color: var(--sl-color-neutral-500);">
+                ${this.hcImportMode === 'workspace'
+                  ? 'Path within the project workspace — the default will be used if no path is provided'
+                  : 'GitHub URL to a harness-config or harness-configs directory — supports arbitrary deep paths'}
               </div>
-            `}
+            </div>
+          `
+        : ''}
+
+      ${this.hcImportLoading
+        ? html`
+            <div class="sync-status syncing">
+              <sl-spinner style="font-size: 0.875rem;"></sl-spinner>
+              ${this.hcImportMode === 'workspace'
+                ? `Importing harness-configs from workspace ${this.hcImportUrl || '/.scion/harness-configs'}...`
+                : `Importing harness-configs from ${this.hcImportUrl}...`}
+            </div>
+          `
+        : ''}
+      ${this.hcImportError
+        ? html`
+            <div class="sync-status error">
+              <sl-icon name="exclamation-triangle"></sl-icon>
+              ${this.hcImportError}
+            </div>
+          `
+        : ''}
+      ${this.hcImportSuccess
+        ? html`
+            <div class="sync-status success">
+              <sl-icon name="check-circle"></sl-icon>
+              ${this.hcImportSuccess}
+            </div>
+          `
+        : ''}
+      <scion-resource-list
+        id="harness-configs-resource-list"
+        kind="harness-config"
+        scope="project"
+        .scopeId=${this.projectId}
+        detailBasePath="/projects/${this.projectId}"
+      ></scion-resource-list>
     `;
   }
 

@@ -90,7 +90,8 @@ func (m *mockTemplateService) DownloadFile(ctx context.Context, url string) ([]b
 
 // mockHubClient is a mock implementation of hubclient.Client.
 type mockHubClient struct {
-	templates hubclient.TemplateService
+	templates      hubclient.TemplateService
+	harnessConfigs hubclient.HarnessConfigService
 }
 
 func (m *mockHubClient) Agents() hubclient.AgentService                                   { return nil }
@@ -98,7 +99,7 @@ func (m *mockHubClient) ProjectAgents(projectID string) hubclient.AgentService  
 func (m *mockHubClient) Projects() hubclient.ProjectService                               { return nil }
 func (m *mockHubClient) RuntimeBrokers() hubclient.RuntimeBrokerService                   { return nil }
 func (m *mockHubClient) Templates() hubclient.TemplateService                             { return m.templates }
-func (m *mockHubClient) HarnessConfigs() hubclient.HarnessConfigService                   { return nil }
+func (m *mockHubClient) HarnessConfigs() hubclient.HarnessConfigService                   { return m.harnessConfigs }
 func (m *mockHubClient) Workspace() hubclient.WorkspaceService                            { return nil }
 func (m *mockHubClient) Users() hubclient.UserService                                     { return nil }
 func (m *mockHubClient) Env() hubclient.EnvService                                        { return nil }
@@ -187,9 +188,9 @@ func TestHydrateWithHash(t *testing.T) {
 	// Pre-populate cache
 	files := map[string][]byte{"test.txt": []byte("cached content")}
 	contentHash := "known-hash"
-	cachedPath, err := cache.Store("tmpl-999", contentHash, files)
+	cachedPath, err := cache.Put(contentHash, files)
 	if err != nil {
-		t.Fatalf("Store() error = %v", err)
+		t.Fatalf("Put() error = %v", err)
 	}
 
 	// Create hydrator with mock that should not be called
@@ -396,7 +397,7 @@ func TestPrefetchTemplate(t *testing.T) {
 	}
 
 	// Verify it's cached
-	path, ok := cache.Get("tmpl-prefetch", "prefetch-hash")
+	path, ok := cache.Get("prefetch-hash")
 	if !ok {
 		t.Error("Template should be cached after prefetch")
 	}

@@ -36,6 +36,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
@@ -142,6 +143,13 @@ type ServerConfig struct {
 	// with access to projected secrets. Defaults to true; set false to block
 	// container-script dispatches on this broker.
 	AllowContainerScriptHarnesses bool
+
+	// ColocatedStorage is the storage backend of a Hub running co-located in the
+	// same process. When set and backed by the local filesystem, the broker
+	// resolves resources for the co-located connection by reading directly from
+	// disk instead of hydrating over HTTP. Leave nil for remote-only brokers or
+	// when the co-located Hub uses a non-local backend.
+	ColocatedStorage storage.Storage
 }
 
 // DefaultServerConfig returns the default server configuration.
@@ -178,6 +186,11 @@ type Server struct {
 
 	// Shared template cache (content-addressed, hub-neutral)
 	cache *templatecache.Cache
+
+	// Shared harness-config cache (content-addressed). Partitioned from the
+	// template cache by directory so the two kinds never share eviction
+	// accounting or collide on identical-content hashes.
+	hcCache *templatecache.Cache
 
 	// Multi-key auth middleware
 	brokerAuthMiddleware *MultiKeyBrokerAuthMiddleware
@@ -331,6 +344,16 @@ func (s *Server) initHubIntegration() error {
 	}
 	s.cache = cache
 
+	// 1b. Initialize the harness-config cache alongside the template cache,
+	// under a sibling directory so the two content-addressed stores stay
+	// independent.
+	hcCacheDir := filepath.Join(filepath.Dir(cacheDir), "harness-configs")
+	hcCache, err := templatecache.New(hcCacheDir, maxSize)
+	if err != nil {
+		return fmt.Errorf("failed to initialize harness-config cache: %w", err)
+	}
+	s.hcCache = hcCache
+
 	// 2. Initialize hub connections map (already done in New)
 
 	// 3. Handle InMemoryCredentials -> "local" connection (co-located mode)
@@ -347,11 +370,13 @@ func (s *Server) initHubIntegration() error {
 			// instead of the HTTP heartbeat service.
 			conn.IsColocated = true
 
-			// Set templates dir for direct filesystem resolution, bypassing
-			// the Hub API → storage → cache hydration round-trip.
-			homeDir, homeErr := os.UserHomeDir()
-			if homeErr == nil {
-				conn.TemplatesDir = filepath.Join(homeDir, ".scion", "templates")
+			// When the co-located Hub's storage backend is the local filesystem,
+			// resolve resources by reading directly from disk — the backend IS
+			// the source of truth, so no signed-URL/HTTP download or cache is
+			// needed. A non-local co-located backend (e.g. GCS) hydrates through
+			// the cache like any other broker.
+			if stor := s.config.ColocatedStorage; stor != nil && stor.Provider() == storage.ProviderLocal {
+				conn.LocalStorage = stor
 			}
 
 			s.hubMu.Lock()
@@ -456,10 +481,14 @@ func (s *Server) createHubConnection(name string, creds *brokercredentials.Broke
 		return nil, fmt.Errorf("failed to create Hub client: %w", err)
 	}
 
-	// Create hydrator using shared cache
+	// Create hydrator + harness-config resolver using shared caches
 	var hydrator *templatecache.Hydrator
 	if s.cache != nil {
 		hydrator = templatecache.NewHydrator(s.cache, client)
+	}
+	var hcResolver *templatecache.Resolver
+	if s.hcCache != nil {
+		hcResolver = templatecache.NewHarnessConfigResolver(s.hcCache, client)
 	}
 
 	conn := &HubConnection{
@@ -471,6 +500,7 @@ func (s *Server) createHubConnection(name string, creds *brokercredentials.Broke
 		SecretKey:   secretKey,
 		HubClient:   client,
 		Hydrator:    hydrator,
+		HCResolver:  hcResolver,
 		Status:      ConnectionStatusDisconnected,
 	}
 
@@ -499,6 +529,10 @@ func (s *Server) createHubConnectionFromConfig() (*HubConnection, error) {
 	if s.cache != nil {
 		hydrator = templatecache.NewHydrator(s.cache, client)
 	}
+	var hcResolver *templatecache.Resolver
+	if s.hcCache != nil {
+		hcResolver = templatecache.NewHarnessConfigResolver(s.hcCache, client)
+	}
 
 	conn := &HubConnection{
 		Name:        "default",
@@ -506,6 +540,7 @@ func (s *Server) createHubConnectionFromConfig() (*HubConnection, error) {
 		BrokerID:    s.config.BrokerID,
 		HubClient:   client,
 		Hydrator:    hydrator,
+		HCResolver:  hcResolver,
 		Status:      ConnectionStatusDisconnected,
 	}
 
@@ -707,6 +742,9 @@ func (s *Server) SetHubClient(client hubclient.Client) {
 	if s.cache != nil {
 		conn.Hydrator = templatecache.NewHydrator(s.cache, client)
 	}
+	if s.hcCache != nil {
+		conn.HCResolver = templatecache.NewHarnessConfigResolver(s.hcCache, client)
+	}
 }
 
 // SetTemplateCache sets the template cache.
@@ -718,6 +756,9 @@ func (s *Server) SetTemplateCache(cache *templatecache.Cache) {
 	for _, conn := range s.hubConnections {
 		if conn.HubClient != nil {
 			conn.Hydrator = templatecache.NewHydrator(cache, conn.HubClient)
+			if s.hcCache != nil {
+				conn.HCResolver = templatecache.NewHarnessConfigResolver(s.hcCache, conn.HubClient)
+			}
 		}
 	}
 }

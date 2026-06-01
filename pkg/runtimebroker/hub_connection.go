@@ -24,6 +24,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
@@ -52,6 +53,7 @@ type HubConnection struct {
 
 	HubClient      hubclient.Client
 	Hydrator       *templatecache.Hydrator
+	HCResolver     *templatecache.Resolver // harness-config hydrator
 	Heartbeat      *HeartbeatService
 	ControlChannel *ControlChannelClient
 
@@ -59,11 +61,13 @@ type HubConnection struct {
 	// the same process.
 	IsColocated bool
 
-	// TemplatesDir is the local filesystem path to the templates directory
-	// (e.g., ~/.scion/templates). When set on a co-located connection, the
-	// broker resolves templates directly from this directory instead of
-	// going through the Hub API → storage → cache hydration round-trip.
-	TemplatesDir string
+	// LocalStorage is the co-located Hub's storage backend when it is backed by
+	// the local filesystem. When set, the broker resolves resources by reading
+	// directly from the backend's on-disk location, bypassing the signed-URL/
+	// HTTP download path and the hydration cache entirely. It is nil for remote
+	// connections and for co-located hubs using a non-local backend (e.g. GCS),
+	// which hydrate through the cache like any other remote broker.
+	LocalStorage storage.Storage
 
 	Status ConnectionStatus
 	mu     sync.RWMutex
@@ -225,6 +229,9 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	// Rebuild hydrator using shared cache
 	if server.cache != nil {
 		hc.Hydrator = templatecache.NewHydrator(server.cache, client)
+	}
+	if server.hcCache != nil {
+		hc.HCResolver = templatecache.NewHarnessConfigResolver(server.hcCache, client)
 	}
 
 	slog.Info("Hub connection reinitialized", "name", hc.Name, "brokerID", creds.BrokerID)

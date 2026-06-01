@@ -711,7 +711,7 @@ func (s *Server) createAgentInProject(
 	// Apply project-level defaults (harness config, limits, resources) from annotations
 	applyProjectDefaults(agent.AppliedConfig, project)
 
-	s.populateAgentConfig(agent, project, resolvedTemplate)
+	s.populateAgentConfig(ctx, agent, project, resolvedTemplate)
 
 	if err := s.store.CreateAgent(ctx, agent); err != nil {
 		writeErrorFromErr(w, err, "")
@@ -4510,6 +4510,12 @@ func (s *Server) handleProjectRoutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for nested /import-harness-configs path
+	if subPath == "import-harness-configs" {
+		s.handleProjectImportHarnessConfigs(w, r, projectID)
+		return
+	}
+
 	// Check for nested /dav/ path (WebDAV endpoint for project workspace sync)
 	if strings.HasPrefix(subPath, "dav") {
 		davPath := strings.TrimPrefix(subPath, "dav")
@@ -6240,9 +6246,10 @@ type ListTemplatesResponse struct {
 
 // ListHarnessConfigsResponse is the response for listing harness configs.
 type ListHarnessConfigsResponse struct {
-	HarnessConfigs []store.HarnessConfig `json:"harnessConfigs"`
-	NextCursor     string                `json:"nextCursor,omitempty"`
-	TotalCount     int                   `json:"totalCount"`
+	HarnessConfigs []HarnessConfigWithCapabilities `json:"harnessConfigs"`
+	NextCursor     string                          `json:"nextCursor,omitempty"`
+	TotalCount     int                             `json:"totalCount"`
+	Capabilities   *Capabilities                   `json:"_capabilities,omitempty"`
 }
 
 func (s *Server) handleTemplates(w http.ResponseWriter, r *http.Request) {
@@ -8566,6 +8573,24 @@ func (s *Server) getHarnessConfigFromTemplate(template *store.Template, fallback
 	return fallback
 }
 
+// lookupHarnessConfigRecord resolves a harness-config reference (name or slug)
+// to its Hub record, checking project scope first then global — the same
+// precedence the broker uses for on-disk lookup. Returns nil if not found.
+func (s *Server) lookupHarnessConfigRecord(ctx context.Context, projectID, ref string) *store.HarnessConfig {
+	if ref == "" {
+		return nil
+	}
+	if projectID != "" {
+		if hc, err := s.store.GetHarnessConfigBySlug(ctx, ref, store.HarnessConfigScopeProject, projectID); err == nil && hc != nil {
+			return hc
+		}
+	}
+	if hc, err := s.store.GetHarnessConfigBySlug(ctx, ref, store.HarnessConfigScopeGlobal, ""); err == nil && hc != nil {
+		return hc
+	}
+	return nil
+}
+
 // buildAppliedConfig constructs an AgentAppliedConfig from a CreateAgentRequest.
 // When req.Config is a ScionConfig, its fields are extracted into the applied config
 // and the full ScionConfig is preserved as InlineConfig for threading to the broker.
@@ -8608,7 +8633,7 @@ func (s *Server) buildAppliedConfig(req CreateAgentRequest, harnessConfig string
 // template-derived fields after the initial config block has been set up.
 // It populates GitClone config from project labels for git-anchored projects, and
 // sets template ID, hash, and hub access scopes from the resolved template.
-func (s *Server) populateAgentConfig(agent *store.Agent, project *store.Project, resolvedTemplate *store.Template) {
+func (s *Server) populateAgentConfig(ctx context.Context, agent *store.Agent, project *store.Project, resolvedTemplate *store.Template) {
 	if agent.AppliedConfig == nil {
 		return
 	}
@@ -8688,6 +8713,25 @@ func (s *Server) populateAgentConfig(agent *store.Agent, project *store.Project,
 					agent.AppliedConfig.InlineConfig.Telemetry = resolvedTemplate.Config.Telemetry
 				}
 			}
+		}
+	}
+
+	// Resolve the harness-config name to a Hub record so the broker can hydrate
+	// it from the configured storage backend, mirroring template hydration.
+	// Without this a remote broker can only use harness-configs that happen to
+	// exist on its local filesystem (see resource-storage-refactor §4/§7.3 step 4).
+	hcRef := agent.AppliedConfig.HarnessConfig
+	if hcRef == "" && resolvedTemplate != nil {
+		hcRef = s.getHarnessConfigFromTemplate(resolvedTemplate, "")
+	}
+	if hcRef != "" {
+		projectID := ""
+		if project != nil {
+			projectID = project.ID
+		}
+		if hc := s.lookupHarnessConfigRecord(ctx, projectID, hcRef); hc != nil {
+			agent.AppliedConfig.HarnessConfigID = hc.ID
+			agent.AppliedConfig.HarnessConfigHash = hc.ContentHash
 		}
 	}
 
@@ -9324,5 +9368,110 @@ func (s *Server) handleProjectImportTemplates(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, ImportTemplatesResponse{
 		Templates: imported,
 		Count:     len(imported),
+	})
+}
+
+// ============================================================================
+// Project Harness-Config Import
+// ============================================================================
+
+// ImportHarnessConfigsRequest is the request body for direct harness-config
+// import. Exactly one of SourceURL or WorkspacePath should be provided.
+type ImportHarnessConfigsRequest struct {
+	SourceURL     string `json:"sourceUrl"`
+	WorkspacePath string `json:"workspacePath"`
+}
+
+// ImportHarnessConfigsResponse is returned after a direct harness-config import
+// completes.
+type ImportHarnessConfigsResponse struct {
+	HarnessConfigs []string `json:"harnessConfigs"`
+	Count          int      `json:"count"`
+}
+
+// handleProjectImportHarnessConfigs imports harness-configs directly from a
+// remote URL or the project workspace into the project's harness-config store,
+// mirroring handleProjectImportTemplates.
+func (s *Server) handleProjectImportHarnessConfigs(w http.ResponseWriter, r *http.Request, projectID string) {
+	if r.Method != http.MethodPost {
+		MethodNotAllowed(w)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Authorize the caller
+	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+		if !agentIdent.HasScope(ScopeAgentCreate) {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Missing required scope: project:agent:create", nil)
+			return
+		}
+		if projectID != agentIdent.ProjectID() {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Agents can only import harness-configs within their own project", nil)
+			return
+		}
+	} else if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
+		decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
+			Type:       "agent",
+			ParentType: "project",
+			ParentID:   projectID,
+		}, ActionCreate)
+		if !decision.Allowed {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"You don't have permission to import harness-configs in this project", nil)
+			return
+		}
+	} else {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+		return
+	}
+
+	var req ImportHarnessConfigsRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid request body", nil)
+		return
+	}
+
+	if req.SourceURL != "" && req.WorkspacePath != "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Exactly one of sourceUrl or workspacePath must be provided", nil)
+		return
+	}
+
+	if req.SourceURL == "" && req.WorkspacePath == "" {
+		// Default workspace path when neither is provided
+		req.WorkspacePath = "/.scion/harness-configs"
+	}
+
+	// Verify project exists
+	project, err := s.store.GetProject(ctx, projectID)
+	if err != nil {
+		if err == store.ErrNotFound {
+			NotFound(w, "Project")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	if s.GetStorage() == nil {
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "Harness-config storage is not configured", nil)
+		return
+	}
+
+	var imported []string
+	if req.WorkspacePath != "" {
+		imported, err = s.importHarnessConfigsFromWorkspace(ctx, project, req.WorkspacePath)
+	} else {
+		req.SourceURL = config.NormalizeTemplateSourceURL(req.SourceURL)
+		imported, err = s.importHarnessConfigsFromRemote(ctx, projectID, req.SourceURL)
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "import_failed", err.Error(), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ImportHarnessConfigsResponse{
+		HarnessConfigs: imported,
+		Count:          len(imported),
 	})
 }

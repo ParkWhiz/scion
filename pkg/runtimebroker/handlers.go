@@ -17,6 +17,7 @@ package runtimebroker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
 )
 
@@ -762,10 +764,14 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, resp)
 }
 
-// hydrateTemplate fetches and caches a template from the Hub if template info is provided.
+// hydrateTemplate resolves a Hub template to a local directory for provisioning.
 // Returns the local template path, or empty string if no Hub template was specified.
-// For co-located connections with a TemplatesDir, it resolves the template directly
-// from the local filesystem, bypassing the Hub API round-trip entirely.
+//
+// Resolution always goes through the connection's storage backend — there is a
+// single read path for every topology. When the backend is the local filesystem
+// (co-located workstation mode) the broker reads the resource directly from the
+// backend's on-disk location; otherwise it hydrates from remote storage via
+// signed URLs and the content-addressed cache.
 func (s *Server) hydrateTemplate(ctx context.Context, cfg *CreateAgentConfig, conn *HubConnection) (string, error) {
 	// Check if we have template info from Hub
 	if cfg.TemplateID == "" && cfg.TemplateHash == "" {
@@ -773,15 +779,21 @@ func (s *Server) hydrateTemplate(ctx context.Context, cfg *CreateAgentConfig, co
 		return "", nil
 	}
 
-	// Co-located shortcut: resolve directly from the local templates directory.
-	// This means edits to ~/.scion/templates/<name> are picked up immediately
-	// without needing to re-sync through Hub storage and cache.
-	if conn.IsColocated && conn.TemplatesDir != "" && cfg.Template != "" {
-		localPath := filepath.Join(conn.TemplatesDir, cfg.Template)
-		if info, err := os.Stat(localPath); err == nil && info.IsDir() {
-			return localPath, nil
+	// Local-backend direct read: the backend is the filesystem, so resolution is
+	// a local path read — no HTTP, no cache.
+	if conn.LocalStorage != nil {
+		ref := cfg.TemplateID
+		if ref == "" {
+			ref = cfg.Template
 		}
-		// Fall through to hydration if local path doesn't exist
+		path, err := s.resolveLocalResource(ctx, storage.ResourceKindTemplate, ref, conn)
+		if err != nil {
+			return "", err
+		}
+		if path != "" {
+			return path, nil
+		}
+		// Not present in the backend yet — fall through to hydration.
 	}
 
 	hydrator := conn.Hydrator
@@ -800,6 +812,129 @@ func (s *Server) hydrateTemplate(ctx context.Context, cfg *CreateAgentConfig, co
 	}
 
 	return "", nil
+}
+
+// hydrateHarnessConfig resolves a Hub harness-config to a local directory for
+// provisioning, mirroring hydrateTemplate. Returns the local directory path, or
+// an empty string when no Hub harness-config was specified (the broker then
+// falls back to its on-disk harness-config search). This is the §7.3 step-4
+// consume path that makes harness-configs usable from a broker that lacks the
+// config on its local filesystem.
+func (s *Server) hydrateHarnessConfig(ctx context.Context, cfg *CreateAgentConfig, conn *HubConnection) (string, error) {
+	if cfg == nil || (cfg.HarnessConfigID == "" && cfg.HarnessConfigHash == "") {
+		return "", nil
+	}
+
+	// Local-backend direct read (co-located workstation mode).
+	if conn.LocalStorage != nil {
+		ref := cfg.HarnessConfigID
+		if ref == "" {
+			ref = cfg.HarnessConfig
+		}
+		path, err := s.resolveLocalResource(ctx, storage.ResourceKindHarnessConfig, ref, conn)
+		if err != nil {
+			return "", err
+		}
+		if path != "" {
+			return path, nil
+		}
+		// Not present in the backend yet — fall through to hydration.
+	}
+
+	resolver := conn.HCResolver
+	if resolver == nil {
+		return "", nil
+	}
+
+	if cfg.HarnessConfigHash != "" && cfg.HarnessConfigID != "" {
+		return resolver.ResolveWithHash(ctx, cfg.HarnessConfigID, cfg.HarnessConfigHash)
+	}
+	if cfg.HarnessConfigID != "" {
+		return resolver.Resolve(ctx, cfg.HarnessConfigID)
+	}
+
+	return "", nil
+}
+
+// localObjectResolver is implemented by storage backends (the local filesystem
+// backend) that can map an object path to an absolute on-disk path. This is the
+// LocalDirBackend seam from §7.3: one assertion, used for every resource kind.
+type localObjectResolver interface {
+	ObjectFSPath(objectPath string) string
+}
+
+// resolveLocalResource resolves a resource of the given kind directly from a
+// co-located local storage backend. It returns the on-disk directory backing the
+// resource, or an empty string if the backend cannot serve it directly (caller
+// then falls back to hydration). Metadata is fetched from the Hub to learn the
+// resource's scope/slug; over a co-located loopback connection this is a cheap
+// DB read.
+func (s *Server) resolveLocalResource(ctx context.Context, kind storage.ResourceKind, ref string, conn *HubConnection) (string, error) {
+	resolver, ok := conn.LocalStorage.(localObjectResolver)
+	if !ok || conn.HubClient == nil || ref == "" {
+		return "", nil
+	}
+
+	objectPath, err := s.resourceObjectPath(ctx, kind, ref, conn)
+	if err != nil {
+		return "", err
+	}
+	if objectPath == "" {
+		return "", nil
+	}
+
+	dir := resolver.ObjectFSPath(objectPath)
+	info, statErr := os.Stat(dir)
+	if statErr != nil || !info.IsDir() {
+		// Backend doesn't have the files on disk; let the caller hydrate.
+		return "", nil
+	}
+	return dir, nil
+}
+
+// resourceObjectPath fetches resource metadata over the hub connection and
+// returns its storage object path, falling back to the kind-keyed scope layout
+// when the record carries no explicit StoragePath.
+func (s *Server) resourceObjectPath(ctx context.Context, kind storage.ResourceKind, ref string, conn *HubConnection) (string, error) {
+	switch kind {
+	case storage.ResourceKindHarnessConfig:
+		hc, err := conn.HubClient.HarnessConfigs().Get(ctx, ref)
+		if err != nil {
+			return "", wrapResourceMetaErr(err, "harness-config")
+		}
+		if hc == nil {
+			return "", nil
+		}
+		if hc.StoragePath != "" {
+			return hc.StoragePath, nil
+		}
+		return storage.ResourceStoragePath(kind, hc.Scope, hc.ScopeID, hc.Slug), nil
+	default:
+		tmpl, err := conn.HubClient.Templates().Get(ctx, ref)
+		if err != nil {
+			return "", wrapResourceMetaErr(err, "template")
+		}
+		if tmpl == nil {
+			return "", nil
+		}
+		if tmpl.StoragePath != "" {
+			return tmpl.StoragePath, nil
+		}
+		scopeID := tmpl.ScopeID
+		if scopeID == "" {
+			scopeID = tmpl.ProjectID
+		}
+		return storage.ResourceStoragePath(kind, tmpl.Scope, scopeID, tmpl.Slug), nil
+	}
+}
+
+// wrapResourceMetaErr normalizes a hub metadata-fetch error, preserving the
+// HubConnectivityError signal used by the provision path.
+func wrapResourceMetaErr(err error, label string) error {
+	if templatecache.IsHubConnectivityError(err) {
+		return &templatecache.HubConnectivityError{Cause: err}
+	}
+	return fmt.Errorf("failed to get %s metadata: %w", label, err)
 }
 
 func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
