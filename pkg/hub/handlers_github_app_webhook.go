@@ -1322,9 +1322,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		}
 	}
 
-	// 1. Look for an active (running) agent labeled with this PR (unless command is /review, /validate, /plan, or /implement)
+	// 1. Look for an active (running) agent labeled with this PR (unless command is /review, /validate, or /implement)
 	var activeAgent *store.Agent
-	if cmd != "/review" && cmd != "/validate" && cmd != "/plan" && cmd != "/implement" {
+	if cmd != "/review" && cmd != "/validate" && cmd != "/implement" {
 		var err error
 		activeAgent, err = s.findActiveAgentForPR(ctx, p.ID, prNumber, repoFullName)
 		if err != nil {
@@ -1332,10 +1332,11 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			return
 		}
 
-		// Only route /fix to an active agent if its template matches the targetTemplate
-		if cmd == "/fix" && activeAgent != nil {
+		// Only route /fix and /plan to an active agent if its template matches the targetTemplate
+		if (cmd == "/fix" || cmd == "/plan") && activeAgent != nil {
 			if activeAgent.Template != targetTemplate {
-				slog.Info("Active agent template mismatch for /fix command. Spawning a new agent with matching template instead.",
+				slog.Info("Active agent template mismatch for command. Spawning a new agent with matching template instead.",
+					"command", cmd,
 					"active_agent_id", activeAgent.ID,
 					"active_agent_template", activeAgent.Template,
 					"required_template", targetTemplate,
@@ -1363,6 +1364,20 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				"project_name", p.Name,
 				"agent_id", activeAgent.ID,
 				"fix_instruction", msgText,
+			)
+		} else if cmd == "/plan" {
+			planText := extractTextAfterCommand(body, "/plan")
+			if planText != "" {
+				msgText = fmt.Sprintf("Please refine/revise the plan based on the following feedback: %s", planText)
+			} else {
+				msgText = "Please refine/revise the plan based on the discussion above."
+			}
+			slog.Info("Routing /plan command to active agent in project/grove",
+				"command", cmd,
+				"project_id", p.ID,
+				"project_name", p.Name,
+				"agent_id", activeAgent.ID,
+				"plan_instruction", msgText,
 			)
 		}
 
@@ -1460,14 +1475,14 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				if planText == "" {
 					planText = prompt
 				}
-				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. You must ONLY plan the changes requested based on the codebase in this workspace. Do NOT execute or apply any code changes. Write a detailed design and implementation plan, then post the complete plan back to the GitHub Issue #%d in repository %s using a comment. The requested item to plan is: %s", repoFull, prNum, repoFull, planText)
+				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. You must ONLY plan the changes requested based on the codebase in this workspace. Do NOT execute or apply any code changes. To allow revising or refining any existing plans based on user feedback, use the GitHub CLI 'gh' or the GitHub API to fetch and inspect the full description of Issue #%d as well as all of its comments. If an existing plan is already present in the comments, incorporate any feedback or requests from the comments and write a revised, complete design and implementation plan, then post it back to GitHub Issue #%d using a comment. The requested planning instruction is: %s", repoFull, prNum, prNum, planText)
 				labels["github-action"] = "plan"
 			} else if command == "/implement" {
 				implementText := extractTextAfterCommand(prompt, "/implement")
 				if implementText == "" {
 					implementText = prompt
 				}
-				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. Implement the plan referenced in GitHub Issue #%d for this repository. To locate the implementation plan, use the GitHub CLI 'gh' or the GitHub API to fetch and inspect the full description of Issue #%d as well as all of its comments. Once you find the plan details in the comments or description, implement it in this workspace. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", repoFull, prNum, prNum, prNum, implementText)
+				taskDesc = fmt.Sprintf("You are working in a local workspace directory that is a checkout of the repository %s. Implement the plan referenced in GitHub Issue #%d for this repository. To locate the plan, use the GitHub CLI 'gh' or the GitHub API to fetch and inspect the full description of Issue #%d as well as all of its comments. If the plan has been updated or revised in subsequent comments, make sure to use the most recently posted (latest revised) version of the plan for execution. Once you find and parse the correct plan details, implement them in this workspace. When you are finished and everything is verified, create a new GitHub Pull Request containing your implementation, and make sure to include a detailed summary of the plan, the work done, and a reference back to the original Issue #%d. The requested implementation instructions are: %s", repoFull, prNum, prNum, prNum, implementText)
 				labels["github-action"] = "implement"
 			}
 
@@ -1481,8 +1496,10 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 
 			agentName := fmt.Sprintf("pr-%d-agent-%d", prNum, time.Now().UnixNano()/1e6)
-			if command == "/plan" || command == "/implement" {
-				agentName = fmt.Sprintf("issue-%d-agent-%d", prNum, time.Now().UnixNano()/1e6)
+			if command == "/plan" {
+				agentName = fmt.Sprintf("issue-%d-agent-planner", prNum)
+			} else if command == "/implement" {
+				agentName = fmt.Sprintf("issue-%d-agent-implementer", prNum)
 			}
 
 			// C: Construct a new agent creation request
@@ -1513,17 +1530,34 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			} else {
 				slog.Info("Successfully spawned dynamic agent from webhook", "project_id", proj.ID, "agent_name", req.Name)
 
-				if command == "/implement" {
+				var agentID string
+				var createResp CreateAgentResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &createResp); err == nil && createResp.Agent != nil {
+					agentID = createResp.Agent.ID
+				}
+
+				if command == "/implement" || command == "/plan" {
 					client, err := s.getGitHubAppClient()
 					if err == nil {
 						parts := strings.SplitN(repoFull, "/", 2)
 						if len(parts) == 2 {
 							owner, repo := parts[0], parts[1]
-							confirmMsg := fmt.Sprintf("🤖 Scion has successfully received your request and started implementing the plan for Issue #%d.", prNum)
-							if err := s.postPRCommentWithFallback(bgCtx, client, installID, owner, repo, prNum, confirmMsg); err != nil {
-								slog.Error("Failed to post implementation start confirmation to GitHub", "repo", repoFull, "pr", prNum, "error", err)
+							var confirmMsg string
+							if command == "/plan" {
+								confirmMsg = fmt.Sprintf("🤖 Scion has successfully received your request and started planning the changes for Issue #%d.", prNum)
 							} else {
-								slog.Info("Posted implementation start confirmation to GitHub", "repo", repoFull, "pr", prNum)
+								confirmMsg = fmt.Sprintf("🤖 Scion has successfully received your request and started implementing the plan for Issue #%d.", prNum)
+							}
+
+							if agentID != "" && s.config.HubEndpoint != "" {
+								link := fmt.Sprintf("%s/agents/%s", strings.TrimSuffix(s.config.HubEndpoint, "/"), agentID)
+								confirmMsg += fmt.Sprintf("\n\nYou can view the agent's progress [here](%s).", link)
+							}
+
+							if err := s.postPRCommentWithFallback(bgCtx, client, installID, owner, repo, prNum, confirmMsg); err != nil {
+								slog.Error("Failed to post starting confirmation to GitHub", "command", command, "repo", repoFull, "pr", prNum, "error", err)
+							} else {
+								slog.Info("Posted starting confirmation to GitHub", "command", command, "repo", repoFull, "pr", prNum)
 							}
 						}
 					}
