@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -628,6 +629,11 @@ func (s *Server) createAgentInProject(
 		harnessConfig = s.getHarnessConfigFromTemplate(resolvedTemplate, "")
 	}
 
+	var validCreatedBy string
+	if _, err := uuid.Parse(createdBy); err == nil {
+		validCreatedBy = createdBy
+	}
+
 	agent := &store.Agent{
 		ID:              api.NewUUID(),
 		Slug:            slug,
@@ -638,8 +644,8 @@ func (s *Server) createAgentInProject(
 		Phase:           string(state.PhaseCreated),
 		Labels:          req.Labels,
 		Visibility:      store.VisibilityPrivate,
-		CreatedBy:       createdBy,
-		OwnerID:         createdBy,
+		CreatedBy:       validCreatedBy,
+		OwnerID:         validCreatedBy,
 		Ancestry:        ancestry,
 	}
 

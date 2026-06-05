@@ -786,7 +786,7 @@ func TestHandleGitHubWebhook_CommentMention(t *testing.T) {
 
 	// Create a project with a matching git remote
 	project := &store.Project{
-		ID:        "proj-mention-1",
+		ID:        tid("proj-mention-1"),
 		Name:      "Proj Mention 1",
 		Slug:      "proj-mention-1",
 		GitRemote: "https://github.com/acme/widgets.git",
