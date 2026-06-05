@@ -259,10 +259,11 @@ type V1ServerConfig struct {
 	Database  *V1DatabaseConfig  `json:"database,omitempty" yaml:"database,omitempty" koanf:"database"`
 	Auth      *V1AuthConfig      `json:"auth,omitempty" yaml:"auth,omitempty" koanf:"auth"`
 	OAuth     *V1OAuthConfig     `json:"oauth,omitempty" yaml:"oauth,omitempty" koanf:"oauth"`
-	Storage   *V1StorageConfig   `json:"storage,omitempty" yaml:"storage,omitempty" koanf:"storage"`
-	Secrets   *V1SecretsConfig   `json:"secrets,omitempty" yaml:"secrets,omitempty" koanf:"secrets"`
-	LogLevel  string             `json:"log_level,omitempty" yaml:"log_level,omitempty" koanf:"log_level"`
-	LogFormat string             `json:"log_format,omitempty" yaml:"log_format,omitempty" koanf:"log_format"`
+	Storage          *V1StorageConfig          `json:"storage,omitempty" yaml:"storage,omitempty" koanf:"storage"`
+	WorkspaceStorage *V1WorkspaceStorageConfig `json:"workspace_storage,omitempty" yaml:"workspace_storage,omitempty" koanf:"workspace_storage"`
+	Secrets          *V1SecretsConfig          `json:"secrets,omitempty" yaml:"secrets,omitempty" koanf:"secrets"`
+	LogLevel         string                    `json:"log_level,omitempty" yaml:"log_level,omitempty" koanf:"log_level"`
+	LogFormat        string                    `json:"log_format,omitempty" yaml:"log_format,omitempty" koanf:"log_format"`
 
 	// NotificationChannels configures external notification delivery channels.
 	// Secrets (webhook URLs, API tokens) are held in memory only — never persisted to a database.
@@ -375,8 +376,12 @@ type V1BrokerConfig struct {
 
 // V1DatabaseConfig holds database settings.
 type V1DatabaseConfig struct {
-	Driver string `json:"driver,omitempty" yaml:"driver,omitempty" koanf:"driver"`
-	URL    string `json:"url,omitempty" yaml:"url,omitempty" koanf:"url"`
+	Driver          string `json:"driver,omitempty" yaml:"driver,omitempty" koanf:"driver"`
+	URL             string `json:"url,omitempty" yaml:"url,omitempty" koanf:"url"`
+	MaxOpenConns    int    `json:"max_open_conns,omitempty" yaml:"max_open_conns,omitempty" koanf:"max_open_conns"`
+	MaxIdleConns    int    `json:"max_idle_conns,omitempty" yaml:"max_idle_conns,omitempty" koanf:"max_idle_conns"`
+	ConnMaxLifetime string `json:"conn_max_lifetime,omitempty" yaml:"conn_max_lifetime,omitempty" koanf:"conn_max_lifetime"`
+	ConnMaxIdleTime string `json:"conn_max_idle_time,omitempty" yaml:"conn_max_idle_time,omitempty" koanf:"conn_max_idle_time"`
 }
 
 // V1AuthConfig holds development authentication settings.
@@ -412,6 +417,80 @@ type V1StorageConfig struct {
 	Provider  string `json:"provider,omitempty" yaml:"provider,omitempty" koanf:"provider"`
 	Bucket    string `json:"bucket,omitempty" yaml:"bucket,omitempty" koanf:"bucket"`
 	LocalPath string `json:"local_path,omitempty" yaml:"local_path,omitempty" koanf:"local_path"`
+}
+
+// V1WorkspaceStorageConfig selects the workspace storage backend.
+// Backend defaults to "local" (today's node-local behavior). When set to "nfs",
+// the NFS sub-block configures shared network-attached workspace storage.
+type V1WorkspaceStorageConfig struct {
+	Backend string       `json:"backend,omitempty" yaml:"backend,omitempty" koanf:"backend"` // "local" (default) | "nfs"
+	NFS     *V1NFSConfig `json:"nfs,omitempty" yaml:"nfs,omitempty" koanf:"nfs"`
+}
+
+// V1NFSConfig holds NFS workspace storage settings.
+type V1NFSConfig struct {
+	// MountRoot is the local base under which each share is mounted at <MountRoot>/<share.ID>.
+	MountRoot string `json:"mount_root,omitempty" yaml:"mount_root,omitempty" koanf:"mount_root"`
+	// MountOptions are passed to mount.nfs. Default "vers=3,hard,nconnect=4,_netdev".
+	// NFSv4.1 requires Filestore Enterprise/zonal or self-hosted NFS; basic/HDD
+	// (BASIC_HDD) supports NFSv3 only. We use Postgres advisory locks, not NFS
+	// flock, so v3 is fine for correctness.
+	MountOptions string       `json:"mount_options,omitempty" yaml:"mount_options,omitempty" koanf:"mount_options"`
+	Shares       []V1NFSShare `json:"shares,omitempty" yaml:"shares,omitempty" koanf:"shares"`
+
+	// Stable, node-independent ownership for NFS-backed trees.
+	// Default 1000:1000 to converge with the K8s pod UID/GID.
+	UID int `json:"uid,omitempty" yaml:"uid,omitempty" koanf:"uid"` // default 1000
+	GID int `json:"gid,omitempty" yaml:"gid,omitempty" koanf:"gid"` // default 1000
+
+	// Kubernetes realization
+	StorageClass string `json:"storage_class,omitempty" yaml:"storage_class,omitempty" koanf:"storage_class"`
+	SubPathRoot  string `json:"subpath_root,omitempty" yaml:"subpath_root,omitempty" koanf:"subpath_root"` // default "projects"
+}
+
+// V1NFSShare identifies a single NFS export that may be mounted by a Runtime Broker.
+type V1NFSShare struct {
+	ID     string `json:"id,omitempty" yaml:"id,omitempty" koanf:"id"`                // stable share id → mount dir + (K8s) PV name
+	Server string `json:"server,omitempty" yaml:"server,omitempty" koanf:"server"`    // e.g. 10.0.0.2 or Filestore IP
+	Export string `json:"export,omitempty" yaml:"export,omitempty" koanf:"export"`    // server export path, e.g. /scion-workspaces
+	PVName string `json:"pv_name,omitempty" yaml:"pv_name,omitempty" koanf:"pv_name"` // K8s static PV+subPath strategy
+}
+
+// ApplyNFSDefaults fills default values for NFS sub-fields when Backend is "nfs".
+// When Backend is empty or "local", the NFS block is left as-is (no materialization).
+// This is idempotent and safe to call multiple times.
+func (ws *V1WorkspaceStorageConfig) ApplyNFSDefaults() {
+	if ws == nil || strings.ToLower(ws.Backend) != "nfs" {
+		return
+	}
+	if ws.NFS == nil {
+		ws.NFS = &V1NFSConfig{}
+	}
+	if ws.NFS.MountOptions == "" {
+		ws.NFS.MountOptions = "vers=3,hard,nconnect=4,_netdev"
+	}
+	if ws.NFS.UID == 0 {
+		ws.NFS.UID = 1000
+	}
+	if ws.NFS.GID == 0 {
+		ws.NFS.GID = 1000
+	}
+	if ws.NFS.SubPathRoot == "" {
+		ws.NFS.SubPathRoot = "projects"
+	}
+}
+
+// ValidateNFS returns an error if Backend is "nfs" but the NFS block is
+// misconfigured (e.g. no shares defined). Call after ApplyNFSDefaults.
+func (ws *V1WorkspaceStorageConfig) ValidateNFS() error {
+	if ws == nil || strings.ToLower(ws.Backend) != "nfs" {
+		return nil
+	}
+	if ws.NFS == nil || len(ws.NFS.Shares) == 0 {
+		return fmt.Errorf("workspace_storage.backend is \"nfs\" but no NFS shares are defined; " +
+			"add at least one entry under workspace_storage.nfs.shares")
+	}
+	return nil
 }
 
 // V1SecretsConfig holds secrets backend settings.
@@ -1140,6 +1219,18 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Database.URL != "" {
 			gc.Database.URL = v1.Database.URL
 		}
+		if v1.Database.MaxOpenConns != 0 {
+			gc.Database.MaxOpenConns = v1.Database.MaxOpenConns
+		}
+		if v1.Database.MaxIdleConns != 0 {
+			gc.Database.MaxIdleConns = v1.Database.MaxIdleConns
+		}
+		if v1.Database.ConnMaxLifetime != "" {
+			gc.Database.ConnMaxLifetime = v1.Database.ConnMaxLifetime
+		}
+		if v1.Database.ConnMaxIdleTime != "" {
+			gc.Database.ConnMaxIdleTime = v1.Database.ConnMaxIdleTime
+		}
 	}
 
 	// Auth config
@@ -1213,6 +1304,11 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Secrets.GCPCredentials != "" {
 			gc.Secrets.GCPCredentials = v1.Secrets.GCPCredentials
 		}
+	}
+
+	// Workspace storage NFS defaults (conditional on backend=nfs)
+	if v1.WorkspaceStorage != nil {
+		v1.WorkspaceStorage.ApplyNFSDefaults()
 	}
 
 	// GitHub App
@@ -1291,8 +1387,12 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 
 	// Database config
 	v1.Database = &V1DatabaseConfig{
-		Driver: gc.Database.Driver,
-		URL:    gc.Database.URL,
+		Driver:          gc.Database.Driver,
+		URL:             gc.Database.URL,
+		MaxOpenConns:    gc.Database.MaxOpenConns,
+		MaxIdleConns:    gc.Database.MaxIdleConns,
+		ConnMaxLifetime: gc.Database.ConnMaxLifetime,
+		ConnMaxIdleTime: gc.Database.ConnMaxIdleTime,
 	}
 
 	// Auth config

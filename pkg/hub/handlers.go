@@ -207,16 +207,15 @@ type CreateAgentRequest struct {
 	// GatherEnv enables the env-gather flow where the broker evaluates env
 	// completeness and may return a 202 requiring the CLI to supply missing values.
 	GatherEnv bool `json:"gatherEnv,omitempty"`
-	// Resume signals that the caller wants to resume an existing stopped agent
-	// in-place rather than deleting and recreating it. When true and the
-	// existing agent is in PhaseStopped, the agent record is preserved and
-	// the broker is asked to restart the container.
-	Resume bool `json:"resume,omitempty"`
 	// Notify subscribes the creating agent/user to status notifications for the new agent.
 	Notify bool `json:"notify,omitempty"`
 	// CleanupMode controls stale-existing-agent cleanup behavior during create:
 	// "strict" (default) fails create if broker cleanup fails; "force" continues.
 	CleanupMode string `json:"cleanupMode,omitempty"`
+	// Resume signals that the caller wants to resume an existing stopped agent
+	// rather than create a brand-new one. When true and a stopped agent with
+	// the same name exists, the Hub recovers it instead of creating fresh.
+	Resume bool `json:"resume,omitempty"`
 	// GCPIdentity specifies the GCP identity assignment for the agent.
 	// Controls metadata server behavior and optional service account binding.
 	GCPIdentity *GCPIdentityAssignment `json:"gcp_identity,omitempty"`
@@ -2314,8 +2313,8 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
-	// Detect group recipient for multi-target fan-out.
-	if structuredMsg != nil && messages.IsGroupRecipient(structuredMsg.Recipient) {
+	// Detect set[] recipient for multi-target fan-out.
+	if structuredMsg != nil && messages.IsSetRecipient(structuredMsg.Recipient) {
 		s.handleGroupMessage(w, r, id, structuredMsg, plainMessage, req.Interrupt)
 		return
 	}
@@ -2413,6 +2412,7 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 	s.logMessage("message dispatched", logAttrs...)
 
 	// Persist to message store (write-through; non-fatal if store fails)
+	var persistedMsgID string
 	if structuredMsg != nil {
 		storeMsg := &store.Message{
 			ID:          api.NewUUID(),
@@ -2437,6 +2437,8 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 		}
 		if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
 			s.messageLog.Error("Failed to persist message", "error", err)
+		} else {
+			persistedMsgID = storeMsg.ID
 		}
 		// Publish SSE event so connected browser clients can update the
 		// per-agent conversation view in real time — mirrors the agent→user
@@ -2454,9 +2456,37 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 		ServiceNotReady(w, "Agent has no runtime broker assigned — the server may still be starting up")
 		return
 	}
-	if err := dispatcher.DispatchAgentMessage(ctx, agent, plainMessage, req.Interrupt, structuredMsg); err != nil {
+	if err := dispatcher.DispatchAgentMessage(ctx, agent, plainMessage, req.Interrupt, structuredMsg); errors.Is(err, ErrMessageDeferred) {
+		s.signalDeferredMessage(ctx, agent.RuntimeBrokerID, agent.ID)
+		// Create notification subscription if requested (before returning 202)
+		if req.Notify {
+			var notifySubscriberType, notifySubscriberID, createdBy string
+			if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+				createdBy = agentIdent.ID()
+				if creatorAgent, err := s.store.GetAgent(ctx, agentIdent.ID()); err == nil {
+					notifySubscriberType = store.SubscriberTypeAgent
+					notifySubscriberID = creatorAgent.Slug
+				}
+			} else if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
+				createdBy = userIdent.ID()
+				notifySubscriberType = store.SubscriberTypeUser
+				notifySubscriberID = userIdent.ID()
+			}
+			s.createNotifySubscription(ctx, agent.ID, agent.ProjectID, notifySubscriberType, notifySubscriberID, createdBy)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		return
+	} else if err != nil {
 		RuntimeError(w, "Failed to send message to runtime broker: "+err.Error())
 		return
+	}
+
+	// Mark the message as dispatched so reconcileBroker does not
+	// re-deliver it on the next broker reconnect.
+	if persistedMsgID != "" {
+		if _, err := s.store.MarkMessageDispatched(ctx, persistedMsgID); err != nil {
+			s.messageLog.Error("Failed to mark message dispatched", "id", persistedMsgID, "error", err)
+		}
 	}
 
 	// Publish agent-to-agent messages through the broker so plugin observers
@@ -2494,15 +2524,14 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 	w.WriteHeader(http.StatusOK)
 }
 
-// GroupMessageRecipientResult holds the delivery status for a single recipient
-// in a message group fan-out.
+// GroupMessageRecipientResult represents the delivery status for one recipient in a set[] delivery.
 type GroupMessageRecipientResult struct {
 	Recipient string `json:"recipient"`
 	Status    string `json:"status"`
 	Error     string `json:"error,omitempty"`
 }
 
-// GroupMessageResponse is the JSON response for a group message delivery.
+// GroupMessageResponse is the JSON response for a set[] message delivery.
 type GroupMessageResponse struct {
 	GroupID   string                        `json:"group_id"`
 	Delivered int                           `json:"delivered"`
@@ -2510,7 +2539,7 @@ type GroupMessageResponse struct {
 	Results   []GroupMessageRecipientResult `json:"results"`
 }
 
-// handleGroupMessage fans out a structured message to multiple recipients in a message group.
+// handleGroupMessage fans out a structured message to multiple recipients parsed from set[].
 func (s *Server) handleGroupMessage(w http.ResponseWriter, r *http.Request, anchorID string, msg *messages.StructuredMessage, plainMessage string, interrupt bool) {
 	ctx := r.Context()
 
@@ -2576,7 +2605,12 @@ func (s *Server) handleGroupMessage(w http.ResponseWriter, r *http.Request, anch
 			s.events.PublishUserMessage(ctx, storeMsg)
 
 			if dispatcher != nil && agent.RuntimeBrokerID != "" {
-				if err := dispatcher.DispatchAgentMessage(ctx, agent, plainMessage, interrupt, &agentMsg); err != nil {
+				if err := dispatcher.DispatchAgentMessage(ctx, agent, plainMessage, interrupt, &agentMsg); errors.Is(err, ErrMessageDeferred) {
+					s.signalDeferredMessage(ctx, agent.RuntimeBrokerID, agent.ID)
+					results[i] = GroupMessageRecipientResult{Recipient: recipStr, Status: "deferred"}
+					delivered++
+					continue
+				} else if err != nil {
 					results[i] = GroupMessageRecipientResult{Recipient: recipStr, Status: "failed", Error: err.Error()}
 					continue
 				}
@@ -2586,6 +2620,12 @@ func (s *Server) handleGroupMessage(w http.ResponseWriter, r *http.Request, anch
 			} else {
 				results[i] = GroupMessageRecipientResult{Recipient: recipStr, Status: "failed", Error: "agent has no runtime broker"}
 				continue
+			}
+
+			// Mark the message as dispatched so reconcileBroker does not
+			// re-deliver it on the next broker reconnect.
+			if _, err := s.store.MarkMessageDispatched(ctx, storeMsg.ID); err != nil {
+				s.messageLog.Error("Failed to mark set message dispatched", "id", storeMsg.ID, "error", err)
 			}
 
 			// Publish agent-to-agent messages through the broker for plugin observers.
@@ -2794,10 +2834,15 @@ func (s *Server) broadcastDirect(w http.ResponseWriter, r *http.Request, project
 		agentMsg := *msg
 		agentMsg.Recipient = "agent:" + agent.Slug
 		agentMsg.RecipientID = agent.ID
-		if err := dispatcher.DispatchAgentMessage(ctx, &agent, agentMsg.Msg, interrupt, &agentMsg); err != nil {
+		dispatched := false
+		if err := dispatcher.DispatchAgentMessage(ctx, &agent, agentMsg.Msg, interrupt, &agentMsg); errors.Is(err, ErrMessageDeferred) {
+			s.signalDeferredMessage(ctx, agent.RuntimeBrokerID, agent.ID)
+		} else if err != nil {
 			s.messageLog.Error("Failed to deliver broadcast message to agent",
 				"agent_id", agent.ID,
 				"agentSlug", agent.Slug, "error", err)
+		} else {
+			dispatched = true
 		}
 		// Persist broadcast message per recipient (non-fatal)
 		storeMsg := &store.Message{
@@ -2816,6 +2861,11 @@ func (s *Server) broadcastDirect(w http.ResponseWriter, r *http.Request, project
 		}
 		if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
 			s.messageLog.Error("Failed to persist broadcast message", "agent_id", agent.ID, "error", err)
+		} else if dispatched {
+			// Mark dispatched so reconcileBroker does not re-deliver.
+			if _, err := s.store.MarkMessageDispatched(ctx, storeMsg.ID); err != nil {
+				s.messageLog.Error("Failed to mark broadcast message dispatched", "id", storeMsg.ID, "error", err)
+			}
 		}
 	}
 
@@ -3545,7 +3595,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else if project.GitRemote == "" {
-		// Hub-managed project (no git remote): create workspace directory.
+		// Hub-native project (no git remote): create workspace directory.
 		if err := s.initHubManagedProject(project); err != nil {
 			slog.Warn("failed to initialize project workspace",
 				"project_id", project.ID, "slug", project.Slug, "error", err)
@@ -5440,7 +5490,7 @@ func (s *Server) cleanupBrokerProjectDirectories(ctx context.Context, project *s
 			continue
 		}
 
-		if err := client.CleanupProject(ctx, provider.BrokerID, broker.Endpoint, project.Slug); err != nil {
+		if err := client.CleanupProject(ctx, provider.BrokerID, broker.Endpoint, project.Slug, project.ID); err != nil {
 			slog.Warn("failed to cleanup project on broker",
 				"project_id", project.ID, "slug", project.Slug,
 				"broker", provider.BrokerID, "endpoint", broker.Endpoint, "error", err)
@@ -9518,10 +9568,6 @@ func (s *Server) handleProjectImportHarnessConfigs(w http.ResponseWriter, r *htt
 		Count:          len(imported),
 	})
 }
-
-// ============================================================================
-// Unified Resource Import (kind/scope-generic)
-// ============================================================================
 
 // ImportResourcesRequest is the body for the unified import endpoint
 // (POST /api/v1/resources/import). It imports a single kind of resource from a

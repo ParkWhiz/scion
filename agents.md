@@ -83,6 +83,11 @@ All icons in the web frontend use the Shoelace `<sl-icon>` component (Bootstrap 
 - **Refactoring**: Since the project is in alpha, refactoring that modifies or removes behavior does not require graceful deprecation.
 
 ## Glossary and project development terminology
+<<<<<<< HEAD
+=======
+
+> **Canonical engineering glossary:** See [`GLOSSARY.md`](./GLOSSARY.md) at the repo root for the canonical, opinionated terminology used throughout the codebase — the preferred term for each concept and the synonyms to avoid. Prefer these terms in new code, comments, and docs.
+>>>>>>> upstream
 
 > **Canonical engineering glossary:** See [`GLOSSARY.md`](./GLOSSARY.md) at the repo root for the canonical, opinionated terminology used throughout the codebase — the preferred term for each concept and the synonyms to avoid. Prefer these terms in new code, comments, and docs.
 

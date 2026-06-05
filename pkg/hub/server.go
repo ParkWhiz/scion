@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -27,6 +28,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +37,13 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/observability/dbmetrics"
+	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
+	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
@@ -74,6 +79,14 @@ type ServerConfig struct {
 	// UserTokenConfig holds configuration for user JWT tokens.
 	// If SigningKey is empty, a random key is generated.
 	UserTokenConfig UserTokenConfig
+	// SharedSigningSecret is the deployment-wide secret (the same value every
+	// replica receives via --session-secret / SESSION_SECRET) from which the
+	// agent and user JWT signing keys are derived deterministically. When set,
+	// every replica derives identical signing keys regardless of its
+	// host-derived HubID, so a JWT minted by one replica validates on any
+	// other replica behind the load balancer. When empty, signing keys fall
+	// back to per-hub storage in the secret backend / store.
+	SharedSigningSecret string
 	// TrustedProxies is a list of trusted proxy IPs/CIDRs for forwarded headers.
 	TrustedProxies []string
 	// Debug enables verbose debug logging.
@@ -316,8 +329,9 @@ type RuntimeBrokerClient interface {
 
 	// CleanupProject asks a broker to remove its local hub-managed project directory.
 	// brokerID is used for HMAC authentication lookup.
+	// projectID is passed to enable NFS subtree cleanup (keyed by project ID).
 	// 404 responses are tolerated for idempotency.
-	CleanupProject(ctx context.Context, brokerID, brokerEndpoint, projectSlug string) error
+	CleanupProject(ctx context.Context, brokerID, brokerEndpoint, projectSlug, projectID string) error
 }
 
 // RemoteCreateAgentRequest is the request body for creating an agent on a remote runtime broker.
@@ -506,9 +520,15 @@ type Server struct {
 	controlChannel         *ControlChannelManager  // WebSocket control channel for runtime brokers
 	authzService           *AuthzService           // Authorization service for policy evaluation
 	events                 EventPublisher          // Event publisher for real-time SSE updates
+	commandBus             CommandBus              // Inter-node dispatch signal bus (nil-safe; nil = no-op)
 	notificationDispatcher *NotificationDispatcher // Notification dispatcher for agent status events
+	// reconcile op executors (seams): default to executeDispatch/deliverMessage;
+	// Phase 3/4 supply the real local-tunnel ops; tests override for exactly-once.
+	execDispatch func(ctx context.Context, d store.BrokerDispatch) (string, error)
+	deliverMsg   func(ctx context.Context, m *store.Message) error
 	maintenance            *MaintenanceState       // Runtime maintenance mode state
 	hubID                  string                  // Unique hub instance ID for secret namespacing
+	instanceID             string                  // Unique per-process ID (uuid); affinity key for broker dispatch
 	embeddedBrokerID       string                  // Broker ID when running in hub+broker combo mode
 	scheduler              *Scheduler              // Unified scheduler for recurring tasks
 	cleanupOnce            sync.Once               // Ensures CleanupResources runs only once
@@ -532,6 +552,18 @@ type Server struct {
 
 	// GCP token metrics tracker (nil = disabled)
 	gcpTokenMetrics *GCPTokenMetrics
+
+	// Database connection-pool / notify metrics recorder (P0-5). Defaults to a
+	// disabled no-op recorder; SetDBMetrics wires a real exporter. Drives the
+	// connection-pool sampler started in StartBackgroundServices.
+	dbMetrics dbmetrics.Recorder
+
+	// Broker dispatch metrics recorder (B5-2). Defaults to a disabled no-op
+	// recorder; SetDispatchMetrics wires a real exporter.
+	dispatchMetrics dispatchmetrics.Recorder
+
+	// stopPoolSampler stops the DB pool-stats sampling goroutine on shutdown.
+	stopPoolSampler func()
 
 	// Message broker proxy for pub/sub message routing (nil = disabled)
 	messageBrokerProxy *MessageBrokerProxy
@@ -558,6 +590,16 @@ type Server struct {
 	githubAppRateLimit *githubapp.RateLimitInfo
 }
 
+func newInstanceID() string {
+	if podName := os.Getenv("POD_NAME"); podName != "" {
+		return podName + "-" + uuid.NewString()
+	}
+	return uuid.NewString()
+}
+
+// InstanceID returns the per-process unique identifier for this hub instance.
+func (s *Server) InstanceID() string { return s.instanceID }
+
 // New creates a new Hub API server.
 func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Apply defaults for zero-value fields that have meaningful defaults.
@@ -574,6 +616,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		events:      noopEventPublisher{},
 		maintenance: NewMaintenanceState(cfg.AdminMode, cfg.MaintenanceMessage),
 		hubID:       cfg.HubID,
+		instanceID:  newInstanceID(),
 
 		// Subsystem loggers
 		agentLifecycleLog: logging.Subsystem("hub.agent-lifecycle"),
@@ -667,6 +710,10 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	}
 
 	// Initialize audit logger (used by broker auth and invite system)
+	// Default reconcile-drain op executors (Phase 3/4 supply the real local ops).
+	srv.execDispatch = srv.executeDispatch
+	srv.deliverMsg = srv.deliverMessage
+
 	srv.auditLogger = NewLogAuditLogger("[Hub Audit]", cfg.Debug)
 
 	// Initialize broker auth service if enabled
@@ -685,10 +732,27 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		RequestTimeout: 120 * time.Second,
 		Debug:          cfg.Debug,
 	}, logging.Subsystem("hub.control-channel"))
-	// Set disconnect callback to mark broker offline when WebSocket drops
-	srv.controlChannel.SetOnDisconnect(func(brokerID string) {
+	// Set disconnect callback to mark broker offline when WebSocket drops.
+	// Compare-and-clear affinity first: only stamp offline if this hub instance +
+	// session still owns the broker. If affinity has moved (broker flapped to
+	// another replica or re-dialed with a newer session), this is a stale
+	// disconnect and we must NOT clobber the live owner's online status.
+	srv.controlChannel.SetOnDisconnect(func(brokerID, sessionID string) {
 		ctx := context.Background()
-		slog.Info("Broker disconnected, marking offline", "brokerID", brokerID)
+
+		cleared, err := s.ReleaseRuntimeBrokerConnection(ctx, brokerID, srv.instanceID, sessionID)
+		if err != nil {
+			slog.Error("Failed to release broker affinity on disconnect", "brokerID", brokerID, "sessionID", sessionID, "error", err)
+			return
+		}
+		if !cleared {
+			// Another replica (or a newer session on this replica) already owns
+			// the socket. Skip the offline stamp to avoid clobbering it.
+			slog.Info("broker reconnected elsewhere; skipping offline stamp", "brokerID", brokerID, "staleSession", sessionID)
+			return
+		}
+
+		slog.Info("Broker disconnected, marking offline", "brokerID", brokerID, "sessionID", sessionID)
 
 		if err := s.UpdateRuntimeBrokerHeartbeat(ctx, brokerID, store.BrokerStatusOffline); err != nil {
 			slog.Error("Failed to mark broker offline", "brokerID", brokerID, "error", err)
@@ -768,6 +832,18 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	return srv, nil
 }
 
+// deriveSharedSigningKey deterministically derives a 32-byte HS256 signing key
+// from the deployment's shared signing secret and the logical key name. The key
+// name (e.g. "user_signing_key", "agent_signing_key") provides domain
+// separation so the user and agent keys differ even though both originate from
+// the same shared secret. Every replica configured with the same shared secret
+// derives identical keys, which is what lets a JWT minted by one replica be
+// validated by another.
+func deriveSharedSigningKey(secret, keyName string) []byte {
+	sum := sha256.Sum256([]byte("scion-hub-signing-key:" + keyName + ":" + secret))
+	return sum[:]
+}
+
 // ensureSigningKey ensures a signing key exists, loading it if it does
 // or generating and saving it if it doesn't.
 //
@@ -785,6 +861,27 @@ func (s *Server) ensureSigningKey(ctx context.Context, keyName string, existingK
 			"sha256_prefix", hex.EncodeToString(fp[:8]),
 		)
 		return existingKey, nil
+	}
+
+	// When a deployment-wide shared signing secret is configured (the same
+	// secret every replica receives via --session-secret / SESSION_SECRET),
+	// derive the signing key deterministically from it. This makes the key
+	// identical on every replica regardless of the host-derived hub ID, so a
+	// JWT minted by one replica validates on any other. It mirrors the web
+	// session cookie store (commit 0515e2a8), whose keys are derived from the
+	// same shared secret, and is what lets the hub scale horizontally behind a
+	// load balancer without operators having to pin a matching HubID on each
+	// replica. Per-host secret-backend storage (below) is bypassed entirely.
+	if s.config.SharedSigningSecret != "" {
+		key := deriveSharedSigningKey(s.config.SharedSigningSecret, keyName)
+		fp := sha256.Sum256(key)
+		slog.Info("ensureSigningKey: derived from shared signing secret",
+			"key", keyName,
+			"source", "shared_secret",
+			"key_len", len(key),
+			"sha256_prefix", hex.EncodeToString(fp[:8]),
+		)
+		return key, nil
 	}
 
 	hubID := s.hubID
@@ -1044,11 +1141,13 @@ func (s *Server) backupSigningKeyToStore(ctx context.Context, keyName, encodedVa
 
 // signingKeySecretID returns a deterministic primary key for a signing key record,
 // scoped to the hub instance to avoid PK collisions during migration.
+// signingKeySecretID derives a stable surrogate primary key for the signing-key
+// backup secret. The store keys secrets by the (key, scope, scope_id) triple, so
+// the ID is only a surrogate; it is generated deterministically as a UUIDv5 so
+// the value is valid for the UUID-typed primary key while remaining stable
+// across restarts.
 func signingKeySecretID(keyName, hubID string) string {
-	if hubID == "" {
-		return fmt.Sprintf("hub-%s", keyName)
-	}
-	return fmt.Sprintf("hub-%s-%s", hubID, keyName)
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("hub-signing-key:"+hubID+":"+keyName)).String()
 }
 
 // SetDispatcher sets the agent dispatcher for co-located runtime broker operations.
@@ -1245,6 +1344,23 @@ func (s *Server) SetMetrics(m MetricsRecorder) {
 	s.metrics = m
 }
 
+// SetDBMetrics wires the database connection-pool / notify metrics recorder
+// (P0-5). When set to an enabled recorder before StartBackgroundServices, the
+// hub starts sampling the DB connection pool into the pool gauges. Passing a
+// disabled recorder (or never calling this) leaves pool sampling off.
+func (s *Server) SetDBMetrics(rec dbmetrics.Recorder) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dbMetrics = rec
+}
+
+// SetDispatchMetrics wires the broker-dispatch metrics recorder (B5-2).
+func (s *Server) SetDispatchMetrics(rec dispatchmetrics.Recorder) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dispatchMetrics = rec
+}
+
 // GetMaintenanceState returns the runtime maintenance state.
 func (s *Server) GetMaintenanceState() *MaintenanceState {
 	return s.maintenance
@@ -1278,8 +1394,26 @@ func (s *Server) SetEventPublisher(ep EventPublisher) {
 	s.events = ep
 }
 
+// SetCommandBus sets the inter-node dispatch signal bus. Nil is safe (treated
+// as no-op). Called from the server-foreground init path after backend selection.
+func (s *Server) SetCommandBus(cb CommandBus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commandBus = cb
+	if pgBus, ok := cb.(*PostgresCommandBus); ok {
+		pgBus.SetOnReconnect(func() {
+			if rec := s.dispatchMetrics; rec != nil {
+				rec.IncCmdBusReconnects(context.Background(), 1)
+			}
+		})
+	}
+}
+
+// CommandBus returns the configured command bus, or nil.
+func (s *Server) CommandBus() CommandBus { return s.commandBus }
+
 // StartNotificationDispatcher creates and starts the notification dispatcher
-// if a ChannelEventPublisher is available. It uses a lazy getter for the
+// if a subscription-capable EventPublisher is available. It uses a lazy getter for the
 // AgentDispatcher so it works even if SetDispatcher is called later.
 // Safe to call multiple times; subsequent calls are no-ops.
 func (s *Server) StartNotificationDispatcher() {
@@ -1290,21 +1424,21 @@ func (s *Server) StartNotificationDispatcher() {
 		return // already started
 	}
 
-	ep, ok := s.events.(*ChannelEventPublisher)
-	if !ok {
+	if _, isNoop := s.events.(noopEventPublisher); isNoop || s.events == nil {
 		slog.Warn("Event publisher does not support subscriptions, notification dispatcher not started")
 		return
 	}
 
-	nd := NewNotificationDispatcher(s.store, ep, s.GetDispatcher, logging.Subsystem("hub.notifications"))
+	nd := NewNotificationDispatcher(s.store, s.events, s.GetDispatcher, logging.Subsystem("hub.notifications"))
 	nd.messageLog = s.dedicatedMessageLog
 	nd.channelRegistry = s.channelRegistry
+	nd.signalDeferred = s.signalDeferredMessage
 	s.notificationDispatcher = nd
 	s.notificationDispatcher.Start()
 }
 
 // StartMessageBroker creates and starts the message broker proxy if a
-// ChannelEventPublisher is available. The broker enables pub/sub message
+// subscription-capable EventPublisher is available. The broker enables pub/sub message
 // routing with topic-based subscriptions and broadcast fan-out.
 // Safe to call multiple times; subsequent calls are no-ops.
 func (s *Server) StartMessageBroker(b eventbus.EventBus) {
@@ -1315,14 +1449,14 @@ func (s *Server) StartMessageBroker(b eventbus.EventBus) {
 		return // already started
 	}
 
-	ep, ok := s.events.(*ChannelEventPublisher)
-	if !ok {
+	if _, isNoop := s.events.(noopEventPublisher); isNoop || s.events == nil {
 		slog.Warn("Event publisher does not support subscriptions, message broker proxy not started")
 		return
 	}
 
-	proxy := NewMessageBrokerProxy(b, s.store, ep, s.GetDispatcher, logging.Subsystem("hub.broker"))
+	proxy := NewMessageBrokerProxy(b, s.store, s.events, s.GetDispatcher, logging.Subsystem("hub.broker"))
 	proxy.messageLog = s.dedicatedMessageLog
+	proxy.SetSignalDeferred(s.signalDeferredMessage)
 	s.messageBrokerProxy = proxy
 	proxy.Start()
 
@@ -1351,7 +1485,9 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 	// Wrap with hybrid client that prefers control channel
 	var client RuntimeBrokerClient
 	if s.controlChannel != nil {
-		client = NewHybridBrokerClient(s.controlChannel, httpClient, &hmacBrokerSigner{store: s.store}, s.config.Debug)
+		hbc := NewHybridBrokerClient(s.controlChannel, httpClient, &hmacBrokerSigner{store: s.store}, s.config.Debug)
+		hbc.SetAffinityLookup(StoreAffinityLookup(s.store, 0))
+		client = hbc
 	} else {
 		client = httpClient
 	}
@@ -1393,6 +1529,16 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 	// Configure GitHub App token minter if the app is configured
 	if s.config.GitHubAppConfig.AppID != 0 {
 		dispatcher.SetGitHubAppMinter(s)
+	}
+
+	// Wire cross-node lifecycle dispatch deps (B4-2) so the dispatcher
+	// can handle ErrLifecycleDeferred from route-gated Start/Stop/Restart
+	// by writing durable intent, signaling the owning node, and waiting
+	// for the terminal phase. In SQLite mode events/commandBus are no-ops,
+	// and route() always returns routeLocal, so this never triggers.
+	dispatcher.SetCrossNodeDeps(s.events, s.commandBus)
+	if s.dispatchMetrics != nil {
+		dispatcher.SetDispatchMetrics(s.dispatchMetrics)
 	}
 
 	return dispatcher
@@ -1583,12 +1729,16 @@ func (s *Server) messageEventHandler() EventHandler {
 		structuredMsg.Plain = payload.Plain
 		structuredMsg.Urgent = payload.Interrupt
 
-		if err := dispatcher.DispatchAgentMessage(ctx, agent, payload.Message, payload.Interrupt, structuredMsg); err != nil {
+		if err := dispatcher.DispatchAgentMessage(ctx, agent, payload.Message, payload.Interrupt, structuredMsg); errors.Is(err, ErrMessageDeferred) {
+			s.signalDeferredMessage(ctx, agent.RuntimeBrokerID, agent.ID)
+			slog.Info("Scheduler: message deferred for cross-node delivery",
+				"eventID", evt.ID, "agent_id", agent.ID, "agentName", agent.Name)
+		} else if err != nil {
 			return fmt.Errorf("failed to dispatch message to agent %s: %w", agent.Name, err)
+		} else {
+			slog.Info("Scheduler: message delivered to agent",
+				"eventID", evt.ID, "agent_id", agent.ID, "agentName", agent.Name)
 		}
-
-		slog.Info("Scheduler: message delivered to agent",
-			"eventID", evt.ID, "agent_id", agent.ID, "agentName", agent.Name)
 		return nil
 	}
 }
@@ -1838,14 +1988,21 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 
 	// Initialize and start the scheduler
 	s.scheduler = NewScheduler(s.store, logging.Subsystem("hub.scheduler"))
-	s.scheduler.RegisterRecurring("agent-heartbeat-timeout", 1, s.agentHeartbeatTimeoutHandler())
-	s.scheduler.RegisterRecurring("agent-stalled-detection", 1, s.agentStalledDetectionHandler())
+	// Recurring sweeps are cluster-wide-once work: under multi-replica Postgres
+	// they must run on a single replica per tick (gated by an advisory lock),
+	// otherwise every replica would publish duplicate offline/stalled events and
+	// race on the schedule claim. On SQLite the lock is a no-op. See
+	// CONCURRENCY-AUDIT.md §"Singleton / leader".
+	s.scheduler.RegisterRecurringSingleton("agent-heartbeat-timeout", 1, store.LockAgentHeartbeatTimeout, s.agentHeartbeatTimeoutHandler())
+	s.scheduler.RegisterRecurringSingleton("agent-stalled-detection", 1, store.LockAgentStalledDetection, s.agentStalledDetectionHandler())
 	if s.config.SoftDeleteRetention > 0 {
-		s.scheduler.RegisterRecurring("soft-delete-purge", 60, s.purgeHandler())
+		s.scheduler.RegisterRecurringSingleton("soft-delete-purge", 60, store.LockSoftDeletePurge, s.purgeHandler())
 	}
 	s.scheduler.RegisterEventHandler("message", s.messageEventHandler())
 	s.scheduler.RegisterEventHandler("dispatch_agent", s.dispatchAgentEventHandler())
-	s.scheduler.RegisterRecurring("schedule-evaluator", 1, s.evaluateSchedulesHandler())
+	s.scheduler.RegisterRecurringSingleton("schedule-evaluator", 1, store.LockScheduleEvaluator, s.evaluateSchedulesHandler())
+	s.scheduler.RegisterRecurringSingleton("broker-affinity-reap", 1, store.LockBrokerAffinityReap, s.brokerAffinityReapHandler())
+	s.scheduler.RegisterRecurringSingleton("broker-message-sweep", 1, store.LockBrokerMessageSweep, s.brokerMessageSweepHandler())
 
 	// Register GitHub App health check if the app is configured
 	s.mu.RLock()
@@ -1857,10 +2014,20 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 		if ghWebhooksEnabled {
 			interval = 1440 // 24 hours when webhooks are enabled
 		}
-		s.scheduler.RegisterRecurring("github-app-health-check", interval, s.githubAppHealthCheckHandler())
+		s.scheduler.RegisterRecurringSingleton("github-app-health-check", interval, store.LockGitHubAppHealthCheck, s.githubAppHealthCheckHandler())
 	}
 
 	s.scheduler.Start(ctx)
+
+	// Start the DB connection-pool stats sampler (P3-6 -> P0-5 gauges). It is a
+	// no-op unless an enabled recorder was wired via SetDBMetrics and the store
+	// exposes its *sql.DB; this keeps connection-budget saturation observable
+	// under multi-replica Postgres (see CONNECTION-BUDGET.md).
+	if rec := s.dbMetrics; rec != nil {
+		if dbp, ok := s.store.(interface{ DB() *sql.DB }); ok {
+			s.stopPoolSampler = dbmetrics.StartPoolSampler(ctx, rec, dbp.DB(), 0)
+		}
+	}
 
 	// Start rate limiter cleanup goroutine (exits when ctx is cancelled).
 	if s.gcpTokenRateLimiter != nil {
@@ -1935,6 +2102,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.scheduler.Stop()
 	}
 
+	// Stop the DB pool-stats sampler.
+	if s.stopPoolSampler != nil {
+		s.stopPoolSampler()
+	}
+
 	// Stop notification dispatcher before closing event publisher
 	if s.notificationDispatcher != nil {
 		s.notificationDispatcher.Stop()
@@ -1943,6 +2115,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Close event publisher
 	if s.events != nil {
 		s.events.Close()
+	}
+	if s.commandBus != nil {
+		s.commandBus.Close()
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1982,6 +2157,9 @@ func (s *Server) CleanupResources(ctx context.Context) error {
 		}
 		if s.events != nil {
 			s.events.Close()
+		}
+		if s.commandBus != nil {
+			s.commandBus.Close()
 		}
 		if s.logQueryService != nil {
 			s.logQueryService.Close()
@@ -2408,31 +2586,35 @@ func (s *Server) handleRuntimeBrokerConnect(w http.ResponseWriter, r *http.Reque
 		}
 
 		// Use the broker ID from header
-		if err := s.controlChannel.HandleUpgrade(w, r, brokerID); err != nil {
+		sessionID, err := s.controlChannel.HandleUpgrade(w, r, brokerID)
+		if err != nil {
 			slog.Error("Upgrade failed for broker", "brokerID", brokerID, "error", err)
 			// Error already written by upgrader
 			return
 		}
-		s.markBrokerOnline(brokerID)
+		s.markBrokerOnline(brokerID, sessionID)
 		return
 	}
 
 	// Use authenticated broker identity
-	if err := s.controlChannel.HandleUpgrade(w, r, broker.ID()); err != nil {
+	sessionID, err := s.controlChannel.HandleUpgrade(w, r, broker.ID())
+	if err != nil {
 		slog.Error("Upgrade failed for broker", "brokerID", broker.ID(), "error", err)
 		// Error already written by upgrader
 		return
 	}
-	s.markBrokerOnline(broker.ID())
+	s.markBrokerOnline(broker.ID(), sessionID)
 }
 
 // markBrokerOnline updates broker and provider statuses to online after a successful WebSocket connection.
-func (s *Server) markBrokerOnline(brokerID string) {
+// It claims broker affinity for this hub instance + the connection's sessionID,
+// which also bumps status->online and refreshes the heartbeat in one CAS write.
+func (s *Server) markBrokerOnline(brokerID, sessionID string) {
 	ctx := context.Background()
-	slog.Info("Broker connected, marking online", "brokerID", brokerID)
+	slog.Info("Broker connected, marking online", "brokerID", brokerID, "sessionID", sessionID, "instanceID", s.instanceID)
 
-	if err := s.store.UpdateRuntimeBrokerHeartbeat(ctx, brokerID, store.BrokerStatusOnline); err != nil {
-		slog.Error("Failed to mark broker online", "brokerID", brokerID, "error", err)
+	if err := s.store.ClaimRuntimeBrokerConnection(ctx, brokerID, s.instanceID, sessionID); err != nil {
+		slog.Error("Failed to claim broker connection", "brokerID", brokerID, "error", err)
 	}
 
 	providers, err := s.store.GetBrokerProjects(ctx, brokerID)
@@ -2457,6 +2639,12 @@ func (s *Server) markBrokerOnline(brokerID string) {
 		brokerName = broker.Name
 	}
 	s.events.PublishBrokerConnected(ctx, brokerID, brokerName, projectIDs)
+
+	// Durability backstop (design §5.3): the moment this node owns the socket,
+	// drain any durable dispatch intent that accumulated while the broker was
+	// offline or owned elsewhere. Async so it never blocks the connect path;
+	// idempotent + CAS-gated so concurrent drains execute each item once.
+	go s.reconcileBroker(context.Background(), brokerID)
 }
 
 // isWebSocketUpgrade checks if the request is a WebSocket upgrade request.
