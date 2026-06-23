@@ -622,6 +622,7 @@ func (s *Server) handleProjectGitHubPermissions(w http.ResponseWriter, r *http.R
 				Contents:     "write",
 				PullRequests: "write",
 				Metadata:     "read",
+				Issues:       "write",
 			}
 		}
 		writeJSON(w, http.StatusOK, perms)
