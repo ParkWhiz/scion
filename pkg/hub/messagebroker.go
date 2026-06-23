@@ -542,6 +542,7 @@ func (p *MessageBrokerProxy) deliverToAgent(ctx context.Context, projectID, agen
 		AgentID:       agent.ID,
 		DispatchState: store.MessageDispatchDispatched,
 		CreatedAt:     time.Now(),
+		ThreadID:      msg.ThreadID,
 	}
 	if err := p.store.CreateMessage(ctx, storeMsg); err != nil {
 		p.log.Error("Failed to persist broker message to store", "agentSlug", agentSlug, "error", err)
