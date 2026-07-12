@@ -444,6 +444,7 @@ type ScionConfig struct {
 	CommandArgs      []string          `json:"command_args,omitempty" yaml:"command_args,omitempty"`
 	TaskFlag         string            `json:"task_flag,omitempty" yaml:"task_flag,omitempty"`
 	Model            string            `json:"model,omitempty" yaml:"model,omitempty"`
+	ThinkingLevel    *int              `json:"thinking_level,omitempty" yaml:"thinking_level,omitempty"`
 	Kubernetes       *KubernetesConfig `json:"kubernetes,omitempty" yaml:"kubernetes,omitempty"`
 	AuthSelectedType string            `json:"auth_selectedType,omitempty" yaml:"auth_selectedType,omitempty"`
 	Resources        *ResourceSpec     `json:"resources,omitempty" yaml:"resources,omitempty"`
@@ -475,6 +476,11 @@ type ScionConfig struct {
 	// Agent operational parameters (creation-time record)
 	Task   string `json:"task,omitempty" yaml:"task,omitempty"`
 	Branch string `json:"branch,omitempty" yaml:"branch,omitempty"`
+
+	// ExplicitWorkspace records that /workspace is a user-provided --workspace
+	// path, bind-mounted directly with no git worktree/branch, even when inside a
+	// repo. Persisted so resume/restart honors the same contract as first start.
+	ExplicitWorkspace bool `json:"explicit_workspace,omitempty" yaml:"explicit_workspace,omitempty"`
 
 	// Info contains persisted metadata about the agent
 	Info *AgentInfo `json:"-" yaml:"-"`

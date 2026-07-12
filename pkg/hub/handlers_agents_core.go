@@ -552,6 +552,13 @@ func (s *Server) createAgentInProject(
 		agent.Template = resolvedTemplate.Slug
 	}
 
+	if req.Config != nil && req.Config.ThinkingLevel != nil {
+		if tl := *req.Config.ThinkingLevel; tl < 0 || tl > 100 {
+			BadRequest(w, "thinking_level must be between 0 and 100")
+			return
+		}
+	}
+
 	agent.AppliedConfig = s.buildAppliedConfig(req, harnessConfig, creatorName)
 
 	// Populate GCP identity in applied config.
@@ -666,7 +673,7 @@ func (s *Server) createAgentInProject(
 				return
 			}
 
-			storagePath := storage.WorkspaceStoragePath(agent.ProjectID, agent.ID)
+			storagePath := storage.WorkspaceStoragePath(s.HubID(), agent.ProjectID, agent.ID)
 			uploadURLs, existingFiles, err := generateWorkspaceUploadURLs(ctx, stor, storagePath, req.WorkspaceFiles)
 			if err != nil {
 				RuntimeError(w, "Failed to generate upload URLs: "+err.Error())
@@ -714,7 +721,7 @@ func (s *Server) createAgentInProject(
 		if !hasLocalPath && !s.isEmbeddedBroker(runtimeBrokerID) {
 			stor := s.GetStorage()
 			if stor != nil {
-				storagePath := storage.ProjectWorkspaceStoragePath(project.ID)
+				storagePath := storage.ProjectWorkspaceStoragePath(s.HubID(), project.ID)
 				if err := gcp.SyncToGCS(ctx, agent.AppliedConfig.Workspace, stor.Bucket(), storagePath+"/files"); err != nil {
 					s.agentLifecycleLog.Warn("Failed to upload hub-managed project workspace to GCS",
 						"agent_id", agent.ID,
@@ -1516,6 +1523,14 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, id string) 
 		if cfg.Model != "" {
 			agent.AppliedConfig.Model = cfg.Model
 		}
+		if cfg.ThinkingLevel != nil {
+			if tl := *cfg.ThinkingLevel; tl < 0 || tl > 100 {
+				BadRequest(w, "thinking_level must be between 0 and 100")
+				return
+			}
+		}
+		// Always apply thinking level from config (nil = explicit unset)
+		agent.AppliedConfig.ThinkingLevel = cfg.ThinkingLevel
 		if cfg.Task != "" {
 			agent.AppliedConfig.Task = cfg.Task
 		}

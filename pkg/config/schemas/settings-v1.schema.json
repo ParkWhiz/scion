@@ -351,6 +351,19 @@
           "$ref": "#/$defs/harnessNoAuthConfig",
           "description": "Behavior when an agent starts without credentials (NoAuth mode)."
         },
+        "thinking_budget_map": {
+          "type": "object",
+          "additionalProperties": { "type": "integer" },
+          "description": "Maps model identifiers to their thinking-budget token limits."
+        },
+        "thinking_budget_flag": {
+          "type": "string",
+          "description": "CLI flag name used to pass the thinking budget to the harness (e.g., '--thinking-budget')."
+        },
+        "thinking_budget_config_key": {
+          "type": "string",
+          "description": "Harness-native config key used to set the thinking budget in a config file."
+        },
         "dialect": {
           "type": "object",
           "description": "Optional hook dialect metadata.",
@@ -707,6 +720,13 @@
           "description": "Stable hub instance identifier used for hub-scoped secret namespacing.",
           "x-env-var": "SCION_SERVER_HUB_HUBID"
         },
+        "hub_name": {
+          "type": "string",
+          "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "description": "Human-readable hub display name for HA deployments. All nodes in a cluster should share the same hub_name. Defaults to os.Hostname() if not set.",
+          "x-env-var": "SCION_SERVER_HUB_HUBNAME",
+          "x-scope": "global"
+        },
         "public_url": {
           "type": "string",
           "format": "uri",
@@ -733,6 +753,12 @@
           "type": "boolean",
           "description": "Preserve workspace files during soft-delete period.",
           "x-env-var": "SCION_SERVER_HUB_SOFT_DELETE_RETAIN_FILES",
+          "x-since": "1"
+        },
+        "auto_suspend_stalled": {
+          "type": "boolean",
+          "description": "Automatically suspend stalled agents.",
+          "x-env-var": "SCION_SERVER_HUB_AUTO_SUSPEND_STALLED",
           "x-since": "1"
         }
       }
@@ -836,6 +862,12 @@
           "type": "array",
           "items": { "type": "string" },
           "x-env-var": "SCION_SERVER_AUTH_AUTHORIZEDDOMAINS"
+        },
+        "user_access_mode": {
+          "type": "string",
+          "description": "Controls user access: 'open' (anyone can sign in), 'invite' (admin must invite), 'closed' (no new users).",
+          "x-env-var": "SCION_SERVER_AUTH_USER_ACCESS_MODE",
+          "x-since": "1"
         }
       }
     },

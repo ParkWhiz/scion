@@ -436,8 +436,11 @@ func loadConfig(path string) (*chatapp.Config, error) {
 
 // discoverSigningKey searches GCP Secret Manager for a secret matching the
 // local hub instance. It filters by scion-name=user_signing_key and
-// scion-hub-hostname matching the local hostname, which uniquely identifies
+// scion-hub-name matching the hub name, which uniquely identifies
 // the hub in a multi-hub project.
+//
+// The hub name is resolved from SCION_SERVER_HUB_HUBNAME (the standard
+// koanf-derived name), then SCION_HUB_NAME, falling back to os.Hostname().
 //
 // When multiple secrets match (e.g. after a hub migration that left a stale
 // secret behind), the function prefers a secret with scion-type=internal
@@ -450,16 +453,25 @@ func discoverSigningKey(ctx context.Context, projectID string) (value, resourceN
 	}
 	defer client.Close()
 
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", "", fmt.Errorf("getting hostname for label match: %w", err)
+	// SCION_SERVER_HUB_HUBNAME (koanf-derived) takes precedence;
+	// SCION_HUB_NAME is a shorter fallback for simple setups.
+	hubName := os.Getenv("SCION_SERVER_HUB_HUBNAME")
+	if hubName == "" {
+		hubName = os.Getenv("SCION_HUB_NAME")
+	}
+	if hubName == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			return "", "", fmt.Errorf("getting hostname for label match: %w", err)
+		}
+		hubName = h
 	}
 	// Labels are stored lowercase (sanitizeLabel in the hub).
-	hostnameLabel := strings.ToLower(hostname)
+	hubNameLabel := strings.ToLower(hubName)
 
 	filter := fmt.Sprintf(
-		"labels.scion-name=user_signing_key AND labels.scion-hub-hostname=%s",
-		hostnameLabel,
+		"labels.scion-name=user_signing_key AND (labels.scion-hub-name=%s OR labels.scion-hub-hostname=%s)",
+		hubNameLabel, hubNameLabel,
 	)
 
 	slog.Debug("searching Secret Manager for signing key",
@@ -487,7 +499,7 @@ func discoverSigningKey(ctx context.Context, projectID string) (value, resourceN
 	}
 
 	if len(candidates) == 0 {
-		return "", "", fmt.Errorf("no secret with labels scion-name=user_signing_key, scion-hub-hostname=%s found in project %s", hostnameLabel, projectID)
+		return "", "", fmt.Errorf("no secret with labels scion-name=user_signing_key, scion-hub-name=%s or scion-hub-hostname=%s found in project %s", hubNameLabel, hubNameLabel, projectID)
 	}
 
 	// Pick the best candidate using a scoring heuristic. The hub's current

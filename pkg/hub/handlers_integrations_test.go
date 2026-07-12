@@ -25,6 +25,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/integrationupdate"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/enttest"
@@ -34,19 +35,21 @@ import (
 // --- mock IntegrationManager ---
 
 type mockIntegrationManager struct {
-	plugins         map[string]map[string]string // name → config
-	selfManaged     map[string]bool
-	deploymentModes map[string]plugin.DeploymentMode
-	healthErr       error
-	infoErr         error
-	configureErr    error
-	reconnectErr    error
-	updateErr       error
-	installErr      error
-	configureCalls  []string
-	reconnectCalls  []string
-	updateCalls     []string
-	installCalls    []string
+	plugins            map[string]map[string]string // name → config
+	selfManaged        map[string]bool
+	deploymentModes    map[string]plugin.DeploymentMode
+	healthErr          error
+	infoErr            error
+	configureErr       error
+	replaceConfigErr   error
+	reconnectErr       error
+	updateErr          error
+	installErr         error
+	configureCalls     []string
+	replaceConfigCalls []string
+	reconnectCalls     []string
+	updateCalls        []string
+	installCalls       []string
 }
 
 func newMockIntegrationManager() *mockIntegrationManager {
@@ -113,6 +116,11 @@ func (m *mockIntegrationManager) ConfigureBroker(name string, extra map[string]s
 	return m.configureErr
 }
 
+func (m *mockIntegrationManager) ReplaceBrokerConfig(name string, cfg map[string]string) error {
+	m.replaceConfigCalls = append(m.replaceConfigCalls, name)
+	return m.replaceConfigErr
+}
+
 func (m *mockIntegrationManager) Reconnect(pluginType, name string) error {
 	m.reconnectCalls = append(m.reconnectCalls, name)
 	return m.reconnectErr
@@ -137,12 +145,15 @@ func (m *mockIntegrationManager) UpdatePlugin(name string, repoPath string) erro
 	return m.updateErr
 }
 
-func (m *mockIntegrationManager) InstallPlugin(name, repoPath, pluginsDir string) error {
+func (m *mockIntegrationManager) InstallPlugin(name, repoPath, pluginsDir, configFile string) error {
 	m.installCalls = append(m.installCalls, name)
 	if m.installErr != nil {
 		return m.installErr
 	}
 	m.plugins[name] = map[string]string{}
+	if configFile != "" {
+		m.plugins[name]["config_file"] = configFile
+	}
 	return nil
 }
 
@@ -441,8 +452,8 @@ func TestRestartIntegration_OK(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	if len(mgr.configureCalls) != 1 || mgr.configureCalls[0] != "telegram" {
-		t.Errorf("expected ConfigureBroker call for telegram, got %v", mgr.configureCalls)
+	if len(mgr.replaceConfigCalls) != 1 || mgr.replaceConfigCalls[0] != "telegram" {
+		t.Errorf("expected ReplaceBrokerConfig call for telegram, got %v", mgr.replaceConfigCalls)
 	}
 }
 
@@ -524,8 +535,8 @@ func TestUpdateConfig_WithConfigFile(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	if len(mgr.configureCalls) != 1 {
-		t.Errorf("expected 1 ConfigureBroker call, got %d", len(mgr.configureCalls))
+	if len(mgr.replaceConfigCalls) != 1 {
+		t.Errorf("expected 1 ReplaceBrokerConfig call, got %d", len(mgr.replaceConfigCalls))
 	}
 }
 
@@ -1496,5 +1507,152 @@ func TestIsHAIntegration_Modes(t *testing.T) {
 	mgr2.selfManaged["slack"] = true
 	if srv.isHAIntegration(mgr2, "slack") {
 		t.Error("self-managed without HA mode should not be HA")
+	}
+}
+
+func TestUpdateConfig_HA_SkipsReconfigure(t *testing.T) {
+	if !enttest.Active() {
+		t.Skip("requires Postgres backend; set SCION_TEST_POSTGRES_URL and build with -tags integration")
+	}
+	client := enttest.NewClient(t)
+
+	mgr := newMockIntegrationManager()
+	mgr.plugins["discord"] = map[string]string{}
+	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
+
+	srv := &Server{dbDriver: "postgres"}
+	srv.pluginManager = mgr
+	srv.entClient = client
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	body := `{"settings":{"guild_id":"12345"}}`
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/integrations/discord/config", strings.NewReader(body))
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	if len(mgr.replaceConfigCalls) != 0 {
+		t.Errorf("expected no ReplaceBrokerConfig calls for HA integration, got %v", mgr.replaceConfigCalls)
+	}
+}
+
+func TestGetIntegration_HA_ReadsFromPostgres(t *testing.T) {
+	if !enttest.Active() {
+		t.Skip("requires Postgres backend; set SCION_TEST_POSTGRES_URL and build with -tags integration")
+	}
+	client := enttest.NewClient(t)
+
+	mgr := newMockIntegrationManager()
+	mgr.plugins["discord"] = map[string]string{
+		"guild_id": "boot-value",
+		"hub_url":  "https://hub.example.com",
+	}
+	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
+
+	// Write config to Postgres — this is what PUT would have done.
+	provider := config.NewPostgresConfigProvider(client, "discord")
+	if err := provider.Save(context.Background(), map[string]string{
+		"guild_id":       "db-value",
+		"application_id": "app-from-db",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	srv := &Server{dbDriver: "postgres"}
+	srv.pluginManager = mgr
+	srv.entClient = client
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/integrations/discord", nil)
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var detail IntegrationDetail
+	if err := json.NewDecoder(rr.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Settings should reflect Postgres values, not boot-time map.
+	if detail.Settings["guild_id"] != "db-value" {
+		t.Errorf("guild_id: expected db-value, got %q", detail.Settings["guild_id"])
+	}
+	if detail.Settings["application_id"] != "app-from-db" {
+		t.Errorf("application_id: expected app-from-db, got %q", detail.Settings["application_id"])
+	}
+	// Internal keys should be filtered out.
+	if _, ok := detail.Settings["hub_url"]; ok {
+		t.Error("hub_url should be filtered from settings")
+	}
+}
+
+func TestInstallPlugin_PassesConfigFile(t *testing.T) {
+	mgr := newMockIntegrationManager()
+
+	if err := mgr.InstallPlugin("telegram", "/repo", "/plugins", "~/.scion/scion-telegram.yaml"); err != nil {
+		t.Fatalf("InstallPlugin: %v", err)
+	}
+
+	cfg := mgr.GetPluginConfig("broker", "telegram")
+	if cfg == nil {
+		t.Fatal("expected non-nil config after install")
+	}
+	if cfg["config_file"] == "" {
+		t.Error("expected config_file to be set after InstallPlugin with configFile parameter")
+	}
+	if cfg["config_file"] != "~/.scion/scion-telegram.yaml" {
+		t.Errorf("expected config_file=~/.scion/scion-telegram.yaml, got %q", cfg["config_file"])
+	}
+}
+
+func TestGetIntegration_ReadsFromConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "telegram.yaml")
+	if err := os.WriteFile(configFile, []byte("webhook_listen: \":9095\"\ndb_path: /tmp/tg.db\n"), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	mgr := newMockIntegrationManager()
+	mgr.plugins["telegram"] = map[string]string{
+		"config_file":    configFile,
+		"webhook_listen": ":9094",
+		"hub_url":        "https://hub.example.com",
+	}
+
+	srv := &Server{}
+	srv.pluginManager = mgr
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/integrations/telegram", nil)
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var detail IntegrationDetail
+	if err := json.NewDecoder(rr.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Settings should reflect the YAML file values, not the boot-time map.
+	if detail.Settings["webhook_listen"] != ":9095" {
+		t.Errorf("webhook_listen: expected :9095 (from file), got %q", detail.Settings["webhook_listen"])
+	}
+	if detail.Settings["db_path"] != "/tmp/tg.db" {
+		t.Errorf("db_path: expected /tmp/tg.db, got %q", detail.Settings["db_path"])
+	}
+	if _, ok := detail.Settings["hub_url"]; ok {
+		t.Error("hub_url should be filtered from settings")
 	}
 }

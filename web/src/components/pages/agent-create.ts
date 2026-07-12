@@ -541,6 +541,7 @@ export class ScionPageAgentCreate extends LitElement {
           SCION_TELEMETRY_ENABLED: this.telemetryEnabled ? 'true' : 'false',
         },
       };
+
       body.config = config;
 
       // Validate GCP assign mode
@@ -772,6 +773,7 @@ private selectBrokerForProject(): void {
       t.defaultHarnessConfig || t.harness || harnessDefault;
 
     // Try project settings default template first
+    let templateResolved = false;
     if (settings?.defaultTemplate) {
       const match = visible.find(
         (t) => t.name === settings.defaultTemplate || t.slug === settings.defaultTemplate
@@ -779,22 +781,25 @@ private selectBrokerForProject(): void {
       if (match) {
         this.templateId = match.id;
         this.setHarnessFromValue(harnessFor(match));
-        return;
+        templateResolved = true;
       }
     }
 
-    // Fallback: template named "default"
-    const fallback = visible.find((t) => t.slug === 'default' || t.name === 'default');
-    if (fallback) {
-      this.templateId = fallback.id;
-      this.setHarnessFromValue(harnessFor(fallback));
-    } else if (visible.length > 0) {
-      this.templateId = visible[0].id;
-      this.setHarnessFromValue(harnessFor(visible[0]));
-    } else {
-      this.templateId = '';
-      this.setHarnessFromValue(harnessDefault);
+    if (!templateResolved) {
+      // Fallback: template named "default"
+      const fallback = visible.find((t) => t.slug === 'default' || t.name === 'default');
+      if (fallback) {
+        this.templateId = fallback.id;
+        this.setHarnessFromValue(harnessFor(fallback));
+      } else if (visible.length > 0) {
+        this.templateId = visible[0].id;
+        this.setHarnessFromValue(harnessFor(visible[0]));
+      } else {
+        this.templateId = '';
+        this.setHarnessFromValue(harnessDefault);
+      }
     }
+
   }
 
   /**
@@ -930,6 +935,7 @@ private selectBrokerForProject(): void {
     defaultMaxDuration?: string;
     defaultGCPIdentityMode?: string;
     defaultGCPIdentityServiceAccountID?: string;
+    defaultModel?: string;
   } | null> {
     if (!projectId) return null;
 
@@ -947,6 +953,7 @@ private selectBrokerForProject(): void {
           defaultMaxDuration?: string;
           defaultGCPIdentityMode?: string;
           defaultGCPIdentityServiceAccountID?: string;
+          defaultModel?: string;
         };
         this.projectSettingsCache.set(projectId, data);
         return data;

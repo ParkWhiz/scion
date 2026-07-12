@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -36,6 +37,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/entc"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
@@ -55,6 +57,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/GoogleCloudPlatform/scion/web"
+	"github.com/knadh/koanf/v2"
 	"github.com/spf13/cobra"
 )
 
@@ -91,7 +94,8 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	}
 	if _, err := os.Stat(globalDir); os.IsNotExist(err) {
 		log.Println("Initializing global scion directory...")
-		if err := config.InitGlobal(harness.EmbedOnlyHarnesses()); err != nil {
+		initOpts := config.InitMachineOpts{SkipRuntimeCheck: hostedMode}
+		if err := config.InitGlobal(harness.EmbedOnlyHarnesses(), initOpts); err != nil {
 			return fmt.Errorf("failed to initialize global config: %w", err)
 		}
 	} else if !hostedMode {
@@ -212,19 +216,11 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	// Parse admin emails
 	adminEmailList := parseAdminEmails(cfg)
 
-	// 10b. Initialize plugin manager
-	pluginMgr := initPluginManager()
-	defer pluginMgr.Shutdown()
-
-	// 11. Start Hub
-	var hubSrv *hub.Server
+	// Initialize secret backend before plugin manager so that boot-time
+	// inline-secret migration can write to the backend before
+	// ResolvePluginConfig strips inline secrets.
 	var secretBackend secret.SecretBackend
-	var hubDBRec dbmetrics.Recorder
-	if enableHub {
-		// Initialize secret backend early so signing keys can be loaded from it
-		// during hub server creation. This prevents the previous bug where
-		// ensureSigningKey always fell through to SQLite because the secret
-		// backend was set too late (after hub.New()).
+	if enableHub && s != nil {
 		hubID := cfg.Hub.ResolveHubID()
 		var sbErr error
 		secretBackend, sbErr = secret.NewBackend(ctx, cfg.Secrets.Backend, s, secret.GCPBackendConfig{
@@ -234,6 +230,19 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		if sbErr != nil {
 			log.Printf("Warning: failed to initialize secret backend: %v", sbErr)
 		}
+		if gcpBackend, ok := secretBackend.(*secret.GCPBackend); ok {
+			gcpBackend.SetHubName(cfg.Hub.ResolveHubName())
+		}
+	}
+
+	// 10b. Initialize plugin manager
+	pluginMgr := initPluginManager(ctx, secretBackend)
+	defer pluginMgr.Shutdown()
+
+	// 11. Start Hub
+	var hubSrv *hub.Server
+	var hubDBRec dbmetrics.Recorder
+	if enableHub {
 
 		var hubInitErr error
 		hubSrv, hubInitErr = initHubServer(ctx, cfg, s, entClient, hubEndpoint, devAuthToken, adminEmailList, adminMode, maintenanceMessage, requestLogger, messageLogger, globalDir, pluginMgr, secretBackend)
@@ -245,6 +254,7 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		if cfg.Hub.GCPProjectID != "" {
 			mp, mpErr := hubmetrics.NewMeterProvider(ctx, cfg.Hub.GCPProjectID,
 				hubmetrics.WithHubID(hubSrv.HubID()),
+				hubmetrics.WithHubName(cfg.Hub.ResolveHubName()),
 			)
 			if mpErr != nil {
 				log.Printf("WARNING: hub metrics export disabled: %v", mpErr)
@@ -301,6 +311,7 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 				return err
 			}
 			hubSrv.SetEventPublisher(eventPub)
+			startSettingsPropagation(ctx, hubSrv, eventPub)
 
 			log.Printf("Starting Hub API server on %s:%d", cfg.Hub.Host, cfg.Hub.Port)
 			wg.Add(1)
@@ -406,10 +417,12 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 					continue
 				}
 
-				// Inject hub credentials into hub-managed broker plugins so they
-				// can authenticate back to the Hub API. Self-managed plugins
-				// handle their own credential lifecycle.
-				if !pluginMgr.IsSelfManaged(scionplugin.PluginTypeBroker, bt) && hubSrv != nil && s != nil {
+				// Inject hub credentials into hub-managed, non-HA broker plugins.
+				// Self-managed plugins handle their own credential lifecycle;
+				// HA integrations pull credentials from env/Secret Manager.
+				if !pluginMgr.IsSelfManaged(scionplugin.PluginTypeBroker, bt) &&
+					pluginMgr.GetDeploymentMode(scionplugin.PluginTypeBroker, bt) != scionplugin.DeploymentModeHA &&
+					hubSrv != nil && s != nil {
 					// Use the same deterministic UUIDv5 as the α migration so the
 					// broker entity created here matches the migrated ID.
 					pluginBrokerNS := uuid.MustParse("5c104390-a1d0-5e9a-9b1e-5c104390a1d0")
@@ -541,6 +554,8 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 		component = "scion-broker"
 	}
 
+	hubName := resolveHubNameFromEnv()
+
 	// Initialize OTel logging
 	ctx := context.Background()
 	logProvider, logCleanup, otelErr := logging.InitOTelLogging(ctx, logging.OTelConfig{})
@@ -560,6 +575,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 		logLevel := logging.ResolveLogLevel(enableDebug)
 		cfg := logging.CloudLoggingConfig{
 			Component: component,
+			HubName:   hubName,
 		}
 		ch, cloudLogCleanup, cloudErr := logging.NewCloudHandler(ctx, cfg, logLevel)
 		if cloudErr != nil {
@@ -576,12 +592,13 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 		}
 	}
 
-	logging.SetupWithOTel(component, enableDebug, useGCP, logProvider, cloudHandler)
+	logging.SetupWithOTel(component, hubName, enableDebug, useGCP, logProvider, cloudHandler)
 
 	// Initialize request logger
 	reqLogCfg := logging.RequestLoggerConfig{
 		FilePath:   os.Getenv(logging.EnvRequestLogPath),
 		Component:  component,
+		HubName:    hubName,
 		UseGCP:     useGCP,
 		Foreground: serverStartForeground,
 		Level:      logging.ResolveLogLevel(enableDebug),
@@ -603,6 +620,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	// Initialize message logger
 	msgLogCfg := logging.MessageLoggerConfig{
 		Component: component,
+		HubName:   hubName,
 		UseGCP:    useGCP,
 		Level:     logging.ResolveLogLevel(enableDebug),
 	}
@@ -1090,6 +1108,25 @@ func parseAdminEmails(cfg *config.GlobalConfig) []string {
 	return adminEmailList
 }
 
+// resolveHubNameFromEnv resolves the hub display name from environment variables,
+// falling back to os.Hostname(). This is used during early logging init before
+// the full config is loaded. SCION_SERVER_HUB_HUBNAME (the standard koanf-derived
+// name) takes precedence; SCION_HUB_NAME is accepted as a shorter fallback for
+// simple setups.
+func resolveHubNameFromEnv() string {
+	if v := os.Getenv("SCION_SERVER_HUB_HUBNAME"); v != "" {
+		return v
+	}
+	if v := os.Getenv("SCION_HUB_NAME"); v != "" {
+		return v
+	}
+	h, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return h
+}
+
 // resolveSessionSecret resolves the deployment-wide session secret from the
 // --session-secret flag, falling back to the SCION_SERVER_SESSION_SECRET env
 // var (then SESSION_SECRET for compatibility). The same value backs both the
@@ -1112,28 +1149,30 @@ func resolveSessionSecret() string {
 // initHubServer creates and configures the Hub server.
 func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store, entClient *ent.Client, hubEndpoint, devAuthToken string, adminEmailList []string, adminMode bool, maintenanceMessage string, requestLogger, messageLogger *slog.Logger, globalDir string, pluginMgr *scionplugin.Manager, secretBackend secret.SecretBackend) (*hub.Server, error) {
 	hubCfg := hub.ServerConfig{
-		HubID:                 cfg.Hub.ResolveHubID(),
-		Port:                  cfg.Hub.Port,
-		Host:                  cfg.Hub.Host,
-		ReadTimeout:           cfg.Hub.ReadTimeout,
-		WriteTimeout:          cfg.Hub.WriteTimeout,
-		CORSEnabled:           cfg.Hub.CORSEnabled,
-		CORSAllowedOrigins:    cfg.Hub.CORSAllowedOrigins,
-		CORSAllowedMethods:    cfg.Hub.CORSAllowedMethods,
-		CORSAllowedHeaders:    cfg.Hub.CORSAllowedHeaders,
-		CORSMaxAge:            cfg.Hub.CORSMaxAge,
-		AuthMode:              cfg.Auth.Mode,
-		DevAuthToken:          devAuthToken,
-		Debug:                 enableDebug,
-		AuthorizedDomains:     cfg.Auth.AuthorizedDomains,
-		AdminEmails:           adminEmailList,
-		UserAccessMode:        cfg.Auth.UserAccessMode,
-		HubEndpoint:           hubEndpoint,
-		SoftDeleteRetention:   cfg.Hub.SoftDeleteRetention,
-		SoftDeleteRetainFiles: cfg.Hub.SoftDeleteRetainFiles,
-		AdminMode:             adminMode,
-		MaintenanceMessage:    maintenanceMessage,
-		Workstation:           !hostedMode,
+		HubID:                        cfg.Hub.ResolveHubID(),
+		HubName:                      cfg.Hub.ResolveHubName(),
+		DisableLegacyStorageFallback: cfg.Hub.DisableLegacyStorageFallback,
+		Port:                         cfg.Hub.Port,
+		Host:                         cfg.Hub.Host,
+		ReadTimeout:                  cfg.Hub.ReadTimeout,
+		WriteTimeout:                 cfg.Hub.WriteTimeout,
+		CORSEnabled:                  cfg.Hub.CORSEnabled,
+		CORSAllowedOrigins:           cfg.Hub.CORSAllowedOrigins,
+		CORSAllowedMethods:           cfg.Hub.CORSAllowedMethods,
+		CORSAllowedHeaders:           cfg.Hub.CORSAllowedHeaders,
+		CORSMaxAge:                   cfg.Hub.CORSMaxAge,
+		AuthMode:                     cfg.Auth.Mode,
+		DevAuthToken:                 devAuthToken,
+		Debug:                        enableDebug,
+		AuthorizedDomains:            cfg.Auth.AuthorizedDomains,
+		AdminEmails:                  adminEmailList,
+		UserAccessMode:               cfg.Auth.UserAccessMode,
+		HubEndpoint:                  hubEndpoint,
+		SoftDeleteRetention:          cfg.Hub.SoftDeleteRetention,
+		SoftDeleteRetainFiles:        cfg.Hub.SoftDeleteRetainFiles,
+		AdminMode:                    adminMode,
+		MaintenanceMessage:           maintenanceMessage,
+		Workstation:                  !hostedMode,
 		DevUserConfig: hub.DevUserConfig{
 			Username:    cfg.Auth.Username,
 			DisplayName: cfg.Auth.DisplayName,
@@ -1289,6 +1328,15 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 	// Hub ID was already resolved and set during initHubServer via ServerConfig.HubID
 	hubID := hubSrv.HubID()
 	log.Printf("Hub instance ID: %s", hubID)
+	if hubID != "" && storageBucket != "" {
+		slog.Info("storage: using hub-scoped GCS paths", "hub_id", hubID, "prefix", "hubs/"+hubID+"/")
+	}
+	if storageBucket != "" && cfg.Hub.IsHubIDAutoGenerated() {
+		slog.Warn("storage: hub_id was auto-generated from hostname; "+
+			"set an explicit hub_id in settings for multi-hub deployments",
+			"hub_id", hubID,
+			"storage_bucket", storageBucket)
+	}
 
 	// Secret backend was initialized before hub.New() and passed via
 	// ServerConfig.SecretBackend so that signing keys are loaded from it
@@ -1354,9 +1402,170 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		}
 	}
 
+	// On first boot with hub-namespaced paths, copy legacy GCS objects to
+	// the hub-scoped prefix so that subsequent sync/dispatch uses the
+	// namespaced paths. Runs synchronously before SyncAll* calls.
+	hubSrv.MigrateStorageOnFirstBoot(ctx)
+
+	// Reconcile resource DB manifest hashes against actual GCS content.
+	// In multi-hub mode a peer hub may have uploaded newer files; this ensures
+	// the local DB reflects reality before any dispatch is attempted.
+	go hubSrv.SyncAllHarnessConfigsFromStorage(ctx)
+	go hubSrv.SyncAllTemplatesFromStorage(ctx)
+
 	log.Printf("Database: %s (%s)", cfg.Database.Driver, cfg.Database.URL)
 
+	// --- Settings-DB Phase 3: OperationalSettings wiring (§3.9) ---
+	// Gated on postgres: in SQLite/workstation mode the legacy file path is
+	// used unchanged.
+	if strings.EqualFold(cfg.Database.Driver, "postgres") {
+		if err := initOperationalSettings(ctx, cfg, hubSrv, s, globalDir); err != nil {
+			return nil, fmt.Errorf("operational settings init: %w", err)
+		}
+	}
+
 	return hubSrv, nil
+}
+
+// initOperationalSettings sets up the OperationalSettings service for postgres
+// mode (settings-db §3.9). It:
+//  1. Acquires advisory lock "hub_settings_seed"
+//  2. If no _meta row exists, seeds sections from settings.yaml (file values only)
+//  3. Releases the lock
+//  4. Calls Refresh to load sections, then applySnapshot
+//  5. Logs any env-overridden Layer-1 keys as a WARN
+func initOperationalSettings(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Server, s store.Store, globalDir string) error {
+	settingStore, ok := s.(store.HubSettingStore)
+	if !ok {
+		// Store does not implement HubSettingStore — skip (should not happen
+		// with postgres, but guard defensively).
+		log.Println("WARNING: store does not implement HubSettingStore; skipping operational settings init")
+		return nil
+	}
+
+	// Build the file-only and env-only koanf instances.
+	fileKoanf := config.LoadFileOnlyKoanf()
+	envKoanf := config.LoadEnvKoanf()
+
+	// --- Seeding under advisory lock ---
+	locker, hasLocker := s.(store.AdvisoryLocker)
+	if hasLocker {
+		acquired, release, err := locker.TryAdvisoryLock(ctx, store.LockHubSettingsSeed)
+		if err != nil {
+			return fmt.Errorf("acquiring hub_settings_seed advisory lock: %w", err)
+		}
+		if acquired {
+			seedErr := seedHubSettingsIfNeeded(ctx, settingStore, fileKoanf, globalDir)
+			// Release the advisory lock immediately after seeding (scoped
+			// release per design §3.9) — Refresh below does not need the lock.
+			if rerr := release(); rerr != nil {
+				slog.Error("Failed to release hub_settings_seed advisory lock", "error", rerr)
+			}
+			if seedErr != nil {
+				return fmt.Errorf("seeding hub settings: %w", seedErr)
+			}
+		} else {
+			// Another replica is seeding — that's fine, we'll pick up the
+			// results via Refresh below.
+			log.Println("Hub settings seed lock held by another replica; skipping seed")
+		}
+	} else {
+		// No advisory locking (shouldn't happen on postgres, but handle).
+		if err := seedHubSettingsIfNeeded(ctx, settingStore, fileKoanf, globalDir); err != nil {
+			return fmt.Errorf("seeding hub settings: %w", err)
+		}
+	}
+
+	// --- Create OperationalSettings, Refresh, and apply ---
+	ops := hub.NewOperationalSettings(settingStore, fileKoanf, envKoanf)
+
+	changed, err := ops.Refresh(ctx)
+	if err != nil {
+		return fmt.Errorf("initial operational settings refresh: %w", err)
+	}
+	if len(changed) > 0 {
+		log.Printf("Operational settings loaded from DB: %v", changed)
+	}
+
+	snap := ops.Snapshot()
+	hub.ApplySnapshot(hubSrv, snap)
+	hub.ApplyMaintenanceFromSnapshot(hubSrv, snap)
+
+	hubSrv.SetOperationalSettings(ops)
+
+	// --- WARN log for env-overridden Layer-1 keys (§3.4) ---
+	if envKeys := ops.EnvOverriddenKeys(); len(envKeys) > 0 {
+		slog.Warn("Layer-1 settings overridden by SCION_SERVER_* env vars on this node — these values diverge from the shared DB",
+			"keys", envKeys)
+	}
+
+	return nil
+}
+
+// startSettingsPropagation wires the event publisher into the OperationalSettings
+// service and starts the cross-replica propagation loop (design §3.6, Phase 4).
+// In file/SQLite mode (no OperationalSettings), this is a no-op.
+func startSettingsPropagation(ctx context.Context, hubSrv *hub.Server, eventPub hub.EventPublisher) {
+	ops := hubSrv.GetOperationalSettings()
+	if ops == nil {
+		return // file/SQLite mode — no propagation needed
+	}
+	ops.SetEventPublisher(eventPub)
+	ops.StartPropagation(ctx, hubSrv)
+	slog.Info("Settings change propagation started (subscribe + poll backstop)")
+}
+
+// seedHubSettingsIfNeeded checks for the _meta sentinel row; if absent, seeds
+// each registry section from the file's Layer-1 keys. Sections with no koanf
+// paths (e.g. maintenance) are skipped — they start with compiled defaults.
+func seedHubSettingsIfNeeded(ctx context.Context, s store.HubSettingStore, fileKoanf *koanf.Koanf, globalDir string) error {
+	// Check for _meta sentinel.
+	_, err := s.GetHubSetting(ctx, "_meta")
+	if err == nil {
+		// _meta exists — seeding already done.
+		log.Println("Hub settings already seeded (_meta row present); skipping seed")
+		return nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("checking _meta row: %w", err)
+	}
+
+	// No _meta — seed.
+	log.Println("Seeding hub_settings from settings.yaml...")
+
+	settingsPath := filepath.Join(globalDir, "settings.yaml")
+
+	for _, sec := range opsettings.Registry {
+		// Skip sections with no koanf paths (e.g. maintenance — runtime-only).
+		if len(sec.KoanfPaths) == 0 {
+			continue
+		}
+
+		doc, err := opsettings.ExtractSectionFromKoanf(fileKoanf, sec.Name)
+		if err != nil {
+			slog.Warn("Failed to extract section for seeding; skipping", "section", sec.Name, "error", err)
+			continue
+		}
+
+		_, err = s.UpsertHubSetting(ctx, sec.Name, doc, "seed", -1) // unconditional upsert
+		if err != nil {
+			return fmt.Errorf("seeding section %q: %w", sec.Name, err)
+		}
+		log.Printf("  Seeded section: %s", sec.Name)
+	}
+
+	// Write _meta sentinel.
+	metaDoc, _ := json.Marshal(map[string]interface{}{
+		"seeded_from":  settingsPath,
+		"seeded_at":    time.Now().UTC().Format(time.RFC3339),
+		"seed_version": "1",
+	})
+	if _, err := s.UpsertHubSetting(ctx, "_meta", metaDoc, "seed", -1); err != nil {
+		return fmt.Errorf("writing _meta sentinel: %w", err)
+	}
+
+	log.Println("Hub settings seeding complete")
+	return nil
 }
 
 // initHubStorage initializes the storage backend for the Hub server.
@@ -1558,6 +1767,7 @@ func initWebServer(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Se
 	// Wire Hub services into WebServer if Hub is enabled
 	if hubSrv != nil {
 		hubSrv.SetEventPublisher(eventPub)
+		startSettingsPropagation(ctx, hubSrv, eventPub)
 		webSrv.SetOAuthService(hubSrv.GetOAuthService())
 		webSrv.SetStore(hubSrv.GetStore())
 		webSrv.SetUserTokenService(hubSrv.GetUserTokenService())
@@ -1602,6 +1812,14 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 
 	// Resolve broker name
 	brokerName := resolveBrokerName(cfg, settings, vsBroker)
+
+	// If no explicit name was configured and this is a co-located broker,
+	// use a stable human-readable name instead of the hostname fallback.
+	if enableHub && !simulateRemoteBroker {
+		if hostname, err := os.Hostname(); err == nil && brokerName == hostname {
+			brokerName = "Hosted Broker"
+		}
+	}
 
 	// Enrich logger with broker_id
 	slog.SetDefault(slog.Default().With(slog.String(logging.AttrBrokerID, brokerID)))
@@ -1795,12 +2013,26 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 			defer wg.Done()
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
+			prevOnline := rhSrv.IsControlChannelConnected()
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := s.UpdateRuntimeBrokerHeartbeat(ctx, brokerID, store.BrokerStatusOnline); err != nil {
+					ccUp := rhSrv.IsControlChannelConnected()
+					status := store.BrokerStatusOnline
+					if !ccUp {
+						status = store.BrokerStatusOffline
+					}
+					if ccUp != prevOnline {
+						if ccUp {
+							log.Printf("Co-located heartbeat: control channel restored, writing online for %s", brokerName)
+						} else {
+							log.Printf("Co-located heartbeat: control channel down, writing offline for %s", brokerName)
+						}
+						prevOnline = ccUp
+					}
+					if err := s.UpdateRuntimeBrokerHeartbeat(ctx, brokerID, status); err != nil {
 						log.Printf("Warning: failed to update internal heartbeat for %s: %v", brokerName, err)
 					}
 				}
@@ -1861,7 +2093,9 @@ func isObserverBroker(pluginMgr *scionplugin.Manager, name string) bool {
 }
 
 // initPluginManager creates and loads a plugin manager from versioned settings.
-func initPluginManager() *scionplugin.Manager {
+// The secretBackend parameter (may be nil) enables one-shot migration of inline
+// secrets to the backend before ResolvePluginConfig strips them.
+func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend) *scionplugin.Manager {
 	logger := logging.Subsystem("plugin")
 	mgr := scionplugin.NewManager(logger)
 	mgr.NewGRPCBrokerAdapter = grpcbroker.NewAdapterFromEntry
@@ -1882,11 +2116,27 @@ func initPluginManager() *scionplugin.Manager {
 		Broker: make(map[string]scionplugin.PluginEntry),
 	}
 	for name, entry := range vs.Server.Plugins.Broker {
-		// Merge config_file contents with inline config (inline overrides file).
-		mergedConfig, mergeErr := config.LoadPluginConfigFile(entry.ConfigFile, entry.Config)
+		// B1: Auto-migrate inline secrets to the secret backend before
+		// ResolvePluginConfig strips them. This ensures existing users
+		// with bot_token in settings.yaml don't lose their credentials
+		// on upgrade.
+		if secretBackend != nil && entry.Config != nil {
+			migrateInlineSecrets(ctx, secretBackend, name, entry.Config)
+		}
+
+		mergedConfig, mergeErr := config.ResolvePluginConfig(entry.ConfigFile, entry.Config)
 		if mergeErr != nil {
 			log.Printf("Warning: failed to load config file for plugin %q: %v", name, mergeErr)
-			mergedConfig = entry.Config
+			mergedConfig = stripSecretKeys(entry.Config)
+		}
+		if secretBackend != nil {
+			mergedConfig = injectPluginSecretsIntoConfig(ctx, secretBackend, name, mergedConfig)
+		}
+		if entry.ConfigFile != "" {
+			if mergedConfig == nil {
+				mergedConfig = make(map[string]string)
+			}
+			mergedConfig["config_file"] = entry.ConfigFile
 		}
 		pluginsCfg.Broker[name] = scionplugin.PluginEntry{
 			Path:          entry.Path,
@@ -2058,6 +2308,59 @@ func resolveMaintenanceConfig(cfg *config.GlobalConfig) hub.MaintenanceConfig {
 	return mc
 }
 
+// migrateInlineSecrets performs a one-shot migration of secret config keys found
+// in the raw inline settings.yaml config into the secret backend. This prevents
+// existing users who followed the Telegram/Discord READMEs (which have
+// bot_token directly in settings.yaml) from losing their credentials when
+// ResolvePluginConfig strips inline secrets.
+func migrateInlineSecrets(ctx context.Context, sb secret.SecretBackend, pluginName string, inlineConfig map[string]string) {
+	mappings, ok := config.PluginSecretKeyMap[pluginName]
+	if !ok {
+		return
+	}
+
+	hubID := sb.HubID()
+	for _, m := range mappings {
+		val, has := inlineConfig[m.ConfigKey]
+		if !has || val == "" {
+			continue
+		}
+		existing, err := sb.Get(ctx, m.SecretKey, store.ScopeHub, hubID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			log.Printf("Warning: failed to check secret backend for %s (plugin %q), skipping migration: %v", m.ConfigKey, pluginName, err)
+			continue
+		}
+		if existing != nil && existing.Value != "" {
+			continue
+		}
+		_, _, err = sb.Set(ctx, &secret.SetSecretInput{
+			Name:          m.SecretKey,
+			Value:         val,
+			SecretType:    secret.TypeVariable,
+			InjectionMode: "as_needed",
+			Scope:         store.ScopeHub,
+			ScopeID:       hubID,
+			Description:   fmt.Sprintf("Auto-migrated from inline config for plugin %s", pluginName),
+		})
+		if err != nil {
+			log.Printf("Warning: failed to migrate inline secret %s for plugin %q: %v", m.ConfigKey, pluginName, err)
+			continue
+		}
+		log.Printf("Migrated inline %s to secret backend for plugin %q — remove it from settings.yaml", m.ConfigKey, pluginName)
+	}
+}
+
+// stripSecretKeys returns a copy of the config map with all secret config keys removed.
+func stripSecretKeys(cfg map[string]string) map[string]string {
+	out := make(map[string]string, len(cfg))
+	for k, v := range cfg {
+		if !config.IsSecretConfigKey(k) {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // injectPluginSecrets loads chat integration secrets from the secret backend
 // and injects them into the extra credentials map. Respects the fallback chain:
 // if the plugin's merged config (file + inline) already has a value for a key,
@@ -2084,4 +2387,38 @@ func injectPluginSecrets(ctx context.Context, sb secret.SecretBackend, pluginNam
 		creds[m.ConfigKey] = sv.Value
 		slog.Info("Injected secret into broker plugin", "secret", m.SecretKey, "plugin", pluginName, "config_key", m.ConfigKey)
 	}
+}
+
+// injectPluginSecretsIntoConfig loads secrets from the backend directly into
+// the plugin's merged config map so they are available when LoadAll calls
+// Configure. Without this, plugins that validate required keys (e.g.
+// Telegram's bot_token) during Configure would fail because
+// ResolvePluginConfig already stripped inline secrets.
+func injectPluginSecretsIntoConfig(ctx context.Context, sb secret.SecretBackend, pluginName string, cfg map[string]string) map[string]string {
+	if sb == nil {
+		return cfg
+	}
+
+	mappings, ok := config.PluginSecretKeyMap[pluginName]
+	if !ok {
+		return cfg
+	}
+
+	hubID := sb.HubID()
+	for _, m := range mappings {
+		if cfg != nil {
+			if existing, ok := cfg[m.ConfigKey]; ok && existing != "" {
+				continue
+			}
+		}
+		sv, err := sb.Get(ctx, m.SecretKey, store.ScopeHub, hubID)
+		if err != nil || sv == nil || sv.Value == "" {
+			continue
+		}
+		if cfg == nil {
+			cfg = make(map[string]string)
+		}
+		cfg[m.ConfigKey] = sv.Value
+	}
+	return cfg
 }

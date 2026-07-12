@@ -88,6 +88,10 @@ func registerGlobalProjectAndBroker(ctx context.Context, s store.Store, brokerID
 		}
 	}
 
+	brokerLabels := map[string]string{
+		"scion.io/broker-role": "embedded",
+	}
+
 	if broker == nil {
 		broker = &store.RuntimeBroker{
 			ID:              brokerID,
@@ -104,6 +108,7 @@ func registerGlobalProjectAndBroker(ctx context.Context, s store.Store, brokerID
 				Attach: true,
 			},
 			Profiles: profiles,
+			Labels:   brokerLabels,
 		}
 
 		if err := s.CreateRuntimeBroker(ctx, broker); err != nil {
@@ -118,6 +123,14 @@ func registerGlobalProjectAndBroker(ctx context.Context, s store.Store, brokerID
 		broker.LastHeartbeat = time.Now()
 		// Update profiles from settings (may have changed)
 		broker.Profiles = profiles
+		// Ensure deployment-type labels are set on re-registration
+		if broker.Labels == nil {
+			broker.Labels = brokerLabels
+		} else {
+			for k, v := range brokerLabels {
+				broker.Labels[k] = v
+			}
+		}
 		if err := s.UpdateRuntimeBroker(ctx, broker); err != nil {
 			return brokerID, fmt.Errorf("failed to update runtime broker: %w", err)
 		}

@@ -23,6 +23,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	smpb "cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"google.golang.org/grpc/codes"
@@ -38,6 +39,8 @@ type GCPBackend struct {
 	smClient  SMClient
 	projectID string
 	hubID     string
+	mu        sync.RWMutex
+	hubName   string
 }
 
 // NewGCPBackend creates a GCPBackend with a real GCP Secret Manager client.
@@ -70,6 +73,13 @@ func NewGCPBackendWithClient(s store.SecretStore, client SMClient, projectID, hu
 // HubID returns the hub instance ID used for hub-scoped secret namespacing.
 func (b *GCPBackend) HubID() string {
 	return b.hubID
+}
+
+// SetHubName sets the human-readable hub display name.
+func (b *GCPBackend) SetHubName(name string) {
+	b.mu.Lock()
+	b.hubName = name
+	b.mu.Unlock()
 }
 
 func (b *GCPBackend) Get(ctx context.Context, name, scope, scopeID string) (*SecretWithValue, error) {
@@ -170,7 +180,7 @@ func (b *GCPBackend) Set(ctx context.Context, input *SetSecretInput) (bool, *Sec
 							Automatic: &smpb.Replication_Automatic{},
 						},
 					},
-					Labels: buildLabels(input, target, hostname()),
+					Labels: buildLabels(input, target, b.resolveHubName()),
 				},
 			})
 			if err != nil {
@@ -462,15 +472,15 @@ func sanitizeLabel(s string) string {
 
 // buildLabels constructs the GCP SM labels map for a secret.
 // For user-scoped secrets with a known email, a scion-userid label is added.
-// The hubHostname label allows filtering secrets by hub in the GCP console.
-func buildLabels(input *SetSecretInput, target, hubHostname string) map[string]string {
+// The scion-hub-name label allows filtering secrets by hub in the GCP console.
+func buildLabels(input *SetSecretInput, target, hubName string) map[string]string {
 	labels := map[string]string{
-		"scion-scope":        sanitizeLabel(input.Scope),
-		"scion-scope-id":     sanitizeLabel(input.ScopeID),
-		"scion-type":         sanitizeLabel(input.SecretType),
-		"scion-name":         sanitizeLabel(input.Name),
-		"scion-target":       sanitizeLabel(target),
-		"scion-hub-hostname": sanitizeLabel(hubHostname),
+		"scion-scope":    sanitizeLabel(input.Scope),
+		"scion-scope-id": sanitizeLabel(input.ScopeID),
+		"scion-type":     sanitizeLabel(input.SecretType),
+		"scion-name":     sanitizeLabel(input.Name),
+		"scion-target":   sanitizeLabel(target),
+		"scion-hub-name": sanitizeLabel(hubName),
 	}
 	if input.Scope == ScopeUser && input.UserEmail != "" {
 		labels["scion-userid"] = sanitizeLabel(input.UserEmail)
@@ -478,8 +488,14 @@ func buildLabels(input *SetSecretInput, target, hubHostname string) map[string]s
 	return labels
 }
 
-// hostname returns the machine hostname for labeling, or "unknown" if unavailable.
-func hostname() string {
+// resolveHubName returns the hub display name if set, falling back to the machine hostname.
+func (b *GCPBackend) resolveHubName() string {
+	b.mu.RLock()
+	name := b.hubName
+	b.mu.RUnlock()
+	if name != "" {
+		return name
+	}
 	h, err := os.Hostname()
 	if err != nil {
 		return "unknown"

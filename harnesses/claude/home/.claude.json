@@ -10,7 +10,7 @@
   "githubRepoPaths": {},
   "shiftEnterKeyBindingInstalled": true,
   "hasCompletedOnboarding": true,
-  "lastOnboardingVersion": "2.0.76",
+  "lastOnboardingVersion": "2.1.197",
   "projects": {
     "/repo-root/.scion/agents/ggg/workspace": {
       "allowedTools": [],
@@ -29,5 +29,5 @@
   "officialMarketplaceAutoInstalled": true,
   "bypassPermissionsModeAccepted": true,
   "effortCalloutDismissed": true,
-  "lastReleaseNotesSeen": "2.0.76"
+  "lastReleaseNotesSeen": "2.1.197"
 }

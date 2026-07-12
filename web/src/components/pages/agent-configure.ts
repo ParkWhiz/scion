@@ -27,6 +27,7 @@ import { customElement, state } from 'lit/decorators.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import type { Agent, CapabilityField, GCPIdentityConfig, GCPServiceAccount, HarnessAdvancedCapabilities } from '../../shared/types.js';
+import { normalizeModelAlias } from '../../shared/model-utils.js';
 import type { EnvEntry } from '../shared/env-editor.js';
 import '../shared/env-editor.js';
 
@@ -47,6 +48,7 @@ interface ScionConfigPayload {
     limits?: { cpu?: string; memory?: string };
     disk?: string;
   };
+  thinking_level?: number | null;
   env?: Record<string, string>;
   telemetry?: { enabled?: boolean };
 }
@@ -54,6 +56,7 @@ interface ScionConfigPayload {
 interface AppliedConfig {
   image?: string;
   model?: string;
+  thinkingLevel?: number | null;
   harnessConfig?: string;
   harnessAuth?: string;
   task?: string;
@@ -64,7 +67,7 @@ interface AppliedConfig {
   };
 }
 
-interface AgentWithConfig extends Agent {
+interface AgentWithConfig extends Omit<Agent, 'appliedConfig'> {
   appliedConfig?: AppliedConfig;
 }
 
@@ -80,6 +83,9 @@ export class ScionPageAgentConfigure extends LitElement {
 
   // Form fields — General
   @state() private model = '';
+  @state() private modelSelection: '' | 'small' | 'medium' | 'large' | 'extra-large' | 'other' = '';
+  @state() private customModelId = '';
+  @state() private thinkingLevel: number | null = null;
   @state() private image = '';
   @state() private branch = '';
   @state() private containerUser = '';
@@ -416,6 +422,15 @@ export class ScionPageAgentConfigure extends LitElement {
     }
   }
 
+  private deriveModelSelection(model: string): { selection: '' | 'small' | 'medium' | 'large' | 'extra-large' | 'other'; customId: string } {
+    if (!model) return { selection: '', customId: '' };
+    const normalized = normalizeModelAlias(model);
+    if (['small', 'medium', 'large', 'extra-large'].includes(normalized)) {
+      return { selection: normalized as 'small' | 'medium' | 'large' | 'extra-large', customId: '' };
+    }
+    return { selection: 'other', customId: model };
+  }
+
   private populateForm(): void {
     if (!this.agent) return;
     const ac = this.agent.appliedConfig;
@@ -423,6 +438,10 @@ export class ScionPageAgentConfigure extends LitElement {
 
     // General
     this.model = ac?.model || ic?.model || '';
+    const derived = this.deriveModelSelection(this.model);
+    this.modelSelection = derived.selection;
+    this.customModelId = derived.customId;
+    this.thinkingLevel = ac?.thinkingLevel ?? ic?.thinking_level ?? null;
     this.image = ac?.image || ic?.image || '';
     this.branch = ic?.branch || '';
     this.containerUser = ic?.user || '';
@@ -464,7 +483,11 @@ export class ScionPageAgentConfigure extends LitElement {
     const config: ScionConfigPayload = {};
     const caps = this.harnessCapabilities;
 
-    if (this.model) config.model = this.model;
+    const model = this.modelSelection === 'other'
+      ? this.customModelId
+      : this.modelSelection;
+    if (model) config.model = model;
+    config.thinking_level = this.thinkingLevel;
     if (this.image) config.image = this.image;
     if (this.branch) config.branch = this.branch;
     if (this.containerUser) config.user = this.containerUser;
@@ -789,12 +812,44 @@ export class ScionPageAgentConfigure extends LitElement {
 
     return html`
       <div class="form-field">
-        <label>Model</label>
-        <sl-input
-          placeholder="e.g. claude-opus-4-6, gemini-2.5-pro"
-          .value=${this.model}
-          @sl-input=${(e: Event) => { this.model = (e.target as HTMLElement & { value: string }).value; }}
-        ></sl-input>
+        <sl-select label="Model" placeholder="use harness default" .value=${this.modelSelection} clearable
+            @sl-change=${(e: any) => { this.modelSelection = e.target.value; if (e.target.value !== 'other') this.customModelId = ''; }}>
+          <sl-option value="small">Small</sl-option>
+          <sl-option value="medium">Medium</sl-option>
+          <sl-option value="large">Large</sl-option>
+          <sl-option value="extra-large">Extra Large</sl-option>
+          <sl-option value="other">Other (specify)</sl-option>
+        </sl-select>
+
+        ${this.modelSelection === 'other' ? html`
+          <sl-input label="Model ID" placeholder="e.g. claude-opus-4-8"
+            .value=${this.customModelId}
+            @sl-input=${(e: any) => { this.customModelId = e.target.value; }}
+            style="margin-top: 0.75rem">
+          </sl-input>
+        ` : ''}
+      </div>
+
+      <div class="form-field">
+        <label>Thinking Level${this.thinkingLevel !== null ? html` <span style="font-weight:normal;color:var(--sl-color-neutral-500)">(${this.thinkingLevel})</span>` : ''}</label>
+        <div style="display:flex;align-items:center;gap:0.75rem">
+          <sl-range
+            min="0" max="100" step="1"
+            .value=${this.thinkingLevel ?? 50}
+            ?disabled=${this.thinkingLevel === null}
+            style="flex:1"
+            @sl-input=${(e: any) => { this.thinkingLevel = e.target.value; }}
+          ></sl-range>
+          <sl-checkbox
+            ?checked=${this.thinkingLevel !== null}
+            @sl-change=${(e: any) => { this.thinkingLevel = e.target.checked ? 50 : null; }}
+          >Set</sl-checkbox>
+        </div>
+        <div class="hint" style="display:flex;justify-content:space-between;margin-top:0.25rem">
+          <span>0 = minimal reasoning</span>
+          <span>${this.thinkingLevel === null ? 'Using harness default' : ''}</span>
+          <span>100 = maximum reasoning</span>
+        </div>
       </div>
 
       <div class="form-field">

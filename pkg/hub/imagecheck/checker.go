@@ -12,6 +12,7 @@ import (
 type CheckResult struct {
 	Status    string
 	Source    string
+	Hash      string
 	Error     string
 	CheckedAt time.Time
 }
@@ -63,7 +64,7 @@ func (c *Checker) Check(ctx context.Context, image string) CheckResult {
 	// Bare image names (no registry prefix) are local-only by convention.
 	// Without a local checker we cannot determine availability, so return
 	// "unknown" rather than probing a remote registry that will 401.
-	if isBareImageName(image) {
+	if IsBareImageName(image) {
 		result := CheckResult{
 			Status:    "unknown",
 			CheckedAt: now,
@@ -92,9 +93,9 @@ func (c *Checker) Check(ctx context.Context, image string) CheckResult {
 	return result
 }
 
-// isBareImageName returns true when the image reference has no explicit
+// IsBareImageName returns true when the image reference has no explicit
 // registry prefix (no '.' or ':' in the first path component before any '/').
-func isBareImageName(image string) bool {
+func IsBareImageName(image string) bool {
 	ref := image
 	if i := strings.LastIndex(ref, ":"); i > 0 {
 		possibleTag := ref[i+1:]
@@ -107,4 +108,92 @@ func isBareImageName(image string) bool {
 		return true
 	}
 	return !strings.Contains(parts[0], ".") && !strings.Contains(parts[0], ":")
+}
+
+type ImageEntityStatus struct {
+	Exists         bool   `json:"exists"`
+	Image          string `json:"image,omitempty"`
+	Hash           string `json:"hash,omitempty"`
+	NewerThanLocal bool   `json:"newer_than_local,omitempty"`
+}
+
+type ThreeWayImageResult struct {
+	LocalShort       ImageEntityStatus `json:"local_short"`
+	LocalLong        ImageEntityStatus `json:"local_long"`
+	Remote           ImageEntityStatus `json:"remote"`
+	ResolvedImage    string            `json:"resolved_image"`
+	ResolutionSource string            `json:"resolution_source"`
+}
+
+// LocalImageIDer is an optional extension of LocalImageExister that can
+// return the image ID (hash) for a local image.
+type LocalImageIDer interface {
+	ImageID(ctx context.Context, image string) (string, error)
+}
+
+func (c *Checker) CheckAll(ctx context.Context, shortImage, longImage string) ThreeWayImageResult {
+	var result ThreeWayImageResult
+	result.LocalShort.Image = shortImage
+	result.LocalLong.Image = longImage
+	result.Remote.Image = longImage
+
+	if c.local != nil {
+		if shortImage != "" {
+			shortExists, _ := c.local.ImageExists(ctx, shortImage)
+			result.LocalShort.Exists = shortExists
+			if shortExists {
+				if ider, ok := c.local.(LocalImageIDer); ok {
+					if id, err := ider.ImageID(ctx, shortImage); err == nil {
+						result.LocalShort.Hash = id
+					}
+				}
+			}
+		}
+
+		if longImage != "" {
+			longExists, _ := c.local.ImageExists(ctx, longImage)
+			result.LocalLong.Exists = longExists
+			if longExists {
+				if ider, ok := c.local.(LocalImageIDer); ok {
+					if id, err := ider.ImageID(ctx, longImage); err == nil {
+						result.LocalLong.Hash = id
+					}
+				}
+			}
+		}
+	}
+
+	if longImage != "" {
+		ref, err := parseImageRef(longImage)
+		if err == nil {
+			remoteResult := checkRemoteImage(ctx, c.client, ref, time.Now())
+			if remoteResult.Status == "valid" {
+				result.Remote.Exists = true
+				result.Remote.Hash = remoteResult.Hash
+				if result.LocalLong.Exists && result.Remote.Hash != "" && result.LocalLong.Hash != "" {
+					result.Remote.NewerThanLocal = result.Remote.Hash != result.LocalLong.Hash
+				}
+			}
+		}
+	}
+
+	switch {
+	case result.LocalShort.Exists:
+		result.ResolvedImage = shortImage
+		result.ResolutionSource = "local_short"
+	case result.LocalLong.Exists:
+		result.ResolvedImage = longImage
+		result.ResolutionSource = "local_long"
+	case result.Remote.Exists:
+		result.ResolvedImage = longImage
+		result.ResolutionSource = "remote"
+	default:
+		result.ResolvedImage = longImage
+		if shortImage != "" {
+			result.ResolvedImage = shortImage
+		}
+		result.ResolutionSource = "none"
+	}
+
+	return result
 }

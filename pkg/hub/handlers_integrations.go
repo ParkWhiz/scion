@@ -33,6 +33,27 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 )
 
+// reconfigureRuntimeKeys lists keys that are injected at runtime/wiring time
+// and must be carried over during reconfigure (they are not in config files).
+var reconfigureRuntimeKeys = map[string]bool{
+	"config_file":      true,
+	"hub_url":          true,
+	"hmac_key":         true,
+	"broker_id":        true,
+	"plugin_name":      true,
+	"project_slug_map": true,
+	"database_url":     true,
+	"database_driver":  true,
+	"bot_id":           true,
+	"mode":             true,
+	"path":             true,
+	"address":          true,
+	"tls_cert_file":    true,
+	"tls_key_file":     true,
+	"tls_ca_file":      true,
+	"tls_skip_verify":  true,
+}
+
 // IntegrationManager is the narrow interface satisfied by *plugin.Manager.
 // It lets the hub query and control broker plugins without importing the
 // plugin package directly.
@@ -43,11 +64,12 @@ type IntegrationManager interface {
 	IsSelfManaged(pluginType, name string) bool
 	GetDeploymentMode(pluginType, name string) plugin.DeploymentMode
 	ConfigureBroker(name string, extra map[string]string) error
+	ReplaceBrokerConfig(name string, cfg map[string]string) error
 	Reconnect(pluginType, name string) error
 	BrokerHealthCheck(name string) (status, message string, details map[string]string, err error)
 	BrokerInfo(name string) (version, channelID string, capabilities []string, err error)
 	UpdatePlugin(name string, repoPath string) error
-	InstallPlugin(name, repoPath, pluginsDir string) error
+	InstallPlugin(name, repoPath, pluginsDir, configFile string) error
 	GetGRPCBrokerAdapter(name string) plugin.GRPCBrokerClient
 }
 
@@ -269,10 +291,14 @@ func (s *Server) handleGetIntegration(w http.ResponseWriter, r *http.Request, na
 		return
 	}
 
-	cfg := mgr.GetPluginConfig("broker", name)
-	if cfg == nil {
-		cfg = make(map[string]string)
+	runtimeCfg := mgr.GetPluginConfig("broker", name)
+	if runtimeCfg == nil {
+		runtimeCfg = make(map[string]string)
 	}
+
+	// Resolve settings from the same provider that PUT writes to, so
+	// GET reflects the latest saved state rather than the boot-time map.
+	cfg := s.resolveIntegrationSettings(r.Context(), mgr, name, runtimeCfg)
 
 	detail := IntegrationDetail{
 		Name:           name,
@@ -285,6 +311,43 @@ func (s *Server) handleGetIntegration(w http.ResponseWriter, r *http.Request, na
 	}
 
 	writeJSON(w, http.StatusOK, detail)
+}
+
+// resolveIntegrationSettings returns the current settings for a plugin by
+// reading from the appropriate config provider (Postgres for HA, YAML file for
+// non-HA). Runtime/wiring keys from the manager map are merged as an underlay.
+func (s *Server) resolveIntegrationSettings(ctx context.Context, mgr IntegrationManager, name string, runtimeCfg map[string]string) map[string]string {
+	if s.isHAIntegration(mgr, name) {
+		if s.entClient != nil {
+			provider := config.NewPostgresConfigProvider(s.entClient, name)
+			if settings, err := provider.Load(ctx); err == nil {
+				// Merge runtime keys as underlay — provider values win.
+				for k, v := range runtimeCfg {
+					if _, ok := settings[k]; !ok {
+						settings[k] = v
+					}
+				}
+				return settings
+			}
+			slog.Warn("Failed to load HA config for GET, falling back to manager map", "plugin", name)
+		}
+		return runtimeCfg
+	}
+
+	configFile := runtimeCfg["config_file"]
+	if configFile != "" {
+		if settings, err := config.ResolvePluginConfig(configFile, nil); err == nil {
+			for k, v := range runtimeCfg {
+				if _, ok := settings[k]; !ok {
+					settings[k] = v
+				}
+			}
+			return settings
+		}
+		slog.Warn("Failed to reload config file for GET, falling back to manager map", "plugin", name)
+	}
+
+	return runtimeCfg
 }
 
 func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Request, name string) {
@@ -419,10 +482,14 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 	}
 
 	// Reconfigure the running integration with updated config.
-	if err := s.reconfigureIntegration(r.Context(), mgr, name); err != nil {
-		slog.Error("Failed to reconfigure integration after config update", "plugin", name, "error", err)
-		InternalError(w)
-		return
+	// For HA integrations the DB write + NOTIFY is the reconfigure path —
+	// pushing a hub-side merge over gRPC would race with the DB-backed reload.
+	if !s.isHAIntegration(mgr, name) {
+		if err := s.reconfigureIntegration(r.Context(), mgr, name); err != nil {
+			slog.Error("Failed to reconfigure integration after config update", "plugin", name, "error", err)
+			InternalError(w)
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -560,12 +627,6 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := mgr.InstallPlugin(name, repoPath, pluginsDir); err != nil {
-		slog.Error("Failed to install integration", "plugin", name, "error", err)
-		InternalError(w)
-		return
-	}
-
 	configFilePath := "~/.scion/scion-" + name + ".yaml"
 	if err := config.CreatePluginConfigFile(name, configFilePath); err != nil {
 		slog.Error("Failed to create plugin config file", "plugin", name, "error", err)
@@ -578,6 +639,12 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 	settingsWriteMu.Unlock()
 	if err != nil {
 		slog.Error("Failed to add plugin to settings.yaml", "plugin", name, "error", err)
+		InternalError(w)
+		return
+	}
+
+	if err := mgr.InstallPlugin(name, repoPath, pluginsDir, configFilePath); err != nil {
+		slog.Error("Failed to install integration", "plugin", name, "error", err)
 		InternalError(w)
 		return
 	}
@@ -759,26 +826,26 @@ func (s *Server) reconfigureIntegration(ctx context.Context, mgr IntegrationMana
 		configFile = pluginCfg["config_file"]
 	}
 
-	merged := make(map[string]string)
-	if configFile != "" {
-		fileMerged, err := config.LoadPluginConfigFile(configFile, nil)
-		if err != nil {
-			slog.Error("Failed to reload config file for reconfigure", "plugin", name, "error", err)
-			for k, v := range pluginCfg {
-				merged[k] = v
-			}
-		} else {
-			merged = fileMerged
-			// Carry over runtime/internal keys from the old config that
-			// are not present in the file (e.g. hub_url, hmac_key).
-			for k, v := range pluginCfg {
-				if _, ok := merged[k]; !ok {
-					merged[k] = v
-				}
-			}
-		}
-	} else {
-		for k, v := range pluginCfg {
+	// When a config file is set, resolve from file only — do NOT pass the
+	// manager's boot-resolved map as "inline" config, because it contains
+	// the file's own keys and would trigger spurious deprecation warnings (B2).
+	// When no config file exists, pass the manager map as inline config so
+	// that inline-only deployments retain their configuration keys.
+	var inlineToPass map[string]string
+	if configFile == "" {
+		inlineToPass = pluginCfg
+	}
+	merged, err := config.ResolvePluginConfig(configFile, inlineToPass)
+	if err != nil {
+		slog.Error("Failed to resolve config for reconfigure", "plugin", name, "error", err)
+		merged = make(map[string]string)
+	}
+
+	// Carry over runtime/wiring keys from the manager map.
+	// Wiring keys must be included because ReplaceBrokerConfig uses replace
+	// semantics (no underlay from boot-time config).
+	for k, v := range pluginCfg {
+		if reconfigureRuntimeKeys[k] && merged[k] == "" {
 			merged[k] = v
 		}
 	}
@@ -796,9 +863,9 @@ func (s *Server) reconfigureIntegration(ctx context.Context, mgr IntegrationMana
 		merged[m.ConfigKey] = val
 	}
 
-	if err := mgr.ConfigureBroker(name, merged); err != nil {
+	if err := mgr.ReplaceBrokerConfig(name, merged); err != nil {
 		if mgr.IsSelfManaged("broker", name) {
-			slog.Warn("ConfigureBroker failed for self-managed plugin, trying Reconnect",
+			slog.Warn("ReplaceBrokerConfig failed for self-managed plugin, trying Reconnect",
 				"plugin", name, "error", err)
 			return mgr.Reconnect("broker", name)
 		}

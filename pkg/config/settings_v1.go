@@ -189,7 +189,7 @@ func RequireImageRegistry(projectPath, profileName string) error {
 }
 
 // RewriteImageRegistry replaces the registry prefix of a container image reference
-// with newRegistry. Only images whose basename starts with "scion-" are rewritten.
+// with newRegistry for any short-form (non-fully-qualified) image.
 // If newRegistry is empty, the original image is returned unchanged.
 func RewriteImageRegistry(fullImage, newRegistry string) string {
 	if newRegistry == "" || fullImage == "" {
@@ -203,11 +203,6 @@ func RewriteImageRegistry(fullImage, newRegistry string) string {
 		basename = fullImage[lastSlash+1:]
 	} else {
 		basename = fullImage
-	}
-
-	// Only rewrite images following the scion naming convention
-	if !strings.HasPrefix(basename, "scion-") {
-		return fullImage
 	}
 
 	// If the image already has an explicit registry hostname
@@ -371,6 +366,7 @@ type V1ServerHubConfig struct {
 	Port         int           `json:"port,omitempty" yaml:"port,omitempty" koanf:"port"`
 	Host         string        `json:"host,omitempty" yaml:"host,omitempty" koanf:"host"`
 	HubID        string        `json:"hub_id,omitempty" yaml:"hub_id,omitempty" koanf:"hub_id"`
+	HubName      string        `json:"hub_name,omitempty" yaml:"hub_name,omitempty" koanf:"hub_name"`
 	PublicURL    string        `json:"public_url,omitempty" yaml:"public_url,omitempty" koanf:"public_url"`
 	ReadTimeout  string        `json:"read_timeout,omitempty" yaml:"read_timeout,omitempty" koanf:"read_timeout"`
 	WriteTimeout string        `json:"write_timeout,omitempty" yaml:"write_timeout,omitempty" koanf:"write_timeout"`
@@ -383,6 +379,8 @@ type V1ServerHubConfig struct {
 	SoftDeleteRetainFiles *bool `json:"soft_delete_retain_files,omitempty" yaml:"soft_delete_retain_files,omitempty" koanf:"soft_delete_retain_files"`
 	// AutoSuspendStalled controls whether stalled agents are automatically suspended.
 	AutoSuspendStalled *bool `json:"auto_suspend_stalled,omitempty" yaml:"auto_suspend_stalled,omitempty" koanf:"auto_suspend_stalled"`
+	// DisableLegacyStorageFallback disables legacy un-namespaced storage path fallback.
+	DisableLegacyStorageFallback *bool `json:"disable_legacy_storage_fallback,omitempty" yaml:"disable_legacy_storage_fallback,omitempty" koanf:"disable_legacy_storage_fallback"`
 }
 
 // V1BrokerConfig holds Runtime Broker configuration.
@@ -1210,6 +1208,9 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Hub.HubID != "" {
 			gc.Hub.HubID = v1.Hub.HubID
 		}
+		if v1.Hub.HubName != "" {
+			gc.Hub.HubName = v1.Hub.HubName
+		}
 		if v1.Hub.PublicURL != "" {
 			gc.Hub.Endpoint = v1.Hub.PublicURL
 		}
@@ -1251,6 +1252,9 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		}
 		if v1.Hub.AutoSuspendStalled != nil {
 			gc.Hub.AutoSuspendStalled = *v1.Hub.AutoSuspendStalled
+		}
+		if v1.Hub.DisableLegacyStorageFallback != nil {
+			gc.Hub.DisableLegacyStorageFallback = *v1.Hub.DisableLegacyStorageFallback
 		}
 	}
 
@@ -1474,6 +1478,7 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		Port:         gc.Hub.Port,
 		Host:         gc.Hub.Host,
 		HubID:        gc.Hub.HubID,
+		HubName:      gc.Hub.HubName,
 		PublicURL:    gc.Hub.Endpoint,
 		ReadTimeout:  gc.Hub.ReadTimeout.String(),
 		WriteTimeout: gc.Hub.WriteTimeout.String(),
@@ -1492,6 +1497,10 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 	if gc.Hub.SoftDeleteRetainFiles {
 		retainFiles := true
 		v1Hub.SoftDeleteRetainFiles = &retainFiles
+	}
+	if gc.Hub.DisableLegacyStorageFallback {
+		disableLegacy := true
+		v1Hub.DisableLegacyStorageFallback = &disableLegacy
 	}
 	v1.Hub = v1Hub
 

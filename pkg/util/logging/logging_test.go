@@ -28,7 +28,7 @@ import (
 func TestGCPHandler(t *testing.T) {
 	var buf bytes.Buffer
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
-	handler := NewGCPHandler(&buf, opts, "test-component")
+	handler := NewGCPHandler(&buf, opts, "test-component", "")
 	logger := slog.New(handler)
 
 	logger.Info("test message", "key", "value")
@@ -47,15 +47,31 @@ func TestGCPHandler(t *testing.T) {
 
 	hostname, _ := os.Hostname()
 	if hostname != "" {
-		assert.Equal(t, hostname, labels["hostname"])
-		assert.Equal(t, hostname, labels["hub"])
+		assert.Nil(t, labels["hostname"], "hostname label should not be set; use node instead")
+		assert.Equal(t, hostname, labels["node"])
 	}
+}
+
+func TestGCPHandler_HubNameLabel(t *testing.T) {
+	var buf bytes.Buffer
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	handler := NewGCPHandler(&buf, opts, "test-component", "prod-hub")
+	logger := slog.New(handler)
+
+	logger.Info("test message")
+
+	var data map[string]interface{}
+	err := json.Unmarshal(buf.Bytes(), &data)
+	assert.NoError(t, err)
+
+	labels := data[GCPKeyLabels].(map[string]interface{})
+	assert.Equal(t, "prod-hub", labels["hub"])
 }
 
 func TestGCPHandler_EmptyMessageSuppressed(t *testing.T) {
 	var buf bytes.Buffer
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
-	handler := NewGCPHandler(&buf, opts, "test-component")
+	handler := NewGCPHandler(&buf, opts, "test-component", "")
 	logger := slog.New(handler)
 
 	// Log with empty message (as HTTP request logs do)
@@ -82,7 +98,7 @@ func TestGCPHandler_EmptyMessageSuppressed(t *testing.T) {
 
 func TestGCPHandler_LabelsPromoteAgentProject(t *testing.T) {
 	var buf bytes.Buffer
-	handler := NewGCPHandler(&buf, nil, "test-component")
+	handler := NewGCPHandler(&buf, nil, "test-component", "")
 	logger := slog.New(handler)
 
 	logger.Info("test message",
@@ -106,7 +122,7 @@ func TestGCPHandler_LabelsPromoteAgentProject(t *testing.T) {
 
 func TestGCPHandler_LabelsFromWithAttrs(t *testing.T) {
 	var buf bytes.Buffer
-	handler := NewGCPHandler(&buf, nil, "test-component")
+	handler := NewGCPHandler(&buf, nil, "test-component", "")
 
 	// Simulate Logger(ctx) which uses slog.With()
 	childHandler := handler.WithAttrs([]slog.Attr{
@@ -130,7 +146,7 @@ func TestGCPHandler_TraceCorrelationFields(t *testing.T) {
 	t.Setenv(EnvGCPProjectID, "deploy-demo-test")
 
 	var buf bytes.Buffer
-	handler := NewGCPHandler(&buf, nil, "test-component")
+	handler := NewGCPHandler(&buf, nil, "test-component", "")
 	logger := slog.New(handler)
 
 	logger.Info("trace log",
@@ -172,7 +188,7 @@ func TestSubsystemLogger(t *testing.T) {
 func TestGCPHandlerSourceLocation(t *testing.T) {
 	var buf bytes.Buffer
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo, AddSource: true}
-	handler := NewGCPHandler(&buf, opts, "test-component")
+	handler := NewGCPHandler(&buf, opts, "test-component", "")
 	logger := slog.New(handler)
 
 	logger.Info("test message")

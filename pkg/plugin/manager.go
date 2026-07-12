@@ -153,6 +153,12 @@ func (m *Manager) LoadAll(cfg PluginsConfig, pluginsDir string) error {
 
 // LoadOne loads a single plugin by type and name from the given configuration.
 func (m *Manager) LoadOne(pluginType, name string, entry PluginEntry, pluginsDir string) error {
+	if entry.ConfigFile != "" {
+		if entry.Config == nil {
+			entry.Config = make(map[string]string)
+		}
+		entry.Config["config_file"] = entry.ConfigFile
+	}
 	if entry.ResolvedDeploymentMode() == DeploymentModeHA {
 		return m.loadGRPCPlugin(pluginType, name, entry)
 	}
@@ -486,6 +492,48 @@ func (m *Manager) ConfigureBroker(name string, extra map[string]string) error {
 	return rpcClient.Configure(merged)
 }
 
+// ReplaceBrokerConfig updates the stored config for a broker plugin and pushes
+// the exact cfg to the running plugin, with no underlay from boot-time config.
+func (m *Manager) ReplaceBrokerConfig(name string, cfg map[string]string) error {
+	key := PluginTypeBroker + ":" + name
+	m.mu.Lock()
+	if dp, ok := m.configs[key]; ok {
+		dp.Config = cfg
+		m.configs[key] = dp
+	}
+	m.mu.Unlock()
+
+	m.mu.RLock()
+	adapter, isGRPC := m.grpcAdapters[key]
+	m.mu.RUnlock()
+
+	if isGRPC {
+		return adapter.Configure(cfg)
+	}
+
+	m.mu.RLock()
+	raw, ok := m.dispensed[key]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("broker plugin not loaded: %s", name)
+	}
+
+	rpcClient, ok := raw.(*BrokerRPCClient)
+	if !ok {
+		return fmt.Errorf("plugin %s is not a broker RPC client", name)
+	}
+
+	merged := make(map[string]string, len(cfg)+1)
+	for k, v := range cfg {
+		merged[k] = v
+	}
+	if rpcClient.hostCallbacksAvailable {
+		merged[hostCallbacksConfigKey] = "true"
+	}
+
+	return rpcClient.Configure(merged)
+}
+
 // GetPluginConfig returns a copy of the stored config map for the named plugin,
 // or nil if the plugin is not loaded. The returned map is safe to read without
 // affecting the manager's internal state.
@@ -714,7 +762,7 @@ func (m *Manager) UpdatePlugin(name string, repoPath string) error {
 
 // InstallPlugin builds a plugin binary from source and loads it into the manager.
 // Used for first-time installation of plugins not yet present on the system.
-func (m *Manager) InstallPlugin(name, repoPath, pluginsDir string) error {
+func (m *Manager) InstallPlugin(name, repoPath, pluginsDir, configFile string) error {
 	key := PluginTypeBroker + ":" + name
 	m.mu.RLock()
 	_, alreadyLoaded := m.clients[key]
@@ -751,7 +799,7 @@ func (m *Manager) InstallPlugin(name, repoPath, pluginsDir string) error {
 		return fmt.Errorf("go build failed for plugin %q: %w\n%s", name, err, string(output))
 	}
 
-	return m.LoadOne(PluginTypeBroker, name, PluginEntry{Path: targetPath}, pluginsDir)
+	return m.LoadOne(PluginTypeBroker, name, PluginEntry{Path: targetPath, ConfigFile: configFile}, pluginsDir)
 }
 
 // Shutdown kills all plugin processes gracefully.

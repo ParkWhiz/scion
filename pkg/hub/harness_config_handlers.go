@@ -22,13 +22,19 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/imagecheck"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
+
+type imageManager interface {
+	imagecheck.LocalImageExister
+	PullImage(ctx context.Context, image string) error
+	RemoveImage(ctx context.Context, image string) error
+}
 
 // CreateHarnessConfigRequest is the request body for creating a harness config.
 type CreateHarnessConfigRequest struct {
@@ -189,13 +195,13 @@ func (s *Server) createHarnessConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate storage path and URI
-	storagePath := storage.HarnessConfigStoragePath(hc.Scope, hc.ScopeID, hc.Slug)
+	storagePath := storage.HarnessConfigStoragePath(s.HubID(), hc.Scope, hc.ScopeID, hc.Slug)
 	hc.StoragePath = storagePath
 
 	stor := s.GetStorage()
 	if stor != nil {
 		hc.StorageBucket = stor.Bucket()
-		hc.StorageURI = storage.HarnessConfigStorageURI(stor.Bucket(), hc.Scope, hc.ScopeID, hc.Slug)
+		hc.StorageURI = storage.HarnessConfigStorageURI(s.HubID(), stor.Bucket(), hc.Scope, hc.ScopeID, hc.Slug)
 	}
 
 	if err := s.store.CreateHarnessConfig(ctx, hc); err != nil {
@@ -249,6 +255,12 @@ func (s *Server) handleHarnessConfigByID(w http.ResponseWriter, r *http.Request)
 		s.handleHarnessConfigValidate(w, r, hcID)
 	case "check-image":
 		s.handleHarnessConfigCheckImage(w, r, hcID)
+	case "image-status":
+		s.handleHarnessConfigImageStatus(w, r, hcID)
+	case "local-image":
+		s.handleHarnessConfigDeleteLocalImage(w, r, hcID)
+	case "pull-image":
+		s.handleHarnessConfigPullImage(w, r, hcID)
 	case "reimport":
 		s.handleHarnessConfigReimport(w, r, hcID)
 	case "files":
@@ -287,31 +299,12 @@ func (s *Server) getHarnessConfig(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 
-	if s.imageStatusStale(hc) {
-		if image := s.harnessConfigImage(hc); image != "" {
-			go func() {
-				if _, err, _ := s.imageStatusFlight.Do(hc.ID, func() (any, error) {
-					s.checkAndUpdateImageStatus(context.Background(), hc.ID, image)
-					return nil, nil
-				}); err != nil {
-					slog.Error("image status check failed", "harness_config_id", hc.ID, "error", err)
-				}
-			}()
-		}
-	}
-
 	resp := HarnessConfigWithCapabilities{HarnessConfig: *hc}
 	if identity := GetIdentityFromContext(ctx); identity != nil {
 		resp.Cap = s.authzService.ComputeCapabilities(ctx, identity, harnessConfigResource(hc))
 	}
 
 	writeJSON(w, http.StatusOK, resp)
-}
-
-func (s *Server) imageStatusStale(hc *store.HarnessConfig) bool {
-	return hc.ImageStatus == store.HarnessConfigImageStatusUnknown ||
-		hc.ImageStatusCheckedAt == nil ||
-		time.Since(*hc.ImageStatusCheckedAt) > 5*time.Minute
 }
 
 func (s *Server) harnessConfigImage(hc *store.HarnessConfig) string {
@@ -678,7 +671,7 @@ func (s *Server) handleHarnessConfigDownload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	downloadURLs, manifestURL, expires, err := generateDownloadURLs(ctx, stor, hc.StoragePath, hc.Files)
+	downloadURLs, manifestURL, expires, err := generateDownloadURLs(ctx, stor, hc.StoragePath, s.legacyFallbackPath(hc.StoragePath), hc.Files)
 	if err != nil {
 		RuntimeError(w, fmt.Sprintf("harness-config %q: %s — run 'scion harness-config validate %s' to diagnose", hc.Name, err, hc.Name))
 		return
@@ -810,13 +803,13 @@ func (s *Server) handleHarnessConfigClone(w http.ResponseWriter, r *http.Request
 		clone.Visibility = source.Visibility
 	}
 
-	storagePath := storage.HarnessConfigStoragePath(clone.Scope, clone.ScopeID, clone.Slug)
+	storagePath := storage.HarnessConfigStoragePath(s.HubID(), clone.Scope, clone.ScopeID, clone.Slug)
 	clone.StoragePath = storagePath
 
 	stor := s.GetStorage()
 	if stor != nil {
 		clone.StorageBucket = stor.Bucket()
-		clone.StorageURI = storage.HarnessConfigStorageURI(stor.Bucket(), clone.Scope, clone.ScopeID, clone.Slug)
+		clone.StorageURI = storage.HarnessConfigStorageURI(s.HubID(), stor.Bucket(), clone.Scope, clone.ScopeID, clone.Slug)
 	}
 
 	if stor != nil && len(source.Files) > 0 && source.StoragePath != "" {
@@ -951,4 +944,118 @@ func (s *Server) handleHarnessConfigReimport(w http.ResponseWriter, r *http.Requ
 		HarnessConfigs: imported,
 		Count:          len(imported),
 	})
+}
+
+// handleHarnessConfigImageStatus returns three-entity image status.
+// GET /api/v1/harness-configs/{id}/image-status
+func (s *Server) handleHarnessConfigImageStatus(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		MethodNotAllowed(w)
+		return
+	}
+
+	ctx := r.Context()
+	hc, err := s.store.GetHarnessConfig(ctx, id)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	image := s.harnessConfigImage(hc)
+	if image == "" {
+		writeError(w, http.StatusBadRequest, "no_image", "Harness config has no image configured", nil)
+		return
+	}
+
+	registry := s.resolveImageRegistry()
+	longImage := config.RewriteImageRegistry(image, registry)
+
+	shortImage := image
+	if !imagecheck.IsBareImageName(image) {
+		shortImage = ""
+	}
+
+	result := s.imageChecker.CheckAll(ctx, shortImage, longImage)
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleHarnessConfigDeleteLocalImage removes the local short-form image.
+// DELETE /api/v1/harness-configs/{id}/local-image
+func (s *Server) handleHarnessConfigDeleteLocalImage(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodDelete {
+		MethodNotAllowed(w)
+		return
+	}
+
+	if s.imageManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "no_runtime", "Container runtime not available", nil)
+		return
+	}
+
+	ctx := r.Context()
+	hc, err := s.store.GetHarnessConfig(ctx, id)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	image := s.harnessConfigImage(hc)
+	if image == "" || !imagecheck.IsBareImageName(image) {
+		writeError(w, http.StatusBadRequest, "no_local_image", "Harness config has no short-form image to delete", nil)
+		return
+	}
+
+	exists, err := s.imageManager.ImageExists(ctx, image)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check_failed", fmt.Sprintf("Failed to check image: %v", err), nil)
+		return
+	}
+	if !exists {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "not_found", "image": image})
+		return
+	}
+
+	if err := s.imageManager.RemoveImage(ctx, image); err != nil {
+		writeError(w, http.StatusInternalServerError, "remove_failed", fmt.Sprintf("Failed to remove image: %v", err), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "removed", "image": image})
+}
+
+// handleHarnessConfigPullImage pulls the latest image from the remote registry.
+// POST /api/v1/harness-configs/{id}/pull-image
+func (s *Server) handleHarnessConfigPullImage(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		MethodNotAllowed(w)
+		return
+	}
+
+	if s.imageManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "no_runtime", "Container runtime not available", nil)
+		return
+	}
+
+	ctx := r.Context()
+	hc, err := s.store.GetHarnessConfig(ctx, id)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	image := s.harnessConfigImage(hc)
+	if image == "" {
+		writeError(w, http.StatusBadRequest, "no_image", "Harness config has no image configured", nil)
+		return
+	}
+
+	registry := s.resolveImageRegistry()
+	pullImage := config.RewriteImageRegistry(image, registry)
+
+	if err := s.imageManager.PullImage(ctx, pullImage); err != nil {
+		writeError(w, http.StatusInternalServerError, "pull_failed", fmt.Sprintf("Failed to pull image: %v", err), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "pulled", "image": pullImage})
 }

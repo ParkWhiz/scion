@@ -31,6 +31,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/imagecheck"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
@@ -312,12 +313,23 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		util.Debugf("image resolution: from agent/template config image=%s", resolvedImage)
 	}
 
-	// Apply image_registry rewrite to whatever image was resolved above.
-	// This rewrites the registry prefix for scion-* images. An explicit
-	// --image flag below takes full precedence (no rewrite).
+	// Two-phase image resolution: for short-form (bare) images, prefer a
+	// locally-built image over the registry version. If no local image
+	// exists, fall back to the registry rewrite.
 	if settings != nil && resolvedImage != "" {
 		imageRegistry := settings.ResolveImageRegistry(opts.Profile)
-		if imageRegistry != "" {
+		if imageRegistry != "" && imagecheck.IsBareImageName(resolvedImage) {
+			localExists, localErr := m.Runtime.ImageExists(ctx, resolvedImage)
+			if localErr == nil && localExists {
+				util.Debugf("image resolution: using local short-form image %s", resolvedImage)
+			} else {
+				rewritten := config.RewriteImageRegistry(resolvedImage, imageRegistry)
+				if rewritten != resolvedImage {
+					util.Debugf("image resolution: image_registry rewrite %s -> %s", resolvedImage, rewritten)
+					resolvedImage = rewritten
+				}
+			}
+		} else if imageRegistry != "" {
 			rewritten := config.RewriteImageRegistry(resolvedImage, imageRegistry)
 			if rewritten != resolvedImage {
 				util.Debugf("image resolution: image_registry rewrite %s -> %s", resolvedImage, rewritten)
@@ -807,15 +819,10 @@ authDone:
 		}
 	}
 
-	repoRoot := ""
-	if effectiveWorkspace != "" && util.IsGitRepoDir(effectiveWorkspace) {
-		commonDir, err := util.GetCommonGitDir(effectiveWorkspace)
-		if err == nil {
-			repoRoot = filepath.Dir(commonDir)
-		}
-	} else if util.IsGitRepoDir(projectDir) {
-		repoRoot, _ = util.RepoRootDir(projectDir)
-	}
+	// On resume/restart opts.Workspace is empty, so re-derive the explicit intent
+	// from the persisted config to keep the explicit workspace plain-mounted.
+	explicitWorkspace := opts.Workspace != "" || (finalScionCfg != nil && finalScionCfg.ExplicitWorkspace)
+	repoRoot := detectRepoRoot(explicitWorkspace, effectiveWorkspace, projectDir)
 
 	// Telemetry defaults to enabled when not explicitly set to false.
 	telemetryEnabled := finalScionCfg != nil && finalScionCfg.Telemetry != nil &&
@@ -1018,6 +1025,31 @@ authDone:
 		HarnessAuth:           opts.HarnessAuth,
 		Profile:               profileName,
 	}, nil
+}
+
+// detectRepoRoot resolves the git repo root to bind-mount for an agent, or ""
+// for a plain in-place workspace mount. An explicit --workspace skips git
+// detection: a workspace that merely sits inside a repo must not be widened to
+// the whole repo, matching ProvisionAgent, which mounts it directly "even if
+// inside a repo" (provision.go). explicit is set on first start (opts.Workspace)
+// and re-derived on resume from the persisted ExplicitWorkspace flag, so the
+// guarantee holds on every entry path.
+func detectRepoRoot(explicit bool, effectiveWorkspace, projectDir string) string {
+	if explicit {
+		return ""
+	}
+	if effectiveWorkspace != "" && util.IsGitRepoDir(effectiveWorkspace) {
+		commonDir, err := util.GetCommonGitDir(effectiveWorkspace)
+		if err == nil {
+			return filepath.Dir(commonDir)
+		}
+		return ""
+	}
+	if util.IsGitRepoDir(projectDir) {
+		root, _ := util.RepoRootDir(projectDir)
+		return root
+	}
+	return ""
 }
 
 // extractWorkspaceFromVolumes finds a volume mounted to /workspace and returns its source path.

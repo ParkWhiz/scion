@@ -25,6 +25,7 @@ import { customElement, property, state } from 'lit/decorators.js';
 
 import type { PageData, Project, Template, AdminGroup, GitHubAppProjectStatus, GitHubTokenPermissions, RuntimeBroker, BrokerProfile, GCPServiceAccount } from '../../shared/types.js';
 import { can, canAny } from '../../shared/types.js';
+import { normalizeModelAlias } from '../../shared/model-utils.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import '../shared/env-var-list.js';
@@ -56,6 +57,8 @@ interface ProjectSettings {
   defaultResources?: ProjectResourceSpec | undefined;
   defaultGCPIdentityMode?: string | undefined;
   defaultGCPIdentityServiceAccountID?: string | undefined;
+  defaultModel?: string | undefined;
+  defaultThinkingLevel?: number | null | undefined;
 }
 
 interface HarnessConfigEntry {
@@ -168,6 +171,15 @@ export class ScionPageProjectSettings extends LitElement {
 
   @state()
   private configDefaultGCPIdentitySAID = '';
+
+  @state()
+  private defaultModelSelection: '' | 'small' | 'medium' | 'large' | 'extra-large' | 'other' = '';
+
+  @state()
+  private defaultCustomModelId = '';
+
+  @state()
+  private defaultThinkingLevel: number | null = null;
 
   @state()
   private gcpServiceAccounts: GCPServiceAccount[] = [];
@@ -874,6 +886,18 @@ export class ScionPageProjectSettings extends LitElement {
         this.configDefaultResDisk = res?.disk || '';
         this.configDefaultGCPIdentityMode = this.settings.defaultGCPIdentityMode || '';
         this.configDefaultGCPIdentitySAID = this.settings.defaultGCPIdentityServiceAccountID || '';
+        if (this.settings.defaultModel) {
+          const dm = normalizeModelAlias(this.settings.defaultModel);
+          if (['small', 'medium', 'large', 'extra-large'].includes(dm)) {
+            this.defaultModelSelection = dm as 'small' | 'medium' | 'large' | 'extra-large';
+          } else {
+            this.defaultModelSelection = 'other';
+            this.defaultCustomModelId = this.settings.defaultModel;
+          }
+        } else {
+          this.defaultModelSelection = '';
+        }
+        this.defaultThinkingLevel = this.settings.defaultThinkingLevel ?? null;
       }
     } catch (err) {
       console.error('Failed to load project settings:', err);
@@ -955,14 +979,20 @@ export class ScionPageProjectSettings extends LitElement {
         }
       }
 
+      const defaultModel = this.defaultModelSelection === 'other'
+        ? this.defaultCustomModelId
+        : this.defaultModelSelection;
+
       const body: ProjectSettings = {
         defaultTemplate: this.configDefaultTemplate || undefined,
         defaultHarnessConfig: this.configDefaultHarnessConfig || undefined,
+        defaultModel: defaultModel || undefined,
         telemetryEnabled: this.configTelemetryEnabled,
         defaultMaxTurns: this.configDefaultMaxTurns || undefined,
         defaultMaxModelCalls: this.configDefaultMaxModelCalls || undefined,
         defaultMaxDuration: this.configDefaultMaxDuration || undefined,
         defaultResources,
+        defaultThinkingLevel: this.defaultThinkingLevel,
         defaultGCPIdentityMode: this.configDefaultGCPIdentityMode || undefined,
         defaultGCPIdentityServiceAccountID:
           this.configDefaultGCPIdentityMode === 'assign'
@@ -1449,6 +1479,69 @@ export class ScionPageProjectSettings extends LitElement {
                 <span class="field-help"
                   >Harness configuration used by default for new agents.</span
                 >
+              </div>
+
+              <div class="config-field">
+                <label>Default Model</label>
+                <sl-select
+                  placeholder="use harness default"
+                  clearable
+                  value=${this.defaultModelSelection}
+                  ?disabled=${!canEdit}
+                  @sl-change=${(e: Event) => {
+                    const val = (e.target as HTMLSelectElement).value as '' | 'small' | 'medium' | 'large' | 'extra-large' | 'other';
+                    this.defaultModelSelection = val;
+                    if (val !== 'other') this.defaultCustomModelId = '';
+                  }}
+                >
+                  <sl-option value="small">Small</sl-option>
+                  <sl-option value="medium">Medium</sl-option>
+                  <sl-option value="large">Large</sl-option>
+                  <sl-option value="extra-large">Extra Large</sl-option>
+                  <sl-option value="other">Other (specify)</sl-option>
+                </sl-select>
+                <span class="field-help"
+                  >Default model alias or ID used for new agents.</span
+                >
+              </div>
+
+              ${this.defaultModelSelection === 'other'
+                ? html`
+                    <div class="config-field">
+                      <label>Model ID</label>
+                      <sl-input
+                        placeholder="e.g. claude-opus-4-8"
+                        .value=${this.defaultCustomModelId}
+                        ?disabled=${!canEdit}
+                        @sl-input=${(e: Event) => {
+                          this.defaultCustomModelId = (e.target as HTMLInputElement).value;
+                        }}
+                      ></sl-input>
+                    </div>
+                  `
+                : ''}
+
+              <div class="config-field">
+                <label>Default Thinking Level${this.defaultThinkingLevel !== null ? html` <span style="font-weight:normal;color:var(--sl-color-neutral-500)">(${this.defaultThinkingLevel})</span>` : ''}</label>
+                <div style="display:flex;align-items:center;gap:0.75rem">
+                  <sl-range
+                    min="0" max="100" step="1"
+                    .value=${this.defaultThinkingLevel ?? 50}
+                    ?disabled=${this.defaultThinkingLevel === null || !canEdit}
+                    style="flex:1"
+                    @sl-input=${(e: Event) => { this.defaultThinkingLevel = (e.target as HTMLInputElement & { value: number }).value; }}
+                  ></sl-range>
+                  <sl-checkbox
+                    ?checked=${this.defaultThinkingLevel !== null}
+                    ?disabled=${!canEdit}
+                    @sl-change=${(e: Event) => { this.defaultThinkingLevel = (e.target as HTMLInputElement & { checked: boolean }).checked ? 50 : null; }}
+                  >Set</sl-checkbox>
+                </div>
+                <span class="field-help" style="display:flex;justify-content:space-between;margin-top:0.25rem">
+                  <span>0 = minimal reasoning</span>
+                  <span>${this.defaultThinkingLevel === null ? 'Using harness default' : ''}</span>
+                  <span>100 = maximum reasoning</span>
+                </span>
               </div>
 
               <div class="config-field">

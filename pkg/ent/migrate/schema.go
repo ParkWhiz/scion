@@ -456,6 +456,29 @@ var (
 			},
 		},
 	}
+	// HubSettingsColumns holds the columns for the "hub_settings" table.
+	HubSettingsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "section", Type: field.TypeString, Unique: true},
+		{Name: "value", Type: field.TypeJSON},
+		{Name: "revision", Type: field.TypeInt64, Default: 1},
+		{Name: "updated_by", Type: field.TypeString, Nullable: true},
+		{Name: "create_time", Type: field.TypeTime},
+		{Name: "update_time", Type: field.TypeTime},
+	}
+	// HubSettingsTable holds the schema information for the "hub_settings" table.
+	HubSettingsTable = &schema.Table{
+		Name:       "hub_settings",
+		Columns:    HubSettingsColumns,
+		PrimaryKey: []*schema.Column{HubSettingsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "hubsetting_section",
+				Unique:  true,
+				Columns: []*schema.Column{HubSettingsColumns[1]},
+			},
+		},
+	}
 	// IntegrationConfigsColumns holds the columns for the "integration_configs" table.
 	IntegrationConfigsColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
@@ -865,7 +888,6 @@ var (
 		{Name: "id", Type: field.TypeUUID},
 		{Name: "name", Type: field.TypeString},
 		{Name: "slug", Type: field.TypeString},
-		{Name: "type", Type: field.TypeString, Nullable: true},
 		{Name: "mode", Type: field.TypeString, Default: "connected"},
 		{Name: "version", Type: field.TypeString, Nullable: true},
 		{Name: "lock_version", Type: field.TypeInt64, Default: 0},
@@ -901,7 +923,7 @@ var (
 			{
 				Name:    "runtimebroker_status",
 				Unique:  false,
-				Columns: []*schema.Column{RuntimeBrokersColumns[7]},
+				Columns: []*schema.Column{RuntimeBrokersColumns[6]},
 			},
 		},
 	}
@@ -1303,6 +1325,7 @@ var (
 		GroupsTable,
 		GroupMembershipsTable,
 		HarnessConfigsTable,
+		HubSettingsTable,
 		IntegrationConfigsTable,
 		IntegrationUpdatesTable,
 		InviteCodesTable,
@@ -1367,6 +1390,9 @@ func init() {
 	GroupMembershipsTable.ForeignKeys[2].RefTable = AgentsTable
 	HarnessConfigsTable.Annotation = &entsql.Annotation{
 		Table: "harness_configs",
+	}
+	HubSettingsTable.Annotation = &entsql.Annotation{
+		Table: "hub_settings",
 	}
 	IntegrationConfigsTable.Annotation = &entsql.Annotation{
 		Table: "integration_configs",

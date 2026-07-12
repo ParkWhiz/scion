@@ -108,10 +108,15 @@ def _update_gemini_settings(settings_path: str, gemini_auth_type: str) -> None:
         auth = {}
         security["auth"] = auth
 
-    if auth.get("selectedType") == gemini_auth_type:
-        return
+    if gemini_auth_type:
+        if auth.get("selectedType") == gemini_auth_type:
+            return
+        auth["selectedType"] = gemini_auth_type
+    else:
+        auth.pop("selectedType", None)
+        if not auth:
+            security.pop("auth", None)
 
-    auth["selectedType"] = gemini_auth_type
     scion_harness.atomic_write_json(expanded, settings)
 
 
@@ -133,12 +138,37 @@ def _build_env_overlay(method: str, env_key: str) -> dict[str, str]:
     return {}
 
 
+def _apply_native_system_prompt(ctx: scion_harness.ProvisionContext) -> None:
+    """Write the staged system prompt to the native Gemini CLI location.
+
+    config.yaml declares system_prompt_file (.gemini/system_prompt.md) and
+    system_prompt_mode (native), so the prompt goes into its own file rather
+    than being prepended to the instructions file.
+    """
+    system_prompt = ctx.read_input_text("system-prompt.md")
+    if not system_prompt.strip():
+        return
+
+    target = str(ctx.harness_config.get("system_prompt_file") or "")
+    if not target:
+        return
+
+    full = os.path.join(ctx.home, target)
+    parent = os.path.dirname(full)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = full + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(system_prompt)
+    os.replace(tmp, full)
+    ctx.info(f"wrote system prompt to {full}")
+
+
 def provision(ctx: scion_harness.ProvisionContext) -> None:
     resolved = ctx.select_auth(AUTH)
 
     gemini_auth_type = _GEMINI_AUTH_TYPE_MAP.get(resolved.method, "")
-    if gemini_auth_type:
-        _update_gemini_settings(GEMINI_SETTINGS_FILE, gemini_auth_type)
+    _update_gemini_settings(GEMINI_SETTINGS_FILE, gemini_auth_type)
 
     env = _build_env_overlay(resolved.method, resolved.env_key)
     extra: dict[str, Any] | None = None
@@ -147,6 +177,16 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
 
     ctx.write_outputs(resolved, env=env, extra=extra)
     ctx.info(f"method={resolved.method}")
+
+    _apply_native_system_prompt(ctx)
+
+    harness_cfg = ctx.harness_config
+    instructions_file = str(harness_cfg.get("instructions_file") or ".gemini/GEMINI.md")
+    scion_harness.project_instructions(
+        ctx,
+        instructions_file,
+        system_prompt_mode="none",
+    )
 
 
 if __name__ == "__main__":

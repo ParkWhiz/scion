@@ -157,6 +157,11 @@ type ServerConfig struct {
 	// HubID is the unique hub instance ID used for secret namespacing.
 	// If empty, secrets are looked up/stored with an empty scope ID.
 	HubID string
+	// HubName is the human-readable hub display name for HA deployments.
+	HubName string
+	// DisableLegacyStorageFallback disables the legacy un-namespaced storage
+	// path fallback. When true, only hub-scoped paths are checked.
+	DisableLegacyStorageFallback bool
 	// SecretBackend is the optional secret backend for signing key storage.
 	// When set before New(), ensureSigningKey can load/persist keys through the
 	// production secret backend (e.g., GCP Secret Manager) instead of relying
@@ -647,6 +652,12 @@ type Server struct {
 	// User last-seen activity tracker (nil = disabled)
 	userActivity *UserActivityTracker
 
+	// operationalSettings manages Layer-1 settings from the DB in postgres mode.
+	// Nil (zero value) in file/SQLite mode (settings-db §3.7).
+	// Uses atomic.Pointer for safe concurrent access — Phase 4/5 will add
+	// request-path readers while Set is called during startup.
+	operationalSettings atomic.Pointer[OperationalSettings]
+
 	// Dedicated request logger (nil = disabled)
 	requestLogger *slog.Logger
 
@@ -673,6 +684,7 @@ type Server struct {
 	imagePullActive  atomic.Bool
 
 	imageChecker      *imagecheck.Checker
+	imageManager      imageManager
 	imageStatusFlight singleflight.Group
 
 	// Mode 3 (HA) integration support fields.
@@ -1491,6 +1503,19 @@ func (s *Server) IsPostgres() bool {
 	return strings.EqualFold(s.dbDriver, "postgres")
 }
 
+// SetOperationalSettings attaches the OperationalSettings service to the
+// server. This is called during postgres-mode startup after seeding and
+// initial refresh (settings-db §3.5/§3.9). Safe for concurrent use.
+func (s *Server) SetOperationalSettings(ops *OperationalSettings) {
+	s.operationalSettings.Store(ops)
+}
+
+// GetOperationalSettings returns the OperationalSettings service, or nil
+// in file/SQLite mode. Safe for concurrent use.
+func (s *Server) GetOperationalSettings() *OperationalSettings {
+	return s.operationalSettings.Load()
+}
+
 // logMessage logs a message dispatch event to the dedicated message logger
 // if configured, otherwise falls back to the standard subsystem message logger.
 func (s *Server) logMessage(msg string, attrs ...any) {
@@ -1520,6 +1545,20 @@ func (s *Server) HubID() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.hubID
+}
+
+// LegacyFallbackEnabled returns true when legacy un-namespaced storage path
+// fallback is active (the default). Returns false when the operator has
+// explicitly disabled it after completing migration.
+func (s *Server) LegacyFallbackEnabled() bool {
+	return !s.config.DisableLegacyStorageFallback
+}
+
+// HubName returns the human-readable hub display name. Thread-safe.
+func (s *Server) HubName() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.HubName
 }
 
 // SetSecretBackend sets the secret backend for pluggable secret storage.
@@ -1634,6 +1673,9 @@ func (s *Server) SetGCPTokenMetrics(m GCPTokenMetricsRecorder) {
 // checker so it can verify images via the local Docker/Podman daemon.
 func (s *Server) SetLocalImageChecker(l imagecheck.LocalImageExister) {
 	s.imageChecker.SetLocal(l)
+	if mgr, ok := l.(imageManager); ok {
+		s.imageManager = mgr
+	}
 }
 
 // GetMaintenanceState returns the runtime maintenance state.
@@ -1856,6 +1898,11 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 	if s.transportMinter != nil && s.transportAudience != "" {
 		dispatcher.SetTransportMinter(s.transportMinter, s.transportAudience)
 	}
+
+	// Wire resource hash repair so the dispatcher can auto-fix stale DB
+	// manifests when the shared GCS bucket was updated by another hub.
+	dispatcher.SetHarnessConfigRepairer(s.syncHarnessConfigFromStorage)
+	dispatcher.SetTemplateRepairer(s.syncTemplateFromStorage)
 
 	return dispatcher
 }
@@ -2701,6 +2748,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/allow-list/", s.handleAdminAllowListByEmail)
 	s.mux.HandleFunc("/api/v1/admin/invites", s.handleAdminInvites)
 	s.mux.HandleFunc("/api/v1/admin/invites/", s.handleAdminInviteByID)
+	s.mux.HandleFunc("/api/v1/admin/server-config/schema", s.handleAdminServerConfigSchema)
 	s.mux.HandleFunc("/api/v1/admin/server-config", s.handleAdminServerConfig)
 	s.mux.HandleFunc("/api/v1/admin/agents/reset-auth-all", s.handleAdminResetAuthAll)
 	s.mux.HandleFunc("/api/v1/admin/gcp-quota", s.handleAdminGCPQuota)

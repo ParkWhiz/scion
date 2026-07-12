@@ -75,6 +75,7 @@ var (
 	disableTelemetry      bool
 	inlineConfigPath      string
 	labelFlags            []string
+	modelFlag             string
 )
 
 func parseLabels(raw []string) (map[string]string, error) {
@@ -182,16 +183,29 @@ type HubContext struct {
 	IsGlobal    bool
 }
 
-// getHubAccessToken returns an access token for authenticating to the Hub.
-// It checks OAuth credentials first, then falls back to dev-auth tokens.
-// This mirrors the auth resolution order used by hubsync.createHubClient.
+// getHubAccessToken returns an access token for authenticating to the Hub over
+// WebSocket (attach, message streaming). It checks OAuth login credentials
+// first, then a SCION_HUB_TOKEN bearer token, then the dev-auth token —
+// mirroring the *bearer-token* order the REST hub client uses (getHubClient in
+// hub.go). The REST path's agent-token sources (scion-token file,
+// SCION_AUTH_TOKEN) are intentionally omitted here: an agent identity token
+// cannot authenticate a human attach.
 func getHubAccessToken(endpoint string) string {
 	// Priority 1: OAuth credentials from scion hub auth login
 	if token := credentials.GetAccessToken(endpoint); token != "" {
 		return token
 	}
 
-	// Priority 2: Dev auth token
+	// Priority 2: SCION_HUB_TOKEN env — a user access token (scion_pat_…) or
+	// bootstrap bearer token. The REST hub client already honors this; the
+	// WebSocket auth paths (attach, message streaming) must too, or a
+	// dev-auth-off hub driven purely by SCION_HUB_TOKEN answers REST calls but
+	// rejects every attach with "no access token found for Hub".
+	if token := os.Getenv("SCION_HUB_TOKEN"); token != "" {
+		return token
+	}
+
+	// Priority 3: Dev auth token
 	return apiclient.ResolveDevToken()
 }
 
@@ -405,6 +419,14 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 		if err := resolveInlineConfigContent(inlineCfg, inlineConfigDir); err != nil {
 			return err
 		}
+	}
+
+	if modelFlag != "" {
+		normalizedModel := config.NormalizeModelAlias(modelFlag)
+		if inlineCfg == nil {
+			inlineCfg = &api.ScionConfig{}
+		}
+		inlineCfg.Model = normalizedModel
 	}
 
 	// This allows starting/resuming an agent even if it exists on Hub but not locally

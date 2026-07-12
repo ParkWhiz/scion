@@ -19,6 +19,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/group"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/groupmembership"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/harnessconfig"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubsetting"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/integrationconfig"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/integrationupdate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/invitecode"
@@ -438,6 +439,30 @@ func init() {
 	harnessconfigDescID := harnessconfigFields[0].Descriptor()
 	// harnessconfig.DefaultID holds the default value on creation for the id field.
 	harnessconfig.DefaultID = harnessconfigDescID.Default.(func() uuid.UUID)
+	hubsettingFields := schema.HubSetting{}.Fields()
+	_ = hubsettingFields
+	// hubsettingDescSection is the schema descriptor for section field.
+	hubsettingDescSection := hubsettingFields[1].Descriptor()
+	// hubsetting.SectionValidator is a validator for the "section" field. It is called by the builders before save.
+	hubsetting.SectionValidator = hubsettingDescSection.Validators[0].(func(string) error)
+	// hubsettingDescRevision is the schema descriptor for revision field.
+	hubsettingDescRevision := hubsettingFields[3].Descriptor()
+	// hubsetting.DefaultRevision holds the default value on creation for the revision field.
+	hubsetting.DefaultRevision = hubsettingDescRevision.Default.(int64)
+	// hubsettingDescCreateTime is the schema descriptor for create_time field.
+	hubsettingDescCreateTime := hubsettingFields[5].Descriptor()
+	// hubsetting.DefaultCreateTime holds the default value on creation for the create_time field.
+	hubsetting.DefaultCreateTime = hubsettingDescCreateTime.Default.(func() time.Time)
+	// hubsettingDescUpdateTime is the schema descriptor for update_time field.
+	hubsettingDescUpdateTime := hubsettingFields[6].Descriptor()
+	// hubsetting.DefaultUpdateTime holds the default value on creation for the update_time field.
+	hubsetting.DefaultUpdateTime = hubsettingDescUpdateTime.Default.(func() time.Time)
+	// hubsetting.UpdateDefaultUpdateTime holds the default value on update for the update_time field.
+	hubsetting.UpdateDefaultUpdateTime = hubsettingDescUpdateTime.UpdateDefault.(func() time.Time)
+	// hubsettingDescID is the schema descriptor for id field.
+	hubsettingDescID := hubsettingFields[0].Descriptor()
+	// hubsetting.DefaultID holds the default value on creation for the id field.
+	hubsetting.DefaultID = hubsettingDescID.Default.(func() uuid.UUID)
 	integrationconfigFields := schema.IntegrationConfig{}.Fields()
 	_ = integrationconfigFields
 	// integrationconfigDescIntegration is the schema descriptor for integration field.
@@ -815,31 +840,31 @@ func init() {
 	// runtimebroker.SlugValidator is a validator for the "slug" field. It is called by the builders before save.
 	runtimebroker.SlugValidator = runtimebrokerDescSlug.Validators[0].(func(string) error)
 	// runtimebrokerDescMode is the schema descriptor for mode field.
-	runtimebrokerDescMode := runtimebrokerFields[4].Descriptor()
+	runtimebrokerDescMode := runtimebrokerFields[3].Descriptor()
 	// runtimebroker.DefaultMode holds the default value on creation for the mode field.
 	runtimebroker.DefaultMode = runtimebrokerDescMode.Default.(string)
 	// runtimebrokerDescLockVersion is the schema descriptor for lock_version field.
-	runtimebrokerDescLockVersion := runtimebrokerFields[6].Descriptor()
+	runtimebrokerDescLockVersion := runtimebrokerFields[5].Descriptor()
 	// runtimebroker.DefaultLockVersion holds the default value on creation for the lock_version field.
 	runtimebroker.DefaultLockVersion = runtimebrokerDescLockVersion.Default.(int64)
 	// runtimebrokerDescStatus is the schema descriptor for status field.
-	runtimebrokerDescStatus := runtimebrokerFields[7].Descriptor()
+	runtimebrokerDescStatus := runtimebrokerFields[6].Descriptor()
 	// runtimebroker.DefaultStatus holds the default value on creation for the status field.
 	runtimebroker.DefaultStatus = runtimebrokerDescStatus.Default.(string)
 	// runtimebrokerDescConnectionState is the schema descriptor for connection_state field.
-	runtimebrokerDescConnectionState := runtimebrokerFields[8].Descriptor()
+	runtimebrokerDescConnectionState := runtimebrokerFields[7].Descriptor()
 	// runtimebroker.DefaultConnectionState holds the default value on creation for the connection_state field.
 	runtimebroker.DefaultConnectionState = runtimebrokerDescConnectionState.Default.(string)
 	// runtimebrokerDescAutoProvide is the schema descriptor for auto_provide field.
-	runtimebrokerDescAutoProvide := runtimebrokerFields[18].Descriptor()
+	runtimebrokerDescAutoProvide := runtimebrokerFields[17].Descriptor()
 	// runtimebroker.DefaultAutoProvide holds the default value on creation for the auto_provide field.
 	runtimebroker.DefaultAutoProvide = runtimebrokerDescAutoProvide.Default.(bool)
 	// runtimebrokerDescCreated is the schema descriptor for created field.
-	runtimebrokerDescCreated := runtimebrokerFields[22].Descriptor()
+	runtimebrokerDescCreated := runtimebrokerFields[21].Descriptor()
 	// runtimebroker.DefaultCreated holds the default value on creation for the created field.
 	runtimebroker.DefaultCreated = runtimebrokerDescCreated.Default.(func() time.Time)
 	// runtimebrokerDescUpdated is the schema descriptor for updated field.
-	runtimebrokerDescUpdated := runtimebrokerFields[23].Descriptor()
+	runtimebrokerDescUpdated := runtimebrokerFields[22].Descriptor()
 	// runtimebroker.DefaultUpdated holds the default value on creation for the updated field.
 	runtimebroker.DefaultUpdated = runtimebrokerDescUpdated.Default.(func() time.Time)
 	// runtimebroker.UpdateDefaultUpdated holds the default value on update for the updated field.
