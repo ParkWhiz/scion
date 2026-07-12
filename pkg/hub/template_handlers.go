@@ -17,6 +17,7 @@ package hub
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -658,6 +659,24 @@ func (s *Server) handleTemplateFinalize(w http.ResponseWriter, r *http.Request, 
 	template.Files = req.Manifest.Files
 	template.ContentHash = contentHash
 	template.Status = store.TemplateStatusActive
+
+	// Re-detect harness from scion-agent.yaml if present in the manifest
+	for _, f := range req.Manifest.Files {
+		if f.Path == scionAgentConfigFile {
+			objectPath := template.StoragePath + "/" + f.Path
+			reader, _, dlErr := stor.Download(ctx, objectPath)
+			if dlErr == nil {
+				data, readErr := io.ReadAll(reader)
+				reader.Close()
+				if readErr == nil {
+					cfgInfo := detectHarnessFromContent(data, template.Name)
+					template.Harness = cfgInfo.Harness
+					template.DefaultHarnessConfig = cfgInfo.DefaultHarnessConfig
+				}
+			}
+			break
+		}
+	}
 
 	if err := s.store.UpdateTemplate(ctx, template); err != nil {
 		writeErrorFromErr(w, err, "")
