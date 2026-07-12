@@ -667,7 +667,7 @@ func (s *Server) handleTemplateFinalize(w http.ResponseWriter, r *http.Request, 
 			reader, _, dlErr := stor.Download(ctx, objectPath)
 			if dlErr == nil {
 				data, readErr := io.ReadAll(reader)
-				reader.Close()
+				_ = reader.Close()
 				if readErr == nil {
 					cfgInfo := detectHarnessFromContent(data, template.Name)
 					template.Harness = cfgInfo.Harness
