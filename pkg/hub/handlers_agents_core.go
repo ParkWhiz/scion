@@ -800,7 +800,37 @@ func (s *Server) createAgentInProject(
 					}
 					return
 				} else if envReqs != nil {
-					// Broker returned 202: needs env gather
+					// Broker returned 202: needs env gather.
+					// Before asking the CLI to gather, try to auto-resolve
+					// needed keys from Hub storage (env vars + secrets).
+					if len(envReqs.Needs) > 0 {
+						autoResolved := s.tryAutoResolveNeeds(ctx, agent, envReqs.Needs)
+						if len(autoResolved) > 0 && len(autoResolved) == len(envReqs.Needs) {
+							if err := dispatcher.DispatchFinalizeEnv(ctx, agent, autoResolved); err != nil {
+								s.agentLifecycleLog.Warn("Auto-resolve env finalize failed, falling back to CLI gather",
+									"agent_id", agent.ID, "error", err)
+							} else {
+								s.agentLifecycleLog.Info("Auto-resolved all needed env vars from Hub storage",
+									"agent_id", agent.ID, "count", len(autoResolved))
+								s.preserveTerminalPhase(ctx, agent)
+								if agent.Phase == string(state.PhaseProvisioning) || agent.Phase == string(state.PhaseCreated) {
+									agent.Phase = string(state.PhaseRunning)
+								}
+								if err := s.updateAgentAfterDispatch(ctx, agent); err != nil {
+									s.agentLifecycleLog.Warn("Failed to update agent phase after auto-resolve", "agent_id", agent.ID, "error", err)
+								}
+								s.events.PublishAgentCreated(ctx, agent)
+								s.enrichAgent(ctx, agent, project, nil)
+								writeJSON(w, http.StatusOK, CreateAgentResponse{
+									Agent:    agent,
+									Warnings: warnings,
+								})
+								return
+							}
+						}
+					}
+
+					// Fall through: ask CLI to gather
 					agent.Phase = string(state.PhaseProvisioning)
 					if err := s.updateAgentAfterDispatch(ctx, agent); err != nil {
 						s.agentLifecycleLog.Warn("Failed to update agent phase for env-gather", "agent_id", agent.ID, "error", err)
@@ -1101,6 +1131,59 @@ func (s *Server) buildEnvGatherResponse(ctx context.Context, agent *store.Agent,
 	}
 
 	return resp
+}
+
+// tryAutoResolveNeeds attempts to resolve needed env keys from Hub storage
+// (env vars table and secret backend). Returns a map of resolved key-value
+// pairs. Only returns keys it could successfully fetch values for.
+func (s *Server) tryAutoResolveNeeds(ctx context.Context, agent *store.Agent, needs []string) map[string]string {
+	resolved := make(map[string]string)
+
+	for _, key := range needs {
+		// Try env vars table first (user scope, then project scope)
+		if agent.OwnerID != "" {
+			vars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "user", ScopeID: agent.OwnerID, Key: key})
+			if err == nil && len(vars) > 0 && vars[0].Value != "" {
+				resolved[key] = vars[0].Value
+				continue
+			}
+		}
+		if agent.ProjectID != "" {
+			vars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "project", ScopeID: agent.ProjectID, Key: key})
+			if err == nil && len(vars) > 0 && vars[0].Value != "" {
+				resolved[key] = vars[0].Value
+				continue
+			}
+		}
+
+		// Try secret backend
+		if s.secretBackend != nil {
+			// Check user scope
+			if agent.OwnerID != "" {
+				val, err := s.store.GetSecretValue(ctx, key, "user", agent.OwnerID)
+				if err == nil && val != "" {
+					resolved[key] = val
+					continue
+				}
+			}
+			// Check project scope
+			if agent.ProjectID != "" {
+				val, err := s.store.GetSecretValue(ctx, key, "project", agent.ProjectID)
+				if err == nil && val != "" {
+					resolved[key] = val
+					continue
+				}
+			}
+			// Check hub scope
+			val, err := s.store.GetSecretValue(ctx, key, "hub", "")
+			if err == nil && val != "" {
+				resolved[key] = val
+				continue
+			}
+		}
+	}
+
+	return resolved
 }
 
 // submitAgentEnv handles POST /api/v1/projects/{projectId}/agents/{agentId}/env
