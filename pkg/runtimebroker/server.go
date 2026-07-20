@@ -40,6 +40,8 @@ import (
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth/adcsource"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
@@ -210,11 +212,6 @@ type Server struct {
 	credLastScan    time.Time
 	credWatcherStop chan struct{}
 
-	// Pending env-gather state: agents waiting for env var submission.
-	// Keyed by immutable agent ID.
-	pendingEnvGather   map[string]*pendingAgentState
-	pendingEnvGatherMu sync.Mutex
-
 	// dispatchAttempts tracks request-id based create-attempt state for
 	// idempotency and auditability.
 	dispatchAttempts   map[string]*dispatchAttempt
@@ -256,18 +253,6 @@ type auxiliaryRuntime struct {
 	Manager agent.Manager
 }
 
-// pendingAgentState holds the partial state for an agent waiting on env-gather.
-type pendingAgentState struct {
-	AgentID      string
-	Request      *CreateAgentRequest
-	MergedEnv    map[string]string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	State        string
-	RequestID    string
-	FinalizeRuns int
-}
-
 type dispatchAttempt struct {
 	RequestID  string
 	Operation  string
@@ -299,7 +284,6 @@ func New(cfg ServerConfig, mgr agent.Manager, rt scionrt.Runtime) *Server {
 		startTime:         time.Now(),
 		version:           "0.1.0", // TODO: Get from build info
 		hubConnections:    make(map[string]*HubConnection),
-		pendingEnvGather:  make(map[string]*pendingAgentState),
 		dispatchAttempts:  make(map[string]*dispatchAttempt),
 		auxiliaryRuntimes: make(map[string]auxiliaryRuntime),
 
@@ -349,6 +333,29 @@ func New(cfg ServerConfig, mgr agent.Manager, rt scionrt.Runtime) *Server {
 	srv.registerRoutes()
 
 	return srv
+}
+
+// RuntimeName returns the name of the currently active container runtime.
+func (s *Server) RuntimeName() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.runtime.Name()
+}
+
+// SwapRuntime replaces the broker's container runtime and agent manager.
+// This is called when the co-located hub detects a runtime configuration
+// change (e.g. during onboarding) so the broker picks up the new engine
+// without requiring a full server restart.
+func (s *Server) SwapRuntime(rt scionrt.Runtime) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := s.runtime.Name()
+	s.runtime = rt
+	s.manager = agent.NewManager(rt)
+	slog.Info("Runtime broker swapped container runtime",
+		"old", old,
+		"new", rt.Name(),
+	)
 }
 
 // initHubIntegration initializes the shared template cache and hub connections.
@@ -516,6 +523,21 @@ func (s *Server) createHubConnection(name string, creds *brokercredentials.Broke
 
 	// Build hub client options
 	opts := buildHubClientOpts(creds, secretKey)
+
+	// Resolve transport auth once and share between REST client and control channel
+	var transportSrc transportauth.TokenSource
+	var transportMode transportauth.HeaderMode
+	src, mode, err := transportauth.ResolveBrokerTransport(creds.TransportMode, creds.TransportAudience, adcsource.New)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve transport auth: %w", err)
+	}
+	if src != nil {
+		transportSrc = src
+		transportMode = mode
+		opts = append(opts, hubclient.WithTransportAuth(src, mode))
+		slog.Info("Hub connection using transport auth", "name", name, "mode", creds.TransportMode)
+	}
+
 	client, err := hubclient.New(hubEndpoint, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Hub client: %w", err)
@@ -532,16 +554,18 @@ func (s *Server) createHubConnection(name string, creds *brokercredentials.Broke
 	}
 
 	conn := &HubConnection{
-		Name:        name,
-		HubEndpoint: hubEndpoint,
-		BrokerID:    creds.BrokerID,
-		AuthMode:    creds.AuthMode,
-		Credentials: creds,
-		SecretKey:   secretKey,
-		HubClient:   client,
-		Hydrator:    hydrator,
-		HCResolver:  hcResolver,
-		Status:      ConnectionStatusDisconnected,
+		Name:            name,
+		HubEndpoint:     hubEndpoint,
+		BrokerID:        creds.BrokerID,
+		AuthMode:        creds.AuthMode,
+		Credentials:     creds,
+		SecretKey:       secretKey,
+		TransportSource: transportSrc,
+		TransportMode:   transportMode,
+		HubClient:       client,
+		Hydrator:        hydrator,
+		HCResolver:      hcResolver,
+		Status:          ConnectionStatusDisconnected,
 	}
 
 	return conn, nil
@@ -560,6 +584,15 @@ func (s *Server) createHubConnectionFromConfig() (*HubConnection, error) {
 		slog.Info("Hub client using auto dev authentication")
 	}
 
+	// Resolve transport auth once from env and share between REST client and control channel
+	var transportSrc transportauth.TokenSource
+	var transportMode transportauth.HeaderMode
+	if src, err := transportauth.FromEnv(); src != nil && err == nil {
+		transportSrc = src
+		transportMode = transportauth.ModeFromEnv()
+		opts = append(opts, hubclient.WithTransportAuth(src, transportMode))
+	}
+
 	client, err := hubclient.New(s.config.HubEndpoint, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Hub client: %w", err)
@@ -575,13 +608,15 @@ func (s *Server) createHubConnectionFromConfig() (*HubConnection, error) {
 	}
 
 	conn := &HubConnection{
-		Name:        "default",
-		HubEndpoint: s.config.HubEndpoint,
-		BrokerID:    s.config.BrokerID,
-		HubClient:   client,
-		Hydrator:    hydrator,
-		HCResolver:  hcResolver,
-		Status:      ConnectionStatusDisconnected,
+		Name:            "default",
+		HubEndpoint:     s.config.HubEndpoint,
+		BrokerID:        s.config.BrokerID,
+		TransportSource: transportSrc,
+		TransportMode:   transportMode,
+		HubClient:       client,
+		Hydrator:        hydrator,
+		HCResolver:      hcResolver,
+		Status:          ConnectionStatusDisconnected,
 	}
 
 	return conn, nil
@@ -1566,6 +1601,11 @@ func (s *Server) registerRoutes() {
 
 	// Project routes
 	s.mux.HandleFunc("/api/v1/projects/", s.handleProjectBySlug)
+
+	// Image state endpoints
+	s.mux.HandleFunc("/api/v1/images/status", s.handleImageStatus)
+	s.mux.HandleFunc("/api/v1/images/pull", s.handleImagePull)
+	s.mux.HandleFunc("/api/v1/images/local", s.handleImageDeleteLocal)
 
 	// Workspace sync routes (for Hub-initiated sync via control channel)
 	s.mux.HandleFunc("/api/v1/workspace/upload", s.handleWorkspaceUpload)

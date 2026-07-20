@@ -391,27 +391,6 @@ func (t *brokerHTTPTransport) CreateAgentWithGather(ctx context.Context, brokerI
 	return &result, nil, nil
 }
 
-func (t *brokerHTTPTransport) FinalizeEnv(ctx context.Context, brokerID, brokerEndpoint, agentID string, env map[string]string) (*RemoteAgentResponse, error) {
-	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/finalize-env", strings.TrimSuffix(brokerEndpoint, "/"), url.PathEscape(agentID))
-	body, err := json.Marshal(map[string]interface{}{"env": env})
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-	resp, err := t.doRequest(ctx, brokerID, http.MethodPost, endpoint, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 400 {
-		return nil, brokerHTTPError(resp)
-	}
-	var result RemoteAgentResponse
-	if err := t.decodeResponse(resp, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
 func (t *brokerHTTPTransport) GetAgentLogs(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, tail int) (string, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/agents/%s/logs", strings.TrimSuffix(brokerEndpoint, "/"), url.PathEscape(agentID))
 	sep := "?"
@@ -468,6 +447,92 @@ func (t *brokerHTTPTransport) ExecAgent(ctx context.Context, brokerID, brokerEnd
 		return "", 0, err
 	}
 	return result.Output, result.ExitCode, nil
+}
+
+// BrokerUnsupportedError indicates that a broker responded but does not support
+// the requested endpoint (e.g. an old broker that hasn't been upgraded yet).
+type BrokerUnsupportedError struct {
+	StatusCode int
+}
+
+func (e *BrokerUnsupportedError) Error() string {
+	return fmt.Sprintf("broker does not support this endpoint (HTTP %d)", e.StatusCode)
+}
+
+// BrokerImageStatusResponse is the response from a broker's /api/v1/images/status endpoint.
+type BrokerImageStatusResponse struct {
+	LocalShort *BrokerImageEntityState `json:"local_short,omitempty"`
+	LocalLong  *BrokerImageEntityState `json:"local_long,omitempty"`
+}
+
+// BrokerImageEntityState describes the local state of a single image entity on a broker.
+type BrokerImageEntityState struct {
+	Exists bool   `json:"exists"`
+	Hash   string `json:"hash,omitempty"`
+}
+
+func (t *brokerHTTPTransport) ImageStatus(ctx context.Context, brokerID, brokerEndpoint, shortImage, longImage string) (*BrokerImageStatusResponse, error) {
+	query := url.Values{}
+	if shortImage != "" {
+		query.Set("short", shortImage)
+	}
+	if longImage != "" {
+		query.Set("long", longImage)
+	}
+	endpoint := fmt.Sprintf("%s/api/v1/images/status?%s", strings.TrimSuffix(brokerEndpoint, "/"), query.Encode())
+
+	resp, err := t.doRequest(ctx, brokerID, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, &BrokerUnsupportedError{StatusCode: resp.StatusCode}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("broker returned status %d", resp.StatusCode)
+	}
+
+	var result BrokerImageStatusResponse
+	if err := t.decodeResponse(resp, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (t *brokerHTTPTransport) PullImage(ctx context.Context, brokerID, brokerEndpoint, image string) error {
+	endpoint := fmt.Sprintf("%s/api/v1/images/pull", strings.TrimSuffix(brokerEndpoint, "/"))
+	body, err := json.Marshal(map[string]string{"image": image})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	resp, err := t.doRequest(ctx, brokerID, http.MethodPost, endpoint, body)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return brokerHTTPError(resp)
+	}
+	return nil
+}
+
+func (t *brokerHTTPTransport) DeleteImage(ctx context.Context, brokerID, brokerEndpoint, image string) error {
+	endpoint := fmt.Sprintf("%s/api/v1/images/local", strings.TrimSuffix(brokerEndpoint, "/"))
+	body, err := json.Marshal(map[string]string{"image": image})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	resp, err := t.doRequest(ctx, brokerID, http.MethodDelete, endpoint, body)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return brokerHTTPError(resp)
+	}
+	return nil
 }
 
 func (t *brokerHTTPTransport) CleanupProject(ctx context.Context, brokerID, brokerEndpoint, projectSlug, projectID string) error {

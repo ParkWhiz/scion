@@ -24,7 +24,7 @@
  * In compact mode (project page), wraps in a section with header/description.
  */
 
-import { LitElement, html, nothing } from 'lit';
+import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import type { Secret, SecretType, ResourceScope, InjectionMode } from '../../shared/types.js';
@@ -61,7 +61,14 @@ export class ScionSecretList extends LitElement {
   // Copy-to-clipboard feedback
   @state() private copiedSecretKey: string | null = null;
 
-  static override styles = [resourceStyles];
+  static override styles = [
+    resourceStyles,
+    css`
+      sl-textarea.secret-value::part(textarea) {
+        -webkit-text-security: disc;
+      }
+    `,
+  ];
 
   override connectedCallback(): void {
     super.connectedCallback();
@@ -437,16 +444,33 @@ export class ScionSecretList extends LitElement {
             required
           ></sl-input>
 
-          <sl-input
-            label="Value"
-            placeholder="Secret value"
-            value=${this.dialogValue}
-            type="password"
-            @sl-input=${(e: Event) => {
-              this.dialogValue = (e.target as HTMLInputElement).value;
-            }}
-            required
-          ></sl-input>
+          ${this.dialogType === 'file'
+            ? html`
+                <sl-textarea
+                  class="secret-value"
+                  label="Value"
+                  placeholder="Paste file contents (e.g. private key)"
+                  value=${this.dialogValue}
+                  rows="6"
+                  resize="vertical"
+                  @sl-input=${(e: Event) => {
+                    this.dialogValue = (e.target as HTMLTextAreaElement).value;
+                  }}
+                  required
+                ></sl-textarea>
+              `
+            : html`
+                <sl-input
+                  label="Value"
+                  placeholder="Secret value"
+                  value=${this.dialogValue}
+                  type="password"
+                  @sl-input=${(e: Event) => {
+                    this.dialogValue = (e.target as HTMLInputElement).value;
+                  }}
+                  required
+                ></sl-input>
+              `}
 
           <div class="dialog-hint">
             <sl-icon name="info-circle"></sl-icon>

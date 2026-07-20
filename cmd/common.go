@@ -76,6 +76,7 @@ var (
 	inlineConfigPath      string
 	labelFlags            []string
 	modelFlag             string
+	thinkingLevelFlag     int = -1
 )
 
 func parseLabels(raw []string) (map[string]string, error) {
@@ -427,6 +428,16 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 			inlineCfg = &api.ScionConfig{}
 		}
 		inlineCfg.Model = normalizedModel
+	}
+	if thinkingLevelFlag != -1 {
+		if thinkingLevelFlag < 0 || thinkingLevelFlag > 100 {
+			return fmt.Errorf("invalid --thinking-level value %d: must be between 0 and 100", thinkingLevelFlag)
+		}
+		if inlineCfg == nil {
+			inlineCfg = &api.ScionConfig{}
+		}
+		val := thinkingLevelFlag
+		inlineCfg.ThinkingLevel = &val
 	}
 
 	// This allows starting/resuming an agent even if it exists on Hub but not locally

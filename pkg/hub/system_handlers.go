@@ -31,6 +31,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	yamlv3 "gopkg.in/yaml.v3"
 )
 
 // --- 2.1: System Check (Doctor) ---
@@ -218,10 +219,17 @@ func (s *Server) handlePutRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update the image checker so it uses the newly selected runtime for
-	// local image existence checks instead of the previously configured one.
+	// Update the image checker and co-located broker runtime so they use
+	// the newly selected runtime instead of the previously configured one.
 	rt := runtime.GetRuntime("", "")
 	s.SetLocalImageChecker(rt)
+
+	s.mu.RLock()
+	reloadFn := s.runtimeReloadFunc
+	s.mu.RUnlock()
+	if reloadFn != nil {
+		reloadFn()
+	}
 
 	writeJSON(w, http.StatusOK, systemRuntimeResponse{
 		Detected:   req.Runtime,
@@ -285,9 +293,7 @@ func (s *Server) handleSystemRegistry(w http.ResponseWriter, r *http.Request) {
 	s.config.MaintenanceConfig.ImageRegistry = req.ImageRegistry
 	s.mu.Unlock()
 
-	writeJSON(w, http.StatusOK, putRegistryResponse{
-		ImageRegistry: req.ImageRegistry,
-	})
+	writeJSON(w, http.StatusOK, putRegistryResponse(req))
 }
 
 // --- 2.3: Onboarding Status ---
@@ -307,6 +313,9 @@ type OnboardingStatus struct {
 	GCPProjectID        string `json:"gcpProjectId,omitempty"`
 	GitVersion          string `json:"gitVersion,omitempty"`
 	GitVersionOK        bool   `json:"gitVersionOK"`
+	GCloudADCAvailable  bool   `json:"gcloudADCAvailable"`
+	AutoInjectGcloudADC bool   `json:"autoInjectGcloudADC"`
+	Workstation         bool   `json:"workstation"`
 }
 
 func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
@@ -388,6 +397,22 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 		status.GitVersion = "not found"
 		status.GitVersionOK = false
 	}
+
+	// GCloudADCAvailable: check if host has gcloud ADC file
+	if home, hErr := os.UserHomeDir(); hErr == nil {
+		adcPath := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
+		if _, err := os.Stat(adcPath); err == nil {
+			status.GCloudADCAvailable = true
+		}
+	}
+
+	// AutoInjectGcloudADC: read current setting value
+	if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
+		status.AutoInjectGcloudADC = vs.AutoInjectGcloudADC
+	}
+
+	// Workstation: whether the server is running in workstation mode
+	status.Workstation = s.workstation
 
 	return status
 }
@@ -1048,6 +1073,83 @@ func (s *Server) handleAppleDNSSetup(w http.ResponseWriter, r *http.Request) {
 		resp.Error = err.Error()
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// --- Workstation Settings ---
+
+// workstationSettingsRequest is the payload for PATCH /api/v1/system/workstation-settings.
+type workstationSettingsRequest struct {
+	AutoInjectGcloudADC *bool `json:"auto_inject_gcloud_adc,omitempty"`
+}
+
+// handleWorkstationSettings handles PATCH /api/v1/system/workstation-settings.
+// It allows toggling workstation-level settings without requiring admin role.
+func (s *Server) handleWorkstationSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		MethodNotAllowed(w)
+		return
+	}
+
+	var req workstationSettingsRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "Invalid request body", nil)
+		return
+	}
+
+	if req.AutoInjectGcloudADC == nil {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "No settings provided", nil)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	globalDir, err := config.GetGlobalDir()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to resolve settings directory", nil)
+		return
+	}
+
+	settingsPath := filepath.Join(globalDir, "settings.yaml")
+
+	var raw map[string]interface{}
+	if data, readErr := os.ReadFile(settingsPath); readErr == nil {
+		if err := yamlv3.Unmarshal(data, &raw); err != nil {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to parse settings file", nil)
+			return
+		}
+	} else if !os.IsNotExist(readErr) {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to read settings file", nil)
+		return
+	}
+	if raw == nil {
+		raw = make(map[string]interface{})
+	}
+
+	raw["auto_inject_gcloud_adc"] = *req.AutoInjectGcloudADC
+
+	if _, ok := raw["schema_version"]; !ok {
+		raw["schema_version"] = "1"
+	}
+
+	newData, err := yamlv3.Marshal(raw)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to marshal settings", nil)
+		return
+	}
+
+	if err := os.WriteFile(settingsPath, newData, 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to write settings file", nil)
+		return
+	}
+
+	slog.Info("Workstation settings updated",
+		"auto_inject_gcloud_adc", *req.AutoInjectGcloudADC,
+	)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"auto_inject_gcloud_adc": *req.AutoInjectGcloudADC,
+	})
 }
 
 // trimOutput removes a trailing newline from command output.

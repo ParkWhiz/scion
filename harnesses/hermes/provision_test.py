@@ -114,10 +114,153 @@ class AuthResolutionTest(unittest.TestCase):
             self._select(["ANTHROPIC_API_KEY"], explicit="auth-file")
         self.assertIn("valid types are", str(ctx.exception))
 
+    def test_vertex_project_id_selects_vertex_ai(self) -> None:
+        result = self._select(["VERTEX_PROJECT_ID"])
+        self.assertEqual(result.method, "vertex-ai")
+        self.assertEqual(result.env_key, "VERTEX_PROJECT_ID")
+
+    def test_google_cloud_project_selects_vertex_ai(self) -> None:
+        result = self._select(["GOOGLE_CLOUD_PROJECT"])
+        self.assertEqual(result.method, "vertex-ai")
+        self.assertEqual(result.env_key, "GOOGLE_CLOUD_PROJECT")
+
+    def test_api_key_takes_precedence_over_vertex(self) -> None:
+        result = self._select(["ANTHROPIC_API_KEY", "VERTEX_PROJECT_ID"])
+        self.assertEqual(result.method, "api-key")
+        self.assertEqual(result.env_key, "ANTHROPIC_API_KEY")
+
+    def test_explicit_vertex_ai_type_accepted(self) -> None:
+        result = self._select(["VERTEX_PROJECT_ID"], explicit="vertex-ai")
+        self.assertEqual(result.method, "vertex-ai")
+        self.assertEqual(result.env_key, "VERTEX_PROJECT_ID")
+
     def test_no_keys_raises(self) -> None:
         with self.assertRaises(scion_harness.ProvisionError) as ctx:
             self._select([])
         self.assertIn("no valid auth method found", str(ctx.exception))
+
+
+_VERTEX_ENV_KEYS = [
+    "VERTEX_PROJECT_ID", "VERTEX_REGION", "VERTEX_CREDENTIALS_PATH",
+    "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_REGION", "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+]
+
+
+@contextmanager
+def clean_vertex_env():
+    """Temporarily unset Vertex/GCP env vars so tests aren't affected by the host."""
+    saved = {k: os.environ.pop(k) for k in _VERTEX_ENV_KEYS if k in os.environ}
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+
+class VertexAIProvisionTest(unittest.TestCase):
+    def test_vertex_ai_sets_default_model_and_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, clean_vertex_env():
+            home = os.path.join(tmp, "home")
+            bundle = os.path.join(tmp, "bundle")
+            os.makedirs(os.path.join(bundle, "outputs"))
+            os.makedirs(home)
+
+            ctx = _make_ctx(
+                bundle,
+                env_vars=["VERTEX_PROJECT_ID"],
+                env_secret_files={"VERTEX_PROJECT_ID": ""},
+                harness_config={
+                    "instructions_file": "AGENTS.md",
+                    "skills_dir": ".hermes/skills",
+                    "system_prompt_mode": "none",
+                },
+            )
+
+            stderr = io.StringIO()
+            with temporary_home(home), redirect_stderr(stderr):
+                provision.provision(ctx)
+
+            with open(os.path.join(bundle, "outputs", "resolved-auth.json"), "r") as f:
+                resolved = json.load(f)
+            self.assertEqual(resolved["method"], "vertex-ai")
+            self.assertTrue(resolved.get("vertex_ai"))
+
+            with open(os.path.join(bundle, "outputs", "env.json"), "r") as f:
+                env = json.load(f)
+            self.assertEqual(env["HERMES_INFERENCE_MODEL"], "google/gemini-2.5-flash")
+            self.assertEqual(env["VERTEX_REGION"], "us-central1")
+
+    def test_vertex_ai_respects_explicit_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, clean_vertex_env():
+            home = os.path.join(tmp, "home")
+            bundle = os.path.join(tmp, "bundle")
+            os.makedirs(os.path.join(bundle, "outputs"))
+            os.makedirs(home)
+
+            manifest = {
+                "harness_bundle_dir": bundle,
+                "harness_config": {
+                    "instructions_file": "AGENTS.md",
+                    "skills_dir": ".hermes/skills",
+                    "system_prompt_mode": "none",
+                },
+                "model_resolution": {"resolved_model": "google/gemini-2.5-pro"},
+            }
+
+            os.makedirs(os.path.join(bundle, "inputs"), exist_ok=True)
+            candidates = {
+                "env_vars": ["VERTEX_PROJECT_ID"],
+                "env_secret_files": {"VERTEX_PROJECT_ID": ""},
+            }
+            with open(os.path.join(bundle, "inputs", "auth-candidates.json"), "w") as f:
+                json.dump(candidates, f)
+
+            ctx = scion_harness.ProvisionContext("hermes", manifest)
+
+            stderr = io.StringIO()
+            with temporary_home(home), redirect_stderr(stderr):
+                provision.provision(ctx)
+
+            with open(os.path.join(bundle, "outputs", "env.json"), "r") as f:
+                env = json.load(f)
+            self.assertEqual(env["HERMES_INFERENCE_MODEL"], "google/gemini-2.5-pro")
+
+
+class VertexRegionFallbackTest(unittest.TestCase):
+    """Test VERTEX_REGION → GOOGLE_CLOUD_REGION → GOOGLE_CLOUD_LOCATION → us-central1."""
+
+    def _region(self, env_overrides: dict[str, str]) -> str:
+        with tempfile.TemporaryDirectory() as tmp, clean_vertex_env():
+            bundle = os.path.join(tmp, "bundle")
+            os.makedirs(os.path.join(bundle, "inputs"))
+            os.makedirs(os.path.join(bundle, "outputs"))
+
+            secrets_dir = os.path.join(bundle, "secrets")
+            os.makedirs(secrets_dir, exist_ok=True)
+            env_secret_files: dict[str, str] = {}
+            for k, v in env_overrides.items():
+                path = os.path.join(secrets_dir, k)
+                with open(path, "w") as f:
+                    f.write(v)
+                env_secret_files[k] = path
+
+            ctx = _make_ctx(bundle, env_vars=list(env_overrides), env_secret_files=env_secret_files)
+            return provision._build_vertex_env(ctx).get("VERTEX_REGION", "")
+
+    def test_vertex_region_preferred(self) -> None:
+        self.assertEqual(
+            self._region({"VERTEX_REGION": "europe-west1", "GOOGLE_CLOUD_REGION": "asia-east1"}),
+            "europe-west1",
+        )
+
+    def test_google_cloud_region_second(self) -> None:
+        self.assertEqual(self._region({"GOOGLE_CLOUD_REGION": "asia-east1"}), "asia-east1")
+
+    def test_google_cloud_location_third(self) -> None:
+        self.assertEqual(self._region({"GOOGLE_CLOUD_LOCATION": "us-west1"}), "us-west1")
+
+    def test_default_us_central1(self) -> None:
+        self.assertEqual(self._region({}), "us-central1")
 
 
 class NoAuthModeTest(unittest.TestCase):
@@ -155,7 +298,7 @@ class NoAuthModeTest(unittest.TestCase):
 
 
 class InstructionProjectionTest(unittest.TestCase):
-    def test_composes_prompts_and_skills(self) -> None:
+    def test_composes_prompts_without_skills_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.join(tmp, "home")
             bundle = os.path.join(tmp, "bundle")
@@ -200,8 +343,8 @@ class InstructionProjectionTest(unittest.TestCase):
             self.assertEqual(content.count(MANAGED_BEGIN), 1)
             self.assertIn("# System Instruction\n\nSystem rules", content)
             self.assertIn("# Agent Instructions\n\nAgent rules", content)
-            self.assertIn("## example\n\n# Example Skill\n\nUse this skill.", content)
-            self.assertIn("## second\n\n# Second Skill\n\nUse this other skill.", content)
+            self.assertNotIn("# Skills", content)
+            self.assertNotIn("# Example Skill", content)
 
     def test_cleans_stale_managed_block_when_inputs_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

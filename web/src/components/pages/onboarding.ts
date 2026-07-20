@@ -36,6 +36,8 @@ interface OnboardingStatus {
   imageRegistry?: string;
   gitVersion?: string;
   gitVersionOK?: boolean;
+  gcloudADCAvailable?: boolean;
+  autoInjectGcloudADC?: boolean;
 }
 
 interface DiagnosticResult {
@@ -95,6 +97,8 @@ export class ScionPageOnboarding extends LitElement {
   @state() private pullTotal = 0;
   @state() private gitVersion = '';
   @state() private gitVersionOK = true;
+  @state() private gcloudADCAvailable = false;
+  @state() private autoInjectGcloudADC = false;
   private imageEventSource: EventSource | null = null;
   private imageJobTimeoutId: number | null = null;
 
@@ -514,6 +518,8 @@ export class ScionPageOnboarding extends LitElement {
       }
       if (status?.gitVersion !== undefined) this.gitVersion = status.gitVersion;
       if (status?.gitVersionOK !== undefined) this.gitVersionOK = status.gitVersionOK;
+      if (status?.gcloudADCAvailable) this.gcloudADCAvailable = true;
+      if (status?.autoInjectGcloudADC) this.autoInjectGcloudADC = true;
 
       // Resume: advance past completed steps only if user has previously started
       const previouslyStarted = sessionStorage.getItem('onboardingStarted') === 'true';
@@ -965,6 +971,22 @@ export class ScionPageOnboarding extends LitElement {
         </p>
       `}
 
+      ${this.gcloudADCAvailable ? html`
+        <div style="margin-top:1rem;padding:0.75rem 1rem;border:1px solid var(--sl-color-neutral-200);border-radius:var(--sl-border-radius-medium);background:var(--sl-color-neutral-50);">
+          <sl-checkbox
+            ?checked=${this.autoInjectGcloudADC}
+            @sl-change=${(e: Event) => {
+              this.autoInjectGcloudADC = (e.target as HTMLInputElement).checked;
+            }}
+          >
+            Automatically inject gcloud credentials into agent containers
+          </sl-checkbox>
+          <p style="font-size:0.75rem;color:var(--scion-text-muted,#64748b);margin:0.25rem 0 0 1.75rem;">
+            Detected: ~/.config/gcloud/application_default_credentials.json
+          </p>
+        </div>
+      ` : nothing}
+
       <div class="footer">
         <sl-button variant="text" @click=${() => { this.currentStep = 3; }}>Back</sl-button>
         <div class="footer-right">
@@ -1063,6 +1085,16 @@ export class ScionPageOnboarding extends LitElement {
         this.error = await extractApiError(res, 'Failed to initialize harnesses');
         return;
       }
+      // Save gcloud ADC injection preference if the option was shown
+      if (this.gcloudADCAvailable) {
+        await apiFetch('/api/v1/admin/server-config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            auto_inject_gcloud_adc: this.autoInjectGcloudADC,
+          }),
+        });
+      }
       this.cleanupImageEvents();
       this.currentStep = 5;
     } finally {
@@ -1100,14 +1132,14 @@ export class ScionPageOnboarding extends LitElement {
         return;
       }
       const data = (await res.json()) as { jobId: string };
-      this.subscribeToImageJob(data.jobId, harnesses.length);
+      this.subscribeToImageJob(data.jobId);
     } catch {
       this.error = 'Failed to connect to the server.';
       this.imagePulling = false;
     }
   }
 
-  private subscribeToImageJob(jobId: string, totalImages: number): void {
+  private subscribeToImageJob(jobId: string): void {
     this.cleanupImageEvents();
 
     const url = `/events?sub=${encodeURIComponent('system.images.' + jobId)}`;
@@ -1150,7 +1182,7 @@ export class ScionPageOnboarding extends LitElement {
 
           if (status === 'done' || status === 'exists' || status === 'error') {
             completedImages.add(fullImageName);
-            if (completedImages.size >= totalImages) {
+            if (this.pullTotal > 0 && completedImages.size >= this.pullTotal) {
               finishPull();
             }
           }

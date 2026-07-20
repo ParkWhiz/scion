@@ -26,6 +26,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/templatecache"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth/adcsource"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
 
@@ -52,6 +54,13 @@ type HubConnection struct {
 
 	Credentials *brokercredentials.BrokerCredentials
 	SecretKey   []byte // decoded from Credentials.SecretKey
+
+	// TransportSource and TransportMode are resolved per-connection for
+	// the control channel WebSocket. The REST hubclient handles its own
+	// transport auth via WithTransportAuth(), but the control channel
+	// dials directly and needs these to build auth headers.
+	TransportSource transportauth.TokenSource
+	TransportMode   transportauth.HeaderMode
 
 	HubClient      hubclient.Client
 	Hydrator       *templatecache.Hydrator
@@ -146,6 +155,8 @@ func (hc *HubConnection) Start(ctx context.Context, server *Server) error {
 				PongWait:            60 * time.Second,
 				WriteWait:           10 * time.Second,
 				Debug:               server.config.Debug,
+				TransportSource:     hc.TransportSource,
+				TransportMode:       hc.TransportMode,
 				OnConnectionStateChange: func(connected bool) {
 					if connected {
 						hc.setStatus(ConnectionStatusConnected)
@@ -226,8 +237,22 @@ func (hc *HubConnection) Reinitialize(ctx context.Context, server *Server, creds
 	}
 	hc.SecretKey = secretKey
 
-	// Create new Hub client
+	// Create new Hub client, resolving transport auth once for both REST and WebSocket
 	opts := buildHubClientOpts(creds, secretKey)
+	src, mode, err := transportauth.ResolveBrokerTransport(creds.TransportMode, creds.TransportAudience, adcsource.New)
+	if err != nil {
+		hc.setStatus(ConnectionStatusError)
+		return fmt.Errorf("failed to resolve transport auth: %w", err)
+	}
+	if src != nil {
+		hc.TransportSource = src
+		hc.TransportMode = mode
+		opts = append(opts, hubclient.WithTransportAuth(src, mode))
+	} else {
+		hc.TransportSource = nil
+		hc.TransportMode = 0
+	}
+
 	client, err := hubclient.New(creds.HubEndpoint, opts...)
 	if err != nil {
 		hc.setStatus(ConnectionStatusError)

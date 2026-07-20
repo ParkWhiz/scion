@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -52,6 +53,8 @@ type mockIntegrationManager struct {
 	reconnectCalls     []string
 	updateCalls        []string
 	installCalls       []string
+	loadOneCalls       []string
+	loadOneErr         error
 }
 
 func newMockIntegrationManager() *mockIntegrationManager {
@@ -91,6 +94,17 @@ func (m *mockIntegrationManager) GetPluginConfig(pluginType, name string) map[st
 		out[k] = v
 	}
 	return out
+}
+
+func (m *mockIntegrationManager) GetPluginConfigFile(pluginType, name string) string {
+	if pluginType != "broker" {
+		return ""
+	}
+	cfg, ok := m.plugins[name]
+	if !ok {
+		return ""
+	}
+	return cfg["config_file"]
 }
 
 func (m *mockIntegrationManager) IsSelfManaged(pluginType, name string) bool {
@@ -159,6 +173,17 @@ func (m *mockIntegrationManager) InstallPlugin(name, repoPath, pluginsDir, confi
 	m.plugins[name] = map[string]string{}
 	if configFile != "" {
 		m.plugins[name]["config_file"] = configFile
+	}
+	return nil
+}
+
+func (m *mockIntegrationManager) LoadOne(pluginType, name string, entry plugin.PluginEntry, pluginsDir string) error {
+	m.loadOneCalls = append(m.loadOneCalls, name)
+	if m.loadOneErr != nil {
+		return m.loadOneErr
+	}
+	if pluginType == "broker" {
+		m.plugins[name] = entry.Config
 	}
 	return nil
 }
@@ -467,6 +492,102 @@ func TestRestartIntegration_OK(t *testing.T) {
 	}
 }
 
+func TestRestartIntegration_WithSpokeWired(t *testing.T) {
+	mgr := newMockIntegrationManager()
+	mgr.plugins["discord"] = map[string]string{}
+
+	// Create a FanOutEventBus with a discord spoke.
+	inproc := eventbus.NewInProcessEventBus(slog.Default())
+	discordBus := eventbus.NewInProcessEventBus(slog.Default())
+	fanout := eventbus.NewFanOutEventBus([]eventbus.NamedEventBus{
+		{Name: "inprocess", Bus: inproc},
+		{Name: "discord", Bus: discordBus},
+	}, slog.Default())
+
+	proxy := NewMessageBrokerProxy(fanout, nil, nil, nil, slog.Default())
+
+	srv := &Server{}
+	srv.pluginManager = mgr
+	srv.SetMessageBrokerProxy(proxy)
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/restart", nil)
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("expected status 'ok', got %v", resp["status"])
+	}
+	// No warnings expected when spoke is wired.
+	if _, hasWarnings := resp["warnings"]; hasWarnings {
+		t.Errorf("expected no warnings when spoke is wired, got %v", resp["warnings"])
+	}
+}
+
+func TestRestartIntegration_WithoutSpokeWired(t *testing.T) {
+	mgr := newMockIntegrationManager()
+	mgr.plugins["discord"] = map[string]string{}
+
+	// Create a FanOutEventBus WITHOUT a discord spoke.
+	inproc := eventbus.NewInProcessEventBus(slog.Default())
+	fanout := eventbus.NewFanOutEventBus([]eventbus.NamedEventBus{
+		{Name: "inprocess", Bus: inproc},
+	}, slog.Default())
+
+	proxy := NewMessageBrokerProxy(fanout, nil, nil, nil, slog.Default())
+
+	srv := &Server{}
+	srv.pluginManager = mgr
+	srv.SetMessageBrokerProxy(proxy)
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/restart", nil)
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp["status"] != "ok" {
+		t.Errorf("expected status 'ok', got %v", resp["status"])
+	}
+	// Warnings expected when spoke is NOT wired.
+	warnings, ok := resp["warnings"].([]interface{})
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected warnings when spoke is not wired, got %v", resp["warnings"])
+	}
+	warning := fmt.Sprintf("%v", warnings[0])
+	if !strings.Contains(warning, "not wired") {
+		t.Errorf("expected warning about spoke not being wired, got %q", warning)
+	}
+}
+
+func TestValidateIntegrationWiring_NoProxy(t *testing.T) {
+	srv := &Server{}
+	warnings := srv.validateIntegrationWiring("discord")
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d", len(warnings))
+	}
+	if !strings.Contains(warnings[0], "message broker not initialized") {
+		t.Errorf("unexpected warning: %s", warnings[0])
+	}
+}
+
 func TestRestartIntegration_NotFound(t *testing.T) {
 	mgr := newMockIntegrationManager()
 	srv := &Server{}
@@ -671,6 +792,79 @@ func TestUpdateConfig_WithConfigFile(t *testing.T) {
 	}
 }
 
+func TestUpdateConfig_InstalledButNotLoaded(t *testing.T) {
+	// Regression test for the PUT /config 404: a freshly installed plugin whose
+	// LoadOne failed (required fields like bot_token missing) is registered in
+	// settings.yaml but absent from the plugin manager. GET falls back to a
+	// settings.yaml stub, and PUT must accept the same fallback — otherwise the
+	// required fields can never be saved and the plugin can never activate.
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	if err := os.MkdirAll(filepath.Join(tmpHome, ".scion"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.AddPluginToSettings("telegram", "~/.scion/scion-telegram.yaml"); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := newMockIntegrationManager() // telegram NOT loaded in the manager
+
+	srv := &Server{}
+	srv.pluginManager = mgr
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	body := `{"settings":{"webhook_listen":":9095"}}`
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/integrations/telegram/config", strings.NewReader(body))
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpHome, ".scion", "scion-telegram.yaml"))
+	if err != nil {
+		t.Fatalf("config file not written: %v", err)
+	}
+	if !strings.Contains(string(data), "webhook_listen") {
+		t.Errorf("config file missing saved setting: %s", string(data))
+	}
+
+	if len(mgr.loadOneCalls) != 1 || mgr.loadOneCalls[0] != "telegram" {
+		t.Errorf("expected activation LoadOne call for telegram, got %v", mgr.loadOneCalls)
+	}
+}
+
+func TestUpdateConfig_InstalledButNotLoaded_ActivationFailureIsNonFatal(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	if err := os.MkdirAll(filepath.Join(tmpHome, ".scion"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.AddPluginToSettings("telegram", "~/.scion/scion-telegram.yaml"); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := newMockIntegrationManager()
+	mgr.loadOneErr = fmt.Errorf("bot_token is required")
+
+	srv := &Server{}
+	srv.pluginManager = mgr
+
+	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
+	body := `{"settings":{"webhook_listen":":9095"}}`
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/integrations/telegram/config", strings.NewReader(body))
+	req = req.WithContext(contextWithIdentity(req.Context(), admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	// Config is persisted even if the plugin still can't load — must be 200.
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestUpdateConfig_InvalidBody(t *testing.T) {
 	mgr := newMockIntegrationManager()
 	mgr.plugins["telegram"] = map[string]string{}
@@ -709,6 +903,10 @@ func TestUpdateConfig_UnknownSecretKey(t *testing.T) {
 }
 
 func TestUpdateConfig_NotFound(t *testing.T) {
+	// Isolate from any real ~/.scion/settings.yaml so the settings.yaml
+	// fallback doesn't find plugins from the host environment.
+	t.Setenv("HOME", t.TempDir())
+
 	mgr := newMockIntegrationManager()
 	srv := &Server{}
 	srv.pluginManager = mgr

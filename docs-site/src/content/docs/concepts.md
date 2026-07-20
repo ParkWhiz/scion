@@ -144,11 +144,11 @@ Scion enforces strict isolation between agents to prevent interference and cross
 - **Externalized Project Data**: Non-git project data and agent home directories are externalized to ensure they cannot be traversed by agents in the workspace.
 - **Shared-Workspace Per-Agent Isolation**: In hub-hosted git projects where multiple agents share a single workspace mount, each agent's per-agent state (its task prompt and resolved configuration) is held outside that shared mount, so sibling agents in the same project cannot read each other's state through the workspace view.
 
-### Contextual Agent Instructions
-Scion automatically tailors an agent's operational context by appending supplemental instructions based on the workspace environment.
-- **`agents-git.md`**: Appended when an agent is running in a Git-backed workspace, providing context on worktree management and branch workflows.
-- **`agents-hub.md`**: Appended when an agent is connected to a Scion Hub, providing instructions for interacting with the Hub API and reporting status.
-These extensions ensure agents understand their specific execution environment without requiring manual configuration in every template.
+### Platform and Workspace Skills
+Scion automatically tailors an agent's operational context by injecting supplemental platform skills based on the workspace environment.
+- **`git-sandbox`**: Injected only for git-associated workspaces, providing instructions on sandbox/worktree environments, local-only operations, and non-interactive conflict resolution.
+- **Platform Skills**: Core instructions (such as status signaling, messaging, and command operations) are dynamically injected to guide the agent in interacting with the system.
+These platform skills ensure agents understand their specific execution environment without requiring manual configuration in every template.
 
 ### Plugin System
 

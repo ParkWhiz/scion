@@ -2179,7 +2179,7 @@ func TestV2_HandleIncoming_EmptyMessageDropped(t *testing.T) {
 		atomic.AddInt32(&received, 1)
 	}
 
-	// No text, no caption, no photo, no document.
+	// No text, no caption, no photo, no document, no audio, no video.
 	b.handleIncomingMessageV2(&TGMessage{
 		MessageID: 1,
 		From:      &TGUser{ID: 456, Username: "alice"},
@@ -2274,7 +2274,7 @@ func TestV2_DownloadTelegramFile_NoAttachment(t *testing.T) {
 
 	_, _, err := b.downloadTelegramFile(ctx, tgMsg, "test-slug")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no photo or document")
+	assert.Contains(t, err.Error(), "no downloadable attachment")
 }
 
 func TestV2_DownloadTelegramFile_DownloadFailure(t *testing.T) {
@@ -2313,6 +2313,266 @@ func TestV2_DownloadTelegramFile_DownloadFailure(t *testing.T) {
 	_, _, err := b.downloadTelegramFile(ctx, tgMsg, "test-slug")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "download file")
+}
+
+func TestV2_DownloadTelegramFile_AudioWithFilename(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	ctx := context.Background()
+	slug := filepath.Base(t.TempDir())
+
+	tgMsg := &TGMessage{
+		Audio: &TGAudio{
+			FileID:       "audio-xyz",
+			FileUniqueID: "audiouniq1",
+			FileName:     "song.mp3",
+			MimeType:     "audio/mpeg",
+			FileSize:     10000,
+			Duration:     180,
+		},
+	}
+
+	agentPath, placeholder, err := b.downloadTelegramFile(ctx, tgMsg, slug)
+	require.NoError(t, err)
+	assert.Contains(t, agentPath, "song.mp3")
+	assert.Contains(t, placeholder, "Audio attached")
+	assert.Contains(t, placeholder, "song.mp3")
+}
+
+func TestV2_DownloadTelegramFile_AudioFallbackName(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	ctx := context.Background()
+	slug := filepath.Base(t.TempDir())
+
+	// Audio with title but no filename — should use title.
+	tgMsg := &TGMessage{
+		Audio: &TGAudio{
+			FileID:       "audio-abc",
+			FileUniqueID: "audiouniq2",
+			Title:        "My Song",
+			FileSize:     5000,
+			Duration:     120,
+		},
+	}
+
+	agentPath, placeholder, err := b.downloadTelegramFile(ctx, tgMsg, slug)
+	require.NoError(t, err)
+	assert.Contains(t, agentPath, "My Song.ogg")
+	assert.Contains(t, placeholder, "Audio attached")
+
+	// Audio with no filename and no title — should use unique ID fallback.
+	tgMsg2 := &TGMessage{
+		Audio: &TGAudio{
+			FileID:       "audio-def",
+			FileUniqueID: "audiouniq3",
+			FileSize:     3000,
+			Duration:     60,
+		},
+	}
+
+	agentPath2, _, err := b.downloadTelegramFile(ctx, tgMsg2, slug)
+	require.NoError(t, err)
+	assert.Contains(t, agentPath2, "audio_audiouniq3.ogg")
+}
+
+func TestV2_DownloadTelegramFile_Video(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	ctx := context.Background()
+	slug := filepath.Base(t.TempDir())
+
+	tgMsg := &TGMessage{
+		Video: &TGVideo{
+			FileID:       "video-xyz",
+			FileUniqueID: "viduniq1",
+			FileName:     "clip.mp4",
+			MimeType:     "video/mp4",
+			FileSize:     50000,
+			Width:        1920,
+			Height:       1080,
+			Duration:     30,
+		},
+	}
+
+	agentPath, placeholder, err := b.downloadTelegramFile(ctx, tgMsg, slug)
+	require.NoError(t, err)
+	assert.Contains(t, agentPath, "clip.mp4")
+	assert.Contains(t, placeholder, "Video attached")
+	assert.Contains(t, placeholder, "clip.mp4")
+}
+
+func TestV2_DownloadTelegramFile_VideoFallbackName(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	ctx := context.Background()
+	slug := filepath.Base(t.TempDir())
+
+	tgMsg := &TGMessage{
+		Video: &TGVideo{
+			FileID:       "video-abc",
+			FileUniqueID: "viduniq2",
+			FileSize:     25000,
+			Width:        640,
+			Height:       480,
+			Duration:     10,
+		},
+	}
+
+	agentPath, _, err := b.downloadTelegramFile(ctx, tgMsg, slug)
+	require.NoError(t, err)
+	assert.Contains(t, agentPath, "video_viduniq2.mp4")
+}
+
+func TestV2_HandleIncoming_StickerSkipped(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	var received int32
+	b.InboundHandler = func(_ string, _ *messages.StructuredMessage) {
+		atomic.AddInt32(&received, 1)
+	}
+
+	// Sticker-only message — should be silently dropped (debug log).
+	b.handleIncomingMessageV2(&TGMessage{
+		MessageID: 10,
+		From:      &TGUser{ID: 456, Username: "alice"},
+		Chat:      TGChat{ID: -200, Type: "group"},
+		Sticker: &TGSticker{
+			FileID:       "sticker-abc",
+			FileUniqueID: "stickeruniq1",
+			Type:         "regular",
+			FileSize:     8000,
+		},
+	})
+
+	assert.Equal(t, int32(0), atomic.LoadInt32(&received))
+}
+
+func TestV2_HandleIncoming_AnimationSkipped(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	var received int32
+	b.InboundHandler = func(_ string, _ *messages.StructuredMessage) {
+		atomic.AddInt32(&received, 1)
+	}
+
+	// Animation-only message — should be silently dropped (debug log).
+	b.handleIncomingMessageV2(&TGMessage{
+		MessageID: 11,
+		From:      &TGUser{ID: 456, Username: "alice"},
+		Chat:      TGChat{ID: -200, Type: "group"},
+		Animation: &TGAnimation{
+			FileID:       "anim-abc",
+			FileUniqueID: "animuniq1",
+			FileName:     "funny.gif",
+			MimeType:     "video/mp4",
+			FileSize:     12000,
+		},
+	})
+
+	assert.Equal(t, int32(0), atomic.LoadInt32(&received))
+}
+
+func TestV2_HandleIncoming_AudioMessageDelivered(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	hub := newFakeHubClient()
+	hub.agents["proj-1"] = []AgentInfo{{Slug: "coder"}}
+	b := newTestBrokerV2WithHub(t, tgSrv, hub)
+
+	ctx := context.Background()
+	require.NoError(t, b.store.SaveUserMapping(ctx, &TelegramUserMapping{
+		TelegramUserID: "456",
+		ScionEmail:     "alice@example.com",
+		LinkedAt:       time.Now().UTC(),
+	}))
+
+	tmpDir := t.TempDir()
+	require.NoError(t, b.store.SaveGroupLink(ctx, &GroupLink{
+		ChatID:       -200,
+		ProjectID:    "proj-1",
+		ProjectSlug:  filepath.Base(tmpDir),
+		DefaultAgent: "coder",
+		LinkedAt:     time.Now().UTC(),
+		Active:       true,
+	}))
+	require.NoError(t, b.store.SaveProjectAgents(ctx, &ProjectAgents{
+		ProjectID:   "proj-1",
+		Agents:      []AgentInfo{{Slug: "coder"}},
+		RefreshedAt: time.Now(),
+	}))
+
+	var deliveredMsg *messages.StructuredMessage
+	done := make(chan struct{}, 1)
+	b.InboundHandler = func(_ string, msg *messages.StructuredMessage) {
+		deliveredMsg = msg
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}
+
+	b.handleIncomingMessageV2(&TGMessage{
+		MessageID: 50,
+		From:      &TGUser{ID: 456, Username: "alice"},
+		Chat:      TGChat{ID: -200, Type: "group"},
+		Date:      time.Now().Unix(),
+		Caption:   "listen to this",
+		Audio: &TGAudio{
+			FileID:       "audio-msg",
+			FileUniqueID: "auduniq",
+			FileName:     "voice.mp3",
+			FileSize:     4096,
+			Duration:     15,
+		},
+	})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for delivery")
+	}
+
+	require.NotNil(t, deliveredMsg)
+	assert.Contains(t, deliveredMsg.Msg, "listen to this")
+	assert.Contains(t, deliveredMsg.Msg, "Audio attached")
+	assert.Len(t, deliveredMsg.Attachments, 1)
+	assert.Contains(t, deliveredMsg.Attachments[0], "voice.mp3")
+}
+
+func TestV2_DownloadTelegramFile_ConfiguredDownloadsPath(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	// Set a custom downloads path.
+	customDir := filepath.Join(t.TempDir(), "custom-downloads")
+	b.downloadsPath = customDir
+
+	ctx := context.Background()
+
+	tgMsg := &TGMessage{
+		Document: &TGDocument{
+			FileID:       "doc-custom",
+			FileUniqueID: "docuniqcustom",
+			FileName:     "custom.pdf",
+			MimeType:     "application/pdf",
+			FileSize:     1024,
+		},
+	}
+
+	_, _, err := b.downloadTelegramFile(ctx, tgMsg, "any-slug")
+	require.NoError(t, err)
+
+	// Verify the file was saved in the custom directory.
+	entries, err := os.ReadDir(customDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].Name(), "custom.pdf")
 }
 
 // --- Code span restoration tests ---
@@ -2550,6 +2810,199 @@ func TestV2_HandleGroupMessage_PreBlockWithLanguage(t *testing.T) {
 	assert.Equal(t, "```go\nfmt.Println(\"hello\")\n```", deliveredMsg.Msg)
 }
 
+// --- Fix H1: captionless audio/video routes to default agent ---
+
+func TestV2_HandleIncoming_CaptionlessAudioRoutesToDefaultAgent(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	hub := newFakeHubClient()
+	hub.agents["proj-1"] = []AgentInfo{{Slug: "coder"}}
+	b := newTestBrokerV2WithHub(t, tgSrv, hub)
+
+	ctx := context.Background()
+	require.NoError(t, b.store.SaveUserMapping(ctx, &TelegramUserMapping{
+		TelegramUserID: "456",
+		ScionEmail:     "alice@example.com",
+		LinkedAt:       time.Now().UTC(),
+	}))
+
+	tmpDir := t.TempDir()
+	require.NoError(t, b.store.SaveGroupLink(ctx, &GroupLink{
+		ChatID:       -200,
+		ProjectID:    "proj-1",
+		ProjectSlug:  filepath.Base(tmpDir),
+		DefaultAgent: "coder",
+		LinkedAt:     time.Now().UTC(),
+		Active:       true,
+	}))
+	require.NoError(t, b.store.SaveProjectAgents(ctx, &ProjectAgents{
+		ProjectID:   "proj-1",
+		Agents:      []AgentInfo{{Slug: "coder"}},
+		RefreshedAt: time.Now(),
+	}))
+
+	var deliveredMsg *messages.StructuredMessage
+	done := make(chan struct{}, 1)
+	b.InboundHandler = func(_ string, msg *messages.StructuredMessage) {
+		deliveredMsg = msg
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}
+
+	// Audio with NO caption and NO @mention — must route via Fallback 3.
+	b.handleIncomingMessageV2(&TGMessage{
+		MessageID: 60,
+		From:      &TGUser{ID: 456, Username: "alice"},
+		Chat:      TGChat{ID: -200, Type: "group"},
+		Date:      time.Now().Unix(),
+		Audio: &TGAudio{
+			FileID:       "audio-nocap",
+			FileUniqueID: "auduniqnocap",
+			FileName:     "song.mp3",
+			FileSize:     4096,
+			Duration:     30,
+		},
+	})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for delivery — captionless audio was dropped")
+	}
+
+	require.NotNil(t, deliveredMsg)
+	assert.Contains(t, deliveredMsg.Msg, "Audio attached")
+	assert.Len(t, deliveredMsg.Attachments, 1)
+	assert.Contains(t, deliveredMsg.Attachments[0], "song.mp3")
+}
+
+func TestV2_HandleIncoming_CaptionlessVideoRoutesToDefaultAgent(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	hub := newFakeHubClient()
+	hub.agents["proj-1"] = []AgentInfo{{Slug: "coder"}}
+	b := newTestBrokerV2WithHub(t, tgSrv, hub)
+
+	ctx := context.Background()
+	require.NoError(t, b.store.SaveUserMapping(ctx, &TelegramUserMapping{
+		TelegramUserID: "456",
+		ScionEmail:     "alice@example.com",
+		LinkedAt:       time.Now().UTC(),
+	}))
+
+	tmpDir := t.TempDir()
+	require.NoError(t, b.store.SaveGroupLink(ctx, &GroupLink{
+		ChatID:       -200,
+		ProjectID:    "proj-1",
+		ProjectSlug:  filepath.Base(tmpDir),
+		DefaultAgent: "coder",
+		LinkedAt:     time.Now().UTC(),
+		Active:       true,
+	}))
+	require.NoError(t, b.store.SaveProjectAgents(ctx, &ProjectAgents{
+		ProjectID:   "proj-1",
+		Agents:      []AgentInfo{{Slug: "coder"}},
+		RefreshedAt: time.Now(),
+	}))
+
+	var deliveredMsg *messages.StructuredMessage
+	done := make(chan struct{}, 1)
+	b.InboundHandler = func(_ string, msg *messages.StructuredMessage) {
+		deliveredMsg = msg
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}
+
+	// Video with NO caption and NO @mention — must route via Fallback 3.
+	b.handleIncomingMessageV2(&TGMessage{
+		MessageID: 61,
+		From:      &TGUser{ID: 456, Username: "alice"},
+		Chat:      TGChat{ID: -200, Type: "group"},
+		Date:      time.Now().Unix(),
+		Video: &TGVideo{
+			FileID:       "video-nocap",
+			FileUniqueID: "viduniqnocap",
+			FileSize:     10000,
+			Width:        640,
+			Height:       480,
+			Duration:     5,
+		},
+	})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for delivery — captionless video was dropped")
+	}
+
+	require.NotNil(t, deliveredMsg)
+	assert.Contains(t, deliveredMsg.Msg, "Video attached")
+	assert.Len(t, deliveredMsg.Attachments, 1)
+	assert.Contains(t, deliveredMsg.Attachments[0], "video_viduniqnocap.mp4")
+}
+
+// --- Fix M1: path traversal in Audio.Title ---
+
+func TestV2_DownloadTelegramFile_AudioTitlePathTraversal(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	ctx := context.Background()
+	slug := filepath.Base(t.TempDir())
+
+	tgMsg := &TGMessage{
+		Audio: &TGAudio{
+			FileID:       "audio-evil",
+			FileUniqueID: "audevil",
+			FileSize:     1024,
+			Duration:     5,
+			Title:        "../../etc/passwd",
+		},
+	}
+
+	agentPath, _, err := b.downloadTelegramFile(ctx, tgMsg, slug)
+	require.NoError(t, err)
+	// The path-traversal components must be stripped — the file should be
+	// named "passwd.ogg" (filepath.Base of "../../etc/passwd.ogg"), not
+	// contain any ".." segments.
+	assert.NotContains(t, agentPath, "..")
+	assert.Contains(t, agentPath, "passwd.ogg")
+}
+
+// --- Fix M2: agentPath reflects custom downloads_path ---
+
+func TestV2_DownloadTelegramFile_ConfiguredDownloadsPathAgentPath(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+
+	// Set a custom downloads path.
+	customDir := filepath.Join(t.TempDir(), "shared-attachments")
+	b.downloadsPath = customDir
+
+	ctx := context.Background()
+
+	tgMsg := &TGMessage{
+		Document: &TGDocument{
+			FileID:       "doc-agent-path",
+			FileUniqueID: "docuniqap",
+			FileName:     "report.pdf",
+			MimeType:     "application/pdf",
+			FileSize:     2048,
+		},
+	}
+
+	agentPath, _, err := b.downloadTelegramFile(ctx, tgMsg, "any-slug")
+	require.NoError(t, err)
+
+	// agentPath must start with the custom downloads path, NOT /workspace/downloads.
+	assert.True(t, strings.HasPrefix(agentPath, customDir),
+		"agentPath %q should start with custom downloads dir %q", agentPath, customDir)
+	assert.NotContains(t, agentPath, "/workspace/downloads")
+	assert.Contains(t, agentPath, "report.pdf")
+}
+
 func TestV2_HandleGroupMessage_CodeSpanWithDefaultAgent(t *testing.T) {
 	tgSrv := newFakeTGServerV2(t)
 	hub := newFakeHubClient()
@@ -2605,4 +3058,187 @@ func TestV2_HandleGroupMessage_CodeSpanWithDefaultAgent(t *testing.T) {
 	}
 
 	assert.Equal(t, "check the `config` file", deliveredMsg.Msg)
+}
+
+func TestResolveRecipientChats(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	// Seed a user mapping and conversation context.
+	require.NoError(t, store.SaveUserMapping(ctx, &TelegramUserMapping{
+		TelegramUserID:   "tg-user-1",
+		TelegramUsername: "alice_tg",
+		ScionUserID:      "scion-uuid-456",
+		ScionEmail:       "alice@example.com",
+		LinkedAt:         time.Now(),
+	}))
+	require.NoError(t, store.SaveConversationContext(ctx, &ConversationContext{
+		TelegramUserID: "tg-user-1",
+		ProjectID:      "proj-1",
+		AgentSlug:      "coder",
+		LastChatID:     12345,
+		LastMessageAt:  time.Now(),
+	}))
+
+	b := &TelegramBrokerV2{
+		log:   slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		store: store,
+	}
+
+	t.Run("email lookup succeeds", func(t *testing.T) {
+		chats := b.resolveRecipientChats(ctx, "user:alice@example.com", "", "proj-1", "coder")
+		assert.Equal(t, []int64{12345}, chats)
+	})
+
+	t.Run("display name with recipientID fallback", func(t *testing.T) {
+		// Hub rewrites recipient to display name; email lookup fails,
+		// but recipientID-based fallback finds the correct mapping.
+		chats := b.resolveRecipientChats(ctx, "user:Alice", "scion-uuid-456", "proj-1", "coder")
+		assert.Equal(t, []int64{12345}, chats)
+	})
+
+	t.Run("display name without recipientID returns nil", func(t *testing.T) {
+		// No recipientID provided — fallback cannot execute.
+		chats := b.resolveRecipientChats(ctx, "user:Alice", "", "proj-1", "coder")
+		assert.Nil(t, chats)
+	})
+
+	t.Run("non-user recipient returns nil", func(t *testing.T) {
+		chats := b.resolveRecipientChats(ctx, "agent:coder", "", "proj-1", "coder")
+		assert.Nil(t, chats)
+	})
+
+	t.Run("email lookup preferred over recipientID", func(t *testing.T) {
+		// When email lookup succeeds, recipientID is not used.
+		chats := b.resolveRecipientChats(ctx, "user:alice@example.com", "scion-uuid-456", "proj-1", "coder")
+		assert.Equal(t, []int64{12345}, chats)
+	})
+}
+
+// --- resolveAttachmentPath tests ---
+
+func TestV2_ResolveAttachmentPath_WorkspacePaths(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+	b.projectSlugMap = map[string]string{
+		"proj-1": "my-project",
+	}
+
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		path      string
+		projectID string
+		want      string
+	}{
+		{
+			name:      "workspace with leading slash",
+			path:      "/workspace/file.txt",
+			projectID: "proj-1",
+			want:      "/home/scion/.scion/projects/my-project/file.txt",
+		},
+		{
+			name:      "workspace without leading slash",
+			path:      "workspace/file.txt",
+			projectID: "proj-1",
+			want:      "/home/scion/.scion/projects/my-project/file.txt",
+		},
+		{
+			name:      "bare workspace",
+			path:      "/workspace",
+			projectID: "proj-1",
+			want:      "/home/scion/.scion/projects/my-project",
+		},
+		{
+			name:      "relative path",
+			path:      "file.txt",
+			projectID: "proj-1",
+			want:      "/home/scion/.scion/projects/my-project/file.txt",
+		},
+		{
+			name:      "no project slug returns original",
+			path:      "/workspace/file.txt",
+			projectID: "unknown-proj",
+			want:      "/workspace/file.txt",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := b.resolveAttachmentPath(ctx, nil, tt.path, tt.projectID)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestV2_ResolveAttachmentPath_SharedDirPaths(t *testing.T) {
+	tgSrv := newFakeTGServerV2(t)
+	b := newTestBrokerV2(t, tgSrv)
+	b.projectSlugMap = map[string]string{
+		"550e8400-e29b-41d4-a716-446655440000": "my-project",
+	}
+
+	ctx := context.Background()
+
+	// Expected: ~/.scion/project-configs/my-project__550e8400/shared-dirs/<name>/<file>
+	// shortUUID = "550e8400" (first 8 hex chars of UUID without dashes)
+
+	tests := []struct {
+		name      string
+		path      string
+		projectID string
+		wantEnd   string // suffix to match (avoids hardcoding HOME)
+	}{
+		{
+			name:      "scion-volumes path with file",
+			path:      "/scion-volumes/scratchpad/projects/chat-admin/report.png",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "project-configs/my-project__550e8400/shared-dirs/scratchpad/projects/chat-admin/report.png",
+		},
+		{
+			name:      "scion-volumes path bare dir",
+			path:      "/scion-volumes/build-cache",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "project-configs/my-project__550e8400/shared-dirs/build-cache",
+		},
+		{
+			name:      "scion-volumes with trailing slash file",
+			path:      "/scion-volumes/scratchpad/file.txt",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "project-configs/my-project__550e8400/shared-dirs/scratchpad/file.txt",
+		},
+		{
+			name:      "in-workspace scion-volumes",
+			path:      "/workspace/.scion-volumes/cache/data.bin",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "project-configs/my-project__550e8400/shared-dirs/cache/data.bin",
+		},
+		{
+			name:      "no project slug returns original",
+			path:      "/scion-volumes/scratchpad/file.txt",
+			projectID: "unknown-proj",
+			wantEnd:   "/scion-volumes/scratchpad/file.txt",
+		},
+		{
+			name:      "path traversal rejected",
+			path:      "/scion-volumes/scratchpad/../../etc/passwd",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "/scion-volumes/scratchpad/../../etc/passwd",
+		},
+		{
+			name:      "path traversal in shared dir name rejected",
+			path:      "/scion-volumes/../.scion/settings.yaml",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "/scion-volumes/../.scion/settings.yaml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := b.resolveAttachmentPath(ctx, nil, tt.path, tt.projectID)
+			assert.True(t, strings.HasSuffix(got, filepath.FromSlash(tt.wantEnd)),
+				"resolveAttachmentPath(%q) = %q, want suffix %q", tt.path, got, tt.wantEnd)
+		})
+	}
 }

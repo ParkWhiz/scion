@@ -232,7 +232,45 @@ def _build_otel_section(telemetry: dict[str, Any], env: dict[str, str] | None) -
     return "\n".join(lines) + "\n"
 
 
-def _reconcile_codex_toml(telemetry: dict[str, Any] | None, env: dict[str, str] | None) -> None:
+def _resolve_reasoning_effort(level: int) -> str:
+    """Map a thinking level (0-100) to OpenAI reasoning_effort (low/medium/high)."""
+    level = max(0, min(100, level))
+    if level >= 67:
+        return "high"
+    if level >= 34:
+        return "medium"
+    return "low"
+
+
+def _is_toml_key_line(line: str, key: str) -> bool:
+    """True if line is a top-level TOML assignment for exactly `key`."""
+    s = line.strip()
+    if not s.startswith(key):
+        return False
+    rest = s[len(key):]
+    return len(rest) > 0 and rest[0] in (" ", "=", "\t")
+
+
+def _strip_toml_top_level_key(content: str, key: str) -> str:
+    """Remove a top-level TOML key = value line from content."""
+    lines = content.split("\n")
+    kept = []
+    in_section = False
+    for line in lines:
+        s = line.strip()
+        if s.startswith("["):
+            in_section = True
+        if not in_section and _is_toml_key_line(line, key):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _reconcile_codex_toml(
+    telemetry: dict[str, Any] | None,
+    env: dict[str, str] | None,
+    reasoning_effort: str | None = None,
+) -> None:
     codex_dir = scion_harness.expand_path("~/.codex")
     os.makedirs(codex_dir, exist_ok=True)
     config_path = os.path.join(codex_dir, "config.toml")
@@ -240,7 +278,13 @@ def _reconcile_codex_toml(telemetry: dict[str, Any] | None, env: dict[str, str] 
     if os.path.isfile(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
             content = f.read()
+    content = _strip_toml_top_level_key(content, "reasoning_effort")
     content = scion_harness.strip_toml_sections(content, lambda h: h == "[otel]")
+
+    if reasoning_effort:
+        re_line = f'reasoning_effort = "{scion_harness.toml_escape(reasoning_effort)}"'
+        content = content.rstrip("\n\t ") + "\n" + re_line + "\n"
+
     if _telemetry_enabled(telemetry):
         section = _build_otel_section(telemetry or {}, env)
         content = content.rstrip("\n\t ") + "\n\n" + section
@@ -351,6 +395,16 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
     instructions_file = str(harness_cfg.get("instructions_file") or ".codex/AGENTS.md")
     scion_harness.project_instructions(ctx, instructions_file)
 
+    thinking_raw = os.environ.get("SCION_THINKING_LEVEL", "").strip()
+    reasoning_effort: str | None = None
+    if thinking_raw:
+        try:
+            thinking_level = int(thinking_raw)
+            reasoning_effort = _resolve_reasoning_effort(thinking_level)
+            ctx.info(f"thinking_level={thinking_level} reasoning_effort={reasoning_effort}")
+        except ValueError:
+            pass
+
     telemetry_payload = ctx.telemetry
     telemetry = telemetry_payload.get("telemetry") if isinstance(telemetry_payload, dict) else None
     env_overlay = telemetry_payload.get("env") if isinstance(telemetry_payload, dict) else None
@@ -359,6 +413,7 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
     _reconcile_codex_toml(
         telemetry if isinstance(telemetry, dict) else None,
         env_overlay,
+        reasoning_effort=reasoning_effort,
     )
 
     extra: dict[str, Any] | None = None

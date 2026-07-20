@@ -93,6 +93,29 @@ func (c *Checker) Check(ctx context.Context, image string) CheckResult {
 	return result
 }
 
+// CheckRemoteOnly checks the remote registry for registry-qualified images,
+// ignoring local state. Bare image names (no registry prefix) delegate to the
+// full Check method since they can only be verified locally.
+// Used for persisted ImageStatus which should reflect registry/reference validity.
+func (c *Checker) CheckRemoteOnly(ctx context.Context, image string) CheckResult {
+	now := time.Now()
+
+	if IsBareImageName(image) {
+		return c.Check(ctx, image)
+	}
+
+	ref, err := parseImageRef(image)
+	if err != nil {
+		return CheckResult{
+			Status:    "invalid",
+			Error:     err.Error(),
+			CheckedAt: now,
+		}
+	}
+
+	return checkRemoteImage(ctx, c.client, ref, now)
+}
+
 // IsBareImageName returns true when the image reference has no explicit
 // registry prefix (no '.' or ':' in the first path component before any '/').
 func IsBareImageName(image string) bool {

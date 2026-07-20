@@ -210,14 +210,16 @@ func (f *FanOutEventBus) BusChannels() []BusChannel {
 // with the same name already exists.
 func (f *FanOutEventBus) AddSpoke(bus NamedEventBus) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	for _, nb := range f.buses {
 		if nb.Name == bus.Name {
+			f.mu.Unlock()
 			return fmt.Errorf("spoke %q already exists", bus.Name)
 		}
 	}
 	f.buses = append(f.buses, bus)
+	f.mu.Unlock()
+
+	f.replaySubscriptions(bus)
 	return nil
 }
 
@@ -246,21 +248,36 @@ func (f *FanOutEventBus) ReplaceSpoke(name string, newBus NamedEventBus) error {
 		f.log.Error("failed to close old spoke during replace", "bus", name, "error", err)
 	}
 
-	// Replay existing subscriptions onto the new spoke so it receives the
-	// same event patterns as the spoke it replaced.
+	f.replaySubscriptions(newBus)
+	return nil
+}
+
+// replaySubscriptions replays all existing subscriptions onto a spoke so it
+// receives the same event patterns as the other spokes.
+func (f *FanOutEventBus) replaySubscriptions(bus NamedEventBus) {
 	f.subMu.Lock()
 	subs := make([]string, len(f.subscriptions))
 	copy(subs, f.subscriptions)
 	f.subMu.Unlock()
 
 	for _, pattern := range subs {
-		if _, err := newBus.Bus.Subscribe(pattern, nil); err != nil {
-			f.log.Error("failed to replay subscription to replaced spoke",
-				"spoke", newBus.Name, "pattern", pattern, "error", err.Error())
+		if _, err := bus.Bus.Subscribe(pattern, nil); err != nil {
+			f.log.Error("failed to replay subscription to spoke",
+				"spoke", bus.Name, "pattern", pattern, "error", err.Error())
 		}
 	}
+}
 
-	return nil
+// HasSpoke reports whether a spoke with the given name exists.
+func (f *FanOutEventBus) HasSpoke(name string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, nb := range f.buses {
+		if nb.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // RemoveSpoke removes a spoke by name and closes it.

@@ -21,6 +21,9 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
+
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
@@ -806,6 +809,52 @@ func (s *ProjectStore) ListRuntimeBrokers(ctx context.Context, filter store.Runt
 	}, nil
 }
 
+// FindEmbeddedBroker returns the single embedded broker if exactly one exists,
+// or nil if zero or multiple embedded brokers are found. "Embedded" means the
+// broker's labels JSON contains {"scion.io/broker-role": "embedded"}.
+// Used to recover the broker ID from the DB when settings are lost.
+func (s *ProjectStore) FindEmbeddedBroker(ctx context.Context) (*store.RuntimeBroker, error) {
+	brokers, err := s.client.RuntimeBroker.Query().
+		Where(brokerLabelContains("scion.io/broker-role", "embedded")).
+		Limit(2). // Only need to know if there's exactly one
+		All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(brokers) != 1 {
+		return nil, nil // Zero or ambiguous — caller should generate a new ID
+	}
+	return entBrokerToStore(brokers[0]), nil
+}
+
+// brokerLabelContains returns an Ent predicate restricting results to runtime
+// brokers whose `labels` JSON object contains the given key-value pair.
+// This is the RuntimeBroker equivalent of the agent labelContains in dialect.go.
+func brokerLabelContains(key, value string) predicate.RuntimeBroker {
+	return func(s *entsql.Selector) {
+		col := s.C(runtimebroker.FieldLabels)
+		switch s.Dialect() {
+		case dialect.Postgres:
+			s.Where(entsql.P(func(b *entsql.Builder) {
+				b.WriteString(col).
+					WriteString(" @> ").
+					Arg(fmt.Sprintf(`{%q:%q}`, key, value)).
+					WriteString("::jsonb")
+			}))
+		default: // SQLite
+			s.Where(entsql.P(func(b *entsql.Builder) {
+				escapedKey := strings.ReplaceAll(key, `"`, `\"`)
+				b.WriteString("json_extract(").
+					WriteString(col).
+					WriteString(", ").
+					Arg(fmt.Sprintf(`$."%s"`, escapedKey)).
+					WriteString(") = ").
+					Arg(value)
+			}))
+		}
+	}
+}
+
 // UpdateRuntimeBrokerHeartbeat updates the broker's status and last-heartbeat
 // timestamp. It uses the same version-CAS loop as UpdateRuntimeBroker so that a
 // high-frequency heartbeat cannot lose an interleaved write; the bump on
@@ -961,6 +1010,42 @@ func (s *ProjectStore) ReleaseAndMarkBrokerOffline(ctx context.Context, brokerID
 		}
 	}
 	return false, store.ErrVersionConflict
+}
+
+// MarkBrokerOffline sets a broker's status to offline. Used during startup
+// repair to ensure stale broker records that were never properly shut down are
+// explicitly marked offline. Uses the version-CAS loop for safe concurrency.
+// Returns ErrNotFound if the broker doesn't exist.
+func (s *ProjectStore) MarkBrokerOffline(ctx context.Context, brokerID string) error {
+	uid, err := parseUUID(brokerID)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+	for attempt := 0; attempt < maxCASRetries; attempt++ {
+		cur, err := s.client.RuntimeBroker.Get(ctx, uid)
+		if err != nil {
+			return mapError(err)
+		}
+		// Already offline — nothing to do.
+		if cur.Status == store.BrokerStatusOffline {
+			return nil
+		}
+		affected, err := s.client.RuntimeBroker.Update().
+			Where(runtimebroker.IDEQ(uid), runtimebroker.LockVersionEQ(cur.LockVersion)).
+			SetStatus(store.BrokerStatusOffline).
+			SetUpdated(now).
+			AddLockVersion(1).
+			Save(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		if affected == 1 {
+			return nil
+		}
+	}
+	return store.ErrVersionConflict
 }
 
 // ReapStaleBrokerAffinity clears affinity (connected_hub_id/connected_session_id/

@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -393,118 +396,166 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 
 		// Initialize message broker from versioned settings.
 		// Uses FanOutBroker to support multiple simultaneous broker plugins.
-		if vs, err := config.LoadVersionedSettings(""); err == nil && vs.Server != nil && vs.Server.MessageBroker != nil && vs.Server.MessageBroker.Enabled {
-			var namedBuses []eventbus.NamedEventBus
-
-			// InProcessEventBus is always present for local pub/sub routing.
-			inproc := eventbus.NewInProcessEventBus(logging.Subsystem("hub.eventbus.inprocess"))
-			namedBuses = append(namedBuses, eventbus.NamedEventBus{Name: "inprocess", Bus: inproc})
-
-			// Resolve the list of plugin broker types.
-			brokerTypes := vs.Server.MessageBroker.Types
-			if len(brokerTypes) == 0 && vs.Server.MessageBroker.Type != "" && vs.Server.MessageBroker.Type != "inprocess" {
-				brokerTypes = []string{vs.Server.MessageBroker.Type}
+		if vs, err := config.LoadVersionedSettings(""); err == nil && vs.Server != nil {
+			// Auto-enable message broker when broker plugins are configured
+			// but message_broker.enabled was not explicitly set (#472).
+			if vs.Server.Plugins != nil && len(vs.Server.Plugins.Broker) > 0 {
+				if vs.Server.MessageBroker == nil {
+					vs.Server.MessageBroker = &config.V1MessageBrokerConfig{}
+				}
+				if !vs.Server.MessageBroker.Enabled {
+					vs.Server.MessageBroker.Enabled = true
+					seen := make(map[string]bool, len(vs.Server.MessageBroker.Types))
+					for _, t := range vs.Server.MessageBroker.Types {
+						seen[t] = true
+					}
+					for name := range vs.Server.Plugins.Broker {
+						if !seen[name] {
+							vs.Server.MessageBroker.Types = append(vs.Server.MessageBroker.Types, name)
+							seen[name] = true
+						}
+					}
+					log.Printf("Auto-enabled message broker for configured broker plugin(s): %v", vs.Server.MessageBroker.Types)
+				}
 			}
 
-			for _, bt := range brokerTypes {
-				if !pluginMgr.HasPlugin(scionplugin.PluginTypeBroker, bt) {
-					log.Printf("Warning: broker plugin %q not loaded, skipping", bt)
-					continue
+			// Auto-populate: if message_broker.enabled but types is empty while
+			// broker plugins exist, populate types from the plugin list.
+			if vs.Server.Plugins != nil && vs.Server.MessageBroker != nil &&
+				vs.Server.MessageBroker.Enabled && len(vs.Server.MessageBroker.Types) == 0 && len(vs.Server.Plugins.Broker) > 0 {
+				for name := range vs.Server.Plugins.Broker {
+					vs.Server.MessageBroker.Types = append(vs.Server.MessageBroker.Types, name)
 				}
-				b, pluginErr := pluginMgr.GetBroker(bt)
-				if pluginErr != nil {
-					log.Printf("Warning: failed to get broker plugin %q: %v", bt, pluginErr)
-					continue
+				log.Printf("NOTICE: message_broker.types was empty — auto-populated from plugins: %v", vs.Server.MessageBroker.Types)
+			}
+
+			// Warn on plugin-not-in-types
+			if vs.Server.Plugins != nil && vs.Server.MessageBroker != nil &&
+				vs.Server.MessageBroker.Enabled && len(vs.Server.MessageBroker.Types) > 0 {
+				typesSet := make(map[string]bool, len(vs.Server.MessageBroker.Types))
+				for _, t := range vs.Server.MessageBroker.Types {
+					typesSet[t] = true
+				}
+				for name := range vs.Server.Plugins.Broker {
+					if !typesSet[name] {
+						log.Printf("WARNING: Broker plugin %q is loaded but not listed in message_broker.types — it will NOT participate in message routing", name)
+					}
+				}
+			}
+
+			if vs.Server.MessageBroker != nil && vs.Server.MessageBroker.Enabled {
+				var namedBuses []eventbus.NamedEventBus
+
+				// InProcessEventBus is always present for local pub/sub routing.
+				inproc := eventbus.NewInProcessEventBus(logging.Subsystem("hub.eventbus.inprocess"))
+				namedBuses = append(namedBuses, eventbus.NamedEventBus{Name: "inprocess", Bus: inproc})
+
+				// Resolve the list of plugin broker types.
+				brokerTypes := vs.Server.MessageBroker.Types
+				if len(brokerTypes) == 0 && vs.Server.MessageBroker.Type != "" && vs.Server.MessageBroker.Type != "inprocess" {
+					brokerTypes = []string{vs.Server.MessageBroker.Type}
 				}
 
-				// Inject hub credentials into hub-managed, non-HA broker plugins.
-				// Self-managed plugins handle their own credential lifecycle;
-				// HA integrations pull credentials from env/Secret Manager.
-				if !pluginMgr.IsSelfManaged(scionplugin.PluginTypeBroker, bt) &&
-					pluginMgr.GetDeploymentMode(scionplugin.PluginTypeBroker, bt) != scionplugin.DeploymentModeHA &&
-					hubSrv != nil && s != nil {
-					// Use the same deterministic UUIDv5 as the α migration so the
-					// broker entity created here matches the migrated ID.
-					pluginBrokerNS := uuid.MustParse("5c104390-a1d0-5e9a-9b1e-5c104390a1d0")
-					legacyID := "plugin-broker-" + bt
-					brokerID := uuid.NewSHA1(pluginBrokerNS, []byte(legacyID)).String()
-					if authSvc := hubSrv.GetBrokerAuthService(); authSvc != nil {
-						// Ensure the runtime broker entity exists (required by
-						// the broker_secrets foreign key constraint).
-						if _, err := s.GetRuntimeBroker(ctx, brokerID); err != nil {
-							pluginBroker := &store.RuntimeBroker{
-								ID:              brokerID,
-								Name:            "plugin-" + bt,
-								Slug:            api.Slugify("plugin-" + bt),
-								Version:         "0.1.0",
-								Status:          store.BrokerStatusOnline,
-								ConnectionState: "embedded",
-								Labels:          map[string]string{"scion.io/plugin": bt},
-								Created:         time.Now(),
-								Updated:         time.Now(),
+				for _, bt := range brokerTypes {
+					if !pluginMgr.HasPlugin(scionplugin.PluginTypeBroker, bt) {
+						log.Printf("Warning: broker plugin %q not loaded, skipping", bt)
+						continue
+					}
+					b, pluginErr := pluginMgr.GetBroker(bt)
+					if pluginErr != nil {
+						log.Printf("Warning: failed to get broker plugin %q: %v", bt, pluginErr)
+						continue
+					}
+
+					// Inject hub credentials into hub-managed, non-HA broker plugins.
+					// Self-managed plugins handle their own credential lifecycle;
+					// HA integrations pull credentials from env/Secret Manager.
+					if !pluginMgr.IsSelfManaged(scionplugin.PluginTypeBroker, bt) &&
+						pluginMgr.GetDeploymentMode(scionplugin.PluginTypeBroker, bt) != scionplugin.DeploymentModeHA &&
+						hubSrv != nil && s != nil {
+						// Use the same deterministic UUIDv5 as the α migration so the
+						// broker entity created here matches the migrated ID.
+						pluginBrokerNS := uuid.MustParse("5c104390-a1d0-5e9a-9b1e-5c104390a1d0")
+						legacyID := "plugin-broker-" + bt
+						brokerID := uuid.NewSHA1(pluginBrokerNS, []byte(legacyID)).String()
+						if authSvc := hubSrv.GetBrokerAuthService(); authSvc != nil {
+							// Ensure the runtime broker entity exists (required by
+							// the broker_secrets foreign key constraint).
+							if _, err := s.GetRuntimeBroker(ctx, brokerID); err != nil {
+								pluginBroker := &store.RuntimeBroker{
+									ID:              brokerID,
+									Name:            "plugin-" + bt,
+									Slug:            api.Slugify("plugin-" + bt),
+									Version:         "0.1.0",
+									Status:          store.BrokerStatusOnline,
+									ConnectionState: "embedded",
+									Labels:          map[string]string{"scion.io/plugin": bt},
+									Created:         time.Now(),
+									Updated:         time.Now(),
+								}
+								if createErr := s.CreateRuntimeBroker(ctx, pluginBroker); createErr != nil {
+									log.Printf("Warning: failed to register broker entity for plugin %q: %v", bt, createErr)
+								}
 							}
-							if createErr := s.CreateRuntimeBroker(ctx, pluginBroker); createErr != nil {
-								log.Printf("Warning: failed to register broker entity for plugin %q: %v", bt, createErr)
-							}
-						}
-						secretKey, secretErr := authSvc.GenerateAndStoreSecret(ctx, brokerID)
-						if secretErr != nil {
-							log.Printf("Warning: failed to generate secret for broker plugin %q: %v", bt, secretErr)
-						} else {
-							hubCreds := map[string]string{
-								"hub_url":     hubEndpoint,
-								"hmac_key":    secretKey,
-								"broker_id":   brokerID,
-								"plugin_name": bt,
-							}
-							// Inject project slug map so hub-managed plugins can resolve
-							// human-readable project names without user-level API access.
-							if projects, listErr := s.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 500}); listErr == nil {
-								slugMap := make(map[string]string, len(projects.Items))
-								for _, p := range projects.Items {
-									if p.Slug != "" {
-										slugMap[p.ID] = p.Slug
-									} else {
-										slugMap[p.ID] = p.Name
+							secretKey, secretErr := authSvc.GenerateAndStoreSecret(ctx, brokerID)
+							if secretErr != nil {
+								log.Printf("Warning: failed to generate secret for broker plugin %q: %v", bt, secretErr)
+							} else {
+								hubCreds := map[string]string{
+									"hub_url":     hubEndpoint,
+									"hmac_key":    secretKey,
+									"broker_id":   brokerID,
+									"plugin_name": bt,
+								}
+								// Inject project slug map so hub-managed plugins can resolve
+								// human-readable project names without user-level API access.
+								if projects, listErr := s.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 500}); listErr == nil {
+									slugMap := make(map[string]string, len(projects.Items))
+									for _, p := range projects.Items {
+										if p.Slug != "" {
+											slugMap[p.ID] = p.Slug
+										} else {
+											slugMap[p.ID] = p.Name
+										}
+									}
+									if jsonBytes, jsonErr := json.Marshal(slugMap); jsonErr == nil {
+										hubCreds["project_slug_map"] = string(jsonBytes)
 									}
 								}
-								if jsonBytes, jsonErr := json.Marshal(slugMap); jsonErr == nil {
-									hubCreds["project_slug_map"] = string(jsonBytes)
+								if cfg.Database.Driver != "" && cfg.Database.Driver != "sqlite" {
+									hubCreds["database_driver"] = cfg.Database.Driver
+									hubCreds["database_url"] = cfg.Database.URL
 								}
-							}
-							if cfg.Database.Driver != "" && cfg.Database.Driver != "sqlite" {
-								hubCreds["database_driver"] = cfg.Database.Driver
-								hubCreds["database_url"] = cfg.Database.URL
-							}
-							// Inject chat integration secrets from the secret backend.
-							// Pass the plugin's merged config so secrets are only injected
-							// when not already set by file or inline config.
-							brokerCfg := pluginMgr.GetPluginConfig(scionplugin.PluginTypeBroker, bt)
-							injectPluginSecrets(ctx, secretBackend, bt, brokerCfg, hubCreds)
-							if cfgErr := pluginMgr.ConfigureBroker(bt, hubCreds); cfgErr != nil {
-								log.Printf("Warning: failed to inject hub credentials into broker plugin %q: %v", bt, cfgErr)
-							} else {
-								log.Printf("Injected hub credentials into broker plugin %q (broker_id=%s)", bt, brokerID)
+								// Inject chat integration secrets from the secret backend.
+								// Pass the plugin's merged config so secrets are only injected
+								// when not already set by file or inline config.
+								brokerCfg := pluginMgr.GetPluginConfig(scionplugin.PluginTypeBroker, bt)
+								injectPluginSecrets(ctx, secretBackend, bt, brokerCfg, hubCreds)
+								if cfgErr := pluginMgr.ConfigureBroker(bt, hubCreds); cfgErr != nil {
+									log.Printf("Warning: failed to inject hub credentials into broker plugin %q: %v", bt, cfgErr)
+								} else {
+									log.Printf("Injected hub credentials into broker plugin %q (broker_id=%s)", bt, brokerID)
+								}
 							}
 						}
 					}
+
+					observer := isObserverBroker(pluginMgr, bt)
+					channelID := pluginChannelID(pluginMgr, bt)
+					namedBuses = append(namedBuses, eventbus.NamedEventBus{
+						Name: bt, Bus: b, Observer: observer, ChannelID: channelID,
+					})
+					log.Printf("Message broker spoke added: name=%s channel_id=%s observer=%v", bt, channelID, observer)
 				}
 
-				observer := isObserverBroker(pluginMgr, bt)
-				channelID := pluginChannelID(pluginMgr, bt)
-				namedBuses = append(namedBuses, eventbus.NamedEventBus{
-					Name: bt, Bus: b, Observer: observer, ChannelID: channelID,
-				})
-				log.Printf("Message broker spoke added: name=%s channel_id=%s observer=%v", bt, channelID, observer)
-			}
+				fanout := eventbus.NewFanOutEventBus(namedBuses, logging.Subsystem("hub.eventbus.fanout"))
+				hubSrv.StartMessageBroker(fanout)
+				log.Printf("Message broker started: fan-out with %d spoke(s)", len(namedBuses))
 
-			fanout := eventbus.NewFanOutEventBus(namedBuses, logging.Subsystem("hub.eventbus.fanout"))
-			hubSrv.StartMessageBroker(fanout)
-			log.Printf("Message broker started: fan-out with %d spoke(s)", len(namedBuses))
-
-			// Wire the broker proxy as the host callbacks target for broker plugins.
-			if proxy := hubSrv.GetMessageBrokerProxy(); proxy != nil {
-				pluginMgr.SetBrokerHostCallbacks(proxy)
+				// Wire the broker proxy as the host callbacks target for broker plugins.
+				if proxy := hubSrv.GetMessageBrokerProxy(); proxy != nil {
+					pluginMgr.SetBrokerHostCallbacks(proxy)
+				}
 			}
 		}
 
@@ -668,6 +719,20 @@ func loadAndReconcileConfig(cmd *cobra.Command) (*config.GlobalConfig, error) {
 			cfg.Storage.Provider = "local"
 		}
 		cfg.Secrets.Backend = "local"
+
+		// Auto-detect gcloud ADC credentials for GCP clients.
+		if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				adcPath := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
+				if _, err := os.Stat(adcPath); err == nil {
+					if err := os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", adcPath); err != nil {
+						log.Printf("GCP: failed to set GOOGLE_APPLICATION_CREDENTIALS: %v", err)
+					} else {
+						log.Printf("GCP: auto-detected gcloud ADC credentials at %s", adcPath)
+					}
+				}
+			}
+		}
 	}
 
 	// Override with command-line flags
@@ -801,9 +866,12 @@ func validateHostedHAPreflight(cfg *config.GlobalConfig) error {
 	if transportAudience == "" {
 		return fmt.Errorf("hosted HA deployment requires server.auth.transport.oidc_audience")
 	}
-	if transportAudience != proxyAudience {
-		return fmt.Errorf("hosted HA deployment requires server.auth.transport.oidc_audience to match server.auth.proxy.iap.audience")
-	}
+	// Note: transport.oidc_audience and proxy.iap.audience are intentionally
+	// allowed to differ. proxy.iap.audience is the Cloud Run native IAP
+	// audience path used for validating incoming IAP-signed JWTs, while
+	// transport.oidc_audience is the audience minted into OIDC tokens for
+	// dispatched agents (typically the IAP OAuth client ID). IAP requires
+	// the OAuth client ID format for token validation, not the Cloud Run path.
 	if strings.TrimSpace(cfg.Auth.Transport.PlatformAuthSA) == "" {
 		return fmt.Errorf("hosted HA deployment requires server.auth.transport.platform_auth_sa")
 	}
@@ -1078,6 +1146,16 @@ func resolveHubEndpoint(cfg *config.GlobalConfig, brokerSettings *config.Setting
 		return hubEndpoint
 	}
 
+	// In hosted mode with IAP authentication, derive the Cloud Run URL from
+	// the IAP audience. This prevents the localhost:8080 fallback which is
+	// unreachable from GKE-dispatched agents.
+	if hostedMode && cfg.Auth.Proxy != nil && cfg.Auth.Proxy.IAP != nil && cfg.Auth.Proxy.IAP.Audience != "" {
+		if cloudRunURL := iapAudienceToCloudRunURL(cfg.Auth.Proxy.IAP.Audience); cloudRunURL != "" {
+			log.Printf("Hub endpoint derived from IAP audience: %s", cloudRunURL)
+			return cloudRunURL
+		}
+	}
+
 	port := cfg.Hub.Port
 	if enableWeb {
 		port = webPort
@@ -1087,6 +1165,29 @@ func resolveHubEndpoint(cfg *config.GlobalConfig, brokerSettings *config.Setting
 		log.Printf("Auto-computed hub endpoint for combo mode: %s", hubEndpoint)
 	}
 	return hubEndpoint
+}
+
+// iapAudienceToCloudRunURL converts a Cloud Run native IAP audience path
+// (/projects/<number>/locations/<region>/services/<service>) to the
+// corresponding Cloud Run service URL (https://<service>-<number>.<region>.run.app).
+//
+// NOTE: This produces legacy-format Cloud Run URLs (<service>-<number>.<region>.run.app).
+// Newer Cloud Run services use the format <service>-<hash>-<region>.a.run.app where
+// the hash cannot be derived from the project number. For those services, set
+// SCION_SERVER_BASE_URL explicitly instead of relying on this derivation.
+func iapAudienceToCloudRunURL(audience string) string {
+	// Expected format: /projects/<project-number>/locations/<region>/services/<service>
+	parts := strings.Split(strings.TrimRight(strings.TrimSpace(audience), "/"), "/")
+	if len(parts) != 7 || parts[0] != "" || parts[1] != "projects" || parts[3] != "locations" || parts[5] != "services" {
+		return ""
+	}
+	projectNumber := parts[2]
+	region := parts[4]
+	service := parts[6]
+	if projectNumber == "" || region == "" || service == "" {
+		return ""
+	}
+	return fmt.Sprintf("https://%s-%s.%s.run.app", service, projectNumber, region)
 }
 
 // parseAdminEmails parses admin emails from the flag or config.
@@ -1437,17 +1538,19 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 func initOperationalSettings(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Server, s store.Store, globalDir string) error {
 	settingStore, ok := s.(store.HubSettingStore)
 	if !ok {
-		// Store does not implement HubSettingStore — skip (should not happen
-		// with postgres, but guard defensively).
 		log.Println("WARNING: store does not implement HubSettingStore; skipping operational settings init")
 		return nil
 	}
 
-	// Build the file-only and env-only koanf instances.
-	fileKoanf := config.LoadFileOnlyKoanf()
+	// Build koanf instances.
 	envKoanf := config.LoadEnvKoanf()
+	bootstrapKoanf := config.LoadBootstrapKoanf()
 
-	// --- Seeding under advisory lock ---
+	// Log deprecation warnings for SCION_SERVER_* env vars that overlap
+	// Layer-1 settings (these should use SCION_SEED_* instead).
+	opsettings.LogDeprecatedServerEnv(envKoanf, slog.Default())
+
+	// --- Every-boot re-sync under advisory lock ---
 	locker, hasLocker := s.(store.AdvisoryLocker)
 	if hasLocker {
 		acquired, release, err := locker.TryAdvisoryLock(ctx, store.LockHubSettingsSeed)
@@ -1455,29 +1558,24 @@ func initOperationalSettings(ctx context.Context, cfg *config.GlobalConfig, hubS
 			return fmt.Errorf("acquiring hub_settings_seed advisory lock: %w", err)
 		}
 		if acquired {
-			seedErr := seedHubSettingsIfNeeded(ctx, settingStore, fileKoanf, globalDir)
-			// Release the advisory lock immediately after seeding (scoped
-			// release per design §3.9) — Refresh below does not need the lock.
+			syncErr := syncHubSettings(ctx, settingStore, bootstrapKoanf)
 			if rerr := release(); rerr != nil {
 				slog.Error("Failed to release hub_settings_seed advisory lock", "error", rerr)
 			}
-			if seedErr != nil {
-				return fmt.Errorf("seeding hub settings: %w", seedErr)
+			if syncErr != nil {
+				return fmt.Errorf("syncing hub settings: %w", syncErr)
 			}
 		} else {
-			// Another replica is seeding — that's fine, we'll pick up the
-			// results via Refresh below.
-			log.Println("Hub settings seed lock held by another replica; skipping seed")
+			log.Println("Hub settings seed lock held by another replica; skipping sync")
 		}
 	} else {
-		// No advisory locking (shouldn't happen on postgres, but handle).
-		if err := seedHubSettingsIfNeeded(ctx, settingStore, fileKoanf, globalDir); err != nil {
-			return fmt.Errorf("seeding hub settings: %w", err)
+		if err := syncHubSettings(ctx, settingStore, bootstrapKoanf); err != nil {
+			return fmt.Errorf("syncing hub settings: %w", err)
 		}
 	}
 
 	// --- Create OperationalSettings, Refresh, and apply ---
-	ops := hub.NewOperationalSettings(settingStore, fileKoanf, envKoanf)
+	ops := hub.NewOperationalSettings(settingStore, bootstrapKoanf, envKoanf)
 
 	changed, err := ops.Refresh(ctx)
 	if err != nil {
@@ -1493,7 +1591,6 @@ func initOperationalSettings(ctx context.Context, cfg *config.GlobalConfig, hubS
 
 	hubSrv.SetOperationalSettings(ops)
 
-	// --- WARN log for env-overridden Layer-1 keys (§3.4) ---
 	if envKeys := ops.EnvOverriddenKeys(); len(envKeys) > 0 {
 		slog.Warn("Layer-1 settings overridden by SCION_SERVER_* env vars on this node — these values diverge from the shared DB",
 			"keys", envKeys)
@@ -1515,57 +1612,92 @@ func startSettingsPropagation(ctx context.Context, hubSrv *hub.Server, eventPub 
 	slog.Info("Settings change propagation started (subscribe + poll backstop)")
 }
 
-// seedHubSettingsIfNeeded checks for the _meta sentinel row; if absent, seeds
-// each registry section from the file's Layer-1 keys. Sections with no koanf
-// paths (e.g. maintenance) are skipped — they start with compiled defaults.
-func seedHubSettingsIfNeeded(ctx context.Context, s store.HubSettingStore, fileKoanf *koanf.Koanf, globalDir string) error {
-	// Check for _meta sentinel.
-	_, err := s.GetHubSetting(ctx, "_meta")
-	if err == nil {
-		// _meta exists — seeding already done.
-		log.Println("Hub settings already seeded (_meta row present); skipping seed")
-		return nil
-	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return fmt.Errorf("checking _meta row: %w", err)
+// syncHubSettings performs every-boot re-sync of hub_settings from bootstrap
+// material. For each registered section:
+//   - If the row is absent or origin=="seeded": write the bootstrap doc
+//     (skip-write-on-equality to avoid revision bumps and event churn).
+//   - If origin=="managed": skip — admin owns this section.
+//
+// Also runs BackfillOrigin for pre-origin rows and writes the _meta sentinel.
+func syncHubSettings(ctx context.Context, s store.HubSettingStore, bootstrapKoanf *koanf.Koanf) error {
+	// Backfill origin for rows created before the origin column existed.
+	if err := s.BackfillOrigin(ctx); err != nil {
+		return fmt.Errorf("backfilling origin: %w", err)
 	}
 
-	// No _meta — seed.
-	log.Println("Seeding hub_settings from settings.yaml...")
-
-	settingsPath := filepath.Join(globalDir, "settings.yaml")
+	log.Println("Syncing hub_settings from bootstrap material...")
 
 	for _, sec := range opsettings.Registry {
-		// Skip sections with no koanf paths (e.g. maintenance — runtime-only).
 		if len(sec.KoanfPaths) == 0 {
 			continue
 		}
 
-		doc, err := opsettings.ExtractSectionFromKoanf(fileKoanf, sec.Name)
+		bootstrapDoc, err := opsettings.ExtractSectionFromKoanf(bootstrapKoanf, sec.Name)
 		if err != nil {
-			slog.Warn("Failed to extract section for seeding; skipping", "section", sec.Name, "error", err)
+			slog.Warn("Failed to extract section for sync; skipping", "section", sec.Name, "error", err)
 			continue
 		}
 
-		_, err = s.UpsertHubSetting(ctx, sec.Name, doc, "seed", -1) // unconditional upsert
-		if err != nil {
-			return fmt.Errorf("seeding section %q: %w", sec.Name, err)
+		existing, err := s.GetHubSetting(ctx, sec.Name)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("checking section %q: %w", sec.Name, err)
 		}
-		log.Printf("  Seeded section: %s", sec.Name)
+
+		if existing == nil {
+			// No row — create with bootstrap material.
+			if _, err := s.UpsertHubSetting(ctx, sec.Name, bootstrapDoc, "seed", -1, "seeded"); err != nil {
+				return fmt.Errorf("seeding section %q: %w", sec.Name, err)
+			}
+			log.Printf("  Seeded section: %s (new)", sec.Name)
+			continue
+		}
+
+		if existing.Origin == "managed" {
+			slog.Debug("Skipping managed section", "section", sec.Name)
+			continue
+		}
+
+		// Origin is "seeded" — update only if content differs.
+		// Compare semantically (not byte-for-byte) because Postgres jsonb
+		// re-serializes values, changing whitespace and key ordering.
+		if jsonEqual(existing.Value, bootstrapDoc) {
+			slog.Debug("Seeded section unchanged; skipping write", "section", sec.Name)
+			continue
+		}
+
+		if _, err := s.UpsertHubSetting(ctx, sec.Name, bootstrapDoc, "seed", -1, "seeded"); err != nil {
+			return fmt.Errorf("re-syncing section %q: %w", sec.Name, err)
+		}
+		log.Printf("  Re-synced section: %s (content changed)", sec.Name)
 	}
 
-	// Write _meta sentinel.
+	// Write/update _meta sentinel.
 	metaDoc, _ := json.Marshal(map[string]interface{}{
-		"seeded_from":  settingsPath,
-		"seeded_at":    time.Now().UTC().Format(time.RFC3339),
-		"seed_version": "1",
+		"synced_at":    time.Now().UTC().Format(time.RFC3339),
+		"seed_version": "2",
 	})
-	if _, err := s.UpsertHubSetting(ctx, "_meta", metaDoc, "seed", -1); err != nil {
+	if _, err := s.UpsertHubSetting(ctx, "_meta", metaDoc, "seed", -1, "seeded"); err != nil {
 		return fmt.Errorf("writing _meta sentinel: %w", err)
 	}
 
-	log.Println("Hub settings seeding complete")
+	log.Println("Hub settings sync complete")
 	return nil
+}
+
+// jsonEqual compares two JSON documents semantically, ignoring whitespace
+// and key ordering differences (as Postgres jsonb re-serializes values).
+// Both inputs must come through json.Unmarshal so numeric types are
+// consistently float64. If either path changes to produce integer types
+// (e.g. a custom decoder), semantically equal values could compare unequal.
+func jsonEqual(a, b json.RawMessage) bool {
+	var aVal, bVal interface{}
+	if err := json.Unmarshal(a, &aVal); err != nil {
+		return bytes.Equal(a, b)
+	}
+	if err := json.Unmarshal(b, &bVal); err != nil {
+		return bytes.Equal(a, b)
+	}
+	return reflect.DeepEqual(aVal, bVal)
 }
 
 // initHubStorage initializes the storage backend for the Hub server.
@@ -1808,7 +1940,7 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 			return fmt.Errorf("stateless Cloud Run broker requires a derivable broker ID: %w", deriveErr)
 		}
 	}
-	brokerID := resolveBrokerID(cfg, settings, vsBroker, globalDir, defaultBrokerID)
+	brokerID := resolveBrokerID(ctx, cfg, settings, vsBroker, globalDir, defaultBrokerID, s)
 
 	// Resolve broker name
 	brokerName := resolveBrokerName(cfg, settings, vsBroker)
@@ -1989,6 +2121,20 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		rhSrv.SetMessageLogger(messageLogger)
 	}
 
+	// Wire runtime reload so reloadSettings can swap the broker's container
+	// engine without a full server restart (fixes onboarding wizard flow).
+	if hubSrv != nil && colocatedBrokerRegistered {
+		hubSrv.SetRuntimeReloadFunc(func() bool {
+			newRT := runtime.GetRuntime("", "")
+			if newRT.Name() == rhSrv.RuntimeName() {
+				return false
+			}
+			rhSrv.SwapRuntime(newRT)
+			hubSrv.SetLocalImageChecker(newRT)
+			return true
+		})
+	}
+
 	if webSrv != nil {
 		webSrv.SetBrokerHealthProvider(func(ctx context.Context) interface{} {
 			return rhSrv.GetHealthInfo(ctx)
@@ -2006,8 +2152,10 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		}
 	}()
 
-	// Start internal heartbeat loop for co-located operation
-	if colocatedBrokerRegistered {
+	// Start internal heartbeat loop for co-located operation.
+	// Skip for stateless Cloud Run brokers — the Hub manages the
+	// logical broker status directly and no container daemon is present.
+	if colocatedBrokerRegistered && !statelessCloudRunBroker {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -2167,7 +2315,10 @@ func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend) 
 var cloudRunLogicalBrokerNamespace = uuid.MustParse("c10f7a0a-6f03-5f9f-8d52-1d98b0fdb001")
 
 // resolveBrokerID determines the broker ID from various sources.
-func resolveBrokerID(cfg *config.GlobalConfig, settings *config.Settings, vsBroker *config.V1BrokerConfig, globalDir, defaultBrokerID string) string {
+// It checks (in order): versioned settings, legacy settings, global config,
+// deterministic Cloud Run ID, DB recovery (single embedded broker), and
+// finally generates a new UUID as a last resort.
+func resolveBrokerID(ctx context.Context, cfg *config.GlobalConfig, settings *config.Settings, vsBroker *config.V1BrokerConfig, globalDir, defaultBrokerID string, s store.Store) string {
 	var brokerID string
 	if vsBroker != nil && vsBroker.BrokerID != "" {
 		brokerID = vsBroker.BrokerID
@@ -2181,6 +2332,23 @@ func resolveBrokerID(cfg *config.GlobalConfig, settings *config.Settings, vsBrok
 		log.Printf("Using deterministic logical broker ID: %s", defaultBrokerID)
 		return defaultBrokerID
 	}
+
+	// Recover from DB: if exactly one embedded broker exists, reuse its ID.
+	if brokerID == "" && s != nil {
+		embedded, err := s.FindEmbeddedBroker(ctx)
+		if err != nil {
+			log.Printf("Warning: failed to query database for broker ID recovery: %v", err)
+		} else if embedded != nil {
+			brokerID = embedded.ID
+			log.Printf("NOTICE: recovered broker ID %s from database (single embedded broker)", brokerID)
+			// Persist so we don't re-recover on next boot (writes to both legacy
+			// hub.brokerId and versioned server.broker.broker_id via UpdateSetting).
+			if err := config.UpdateSetting(globalDir, "hub.brokerId", brokerID, true); err != nil {
+				log.Printf("Warning: failed to persist recovered broker ID to settings: %v", err)
+			}
+		}
+	}
+
 	if brokerID == "" {
 		brokerID = api.NewUUID()
 		if err := config.UpdateSetting(globalDir, "hub.brokerId", brokerID, true); err != nil {
@@ -2196,12 +2364,36 @@ func deriveCloudRunLogicalBrokerID(settings *config.VersionedSettings, rt runtim
 	if settings == nil || rt == nil || rt.Name() != "cloudrun" {
 		return "", fmt.Errorf("deriveCloudRunLogicalBrokerID requires cloudrun runtime (got settings=%v, rt=%v)", settings != nil, rt)
 	}
+	// Scan all profiles to find one backed by a cloudrun runtime with project+region.
+	// This avoids requiring active_profile to point to the cloudrun profile, which
+	// would make cloudrun the default dispatch profile — conflicting with k8s dispatch.
+	// Sort profile names for deterministic iteration: if multiple cloudrun profiles
+	// exist, the first alphabetically wins, producing a stable broker ID across restarts.
+	profileNames := make([]string, 0, len(settings.Profiles))
+	for profileName := range settings.Profiles {
+		profileNames = append(profileNames, profileName)
+	}
+	sort.Strings(profileNames)
+	for _, profileName := range profileNames {
+		rtConfig, runtimeType, err := settings.ResolveRuntime(profileName)
+		if err != nil || runtimeType != "cloudrun" || rtConfig.CloudRun == nil {
+			continue
+		}
+		projectID := strings.TrimSpace(rtConfig.CloudRun.Project)
+		location := strings.TrimSpace(rtConfig.CloudRun.Region)
+		if projectID == "" || location == "" {
+			continue
+		}
+		seed := fmt.Sprintf("cloudrun:%s:%s", projectID, location)
+		return uuid.NewSHA1(cloudRunLogicalBrokerNamespace, []byte(seed)).String(), nil
+	}
+	// Fall back to resolving via active_profile for backward compatibility.
 	rtConfig, runtimeType, err := settings.ResolveRuntime("")
 	if err != nil {
 		return "", fmt.Errorf("deriveCloudRunLogicalBrokerID: failed to resolve runtime: %w", err)
 	}
 	if runtimeType != "cloudrun" || rtConfig.CloudRun == nil {
-		return "", fmt.Errorf("deriveCloudRunLogicalBrokerID: expected cloudrun runtime, got %q", runtimeType)
+		return "", fmt.Errorf("deriveCloudRunLogicalBrokerID: no cloudrun profile with project+region found in settings (active profile runtime: %q)", runtimeType)
 	}
 	projectID := strings.TrimSpace(rtConfig.CloudRun.Project)
 	location := strings.TrimSpace(rtConfig.CloudRun.Region)

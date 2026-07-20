@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,34 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/wsprotocol"
 	"github.com/google/uuid"
 )
+
+// maxControlChannelBodySize is the maximum body size (in bytes) that can be
+// sent through the WebSocket control channel without exceeding the broker's
+// read limit. The RequestEnvelope.Body field is base64-encoded in JSON, adding
+// ~33% overhead, so the safe body threshold for a 1MB wire limit is ~768KB.
+// Requests exceeding this limit are rejected before encoding so callers
+// (e.g. HybridBrokerClient) can detect ErrPayloadTooLarge and fall back to
+// direct HTTP (issue #165).
+const maxControlChannelBodySize = 768 * 1024 // 768KB → ~1MB on wire after base64
+
+// ErrPayloadTooLarge is returned by the control channel client when a request
+// body exceeds maxControlChannelBodySize. Callers should use errors.As to
+// detect this condition and fall back to direct HTTP rather than propagating
+// the error.
+type ErrPayloadTooLarge struct {
+	Method string
+	Path   string
+	Size   int
+	Limit  int
+}
+
+func (e *ErrPayloadTooLarge) Error() string {
+	return fmt.Sprintf(
+		"control channel payload too large: %s %s body is %d bytes (limit %d); "+
+			"use direct HTTP to reach this broker instead (issue #165)",
+		e.Method, e.Path, e.Size, e.Limit,
+	)
+}
 
 // ControlChannelBrokerClient implements RuntimeBrokerClient by tunneling requests
 // through the control channel WebSocket connection.
@@ -276,6 +305,10 @@ func (c *ControlChannelBrokerClient) CreateAgentWithGather(ctx context.Context, 
 		return nil, nil, err
 	}
 
+	if resp.StatusCode >= 400 {
+		return nil, nil, fmt.Errorf("runtime broker returned error %d: %s", resp.StatusCode, string(resp.Body))
+	}
+
 	if resp.StatusCode == http.StatusAccepted {
 		var envReqs RemoteEnvRequirementsResponse
 		if err := json.Unmarshal(resp.Body, &envReqs); err != nil {
@@ -362,37 +395,86 @@ func (c *ControlChannelBrokerClient) CleanupProject(ctx context.Context, brokerI
 	return nil
 }
 
-// FinalizeEnv sends gathered env vars to a broker to complete agent creation via control channel.
-func (c *ControlChannelBrokerClient) FinalizeEnv(ctx context.Context, brokerID, brokerEndpoint, agentID string, env map[string]string) (*RemoteAgentResponse, error) {
-	_ = brokerEndpoint
-	path := fmt.Sprintf("/api/v1/agents/%s/finalize-env", url.PathEscape(agentID))
-
-	body, err := json.Marshal(map[string]interface{}{
-		"env": env,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+// ImageStatus queries a broker's local image state via control channel.
+func (c *ControlChannelBrokerClient) ImageStatus(ctx context.Context, brokerID, shortImage, longImage string) (*BrokerImageStatusResponse, error) {
+	query := url.Values{}
+	if shortImage != "" {
+		query.Set("short", shortImage)
+	}
+	if longImage != "" {
+		query.Set("long", longImage)
 	}
 
-	resp, err := c.doRequest(ctx, brokerID, "POST", path, "", body)
+	resp, err := c.doRequestRaw(ctx, brokerID, "GET", "/api/v1/images/status", query.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	var result RemoteAgentResponse
-	if err := json.Unmarshal(resp.Body, &result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, &BrokerUnsupportedError{StatusCode: resp.StatusCode}
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("runtime broker returned error %d: %s", resp.StatusCode, string(resp.Body))
 	}
 
+	var result BrokerImageStatusResponse
+	if err := json.Unmarshal(resp.Body, &result); err != nil {
+		return nil, fmt.Errorf("failed to decode image status response: %w", err)
+	}
 	return &result, nil
 }
 
+// PullImage asks a broker to pull an image via control channel.
+// Note: inherits the tunnel's RequestTimeout (default 120s). Large image pulls
+// may exceed this timeout and report an error even though the pull continues
+// broker-side. A future async-pull mechanism would address this limitation.
+func (c *ControlChannelBrokerClient) PullImage(ctx context.Context, brokerID, image string) error {
+	body, err := json.Marshal(map[string]string{"image": image})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	_, err = c.doRequest(ctx, brokerID, "POST", "/api/v1/images/pull", "", body)
+	return err
+}
+
+// DeleteImage asks a broker to remove a local image via control channel.
+func (c *ControlChannelBrokerClient) DeleteImage(ctx context.Context, brokerID, image string) error {
+	body, err := json.Marshal(map[string]string{"image": image})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	_, err = c.doRequest(ctx, brokerID, "DELETE", "/api/v1/images/local", "", body)
+	return err
+}
+
+// checkBodySize returns an *ErrPayloadTooLarge if the body is too large to
+// tunnel safely through the control channel WebSocket without exceeding the
+// broker's read limit. The Body field is base64-encoded in the RequestEnvelope
+// JSON, so the actual wire size is roughly len(body)*4/3 plus envelope
+// metadata. Callers should use errors.As(err, &ErrPayloadTooLarge{}) to detect
+// this condition and fall back to direct HTTP.
+func checkBodySize(method, path string, body []byte) error {
+	if len(body) > maxControlChannelBodySize {
+		return &ErrPayloadTooLarge{
+			Method: method,
+			Path:   path,
+			Size:   len(body),
+			Limit:  maxControlChannelBodySize,
+		}
+	}
+	return nil
+}
+
 // doRequestRaw tunnels an HTTP request through the control channel without
-// treating non-2xx status codes as errors. This is needed for env-gather
-// where 202 is a valid non-error response.
+// treating non-2xx status codes as errors. Callers are responsible for
+// inspecting resp.StatusCode themselves.
 func (c *ControlChannelBrokerClient) doRequestRaw(ctx context.Context, brokerID, method, path, query string, body []byte) (*wsprotocol.ResponseEnvelope, error) {
 	if !c.manager.IsConnected(brokerID) {
 		return nil, fmt.Errorf("broker %s not connected via control channel", brokerID)
+	}
+
+	if err := checkBodySize(method, path, body); err != nil {
+		return nil, err
 	}
 
 	headers, err := c.buildRequestHeaders(ctx, brokerID, method, path, query, body)
@@ -406,10 +488,6 @@ func (c *ControlChannelBrokerClient) doRequestRaw(ctx context.Context, brokerID,
 		return nil, fmt.Errorf("control channel request failed: %w", err)
 	}
 
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("runtime broker returned error %d: %s", resp.StatusCode, string(resp.Body))
-	}
-
 	return resp, nil
 }
 
@@ -417,6 +495,10 @@ func (c *ControlChannelBrokerClient) doRequestRaw(ctx context.Context, brokerID,
 func (c *ControlChannelBrokerClient) doRequest(ctx context.Context, brokerID, method, path, query string, body []byte) (*wsprotocol.ResponseEnvelope, error) {
 	if !c.manager.IsConnected(brokerID) {
 		return nil, fmt.Errorf("broker %s not connected via control channel", brokerID)
+	}
+
+	if err := checkBodySize(method, path, body); err != nil {
+		return nil, err
 	}
 
 	headers, err := c.buildRequestHeaders(ctx, brokerID, method, path, query, body)
@@ -507,9 +589,20 @@ func (c *HybridBrokerClient) useControlChannel(brokerID string) bool {
 }
 
 // CreateAgent creates an agent, preferring control channel.
+// If the control channel rejects the payload as too large (ErrPayloadTooLarge),
+// it falls back to direct HTTP so the agent creation can still succeed.
 func (c *HybridBrokerClient) CreateAgent(ctx context.Context, brokerID, brokerEndpoint string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, error) {
 	if c.useControlChannel(brokerID) {
-		return c.controlChannel.CreateAgent(ctx, brokerID, brokerEndpoint, req)
+		resp, err := c.controlChannel.CreateAgent(ctx, brokerID, brokerEndpoint, req)
+		if err == nil {
+			return resp, nil
+		}
+		var payloadErr *ErrPayloadTooLarge
+		if errors.As(err, &payloadErr) {
+			// Payload too large for the WebSocket channel — fall back to HTTP.
+			return c.httpClient.CreateAgent(ctx, brokerID, brokerEndpoint, req)
+		}
+		return nil, err
 	}
 	return c.httpClient.CreateAgent(ctx, brokerID, brokerEndpoint, req)
 }
@@ -619,10 +712,21 @@ func (c *HybridBrokerClient) CheckAgentPrompt(ctx context.Context, brokerID, bro
 // to decide the delivery path. routeLocal uses the control-channel tunnel,
 // routeHTTP falls back to HTTP, and routeForward/routeUndeliverable return
 // ErrLifecycleDeferred so the caller can write durable intent + wait.
+// If the control channel rejects the payload as too large (ErrPayloadTooLarge),
+// it falls back to direct HTTP regardless of the routing decision.
 func (c *HybridBrokerClient) CreateAgentWithGather(ctx context.Context, brokerID, brokerEndpoint string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error) {
 	switch c.route(ctx, brokerID, brokerEndpoint) {
 	case routeLocal:
-		return c.controlChannel.CreateAgentWithGather(ctx, brokerID, brokerEndpoint, req)
+		resp, envReqs, err := c.controlChannel.CreateAgentWithGather(ctx, brokerID, brokerEndpoint, req)
+		if err == nil {
+			return resp, envReqs, nil
+		}
+		var payloadErr *ErrPayloadTooLarge
+		if errors.As(err, &payloadErr) {
+			// Payload too large for the WebSocket channel — fall back to HTTP.
+			return c.httpClient.CreateAgentWithGather(ctx, brokerID, brokerEndpoint, req)
+		}
+		return nil, nil, err
 	case routeHTTP:
 		return c.httpClient.CreateAgentWithGather(ctx, brokerID, brokerEndpoint, req)
 	default:
@@ -653,17 +757,43 @@ func (c *HybridBrokerClient) CleanupProject(ctx context.Context, brokerID, broke
 	return c.httpClient.CleanupProject(ctx, brokerID, brokerEndpoint, projectSlug, projectID)
 }
 
-// FinalizeEnv sends gathered env vars to a broker, using route() to decide the
-// delivery path. routeLocal uses the control-channel tunnel, routeHTTP falls
-// back to HTTP, and routeForward/routeUndeliverable return ErrLifecycleDeferred
-// so the caller can write durable intent + wait.
-func (c *HybridBrokerClient) FinalizeEnv(ctx context.Context, brokerID, brokerEndpoint, agentID string, env map[string]string) (*RemoteAgentResponse, error) {
-	switch c.route(ctx, brokerID, brokerEndpoint) {
-	case routeLocal:
-		return c.controlChannel.FinalizeEnv(ctx, brokerID, brokerEndpoint, agentID, env)
-	case routeHTTP:
-		return c.httpClient.FinalizeEnv(ctx, brokerID, brokerEndpoint, agentID, env)
-	default:
-		return nil, ErrLifecycleDeferred
+// brokerImageClient is an optional interface implemented by RuntimeBrokerClient
+// implementations that support image operations.
+type brokerImageClient interface {
+	ImageStatus(ctx context.Context, brokerID, brokerEndpoint, shortImage, longImage string) (*BrokerImageStatusResponse, error)
+	PullImage(ctx context.Context, brokerID, brokerEndpoint, image string) error
+	DeleteImage(ctx context.Context, brokerID, brokerEndpoint, image string) error
+}
+
+// ImageStatus queries a broker's local image state, preferring control channel.
+func (c *HybridBrokerClient) ImageStatus(ctx context.Context, brokerID, brokerEndpoint, shortImage, longImage string) (*BrokerImageStatusResponse, error) {
+	if c.useControlChannel(brokerID) {
+		return c.controlChannel.ImageStatus(ctx, brokerID, shortImage, longImage)
 	}
+	if ic, ok := c.httpClient.(brokerImageClient); ok {
+		return ic.ImageStatus(ctx, brokerID, brokerEndpoint, shortImage, longImage)
+	}
+	return nil, fmt.Errorf("HTTP client does not support image status queries")
+}
+
+// PullImage asks a broker to pull an image, preferring control channel.
+func (c *HybridBrokerClient) PullImage(ctx context.Context, brokerID, brokerEndpoint, image string) error {
+	if c.useControlChannel(brokerID) {
+		return c.controlChannel.PullImage(ctx, brokerID, image)
+	}
+	if ic, ok := c.httpClient.(brokerImageClient); ok {
+		return ic.PullImage(ctx, brokerID, brokerEndpoint, image)
+	}
+	return fmt.Errorf("HTTP client does not support image pull")
+}
+
+// DeleteImage asks a broker to remove a local image, preferring control channel.
+func (c *HybridBrokerClient) DeleteImage(ctx context.Context, brokerID, brokerEndpoint, image string) error {
+	if c.useControlChannel(brokerID) {
+		return c.controlChannel.DeleteImage(ctx, brokerID, image)
+	}
+	if ic, ok := c.httpClient.(brokerImageClient); ok {
+		return ic.DeleteImage(ctx, brokerID, brokerEndpoint, image)
+	}
+	return fmt.Errorf("HTTP client does not support image delete")
 }

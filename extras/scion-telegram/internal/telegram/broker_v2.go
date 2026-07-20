@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
@@ -84,6 +85,7 @@ type TelegramBrokerV2 struct {
 
 	agentCacheTTL  time.Duration
 	projectSlugMap map[string]string // injected by hub: projectID → slug
+	downloadsPath  string            // override for file download directory; empty = default
 
 	// Webhook mode fields.
 	inboundMode   string // "poll" (default) or "webhook"
@@ -170,6 +172,11 @@ func (b *TelegramBrokerV2) Configure(config map[string]string) error {
 			return fmt.Errorf("invalid agent_cache_ttl: %w", err)
 		}
 		b.agentCacheTTL = d
+	}
+
+	// Parse optional downloads directory override.
+	if v, ok := config["downloads_path"]; ok && v != "" {
+		b.downloadsPath = v
 	}
 
 	// Initialize store: Postgres if database_url is set, otherwise SQLite.
@@ -622,7 +629,7 @@ func (b *TelegramBrokerV2) Publish(ctx context.Context, topic string, msg *messa
 
 	// Priority 2: Look up via ConversationContext for the recipient.
 	if len(chatIDs) == 0 && msg != nil && msg.Recipient != "" && store != nil {
-		chatIDs = b.resolveRecipientChats(ctx, msg.Recipient, projectID, agentSlug)
+		chatIDs = b.resolveRecipientChats(ctx, msg.Recipient, msg.RecipientID, projectID, agentSlug)
 	}
 
 	// Priority 3: Broadcast to all GroupLinks for the project.
@@ -774,8 +781,8 @@ func (b *TelegramBrokerV2) Publish(ctx context.Context, topic string, msg *messa
 		}
 		if err != nil {
 			var apiErr *APIError
-			if errors.As(err, &apiErr) && apiErr.IsTransient() {
-				b.log.Warn("Transient Telegram API error, dropping message",
+			if errors.As(err, &apiErr) && apiErr.Code == http.StatusTooManyRequests {
+				b.log.Warn("Rate-limited by Telegram API, dropping message",
 					"chat_id", chatID, "topic", topic,
 					"code", apiErr.Code, "retry_after_sec", apiErr.RetryAfterSec,
 					"error", err)
@@ -886,7 +893,10 @@ func resolveOutboundMentions(ctx context.Context, store Store, text string) stri
 }
 
 // resolveRecipientChats looks up target chats for a specific recipient.
-func (b *TelegramBrokerV2) resolveRecipientChats(ctx context.Context, recipient, projectID, agentSlug string) []int64 {
+// It first attempts email-based lookup via GetUserMappingByEmail; if that fails
+// (e.g. because the hub rewrote the recipient to a display name), it falls back
+// to looking up the scion user UUID via GetUserMappingByScionUserID.
+func (b *TelegramBrokerV2) resolveRecipientChats(ctx context.Context, recipient, recipientID, projectID, agentSlug string) []int64 {
 	// Extract email from "user:email@example.com" format.
 	email := strings.TrimPrefix(recipient, "user:")
 	if email == recipient {
@@ -894,6 +904,22 @@ func (b *TelegramBrokerV2) resolveRecipientChats(ctx context.Context, recipient,
 	}
 
 	mapping, err := b.store.GetUserMappingByEmail(ctx, email)
+	if err != nil {
+		b.log.Error("Failed to look up user mapping by email", "email", email, "error", err)
+	}
+
+	// Fallback: try scion user ID lookup (handles display-name recipients).
+	if (err != nil || mapping == nil) && recipientID != "" {
+		var fallbackErr error
+		mapping, fallbackErr = b.store.GetUserMappingByScionUserID(ctx, recipientID)
+		if fallbackErr != nil {
+			b.log.Error("Failed to look up user mapping by scion user ID", "recipientID", recipientID, "error", fallbackErr)
+			err = fallbackErr
+		} else {
+			err = nil
+		}
+	}
+
 	if err != nil || mapping == nil {
 		return nil
 	}
@@ -941,8 +967,8 @@ func (b *TelegramBrokerV2) publishInputNeeded(ctx context.Context, api *Telegram
 		}
 		if err != nil {
 			var apiErr *APIError
-			if errors.As(err, &apiErr) && apiErr.IsTransient() {
-				b.log.Warn("Transient error sending input-needed",
+			if errors.As(err, &apiErr) && apiErr.Code == http.StatusTooManyRequests {
+				b.log.Warn("Rate-limited sending input-needed",
 					"chat_id", chatID, "error", err)
 				continue
 			}
@@ -1074,8 +1100,8 @@ func (b *TelegramBrokerV2) publishStateChangeDM(ctx context.Context, api *Telegr
 	}
 	if err != nil {
 		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.IsTransient() {
-			b.log.Warn("Transient error sending state-change DM",
+		if errors.As(err, &apiErr) && apiErr.Code == http.StatusTooManyRequests {
+			b.log.Warn("Rate-limited sending state-change DM",
 				"telegram_user_id", tgUserID, "error", err)
 			return nil
 		}
@@ -1155,8 +1181,8 @@ func (b *TelegramBrokerV2) publishInputNeededDM(ctx context.Context, api *Telegr
 	}
 	if err != nil {
 		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.IsTransient() {
-			b.log.Warn("Transient error sending input-needed DM",
+		if errors.As(err, &apiErr) && apiErr.Code == http.StatusTooManyRequests {
+			b.log.Warn("Rate-limited sending input-needed DM",
 				"telegram_user_id", tgUserID, "error", err)
 			return nil
 		}
@@ -1181,14 +1207,22 @@ func (b *TelegramBrokerV2) publishInputNeededDM(ctx context.Context, api *Telegr
 	return nil
 }
 
-// resolveAttachmentPath translates an agent-relative /workspace path to the
-// corresponding host-side path under /home/scion/.scion/projects/<slug>/.
-// Agent containers mount /home/scion/.scion/projects/<slug> as /workspace.
-// Accepts "/workspace/file", "/workspace", "workspace/file", "workspace",
-// and bare relative paths like "file.png". Falls back to the original path
-// if translation is not possible.
+// resolveAttachmentPath translates agent-side paths to host-side paths.
+//
+// Supported container-side paths:
+//   - /workspace/<file>  → ~/.scion/projects/<slug>/<file>
+//   - /scion-volumes/<name>/<file> → ~/.scion/project-configs/<slug>__<shortUUID>/shared-dirs/<name>/<file>
+//   - /workspace/.scion-volumes/<name>/<file> → same as /scion-volumes/<name>/<file>
+//
+// Also accepts bare relative paths and "workspace/" without leading slash.
+// Falls back to the original path if translation is not possible.
 func (b *TelegramBrokerV2) resolveAttachmentPath(ctx context.Context, store Store, attachPath, projectID string) string {
 	originalPath := attachPath
+
+	// Handle /scion-volumes/<name>/... container-internal shared dir paths.
+	if strings.HasPrefix(attachPath, "/scion-volumes/") || attachPath == "/scion-volumes" {
+		return b.resolveSharedDirAttachmentPath(ctx, store, attachPath, projectID)
+	}
 
 	var relPath string
 	switch {
@@ -1213,17 +1247,17 @@ func (b *TelegramBrokerV2) resolveAttachmentPath(ctx context.Context, store Stor
 		return attachPath
 	}
 
-	// Look up project slug from group links, falling back to the injected slug map.
-	slug := ""
-	if store != nil && projectID != "" {
-		links, err := store.GetGroupLinksForProject(ctx, projectID)
-		if err == nil && len(links) > 0 && links[0].ProjectSlug != "" {
-			slug = links[0].ProjectSlug
-		}
+	// In-workspace shared dirs are mounted at /workspace/.scion-volumes/<name>
+	// inside containers. Redirect to shared dir resolution.
+	if strings.HasPrefix(relPath, ".scion-volumes/") {
+		containerPath := "/scion-volumes/" + strings.TrimPrefix(relPath, ".scion-volumes/")
+		return b.resolveSharedDirAttachmentPath(ctx, store, containerPath, projectID)
 	}
-	if slug == "" && projectID != "" {
-		slug = b.projectSlugMap[projectID]
+	if relPath == ".scion-volumes" {
+		return attachPath
 	}
+
+	slug := b.resolveProjectSlug(ctx, store, projectID)
 	if slug == "" {
 		b.log.Debug("Attachment path unchanged, no project slug found",
 			"original", originalPath, "project_id", projectID)
@@ -1247,6 +1281,80 @@ func (b *TelegramBrokerV2) resolveAttachmentPath(ctx context.Context, store Stor
 	return hostPath
 }
 
+// resolveSharedDirAttachmentPath translates a container-internal shared dir
+// path (/scion-volumes/<name>/...) to the host-side path under
+// ~/.scion/project-configs/<slug>__<shortUUID>/shared-dirs/<name>/.
+func (b *TelegramBrokerV2) resolveSharedDirAttachmentPath(ctx context.Context, store Store, attachPath, projectID string) string {
+	trimmed := strings.TrimPrefix(attachPath, "/scion-volumes/")
+	if trimmed == "" || trimmed == attachPath {
+		b.log.Warn("Invalid shared dir attachment path", "attach_path", attachPath)
+		return attachPath
+	}
+
+	parts := strings.SplitN(trimmed, "/", 2)
+	sharedDirName := parts[0]
+	if sharedDirName == "" || sharedDirName == "." || sharedDirName == ".." {
+		b.log.Warn("Invalid shared dir name in attachment path",
+			"attach_path", attachPath, "shared_dir_name", sharedDirName)
+		return attachPath
+	}
+	relPath := ""
+	if len(parts) > 1 {
+		relPath = filepath.Clean(parts[1])
+		if strings.HasPrefix(relPath, "..") || filepath.IsAbs(relPath) {
+			b.log.Warn("Shared dir attachment path escapes directory",
+				"attach_path", attachPath, "rel_path", relPath)
+			return attachPath
+		}
+	}
+
+	slug := b.resolveProjectSlug(ctx, store, projectID)
+	if slug == "" || projectID == "" {
+		b.log.Debug("Shared dir path unchanged, no project slug or ID",
+			"original", attachPath, "project_id", projectID)
+		return attachPath
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		b.log.Warn("Failed to resolve home dir for shared dir path", "error", err)
+		return attachPath
+	}
+
+	sharedDirBase := config.SharedDirHostPath(home, slug, projectID, sharedDirName)
+	var hostPath string
+	if relPath == "" || relPath == "." {
+		hostPath = sharedDirBase
+	} else {
+		hostPath = filepath.Join(sharedDirBase, relPath)
+		if !strings.HasPrefix(hostPath, sharedDirBase+string(filepath.Separator)) {
+			b.log.Warn("Resolved shared dir path escapes directory",
+				"host_path", hostPath, "expected_prefix", sharedDirBase+string(filepath.Separator))
+			return attachPath
+		}
+	}
+
+	b.log.Debug("Resolved shared dir attachment path",
+		"original", attachPath, "resolved", hostPath)
+	return hostPath
+}
+
+// resolveProjectSlug looks up the project slug from the store (group links)
+// or the hub-injected slug map.
+func (b *TelegramBrokerV2) resolveProjectSlug(ctx context.Context, store Store, projectID string) string {
+	slug := ""
+	if store != nil && projectID != "" {
+		links, err := store.GetGroupLinksForProject(ctx, projectID)
+		if err == nil && len(links) > 0 && links[0].ProjectSlug != "" {
+			slug = links[0].ProjectSlug
+		}
+	}
+	if slug == "" && projectID != "" {
+		slug = b.projectSlugMap[projectID]
+	}
+	return slug
+}
+
 // publishAttachment reads a file from the local filesystem and sends it to
 // each target chat via Telegram's sendDocument API. The message body is used
 // as the document caption.
@@ -1266,7 +1374,7 @@ func (b *TelegramBrokerV2) publishAttachment(ctx context.Context, api *TelegramA
 	}
 	defer f.Close()
 
-	filename := filepath.Base(attachPath)
+	filename := filepath.Base(strings.ReplaceAll(attachPath, "\\", "/"))
 	if name, ok := msg.Metadata["telegram_attachment_name"]; ok && name != "" {
 		filename = name
 	}
@@ -1290,8 +1398,8 @@ func (b *TelegramBrokerV2) publishAttachment(ctx context.Context, api *TelegramA
 		_, err := api.SendDocument(ctx, chatID, filename, f, caption, "", opts...)
 		if err != nil {
 			var apiErr *APIError
-			if errors.As(err, &apiErr) && apiErr.IsTransient() {
-				b.log.Warn("Transient error sending attachment",
+			if errors.As(err, &apiErr) && apiErr.Code == http.StatusTooManyRequests {
+				b.log.Warn("Rate-limited sending attachment",
 					"chat_id", chatID, "error", err)
 				continue
 			}
@@ -1562,11 +1670,23 @@ func (b *TelegramBrokerV2) getUpdatesV2(ctx context.Context, offset int64, timeo
 // --- Inbound message handling ---
 
 func (b *TelegramBrokerV2) handleIncomingMessageV2(tgMsg *TGMessage) {
-	if tgMsg.Text == "" && tgMsg.Caption == "" && tgMsg.Photo == nil && tgMsg.Document == nil {
+	if tgMsg == nil {
+		return
+	}
+	hasAttachment := tgMsg.Photo != nil || tgMsg.Document != nil || tgMsg.Audio != nil || tgMsg.Video != nil
+	hasSkippedAttachment := tgMsg.Sticker != nil || tgMsg.Animation != nil
+
+	if tgMsg.Text == "" && tgMsg.Caption == "" && !hasAttachment {
+		if hasSkippedAttachment {
+			b.log.Debug("Skipping unsupported attachment type (sticker/animation)",
+				"message_id", tgMsg.MessageID,
+				"has_sticker", tgMsg.Sticker != nil,
+				"has_animation", tgMsg.Animation != nil)
+		}
 		return
 	}
 
-	// Use caption as text fallback for photo/document messages.
+	// Use caption as text fallback for photo/document/audio/video messages.
 	if tgMsg.Text == "" && tgMsg.Caption != "" {
 		tgMsg.Text = tgMsg.Caption
 	}
@@ -1724,7 +1844,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 	// later (offset>0) do not block default routing; resolveUserMentions
 	// injects the resolved scion identity for those.
 	if len(targets) == 0 && effectiveDefault != "" {
-		hasAttachment := tgMsg.Photo != nil || tgMsg.Document != nil
+		hasAttachment := tgMsg.Photo != nil || tgMsg.Document != nil || tgMsg.Audio != nil || tgMsg.Video != nil
 		text := strings.TrimSpace(tgMsg.Text)
 		textRoutes := text != "" && !strings.HasPrefix(text, "/") && !strings.HasPrefix(text, "@") && !hasNonBotUserMention(tgMsg, botUsername, agents)
 		if textRoutes || hasAttachment {
@@ -1809,13 +1929,85 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 	// text_mention display names with "user:email" in the message text.
 	resolvedText, resolvedMentionsJSON := b.resolveUserMentions(ctx, tgMsg)
 
-	// Strip bot/agent mentions to get clean message text.
-	cleanText := stripMentions(resolvedText, botUsername, targets)
+	// Classify mentions by position (start vs. body) for mention notifications.
+	// Skip classification for @all broadcasts — those are handled by existing logic.
+	// Run on resolvedText so body-mention recipients get resolved user identities.
+	var classified ClassifiedMentions
+	if !isAll {
+		classified = classifyMentions(resolvedText, botUsername, agents, func(username string) (string, bool) {
+			// User resolver: for now return not-found. Unresolvable @chatUser
+			// mentions are dropped per the design doc.
+			return "", false
+		})
+	}
+
+	// Strip only start-mention agent slugs (not body mentions) so body mentions
+	// remain in the delivered text. For @all or fallback routing (no classifyMentions
+	// result), fall back to stripping all targets.
+	stripSlugs := targets
+	if !isAll && len(classified.StartMentions) > 0 {
+		stripSlugs = make([]string, 0, len(classified.StartMentions))
+		for _, m := range classified.StartMentions {
+			if m.Kind == "agent" {
+				stripSlugs = append(stripSlugs, m.Name)
+			}
+		}
+	}
+	// Filter targets to only start-mention agents, or exclude body-mention agents if no start-mentions exist.
+	// Body-mention agents will be handled by the TypeMention delivery loop.
+	if !isAll {
+		if len(classified.StartMentions) > 0 {
+			startMentionSet := make(map[string]bool, len(classified.StartMentions))
+			for _, sm := range classified.StartMentions {
+				if sm.Kind == "agent" {
+					startMentionSet[strings.ToLower(sm.Name)] = true
+				}
+			}
+			filteredTargets := make([]string, 0, len(targets))
+			for _, t := range targets {
+				if startMentionSet[strings.ToLower(t)] {
+					filteredTargets = append(filteredTargets, t)
+				}
+			}
+			targets = filteredTargets
+		} else {
+			// No start mentions: don't strip any agents from text (body mentions stay visible).
+			stripSlugs = nil
+
+			if len(classified.BodyMentions) > 0 {
+				bodyMentionSet := make(map[string]bool, len(classified.BodyMentions))
+				for _, bm := range classified.BodyMentions {
+					if bm.Kind == "agent" {
+						bodyMentionSet[strings.ToLower(bm.Name)] = true
+					}
+				}
+				filteredTargets := make([]string, 0, len(targets))
+				for _, t := range targets {
+					if !bodyMentionSet[strings.ToLower(t)] {
+						filteredTargets = append(filteredTargets, t)
+					}
+				}
+				targets = filteredTargets
+			}
+		}
+
+		// If body-mention filter emptied targets, restore default agent so instruction is delivered.
+		if len(targets) == 0 && len(classified.StartMentions) == 0 && effectiveDefault != "" {
+			hasAttachment := tgMsg.Photo != nil || tgMsg.Document != nil || tgMsg.Audio != nil || tgMsg.Video != nil
+			text := strings.TrimSpace(tgMsg.Text)
+			textRoutes := text != "" && !strings.HasPrefix(text, "/") && !hasNonBotUserMention(tgMsg, botUsername, agents)
+			if (textRoutes || hasAttachment) && slices.Contains(agents, effectiveDefault) {
+				targets = []string{effectiveDefault}
+			}
+		}
+	}
+
+	cleanText := stripMentions(resolvedText, botUsername, stripSlugs)
 	cleanText = strings.TrimSpace(cleanText)
 
-	// Download file attachments (photos/documents).
+	// Download file attachments (photos/documents/audio/video).
 	var attachmentPath, placeholder string
-	if tgMsg.Photo != nil || tgMsg.Document != nil {
+	if tgMsg.Photo != nil || tgMsg.Document != nil || tgMsg.Audio != nil || tgMsg.Video != nil {
 		var err error
 		attachmentPath, placeholder, err = b.downloadTelegramFile(ctx, tgMsg, link.ProjectSlug)
 		if err != nil {
@@ -1930,13 +2122,83 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 			}
 		}
 	}
+
+	// Deliver TypeMention messages for body mentions (agents referenced
+	// inline in the message body, not as primary recipients).
+	if !isAll && len(classified.BodyMentions) > 0 {
+		// Build the mention source: the primary recipient identity.
+		var mentionSource string
+		if recipientsSet != "" {
+			mentionSource = recipientsSet
+		} else if len(targets) == 1 {
+			mentionSource = "agent:" + targets[0]
+		}
+
+		// Use StrippedBody (start mentions removed, body mentions preserved)
+		// as the message text for mention recipients.
+		mentionText := classified.StrippedBody
+		if placeholder != "" {
+			if mentionText != "" {
+				mentionText = mentionText + "\n" + placeholder
+			} else {
+				mentionText = placeholder
+			}
+		}
+
+		// Build a set of primary targets for dedup.
+		targetSet := make(map[string]bool, len(targets))
+		for _, slug := range targets {
+			targetSet[strings.ToLower(slug)] = true
+		}
+
+		for _, mention := range classified.BodyMentions {
+			if mention.Kind != "agent" {
+				continue
+			}
+			// Skip if the agent is already a primary target (dedup).
+			if targetSet[strings.ToLower(mention.Name)] {
+				continue
+			}
+			if mentionText == "" {
+				continue
+			}
+
+			mentionRecipient := "agent:" + mention.Name
+			mentionTopic := projectcompat.AgentTopic(link.ProjectID, mention.Name)
+
+			mentionMsg := messages.NewMention(sender, mentionRecipient, mentionText, mentionSource)
+			mentionMsg.SenderID = senderID
+			mentionMsg.Channel = "telegram"
+			mentionMsg.Metadata["telegram_chat_id"] = strconv.FormatInt(chatID, 10)
+			mentionMsg.Metadata["telegram_message_id"] = strconv.FormatInt(tgMsg.MessageID, 10)
+			mentionMsg.Metadata["project_id"] = link.ProjectID
+
+			if tgMsg.MessageThreadID != 0 {
+				mentionMsg.ThreadID = strconv.FormatInt(tgMsg.MessageThreadID, 10)
+			}
+
+			if attachmentPath != "" {
+				mentionMsg.Attachments = []string{attachmentPath}
+			}
+
+			if resolvedMentionsJSON != "" {
+				mentionMsg.Metadata["resolved_mentions"] = resolvedMentionsJSON
+			}
+
+			b.log.Debug("Delivering mention notification",
+				"topic", mentionTopic, "sender", sender, "mentioned_agent", mention.Name,
+				"mention_source", mentionSource)
+
+			b.deliverInboundWithFeedback(ctx, mentionTopic, mentionMsg) //nolint:errcheck
+		}
+	}
 }
 
 const maxTelegramFileSize = 20 * 1024 * 1024 // 20 MB
 
-// downloadTelegramFile downloads a photo or document from a Telegram message
-// and saves it to the agent's workspace downloads directory. Returns the
-// agent-relative path and a placeholder string for the message body.
+// downloadTelegramFile downloads a photo, document, audio, or video from a
+// Telegram message and saves it to the configured downloads directory.
+// Returns the agent-relative path and a placeholder string for the message body.
 func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, tgMsg *TGMessage, projectSlug string) (agentPath, placeholder string, err error) {
 	var fileID, fileName, fileType string
 	var fileSize int64
@@ -1956,8 +2218,38 @@ func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, tgMsg *TGMe
 		fileSize = largest.FileSize
 		fileName = fmt.Sprintf("photo_%s.jpg", largest.FileUniqueID)
 		fileType = "Photo"
+	case tgMsg.Audio != nil:
+		fileID = tgMsg.Audio.FileID
+		fileSize = tgMsg.Audio.FileSize
+		fileName = tgMsg.Audio.FileName
+		if fileName == "" {
+			// Build a descriptive name from title/performer if available.
+			if tgMsg.Audio.Title != "" {
+				fileName = tgMsg.Audio.Title + ".ogg"
+			} else {
+				fileName = fmt.Sprintf("audio_%s.ogg", tgMsg.Audio.FileUniqueID)
+			}
+		}
+		fileType = "Audio"
+	case tgMsg.Video != nil:
+		fileID = tgMsg.Video.FileID
+		fileSize = tgMsg.Video.FileSize
+		fileName = tgMsg.Video.FileName
+		if fileName == "" {
+			fileName = fmt.Sprintf("video_%s.mp4", tgMsg.Video.FileUniqueID)
+		}
+		fileType = "Video"
 	default:
-		return "", "", fmt.Errorf("message has no photo or document")
+		return "", "", fmt.Errorf("message has no downloadable attachment")
+	}
+
+	// Sanitize the filename to prevent path traversal via user-controlled
+	// fields (e.g. Document.FileName, Audio.Title). Replacing backslashes
+	// with forward slashes first ensures that both Windows and Unix path
+	// separators are stripped regardless of the host OS.
+	fileName = filepath.Base(strings.ReplaceAll(fileName, "\\", "/"))
+	if fileName == "." || fileName == "" {
+		fileName = fmt.Sprintf("file_%s", fileID)
 	}
 
 	if fileSize > maxTelegramFileSize {
@@ -1978,7 +2270,13 @@ func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, tgMsg *TGMe
 	timestamp := time.Now().Unix()
 	destName := fmt.Sprintf("tg_%d_%s", timestamp, fileName)
 
-	hostDir := filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
+	// Use configured downloads_path if set; otherwise default to project dir.
+	var hostDir string
+	if b.downloadsPath != "" {
+		hostDir = b.downloadsPath
+	} else {
+		hostDir = filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
+	}
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
 		return "", "", fmt.Errorf("create downloads dir: %w", err)
 	}
@@ -1995,7 +2293,15 @@ func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, tgMsg *TGMe
 		return "", "", fmt.Errorf("write file: %w", err)
 	}
 
-	agentPath = filepath.Join("/workspace/downloads", destName)
+	// Derive the agent-visible path from the same base used to save the file.
+	// When a custom downloads_path is configured, the agent sees that path
+	// directly; otherwise it sees the conventional /workspace/downloads mount.
+	if b.downloadsPath != "" {
+		agentPath = filepath.Join(b.downloadsPath, destName)
+	} else {
+		agentPath = filepath.Join("/workspace/downloads", destName)
+	}
+	agentPath = filepath.ToSlash(agentPath)
 	placeholder = fmt.Sprintf("📎 [%s attached: %s]", fileType, fileName)
 
 	b.log.Info("Downloaded telegram file",

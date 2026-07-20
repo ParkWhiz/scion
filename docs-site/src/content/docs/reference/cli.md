@@ -41,7 +41,7 @@ starting a **stopped** or **error** agent runs a fresh session. See
     - `-d, --detached`: Run in detached mode (default true).
     - `--config <path>`: Path to inline agent config file (YAML/JSON) for Just-In-Time (JIT) overrides, or `-` for stdin.
     - `--harness-config <string>`: Named harness configuration to use.
-    - `--harness-auth <string>`: Override auth method for the harness (e.g., `api-key`, `vertex-ai`, `auth-file`).
+    - `--harness-auth <string>`: Override auth method for the harness. Universal types: `api-key`, `oauth-token`, `vertex-ai`, `auth-file` (each harness accepts a subset — see [Harness Authentication](/scion/local/agent-credentials/)).
     - `--broker <string>`: Preferred runtime broker ID or name for execution.
     - `--notify`: Get notified via the browser or system when the spawned agent reaches a terminal state.
 
@@ -240,19 +240,29 @@ Manages shared directories for agents within a project.
 
 ### `scion templates`
 
-Manages agent templates.
+Manages agent templates. `scion template` (singular) is an accepted alias. Scope defaults to the project; add the root `--global` flag to target global templates.
 
-- `list`: List available templates.
-- `show <name>`: Show configuration of a template.
-- `create <name> [--harness <type>]`: Create a new template.
-- `clone <src> <dest>`: Clone a template.
+- `list`: List available templates (local, and Hub when connected), grouped by scope.
+- `show <name>`: Show a template's resolved configuration.
+    - Flags: `--local` (search local only), `--hub` (search Hub only).
+- `create <name>`: Create a new template (seeded from the `default` template).
+- `clone <src> <dest>`: Clone an existing template (local or Hub source) to a new local one.
+    - Flags: `--local`, `--hub` (restrict where the source is searched).
 - `delete <name>` (alias `rm`): Delete a template.
-- `import <source>`: Import agent definitions (from Claude/Gemini) as templates.
+    - Flags: `--local`, `--hub`.
+- `import <source>`: Import agent definitions (Claude/Gemini sub-agents or Scion templates) into your templates directory.
+    - Flags: `--all` (import every discovered agent), `-H, --harness <type>` (force `claude`/`gemini`), `--name <name>` (rename a single import), `--force` (overwrite), `--dry-run` (preview).
 - `update-default`: Update the global default template with the latest from the binary.
     - Flags:
         - `--force`: Overwrite the existing default template if it already exists.
-- `sync [--all]`: Sync project-level templates with the Hub. Use `--all` to sync all templates at once.
+
+Hub-only commands (require an enabled Hub):
+
+- `sync [template]` (alias `push`): Create or update a template in the Hub; only changed files are uploaded. Use `--all` to sync every local template, or `--name <name>` to sync under a different Hub name.
+- `pull <name>`: Download a template from the Hub to the local filesystem. Use `--to <path>` for a custom destination.
 - `status`: Show the sync status of templates relative to the Hub.
+
+See [Templates & Roles](/scion/local/templates/) for the full guide.
 
 ## Skill Bank
 
