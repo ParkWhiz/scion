@@ -16,12 +16,15 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -34,6 +37,73 @@ type imageManager interface {
 	imagecheck.LocalImageExister
 	PullImage(ctx context.Context, image string) error
 	RemoveImage(ctx context.Context, image string) error
+}
+
+var nodeBoundProfileTypes = map[string]bool{
+	"docker": true,
+	"podman": true,
+	"apple":  true,
+}
+
+func isNodeBoundBroker(broker *store.RuntimeBroker) bool {
+	for _, p := range broker.Profiles {
+		if nodeBoundProfileTypes[p.Type] {
+			return true
+		}
+	}
+	return false
+}
+
+type AggregatedImageStatusResponse struct {
+	Image        string               `json:"image"`
+	Registry     *RegistryImageStatus `json:"registry"`
+	Brokers      []BrokerImageEntry   `json:"brokers"`
+	ProxyBrokers []ProxyBrokerEntry   `json:"proxy_brokers,omitempty"`
+}
+
+type RegistryImageStatus struct {
+	Image     string    `json:"image"`
+	Exists    bool      `json:"exists"`
+	Hash      string    `json:"hash,omitempty"`
+	CheckedAt time.Time `json:"checked_at"`
+}
+
+type BrokerImageEntry struct {
+	BrokerID         string                  `json:"broker_id"`
+	BrokerName       string                  `json:"broker_name"`
+	Reachable        bool                    `json:"reachable"`
+	Unsupported      bool                    `json:"unsupported,omitempty"`
+	LocalShort       *BrokerImageEntityState `json:"local_short,omitempty"`
+	LocalLong        *BrokerImageEntityState `json:"local_long,omitempty"`
+	NewerInRegistry  bool                    `json:"newer_in_registry,omitempty"`
+	ResolvedImage    string                  `json:"resolved_image,omitempty"`
+	ResolutionSource string                  `json:"resolution_source,omitempty"`
+}
+
+type ProxyBrokerEntry struct {
+	BrokerID   string `json:"broker_id"`
+	BrokerName string `json:"broker_name"`
+	Runtime    string `json:"runtime"`
+}
+
+func (s *Server) checkRegistryImage(ctx context.Context, longImage string) RegistryImageStatus {
+	now := time.Now()
+	if longImage == "" {
+		return RegistryImageStatus{CheckedAt: now}
+	}
+	if imagecheck.IsBareImageName(longImage) {
+		return RegistryImageStatus{
+			Image:     longImage,
+			CheckedAt: now,
+		}
+	}
+	result := s.imageChecker.CheckRemoteOnly(ctx, longImage)
+	return RegistryImageStatus{
+		Image:     longImage,
+		Exists:    result.Status == "valid",
+		Hash:      result.Hash,
+		CheckedAt: result.CheckedAt,
+	}
 }
 
 // CreateHarnessConfigRequest is the request body for creating a harness config.
@@ -626,7 +696,74 @@ func (s *Server) handleHarnessConfigCheckImage(w http.ResponseWriter, r *http.Re
 	registry := s.resolveImageRegistry()
 	resolvedImage := config.RewriteImageRegistry(image, registry)
 	slog.Info("checking image status", "id", hc.ID, "image", image, "resolved", resolvedImage, "registry", registry)
-	result := s.imageChecker.Check(ctx, resolvedImage)
+
+	if imagecheck.IsBareImageName(image) {
+		status := store.HarnessConfigImageStatusUnknown
+		source := "broker_check"
+
+		if s.brokerClient != nil {
+			brokerResult, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{}, store.ListOptions{Limit: 100})
+			if err == nil {
+				var found bool
+				var wg sync.WaitGroup
+				var mu sync.Mutex
+				for i := range brokerResult.Items {
+					b := &brokerResult.Items[i]
+					if _, isPlugin := b.Labels["scion.io/plugin"]; isPlugin {
+						continue
+					}
+					if !s.canDispatchToBroker(ctx, b) {
+						continue
+					}
+					if !isNodeBoundBroker(b) {
+						continue
+					}
+					wg.Add(1)
+					go func(broker *store.RuntimeBroker) {
+						defer wg.Done()
+						brokerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+						defer cancel()
+						imgResp, err := s.brokerClient.ImageStatus(brokerCtx, broker.ID, broker.Endpoint, image, "")
+						if err != nil {
+							return
+						}
+						if imgResp != nil && imgResp.LocalShort != nil && imgResp.LocalShort.Exists {
+							mu.Lock()
+							found = true
+							mu.Unlock()
+						}
+					}(b)
+				}
+				wg.Wait()
+				if found {
+					status = store.HarnessConfigImageStatusValid
+				}
+			}
+		}
+
+		if status != store.HarnessConfigImageStatusValid && resolvedImage != image {
+			result := s.imageChecker.CheckRemoteOnly(ctx, resolvedImage)
+			if result.Status == "valid" {
+				status = store.HarnessConfigImageStatusValid
+				source = "registry"
+			}
+		}
+
+		now := time.Now()
+		if err := s.store.UpdateHarnessConfigImageStatus(ctx, hc.ID, status, now); err != nil {
+			slog.Warn("failed to persist image status", "id", hc.ID, "error", err)
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"image_status":            status,
+			"image_status_checked_at": now,
+			"source":                  source,
+			"resolved_image":          image,
+		})
+		return
+	}
+
+	result := s.imageChecker.CheckRemoteOnly(ctx, resolvedImage)
 	slog.Info("image check result", "id", hc.ID, "status", result.Status, "source", result.Source, "error", result.Error)
 
 	if err := s.store.UpdateHarnessConfigImageStatus(ctx, hc.ID, result.Status, result.CheckedAt); err != nil {
@@ -934,19 +1071,31 @@ func (s *Server) handleHarnessConfigReimport(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	imported, err := run(nil)
+	var failures []ImportFailure
+	imported, err := run(failureCollector(&failures))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "reimport_failed", err.Error(), nil)
+		return
+	}
+
+	if len(imported) == 0 && len(failures) > 0 {
+		reasons := make([]string, len(failures))
+		for i, f := range failures {
+			reasons[i] = f.Name + ": " + f.Reason
+		}
+		writeError(w, http.StatusBadRequest, "reimport_failed",
+			"config.yaml validation failed: "+strings.Join(reasons, "; "), nil)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, ImportHarnessConfigsResponse{
 		HarnessConfigs: imported,
 		Count:          len(imported),
+		Failed:         failures,
 	})
 }
 
-// handleHarnessConfigImageStatus returns three-entity image status.
+// handleHarnessConfigImageStatus returns per-broker aggregated image status.
 // GET /api/v1/harness-configs/{id}/image-status
 func (s *Server) handleHarnessConfigImageStatus(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodGet {
@@ -975,20 +1124,175 @@ func (s *Server) handleHarnessConfigImageStatus(w http.ResponseWriter, r *http.R
 		shortImage = ""
 	}
 
-	result := s.imageChecker.CheckAll(ctx, shortImage, longImage)
-	writeJSON(w, http.StatusOK, result)
-}
+	registryStatus := s.checkRegistryImage(ctx, longImage)
 
-// handleHarnessConfigDeleteLocalImage removes the local short-form image.
-// DELETE /api/v1/harness-configs/{id}/local-image
-func (s *Server) handleHarnessConfigDeleteLocalImage(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodDelete {
-		MethodNotAllowed(w)
+	if s.brokerClient == nil {
+		if s.imageManager != nil {
+			entry := s.buildLocalImageEntry(ctx, shortImage, longImage, registryStatus)
+			writeJSON(w, http.StatusOK, AggregatedImageStatusResponse{
+				Image:    image,
+				Registry: &registryStatus,
+				Brokers:  []BrokerImageEntry{entry},
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, AggregatedImageStatusResponse{
+			Image:    image,
+			Registry: &registryStatus,
+		})
 		return
 	}
 
-	if s.imageManager == nil {
-		writeError(w, http.StatusServiceUnavailable, "no_runtime", "Container runtime not available", nil)
+	brokerResult, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{}, store.ListOptions{Limit: 100})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "broker_list_failed", fmt.Sprintf("Failed to list brokers: %v", err), nil)
+		return
+	}
+
+	var nodeBound []*store.RuntimeBroker
+	var proxyEntries []ProxyBrokerEntry
+	for i := range brokerResult.Items {
+		b := &brokerResult.Items[i]
+		if _, isPlugin := b.Labels["scion.io/plugin"]; isPlugin {
+			continue
+		}
+		if !s.canDispatchToBroker(ctx, b) {
+			continue
+		}
+		if isNodeBoundBroker(b) {
+			nodeBound = append(nodeBound, b)
+		} else {
+			var runtimeTypes []string
+			seen := map[string]bool{}
+			for _, p := range b.Profiles {
+				if !seen[p.Type] {
+					runtimeTypes = append(runtimeTypes, p.Type)
+					seen[p.Type] = true
+				}
+			}
+			runtime := strings.Join(runtimeTypes, ",")
+			proxyEntries = append(proxyEntries, ProxyBrokerEntry{
+				BrokerID: b.ID, BrokerName: b.Name, Runtime: runtime,
+			})
+		}
+	}
+
+	brokerEntries := make([]BrokerImageEntry, len(nodeBound))
+	var wg sync.WaitGroup
+	for i, broker := range nodeBound {
+		wg.Add(1)
+		go func(idx int, b *store.RuntimeBroker) {
+			defer wg.Done()
+			entry := BrokerImageEntry{
+				BrokerID:   b.ID,
+				BrokerName: b.Name,
+			}
+
+			brokerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+
+			imgResp, err := s.brokerClient.ImageStatus(brokerCtx, b.ID, b.Endpoint, shortImage, longImage)
+			if err != nil {
+				var unsupported *BrokerUnsupportedError
+				if errors.As(err, &unsupported) {
+					entry.Reachable = true
+					entry.Unsupported = true
+				} else {
+					entry.Reachable = false
+				}
+			} else if imgResp != nil {
+				entry.Reachable = true
+				entry.LocalShort = imgResp.LocalShort
+				entry.LocalLong = imgResp.LocalLong
+
+				if entry.LocalLong != nil && entry.LocalLong.Exists && registryStatus.Hash != "" && entry.LocalLong.Hash != "" {
+					entry.NewerInRegistry = registryStatus.Hash != entry.LocalLong.Hash
+				}
+
+				switch {
+				case entry.LocalShort != nil && entry.LocalShort.Exists:
+					entry.ResolvedImage = shortImage
+					entry.ResolutionSource = "local_short"
+				case entry.LocalLong != nil && entry.LocalLong.Exists:
+					entry.ResolvedImage = longImage
+					entry.ResolutionSource = "local_long"
+				case registryStatus.Exists:
+					entry.ResolvedImage = longImage
+					entry.ResolutionSource = "remote"
+				default:
+					entry.ResolutionSource = "none"
+				}
+			}
+			brokerEntries[idx] = entry
+		}(i, broker)
+	}
+	wg.Wait()
+
+	if len(nodeBound) == 0 && s.imageManager != nil {
+		entry := s.buildLocalImageEntry(ctx, shortImage, longImage, registryStatus)
+		brokerEntries = append(brokerEntries, entry)
+	}
+
+	resp := AggregatedImageStatusResponse{
+		Image:        image,
+		Registry:     &registryStatus,
+		Brokers:      brokerEntries,
+		ProxyBrokers: proxyEntries,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// buildLocalImageEntry constructs a BrokerImageEntry using the hub's
+// co-located container runtime (Docker/Podman) when no broker client is
+// available. This ensures workstation-mode users see pulled image state
+// and the Build Image option.
+func (s *Server) buildLocalImageEntry(ctx context.Context, shortImage, longImage string, registryStatus RegistryImageStatus) BrokerImageEntry {
+	result := s.imageChecker.CheckAll(ctx, shortImage, longImage)
+
+	brokerName := "Local Runtime"
+	if namer, ok := s.imageManager.(interface{ Name() string }); ok {
+		if n := namer.Name(); n != "" {
+			brokerName = n
+		}
+	}
+
+	entry := BrokerImageEntry{
+		BrokerName: brokerName,
+		Reachable:  true,
+	}
+	if shortImage != "" {
+		entry.LocalShort = &BrokerImageEntityState{Exists: result.LocalShort.Exists, Hash: result.LocalShort.Hash}
+	}
+	if longImage != "" {
+		entry.LocalLong = &BrokerImageEntityState{Exists: result.LocalLong.Exists, Hash: result.LocalLong.Hash}
+	}
+
+	if entry.LocalLong != nil && entry.LocalLong.Exists && registryStatus.Hash != "" && entry.LocalLong.Hash != "" {
+		entry.NewerInRegistry = registryStatus.Hash != entry.LocalLong.Hash
+	}
+
+	switch {
+	case entry.LocalShort != nil && entry.LocalShort.Exists:
+		entry.ResolvedImage = shortImage
+		entry.ResolutionSource = "local_short"
+	case entry.LocalLong != nil && entry.LocalLong.Exists:
+		entry.ResolvedImage = longImage
+		entry.ResolutionSource = "local_long"
+	case registryStatus.Exists:
+		entry.ResolvedImage = longImage
+		entry.ResolutionSource = "remote"
+	default:
+		entry.ResolutionSource = "none"
+	}
+
+	return entry
+}
+
+// handleHarnessConfigDeleteLocalImage removes the local short-form image.
+// DELETE /api/v1/harness-configs/{id}/local-image?broker_id=...
+func (s *Server) handleHarnessConfigDeleteLocalImage(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodDelete {
+		MethodNotAllowed(w)
 		return
 	}
 
@@ -1002,6 +1306,38 @@ func (s *Server) handleHarnessConfigDeleteLocalImage(w http.ResponseWriter, r *h
 	image := s.harnessConfigImage(hc)
 	if image == "" || !imagecheck.IsBareImageName(image) {
 		writeError(w, http.StatusBadRequest, "no_local_image", "Harness config has no short-form image to delete", nil)
+		return
+	}
+
+	brokerID := r.URL.Query().Get("broker_id")
+	if brokerID != "" {
+		if s.brokerClient == nil {
+			writeError(w, http.StatusServiceUnavailable, "no_broker_client", "Broker routing not available", nil)
+			return
+		}
+		broker, err := s.store.GetRuntimeBroker(ctx, brokerID)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		if !s.canDispatchToBroker(ctx, broker) {
+			writeError(w, http.StatusForbidden, "forbidden", "You do not have permission to perform image operations on this broker", nil)
+			return
+		}
+		if !isNodeBoundBroker(broker) {
+			writeError(w, http.StatusBadRequest, "invalid_broker", "Image operations are only supported on node-bound brokers", nil)
+			return
+		}
+		if err := s.brokerClient.DeleteImage(ctx, broker.ID, broker.Endpoint, image); err != nil {
+			writeError(w, http.StatusInternalServerError, "remove_failed", fmt.Sprintf("Failed to remove image on broker %s: %v", broker.Name, err), nil)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "removed", "image": image, "broker_id": broker.ID})
+		return
+	}
+
+	if s.imageManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "no_runtime", "Container runtime not available", nil)
 		return
 	}
 
@@ -1024,15 +1360,10 @@ func (s *Server) handleHarnessConfigDeleteLocalImage(w http.ResponseWriter, r *h
 }
 
 // handleHarnessConfigPullImage pulls the latest image from the remote registry.
-// POST /api/v1/harness-configs/{id}/pull-image
+// POST /api/v1/harness-configs/{id}/pull-image?broker_id=...
 func (s *Server) handleHarnessConfigPullImage(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
 		MethodNotAllowed(w)
-		return
-	}
-
-	if s.imageManager == nil {
-		writeError(w, http.StatusServiceUnavailable, "no_runtime", "Container runtime not available", nil)
 		return
 	}
 
@@ -1051,6 +1382,38 @@ func (s *Server) handleHarnessConfigPullImage(w http.ResponseWriter, r *http.Req
 
 	registry := s.resolveImageRegistry()
 	pullImage := config.RewriteImageRegistry(image, registry)
+
+	brokerID := r.URL.Query().Get("broker_id")
+	if brokerID != "" {
+		if s.brokerClient == nil {
+			writeError(w, http.StatusServiceUnavailable, "no_broker_client", "Broker routing not available", nil)
+			return
+		}
+		broker, err := s.store.GetRuntimeBroker(ctx, brokerID)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		if !s.canDispatchToBroker(ctx, broker) {
+			writeError(w, http.StatusForbidden, "forbidden", "You do not have permission to perform image operations on this broker", nil)
+			return
+		}
+		if !isNodeBoundBroker(broker) {
+			writeError(w, http.StatusBadRequest, "invalid_broker", "Image operations are only supported on node-bound brokers", nil)
+			return
+		}
+		if err := s.brokerClient.PullImage(ctx, broker.ID, broker.Endpoint, pullImage); err != nil {
+			writeError(w, http.StatusInternalServerError, "pull_failed", fmt.Sprintf("Failed to pull image on broker %s: %v", broker.Name, err), nil)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "pulled", "image": pullImage, "broker_id": broker.ID})
+		return
+	}
+
+	if s.imageManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "no_runtime", "Container runtime not available", nil)
+		return
+	}
 
 	if err := s.imageManager.PullImage(ctx, pullImage); err != nil {
 		writeError(w, http.StatusInternalServerError, "pull_failed", fmt.Sprintf("Failed to pull image: %v", err), nil)

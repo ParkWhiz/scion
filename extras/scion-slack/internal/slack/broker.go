@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -438,6 +439,17 @@ func (b *SlackBroker) Publish(ctx context.Context, topic string, msg *messages.S
 		return nil
 	}
 
+	// Replace scion user emails with Slack @mentions in the message body.
+	// Create a shallow copy to avoid mutating the shared msg pointer.
+	if store != nil {
+		resolvedMsg := resolveOutboundMentions(ctx, store, msg.Msg)
+		if resolvedMsg != msg.Msg {
+			msgCopy := *msg
+			msgCopy.Msg = resolvedMsg
+			msg = &msgCopy
+		}
+	}
+
 	senderSlug := agentSlug
 	if senderSlug == "" && strings.HasPrefix(msg.Sender, "agent:") {
 		senderSlug = strings.TrimPrefix(msg.Sender, "agent:")
@@ -845,6 +857,70 @@ func (b *SlackBroker) pruneSentIDsLocked() {
 			delete(b.sentIDs, k)
 		}
 	}
+}
+
+// --- Outbound mention resolution ---
+
+var outboundEmailRe = regexp.MustCompile(`(?:user:)?[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
+
+// resolveOutboundMentions scans text for scion user emails (with optional
+// "user:" prefix) and replaces them with Slack <@user_id> mentions when the
+// user is registered.
+func resolveOutboundMentions(ctx context.Context, store Store, text string) string {
+	if store == nil || text == "" {
+		return text
+	}
+
+	matches := outboundEmailRe.FindAllStringIndex(text, -1)
+	if len(matches) == 0 {
+		return text
+	}
+
+	// Cache email→SlackUserID lookups within this call to avoid redundant
+	// DB queries when the same email appears multiple times.
+	emailCache := make(map[string]string)
+
+	// Process in reverse order so indices remain valid after replacement.
+	for i := len(matches) - 1; i >= 0; i-- {
+		start, end := matches[i][0], matches[i][1]
+
+		// Skip emails embedded in URLs (preceded by '/' or ':').
+		if start > 0 {
+			prev := text[start-1]
+			if prev == '/' || prev == ':' {
+				continue
+			}
+		}
+		// Skip emails followed by '/' (URL path).
+		if end < len(text) && text[end] == '/' {
+			continue
+		}
+
+		match := text[start:end]
+		email := match
+		if strings.HasPrefix(email, "user:") {
+			email = strings.TrimPrefix(email, "user:")
+		}
+
+		var slackUserID string
+		if id, cached := emailCache[email]; cached {
+			slackUserID = id
+		} else {
+			mapping, err := store.GetUserMappingByEmail(ctx, email)
+			if err == nil && mapping != nil {
+				slackUserID = mapping.SlackUserID
+			}
+			emailCache[email] = slackUserID
+		}
+
+		if slackUserID == "" {
+			continue
+		}
+
+		text = text[:start] + "<@" + slackUserID + ">" + text[end:]
+	}
+
+	return text
 }
 
 // --- HMAC auth helpers ---

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
@@ -92,10 +93,6 @@ func (c *HTTPRuntimeBrokerClient) CreateAgentWithGather(ctx context.Context, bro
 	return c.transport.CreateAgentWithGather(ctx, brokerID, brokerEndpoint, req)
 }
 
-func (c *HTTPRuntimeBrokerClient) FinalizeEnv(ctx context.Context, brokerID, brokerEndpoint, agentID string, env map[string]string) (*RemoteAgentResponse, error) {
-	return c.transport.FinalizeEnv(ctx, brokerID, brokerEndpoint, agentID, env)
-}
-
 func (c *HTTPRuntimeBrokerClient) GetAgentLogs(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, tail int) (string, error) {
 	return c.transport.GetAgentLogs(ctx, brokerID, brokerEndpoint, agentID, projectID, tail)
 }
@@ -141,6 +138,7 @@ type HTTPAgentDispatcher struct {
 	devAuthToken      string               // Dev auth token to inject into agent env (dev-auth mode only)
 	transportMinter   TransportTokenMinter // Optional transport token minter for OIDC dispatch
 	transportAudience string               // OIDC audience for transport tokens
+	transportMode     string               // Transport auth mode (iap, cloudrun_invoker)
 	debug             bool
 	log               *slog.Logger
 
@@ -152,6 +150,10 @@ type HTTPAgentDispatcher struct {
 	events          EventPublisher
 	commandBus      CommandBus
 	dispatchMetrics dispatchmetrics.Recorder
+
+	// imageRegistry is the configured image registry prefix for rewriting
+	// bare image names before dispatching to brokers.
+	imageRegistry string
 
 	// Resource hash repair callbacks sync a resource's DB manifest from GCS
 	// when a hash mismatch is detected during dispatch. Nil = no repair.
@@ -210,11 +212,12 @@ func (d *HTTPAgentDispatcher) SetAuthzService(a *AuthzService) {
 	d.authzService = a
 }
 
-// SetTransportMinter sets the transport token minter and audience for injecting
-// transport-layer OIDC tokens into agent dispatch payloads.
-func (d *HTTPAgentDispatcher) SetTransportMinter(minter TransportTokenMinter, audience string) {
+// SetTransportMinter sets the transport token minter, audience, and mode for
+// injecting transport-layer OIDC tokens into agent dispatch payloads.
+func (d *HTTPAgentDispatcher) SetTransportMinter(minter TransportTokenMinter, audience, mode string) {
 	d.transportMinter = minter
 	d.transportAudience = audience
+	d.transportMode = mode
 }
 
 // SetGitHubAppMinter sets the GitHub App token minter for resolving
@@ -241,6 +244,12 @@ func (d *HTTPAgentDispatcher) SetDispatchMetrics(rec dispatchmetrics.Recorder) {
 // DB manifest from storage when a hash mismatch is detected during dispatch.
 func (d *HTTPAgentDispatcher) SetHarnessConfigRepairer(fn func(ctx context.Context, name string) error) {
 	d.harnessConfigRepairer = fn
+}
+
+// SetImageRegistry sets the image registry prefix for rewriting bare image
+// names before dispatching to brokers.
+func (d *HTTPAgentDispatcher) SetImageRegistry(registry string) {
+	d.imageRegistry = registry
 }
 
 // SetTemplateRepairer registers a callback that syncs a template's DB manifest
@@ -430,9 +439,13 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 				ProjectID:    gcpID.ProjectID,
 			}
 		}
+		image := agent.AppliedConfig.Image
+		if image != "" && d.imageRegistry != "" {
+			image = config.RewriteImageRegistry(image, d.imageRegistry)
+		}
 		req.Config = &RemoteAgentConfig{
 			Template:          agent.Template,
-			Image:             agent.AppliedConfig.Image,
+			Image:             image,
 			HarnessConfig:     agent.AppliedConfig.HarnessConfig,
 			HarnessAuth:       agent.AppliedConfig.HarnessAuth,
 			Task:              agent.AppliedConfig.Task,
@@ -643,6 +656,9 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 			req.ResolvedEnv["SCION_TRANSPORT_TOKEN"] = tToken
 			req.ResolvedEnv["SCION_TRANSPORT_AUDIENCE"] = d.transportAudience
 			req.ResolvedEnv["SCION_TRANSPORT_TOKEN_EXPIRY"] = tExpiry.UTC().Format(time.RFC3339)
+			if d.transportMode != "" {
+				req.ResolvedEnv["SCION_TRANSPORT_MODE"] = d.transportMode
+			}
 		}
 	}
 
@@ -908,7 +924,20 @@ func (d *HTTPAgentDispatcher) deferredCreateWithGather(ctx context.Context, agen
 	return cr.EnvRequirements, nil
 }
 
-// DispatchFinalizeEnv sends gathered env vars to the broker to complete agent creation.
+// ErrEnvStillMissing is returned when a replay-based finalize discovers that
+// required env keys are still unsatisfied after merging CLI-gathered values.
+type ErrEnvStillMissing struct {
+	Requirements *RemoteEnvRequirementsResponse
+}
+
+func (e *ErrEnvStillMissing) Error() string {
+	return fmt.Sprintf("env still missing after finalize: %v", e.Requirements.Needs)
+}
+
+// DispatchFinalizeEnv replays a full create request with CLI-gathered env merged
+// at highest precedence, instead of calling the broker's stateful finalize-env
+// action. This makes the finalize HA-safe: the replay can land on any broker
+// replica because it carries the complete request state.
 func (d *HTTPAgentDispatcher) DispatchFinalizeEnv(ctx context.Context, agent *store.Agent, env map[string]string) error {
 	if err := requireRuntimeBrokerAssigned(agent); err != nil {
 		return err
@@ -919,12 +948,36 @@ func (d *HTTPAgentDispatcher) DispatchFinalizeEnv(ctx context.Context, agent *st
 		return err
 	}
 
-	resp, err := d.client.FinalizeEnv(ctx, agent.RuntimeBrokerID, endpoint, agent.ID, env)
+	req, err := d.buildCreateRequest(ctx, agent, "DispatchFinalizeEnv")
+	if err != nil {
+		return err
+	}
+	req.GatherEnv = true
+
+	if req.ResolvedEnv == nil {
+		req.ResolvedEnv = map[string]string{}
+	}
+	for k, v := range env {
+		req.ResolvedEnv[k] = v
+	}
+
+	req.EnvSources = d.buildEnvSources(ctx, agent, req.ResolvedEnv)
+
+	resp, envReqs, err := d.client.CreateAgentWithGather(ctx, agent.RuntimeBrokerID, endpoint, req)
+	if isHashMismatchError(err) {
+		if repairErr := d.repairHashMismatch(ctx, agent, err); repairErr == nil {
+			resp, envReqs, err = d.client.CreateAgentWithGather(ctx, agent.RuntimeBrokerID, endpoint, req)
+		}
+	}
 	if errors.Is(err, ErrLifecycleDeferred) {
 		return d.deferredFinalizeEnv(ctx, agent, env)
 	}
 	if err != nil {
 		return err
+	}
+
+	if envReqs != nil && len(envReqs.Needs) > 0 {
+		return &ErrEnvStillMissing{Requirements: envReqs}
 	}
 
 	if resp != nil {
@@ -1226,6 +1279,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 			resolvedEnv["SCION_TRANSPORT_TOKEN"] = tToken
 			resolvedEnv["SCION_TRANSPORT_AUDIENCE"] = d.transportAudience
 			resolvedEnv["SCION_TRANSPORT_TOKEN_EXPIRY"] = tExpiry.UTC().Format(time.RFC3339)
+			if d.transportMode != "" {
+				resolvedEnv["SCION_TRANSPORT_MODE"] = d.transportMode
+			}
 		}
 	}
 
@@ -1393,6 +1449,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 			resolvedEnv["SCION_TRANSPORT_TOKEN"] = tToken
 			resolvedEnv["SCION_TRANSPORT_AUDIENCE"] = d.transportAudience
 			resolvedEnv["SCION_TRANSPORT_TOKEN_EXPIRY"] = tExpiry.UTC().Format(time.RFC3339)
+			if d.transportMode != "" {
+				resolvedEnv["SCION_TRANSPORT_MODE"] = d.transportMode
+			}
 		}
 	}
 

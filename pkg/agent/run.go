@@ -38,6 +38,7 @@ import (
 )
 
 var ErrTmuxBinaryNotFound = errors.New("tmux binary not found")
+var ErrContainerNameInUse = errors.New("agent name is already in use by a stopped container; please delete the existing agent or choose a different name")
 
 func classifyLaunchRuntimeError(err error, resolvedImage string) error {
 	if err == nil {
@@ -46,7 +47,19 @@ func classifyLaunchRuntimeError(err error, resolvedImage string) error {
 	if errors.Is(err, exec.ErrNotFound) || isTmuxShellNotFoundError(err) {
 		return fmt.Errorf("failed to launch container in image %q: %w: %w", resolvedImage, ErrTmuxBinaryNotFound, err)
 	}
+	if isContainerNameInUseError(err) {
+		return ErrContainerNameInUse
+	}
 	return fmt.Errorf("failed to launch container: %w", err)
+}
+
+func isContainerNameInUseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return (strings.Contains(msg, "container name") && strings.Contains(msg, "already in use")) ||
+		strings.Contains(msg, "is already in use by container")
 }
 
 func isTmuxShellNotFoundError(err error) bool {
@@ -313,14 +326,38 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		util.Debugf("image resolution: from agent/template config image=%s", resolvedImage)
 	}
 
+	// Apply CLI/dispatch image override before registry rewrite so the
+	// rewrite applies last regardless of the image source.
+	if opts.Image != "" {
+		resolvedImage = opts.Image
+		util.Debugf("image resolution: from CLI/dispatch --image flag image=%s", resolvedImage)
+	}
+
 	// Two-phase image resolution: for short-form (bare) images, prefer a
 	// locally-built image over the registry version. If no local image
 	// exists, fall back to the registry rewrite.
+	// NOTE: The local-exists check only applies to runtimes with local image
+	// storage (docker, podman, container). Runtimes like kubernetes and cloudrun
+	// always return true from ImageExists (images are pulled on demand by the
+	// node), so we must skip the local check to ensure registry rewrite applies.
 	if settings != nil && resolvedImage != "" {
 		imageRegistry := settings.ResolveImageRegistry(opts.Profile)
 		if imageRegistry != "" && imagecheck.IsBareImageName(resolvedImage) {
-			localExists, localErr := m.Runtime.ImageExists(ctx, resolvedImage)
-			if localErr == nil && localExists {
+			runtimeName := ""
+			if m.Runtime != nil {
+				runtimeName = m.Runtime.Name()
+			}
+			hasLocalImages := runtimeName == "docker" || runtimeName == "podman" ||
+				runtimeName == "container" || runtimeName == "apple-container"
+			localExists := false
+			if hasLocalImages {
+				var localErr error
+				localExists, localErr = m.Runtime.ImageExists(ctx, resolvedImage)
+				if localErr != nil {
+					localExists = false
+				}
+			}
+			if localExists {
 				util.Debugf("image resolution: using local short-form image %s", resolvedImage)
 			} else {
 				rewritten := config.RewriteImageRegistry(resolvedImage, imageRegistry)
@@ -336,12 +373,6 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 				resolvedImage = rewritten
 			}
 		}
-	}
-
-	// CLI Overrides
-	if opts.Image != "" {
-		resolvedImage = opts.Image
-		util.Debugf("image resolution: from CLI --image flag image=%s", resolvedImage)
 	}
 
 	if resolvedImage == "" {
@@ -604,6 +635,9 @@ authDone:
 	}
 	if _, ok := opts.Env["SCION_MODEL"]; !ok && finalScionCfg != nil && finalScionCfg.Model != "" {
 		opts.Env["SCION_MODEL"] = finalScionCfg.Model
+	}
+	if _, ok := opts.Env["SCION_THINKING_LEVEL"]; !ok && finalScionCfg != nil && finalScionCfg.ThinkingLevel != nil {
+		opts.Env["SCION_THINKING_LEVEL"] = strconv.Itoa(*finalScionCfg.ThinkingLevel)
 	}
 	if _, ok := opts.Env["SCION_CREATOR"]; !ok {
 		if u, err := user.Current(); err == nil {

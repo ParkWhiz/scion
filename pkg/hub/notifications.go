@@ -115,6 +115,12 @@ func (nd *NotificationDispatcher) handleEvent(evt Event) {
 		return
 	}
 
+	// Skip events with no agent ID — can happen for system events fired during
+	// project creation before any agents exist.
+	if statusEvt.AgentID == "" {
+		return
+	}
+
 	ctx := context.Background()
 
 	// Collect subscriptions from both scopes: agent-scoped first (more specific),
@@ -185,6 +191,10 @@ func (nd *NotificationDispatcher) handleDeletedEvent(evt Event) {
 	var deletedEvt AgentDeletedEvent
 	if err := json.Unmarshal(evt.Data, &deletedEvt); err != nil {
 		nd.log.Error("Failed to unmarshal agent deleted event", "error", err)
+		return
+	}
+
+	if deletedEvt.AgentID == "" {
 		return
 	}
 

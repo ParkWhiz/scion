@@ -37,3 +37,5 @@ You may be sent messages via the system. These will include markers:
 ```
 
 They will contain information about the sender and may be instructions, or a notification about an agent you are interacting with (for example, it completed its task or needs input).
+
+See scion-messaging skill for more information on messages

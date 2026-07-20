@@ -7,29 +7,66 @@ _sci·on /ˈsīən/ — a young shoot or twig, cut for grafting or rooting._
 Scion is an experimental multi-agent orchestration testbed designed to manage "deep agents" running in containers.
 
 
-Scion orchestrates "deep agents" (Claude Code, Gemini CLI, and others) as isolated, concurrent processes. Each agent gets its own container, git worktree, and credentials — so they can work on different parts of your project without stepping on each other. Agents run locally, on remote VMs, or across Kubernetes clusters.
+Scion orchestrates "deep agents" (Claude Code, Gemini CLI, and others) as isolated, concurrent processes. Each agent gets its own container, (optional) git worktree, and credentials — so they can work on different parts of your project without stepping on each other. Agents run locally, on remote VMs, or across Kubernetes clusters.
 
 Rather than prescribing rigid orchestration patterns, Scion takes a "less is more" approach: agents dynamically learn a CLI tool, letting the models themselves decide how to coordinate among agents. This makes it a rapid prototype testbed for experimenting with multi-agent patterns through natural language prompting. Read more in [Philosophy](https://googlecloudplatform.github.io/scion/philosophy/).
 
 
-## See It in Action
+## In Action
+
+While Scion is powered by coding agents, and can absolutely be used for multi-agent software development, it isn't exclusive to software development, but is a orchestration tool and layer, which can be combined with other agent augmenting system (task tracking, memory, etc - see below on compliments to Scion). We have used it internally at Google for exploring software porting, used for market research, product testing, and more. We are exploring it for use in Cloud operations, and scientific research.  Below are a couple other demonstrations of how agents can collaborate in interesting scenarios.
+
+### Scion Films
+
+<img height="200" alt="scion-films-poster" src="https://github.com/user-attachments/assets/51be1c80-4bb3-48ad-90e9-356aeffcb678" />
+
+
+The [Scion Films](https://films.scion-ai.dev/) project was an exploration in how to iterate and improve multi-agent orchestration, skills, and tools in a domain that is not as innate or "verifiable" as classic auto-research problems where a simple computable scoring metric was used. Instead, human viewer feedback and agent retrospectives were used to iterate across a series of "pilots" - for fun, we use agents to document the entire proces, and in the end, they used the same refined tools and process to make a documentary film.
+
+### Relics of Athenaeum
 
 [Relics of Athenaeum](https://github.com/ptone/scion-athenaeum) is an "agent game" that demonstrates multi-agent orchestration defined entirely in markdown. A group of agents collaborate to solve computational puzzles, coordinating through group and direct messaging — all running in containers on off-the-shelf harnesses.
 
-<a href="https://github.com/ptone/scion-athenaeum"><img width="425" height="238" alt="Relics of Athenaeum" src="https://github.com/user-attachments/assets/cbee74a3-f3aa-4739-b423-0a83d5dd4c13" /></a>&nbsp;<a href="https://www.youtube.com/watch?v=w16bsh6lFL8"><img width="300" height="200" alt="Visualization of agent coordination" src="https://github.com/user-attachments/assets/a615da24-33d8-4882-abe1-95adea4ed79a" /></a>
+<a href="https://github.com/ptone/scion-athenaeum"><img height="200" alt="Relics of Athenaeum" src="https://github.com/user-attachments/assets/cbee74a3-f3aa-4739-b423-0a83d5dd4c13" /></a>&nbsp;<a href="https://www.youtube.com/watch?v=w16bsh6lFL8"><img height="200" alt="Visualization of agent coordination" src="https://github.com/user-attachments/assets/a615da24-33d8-4882-abe1-95adea4ed79a" /></a>
 
 The visualization above replays the actual telemetry collected from messages and file access in the shared workspace while the agents solved the challenges of the game. While this is a "game", the same process of team definition works for software engineering, data research, and platform engineering workflows.
 
+## Scion architecture companions
+
+Scion acts as a core component in a multi-agent solution, but does not try to package all capabilities into a monolithic and over-opinionated solution, instead trying to offer value in durable and well structure abstractions and primitives.  In that sense it is like a game engine upon which you build your game title. First and foremost this comes down to defining your own agent templates, which increasingly are based on skills. If you are doing software factory work, you will want some task management system which could be Github issues, Linear, or something more agent-centric like [Farmtable](https://github.com/scion-frontiers/farmtable), or [Beads](https://github.com/gastownhall/beads). You also might want to introduce a component that manages agent memory (although Scion's use of shared filesystem may get you a long way), network proxy access, etc.
+
 ## Quick Start
 
-### Workstation Quick Start (Homebrew)
+### Install with Homebrew (recommended)
+
+The easiest way to get Scion is the community [homebrew-scion](https://github.com/homebrew-scion/homebrew-scion) tap:
 
 ```bash
-brew install scion
+brew tap homebrew-scion/scion
+brew install homebrew-scion/scion/scion
+```
+
+This installs the `scion` CLI — pre-configured to use `ghcr.io/homebrew-scion` as the default image registry — along with the `scion-plugin-telegram` broker plugin. To upgrade later:
+
+```bash
+brew update && brew upgrade homebrew-scion/scion/scion
+```
+
+Then start the Workstation server:
+
+```bash
 scion server start
 ```
 
-Your browser will open to the onboarding wizard at `http://127.0.0.1:8080/onboarding`, which walks you through machine setup, runtime detection, harness selection, and creating your first project.
+Your browser opens to the onboarding wizard at `http://127.0.0.1:8080/onboarding`, which walks you through runtime detection (Docker, Podman, or Apple Container), identity configuration, container image setup, and creating your first workspace.
+
+After onboarding, start your first agent:
+
+```bash
+scion start my-agent "Your task here"
+```
+
+See the [homebrew-scion tap](https://github.com/homebrew-scion/homebrew-scion) for the full list of pre-built multi-arch container images and distribution details.
 
 ### Install from Source
 
@@ -116,11 +153,13 @@ Visit our **[Documentation Site](https://googlecloudplatform.github.io/scion/)**
 
 ## Project Status
 
-This project is early and experimental. Core concepts are settled, but expect rough edges:
+This project is evolving and experimental. Core concepts are settled, but expect rough edges:
 
-- **Local mode** — relatively stable
-- **Hub-based workflows** — ~80% verified
-- **Kubernetes runtime** — early, with known rough edges
+- **Local mode** — relatively stable. Increasingly focused on local "workstation" mode where a full local server runs.
+- **Single-node Hub** — Mature and is in use for many projects inside google
+- **Distributed HA** — early, with known rough edges
+
+See the [public roadmap](https://github.com/orgs/scion-frontiers/projects/5/views/2) for details.
 
 ## Disclaimers
 

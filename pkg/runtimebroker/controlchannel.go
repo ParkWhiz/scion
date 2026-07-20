@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
 	"github.com/GoogleCloudPlatform/scion/pkg/wsprotocol"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -58,6 +59,11 @@ type ControlChannelConfig struct {
 
 	// Debug enables verbose logging.
 	Debug bool
+
+	// TransportSource provides OIDC tokens for transport-layer auth (IAP).
+	TransportSource transportauth.TokenSource
+	// TransportMode controls which HTTP header carries the transport token.
+	TransportMode transportauth.HeaderMode
 
 	// OnConnectionStateChange is called when the control channel connects
 	// or disconnects. connected=true after a successful handshake,
@@ -106,6 +112,8 @@ type AgentLookup interface {
 	RuntimeCommand() string
 }
 
+const defaultMaxConcurrentDispatches = 20
+
 // ControlChannelClient manages the WebSocket connection to the Hub.
 type ControlChannelClient struct {
 	config         ControlChannelConfig
@@ -116,6 +124,10 @@ type ControlChannelClient struct {
 	log            *slog.Logger
 	streams        map[string]*StreamHandler
 	streamMu       sync.RWMutex
+
+	// dispatchSem limits concurrent async request dispatches to prevent
+	// unbounded goroutine growth under load.
+	dispatchSem chan struct{}
 
 	// Connection state
 	connected   bool
@@ -153,6 +165,7 @@ func NewControlChannelClient(config ControlChannelConfig, handlers http.Handler,
 		connectionName: connectionName,
 		log:            log,
 		streams:        make(map[string]*StreamHandler),
+		dispatchSem:    make(chan struct{}, defaultMaxConcurrentDispatches),
 	}
 }
 
@@ -233,7 +246,14 @@ func (c *ControlChannelClient) doConnect() error {
 	// for closing resp.Body in that case — otherwise the transport holds the
 	// connection open and leaks the file descriptor. Drain-and-close before
 	// returning the error.
-	conn, resp, err := wsprotocol.Dial(c.ctx, wsURL, headers)
+	//
+	// Use DialWithConfig so the broker's read limit matches the hub's write
+	// limit. The default 64KB was too small for RemoteCreateAgentRequest
+	// payloads that include InlineConfig, resolved env/secrets, and a JWT
+	// (see issue #165). 1MB aligns with the hub-side MaxMessageSize.
+	connCfg := wsprotocol.DefaultConnectionConfig()
+	connCfg.MaxMessageSize = 1024 * 1024 // 1MB
+	conn, resp, err := wsprotocol.DialWithConfig(c.ctx, wsURL, headers, connCfg)
 	if err != nil {
 		if resp != nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
@@ -301,8 +321,13 @@ func (c *ControlChannelClient) buildAuthHeaders() (http.Header, error) {
 	headers := http.Header{}
 
 	if len(c.config.SecretKey) == 0 {
-		// No auth configured
 		headers.Set("X-Scion-Broker-ID", c.config.BrokerID)
+		// Still apply transport auth even without HMAC (proxy-auth mode)
+		if c.config.TransportSource != nil {
+			if err := transportauth.ApplyHeaders(headers, c.config.TransportSource, c.config.TransportMode); err != nil {
+				return nil, fmt.Errorf("failed to apply transport auth headers: %w", err)
+			}
+		}
 		return headers, nil
 	}
 
@@ -330,6 +355,13 @@ func (c *ControlChannelClient) buildAuthHeaders() (http.Header, error) {
 	// Copy the signed headers
 	for key := range req.Header {
 		headers.Set(key, req.Header.Get(key))
+	}
+
+	// Transport-layer OIDC for IAP-protected hubs
+	if c.config.TransportSource != nil {
+		if err := transportauth.ApplyHeaders(headers, c.config.TransportSource, c.config.TransportMode); err != nil {
+			return nil, fmt.Errorf("failed to apply transport auth headers: %w", err)
+		}
 	}
 
 	return headers, nil
@@ -467,11 +499,39 @@ func (c *ControlChannelClient) handleMessage(data []byte) error {
 	}
 }
 
-// handleRequest processes a tunneled HTTP request.
-func (c *ControlChannelClient) handleRequest(data []byte) (retErr error) {
+// handleRequest parses the request envelope and dispatches it asynchronously
+// so the message loop is never blocked by slow HTTP handlers (e.g. container
+// creation that can take 60-90s). Without this, the single-threaded message
+// loop cannot call ReadMessage while a handler is running, pong frames are
+// never consumed, and the hub's PongWait expires — dropping the WebSocket.
+func (c *ControlChannelClient) handleRequest(data []byte) error {
 	var req wsprotocol.RequestEnvelope
 	if err := json.Unmarshal(data, &req); err != nil {
 		return fmt.Errorf("failed to parse request: %w", err)
+	}
+
+	if c.config.Debug {
+		c.log.Debug("Control channel request", "method", req.Method, "path", req.Path)
+	}
+
+	conn := c.conn
+	c.wg.Add(1)
+	go c.dispatchRequest(conn, req)
+	return nil
+}
+
+// dispatchRequest runs the HTTP handler for a tunneled request and sends the
+// response back over the WebSocket. It acquires the dispatch semaphore to
+// bound concurrency and releases it when done.
+func (c *ControlChannelClient) dispatchRequest(conn *wsprotocol.Connection, req wsprotocol.RequestEnvelope) {
+	defer c.wg.Done()
+
+	// Acquire dispatch semaphore to limit concurrent goroutines.
+	select {
+	case c.dispatchSem <- struct{}{}:
+		defer func() { <-c.dispatchSem }()
+	case <-c.ctx.Done():
+		return
 	}
 
 	// Recover from panics (e.g. httptest.NewRequest on malformed URLs) to
@@ -480,15 +540,11 @@ func (c *ControlChannelClient) handleRequest(data []byte) (retErr error) {
 		if r := recover(); r != nil {
 			c.log.Error("Panic in control channel request handler", "panic", r, "method", req.Method, "path", req.Path)
 			resp := wsprotocol.NewResponseEnvelope(req.RequestID, http.StatusBadRequest, nil, []byte(fmt.Sprintf(`{"error":"request caused panic: %v"}`, r)))
-			if writeErr := c.conn.WriteJSON(resp); writeErr != nil {
-				retErr = fmt.Errorf("failed to send panic error response: %w", writeErr)
+			if writeErr := conn.WriteJSON(resp); writeErr != nil {
+				c.log.Error("Failed to send panic error response", "error", writeErr)
 			}
 		}
 	}()
-
-	if c.config.Debug {
-		c.log.Debug("Control channel request", "method", req.Method, "path", req.Path)
-	}
 
 	// Build HTTP request
 	path := req.Path
@@ -527,8 +583,9 @@ func (c *ControlChannelClient) handleRequest(data []byte) (retErr error) {
 
 	resp := wsprotocol.NewResponseEnvelope(req.RequestID, result.StatusCode, headers, respBody)
 
-	// Send response
-	return c.conn.WriteJSON(resp)
+	if err := conn.WriteJSON(resp); err != nil {
+		c.log.Error("Failed to send response", "error", err, "requestID", req.RequestID)
+	}
 }
 
 // handleStreamOpen processes a stream open request.

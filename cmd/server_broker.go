@@ -136,6 +136,51 @@ func registerGlobalProjectAndBroker(ctx context.Context, s store.Store, brokerID
 		}
 	}
 
+	// Re-assign agents orphaned by broker ID changes.
+	// An agent is orphaned when its RuntimeBrokerID points to a broker that
+	// is offline/missing AND the agent is not in a terminal state.
+	// Guard: agents under active remote brokers are NOT reassigned.
+	orphaned, orphanErr := s.FindOrphanedAgents(ctx, brokerID)
+	if orphanErr != nil {
+		log.Printf("Warning: failed to query orphaned agents: %v", orphanErr)
+	} else if len(orphaned) > 0 {
+		// Collect distinct old broker IDs for downstream repair.
+		oldBrokerIDs := make(map[string]struct{})
+		for _, a := range orphaned {
+			if a.RuntimeBrokerID != "" && a.RuntimeBrokerID != brokerID {
+				oldBrokerIDs[a.RuntimeBrokerID] = struct{}{}
+			}
+		}
+
+		reassigned, reassignErr := s.ReassignAgentsToBroker(ctx, orphaned, brokerID)
+		if reassignErr != nil {
+			log.Printf("Warning: failed to re-assign %d orphaned agent(s): %v", len(orphaned), reassignErr)
+		} else {
+			log.Printf("NOTICE: re-assigned %d orphaned agent(s) to broker %s", reassigned, brokerID)
+		}
+
+		// Update projects whose default broker points to an offline/missing broker.
+		for oldID := range oldBrokerIDs {
+			updated, err := s.ReassignProjectBroker(ctx, oldID, brokerID)
+			if err != nil {
+				log.Printf("Warning: failed to reassign projects from broker %s: %v", oldID, err)
+			} else if updated > 0 {
+				log.Printf("NOTICE: updated %d project(s) default broker from %s to %s", updated, oldID, brokerID)
+			}
+		}
+
+		// Mark stale broker records as offline so they don't appear active.
+		for oldID := range oldBrokerIDs {
+			if err := s.MarkBrokerOffline(ctx, oldID); err != nil {
+				if err != store.ErrNotFound {
+					log.Printf("Warning: failed to mark broker %s offline: %v", oldID, err)
+				}
+			} else {
+				log.Printf("NOTICE: marked stale broker %s as offline", oldID)
+			}
+		}
+	}
+
 	// Now that the runtime broker exists, set it as the default for the project
 	if projectNeedsDefaultBroker {
 		globalProject.DefaultRuntimeBrokerID = brokerID

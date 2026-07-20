@@ -22,7 +22,7 @@ Copilot-native concerns handled here:
   - Auth token is always exposed as COPILOT_GITHUB_TOKEN in env.json.
   - MCP servers translate to Copilot's native format in ~/.copilot/mcp-config.json
     (stdio→local, sse/streamable-http→http).
-  - Instructions project to .github/copilot-instructions.md.
+  - Instructions project to ~/.copilot/copilot-instructions.md (configurable).
   - ~/.copilot/settings.json and config.json get sane defaults.
 
 Exception to §4.2 (env.json placeholder policy): copilot receives its auth
@@ -47,6 +47,8 @@ assert scion_harness.INTERFACE_VERSION >= 2, (
     f"got {scion_harness.INTERFACE_VERSION}"
 )
 
+COPILOT_CONFIG_FILE = "~/.copilot/config.json"
+
 AUTH = scion_harness.AuthSpec(
     "copilot",
     [
@@ -58,6 +60,12 @@ AUTH = scion_harness.AuthSpec(
                 'with a fine-grained PAT that has "Copilot Requests" permission'
             ),
             env_fallback=True,
+        ),
+        scion_harness.file_method(
+            "auth-file",
+            path=COPILOT_CONFIG_FILE,
+            hint=f"provide copilot config at {COPILOT_CONFIG_FILE}",
+            secret_key="COPILOT_CONFIG",
         ),
     ],
     fallback_to_none_on_error=True,
@@ -81,12 +89,79 @@ def _read_token(ctx: scion_harness.ProvisionContext, env_key: str) -> str:
     return os.environ.get(env_key, "")
 
 
+def _write_copilot_config_file(ctx: scion_harness.ProvisionContext) -> None:
+    """Write ~/.copilot/config.json from a staged COPILOT_CONFIG file secret."""
+    content = ctx.read_file_secret("COPILOT_CONFIG")
+    if not content:
+        return
+    if not content.strip():
+        raise scion_harness.ProvisionError("COPILOT_CONFIG secret is empty")
+    try:
+        lines = [ln for ln in content.splitlines() if not ln.strip().startswith("//")]
+        json.loads("\n".join(lines))
+    except json.JSONDecodeError as exc:
+        raise scion_harness.ProvisionError(
+            f"COPILOT_CONFIG secret is not valid JSON: {exc}"
+        ) from exc
+    config_dir = scion_harness.expand_path("~/.copilot")
+    os.makedirs(config_dir, exist_ok=True)
+    target = os.path.join(config_dir, "config.json")
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+
+
 def _write_mcp_config(ctx: scion_harness.ProvisionContext, servers: dict[str, Any]) -> None:
     """Write MCP servers to ~/.copilot/mcp-config.json."""
     config_dir = os.path.join(ctx.home, ".copilot")
     os.makedirs(config_dir, exist_ok=True)
     config_path = os.path.join(config_dir, "mcp-config.json")
     scion_harness.atomic_write_json(config_path, {"mcpServers": servers})
+
+
+_COPILOT_HOOK_EVENTS = [
+    "sessionStart",
+    "sessionEnd",
+    "userPromptSubmitted",
+    "preToolUse",
+    "postToolUse",
+    "errorOccurred",
+    "agentStop",
+    "subagentStop",
+]
+
+
+def _write_hooks(home: str) -> None:
+    """Write ~/.copilot/hooks/scion.json wiring Copilot events to sciontool.
+
+    Each hook fires ``sciontool hook <event> --dialect=copilot`` which creates
+    a synthetic event and processes it through the copilot mapping dialect
+    (staged as dialect.yaml alongside this script).
+    """
+    hooks: dict[str, list[dict[str, Any]]] = {}
+    for event in _COPILOT_HOOK_EVENTS:
+        hooks[event] = [
+            {
+                "type": "command",
+                "bash": f"sciontool hook {event} --dialect=copilot",
+            }
+        ]
+
+    hooks_data: dict[str, Any] = {"version": 1, "hooks": hooks}
+
+    hooks_dir = os.path.join(home, ".copilot", "hooks")
+    os.makedirs(hooks_dir, exist_ok=True)
+    hooks_path = os.path.join(hooks_dir, "scion.json")
+    try:
+        scion_harness.atomic_write_json(hooks_path, hooks_data)
+    except (OSError, PermissionError) as exc:
+        print(
+            f"copilot provision: warning: could not write hooks to "
+            f"{hooks_path}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _ensure_settings(ctx: scion_harness.ProvisionContext) -> None:
@@ -123,8 +198,12 @@ def _ensure_settings(ctx: scion_harness.ProvisionContext) -> None:
         except (OSError, json.JSONDecodeError):
             pass
 
-    if "trustedFolders" not in config:
+    folders = config.get("trustedFolders")
+    if not isinstance(folders, list):
         config["trustedFolders"] = [ctx.workspace]
+        scion_harness.atomic_write_json(config_path, config)
+    elif ctx.workspace not in folders:
+        folders.append(ctx.workspace)
         scion_harness.atomic_write_json(config_path, config)
 
 
@@ -142,6 +221,7 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
         resolved = scion_harness.ResolvedAuth(method="none")
 
     env: dict[str, str] = {}
+    extra: dict[str, Any] | None = None
     if resolved.method == "api-key" and resolved.env_key:
         secret = _read_token(ctx, resolved.env_key)
         if not secret:
@@ -151,9 +231,16 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
             )
         env["COPILOT_GITHUB_TOKEN"] = secret
 
-    ctx.write_outputs(resolved, env=env)
+    if resolved.method == "auth-file":
+        _write_copilot_config_file(ctx)
+        extra = {"config_file_written": True}
 
-    target = os.path.join(ctx.workspace, ".github", "copilot-instructions.md")
+    ctx.write_outputs(resolved, env=env, extra=extra)
+
+    harness_cfg = ctx.harness_config
+    instructions_file = harness_cfg.get('instructions_file') or '.copilot/copilot-instructions.md'
+    target = os.path.join(ctx.home, instructions_file)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
     try:
         scion_harness.project_instructions(ctx, target)
     except OSError as exc:
@@ -195,6 +282,8 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
     scion_harness.apply_mcp_translated(
         ctx, translate_mcp, lambda servers: _write_mcp_config(ctx, servers)
     )
+
+    _write_hooks(ctx.home)
 
     try:
         _ensure_settings(ctx)

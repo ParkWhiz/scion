@@ -97,6 +97,7 @@ export default defineConfig({
 						{ label: 'Installation', slug: 'getting-started/install' },
 						{ label: 'Onboarding Wizard', slug: 'getting-started/onboarding' },
 						{ label: 'Tutorial', slug: 'getting-started/tutorial' },
+						{ label: 'Setting Up Telegram', slug: 'getting-started/telegram' },
 					],
 				},
 				{
@@ -108,6 +109,7 @@ export default defineConfig({
 						{ label: 'Workspaces & Sharing Modes', slug: 'local/workspaces-and-sharing' },
 						{ label: 'Templates & Roles', slug: 'local/templates' },
 						{ label: 'Skills (Authoring & Publishing)', slug: 'local/skills' },
+						{ label: 'GCP Skill Registry', slug: 'local/skill-registry-gcp' },
 						{ label: 'Agent Credentials', slug: 'local/agent-credentials' },
 						{ label: 'Custom Images', slug: 'local/custom-images' },
 						{ label: 'Tmux Sessions', slug: 'local/tmux' },
@@ -166,11 +168,11 @@ export default defineConfig({
 				},
 				{
 					label: 'Technical Reference',
-					autogenerate: { directory: 'reference' },
+					items: [{ autogenerate: { directory: 'reference' } }],
 				},
 				{
 					label: 'Contributing',
-					autogenerate: { directory: 'contributing' },
+					items: [{ autogenerate: { directory: 'contributing' } }],
 				},
 			],
 		}),

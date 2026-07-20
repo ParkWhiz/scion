@@ -30,6 +30,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/daemon"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubsync"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth/adcsource"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/version"
 	"github.com/google/uuid"
@@ -62,6 +64,10 @@ var (
 	brokerBrokerID    string // --broker flag for remote broker operations
 	brokerMakeDefault bool   // --make-default flag to set broker as project default
 	brokerHubFlag     string // --hub flag to target a specific hub connection
+
+	// broker register transport flags
+	brokerTransportMode     string
+	brokerTransportAudience string
 
 	// broker hubs flags
 	brokerHubsJSON bool
@@ -338,6 +344,8 @@ func init() {
 	brokerRegisterCmd.Flags().BoolVar(&brokerForceRegister, "force", false, "Force re-registration even if already registered")
 	brokerRegisterCmd.Flags().BoolVar(&brokerAutoProvide, "auto-provide", false, "Automatically add as provider for new projects")
 	brokerRegisterCmd.Flags().StringVar(&brokerHubName, "name", "", "Name for this hub connection (derived from endpoint if not specified)")
+	brokerRegisterCmd.Flags().StringVar(&brokerTransportMode, "transport-mode", "", "Transport auth mode: 'iap' or 'cloudrun_invoker' (overrides SCION_TRANSPORT_MODE)")
+	brokerRegisterCmd.Flags().StringVar(&brokerTransportAudience, "transport-audience", "", "Transport auth OIDC audience (overrides SCION_TRANSPORT_AUDIENCE)")
 
 	// Deregister flags
 	brokerDeregisterCmd.Flags().BoolVar(&brokerDeregisterBrokerOnly, "broker-only", false, "Only remove broker record, not project providers")
@@ -577,14 +585,26 @@ func runBrokerRegister(cmd *cobra.Command, args []string) error {
 
 		brokerID = joinResp.BrokerID
 
+		// Resolve transport config from flags, then env
+		transportMode := brokerTransportMode
+		if transportMode == "" {
+			transportMode = os.Getenv(transportauth.EnvTransportMode)
+		}
+		transportAudience := brokerTransportAudience
+		if transportAudience == "" {
+			transportAudience = os.Getenv(transportauth.EnvTransportAudience)
+		}
+
 		// Save credentials to MultiStore
 		newCreds := &brokercredentials.BrokerCredentials{
-			Name:         hubName,
-			BrokerID:     brokerID,
-			SecretKey:    joinResp.SecretKey,
-			HubEndpoint:  endpoint,
-			AuthMode:     brokercredentials.AuthModeHMAC,
-			RegisteredAt: time.Now(),
+			Name:              hubName,
+			BrokerID:          brokerID,
+			SecretKey:         joinResp.SecretKey,
+			HubEndpoint:       endpoint,
+			AuthMode:          brokercredentials.AuthModeHMAC,
+			RegisteredAt:      time.Now(),
+			TransportMode:     transportMode,
+			TransportAudience: transportAudience,
 		}
 		if err := multiStore.Save(newCreds); err != nil {
 			fmt.Printf("Warning: failed to save broker credentials: %v\n", err)
@@ -1984,6 +2004,15 @@ func getHubClientForConnection(name string) (hubclient.Client, error) {
 		} else {
 			opts = append(opts, hubclient.WithAutoDevAuth())
 		}
+	}
+
+	// Transport auth for IAP-protected hubs
+	src, mode, err := transportauth.ResolveBrokerTransport(creds.TransportMode, creds.TransportAudience, adcsource.New)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve transport auth: %w", err)
+	}
+	if src != nil {
+		opts = append(opts, hubclient.WithTransportAuth(src, mode))
 	}
 
 	client, err := hubclient.New(creds.HubEndpoint, opts...)

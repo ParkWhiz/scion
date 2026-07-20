@@ -17,9 +17,11 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -71,6 +73,7 @@ type IntegrationManager interface {
 	ListPlugins() []string
 	HasPlugin(pluginType, name string) bool
 	GetPluginConfig(pluginType, name string) map[string]string
+	GetPluginConfigFile(pluginType, name string) string
 	IsSelfManaged(pluginType, name string) bool
 	GetDeploymentMode(pluginType, name string) plugin.DeploymentMode
 	ConfigureBroker(name string, extra map[string]string) error
@@ -80,6 +83,7 @@ type IntegrationManager interface {
 	BrokerInfo(name string) (version, channelID string, capabilities []string, err error)
 	UpdatePlugin(name string, repoPath string) error
 	InstallPlugin(name, repoPath, pluginsDir, configFile string) error
+	LoadOne(pluginType, name string, entry plugin.PluginEntry, pluginsDir string) error
 	GetBroker(name string) (eventbus.EventBus, error)
 	GetGRPCBrokerAdapter(name string) plugin.GRPCBrokerClient
 }
@@ -272,11 +276,13 @@ func (s *Server) handleListIntegrations(w http.ResponseWriter, r *http.Request) 
 
 	plugins := mgr.ListPlugins()
 	summaries := make([]IntegrationSummary, 0, len(plugins))
+	seen := make(map[string]bool, len(plugins))
 	for _, key := range plugins {
 		name := pluginNameFromKey(key)
 		if name == "" {
 			continue
 		}
+		seen[name] = true
 
 		summary := IntegrationSummary{
 			Name:           name,
@@ -289,6 +295,32 @@ func (s *Server) handleListIntegrations(w http.ResponseWriter, r *http.Request) 
 		summaries = append(summaries, summary)
 	}
 
+	// Union-merge installed-but-unconfigured plugins from settings.yaml.
+	// When LoadOne fails (e.g. bot_token missing at first install), the plugin
+	// is never in mgr.clients and won't appear above — but it IS in
+	// settings.yaml and should still be listed so the user can configure it.
+	globalDir, err := config.GetGlobalDir()
+	if err == nil {
+		if vs, err := config.LoadSingleFileVersioned(globalDir); err == nil {
+			if vs.Server != nil && vs.Server.Plugins != nil {
+				for name := range vs.Server.Plugins.Broker {
+					if seen[name] {
+						continue
+					}
+					summaries = append(summaries, IntegrationSummary{
+						Name:     name,
+						Platform: resolvePlatform(name),
+						Status: &IntegrationStatus{
+							Connected: false,
+							Message:   "Plugin installed — configure bot_token to activate",
+						},
+						HasSecrets: s.checkIntegrationSecrets(r.Context(), name),
+					})
+				}
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, summaries)
 }
 
@@ -298,6 +330,21 @@ func (s *Server) handleGetIntegration(w http.ResponseWriter, r *http.Request, na
 	s.mu.RUnlock()
 
 	if mgr == nil || !mgr.HasPlugin("broker", name) {
+		// Fallback: plugin may be in settings.yaml but not loaded (e.g. bot_token
+		// was missing at startup so LoadOne failed). Return a stub detail so the
+		// UI can show the configuration form instead of an error toast.
+		if installedPluginSettingsEntry(name) != nil {
+			writeJSON(w, http.StatusOK, IntegrationDetail{
+				Name:     name,
+				Platform: resolvePlatform(name),
+				Settings: map[string]string{},
+				Status: &IntegrationStatus{
+					Connected: false,
+					Message:   "Plugin installed — configure required fields to activate",
+				},
+			})
+			return
+		}
 		NotFound(w, "integration")
 		return
 	}
@@ -345,7 +392,10 @@ func (s *Server) resolveIntegrationSettings(ctx context.Context, mgr Integration
 		return runtimeCfg
 	}
 
-	configFile := runtimeCfg["config_file"]
+	configFile := mgr.GetPluginConfigFile("broker", name)
+	if configFile == "" {
+		configFile = runtimeCfg["config_file"]
+	}
 	if configFile != "" {
 		if settings, err := config.ResolvePluginConfig(configFile, nil); err == nil {
 			for k, v := range runtimeCfg {
@@ -366,9 +416,33 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 	mgr := s.pluginManager
 	s.mu.RUnlock()
 
-	if mgr == nil || !mgr.HasPlugin("broker", name) {
+	if mgr == nil {
 		NotFound(w, "integration")
 		return
+	}
+
+	loaded := mgr.HasPlugin("broker", name)
+	var settingsEntry *config.V1PluginEntry
+	if !loaded {
+		// Mirror handleGetIntegration's fallback: the plugin may be registered
+		// in settings.yaml but not loaded — on a fresh install LoadOne fails
+		// because required fields (e.g. bot_token) don't exist yet. GET already
+		// returns a stub so the UI can show the config form; PUT must accept
+		// that form's submission, otherwise the required fields can never be
+		// saved and the integration can never activate.
+		settingsEntry = installedPluginSettingsEntry(name)
+		if settingsEntry == nil {
+			NotFound(w, "integration")
+			return
+		}
+	}
+
+	isHA := false
+	if loaded {
+		isHA = s.isHAIntegration(mgr, name)
+	} else {
+		pe := plugin.PluginEntry{SelfManaged: settingsEntry.SelfManaged, Mode: settingsEntry.Mode}
+		isHA = pe.ResolvedDeploymentMode() == plugin.DeploymentModeHA
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -413,7 +487,7 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 		var provider config.IntegrationConfigProvider
 		var haConfigTx *ent.Tx
 
-		if s.isHAIntegration(mgr, name) {
+		if isHA {
 			if !s.requirePostgres(w) {
 				return
 			}
@@ -433,10 +507,17 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 			provider = pgProvider
 			haConfigTx = haTx
 		} else {
-			pluginCfg := mgr.GetPluginConfig("broker", name)
 			configFile := ""
-			if pluginCfg != nil {
-				configFile = pluginCfg["config_file"]
+			if loaded {
+				configFile = mgr.GetPluginConfigFile("broker", name)
+				if configFile == "" {
+					pluginCfg := mgr.GetPluginConfig("broker", name)
+					if pluginCfg != nil {
+						configFile = pluginCfg["config_file"]
+					}
+				}
+			} else {
+				configFile = settingsEntry.ConfigFile
 			}
 
 			if configFile == "" {
@@ -495,11 +576,26 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 	// Reconfigure the running integration with updated config.
 	// For HA integrations the DB write + NOTIFY is the reconfigure path —
 	// pushing a hub-side merge over gRPC would race with the DB-backed reload.
-	if !s.isHAIntegration(mgr, name) {
-		if err := s.reconfigureIntegration(r.Context(), mgr, name); err != nil {
-			slog.Error("Failed to reconfigure integration after config update", "plugin", name, "error", err)
-			InternalError(w)
-			return
+	if loaded {
+		if !isHA {
+			if err := s.reconfigureIntegration(r.Context(), mgr, name); err != nil {
+				slog.Error("Failed to reconfigure integration after config update", "plugin", name, "error", err)
+				InternalError(w)
+				return
+			}
+		}
+	} else {
+		// The plugin was installed but never loaded (required fields were
+		// missing at install/startup). Now that config and secrets are saved,
+		// try to activate it. Failure is non-fatal: the config is persisted,
+		// and the plugin will load on the next server restart once all its
+		// required fields are present.
+		if err := s.activateInstalledIntegration(ctx, mgr, name, settingsEntry); err != nil {
+			slog.Warn("Config saved but plugin activation failed (likely still missing required fields)",
+				"plugin", name, "error", err)
+		} else {
+			s.refreshBrokerSpoke(mgr, name)
+			slog.Info("Plugin activated after config update", "plugin", name)
 		}
 	}
 
@@ -527,7 +623,38 @@ func (s *Server) handleRestartIntegration(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	// Post-restart validation: check that the plugin is wired into the FanOut.
+	warnings := s.validateIntegrationWiring(name)
+
+	response := map[string]interface{}{
+		"status": "ok",
+	}
+	if len(warnings) > 0 {
+		response["warnings"] = warnings
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+// validateIntegrationWiring checks that the named plugin is wired into the
+// FanOut event bus as a spoke. Returns warnings for any issues found.
+func (s *Server) validateIntegrationWiring(name string) []string {
+	var warnings []string
+
+	proxy := s.GetMessageBrokerProxy()
+	if proxy == nil {
+		warnings = append(warnings, "message broker not initialized")
+		return warnings
+	}
+	fanout, ok := proxy.bus.(*eventbus.FanOutEventBus)
+	if !ok {
+		return warnings
+	}
+	if !fanout.HasSpoke(name) {
+		warnings = append(warnings, fmt.Sprintf("plugin %q is not wired into the FanOut event bus — messages will not be routed", name))
+	}
+
+	return warnings
 }
 
 func (s *Server) handleIntegrationHealth(w http.ResponseWriter, r *http.Request, name string) {
@@ -617,26 +744,35 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 	}
 
 	repoPath := s.config.MaintenanceConfig.RepoPath
-	if repoPath == "" {
-		slog.Error("No repository path configured for plugin install")
-		InternalError(w)
+	binaryName := "scion-plugin-" + name
+	_, lookPathErr := exec.LookPath(binaryName)
+	binaryOnPath := lookPathErr == nil
+
+	if repoPath == "" && !binaryOnPath {
+		slog.Error("No repository path configured and plugin binary not found on PATH",
+			"plugin", name, "binary", binaryName)
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"Plugin installation requires either a repository path or the plugin binary on PATH", nil)
 		return
 	}
 
-	sourceDir := filepath.Join(repoPath, "extras", "scion-"+name)
-	if _, err := os.Stat(sourceDir); err != nil {
-		NotFound(w, "plugin source")
-		return
-	}
+	// Source-dir check and build lock only apply when building from source.
+	if repoPath != "" {
+		sourceDir := filepath.Join(repoPath, "extras", "scion-"+name)
+		if _, err := os.Stat(sourceDir); err != nil {
+			NotFound(w, "plugin source")
+			return
+		}
 
-	mu := acquirePluginBuildLock(name)
-	if mu == nil {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "a build is already in progress for this integration",
-		})
-		return
+		mu := acquirePluginBuildLock(name)
+		if mu == nil {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "a build is already in progress for this integration",
+			})
+			return
+		}
+		defer releasePluginBuildLock(name)
 	}
-	defer releasePluginBuildLock(name)
 
 	pluginsDir, err := plugin.DefaultPluginsDir()
 	if err != nil {
@@ -674,14 +810,37 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := mgr.InstallPlugin(name, repoPath, pluginsDir, configFilePath); err != nil {
-		slog.Error("Failed to install integration", "plugin", name, "error", err)
-		InternalError(w)
-		return
+	if repoPath != "" {
+		// Build from source (dev mode).
+		if err := mgr.InstallPlugin(name, repoPath, pluginsDir, configFilePath); err != nil {
+			slog.Error("Failed to install integration", "plugin", name, "error", err)
+			// Use a sanitized message — raw error may contain compiler output and host paths.
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"Plugin installation failed — check server logs for details", nil)
+			return
+		}
+	} else {
+		// Binary is already on PATH (Homebrew/package-manager install).
+		// Config file and settings.yaml were written above — no build needed.
+		slog.Info("Plugin binary found on PATH, skipping build", "plugin", name, "binary", binaryName)
+
+		binaryPath, _ := exec.LookPath(binaryName)
+		if err := mgr.LoadOne(plugin.PluginTypeBroker, name, plugin.PluginEntry{Path: binaryPath, ConfigFile: configFilePath}, pluginsDir); err != nil {
+			// LoadOne failing due to missing required config (e.g. bot_token) is
+			// expected on first install — the plugin is installed but not yet
+			// configured. Log a warning and continue; the operator must configure
+			// the plugin via the admin UI before it becomes active.
+			slog.Warn("Plugin installed but not yet configured (LoadOne failed, likely missing required fields)",
+				"plugin", name, "error", err)
+		}
 	}
 
 	if err := s.reconfigureIntegration(r.Context(), mgr, name); err != nil {
-		slog.Warn("Plugin installed but reconfigure failed", "plugin", name, "error", err)
+		// Plugin is already written to disk and registered in settings.yaml.
+		// Returning 500 would leave an inconsistent state (installed on disk,
+		// error reported to client). Treat as a non-fatal warning; the operator
+		// can reconfigure via the admin UI.
+		slog.Warn("Plugin installed but initial reconfigure failed", "plugin", name, "error", err)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -694,19 +853,48 @@ func (s *Server) handleListAvailableIntegrations(w http.ResponseWriter, _ *http.
 
 	repoPath := s.config.MaintenanceConfig.RepoPath
 
+	// Load settings.yaml once so we can skip plugins that are registered there
+	// (installed but unconfigured — LoadOne failed so they're not in mgr).
+	var settingsBroker map[string]struct{}
+	if globalDir, err := config.GetGlobalDir(); err == nil {
+		if vs, err := config.LoadSingleFileVersioned(globalDir); err == nil {
+			if vs.Server != nil && vs.Server.Plugins != nil {
+				settingsBroker = make(map[string]struct{}, len(vs.Server.Plugins.Broker))
+				for k := range vs.Server.Plugins.Broker {
+					settingsBroker[k] = struct{}{}
+				}
+			}
+		}
+	}
+
 	var available []AvailableIntegration
 	for _, name := range knownPlugins {
 		if mgr != nil && mgr.HasPlugin("broker", name) {
 			continue
 		}
-		if repoPath != "" {
-			sourceDir := filepath.Join(repoPath, "extras", "scion-"+name)
-			if _, err := os.Stat(sourceDir); err != nil {
-				continue
-			}
-		} else {
+		// Also skip if registered in settings.yaml (installed but not yet loaded).
+		if _, ok := settingsBroker[name]; ok {
 			continue
 		}
+
+		binaryName := "scion-plugin-" + name
+
+		// Check 1: binary is on $PATH (covers Homebrew / package-manager installs).
+		_, onPathErr := exec.LookPath(binaryName)
+
+		// Check 2: source checkout exists (covers development installs).
+		inSourceCheckout := false
+		if repoPath != "" {
+			sourceDir := filepath.Join(repoPath, "extras", "scion-"+name)
+			if _, err := os.Stat(sourceDir); err == nil {
+				inSourceCheckout = true
+			}
+		}
+
+		if onPathErr != nil && !inSourceCheckout {
+			continue // neither binary on PATH nor source checkout found
+		}
+
 		available = append(available, AvailableIntegration{
 			Name:     name,
 			Platform: resolvePlatform(name),
@@ -720,6 +908,72 @@ func (s *Server) handleListAvailableIntegrations(w http.ResponseWriter, _ *http.
 }
 
 // --- Helpers ---
+
+// installedPluginSettingsEntry returns the settings.yaml broker entry for the
+// named plugin, or nil if the plugin is not registered there. Used as the
+// fallback identity check for plugins that are installed (present in
+// settings.yaml) but not loaded into the manager (LoadOne failed because
+// required fields were missing).
+func installedPluginSettingsEntry(name string) *config.V1PluginEntry {
+	globalDir, err := config.GetGlobalDir()
+	if err != nil {
+		return nil
+	}
+	vs, err := config.LoadSingleFileVersioned(globalDir)
+	if err != nil || vs.Server == nil || vs.Server.Plugins == nil {
+		return nil
+	}
+	entry, ok := vs.Server.Plugins.Broker[name]
+	if !ok {
+		return nil
+	}
+	return &entry
+}
+
+// activateInstalledIntegration loads a plugin that is registered in
+// settings.yaml but not yet running. It builds the same fully-resolved config
+// map that server startup builds — file settings, secret-backend secrets, and
+// hub wiring credentials — so the plugin's Configure call succeeds on load.
+func (s *Server) activateInstalledIntegration(ctx context.Context, mgr IntegrationManager, name string, entry *config.V1PluginEntry) error {
+	merged, err := config.ResolvePluginConfig(entry.ConfigFile, entry.Config)
+	if err != nil {
+		slog.Warn("Failed to resolve config file for plugin activation", "plugin", name, "error", err)
+		merged = make(map[string]string)
+	}
+
+	for _, m := range config.PluginSecretKeyMap[name] {
+		if merged[m.ConfigKey] != "" {
+			continue
+		}
+		if val, err := s.LoadChatIntegrationSecret(ctx, m.SecretKey); err == nil && val != "" {
+			merged[m.ConfigKey] = val
+		}
+	}
+
+	for k, v := range s.getPluginHubCreds(ctx, name) {
+		if v != "" {
+			merged[k] = v
+		}
+	}
+
+	pluginsDir, err := plugin.DefaultPluginsDir()
+	if err != nil {
+		return err
+	}
+
+	return mgr.LoadOne(plugin.PluginTypeBroker, name, plugin.PluginEntry{
+		Path:          entry.Path,
+		Config:        merged,
+		ConfigFile:    entry.ConfigFile,
+		SelfManaged:   entry.SelfManaged,
+		Mode:          entry.Mode,
+		Address:       entry.Address,
+		TLSCertFile:   entry.TLSCertFile,
+		TLSKeyFile:    entry.TLSKeyFile,
+		TLSCAFile:     entry.TLSCAFile,
+		TLSSkipVerify: entry.TLSSkipVerify,
+	}, pluginsDir)
+}
 
 // pluginNameFromKey extracts the plugin name from a "type:name" key,
 // returning only broker plugin names.
@@ -909,9 +1163,10 @@ func (s *Server) getPluginHubCreds(ctx context.Context, name string) map[string]
 func (s *Server) reconfigureIntegration(ctx context.Context, mgr IntegrationManager, name string) error {
 	pluginCfg := mgr.GetPluginConfig("broker", name)
 
-	// Re-read config file if one is configured.
-	configFile := ""
-	if pluginCfg != nil {
+	// Re-read config file if one is configured. Prefer the immutable
+	// configFiles store over the mutable runtime config map.
+	configFile := mgr.GetPluginConfigFile("broker", name)
+	if configFile == "" && pluginCfg != nil {
 		configFile = pluginCfg["config_file"]
 	}
 
@@ -964,6 +1219,13 @@ func (s *Server) reconfigureIntegration(ctx context.Context, mgr IntegrationMana
 		}
 	}
 
+	// Preserve the config_file path in the merged map so that
+	// ReplaceBrokerConfig doesn't overwrite dp.Config with a map that
+	// lacks the key, which would cause subsequent reloads to lose it.
+	if configFile != "" {
+		merged["config_file"] = configFile
+	}
+
 	if err := mgr.ReplaceBrokerConfig(name, merged); err != nil {
 		if mgr.IsSelfManaged("broker", name) {
 			slog.Warn("ReplaceBrokerConfig failed for self-managed plugin, trying Reconnect",
@@ -1014,7 +1276,14 @@ func (s *Server) refreshBrokerSpoke(mgr IntegrationManager, name string) {
 		ChannelID: channelID,
 	}
 	if err := fanout.ReplaceSpoke(name, spoke); err != nil {
-		slog.Error("Failed to replace broker spoke", "plugin", name, "error", err)
+		// No existing spoke — the plugin was activated after startup (e.g. it
+		// failed to load at boot and was configured via the admin UI). Add it.
+		if addErr := fanout.AddSpoke(spoke); addErr != nil {
+			slog.Error("Failed to replace or add broker spoke", "plugin", name,
+				"replace_error", err, "add_error", addErr)
+		} else {
+			slog.Info("Added broker spoke for newly activated plugin", "plugin", name)
+		}
 	} else {
 		slog.Info("Replaced broker spoke after plugin restart", "plugin", name)
 	}

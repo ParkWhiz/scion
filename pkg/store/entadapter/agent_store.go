@@ -17,6 +17,7 @@ package entadapter
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -27,6 +28,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -769,4 +772,126 @@ func parseUUIDList(ids []string) []uuid.UUID {
 		}
 	}
 	return out
+}
+
+// FindOrphanedAgents returns non-terminal agents whose RuntimeBrokerID
+// references a broker that is offline or does not exist. Agents assigned to
+// currentBrokerID are excluded so that a running multi-broker setup does not
+// have its agents reassigned.
+func (s *AgentStore) FindOrphanedAgents(ctx context.Context, currentBrokerID string) ([]*store.Agent, error) {
+	parsedID, parseErr := uuid.Parse(currentBrokerID)
+	if parseErr != nil {
+		return nil, fmt.Errorf("invalid currentBrokerID %q: %w", currentBrokerID, parseErr)
+	}
+
+	// Collect IDs of all online brokers (excluding the current one, which may
+	// not be stamped online yet during startup).
+	onlineBrokers, err := s.client.RuntimeBroker.Query().
+		Where(
+			runtimebroker.StatusEQ(store.BrokerStatusOnline),
+			runtimebroker.IDNEQ(parsedID),
+		).
+		Select(runtimebroker.FieldID).
+		All(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the set of broker IDs whose agents must NOT be touched:
+	// the current broker + every online remote broker.
+	excludeIDs := make([]string, 0, len(onlineBrokers)+1)
+	excludeIDs = append(excludeIDs, currentBrokerID)
+	for _, b := range onlineBrokers {
+		excludeIDs = append(excludeIDs, b.ID.String())
+	}
+
+	// Terminal phases: agents in these states should not be reassigned.
+	terminalPhases := []string{"stopped", "error"}
+
+	rows, err := s.client.Agent.Query().
+		Where(
+			agent.RuntimeBrokerIDNotIn(excludeIDs...),
+			agent.RuntimeBrokerIDNEQ(""),        // Must have a broker assignment
+			agent.PhaseNotIn(terminalPhases...), // Not in a terminal state
+			agent.DeletedAtIsNil(),              // Not soft-deleted
+		).
+		All(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	agents := make([]*store.Agent, 0, len(rows))
+	for _, a := range rows {
+		sa := entAgentToStore(a)
+		agents = append(agents, sa)
+	}
+	return agents, nil
+}
+
+// ReassignAgentsToBroker bulk-updates the RuntimeBrokerID of the given agents
+// to the specified broker ID. Returns the number of agents actually updated.
+func (s *AgentStore) ReassignAgentsToBroker(ctx context.Context, agents []*store.Agent, brokerID string) (int, error) {
+	if len(agents) == 0 {
+		return 0, nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(agents))
+	for _, a := range agents {
+		uid, err := uuid.Parse(a.ID)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, uid)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	affected, err := s.client.Agent.Update().
+		Where(agent.IDIn(ids...)).
+		SetRuntimeBrokerID(brokerID).
+		Save(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
+// ReassignProjectBroker updates projects whose DefaultRuntimeBrokerID matches
+// oldBrokerID to point to newBrokerID. It applies the same multi-broker safety
+// guard as FindOrphanedAgents: the old broker must be offline or missing — if
+// it is still online, no projects are updated (it's a legitimate remote
+// broker). Returns the number of projects updated.
+func (s *AgentStore) ReassignProjectBroker(ctx context.Context, oldBrokerID, newBrokerID string) (int, error) {
+	if oldBrokerID == newBrokerID {
+		return 0, nil
+	}
+
+	// Safety guard: check if the old broker is still online. If so, it is a
+	// legitimate remote broker and its projects must not be touched.
+	oldUID, err := uuid.Parse(oldBrokerID)
+	if err != nil {
+		return 0, fmt.Errorf("invalid oldBrokerID %q: %w", oldBrokerID, err)
+	}
+
+	oldBroker, err := s.client.RuntimeBroker.Query().
+		Where(runtimebroker.IDEQ(oldUID)).
+		Select(runtimebroker.FieldStatus).
+		Only(ctx)
+	if err != nil && !ent.IsNotFound(err) {
+		return 0, err
+	}
+	if err == nil && oldBroker.Status == store.BrokerStatusOnline {
+		// Old broker is still online — do not reassign its projects.
+		return 0, nil
+	}
+
+	affected, err := s.client.Project.Update().
+		Where(project.DefaultRuntimeBrokerIDEQ(oldBrokerID)).
+		SetDefaultRuntimeBrokerID(newBrokerID).
+		Save(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
 }

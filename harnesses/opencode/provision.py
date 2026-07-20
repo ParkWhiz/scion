@@ -184,6 +184,23 @@ def _translate_mcp_server(name: str, spec: dict[str, Any]) -> dict[str, Any] | N
     return None
 
 
+def _write_opencode_auth_file(ctx: sh.ProvisionContext) -> None:
+    """Write ~/.local/share/opencode/auth.json from a staged OPENCODE_AUTH file secret."""
+    if "OPENCODE_AUTH" not in ctx.file_secret_files:
+        return
+    content = ctx.read_file_secret("OPENCODE_AUTH")
+    if not content.strip():
+        raise sh.ProvisionError("OPENCODE_AUTH secret is empty")
+    try:
+        json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise sh.ProvisionError(
+            f"OPENCODE_AUTH secret is not valid JSON: {exc}"
+        ) from exc
+    target = sh.expand_path(OPENCODE_AUTH_FILE)
+    sh.atomic_write_text(target, content, mode=0o600)
+
+
 def _write_mcp_config(servers: dict[str, Any]) -> None:
     """Merge translated MCP servers into ~/.config/opencode/opencode.json."""
     config_path = sh.expand_path(OPENCODE_CONFIG_FILE)
@@ -202,6 +219,25 @@ def _write_mcp_config(servers: dict[str, Any]) -> None:
     for name, native in servers.items():
         mcp_block[name] = native
     config_data["mcp"] = mcp_block
+    sh.atomic_write_json(config_path, config_data)
+
+
+def _write_model_config(model: str) -> None:
+    """Write the resolved model into ~/.config/opencode/opencode.json."""
+    config_path = sh.expand_path(OPENCODE_CONFIG_FILE)
+    config_data: dict[str, Any] = {}
+    if os.path.isfile(config_path):
+        try:
+            existing = sh.load_json(config_path)
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        if isinstance(existing, dict):
+            config_data = existing
+
+    if model:
+        config_data["model"] = model
+    else:
+        config_data.pop("model", None)
     sh.atomic_write_json(config_path, config_data)
 
 
@@ -232,6 +268,10 @@ def provision(ctx: sh.ProvisionContext) -> None:
     extra: dict[str, Any] = {}
     env: dict[str, str] = {}
 
+    if resolved.method == "auth-file":
+        _write_opencode_auth_file(ctx)
+        extra["auth_file_written"] = True
+
     if resolved.method == "vertex-ai":
         extra["vertex_project_env"] = "VERTEXAI_PROJECT"
         extra["vertex_location_env"] = "VERTEX_LOCATION"
@@ -241,7 +281,10 @@ def provision(ctx: sh.ProvisionContext) -> None:
 
     sh.apply_mcp_translated(ctx, _translate_mcp_server, _write_mcp_config)
 
-    ctx.info(f"method={resolved.method}")
+    resolved_model = str(ctx.model_resolution.get("resolved_model") or "").strip()
+    _write_model_config(resolved_model)
+
+    ctx.info(f"method={resolved.method}" + (f" model={resolved_model}" if resolved_model else ""))
 
 
 if __name__ == "__main__":

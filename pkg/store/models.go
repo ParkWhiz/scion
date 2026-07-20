@@ -613,7 +613,8 @@ const (
 	HarnessConfigStatusArchived = "archived"
 )
 
-// HarnessConfigImageStatus constants
+// HarnessConfigImageStatus constants — reflect registry/reference validity only.
+// Local image availability is runtime-dependent and not persisted here.
 const (
 	HarnessConfigImageStatusUnknown = "unknown"
 	HarnessConfigImageStatusValid   = "valid"
@@ -1560,8 +1561,9 @@ type Message struct {
 	// DispatchState tracks cross-node delivery of the message to the broker:
 	// pending|dispatched|failed. The message row is its own durable dispatch
 	// intent (design §5.2/§6.1).
-	DispatchState string     `json:"dispatchState,omitempty"`
-	DispatchedAt  *time.Time `json:"dispatchedAt,omitempty"`
+	DispatchState         string     `json:"dispatchState,omitempty"`
+	DispatchedAt          *time.Time `json:"dispatchedAt,omitempty"`
+	DispatchFailureReason *string    `json:"dispatchFailureReason,omitempty"`
 }
 
 // MarshalJSON implements custom marshaling to support legacy groveId field.
@@ -2082,6 +2084,7 @@ type HubSetting struct {
 	Value     json.RawMessage `json:"value"`
 	Revision  int64           `json:"revision"`
 	UpdatedBy string          `json:"updatedBy,omitempty"`
+	Origin    string          `json:"origin,omitempty"`
 	CreatedAt time.Time       `json:"createdAt"`
 	UpdatedAt time.Time       `json:"updatedAt"`
 }

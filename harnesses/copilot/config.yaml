@@ -30,7 +30,7 @@ provisioner:
 config_dir: .copilot
 skills_dir: .copilot/skills
 interrupt_key: C-c
-instructions_file: .github/copilot-instructions.md
+instructions_file: .copilot/copilot-instructions.md
 system_prompt_mode: prepend_to_instructions
 
 model_aliases:
@@ -60,11 +60,10 @@ mcp:
     stdio: local
     sse: http
     streamable-http: http
-
 capabilities:
   limits:
-    max_turns: { support: "no", reason: "Copilot CLI has no hook dialect for turn events" }
-    max_model_calls: { support: "no", reason: "Copilot CLI has no hook dialect for model events" }
+    max_turns: { support: "no", reason: "Copilot CLI turn events do not carry a turn counter" }
+    max_model_calls: { support: "no", reason: "Copilot CLI does not expose model-call start/end events" }
     max_duration: { support: "yes" }
   telemetry:
     enabled: { support: "no", reason: "Copilot telemetry config surface is undocumented" }
@@ -74,7 +73,7 @@ capabilities:
     agent_instructions: { support: "yes" }
   auth:
     api_key: { support: "yes" }
-    auth_file: { support: "no", reason: "OAuth capture not implemented in initial version" }
+    auth_file: { support: "yes" }
     oauth_token: { support: "no" }
     vertex_ai: { support: "no", reason: "Copilot uses GitHub auth, not GCP" }
   mcp:
@@ -98,8 +97,16 @@ auth:
     api-key:
       required_env:
         - any_of: ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+    auth-file:
+      required_files:
+        - name: COPILOT_CONFIG
+          type: file
+          target_suffix: "/.copilot/config.json"
+          field: CopilotConfigFile
   autodetect:
     env:
       COPILOT_GITHUB_TOKEN: api-key
       GH_TOKEN: api-key
       GITHUB_TOKEN: api-key
+    files:
+      COPILOT_CONFIG: auth-file

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -327,4 +328,427 @@ func TestPublish_MediaChannelWithoutThreadID_ReturnsError(t *testing.T) {
 	err := b.Publish(context.Background(), "test-topic", msg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "forum/media channel")
+}
+
+func TestResolveRecipientChannels(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	// Seed a user mapping and conversation context.
+	require.NoError(t, store.CreateUserMapping(ctx, &DiscordUserMapping{
+		DiscordUserID:   "discord-user-1",
+		DiscordUsername: "alice_discord",
+		ScionUserID:     "scion-uuid-123",
+		ScionEmail:      "alice@example.com",
+		LinkedAt:        time.Now(),
+	}))
+	require.NoError(t, store.SetConversationContext(ctx, &ConversationContext{
+		DiscordUserID: "discord-user-1",
+		ProjectID:     "proj-1",
+		AgentSlug:     "coder",
+		LastChannelID: "channel-42",
+		LastMessageAt: time.Now(),
+	}))
+
+	b := &DiscordBroker{
+		log:   discardLogger(),
+		store: store,
+	}
+
+	t.Run("email lookup succeeds", func(t *testing.T) {
+		channels := b.resolveRecipientChannels(ctx, "user:alice@example.com", "", "proj-1", "coder")
+		assert.Equal(t, []string{"channel-42"}, channels)
+	})
+
+	t.Run("display name with recipientID fallback", func(t *testing.T) {
+		// Hub rewrites recipient to display name; email lookup fails,
+		// but recipientID-based fallback finds the correct mapping.
+		channels := b.resolveRecipientChannels(ctx, "user:Alice", "scion-uuid-123", "proj-1", "coder")
+		assert.Equal(t, []string{"channel-42"}, channels)
+	})
+
+	t.Run("display name without recipientID returns nil", func(t *testing.T) {
+		// No recipientID provided — fallback cannot execute.
+		channels := b.resolveRecipientChannels(ctx, "user:Alice", "", "proj-1", "coder")
+		assert.Nil(t, channels)
+	})
+
+	t.Run("non-user recipient returns nil", func(t *testing.T) {
+		channels := b.resolveRecipientChannels(ctx, "agent:coder", "", "proj-1", "coder")
+		assert.Nil(t, channels)
+	})
+
+	t.Run("email lookup preferred over recipientID", func(t *testing.T) {
+		// When email lookup succeeds, recipientID is not used.
+		channels := b.resolveRecipientChannels(ctx, "user:alice@example.com", "scion-uuid-123", "proj-1", "coder")
+		assert.Equal(t, []string{"channel-42"}, channels)
+	})
+
+	t.Run("fallback to latest conversation context", func(t *testing.T) {
+		// Add a second conversation context for a different agent.
+		require.NoError(t, store.SetConversationContext(ctx, &ConversationContext{
+			DiscordUserID: "discord-user-1",
+			ProjectID:     "proj-1",
+			AgentSlug:     "reviewer",
+			LastChannelID: "channel-99",
+			LastMessageAt: time.Now(),
+		}))
+		// With an unknown agent slug, should fall back to the latest context.
+		channels := b.resolveRecipientChannels(ctx, "user:Alice", "scion-uuid-123", "proj-1", "unknown-agent")
+		assert.NotNil(t, channels)
+		assert.Len(t, channels, 1)
+	})
+}
+
+// --- HealthCheck gateway_connected tests ---
+
+func TestHealthCheck_GatewayConnected(t *testing.T) {
+	b := &DiscordBroker{
+		log:              discardLogger(),
+		session:          &discordgo.Session{},
+		subs:             map[string]bool{"test.>": true},
+		sentIDs:          make(map[string]time.Time),
+		gatewayConnected: true,
+	}
+
+	status, err := b.HealthCheck()
+	require.NoError(t, err)
+	assert.Equal(t, "healthy", status.Status)
+	assert.Equal(t, "discord bot operational", status.Message)
+	assert.Equal(t, "true", status.Details["gateway_connected"])
+}
+
+func TestHealthCheck_GatewayDisconnectedWithSubs(t *testing.T) {
+	b := &DiscordBroker{
+		log:              discardLogger(),
+		session:          &discordgo.Session{},
+		subs:             map[string]bool{"test.>": true},
+		sentIDs:          make(map[string]time.Time),
+		gatewayConnected: false,
+	}
+
+	status, err := b.HealthCheck()
+	require.NoError(t, err)
+	assert.Equal(t, "degraded", status.Status)
+	assert.Contains(t, status.Message, "gateway not connected")
+	assert.Equal(t, "false", status.Details["gateway_connected"])
+}
+
+func TestHealthCheck_GatewayDisconnectedNoSubs(t *testing.T) {
+	b := &DiscordBroker{
+		log:              discardLogger(),
+		session:          &discordgo.Session{},
+		subs:             map[string]bool{},
+		sentIDs:          make(map[string]time.Time),
+		gatewayConnected: false,
+	}
+
+	status, err := b.HealthCheck()
+	require.NoError(t, err)
+	// No subscriptions → no degraded status even if gateway disconnected.
+	assert.Equal(t, "healthy", status.Status)
+	assert.Equal(t, "false", status.Details["gateway_connected"])
+}
+
+func TestHealthCheck_Closed(t *testing.T) {
+	b := &DiscordBroker{
+		log:    discardLogger(),
+		closed: true,
+	}
+
+	status, err := b.HealthCheck()
+	require.NoError(t, err)
+	assert.Equal(t, "unhealthy", status.Status)
+}
+
+func TestHealthCheck_NoSession(t *testing.T) {
+	b := &DiscordBroker{
+		log:     discardLogger(),
+		session: nil,
+	}
+
+	status, err := b.HealthCheck()
+	require.NoError(t, err)
+	assert.Equal(t, "degraded", status.Status)
+	assert.Contains(t, status.Message, "not configured")
+}
+
+// --- resolveAttachmentPath tests ---
+
+func TestResolveAttachmentPath_WorkspacePaths(t *testing.T) {
+	b := &DiscordBroker{
+		log: discardLogger(),
+		projectSlugMap: map[string]string{
+			"proj-1": "my-project",
+		},
+	}
+
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		path      string
+		projectID string
+		want      string
+	}{
+		{
+			name:      "workspace with leading slash",
+			path:      "/workspace/file.txt",
+			projectID: "proj-1",
+			want:      "/home/scion/.scion/projects/my-project/file.txt",
+		},
+		{
+			name:      "workspace without leading slash",
+			path:      "workspace/file.txt",
+			projectID: "proj-1",
+			want:      "/home/scion/.scion/projects/my-project/file.txt",
+		},
+		{
+			name:      "bare workspace",
+			path:      "/workspace",
+			projectID: "proj-1",
+			want:      "/home/scion/.scion/projects/my-project",
+		},
+		{
+			name:      "relative path",
+			path:      "file.txt",
+			projectID: "proj-1",
+			want:      "/home/scion/.scion/projects/my-project/file.txt",
+		},
+		{
+			name:      "no project slug returns empty",
+			path:      "/workspace/file.txt",
+			projectID: "unknown-proj",
+			want:      "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := b.resolveAttachmentPath(ctx, tt.path, tt.projectID)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestResolveAttachmentPath_SharedDirPaths(t *testing.T) {
+	b := &DiscordBroker{
+		log: discardLogger(),
+		projectSlugMap: map[string]string{
+			"550e8400-e29b-41d4-a716-446655440000": "my-project",
+		},
+	}
+
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		path      string
+		projectID string
+		wantEnd   string // suffix to match (avoids hardcoding HOME)
+		wantEmpty bool
+	}{
+		{
+			name:      "scion-volumes path with file",
+			path:      "/scion-volumes/scratchpad/projects/chat-admin/report.png",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "project-configs/my-project__550e8400/shared-dirs/scratchpad/projects/chat-admin/report.png",
+		},
+		{
+			name:      "scion-volumes path bare dir",
+			path:      "/scion-volumes/build-cache",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "project-configs/my-project__550e8400/shared-dirs/build-cache",
+		},
+		{
+			name:      "scion-volumes with trailing slash file",
+			path:      "/scion-volumes/scratchpad/file.txt",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "project-configs/my-project__550e8400/shared-dirs/scratchpad/file.txt",
+		},
+		{
+			name:      "in-workspace scion-volumes",
+			path:      "/workspace/.scion-volumes/cache/data.bin",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEnd:   "project-configs/my-project__550e8400/shared-dirs/cache/data.bin",
+		},
+		{
+			name:      "no project slug returns empty",
+			path:      "/scion-volumes/scratchpad/file.txt",
+			projectID: "unknown-proj",
+			wantEmpty: true,
+		},
+		{
+			name:      "path traversal rejected",
+			path:      "/scion-volumes/scratchpad/../../etc/passwd",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEmpty: true,
+		},
+		{
+			name:      "path traversal in shared dir name rejected",
+			path:      "/scion-volumes/../.scion/settings.yaml",
+			projectID: "550e8400-e29b-41d4-a716-446655440000",
+			wantEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := b.resolveAttachmentPath(ctx, tt.path, tt.projectID)
+			if tt.wantEmpty {
+				assert.Empty(t, got, "resolveAttachmentPath(%q) should return empty", tt.path)
+			} else {
+				assert.True(t, strings.HasSuffix(got, filepath.FromSlash(tt.wantEnd)),
+					"resolveAttachmentPath(%q) = %q, want suffix %q", tt.path, got, tt.wantEnd)
+			}
+		})
+	}
+}
+
+func TestResolveOutboundMentions(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// User with Discord ID and username.
+	require.NoError(t, store.CreateUserMapping(ctx, &DiscordUserMapping{
+		DiscordUserID:   "100",
+		DiscordUsername: "ptone805",
+		ScionEmail:      "ptone@google.com",
+		LinkedAt:        time.Now().UTC(),
+	}))
+	// User with Discord ID but no username — should still produce <@id> mention.
+	require.NoError(t, store.CreateUserMapping(ctx, &DiscordUserMapping{
+		DiscordUserID: "200",
+		ScionEmail:    "nousername@example.com",
+		LinkedAt:      time.Now().UTC(),
+	}))
+
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "user:email replaced",
+			text: "Hey user:ptone@google.com check this",
+			want: "Hey <@100> check this",
+		},
+		{
+			name: "standalone email replaced",
+			text: "Hey ptone@google.com check this",
+			want: "Hey <@100> check this",
+		},
+		{
+			name: "user with no username still uses ID mention",
+			text: "Contact nousername@example.com please",
+			want: "Contact <@200> please",
+		},
+		{
+			name: "unknown email leaves as-is",
+			text: "Contact unknown@example.com please",
+			want: "Contact unknown@example.com please",
+		},
+		{
+			name: "email in URL skipped",
+			text: "See https://ptone@google.com/path",
+			want: "See https://ptone@google.com/path",
+		},
+		{
+			name: "mailto skipped",
+			text: "Send to mailto:ptone@google.com",
+			want: "Send to mailto:ptone@google.com",
+		},
+		{
+			name: "multiple emails",
+			text: "user:ptone@google.com and nousername@example.com",
+			want: "<@100> and <@200>",
+		},
+		{
+			name: "email at start of text",
+			text: "ptone@google.com said hello",
+			want: "<@100> said hello",
+		},
+		{
+			name: "email at end of text",
+			text: "message from ptone@google.com",
+			want: "message from <@100>",
+		},
+		{
+			name: "empty text",
+			text: "",
+			want: "",
+		},
+		{
+			name: "no emails",
+			text: "just a regular message",
+			want: "just a regular message",
+		},
+		{
+			name: "email followed by slash skipped",
+			text: "http://ptone@google.com/foo",
+			want: "http://ptone@google.com/foo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveOutboundMentions(ctx, store, tt.text)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("nil store returns text unchanged", func(t *testing.T) {
+		got := resolveOutboundMentions(ctx, nil, "ptone@google.com")
+		assert.Equal(t, "ptone@google.com", got)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// senderSlug derivation — uses shared deriveSenderSlug from format.go
+// ---------------------------------------------------------------------------
+
+func TestDeriveSenderSlug(t *testing.T) {
+	tests := []struct {
+		name      string
+		sender    string
+		agentSlug string
+		want      string
+	}{
+		{
+			name:      "sender is agent — uses sender slug",
+			sender:    "agent:builder",
+			agentSlug: "reviewer",
+			want:      "builder",
+		},
+		{
+			name:      "sender is not agent — falls back to agentSlug",
+			sender:    "user:alice@example.com",
+			agentSlug: "coder",
+			want:      "coder",
+		},
+		{
+			name:      "sender is agent and agentSlug is empty",
+			sender:    "agent:deployer",
+			agentSlug: "",
+			want:      "deployer",
+		},
+		{
+			name:      "sender is not agent and agentSlug is empty",
+			sender:    "user:bob@example.com",
+			agentSlug: "",
+			want:      "",
+		},
+		{
+			name:      "observe mode — sender differs from topic agent",
+			sender:    "agent:agent-b",
+			agentSlug: "agent-a",
+			want:      "agent-b",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveSenderSlug(tt.sender, tt.agentSlug)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

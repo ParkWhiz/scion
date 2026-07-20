@@ -15,13 +15,18 @@
 package hub
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/version"
 	yamlv3 "gopkg.in/yaml.v3"
 )
@@ -33,6 +38,9 @@ type ServerConfigResponse struct {
 	ScionVersion   string `json:"scion_version,omitempty"`
 	ScionCommit    string `json:"scion_commit,omitempty"`
 	ScionBuildTime string `json:"scion_build_time,omitempty"`
+
+	// SettingsTier indicates the settings backend: "db" or "file".
+	SettingsTier string `json:"settings_tier,omitempty"`
 
 	SchemaVersion        string                               `json:"schema_version"`
 	ActiveProfile        string                               `json:"active_profile,omitempty"`
@@ -51,6 +59,14 @@ type ServerConfigResponse struct {
 	DefaultMaxModelCalls int               `json:"default_max_model_calls,omitempty"`
 	DefaultMaxDuration   string            `json:"default_max_duration,omitempty"`
 	DefaultResources     *api.ResourceSpec `json:"default_resources,omitempty"`
+
+	// AutoInjectGcloudADC controls whether gcloud ADC is injected into agent containers.
+	AutoInjectGcloudADC bool `json:"auto_inject_gcloud_adc,omitempty"`
+
+	// EnvOverrides lists koanf keys overridden by SCION_SERVER_* env vars
+	// on this node. Present in both file-mode and DB-mode responses so the
+	// admin UI can show env-pinned fields regardless of settings tier.
+	EnvOverrides []string `json:"env_overrides,omitempty"`
 }
 
 // ServerConfigUpdateRequest is the payload for updating settings.
@@ -72,6 +88,9 @@ type ServerConfigUpdateRequest struct {
 	DefaultMaxModelCalls *int              `json:"default_max_model_calls,omitempty"`
 	DefaultMaxDuration   *string           `json:"default_max_duration,omitempty"`
 	DefaultResources     *api.ResourceSpec `json:"default_resources,omitempty"`
+
+	// AutoInjectGcloudADC controls whether gcloud ADC is injected into agent containers.
+	AutoInjectGcloudADC *bool `json:"auto_inject_gcloud_adc,omitempty"`
 }
 
 // handleAdminServerConfig handles GET/PUT /api/v1/admin/server-config.
@@ -109,6 +128,62 @@ func (s *Server) handleAdminServerConfig(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// handleAdminServerConfigSectionReset handles
+// DELETE /api/v1/admin/server-config/sections/{name}
+// Resets a managed section back to bootstrap material by deleting the DB row.
+// Postgres mode only; admin-gated. Design §3.2.4.
+func (s *Server) handleAdminServerConfigSectionReset(w http.ResponseWriter, r *http.Request) {
+	user := GetUserIdentityFromContext(r.Context())
+	if user == nil || user.Role() != "admin" {
+		Forbidden(w)
+		return
+	}
+
+	if r.Method != http.MethodDelete {
+		MethodNotAllowed(w)
+		return
+	}
+
+	ops := s.GetOperationalSettings()
+	if ops == nil || !s.IsPostgres() {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
+			"Section reset is only available in postgres mode", nil)
+		return
+	}
+
+	sectionName := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/server-config/sections/")
+	if sectionName == "" {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
+			"Section name is required", nil)
+		return
+	}
+
+	sec := opsettings.SectionByName(sectionName)
+	if sec == nil {
+		writeError(w, http.StatusNotFound, ErrCodeNotFound,
+			"Unknown section: "+sectionName, nil)
+		return
+	}
+
+	if err := ops.DeleteSection(r.Context(), sectionName); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, ErrCodeNotFound,
+				"Section not found in database: "+sectionName, nil)
+			return
+		}
+		slog.Error("Failed to reset section", "section", sectionName, "error", err)
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"Failed to reset section", nil)
+		return
+	}
+
+	slog.Info("Section reset to bootstrap", "section", sectionName, "by", user.Email())
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"reset":   true,
+		"section": sectionName,
+	})
+}
+
 // handleGetServerConfig reads and returns the global settings.yaml.
 func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 	globalDir, err := config.GetGlobalDir()
@@ -121,13 +196,19 @@ func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 	data, err := os.ReadFile(settingsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Return empty/default response if no settings file exists
-			writeJSON(w, http.StatusOK, ServerConfigResponse{
+			resp := ServerConfigResponse{
 				ScionVersion:   version.Short(),
 				ScionCommit:    version.GetCommit(),
 				ScionBuildTime: version.GetBuildTime(),
+				SettingsTier:   "file",
 				SchemaVersion:  "1",
-			})
+			}
+			envK := config.LoadEnvKoanf()
+			if envOverrides := opsettings.DetectEnvOverrides(envK); len(envOverrides) > 0 {
+				sort.Strings(envOverrides)
+				resp.EnvOverrides = envOverrides
+			}
+			writeJSON(w, http.StatusOK, resp)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to read settings file", nil)
@@ -145,6 +226,7 @@ func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 		ScionVersion:         version.Short(),
 		ScionCommit:          version.GetCommit(),
 		ScionBuildTime:       version.GetBuildTime(),
+		SettingsTier:         "file",
 		SchemaVersion:        vs.SchemaVersion,
 		ActiveProfile:        vs.ActiveProfile,
 		DefaultTemplate:      vs.DefaultTemplate,
@@ -160,6 +242,15 @@ func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 		DefaultMaxModelCalls: vs.DefaultMaxModelCalls,
 		DefaultMaxDuration:   vs.DefaultMaxDuration,
 		DefaultResources:     vs.DefaultResources,
+		AutoInjectGcloudADC:  vs.AutoInjectGcloudADC,
+	}
+
+	// Env overrides — detect SCION_SERVER_* env vars so the admin UI can
+	// show env-pinned fields in file mode too (H1).
+	envK := config.LoadEnvKoanf()
+	if envOverrides := opsettings.DetectEnvOverrides(envK); len(envOverrides) > 0 {
+		sort.Strings(envOverrides)
+		resp.EnvOverrides = envOverrides
 	}
 
 	maskSensitiveFields(&resp)
@@ -257,6 +348,22 @@ func (s *Server) reloadSettings() map[string]interface{} {
 		results["applied"] = applied
 	}
 
+	// Detect container runtime changes and reload the co-located broker.
+	// This covers the onboarding wizard flow where the user selects a
+	// different runtime (e.g. podman) after the server auto-detected one
+	// at startup. Without this, the broker continues using the stale
+	// runtime until a manual server restart.
+	s.mu.RLock()
+	reloadFn := s.runtimeReloadFunc
+	s.mu.RUnlock()
+	if reloadFn != nil {
+		if reloaded := reloadFn(); reloaded {
+			applied := results["applied"].([]string)
+			applied = append(applied, "broker_runtime")
+			results["applied"] = applied
+		}
+	}
+
 	return results
 }
 
@@ -333,6 +440,13 @@ func applySettingsUpdates(raw map[string]interface{}, req *ServerConfigUpdateReq
 	}
 	if req.DefaultResources != nil {
 		raw["default_resources"] = marshalToMap(req.DefaultResources)
+	}
+	if req.AutoInjectGcloudADC != nil {
+		if *req.AutoInjectGcloudADC {
+			raw["auto_inject_gcloud_adc"] = true
+		} else {
+			delete(raw, "auto_inject_gcloud_adc")
+		}
 	}
 }
 

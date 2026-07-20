@@ -50,7 +50,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -204,7 +203,7 @@ type MaintenanceConfig struct {
 	ImageRegistry string
 	// ImageTag is the default image tag to pull (default: "latest").
 	ImageTag string
-	// Harnesses is the list of harness names whose images should be pulled (e.g., ["claude", "gemini", "opencode", "codex"]).
+	// Harnesses is the list of harness names whose images should be pulled (e.g., ["claude", "antigravity", "opencode", "codex"]).
 	Harnesses []string
 	// RuntimeBin overrides auto-detection of the container runtime binary (docker, podman).
 	RuntimeBin string
@@ -363,10 +362,6 @@ type RuntimeBrokerClient interface {
 	// brokerID is used for HMAC authentication lookup.
 	// projectID scopes the lookup to a specific project (required for uniqueness).
 	CheckAgentPrompt(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string) (bool, error)
-
-	// FinalizeEnv sends gathered env vars to a broker to complete agent creation
-	// after an initial 202 env-gather response.
-	FinalizeEnv(ctx context.Context, brokerID, brokerEndpoint, agentID string, env map[string]string) (*RemoteAgentResponse, error)
 
 	// CreateAgentWithGather creates an agent and handles 202 env-gather responses.
 	// Returns (response, nil, nil) on success, (nil, envReqs, nil) on 202, or (nil, nil, err) on error.
@@ -597,6 +592,7 @@ type Server struct {
 	// statelessEmbeddedBroker is true when the embedded broker identity is a
 	// replica-independent API adapter rather than a process-owned control channel.
 	statelessEmbeddedBroker bool
+	runtimeReloadFunc       func() bool        // Callback to reload the co-located broker runtime; returns true if swapped
 	workstation             bool               // True when running in workstation (non-production) mode
 	scheduler               *Scheduler         // Unified scheduler for recurring tasks
 	cleanupOnce             sync.Once          // Ensures CleanupResources runs only once
@@ -621,6 +617,7 @@ type Server struct {
 	// Transport token minter for agent outbound auth (nil = transport auth disabled)
 	transportMinter   TransportTokenMinter
 	transportAudience string
+	transportMode     string
 
 	// GCP token generator for agent identity (nil = GCP identity disabled)
 	gcpTokenGenerator GCPTokenGenerator
@@ -683,9 +680,9 @@ type Server struct {
 	imageBuildActive atomic.Bool
 	imagePullActive  atomic.Bool
 
-	imageChecker      *imagecheck.Checker
-	imageManager      imageManager
-	imageStatusFlight singleflight.Group
+	imageChecker *imagecheck.Checker
+	imageManager imageManager
+	brokerClient *HybridBrokerClient
 
 	// Mode 3 (HA) integration support fields.
 	// dbDriver records the database backend ("sqlite" or "postgres") for
@@ -866,6 +863,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	if cfg.TransportMinter != nil {
 		srv.transportMinter = cfg.TransportMinter
 		srv.transportAudience = cfg.TransportAudience
+		srv.transportMode = cfg.TransportMode
 		slog.Info("Transport token minter configured",
 			"mode", cfg.TransportMode,
 			"audience", cfg.TransportAudience)
@@ -876,7 +874,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		PingInterval:   30 * time.Second,
 		PongWait:       60 * time.Second,
 		WriteWait:      10 * time.Second,
-		MaxMessageSize: 64 * 1024,
+		MaxMessageSize: 1024 * 1024, // 1MB — see issue #165
 		RequestTimeout: 120 * time.Second,
 		Debug:          cfg.Debug,
 	}, logging.Subsystem("hub.control-channel"))
@@ -1397,6 +1395,16 @@ func (s *Server) SetStatelessEmbeddedBrokerID(id string) {
 	s.statelessEmbeddedBroker = id != ""
 }
 
+// SetRuntimeReloadFunc registers a callback that reloads the co-located
+// broker's container runtime. Called during startup wiring so that
+// reloadSettings can trigger a runtime swap without a full restart.
+// The callback returns true if the runtime was actually swapped.
+func (s *Server) SetRuntimeReloadFunc(fn func() bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runtimeReloadFunc = fn
+}
+
 // GetEmbeddedBrokerID returns the co-located broker ID, if any.
 func (s *Server) GetEmbeddedBrokerID() string {
 	s.mu.RLock()
@@ -1488,9 +1496,6 @@ func (s *Server) SetIntegrationHA(dbDriver string, client *ent.Client, dsn strin
 	s.entClient = client
 	s.databaseDSN = dsn
 
-	if client != nil && s.discordLinkService != nil {
-		s.discordLinkService.SetEntClient(client)
-	}
 	s.mu.Unlock()
 
 	if client != nil {
@@ -1840,6 +1845,7 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 		if statelessBrokerID := s.GetStatelessEmbeddedBrokerID(); statelessBrokerID != "" {
 			hbc.SetStatelessLocalBrokers([]string{statelessBrokerID})
 		}
+		s.brokerClient = hbc
 		client = hbc
 	} else {
 		client = httpClient
@@ -1896,13 +1902,16 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 
 	// Configure transport token minter if available
 	if s.transportMinter != nil && s.transportAudience != "" {
-		dispatcher.SetTransportMinter(s.transportMinter, s.transportAudience)
+		dispatcher.SetTransportMinter(s.transportMinter, s.transportAudience, s.transportMode)
 	}
 
 	// Wire resource hash repair so the dispatcher can auto-fix stale DB
 	// manifests when the shared GCS bucket was updated by another hub.
 	dispatcher.SetHarnessConfigRepairer(s.syncHarnessConfigFromStorage)
 	dispatcher.SetTemplateRepairer(s.syncTemplateFromStorage)
+
+	// Set image registry so bare image names are rewritten before dispatch
+	dispatcher.SetImageRegistry(s.resolveImageRegistry())
 
 	return dispatcher
 }
@@ -2749,6 +2758,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/invites", s.handleAdminInvites)
 	s.mux.HandleFunc("/api/v1/admin/invites/", s.handleAdminInviteByID)
 	s.mux.HandleFunc("/api/v1/admin/server-config/schema", s.handleAdminServerConfigSchema)
+	s.mux.HandleFunc("/api/v1/admin/server-config/sections/", s.handleAdminServerConfigSectionReset)
 	s.mux.HandleFunc("/api/v1/admin/server-config", s.handleAdminServerConfig)
 	s.mux.HandleFunc("/api/v1/admin/agents/reset-auth-all", s.handleAdminResetAuthAll)
 	s.mux.HandleFunc("/api/v1/admin/gcp-quota", s.handleAdminGCPQuota)
@@ -2814,6 +2824,7 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/api/v1/system/images/build", s.requireWorkstation(http.HandlerFunc(s.handleSystemImagesBuild)))
 	s.mux.Handle("/api/v1/system/apple-dns", s.requireWorkstation(http.HandlerFunc(s.handleAppleDNS)))
 	s.mux.Handle("/api/v1/system/registry", s.requireWorkstation(http.HandlerFunc(s.handleSystemRegistry)))
+	s.mux.Handle("/api/v1/system/workstation-settings", s.requireWorkstation(http.HandlerFunc(s.handleWorkstationSettings)))
 
 	// Workstation-only filesystem endpoints
 	s.mux.Handle("/api/v1/system/fs/list", s.requireWorkstation(http.HandlerFunc(s.handleFSList)))

@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
@@ -47,6 +49,9 @@ const (
 	// OriginMarkerValue is the marker value for hub-originated messages.
 	OriginMarkerValue = "hub"
 )
+
+// outboundEmailRe matches scion user emails in outbound messages, with optional "user:" prefix.
+var outboundEmailRe = regexp.MustCompile(`(?:user:)?[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
 
 // Config holds Discord-specific configuration parsed from the plugin config map.
 type Config struct {
@@ -145,6 +150,8 @@ type DiscordBroker struct {
 
 	sendQueue *SendQueue
 	webhooks  *WebhookManager
+
+	gatewayConnected bool // set true in handleReady, false on disconnect
 
 	threadParents map[string]string // channelID -> parentID (cached thread lookups)
 
@@ -487,7 +494,7 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 		if ccSlug == "" && msg.Sender != "" && strings.HasPrefix(msg.Sender, "agent:") {
 			ccSlug = strings.TrimPrefix(msg.Sender, "agent:")
 		}
-		channelIDs = b.resolveRecipientChannels(ctx, msg.Recipient, projectID, ccSlug)
+		channelIDs = b.resolveRecipientChannels(ctx, msg.Recipient, msg.RecipientID, projectID, ccSlug)
 	}
 
 	// Priority 3: Broadcast to all ChannelLinks for the project.
@@ -524,10 +531,11 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 		msg.Type == messages.TypeInstruction
 
 	// Extract agent slug from sender for webhook username.
-	senderSlug := agentSlug
-	if senderSlug == "" && strings.HasPrefix(msg.Sender, "agent:") {
-		senderSlug = strings.TrimPrefix(msg.Sender, "agent:")
-	}
+	// Prefer msg.Sender so observed agent-to-agent messages display under the sender's identity.
+	senderSlug := deriveSenderSlug(msg.Sender, agentSlug)
+
+	// Replace scion user emails with Discord @mentions in the message body.
+	msg.Msg = resolveOutboundMentions(ctx, store, msg.Msg)
 
 	// Format the message text. When sending via webhook, the webhook username
 	// already shows the agent name, so we skip the agent name header and just
@@ -587,6 +595,13 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 	isStateChange := msg != nil && msg.Type == messages.TypeStateChange
 	needsFilter := isAgentToAgent || isStateChange
 
+	// Build an embed for observed agent-to-agent messages so they are
+	// visually distinct from direct messages (gray sidebar, sender→recipient title).
+	var observeEmbeds []*discordgo.MessageEmbed
+	if isAgentToAgent {
+		observeEmbeds = []*discordgo.MessageEmbed{formatObservedEmbed(msg)}
+	}
+
 	// Send to each target channel.
 	var errs []error
 	for _, channelID := range channelIDs {
@@ -632,9 +647,9 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 			// webhook on the parent channel and execute with thread_id.
 			parentID, isThread := b.resolveThreadParent(channelID)
 			if isThread && parentID != "" {
-				_, err = webhooks.SendAsAgentInThread(parentID, channelID, senderSlug, text, nil, nil, files)
+				_, err = webhooks.SendAsAgentInThread(parentID, channelID, senderSlug, text, observeEmbeds, nil, files)
 			} else {
-				_, err = webhooks.SendAsAgent(channelID, senderSlug, text, nil, nil, files)
+				_, err = webhooks.SendAsAgent(channelID, senderSlug, text, observeEmbeds, nil, files)
 			}
 			if err != nil {
 				// Fallback to bot API if webhook send fails.
@@ -757,7 +772,8 @@ func (b *DiscordBroker) HealthCheck() (*plugin.HealthStatus, error) {
 	}
 
 	details := map[string]string{
-		"subscriptions": fmt.Sprintf("%d", len(b.subs)),
+		"subscriptions":     fmt.Sprintf("%d", len(b.subs)),
+		"gateway_connected": fmt.Sprintf("%v", b.gatewayConnected),
 	}
 
 	if b.botUser != nil {
@@ -768,11 +784,65 @@ func (b *DiscordBroker) HealthCheck() (*plugin.HealthStatus, error) {
 		details["hub_url"] = b.hubURL
 	}
 
+	// Report degraded when gateway is disconnected but subscriptions are active.
+	if !b.gatewayConnected && len(b.subs) > 0 {
+		return &plugin.HealthStatus{
+			Status:  "degraded",
+			Message: "gateway not connected (subscriptions active but no gateway session)",
+			Details: details,
+		}, nil
+	}
+
 	return &plugin.HealthStatus{
 		Status:  "healthy",
 		Message: "discord bot operational",
 		Details: details,
 	}, nil
+}
+
+// --- Outbound mention resolution ---
+
+// resolveOutboundMentions scans text for scion user emails (with optional
+// "user:" prefix) and replaces them with Discord @mentions when the user
+// has a mapping in the store.
+func resolveOutboundMentions(ctx context.Context, store Store, text string) string {
+	if store == nil || text == "" {
+		return text
+	}
+
+	matches := outboundEmailRe.FindAllStringIndex(text, -1)
+	if len(matches) == 0 {
+		return text
+	}
+
+	for i := len(matches) - 1; i >= 0; i-- {
+		start, end := matches[i][0], matches[i][1]
+
+		if start > 0 {
+			prev := text[start-1]
+			if prev == '/' || prev == ':' {
+				continue
+			}
+		}
+		if end < len(text) && text[end] == '/' {
+			continue
+		}
+
+		match := text[start:end]
+		email := match
+		if strings.HasPrefix(email, "user:") {
+			email = strings.TrimPrefix(email, "user:")
+		}
+
+		mapping, err := store.GetUserMappingByEmail(ctx, email)
+		if err != nil || mapping == nil {
+			continue
+		}
+
+		text = text[:start] + FormatDiscordMention(mapping.DiscordUserID) + text[end:]
+	}
+
+	return text
 }
 
 // --- Gateway setup ---
@@ -787,6 +857,7 @@ func (b *DiscordBroker) startGateway() error {
 
 	// Register gateway event handlers.
 	session.AddHandler(b.handleReady)
+	session.AddHandler(b.handleDisconnect)
 	session.AddHandler(b.handleGuildCreate)
 	session.AddHandler(b.handleGuildDelete)
 	session.AddHandler(b.handleMessageCreate)
@@ -807,6 +878,7 @@ func (b *DiscordBroker) startGateway() error {
 func (b *DiscordBroker) handleReady(_ *discordgo.Session, r *discordgo.Ready) {
 	b.mu.Lock()
 	b.botUser = r.User
+	b.gatewayConnected = true
 	commands := b.commands
 	b.mu.Unlock()
 
@@ -823,6 +895,15 @@ func (b *DiscordBroker) handleReady(_ *discordgo.Session, r *discordgo.Ready) {
 			b.log.Error("Failed to register slash commands", "error", err)
 		}
 	}
+}
+
+// handleDisconnect is called when the bot disconnects from the Discord gateway.
+func (b *DiscordBroker) handleDisconnect(_ *discordgo.Session, _ *discordgo.Disconnect) {
+	b.mu.Lock()
+	b.gatewayConnected = false
+	b.mu.Unlock()
+
+	b.log.Warn("Discord gateway disconnected")
 }
 
 // handleGuildCreate is called when the bot joins a guild or when guild
@@ -964,7 +1045,13 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		return
 	}
 
-	if m.Content == "" {
+	if m.Content == "" && len(m.Attachments) == 0 {
+		return
+	}
+
+	// Drop system messages (thread created, channel rename, pin, etc.)
+	// while keeping normal messages and replies.
+	if m.Type != discordgo.MessageTypeDefault && m.Type != discordgo.MessageTypeReply {
 		return
 	}
 
@@ -982,20 +1069,10 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := store.GetChannelLink(ctx, channelID)
+	link, err := resolveChannelLink(ctx, s, store, channelID)
 	if err != nil {
 		b.log.Error("Failed to get channel link", "channel_id", channelID, "error", err)
 		return
-	}
-	// If no direct link, check if this is a thread whose parent channel is linked.
-	if link == nil || !link.Active {
-		if parentID, isThread := b.resolveThreadParent(channelID); isThread && parentID != "" {
-			link, err = store.GetChannelLink(ctx, parentID)
-			if err != nil {
-				b.log.Error("Failed to get parent channel link", "parent_id", parentID, "error", err)
-				return
-			}
-		}
 	}
 	if link == nil || !link.Active {
 		return
@@ -1010,7 +1087,7 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 	agents := b.getProjectAgents(ctx, link.ProjectID)
 
 	// Three-tier @-mention routing.
-	targets, _ := resolveTargetAgents(m, botUserID, link.DefaultAgent, agents)
+	targets, isAll := resolveTargetAgents(m, botUserID, link.DefaultAgent, agents)
 
 	// Fallback: reply-to-bot message — extract agent from webhook username.
 	if len(targets) == 0 && m.ReferencedMessage != nil {
@@ -1020,11 +1097,23 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		}
 	}
 
+	// Resolve effective default — thread override first, then channel fallback.
+	effectiveDefault := link.DefaultAgent
+	if parentID, isThread := b.resolveThreadParent(channelID); isThread {
+		if threadDefault, err := store.GetThreadDefault(ctx, parentID, channelID); err != nil {
+			b.log.Error("Failed to get thread default", "error", err)
+		} else if threadDefault != "" {
+			effectiveDefault = threadDefault
+		}
+	}
+
 	// Fallback: unaddressed text → default agent (if configured).
-	if len(targets) == 0 && link.DefaultAgent != "" {
+	// Skip if the message @-mentions a non-bot Discord user — those are
+	// directed at humans, not the bot's default agent.
+	if len(targets) == 0 && effectiveDefault != "" && !hasNonBotMentions(m.Message, botUserID) {
 		text := strings.TrimSpace(m.Content)
 		if text != "" && !strings.HasPrefix(text, "/") {
-			targets = []string{link.DefaultAgent}
+			targets = []string{effectiveDefault}
 		}
 	}
 
@@ -1053,11 +1142,116 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		return
 	}
 
-	// Strip bot and agent mentions from message text.
-	cleanText := stripMentions(m.Content, botUserID, targets)
+	// Classify mentions by position before stripping.
+	var classified ClassifiedMentions
+	if !isAll {
+		classified = classifyMentions(m.Content, botUserID, agents, func(username string) (string, bool) {
+			// User resolution via store mapping is not yet wired up.
+			return "", false
+		})
+	}
+
+	// Determine which agent slugs are start-mentions (to strip from text).
+	// Only strip start-mention agents; body mentions stay in text.
+	// For @all or fallback routing, fall back to stripping all targets.
+	stripSlugs := targets
+	if !isAll && len(classified.StartMentions) > 0 {
+		stripSlugs = make([]string, 0, len(classified.StartMentions))
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "agent" {
+				stripSlugs = append(stripSlugs, sm.Name)
+			}
+		}
+	}
+
+	// Filter targets to only start-mention agents, or exclude body-mention agents if no start-mentions exist.
+	// Body-mention agents will be handled by the TypeMention delivery loop.
+	if !isAll {
+		if len(classified.StartMentions) > 0 {
+			startMentionSet := make(map[string]bool, len(classified.StartMentions))
+			for _, sm := range classified.StartMentions {
+				if sm.Kind == "agent" {
+					startMentionSet[strings.ToLower(sm.Name)] = true
+				}
+			}
+			filteredTargets := make([]string, 0, len(targets))
+			for _, t := range targets {
+				if startMentionSet[strings.ToLower(t)] {
+					filteredTargets = append(filteredTargets, t)
+				}
+			}
+			targets = filteredTargets
+		} else {
+			// No start mentions: don't strip any agents from text (body mentions stay visible).
+			stripSlugs = nil
+
+			if len(classified.BodyMentions) > 0 {
+				bodyMentionSet := make(map[string]bool, len(classified.BodyMentions))
+				for _, bm := range classified.BodyMentions {
+					if bm.Kind == "agent" {
+						bodyMentionSet[strings.ToLower(bm.Name)] = true
+					}
+				}
+				filteredTargets := make([]string, 0, len(targets))
+				for _, t := range targets {
+					if !bodyMentionSet[strings.ToLower(t)] {
+						filteredTargets = append(filteredTargets, t)
+					}
+				}
+				targets = filteredTargets
+			}
+		}
+
+		// If body-mention filter emptied targets, restore default agent so instruction is delivered.
+		if len(targets) == 0 && len(classified.StartMentions) == 0 && effectiveDefault != "" && !hasNonBotMentions(m.Message, botUserID) {
+			text := strings.TrimSpace(m.Content)
+			if text != "" && !strings.HasPrefix(text, "/") {
+				targets = []string{effectiveDefault}
+			}
+		}
+	}
+
+	// Strip bot and start-mention agent mentions from message text.
+	// Body-mention agents remain visible in the delivered text.
+	cleanText := stripMentions(m.Content, botUserID, stripSlugs)
 	cleanText = strings.TrimSpace(cleanText)
+
+	// Download Discord attachments and build metadata.
+	var attachmentPaths []string
+	for _, att := range m.Attachments {
+		if att == nil || att.URL == "" {
+			continue
+		}
+		agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, link.ProjectSlug)
+		if err != nil {
+			b.log.Error("Failed to download Discord attachment",
+				"filename", att.Filename, "error", err)
+			continue
+		}
+		attachmentPaths = append(attachmentPaths, agentPath)
+		if placeholder != "" {
+			if cleanText != "" {
+				cleanText = cleanText + "\n" + placeholder
+			} else {
+				cleanText = placeholder
+			}
+		}
+	}
+
 	if cleanText == "" {
 		return
+	}
+
+	// Determine message type and recipients for multi-agent routing.
+	msgType := messages.TypeInstruction
+	var groupRecipients string
+	if len(targets) > 1 && !isAll {
+		msgType = messages.TypeGroupSet
+		recipientIDs := make([]string, len(targets))
+		for i, slug := range targets {
+			recipientIDs[i] = "agent:" + slug
+		}
+		groupRecipients = messages.FormatGroupRecipients(sender, recipientIDs)
 	}
 
 	// Deliver to each target agent.
@@ -1077,15 +1271,17 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		recipient := "agent:" + agentSlug
 
 		msg := &messages.StructuredMessage{
-			Version:   messages.Version,
-			Timestamp: m.Timestamp.UTC().Format(time.RFC3339),
-			Channel:   "discord",
-			ThreadID:  channelID,
-			Sender:    sender,
-			SenderID:  senderID,
-			Recipient: recipient,
-			Msg:       cleanText,
-			Type:      messages.TypeInstruction,
+			Version:     messages.Version,
+			Timestamp:   m.Timestamp.UTC().Format(time.RFC3339),
+			Channel:     "discord",
+			ThreadID:    channelID,
+			Sender:      sender,
+			SenderID:    senderID,
+			Recipient:   recipient,
+			Recipients:  groupRecipients,
+			Msg:         cleanText,
+			Type:        msgType,
+			Attachments: attachmentPaths,
 			Metadata: map[string]string{
 				"discord_channel_id": channelID,
 				"discord_message_id": m.ID,
@@ -1104,6 +1300,54 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 
 		if he := b.deliverInbound(topic, msg); he != nil {
 			s.ChannelMessageSend(channelID, he.userFacingMessage())
+		}
+	}
+
+	// Deliver TypeMention notifications for body mentions.
+	if !isAll && len(classified.BodyMentions) > 0 {
+		targetSet := make(map[string]bool, len(targets))
+		for _, slug := range targets {
+			targetSet[strings.ToLower(slug)] = true
+		}
+
+		// Build the mention source: who the primary message was addressed to.
+		var mentionSource string
+		if groupRecipients != "" {
+			mentionSource = groupRecipients
+		} else if len(targets) == 1 {
+			mentionSource = "agent:" + targets[0]
+		}
+
+		for _, bm := range classified.BodyMentions {
+			if bm.Kind != "agent" {
+				continue
+			}
+			// Skip agents already receiving the primary message.
+			if targetSet[strings.ToLower(bm.Name)] {
+				continue
+			}
+
+			mentionMsg := messages.NewMention(sender, "agent:"+bm.Name, cleanText, mentionSource)
+			mentionMsg.SenderID = senderID
+			mentionMsg.Channel = "discord"
+			mentionMsg.ThreadID = channelID
+			mentionMsg.Metadata["discord_channel_id"] = channelID
+			mentionMsg.Metadata["discord_message_id"] = m.ID
+			mentionMsg.Metadata["discord_guild_id"] = m.GuildID
+			mentionMsg.Metadata["project_id"] = link.ProjectID
+			if len(attachmentPaths) > 0 {
+				mentionMsg.Attachments = attachmentPaths
+			}
+
+			mentionTopic := projectcompat.AgentTopic(link.ProjectID, bm.Name)
+
+			b.log.Debug("Delivering body mention notification",
+				"topic", mentionTopic, "sender", sender, "mentioned_agent", bm.Name)
+
+			if he := b.deliverInbound(mentionTopic, mentionMsg); he != nil {
+				b.log.Warn("Failed to deliver mention notification",
+					"agent", bm.Name, "error", he.userFacingMessage())
+			}
 		}
 	}
 }
@@ -1348,7 +1592,10 @@ func (b *DiscordBroker) isForumChannel(channelID string) bool {
 }
 
 // resolveRecipientChannels looks up target channels for a specific recipient.
-func (b *DiscordBroker) resolveRecipientChannels(ctx context.Context, recipient, projectID, agentSlug string) []string {
+// It first attempts email-based lookup via GetUserMappingByEmail; if that fails
+// (e.g. because the hub rewrote the recipient to a display name), it falls back
+// to looking up the scion user UUID via GetUserMappingByScionUserID.
+func (b *DiscordBroker) resolveRecipientChannels(ctx context.Context, recipient, recipientID, projectID, agentSlug string) []string {
 	email := strings.TrimPrefix(recipient, "user:")
 	if email == recipient {
 		return nil
@@ -1363,6 +1610,22 @@ func (b *DiscordBroker) resolveRecipientChannels(ctx context.Context, recipient,
 	}
 
 	mapping, err := store.GetUserMappingByEmail(ctx, email)
+	if err != nil {
+		b.log.Error("Failed to look up user mapping by email", "email", email, "error", err)
+	}
+
+	// Fallback: try scion user ID lookup (handles display-name recipients).
+	if (err != nil || mapping == nil) && recipientID != "" {
+		var fallbackErr error
+		mapping, fallbackErr = store.GetUserMappingByScionUserID(ctx, recipientID)
+		if fallbackErr != nil {
+			b.log.Error("Failed to look up user mapping by scion user ID", "recipientID", recipientID, "error", fallbackErr)
+			err = fallbackErr
+		} else {
+			err = nil
+		}
+	}
+
 	if err != nil || mapping == nil {
 		return nil
 	}
@@ -1421,11 +1684,21 @@ func (b *DiscordBroker) resolveStaleChannelSlugs(ctx context.Context) {
 
 // --- Attachment helpers ---
 
-// resolveAttachmentPath translates an agent-relative /workspace path to the
-// host-side path under /home/scion/.scion/projects/<slug>/. Agent containers
-// mount /home/scion/.scion/projects/<slug> as /workspace.
+// resolveAttachmentPath translates agent-side paths to host-side paths.
+//
+// Supported container-side paths:
+//   - /workspace/<file>  → ~/.scion/projects/<slug>/<file>
+//   - /scion-volumes/<name>/<file> → ~/.scion/project-configs/<slug>__<shortUUID>/shared-dirs/<name>/<file>
+//   - /workspace/.scion-volumes/<name>/<file> → same as /scion-volumes/<name>/<file>
+//
+// Also accepts bare relative paths and "workspace/" without leading slash.
 // Returns empty string if the path is unsafe or cannot be resolved.
 func (b *DiscordBroker) resolveAttachmentPath(ctx context.Context, attachPath, projectID string) string {
+	// Handle /scion-volumes/<name>/... container-internal shared dir paths.
+	if strings.HasPrefix(attachPath, "/scion-volumes/") || attachPath == "/scion-volumes" {
+		return b.resolveSharedDirAttachmentPath(ctx, attachPath, projectID)
+	}
+
 	var relPath string
 	switch {
 	case strings.HasPrefix(attachPath, "/workspace/"):
@@ -1451,17 +1724,17 @@ func (b *DiscordBroker) resolveAttachmentPath(ctx context.Context, attachPath, p
 		return ""
 	}
 
-	// Look up project slug from channel links, falling back to the injected slug map.
-	slug := ""
-	if b.store != nil && projectID != "" {
-		links, err := b.store.GetChannelLinksForProject(ctx, projectID)
-		if err == nil && len(links) > 0 && links[0].ProjectSlug != "" {
-			slug = links[0].ProjectSlug
-		}
+	// In-workspace shared dirs are mounted at /workspace/.scion-volumes/<name>
+	// inside containers. Redirect to shared dir resolution.
+	if strings.HasPrefix(relPath, ".scion-volumes/") {
+		containerPath := "/scion-volumes/" + strings.TrimPrefix(relPath, ".scion-volumes/")
+		return b.resolveSharedDirAttachmentPath(ctx, containerPath, projectID)
 	}
-	if slug == "" && projectID != "" {
-		slug = b.projectSlugMap[projectID]
+	if relPath == ".scion-volumes" {
+		return ""
 	}
+
+	slug := b.resolveProjectSlug(ctx, projectID)
 	if slug == "" {
 		b.log.Warn("Cannot resolve attachment path: no project slug found",
 			"attach_path", attachPath, "project_id", projectID)
@@ -1483,6 +1756,155 @@ func (b *DiscordBroker) resolveAttachmentPath(ctx context.Context, attachPath, p
 
 	b.log.Debug("Resolved attachment path", "original", attachPath, "resolved", hostPath)
 	return hostPath
+}
+
+// resolveSharedDirAttachmentPath translates a container-internal shared dir
+// path (/scion-volumes/<name>/...) to the host-side path under
+// ~/.scion/project-configs/<slug>__<shortUUID>/shared-dirs/<name>/.
+// Returns empty string if the path is unsafe or cannot be resolved.
+func (b *DiscordBroker) resolveSharedDirAttachmentPath(ctx context.Context, attachPath, projectID string) string {
+	trimmed := strings.TrimPrefix(attachPath, "/scion-volumes/")
+	if trimmed == "" || trimmed == attachPath {
+		b.log.Warn("Invalid shared dir attachment path", "attach_path", attachPath)
+		return ""
+	}
+
+	parts := strings.SplitN(trimmed, "/", 2)
+	sharedDirName := parts[0]
+	if sharedDirName == "" || sharedDirName == "." || sharedDirName == ".." {
+		b.log.Warn("Invalid shared dir name in attachment path",
+			"attach_path", attachPath, "shared_dir_name", sharedDirName)
+		return ""
+	}
+	relPath := ""
+	if len(parts) > 1 {
+		relPath = filepath.Clean(parts[1])
+		if strings.HasPrefix(relPath, "..") || filepath.IsAbs(relPath) {
+			b.log.Warn("Shared dir attachment path escapes directory",
+				"attach_path", attachPath, "rel_path", relPath)
+			return ""
+		}
+	}
+
+	slug := b.resolveProjectSlug(ctx, projectID)
+	if slug == "" || projectID == "" {
+		b.log.Warn("Cannot resolve shared dir path: no project slug or ID",
+			"attach_path", attachPath, "project_id", projectID)
+		return ""
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		b.log.Warn("Failed to resolve home dir for shared dir path", "error", err)
+		return ""
+	}
+
+	sharedDirBase := config.SharedDirHostPath(home, slug, projectID, sharedDirName)
+	var hostPath string
+	if relPath == "" || relPath == "." {
+		hostPath = sharedDirBase
+	} else {
+		hostPath = filepath.Join(sharedDirBase, relPath)
+		if !strings.HasPrefix(hostPath, sharedDirBase+string(filepath.Separator)) {
+			b.log.Warn("Resolved shared dir path escapes directory",
+				"host_path", hostPath, "expected_prefix", sharedDirBase+string(filepath.Separator))
+			return ""
+		}
+	}
+
+	b.log.Debug("Resolved shared dir attachment path",
+		"original", attachPath, "resolved", hostPath)
+	return hostPath
+}
+
+// resolveProjectSlug looks up the project slug from the store (channel links)
+// or the hub-injected slug map.
+func (b *DiscordBroker) resolveProjectSlug(ctx context.Context, projectID string) string {
+	slug := ""
+	if b.store != nil && projectID != "" {
+		links, err := b.store.GetChannelLinksForProject(ctx, projectID)
+		if err == nil && len(links) > 0 && links[0].ProjectSlug != "" {
+			slug = links[0].ProjectSlug
+		}
+	}
+	if slug == "" && projectID != "" {
+		slug = b.projectSlugMap[projectID]
+	}
+	return slug
+}
+
+const maxDiscordAttachmentSize = 25 * 1024 * 1024 // 25 MB
+
+// downloadDiscordAttachment downloads a file from a Discord message attachment
+// and saves it to the agent's workspace downloads directory. Returns the
+// agent-relative path and a placeholder string for the message body.
+//
+// NOTE: This writes to the host filesystem at /home/scion/.scion/projects/<slug>/downloads/.
+// The agent container must share this volume mount for the file to be visible
+// at /workspace/downloads/. This works in single-VM / shared-dir setups but
+// will NOT work when agents and the plugin run in separate pods with isolated
+// volumes. See #397 for the tracked fix.
+func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *discordgo.MessageAttachment, projectSlug string) (agentPath, placeholder string, err error) {
+	if projectSlug == "" {
+		return "", "", fmt.Errorf("project slug is empty")
+	}
+
+	if att.Size > maxDiscordAttachmentSize {
+		return "", "", fmt.Errorf("attachment too large (%d bytes, max %d)", att.Size, maxDiscordAttachmentSize)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, att.URL, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("create request for %q: %w", att.Filename, err)
+	}
+
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("download %q: %w", att.Filename, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("download %q: HTTP %d", att.Filename, resp.StatusCode)
+	}
+
+	fileName := filepath.Base(att.Filename)
+	if fileName == "" || fileName == "." || fileName == "/" {
+		fileName = att.ID
+	}
+	timestamp := time.Now().Unix()
+	destName := fmt.Sprintf("discord_%d_%s", timestamp, fileName)
+
+	hostDir := filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
+	if err := os.MkdirAll(hostDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("create downloads dir: %w", err)
+	}
+
+	destPath := filepath.Join(hostDir, destName)
+	f, err := os.Create(destPath)
+	if err != nil {
+		return "", "", fmt.Errorf("create file: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, io.LimitReader(resp.Body, maxDiscordAttachmentSize)); err != nil {
+		f.Close()
+		os.Remove(destPath)
+		return "", "", fmt.Errorf("write file: %w", err)
+	}
+
+	agentPath = filepath.Join("/workspace/downloads", destName)
+	contentType := att.ContentType
+	if contentType == "" {
+		contentType = "file"
+	}
+	placeholder = fmt.Sprintf("[Attachment: %s (%s)]", fileName, contentType)
+
+	b.log.Info("Downloaded Discord attachment",
+		"filename", fileName, "content_type", contentType,
+		"path", destPath, "agent_path", agentPath)
+
+	return agentPath, placeholder, nil
 }
 
 // --- Topic parsing ---
@@ -1660,6 +2082,17 @@ func generateRequestID() string {
 	b := make([]byte, 12)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// hasNonBotMentions returns true if the message @-mentions any Discord user
+// other than the bot itself.
+func hasNonBotMentions(m *discordgo.Message, botUserID string) bool {
+	for _, u := range m.Mentions {
+		if u.ID != botUserID {
+			return true
+		}
+	}
+	return false
 }
 
 // agentSlugs extracts slug strings from a slice of AgentInfo.

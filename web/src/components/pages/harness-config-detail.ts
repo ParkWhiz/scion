@@ -120,12 +120,33 @@ export class ScionPageHarnessConfigDetail extends LitElement {
 
   @state()
   private imageStatus: {
-    local_short?: { exists: boolean; image: string; hash: string };
-    local_long?: { exists: boolean; image: string; hash: string };
-    remote?: { exists: boolean; image: string; hash: string; newer_than_local: boolean };
-    resolved_image?: string;
-    resolution_source?: string;
+    image?: string;
+    registry?: {
+      image: string;
+      exists: boolean;
+      hash: string;
+      checked_at: string;
+    };
+    brokers?: Array<{
+      broker_id: string;
+      broker_name: string;
+      reachable: boolean;
+      unsupported?: boolean;
+      local_short?: { exists: boolean; hash: string };
+      local_long?: { exists: boolean; hash: string };
+      newer_in_registry?: boolean;
+      resolved_image?: string;
+      resolution_source?: string;
+    }>;
+    proxy_brokers?: Array<{
+      broker_id: string;
+      broker_name: string;
+      runtime: string;
+    }>;
   } | null = null;
+
+  @state()
+  private expandedBrokers: Set<string> = new Set();
 
   @state()
   private imageActionRunning = false;
@@ -290,6 +311,17 @@ export class ScionPageHarnessConfigDetail extends LitElement {
       font-weight: 600;
       margin: 0 0 1rem;
     }
+    .image-section-subtitle {
+      font-size: 0.75rem;
+      font-weight: 400;
+      color: var(--sl-color-neutral-500);
+    }
+    .image-info-note {
+      font-size: 0.8125rem;
+      color: var(--sl-color-neutral-500);
+      margin: 0.5rem 0 0;
+      font-style: italic;
+    }
     .image-table {
       width: 100%;
       border-collapse: collapse;
@@ -361,6 +393,79 @@ export class ScionPageHarnessConfigDetail extends LitElement {
       display: flex;
       gap: 0.5rem;
       margin-top: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    .broker-row {
+      cursor: pointer;
+      user-select: none;
+    }
+    .broker-row:hover {
+      background: var(--sl-color-neutral-50);
+    }
+    .broker-row-expanded {
+      background: var(--sl-color-neutral-50);
+    }
+    .broker-detail-row td {
+      padding-left: 2rem;
+    }
+    .broker-toggle {
+      display: inline-block;
+      width: 1em;
+      text-align: center;
+      margin-right: 0.25rem;
+      font-size: 0.75rem;
+    }
+    .rollup-badge {
+      display: inline-block;
+      padding: 0.0625rem 0.375rem;
+      border-radius: var(--sl-border-radius-pill);
+      font-size: 0.625rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .rollup-badge-up-to-date {
+      background: var(--sl-color-success-100, #dcfce7);
+      color: var(--sl-color-success-700, #15803d);
+    }
+    .rollup-badge-stale {
+      background: var(--sl-color-warning-100, #fef3c7);
+      color: var(--sl-color-warning-700, #a16207);
+    }
+    .rollup-badge-local-only {
+      background: var(--sl-color-primary-100, #dbeafe);
+      color: var(--sl-color-primary-700, #1d4ed8);
+    }
+    .rollup-badge-missing {
+      background: var(--sl-color-danger-100, #fee2e2);
+      color: var(--sl-color-danger-700, #b91c1c);
+    }
+    .rollup-badge-unreachable {
+      background: var(--sl-color-neutral-200);
+      color: var(--sl-color-neutral-600);
+    }
+    .reachable-dot {
+      display: inline-block;
+      width: 0.5rem;
+      height: 0.5rem;
+      border-radius: 50%;
+      margin-right: 0.25rem;
+    }
+    .reachable-dot.online { background: var(--sl-color-success-500); }
+    .reachable-dot.offline { background: var(--sl-color-neutral-400); }
+    .proxy-info-note {
+      font-size: 0.8125rem;
+      color: var(--sl-color-neutral-500);
+      margin: 1rem 0 0;
+      padding: 0.75rem 1rem;
+      background: var(--sl-color-neutral-50);
+      border: 1px solid var(--sl-color-neutral-200);
+      border-radius: var(--sl-border-radius-medium);
+    }
+    .broker-actions {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.5rem 0.75rem;
       flex-wrap: wrap;
     }
 
@@ -574,7 +679,7 @@ export class ScionPageHarnessConfigDetail extends LitElement {
             : ''}
           ${hc.sourceUrl
             ? html`<span class="source-url">Source:
-                <a href=${hc.sourceUrl} target="_blank" rel="noopener">${hc.sourceUrl}</a>
+                <a href=${hc.sourceUrl.replace(/^git\+/, '')} target="_blank" rel="noopener">${hc.sourceUrl}</a>
               </span>`
             : ''}
         </div>
@@ -628,97 +733,282 @@ export class ScionPageHarnessConfigDetail extends LitElement {
     if (!showSection) return nothing;
 
     const st = this.imageStatus;
-    const src = st?.resolution_source || '';
 
+    if (!st) {
+      return html`
+        <div class="image-section">
+          <h2>Images</h2>
+          <sl-spinner style="font-size: 1rem;"></sl-spinner> Loading image status...
+        </div>
+      `;
+    }
+
+    const brokers = st.brokers ?? [];
+    const proxyBrokers = st.proxy_brokers ?? [];
+
+    if (brokers.length === 1) {
+      return this.renderSingleBrokerImage(brokers[0], st);
+    } else if (brokers.length > 1) {
+      return this.renderMultiBrokerImage(brokers, proxyBrokers, st);
+    } else {
+      return this.renderProxyOnlyImage(proxyBrokers, st);
+    }
+  }
+
+  private brokerRollup(broker: NonNullable<NonNullable<typeof this.imageStatus>['brokers']>[0]): { label: string; cssClass: string } {
+    if (!broker.reachable) return { label: 'unreachable', cssClass: 'rollup-badge-unreachable' };
+    if (broker.unsupported) return { label: 'needs upgrade', cssClass: 'rollup-badge-stale' };
+    if (broker.local_short?.exists && !broker.local_long?.exists) return { label: 'local build only', cssClass: 'rollup-badge-local-only' };
+    if (broker.local_long?.exists && broker.newer_in_registry) return { label: 'stale pull', cssClass: 'rollup-badge-stale' };
+    if ((broker.local_long?.exists && !broker.newer_in_registry) || broker.local_short?.exists) return { label: 'up-to-date', cssClass: 'rollup-badge-up-to-date' };
+    return { label: 'missing', cssClass: 'rollup-badge-missing' };
+  }
+
+  private renderRegistryRow(st: typeof this.imageStatus) {
+    return html`
+      <tr>
+        <td class="image-entity-name">Registry</td>
+        <td class="image-ref">${st?.registry?.image || '—'}</td>
+        <td class="image-hash">${st?.registry?.exists ? (st.registry.hash || '—') : ''}</td>
+        <td>
+          ${st
+            ? (st.registry?.exists
+              ? html`Available`
+              : html`<span class="not-found">Not found</span>`)
+            : html`<sl-spinner style="font-size: 0.75rem;"></sl-spinner> Checking...`}
+        </td>
+      </tr>
+    `;
+  }
+
+  private renderSingleBrokerImage(
+    broker: NonNullable<NonNullable<typeof this.imageStatus>['brokers']>[0],
+    st: typeof this.imageStatus
+  ) {
+    const hc = this.harnessConfig!;
+    const image = hc.config?.image;
+
+    if (!broker.reachable) {
+      return html`
+        <div class="image-section">
+          <h2>Images <span class="image-section-subtitle">Runtime: ${broker.broker_name}</span></h2>
+          <table class="image-table">
+            <thead>
+              <tr><th>Entity</th><th>Image</th><th>Hash</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              ${this.renderRegistryRow(st)}
+            </tbody>
+          </table>
+          <div class="proxy-info-note">
+            Runtime broker "${broker.broker_name}" is currently unreachable.
+            Local image state cannot be determined.
+          </div>
+          <div class="image-actions">
+            <sl-button size="small" variant="text" @click=${this.recheckImage} ?disabled=${this.imageActionRunning}>
+              <sl-icon slot="prefix" name="arrow-repeat"></sl-icon>
+              Re-check
+            </sl-button>
+          </div>
+        </div>
+      `;
+    }
+
+    const src = broker.resolution_source || '';
     return html`
       <div class="image-section">
-        <h2>Images</h2>
+        <h2>Images <span class="image-section-subtitle">Runtime: ${broker.broker_name}</span></h2>
         <table class="image-table">
           <thead>
-            <tr>
-              <th>Entity</th>
-              <th>Image</th>
-              <th>Hash</th>
-              <th>Status</th>
-            </tr>
+            <tr><th>Entity</th><th>Image</th><th>Hash</th><th>Status</th></tr>
           </thead>
           <tbody>
+            ${this.renderRegistryRow(st)}
             <tr class=${src === 'local_short' ? 'active-row' : ''}>
               <td class="image-entity-name">Local Build</td>
-              <td class="image-ref">${st?.local_short?.image || image || '—'}</td>
-              <td class="image-hash">${st?.local_short?.exists ? (st.local_short.hash || '—') : ''}</td>
+              <td class="image-ref">${st?.image || image || '—'}</td>
+              <td class="image-hash">${broker.local_short?.exists ? (broker.local_short.hash || '—') : ''}</td>
               <td>
-                ${st
-                  ? (st.local_short?.exists
-                    ? html`Available${src === 'local_short' ? html`<span class="active-badge">Active</span>` : nothing}`
-                    : html`<span class="not-found">Not found</span>`)
-                  : html`<sl-spinner style="font-size: 0.75rem;"></sl-spinner> Checking...`}
+                ${broker.local_short?.exists
+                  ? html`Available${src === 'local_short' ? html`<span class="active-badge">Active</span>` : nothing}`
+                  : html`<span class="not-found">Not found</span>`}
               </td>
             </tr>
             <tr class=${src === 'local_long' ? 'active-row' : ''}>
               <td class="image-entity-name">Pulled</td>
-              <td class="image-ref">${st?.local_long?.image || '—'}</td>
-              <td class="image-hash">${st?.local_long?.exists ? (st.local_long.hash || '—') : ''}</td>
+              <td class="image-ref">${st?.registry?.image || '—'}</td>
+              <td class="image-hash">${broker.local_long?.exists ? (broker.local_long.hash || '—') : ''}</td>
               <td>
-                ${st
-                  ? (st.local_long?.exists
-                    ? html`Available${src === 'local_long' ? html`<span class="active-badge">Active</span>` : nothing}`
-                    : html`<span class="not-found">Not found</span>`)
-                  : html`<sl-spinner style="font-size: 0.75rem;"></sl-spinner> Checking...`}
-              </td>
-            </tr>
-            <tr class=${src === 'remote' ? 'active-row' : ''}>
-              <td class="image-entity-name">Remote</td>
-              <td class="image-ref">${st?.remote?.image || '—'}</td>
-              <td class="image-hash">${st?.remote?.exists ? (st.remote.hash || '—') : ''}</td>
-              <td>
-                ${st
-                  ? (st.remote?.exists
-                    ? html`Available${src === 'remote' ? html`<span class="active-badge">Active</span>` : nothing}
-                      ${st.remote?.newer_than_local ? html`<span class="newer-badge">Newer version available</span>` : nothing}`
-                    : html`<span class="not-found">Not checked</span>`)
-                  : html`<sl-spinner style="font-size: 0.75rem;"></sl-spinner> Checking...`}
+                ${broker.local_long?.exists
+                  ? html`Available${src === 'local_long' ? html`<span class="active-badge">Active</span>` : nothing}
+                    ${broker.newer_in_registry ? html`<span class="newer-badge">Newer in registry</span>` : nothing}`
+                  : html`<span class="not-found">Not found</span>`}
               </td>
             </tr>
           </tbody>
         </table>
         <div class="image-actions">
           ${this.hasDockerfile ? html`
-            <sl-button
-              size="small"
-              variant="primary"
-              @click=${this.openBuildDialog}
-              ?disabled=${this.buildRunning}
-            >
+            <sl-button size="small" variant="primary" @click=${this.openBuildDialog} ?disabled=${this.buildRunning}>
               <sl-icon slot="prefix" name="hammer"></sl-icon>
               ${this.buildRunning ? 'Building...' : 'Build Image'}
             </sl-button>
           ` : nothing}
-          ${st?.local_short?.exists ? html`
-            <sl-button
-              size="small"
-              variant="warning"
-              outline
-              @click=${this.deleteLocalImage}
-              ?disabled=${this.imageActionRunning}
-            >
+          <sl-button size="small" variant="default" @click=${() => this.pullLatestImage(broker.broker_id)} ?disabled=${this.imageActionRunning}>
+            <sl-icon slot="prefix" name="cloud-download"></sl-icon>
+            Pull Latest
+          </sl-button>
+          ${broker.local_short?.exists ? html`
+            <sl-button size="small" variant="warning" outline @click=${() => this.deleteLocalImage(broker.broker_id)} ?disabled=${this.imageActionRunning}>
               <sl-icon slot="prefix" name="trash"></sl-icon>
               Delete Local
             </sl-button>
           ` : nothing}
-          <sl-button
-            size="small"
-            variant="default"
-            @click=${this.pullLatestImage}
-            ?disabled=${this.imageActionRunning}
-          >
-            <sl-icon slot="prefix" name="cloud-download"></sl-icon>
-            Pull Latest
-          </sl-button>
           <sl-button size="small" variant="text" @click=${this.recheckImage} ?disabled=${this.imageActionRunning}>
             <sl-icon slot="prefix" name="arrow-repeat"></sl-icon>
-            Re-check Remote
+            Re-check
           </sl-button>
+        </div>
+      </div>
+    `;
+  }
+
+  private toggleBroker(brokerId: string): void {
+    const next = new Set(this.expandedBrokers);
+    if (next.has(brokerId)) {
+      next.delete(brokerId);
+    } else {
+      next.add(brokerId);
+    }
+    this.expandedBrokers = next;
+  }
+
+  private renderMultiBrokerImage(
+    brokers: NonNullable<NonNullable<typeof this.imageStatus>['brokers']>,
+    proxyBrokers: NonNullable<NonNullable<typeof this.imageStatus>['proxy_brokers']>,
+    st: typeof this.imageStatus
+  ) {
+    return html`
+      <div class="image-section">
+        <h2>Images</h2>
+        <table class="image-table">
+          <thead>
+            <tr><th>Entity</th><th>Image</th><th>Hash</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            ${this.renderRegistryRow(st)}
+            ${brokers.map(b => this.renderBrokerRow(b, st))}
+          </tbody>
+        </table>
+        <div class="image-actions">
+          ${this.hasDockerfile ? html`
+            <sl-button size="small" variant="primary" @click=${this.openBuildDialog} ?disabled=${this.buildRunning}>
+              <sl-icon slot="prefix" name="hammer"></sl-icon>
+              ${this.buildRunning ? 'Building...' : 'Build Image'}
+            </sl-button>
+          ` : nothing}
+          <sl-button size="small" variant="text" @click=${this.recheckImage} ?disabled=${this.imageActionRunning}>
+            <sl-icon slot="prefix" name="arrow-repeat"></sl-icon>
+            Re-check
+          </sl-button>
+        </div>
+        ${proxyBrokers.length > 0 ? html`
+          <div class="proxy-info-note">
+            ${proxyBrokers.length} proxy broker${proxyBrokers.length > 1 ? 's' : ''}
+            (${proxyBrokers.map(p => p.broker_name).join(', ')}) —
+            images pulled by substrate at provision time.
+          </div>
+        ` : nothing}
+      </div>
+    `;
+  }
+
+  private renderBrokerRow(
+    broker: NonNullable<NonNullable<typeof this.imageStatus>['brokers']>[0],
+    st: typeof this.imageStatus
+  ) {
+    const expanded = this.expandedBrokers.has(broker.broker_id);
+    const rollup = this.brokerRollup(broker);
+    const src = broker.resolution_source || '';
+
+    return html`
+      <tr class="broker-row ${expanded ? 'broker-row-expanded' : ''}" @click=${() => this.toggleBroker(broker.broker_id)}>
+        <td class="image-entity-name">
+          <span class="broker-toggle">${expanded ? '▾' : '▸'}</span>
+          <span class="reachable-dot ${broker.reachable ? 'online' : 'offline'}"></span>
+          ${broker.broker_name}
+        </td>
+        <td><span class="rollup-badge ${rollup.cssClass}">${rollup.label}</span></td>
+        <td></td>
+        <td>${broker.resolved_image ? html`resolves: ${src === 'local_short' ? 'local build' : src === 'local_long' ? 'pulled' : src}` : ''}</td>
+      </tr>
+      ${expanded && broker.reachable ? html`
+        <tr class="broker-detail-row">
+          <td class="image-entity-name">Local Build</td>
+          <td class="image-ref">${st?.image || '—'}</td>
+          <td class="image-hash">${broker.local_short?.exists ? (broker.local_short.hash || '—') : ''}</td>
+          <td>${broker.local_short?.exists
+            ? html`Available${src === 'local_short' ? html`<span class="active-badge">Active</span>` : nothing}`
+            : html`<span class="not-found">—</span>`}</td>
+        </tr>
+        <tr class="broker-detail-row">
+          <td class="image-entity-name">Pulled</td>
+          <td class="image-ref">${st?.registry?.image || '—'}</td>
+          <td class="image-hash">${broker.local_long?.exists ? (broker.local_long.hash || '—') : ''}</td>
+          <td>${broker.local_long?.exists
+            ? html`Available${src === 'local_long' ? html`<span class="active-badge">Active</span>` : nothing}
+              ${broker.newer_in_registry ? html`<span class="newer-badge">Newer in registry</span>` : nothing}`
+            : html`<span class="not-found">—</span>`}</td>
+        </tr>
+        <tr class="broker-detail-row">
+          <td colspan="4">
+            <div class="broker-actions">
+              <sl-button size="small" variant="default" @click=${(e: Event) => { e.stopPropagation(); void this.pullLatestImage(broker.broker_id); }} ?disabled=${this.imageActionRunning}>
+                <sl-icon slot="prefix" name="cloud-download"></sl-icon>
+                Pull Latest
+              </sl-button>
+              ${broker.local_short?.exists ? html`
+                <sl-button size="small" variant="warning" outline @click=${(e: Event) => { e.stopPropagation(); void this.deleteLocalImage(broker.broker_id); }} ?disabled=${this.imageActionRunning}>
+                  <sl-icon slot="prefix" name="trash"></sl-icon>
+                  Delete Local
+                </sl-button>
+              ` : nothing}
+              <sl-button size="small" variant="text" @click=${(e: Event) => { e.stopPropagation(); void this.recheckImage(); }} ?disabled=${this.imageActionRunning}>
+                <sl-icon slot="prefix" name="arrow-repeat"></sl-icon>
+                Re-check
+              </sl-button>
+            </div>
+          </td>
+        </tr>
+      ` : nothing}
+    `;
+  }
+
+  private renderProxyOnlyImage(
+    _proxyBrokers: NonNullable<NonNullable<typeof this.imageStatus>['proxy_brokers']>,
+    st: typeof this.imageStatus
+  ) {
+    return html`
+      <div class="image-section">
+        <h2>Images</h2>
+        <table class="image-table">
+          <thead>
+            <tr><th>Entity</th><th>Image</th><th>Hash</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            ${this.renderRegistryRow(st)}
+          </tbody>
+        </table>
+        <div class="image-actions">
+          <sl-button size="small" variant="text" @click=${this.recheckImage} ?disabled=${this.imageActionRunning}>
+            <sl-icon slot="prefix" name="arrow-repeat"></sl-icon>
+            Re-check
+          </sl-button>
+        </div>
+        <div class="proxy-info-note">
+          Agents on this hub run on proxy brokers.
+          Images are pulled by the substrate at provision time;
+          there is no node-local image state to inspect.
         </div>
       </div>
     `;
@@ -741,11 +1031,11 @@ export class ScionPageHarnessConfigDetail extends LitElement {
     }
   }
 
-  private async deleteLocalImage(): Promise<void> {
+  private async deleteLocalImage(brokerId: string): Promise<void> {
     this.imageActionRunning = true;
     try {
       const resp = await apiFetch(
-        `/api/v1/harness-configs/${this.harnessConfigId}/local-image`,
+        `/api/v1/harness-configs/${this.harnessConfigId}/local-image?broker_id=${brokerId}`,
         { method: 'DELETE' }
       );
       if (resp.ok) {
@@ -759,11 +1049,11 @@ export class ScionPageHarnessConfigDetail extends LitElement {
     }
   }
 
-  private async pullLatestImage(): Promise<void> {
+  private async pullLatestImage(brokerId: string): Promise<void> {
     this.imageActionRunning = true;
     try {
       const resp = await apiFetch(
-        `/api/v1/harness-configs/${this.harnessConfigId}/pull-image`,
+        `/api/v1/harness-configs/${this.harnessConfigId}/pull-image?broker_id=${brokerId}`,
         { method: 'POST' }
       );
       if (resp.ok) {
@@ -803,7 +1093,17 @@ export class ScionPageHarnessConfigDetail extends LitElement {
 
       const result = await response.json();
       const count = result?.count ?? result?.harnessConfigs?.length ?? 0;
-      this.reimportStatus = `Refreshed successfully (${count} config${count !== 1 ? 's' : ''} updated).`;
+      const failed: Array<{name: string; reason: string}> = result?.failed ?? [];
+
+      if (failed.length > 0) {
+        const reasons = failed.map((f: {name: string; reason: string}) => `${f.name}: ${f.reason}`).join('\n');
+        this.reimportError = `${failed.length} config(s) failed validation:\n${reasons}`;
+        if (count > 0) {
+          this.reimportStatus = `${count} config(s) updated, but some failed.`;
+        }
+      } else {
+        this.reimportStatus = `Refreshed successfully (${count} config${count !== 1 ? 's' : ''} updated).`;
+      }
       await this.loadHarnessConfig();
     } catch (err) {
       this.reimportError = err instanceof Error ? err.message : 'Failed to refresh from source';

@@ -793,7 +793,11 @@ func (s *Server) createAgentInProject(
 					// trigger spurious sync-registration attempts.
 					_ = dispatcher.DispatchAgentDelete(ctx, agent, true, true, false, time.Time{})
 					_ = s.store.DeleteAgent(ctx, agent.ID)
-					RuntimeError(w, "Failed to dispatch to runtime broker: "+err.Error())
+					if isContainerNameConflict(err) {
+						Conflict(w, "Agent name is already in use by a stopped container. Please delete the existing agent or choose a different name.")
+					} else {
+						RuntimeError(w, "Failed to dispatch to runtime broker: "+err.Error())
+					}
 					return
 				} else if envReqs != nil {
 					// Broker returned 202: needs env gather
@@ -830,7 +834,11 @@ func (s *Server) createAgentInProject(
 					// trigger spurious sync-registration attempts.
 					_ = dispatcher.DispatchAgentDelete(ctx, agent, true, true, false, time.Time{})
 					_ = s.store.DeleteAgent(ctx, agent.ID)
-					RuntimeError(w, "Failed to dispatch to runtime broker: "+err.Error())
+					if isContainerNameConflict(err) {
+						Conflict(w, "Agent name is already in use by a stopped container. Please delete the existing agent or choose a different name.")
+					} else {
+						RuntimeError(w, "Failed to dispatch to runtime broker: "+err.Error())
+					}
 					return
 				} else if envReqs != nil && len(envReqs.Needs) > 0 {
 					// Broker reported missing required env vars — fail the dispatch.
@@ -1146,6 +1154,12 @@ func (s *Server) submitAgentEnv(w http.ResponseWriter, r *http.Request, projectI
 	}
 
 	if err := dispatcher.DispatchFinalizeEnv(ctx, agent, req.Env); err != nil {
+		var stillMissing *ErrEnvStillMissing
+		if errors.As(err, &stillMissing) {
+			MissingEnvVars(w, stillMissing.Requirements.Needs,
+				s.buildEnvGatherResponse(ctx, agent, stillMissing.Requirements))
+			return
+		}
 		RuntimeError(w, "Failed to finalize env on runtime broker: "+err.Error())
 		return
 	}
@@ -2053,4 +2067,13 @@ func (s *Server) handleAgentResetAuth(w http.ResponseWriter, r *http.Request, id
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "Auth reset dispatched successfully",
 	})
+}
+
+func isContainerNameConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return (strings.Contains(msg, "container name") && strings.Contains(msg, "already in use")) ||
+		strings.Contains(msg, "is already in use by container")
 }

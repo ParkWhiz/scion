@@ -251,6 +251,11 @@ type VersionedSettings struct {
 	DefaultMaxModelCalls int               `json:"default_max_model_calls,omitempty" yaml:"default_max_model_calls,omitempty" koanf:"default_max_model_calls"`
 	DefaultMaxDuration   string            `json:"default_max_duration,omitempty" yaml:"default_max_duration,omitempty" koanf:"default_max_duration"`
 	DefaultResources     *api.ResourceSpec `json:"default_resources,omitempty" yaml:"default_resources,omitempty" koanf:"default_resources"`
+
+	// AutoInjectGcloudADC controls whether the host's gcloud Application Default
+	// Credentials file is automatically injected into agent containers in
+	// co-located (workstation) mode.
+	AutoInjectGcloudADC bool `json:"auto_inject_gcloud_adc,omitempty" yaml:"auto_inject_gcloud_adc,omitempty" koanf:"auto_inject_gcloud_adc"`
 }
 
 // V1ServerConfig holds server-side configuration in the versioned settings format.
@@ -1839,15 +1844,30 @@ func convertVersionedToLegacy(vs *VersionedSettings) *Settings {
 
 // detectHierarchyFormat checks settings files in the global and project directories
 // to determine if any user file uses the versioned format.
-// Returns true if any user file is versioned (has schema_version).
-func detectHierarchyFormat(projectPath string) (hasVersioned bool) {
+// Returns:
+//   - hasVersioned: true if any user file is versioned (has schema_version or v1 structural indicators)
+//   - missingSchemaVersion: true if versioned was detected via v1 structural indicators only (schema_version absent)
+func detectHierarchyFormat(projectPath string) (hasVersioned bool, missingSchemaVersion bool) {
+	// fileIsVersionedViaSV returns true if data has an explicit schema_version key.
+	fileHasExplicitVersion := func(data []byte) bool {
+		var raw map[string]interface{}
+		if err := yamlv3.Unmarshal(data, &raw); err != nil || raw == nil {
+			return false
+		}
+		_, ok := raw["schema_version"]
+		return ok
+	}
+
 	// Check global settings
 	globalDir, _ := GetGlobalDir()
 	if globalDir != "" {
 		if path := GetSettingsPath(globalDir); path != "" {
 			if data, err := os.ReadFile(path); err == nil {
 				if version, _ := DetectSettingsFormat(data); version != "" {
-					return true
+					if !fileHasExplicitVersion(data) {
+						missingSchemaVersion = true
+					}
+					return true, missingSchemaVersion
 				}
 			}
 		}
@@ -1859,13 +1879,16 @@ func detectHierarchyFormat(projectPath string) (hasVersioned bool) {
 		if path := GetSettingsPath(effectiveProjectPath); path != "" {
 			if data, err := os.ReadFile(path); err == nil {
 				if version, _ := DetectSettingsFormat(data); version != "" {
-					return true
+					if !fileHasExplicitVersion(data) {
+						missingSchemaVersion = true
+					}
+					return true, missingSchemaVersion
 				}
 			}
 		}
 	}
 
-	return false
+	return false, false
 }
 
 // LoadEffectiveSettings is a unified entry point that detects the settings format
@@ -1874,12 +1897,17 @@ func detectHierarchyFormat(projectPath string) (hasVersioned bool) {
 // - If all user files are legacy or absent → uses LoadSettingsKoanf + AdaptLegacySettings
 // Returns (settings, deprecation_warnings, error).
 func LoadEffectiveSettings(projectPath string) (*VersionedSettings, []string, error) {
-	if detectHierarchyFormat(projectPath) {
+	hasVersioned, missingSchemaVersion := detectHierarchyFormat(projectPath)
+	if hasVersioned {
 		vs, err := LoadVersionedSettings(projectPath)
 		if err != nil {
 			return nil, nil, fmt.Errorf("loading versioned settings: %w", err)
 		}
-		return vs, nil, nil
+		var warnings []string
+		if missingSchemaVersion {
+			warnings = append(warnings, `settings.yaml contains v1 runtime fields (type, cloudrun, gke, list_all_namespaces) but is missing 'schema_version: "1"'; add it as the first line to silence this warning`)
+		}
+		return vs, warnings, nil
 	}
 
 	// Legacy path: load via existing loader, then adapt

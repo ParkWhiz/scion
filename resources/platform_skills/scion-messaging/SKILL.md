@@ -25,7 +25,7 @@ Choosing the right recipient is critical to avoid spam and ensure the message re
 
 - **`agent:<name>`**: Use this to message a specific agent by its name (e.g., `agent:tech-lead`).
 - **`user:<email>`**: Use this to message a human user directly (e.g., `user:preston@example.com`).
-- **`set[a,b,...]`**: Use this for group messaging to a specific list of agents/users (e.g., `set[tech-lead, editor]`).
+- **`group[a,b,...]`**: Use this for group messaging to a specific list of agents/users (e.g., `group[tech-lead, editor]`).
 - **`coordinator`**: (Convention) Usually refers to the agent managing the project.
 
 **Anti-Pattern:** NEVER use `--broadcast`. It spams every agent in the project, wastes context windows, and is often ignored or causes confusion.
@@ -51,7 +51,7 @@ Every message should move work forward. High-signal messages are functional and 
 
 ## Channel and Thread Targeting
 
-- **`--channel <name>`**: Use this to target a specific delivery channel (e.g., `telegram`, `gchat`, `web`).
+- **`--channel <name>`**: Use this to target a specific delivery channel (e.g., `telegram`, `discord`, `web`).
 - **`--thread-id <id>`**: Use this to reply within a specific project thread, ensuring continuity for the user.
 
 ## Special Message Flags
@@ -68,9 +68,8 @@ The `scion message` command provides powerful flags for advanced orchestration:
 
 ## Agent-to-Agent Coordination Patterns
 
-- **Coordinator Relay**: Workers generally communicate through the coordinator rather than directly with each other.
-- **Context Sharding**: For long-running tasks, split the work into batches of ≤10 items. Have the agent message the coordinator after each batch to avoid context exhaustion.
-- **Self-Callback Heartbeat**: For very long tasks, use `scion message --in` to send yourself a reminder to check in or provide a status update.
+- **Coordinator Relay**: Workers generally communicate through the coordinator rather than directly with each other. This guidance may be set by the coordinator.
+- **Self-Callback Heartbeat**: For very long external tasks, use `scion message --in` to send yourself a reminder to check on the process or provide a status update. (during long blocked periods)
 
 ## Multi-User Communication
 

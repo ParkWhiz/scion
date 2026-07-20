@@ -388,7 +388,7 @@ export class ScionPageAgentCreate extends LitElement {
           fetch('/api/v1/runtime-brokers?limit=200', { credentials: 'include' }),
           fetch('/api/v1/templates?status=active&limit=200', { credentials: 'include' }),
           fetch('/api/v1/settings/public', { credentials: 'include' }),
-          fetch('/api/v1/harness-configs?status=active&limit=100', { credentials: 'include' }),
+          apiFetch('/api/v1/harness-configs?status=active&limit=100'),
         ]);
 
       if (projectsRes.ok) {
@@ -748,13 +748,21 @@ private selectBrokerForProject(): void {
    * for the current project plus global templates.
    */
   private get filteredTemplates(): Template[] {
-    if (!this.projectId) return this.templates;
-    return this.templates.filter(
-      (t) =>
-        t.scope === 'global' ||
-        t.scope === 'user' ||
-        (t.scope === 'project' && t.scopeId === this.projectId)
-    );
+    const visible = this.projectId
+      ? this.templates.filter(
+          (t) =>
+            t.scope === 'global' ||
+            t.scope === 'user' ||
+            (t.scope === 'project' && t.scopeId === this.projectId)
+        )
+      : this.templates;
+
+    const byName = (a: Template, b: Template) =>
+      (a.displayName || a.name).localeCompare(b.displayName || b.name);
+
+    const project = visible.filter((t) => t.scope === 'project').sort(byName);
+    const rest = visible.filter((t) => t.scope !== 'project').sort(byName);
+    return [...project, ...rest];
   }
 
   /**

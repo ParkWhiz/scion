@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -155,12 +156,74 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 			Attach: true,
 			Exec:   true,
 		},
-		Profiles: []BrokerProfile{
-			{Name: "default", Type: runtimeType, Available: true},
-		},
+		Profiles: s.buildInfoProfiles(runtimeType),
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// isLocalOnlyRuntime returns true for runtime types that require a local daemon
+// or hardware and cannot function in a hosted cloud environment.
+func isLocalOnlyRuntime(runtimeType string) bool {
+	switch runtimeType {
+	case "docker", "podman", "container":
+		return true
+	}
+	return false
+}
+
+// buildInfoProfiles enumerates configured profiles from effective settings.
+// Falls back to a single "default" profile when no profiles are configured.
+func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
+	vs, _, err := config.LoadEffectiveSettings("")
+	if err != nil || len(vs.Profiles) == 0 {
+		return []BrokerProfile{
+			{Name: "default", Type: defaultRuntimeType, Available: true},
+		}
+	}
+
+	names := make([]string, 0, len(vs.Profiles))
+	for name := range vs.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var profiles []BrokerProfile
+	for _, name := range names {
+		profileCfg := vs.Profiles[name]
+		rtType := profileCfg.Runtime
+		if rtType == "" {
+			rtType = defaultRuntimeType
+		}
+
+		if !isLocalOnlyRuntime(defaultRuntimeType) && isLocalOnlyRuntime(rtType) {
+			continue
+		}
+
+		var ctx, ns string
+		if vs.Runtimes != nil {
+			if rtCfg, ok := vs.Runtimes[rtType]; ok {
+				ctx = rtCfg.Context
+				ns = rtCfg.Namespace
+			}
+		}
+
+		profiles = append(profiles, BrokerProfile{
+			Name:      name,
+			Type:      rtType,
+			Available: true,
+			Context:   ctx,
+			Namespace: ns,
+		})
+	}
+
+	if len(profiles) == 0 {
+		return []BrokerProfile{
+			{Name: "default", Type: defaultRuntimeType, Available: true},
+		}
+	}
+
+	return profiles
 }
 
 // handleHubConnections returns live status of all hub connections.
@@ -502,21 +565,6 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if len(needs) > 0 {
-				// Store pending state for finalize-env
-				s.pendingEnvGatherMu.Lock()
-				now := time.Now()
-				s.cleanupExpiredPendingLocked(now)
-				s.upsertPendingState(&pendingAgentState{
-					AgentID:   agentKey,
-					Request:   &req,
-					MergedEnv: env,
-					CreatedAt: now,
-					UpdatedAt: now,
-					State:     pendingStatePending,
-					RequestID: req.RequestID,
-				})
-				s.pendingEnvGatherMu.Unlock()
-
 				if s.config.Debug {
 					s.envSecretLog.Debug("Env-gather: returning 202 with requirements",
 						"required", required,
@@ -807,7 +855,11 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 					"agent_id", req.ID, "project_id", req.ProjectID, "agent", opts.Name)
 			}
 		}
-		RuntimeError(w, "Failed to create agent: "+err.Error())
+		if errors.Is(err, agent.ErrContainerNameInUse) {
+			Conflict(w, err.Error())
+		} else {
+			RuntimeError(w, "Failed to create agent: "+err.Error())
+		}
 		return
 	}
 
@@ -1184,8 +1236,6 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, p
 		s.getStats(w, r, id, projectID)
 	case api.AgentActionHasPrompt:
 		s.checkAgentPrompt(w, r, id, projectID)
-	case api.AgentActionFinalizeEnv:
-		s.finalizeEnv(w, r, id)
 	}
 }
 
@@ -1309,7 +1359,11 @@ func (s *Server) startAgent(w http.ResponseWriter, r *http.Request, id, projectI
 	if err != nil {
 		s.agentLifecycleLog.Error("Agent start failed",
 			"agent_id", id, "error", err)
-		RuntimeError(w, "Failed to start agent: "+err.Error())
+		if errors.Is(err, agent.ErrContainerNameInUse) {
+			Conflict(w, err.Error())
+		} else {
+			RuntimeError(w, "Failed to start agent: "+err.Error())
+		}
 		return
 	}
 
@@ -2181,10 +2235,17 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 
 			for _, as := range authSecrets {
 				if _, ok := fileSecrets[as.Key]; !ok {
-					// Check if any alternative env keys satisfy this requirement.
+					// Check if any alternative env keys satisfy this requirement
+					// via resolved env, inline config env, or process env (the
+					// latter covers workstation mode where PR #719 sets
+					// GOOGLE_APPLICATION_CREDENTIALS at startup).
 					altSatisfied := false
 					for _, altKey := range as.AlternativeEnvKeys {
 						if v, ok := req.ResolvedEnv[altKey]; ok && v != "" {
+							altSatisfied = true
+							break
+						}
+						if v := os.Getenv(altKey); v != "" {
 							altSatisfied = true
 							break
 						}
@@ -2344,123 +2405,6 @@ func (s *Server) resolveHarnessConfigForEnvGather(req CreateAgentRequest, settin
 		return ""
 	}
 	return res.Name
-}
-
-// finalizeEnv handles the second phase of env-gather: receiving gathered env vars
-// from the Hub and starting the agent with the complete environment.
-func (s *Server) finalizeEnv(w http.ResponseWriter, r *http.Request, id string) {
-	ctx := r.Context()
-
-	var req FinalizeEnvRequest
-	if err := readJSON(r, &req); err != nil {
-		BadRequest(w, "Invalid request body: "+err.Error())
-		return
-	}
-
-	// Look up pending state
-	s.pendingEnvGatherMu.Lock()
-	s.cleanupExpiredPendingLocked(time.Now())
-	pending, ok := s.pendingEnvGather[id]
-	if ok && pending.State == pendingStateFinalizing {
-		s.pendingEnvGatherMu.Unlock()
-		writeError(w, http.StatusConflict, ErrCodeConflict, "agent finalize-env already in progress", map[string]interface{}{
-			"agentId": id,
-		})
-		return
-	}
-	if ok {
-		pending.State = pendingStateFinalizing
-		pending.UpdatedAt = time.Now()
-		pending.FinalizeRuns++
-		s.upsertPendingState(pending)
-	}
-	s.pendingEnvGatherMu.Unlock()
-
-	if !ok {
-		NotFound(w, "Pending agent")
-		return
-	}
-
-	// Merge gathered env into the previously merged env
-	for k, v := range req.Env {
-		pending.MergedEnv[k] = v
-	}
-
-	if s.config.Debug {
-		s.envSecretLog.Debug("Finalize-env: merging gathered env", "gatheredKeys", len(req.Env), "totalEnv", len(pending.MergedEnv))
-	}
-
-	origReq := pending.Request
-
-	// Build unified start context from the original pending request + merged env
-	sc, err := s.buildStartContext(ctx, startContextInputs{
-		Name:            origReq.Name,
-		AgentID:         origReq.ID,
-		Slug:            origReq.Slug,
-		ProjectPath:     origReq.ProjectPath,
-		ProjectSlug:     origReq.ProjectSlug,
-		ProjectID:       origReq.ProjectID,
-		Config:          origReq.Config,
-		InlineConfig:    origReq.InlineConfig,
-		SharedDirs:      origReq.SharedDirs,
-		HubEndpoint:     origReq.HubEndpoint,
-		AgentToken:      origReq.AgentToken,
-		CreatorName:     origReq.CreatorName,
-		ResolvedEnv:     pending.MergedEnv,
-		ResolvedSecrets: origReq.ResolvedSecrets,
-		NoAuth:          origReq.NoAuth,
-		Attach:          origReq.Attach,
-		HTTPRequest:     r,
-	})
-	if err != nil {
-		TemplateError(w, err.Error())
-		return
-	}
-	opts := sc.Opts
-
-	if s.config.Debug {
-		s.envSecretLog.Debug("Finalize-env: StartOptions built from pending request",
-			"name", opts.Name,
-			"projectPath", opts.ProjectPath,
-			"template", opts.Template,
-			"image", opts.Image,
-			"profile", opts.Profile,
-			"harnessConfig", opts.HarnessConfig,
-			"hasConfig", origReq.Config != nil,
-		)
-	}
-
-	// Start the agent
-	agentInfo, err := sc.Manager.Start(ctx, opts)
-	if err != nil {
-		// Keep pending state for retry on transient start failures.
-		s.pendingEnvGatherMu.Lock()
-		if cur, exists := s.pendingEnvGather[id]; exists {
-			cur.State = pendingStatePending
-			cur.UpdatedAt = time.Now()
-			s.upsertPendingState(cur)
-		}
-		s.pendingEnvGatherMu.Unlock()
-		RuntimeError(w, "Failed to create agent: "+err.Error())
-		return
-	}
-
-	s.pendingEnvGatherMu.Lock()
-	s.deletePendingState(id)
-	s.pendingEnvGatherMu.Unlock()
-
-	s.agentLifecycleLog.Info("Agent created (finalize-env)",
-		"agent_id", origReq.ID, "project_id", origReq.ProjectID,
-		"name", origReq.Name, "slug", origReq.Slug,
-		"phase", string(state.PhaseRunning),
-		"container_status", agentInfo.ContainerStatus)
-
-	resp := CreateAgentResponse{
-		Agent:   agentInfoPtr(AgentInfoToResponse(*agentInfo)),
-		Created: true,
-	}
-
-	writeJSON(w, http.StatusCreated, resp)
 }
 
 // resolveManagerForAgent returns the appropriate agent.Manager for an existing

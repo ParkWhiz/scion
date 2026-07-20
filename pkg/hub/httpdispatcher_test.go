@@ -175,12 +175,6 @@ func (m *mockRuntimeBrokerClient) CheckAgentPrompt(ctx context.Context, brokerID
 	return false, m.returnErr
 }
 
-func (m *mockRuntimeBrokerClient) FinalizeEnv(ctx context.Context, brokerID, brokerEndpoint, agentID string, env map[string]string) (*RemoteAgentResponse, error) {
-	return &RemoteAgentResponse{
-		Agent: &RemoteAgentInfo{ID: agentID, Name: agentID, Phase: string(state.PhaseRunning)},
-	}, m.returnErr
-}
-
 func (m *mockRuntimeBrokerClient) GetAgentLogs(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, tail int) (string, error) {
 	return "", nil
 }
@@ -3370,4 +3364,144 @@ func TestBuildCreateRequest_NoAuth_SkipsSecrets(t *testing.T) {
 			t.Errorf("expected 2 resolved secrets, got %d", len(req.ResolvedSecrets))
 		}
 	})
+}
+
+func TestHTTPAgentDispatcher_DispatchAgentCreate_AppliesImageRegistry(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("host-1"),
+		Name:     "test-host",
+		Slug:     "test-host",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetImageRegistry("us-docker.pkg.dev/my-project/scion")
+
+	agent := &store.Agent{
+		ID:              tid("agent-1"),
+		Name:            "test-agent",
+		Slug:            "test-agent",
+		ProjectID:       tid("project-1"),
+		RuntimeBrokerID: tid("host-1"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+			Task:          "do something",
+			Image:         "scion-claude:latest",
+		},
+	}
+
+	err := dispatcher.DispatchAgentCreate(ctx, agent)
+	if err != nil {
+		t.Fatalf("DispatchAgentCreate failed: %v", err)
+	}
+
+	if !mockClient.createCalled {
+		t.Fatal("expected CreateAgent to be called")
+	}
+	if mockClient.lastCreateReq.Config == nil {
+		t.Fatal("expected config to be present")
+	}
+	want := "us-docker.pkg.dev/my-project/scion/scion-claude:latest"
+	if mockClient.lastCreateReq.Config.Image != want {
+		t.Errorf("expected image %q after registry rewrite, got %q",
+			want, mockClient.lastCreateReq.Config.Image)
+	}
+}
+
+func TestHTTPAgentDispatcher_DispatchAgentCreate_NoRegistryNoRewrite(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("host-1"),
+		Name:     "test-host",
+		Slug:     "test-host",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	// No SetImageRegistry call — registry is empty
+
+	agent := &store.Agent{
+		ID:              tid("agent-1"),
+		Name:            "test-agent",
+		Slug:            "test-agent",
+		ProjectID:       tid("project-1"),
+		RuntimeBrokerID: tid("host-1"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+			Image:         "scion-claude:latest",
+		},
+	}
+
+	err := dispatcher.DispatchAgentCreate(ctx, agent)
+	if err != nil {
+		t.Fatalf("DispatchAgentCreate failed: %v", err)
+	}
+
+	if mockClient.lastCreateReq.Config == nil {
+		t.Fatal("expected config to be present")
+	}
+	if mockClient.lastCreateReq.Config.Image != "scion-claude:latest" {
+		t.Errorf("expected bare image when no registry set, got %q",
+			mockClient.lastCreateReq.Config.Image)
+	}
+}
+
+func TestHTTPAgentDispatcher_DispatchAgentCreate_FullyQualifiedImageNotRewritten(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("host-1"),
+		Name:     "test-host",
+		Slug:     "test-host",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetImageRegistry("us-docker.pkg.dev/my-project/scion")
+
+	agent := &store.Agent{
+		ID:              tid("agent-1"),
+		Name:            "test-agent",
+		Slug:            "test-agent",
+		ProjectID:       tid("project-1"),
+		RuntimeBrokerID: tid("host-1"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+			Image:         "ghcr.io/custom/image:v2",
+		},
+	}
+
+	err := dispatcher.DispatchAgentCreate(ctx, agent)
+	if err != nil {
+		t.Fatalf("DispatchAgentCreate failed: %v", err)
+	}
+
+	if mockClient.lastCreateReq.Config == nil {
+		t.Fatal("expected config to be present")
+	}
+	if mockClient.lastCreateReq.Config.Image != "ghcr.io/custom/image:v2" {
+		t.Errorf("expected fully-qualified image to be unchanged, got %q",
+			mockClient.lastCreateReq.Config.Image)
+	}
 }

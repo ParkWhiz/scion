@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
@@ -311,7 +312,7 @@ func (h *CommandHandler) HandleAutocomplete(s *discordgo.Session, i *discordgo.I
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+		link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 		if err != nil || link == nil {
 			// No link — return empty choices.
 			_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -434,19 +435,38 @@ func (h *CommandHandler) HandleSetup(s *discordgo.Session, i *discordgo.Interact
 		return
 	}
 
-	// Check existing link.
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
-	if err != nil {
-		h.log.Error("Failed to check channel link", "error", err, "channel_id", i.ChannelID)
-		h.followup(s, i, "Something went wrong. Please try again.")
-		return
-	}
-	if link != nil {
-		h.followup(s, i, fmt.Sprintf(
-			"This channel is already linked to project **%s**.\nUse `/scion unlink` first to change it.",
-			link.ProjectSlug,
-		))
-		return
+	// If running in a thread/forum topic, resolve the parent channel.
+	var link *ChannelLink
+	parentID := threadParentID(s, i.ChannelID)
+	if parentID != "" {
+		link, err = h.store.GetChannelLink(ctx, parentID)
+		if err != nil {
+			h.log.Error("Failed to check parent channel link", "error", err, "parent_id", parentID)
+			h.followup(s, i, "Something went wrong. Please try again.")
+			return
+		}
+		if link != nil && link.Active {
+			h.followup(s, i, fmt.Sprintf(
+				"This channel is already set up (project **%s**). Use `/scion default` to set a per-thread default agent.",
+				link.ProjectSlug,
+			))
+			return
+		}
+	} else {
+		// Check existing link.
+		link, err = h.store.GetChannelLink(ctx, i.ChannelID)
+		if err != nil {
+			h.log.Error("Failed to check channel link", "error", err, "channel_id", i.ChannelID)
+			h.followup(s, i, "Something went wrong. Please try again.")
+			return
+		}
+		if link != nil {
+			h.followup(s, i, fmt.Sprintf(
+				"This channel is already linked to project **%s**.\nUse `/scion unlink` first to change it.",
+				link.ProjectSlug,
+			))
+			return
+		}
 	}
 
 	// Get user's projects.
@@ -537,7 +557,7 @@ func (h *CommandHandler) HandleAgents(s *discordgo.Session, i *discordgo.Interac
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil {
 		h.log.Error("Failed to get channel link", "error", err, "channel_id", i.ChannelID)
 		h.followup(s, i, "Something went wrong. Please try again.")
@@ -611,7 +631,7 @@ func (h *CommandHandler) HandleInfo(s *discordgo.Session, i *discordgo.Interacti
 
 	// Show channel link if in a guild channel.
 	if i.ChannelID != "" {
-		link, linkErr := h.store.GetChannelLink(ctx, i.ChannelID)
+		link, linkErr := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 		if linkErr == nil && link != nil {
 			sb.WriteString(fmt.Sprintf("\n**Channel project:** %s", link.ProjectSlug))
 			if link.DefaultAgent != "" {
@@ -634,7 +654,7 @@ func (h *CommandHandler) HandleStatus(s *discordgo.Session, i *discordgo.Interac
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil || link == nil {
 		h.followup(s, i, "This channel is not linked to a project. Use `/scion setup` first.")
 		return
@@ -646,6 +666,9 @@ func (h *CommandHandler) HandleStatus(s *discordgo.Session, i *discordgo.Interac
 		return
 	}
 
+	// Detect thread context for default info display.
+	statusParentID := threadParentID(s, i.ChannelID)
+
 	for _, agent := range agents {
 		if agent.Slug == agentSlug {
 			emoji := activityEmoji(agent.Activity)
@@ -653,7 +676,22 @@ func (h *CommandHandler) HandleStatus(s *discordgo.Session, i *discordgo.Interac
 			if activity == "" {
 				activity = "unknown"
 			}
-			h.followup(s, i, fmt.Sprintf("%s **%s** -- %s", emoji, agent.Slug, activity))
+			statusMsg := fmt.Sprintf("%s **%s** -- %s", emoji, agent.Slug, activity)
+			if statusParentID != "" {
+				threadDefault, err := h.store.GetThreadDefault(ctx, link.ChannelID, i.ChannelID)
+				if err != nil {
+					h.log.Error("Failed to get thread default", "error", err)
+				} else if threadDefault != "" {
+					statusMsg += fmt.Sprintf("\nThread default: **%s**", threadDefault)
+				}
+				channelDefault := link.DefaultAgent
+				if channelDefault != "" {
+					statusMsg += fmt.Sprintf("\nChannel default: **%s**", channelDefault)
+				} else {
+					statusMsg += "\nChannel default: none"
+				}
+			}
+			h.followup(s, i, statusMsg)
 			return
 		}
 	}
@@ -693,12 +731,7 @@ func (h *CommandHandler) HandleMessage(s *discordgo.Session, i *discordgo.Intera
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
-	if err != nil || link == nil {
-		if parentID := threadParentID(s, i.ChannelID); parentID != "" {
-			link, err = h.store.GetChannelLink(ctx, parentID)
-		}
-	}
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil || link == nil {
 		h.followup(s, i, "This channel is not linked to a project. Use `/scion setup` first.")
 		return
@@ -796,11 +829,13 @@ func (h *CommandHandler) HandleLogs(s *discordgo.Session, i *discordgo.Interacti
 }
 
 // HandleDefault shows agent selection buttons for setting the default agent.
+// When invoked from a thread, it manages per-thread overrides instead of
+// the channel-level default.
 func (h *CommandHandler) HandleDefault(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil {
 		h.log.Error("Failed to get channel link", "error", err, "channel_id", i.ChannelID)
 		h.followup(s, i, "Something went wrong. Please try again.")
@@ -823,22 +858,53 @@ func (h *CommandHandler) HandleDefault(s *discordgo.Session, i *discordgo.Intera
 		return
 	}
 
+	// Detect thread context.
+	parentID := threadParentID(s, i.ChannelID)
+	isThread := parentID != ""
+	threadID := ""
+	if isThread {
+		threadID = i.ChannelID
+	}
+
+	// Determine the current effective default for highlighting.
+	currentDefault := link.DefaultAgent
+	if isThread {
+		td, err := h.store.GetThreadDefault(ctx, link.ChannelID, threadID)
+		if err != nil {
+			h.log.Error("Failed to get thread default", "error", err)
+		} else if td != "" {
+			currentDefault = td
+		}
+	}
+
+	promptText := "Select the default agent for this channel:"
+	if isThread {
+		promptText = "Select the default agent for this thread:"
+		if link.DefaultAgent != "" {
+			promptText += fmt.Sprintf("\nChannel-wide default: **%s**", link.DefaultAgent)
+		}
+	}
+
 	var currentText string
-	if link.DefaultAgent != "" {
-		currentText = fmt.Sprintf("Current default: **%s**\n", link.DefaultAgent)
+	if currentDefault != "" {
+		currentText = fmt.Sprintf("Current default: **%s**\n", currentDefault)
 	}
 
 	var rows []discordgo.MessageComponent
 	var buttons []discordgo.MessageComponent
 	for idx, slug := range agents {
 		style := discordgo.SecondaryButton
-		if slug == link.DefaultAgent {
+		if slug == currentDefault {
 			style = discordgo.PrimaryButton
+		}
+		customID := fmt.Sprintf("default:set:%s", slug)
+		if threadID != "" {
+			customID = fmt.Sprintf("default:set:%s:%s", slug, threadID)
 		}
 		buttons = append(buttons, discordgo.Button{
 			Label:    slug,
 			Style:    style,
-			CustomID: fmt.Sprintf("default:set:%s", slug),
+			CustomID: customID,
 		})
 		if len(buttons) == 5 || idx == len(agents)-1 {
 			rows = append(rows, discordgo.ActionsRow{Components: buttons})
@@ -849,19 +915,23 @@ func (h *CommandHandler) HandleDefault(s *discordgo.Session, i *discordgo.Intera
 		}
 	}
 	if len(rows) < 5 {
+		noneCustomID := "default:none"
+		if threadID != "" {
+			noneCustomID = fmt.Sprintf("default:none:%s", threadID)
+		}
 		rows = append(rows, discordgo.ActionsRow{
 			Components: []discordgo.MessageComponent{
 				discordgo.Button{
 					Label:    "None",
 					Style:    discordgo.DangerButton,
-					CustomID: "default:none",
+					CustomID: noneCustomID,
 				},
 			},
 		})
 	}
 
 	_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-		Content:    currentText + "Select the default agent for this channel:",
+		Content:    currentText + promptText,
 		Components: rows,
 	})
 }
@@ -871,7 +941,7 @@ func (h *CommandHandler) HandleSettings(s *discordgo.Session, i *discordgo.Inter
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil {
 		h.log.Error("Failed to get channel link", "error", err, "channel_id", i.ChannelID)
 		h.followup(s, i, "Something went wrong. Please try again.")
@@ -1014,6 +1084,11 @@ func interactionUserID(i *discordgo.InteractionCreate) string {
 	return ""
 }
 
+var (
+	threadParentsMu sync.Mutex
+	threadParents   = make(map[string]string)
+)
+
 // threadParentID returns the parent channel ID if channelID is a thread,
 // or empty string if it is not a thread or the lookup fails.
 func threadParentID(s *discordgo.Session, channelID string) string {
@@ -1034,6 +1109,32 @@ func threadParentID(s *discordgo.Session, channelID string) string {
 		return ch.ParentID
 	}
 	return ""
+}
+
+// resolveChannelLink looks up a ChannelLink for channelID. If no active link
+// is found and the channel is a thread, it falls back to the parent channel.
+func resolveChannelLink(ctx context.Context, s *discordgo.Session, store Store, channelID string) (*ChannelLink, error) {
+	link, err := store.GetChannelLink(ctx, channelID)
+	if err != nil {
+		return nil, err
+	}
+	if link == nil || !link.Active {
+		threadParentsMu.Lock()
+		parentID, cached := threadParents[channelID]
+		threadParentsMu.Unlock()
+
+		if !cached {
+			parentID = threadParentID(s, channelID)
+			threadParentsMu.Lock()
+			threadParents[channelID] = parentID
+			threadParentsMu.Unlock()
+		}
+
+		if parentID != "" {
+			return store.GetChannelLink(ctx, parentID)
+		}
+	}
+	return link, nil
 }
 
 // activityEmoji returns an emoji for an agent activity state.
