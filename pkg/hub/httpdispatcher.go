@@ -21,11 +21,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
@@ -33,6 +38,8 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"golang.org/x/sync/errgroup"
 )
 
 // HTTPRuntimeBrokerClient is an HTTP-based implementation of RuntimeBrokerClient.
@@ -134,6 +141,7 @@ type HTTPAgentDispatcher struct {
 	authzService      *AuthzService        // Optional authz service for progeny secret verification
 	githubAppMinter   GitHubAppTokenMinter // Optional GitHub App token minter
 	hubEndpoint       string               // Hub endpoint URL for agents to call back
+	hubName           string               // Hub display name for agent log labeling
 	hubID             string               // Hub instance ID for hub-scoped queries
 	devAuthToken      string               // Dev auth token to inject into agent env (dev-auth mode only)
 	transportMinter   TransportTokenMinter // Optional transport token minter for OIDC dispatch
@@ -159,6 +167,13 @@ type HTTPAgentDispatcher struct {
 	// when a hash mismatch is detected during dispatch. Nil = no repair.
 	harnessConfigRepairer func(ctx context.Context, name string) error
 	templateRepairer      func(ctx context.Context, ref string) error
+
+	// hubAgentDefaultsProvider returns the hub's operational agent_defaults at
+	// dispatch time. A callback rather than a snapshot because the settings
+	// propagation goroutine rewrites them while the hub runs; the Server's
+	// accessor reads under its lock. Nil = no hub defaults (local dispatcher,
+	// tests) and the wire field is omitted.
+	hubAgentDefaultsProvider func() opsettings.AgentDefaultsSettings
 }
 
 // NewHTTPAgentDispatcher creates a new HTTP-based agent dispatcher.
@@ -189,6 +204,13 @@ func (d *HTTPAgentDispatcher) SetTokenGenerator(gen AgentTokenGenerator) {
 // SetHubEndpoint sets the Hub endpoint URL that agents will use to call back.
 func (d *HTTPAgentDispatcher) SetHubEndpoint(endpoint string) {
 	d.hubEndpoint = endpoint
+}
+
+// SetHubName sets the hub display name for agent log labeling.
+// When set, agents receive SCION_HUB_NAME so their Cloud Logging entries
+// carry a "hub" label matching the hub-scoped log query filter.
+func (d *HTTPAgentDispatcher) SetHubName(name string) {
+	d.hubName = name
 }
 
 // SetSecretBackend sets the secret backend for resolving secrets.
@@ -244,6 +266,13 @@ func (d *HTTPAgentDispatcher) SetDispatchMetrics(rec dispatchmetrics.Recorder) {
 // DB manifest from storage when a hash mismatch is detected during dispatch.
 func (d *HTTPAgentDispatcher) SetHarnessConfigRepairer(fn func(ctx context.Context, name string) error) {
 	d.harnessConfigRepairer = fn
+}
+
+// SetHubAgentDefaultsProvider registers the accessor for the hub's operational
+// agent_defaults, read on every dispatch so a settings change takes effect
+// without a restart. Mirrors SetHarnessConfigRepairer.
+func (d *HTTPAgentDispatcher) SetHubAgentDefaultsProvider(fn func() opsettings.AgentDefaultsSettings) {
+	d.hubAgentDefaultsProvider = fn
 }
 
 // SetImageRegistry sets the image registry prefix for rewriting bare image
@@ -429,7 +458,10 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 		// ensuring a consistent workspace strategy regardless of whether
 		// the broker happens to have the repo locally.
 		if projectInfo.projectPath != "" {
-			workspace = ""
+			if workspace == "" || filepath.IsAbs(workspace) {
+				workspace = ""
+			}
+			// else: relative workspace -- keep it; broker joins with its own project root
 		}
 		var remoteGCPIdentity *RemoteGCPIdentityConfig
 		if gcpID := agent.AppliedConfig.GCPIdentity; gcpID != nil {
@@ -444,22 +476,34 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 			image = config.RewriteImageRegistry(image, d.imageRegistry)
 		}
 		req.Config = &RemoteAgentConfig{
-			Template:          agent.Template,
-			Image:             image,
-			HarnessConfig:     agent.AppliedConfig.HarnessConfig,
-			HarnessAuth:       agent.AppliedConfig.HarnessAuth,
-			Task:              agent.AppliedConfig.Task,
-			Workspace:         workspace,
-			Profile:           agent.AppliedConfig.Profile,
-			Branch:            agent.AppliedConfig.Branch,
-			TemplateID:        agent.AppliedConfig.TemplateID,
-			TemplateHash:      agent.AppliedConfig.TemplateHash,
-			HarnessConfigID:   agent.AppliedConfig.HarnessConfigID,
-			HarnessConfigHash: agent.AppliedConfig.HarnessConfigHash,
-			GitClone:          gitClone,
-			SharedWorkspace:   projectInfo.sharedWorkspace,
-			GCPIdentity:       remoteGCPIdentity,
+			Template:                  agent.Template,
+			Image:                     image,
+			HarnessConfig:             agent.AppliedConfig.HarnessConfig,
+			HarnessAuth:               agent.AppliedConfig.HarnessAuth,
+			Task:                      agent.AppliedConfig.Task,
+			Workspace:                 workspace,
+			Profile:                   agent.AppliedConfig.Profile,
+			Branch:                    agent.AppliedConfig.Branch,
+			TemplateID:                agent.AppliedConfig.TemplateID,
+			TemplateHash:              agent.AppliedConfig.TemplateHash,
+			HarnessConfigID:           agent.AppliedConfig.HarnessConfigID,
+			HarnessConfigHash:         agent.AppliedConfig.HarnessConfigHash,
+			GitClone:                  gitClone,
+			SharedWorkspace:           projectInfo.sharedWorkspace,
+			GCPIdentity:               remoteGCPIdentity,
+			ProjectPreStartHookScript: agent.AppliedConfig.ProjectPreStartHookScript,
 		}
+
+		// Hub operational agent_defaults (limits/resources only) travel in
+		// their own low-rank slot, NOT in InlineConfig: InlineConfig lands in
+		// the override position at provision.go's merge and would let a
+		// hub-wide floor outrank a template's explicit max_turns. The broker
+		// applies these below the template and above its own settings.yaml
+		// defaults. Nil in file mode — see remoteHubAgentDefaults.
+		if d.hubAgentDefaultsProvider != nil {
+			req.Config.HubAgentDefaults = remoteHubAgentDefaults(d.hubAgentDefaultsProvider())
+		}
+
 		req.ResolvedEnv = agent.AppliedConfig.Env
 
 		// Thread through the full inline ScionConfig for broker-side provisioning
@@ -476,6 +520,23 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 				"hasInlineConfig", agent.AppliedConfig.InlineConfig != nil,
 			)
 		}
+	}
+
+	// Clone req.ResolvedEnv to avoid mutating the shared agent.AppliedConfig.Env
+	// map, which is a direct reference and may be read concurrently.
+	if req.ResolvedEnv != nil {
+		req.ResolvedEnv = maps.Clone(req.ResolvedEnv)
+	}
+	if req.ResolvedEnv == nil {
+		req.ResolvedEnv = make(map[string]string)
+	}
+	injectModelEnv(req.ResolvedEnv, agent.AppliedConfig)
+	injectThinkingLevelEnv(req.ResolvedEnv, agent.AppliedConfig)
+
+	// Inject hub name so agents can label their Cloud Logging entries with the
+	// hub identity, matching the hub-scoped log query filter (labels.hub).
+	if d.hubName != "" {
+		req.ResolvedEnv["SCION_HUB_NAME"] = d.hubName
 	}
 
 	// Resolve env vars from Hub storage (user/project/broker scopes) and merge.
@@ -620,6 +681,60 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 		}
 	}
 
+	// Collect project-scope secrets for provision-time credential resolution.
+	// These are NOT merged into ResolvedEnv and will not appear in the container env.
+	// NOT gated on noAuth: provisionCredentials serve skill resolution (gh://
+	// convention tokens like GH_{OWNER}), not harness auth. Suppressing them under
+	// noAuth starves the GitHubSkillResolver of credentials for private repos.
+	if agent.ProjectID != "" && d.secretBackend != nil {
+		projectSecrets, listErr := d.secretBackend.List(ctx, secret.Filter{
+			Scope:   secret.ScopeProject,
+			ScopeID: agent.ProjectID,
+		})
+		if listErr != nil {
+			if d.debug {
+				d.log.Warn("buildCreateRequest: failed to list project secrets for ProvisionCredentials",
+					"agent_id", agent.ID, "error", listErr)
+			}
+		} else if len(projectSecrets) > 0 {
+			type namedValue struct{ name, value string }
+			fetched := make([]namedValue, len(projectSecrets))
+
+			g, gctx := errgroup.WithContext(ctx)
+			for i, sm := range projectSecrets {
+				if sm.SecretType == store.SecretTypeInternal {
+					continue
+				}
+				i, sm := i, sm // capture loop vars
+				g.Go(func() error {
+					sv, getErr := d.secretBackend.Get(gctx, sm.Name, secret.ScopeProject, agent.ProjectID)
+					if getErr != nil {
+						if d.debug {
+							d.log.Warn("buildCreateRequest: failed to get project secret for ProvisionCredentials",
+								"agent_id", agent.ID, "secret", sm.Name, "error", getErr)
+						}
+						return nil // don't fail the group for individual secrets
+					}
+					if sv != nil && sv.Value != "" {
+						fetched[i] = namedValue{sm.Name, sv.Value}
+					}
+					return nil
+				})
+			}
+			_ = g.Wait()
+
+			creds := make(map[string]string)
+			for _, nv := range fetched {
+				if nv.name != "" {
+					creds[nv.name] = nv.value
+				}
+			}
+			if len(creds) > 0 {
+				req.ProvisionCredentials = creds
+			}
+		}
+	}
+
 	// Log a summary of env resolution sources
 	if d.debug {
 		configEnvCount := 0
@@ -631,6 +746,7 @@ func (d *HTTPAgentDispatcher) buildCreateRequest(ctx context.Context, agent *sto
 			"storageEnvCount", len(envFromStorage),
 			"resolvedSecretsCount", len(req.ResolvedSecrets),
 			"totalResolvedEnvCount", len(req.ResolvedEnv),
+			"provisionCredentialsCount", len(req.ProvisionCredentials),
 		)
 	}
 
@@ -778,17 +894,27 @@ func (d *HTTPAgentDispatcher) applyBrokerResponse(agent *store.Agent, resp *Remo
 
 // DispatchAgentCreate creates and starts an agent on the runtime broker.
 func (d *HTTPAgentDispatcher) DispatchAgentCreate(ctx context.Context, agent *store.Agent) error {
+	ctx, span := tracer.Start(ctx, "hub.dispatch.create")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.agent.id", agent.ID),
+		attribute.String("scion.broker.id", agent.RuntimeBrokerID),
+	)
+
 	if err := requireRuntimeBrokerAssigned(agent); err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
 	endpoint, err := d.getBrokerEndpoint(ctx, agent.RuntimeBrokerID)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
 	req, err := d.buildCreateRequest(ctx, agent, "DispatchAgentCreate")
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -799,6 +925,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreate(ctx context.Context, agent *st
 		}
 	}
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -892,20 +1019,36 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreateWithGather(ctx context.Context,
 		}
 	}
 	if errors.Is(err, ErrLifecycleDeferred) {
-		return d.deferredCreateWithGather(ctx, agent)
-	}
-	if err != nil {
+		envReqs, err = d.deferredCreateWithGather(ctx, agent)
+		if err != nil {
+			return nil, err
+		}
+		// Fall through to the second-pass as_needed resolution below.
+	} else if err != nil {
 		return nil, err
-	}
-
-	if envReqs != nil {
-		return envReqs, nil
-	}
-
-	if resp != nil {
+	} else if resp != nil {
 		d.applyBrokerResponse(agent, resp)
 	}
-	return nil, nil
+
+	// Second pass: if the broker reported needed keys, check whether any can
+	// be satisfied by as_needed env vars or secrets. If so, finalize them
+	// transparently without requiring CLI intervention.
+	if envReqs != nil && len(envReqs.Needs) > 0 {
+		asNeededEnv := d.resolveAsNeededForKeys(ctx, agent, envReqs.Needs, envReqs.Alternatives)
+		if len(asNeededEnv) > 0 {
+			err := d.DispatchFinalizeEnv(ctx, agent, asNeededEnv)
+			if err == nil {
+				return nil, nil // All needs satisfied by as_needed entries
+			}
+			var stillMissing *ErrEnvStillMissing
+			if errors.As(err, &stillMissing) {
+				return stillMissing.Requirements, nil // Partial; remaining needs returned
+			}
+			return nil, err
+		}
+	}
+
+	return envReqs, nil
 }
 
 // deferredCreateWithGather handles a cross-node create-with-gather via durable dispatch.
@@ -977,6 +1120,27 @@ func (d *HTTPAgentDispatcher) DispatchFinalizeEnv(ctx context.Context, agent *st
 	}
 
 	if envReqs != nil && len(envReqs.Needs) > 0 {
+		// Second pass: try to satisfy remaining needs with as_needed entries,
+		// mirroring the pattern in DispatchAgentCreateWithGather.
+		asNeededEnv := d.resolveAsNeededForKeys(ctx, agent, envReqs.Needs, envReqs.Alternatives)
+		if len(asNeededEnv) > 0 {
+			for k, v := range asNeededEnv {
+				req.ResolvedEnv[k] = v
+			}
+			resp2, envReqs2, err2 := d.client.CreateAgentWithGather(
+				ctx, agent.RuntimeBrokerID, endpoint, req,
+			)
+			if err2 != nil {
+				return err2
+			}
+			if envReqs2 != nil && len(envReqs2.Needs) > 0 {
+				return &ErrEnvStillMissing{Requirements: envReqs2}
+			}
+			if resp2 != nil {
+				d.applyBrokerResponse(agent, resp2)
+			}
+			return nil
+		}
 		return &ErrEnvStillMissing{Requirements: envReqs}
 	}
 
@@ -991,141 +1155,500 @@ func (d *HTTPAgentDispatcher) deferredFinalizeEnv(ctx context.Context, agent *st
 	return d.deferredDataOp(ctx, agent, "finalize_env", &FinalizeEnvDispatchArgs{Env: env})
 }
 
-// resolveEnvFromStorage queries Hub env var storage for all applicable scopes
-// and returns a merged map with precedence: user > project > global.
+// envScopePrecedence is the single, authoritative statement of the order in
+// which Hub env var STORAGE scopes are applied, LOWEST PRECEDENCE FIRST:
+//
+//	runtime_broker  <  hub  <  project  <  user
+//
+// The slice below is written LOWEST FIRST, so read the sequence rather than a
+// word: runtime_broker, then hub, then project, then user. runtime_broker is
+// therefore the WEAKEST of the four in precedence and the FIRST element in the
+// slice; user is the strongest and the last element. Saying "runtime_broker is
+// last" is true of precedence and false of the literal, which is why the
+// sequence is spelled out instead.
+//
+// It was the strongest until this changed, and
+// that was an accident of the order four near-identical blocks happened to
+// appear in — not a decision. Broker-scoped env is the most infrastructural and
+// least specific of the four, so it is the weakest default rather than an
+// override nobody can escape. The scope may be removed entirely in a future
+// release; bottom-ranking it is a step in that direction.
+//
+// THIS IS ONLY THE STORAGE-SCOPE LADDER. It is not the whole settings
+// precedence chain — templates, harness overrides, profiles and project
+// annotations all sit between these scopes and the final agent config, and they
+// are resolved elsewhere. See the settings-precedence reference doc for the
+// full stack; do not read the four names above as a complete ordering.
+//
+// Where explicit agent config sits, precisely, because the relation is NOT a
+// plain inequality: buildCreateRequest seeds ResolvedEnv from
+// AppliedConfig.Env, then storage fills only the keys config left ABSENT or set
+// to the EMPTY STRING. So a non-empty config value outranks all four scopes,
+// while an empty one is a passthrough marker that deliberately yields to
+// storage.
+//
+// The three consumers in THIS file derive their order from this list — the
+// resolver (resolveEnvFromStorage), the provenance reporter that tells the CLI
+// where a value came from (buildEnvSources), and the startup shadow warning
+// (WarnOutrankedBrokerEnvKeys). For those three, changing the order here is the
+// only edit required, and it is a user-visible behaviour change for any
+// deployment that defines the same key in two scopes.
+//
+// THAT IS NOT THE SAME AS "everywhere", AND THE DIFFERENCE IS LOAD-BEARING.
+// Server.buildEnvGatherResponse in handlers_agents_core.go answers the same
+// "where did this value come from" question for the env-gather path from its
+// own hardcoded chain: it defaults the reported scope to hub, then checks user,
+// project, config and secret, and never consults runtime_broker at all — so a
+// broker-only key is reported there as "hub". It does not reference this list,
+// and its user-before-project order agrees with this one by coincidence rather
+// than by construction. Reordering here does not reach it. That reporter is
+// tracked as a separate follow-up and is deliberately not changed by phase 10;
+// what matters here is that you must not read this list as the only place a
+// scope order is written down.
+var envScopePrecedence = []string{
+	store.ScopeRuntimeBroker,
+	store.ScopeHub,
+	store.ScopeProject,
+	store.ScopeUser,
+}
+
+// envScopeID returns the ID the given scope is keyed by for this agent, or ""
+// if the scope does not apply (e.g. an agent with no project). The hub scope is
+// keyed by the hub's own instance ID, not by anything on the agent.
+func (d *HTTPAgentDispatcher) envScopeID(scope string, agent *store.Agent) string {
+	switch scope {
+	case store.ScopeHub:
+		return d.hubID
+	case store.ScopeProject:
+		return agent.ProjectID
+	case store.ScopeUser:
+		return agent.OwnerID
+	case store.ScopeRuntimeBroker:
+		return agent.RuntimeBrokerID
+	default:
+		return ""
+	}
+}
+
+// envScopesInPrecedenceOrder returns the env var storage queries that apply to
+// this agent, lowest precedence first, so a caller can simply run them in order
+// and let later scopes overwrite earlier ones.
+//
+// Scopes whose scope ID is empty for this agent are omitted, with the exception
+// of the hub scope: it is always queried, because an empty ScopeID means "no
+// scope-ID filter" to the store and the hub scope has always been queried
+// unconditionally.
+func (d *HTTPAgentDispatcher) envScopesInPrecedenceOrder(agent *store.Agent) []store.EnvVarFilter {
+	if agent == nil {
+		return nil
+	}
+	filters := make([]store.EnvVarFilter, 0, len(envScopePrecedence))
+	for _, scope := range envScopePrecedence {
+		scopeID := d.envScopeID(scope, agent)
+		if scopeID == "" && scope != store.ScopeHub {
+			if d.debug {
+				d.log.Debug("env scope does not apply to agent (empty scope ID)", "scope", scope, "agent_id", agent.ID)
+			}
+			continue
+		}
+		filters = append(filters, store.EnvVarFilter{Scope: scope, ScopeID: scopeID})
+	}
+	return filters
+}
+
+// envScopeSourceLabel maps a storage scope to the source name reported to the
+// CLI. The labels are the user-facing names, which are not identical to the
+// scope constants: store.ScopeRuntimeBroker is reported as "broker".
+func envScopeSourceLabel(scope string) string {
+	switch scope {
+	case store.ScopeHub:
+		return "hub"
+	case store.ScopeProject:
+		return "project"
+	case store.ScopeUser:
+		return "user"
+	case store.ScopeRuntimeBroker:
+		return "broker"
+	default:
+		return scope
+	}
+}
+
+// envScopesOutranking returns the scopes in order that beat the given scope,
+// i.e. those appearing after it. Returns nil if scope is not in order at all,
+// and an empty slice if nothing outranks it.
+//
+// This is derived from the ordering list rather than hard-coded so that moving
+// an entry in envScopePrecedence changes who outranks whom for all three
+// consumers in this file at once — the same property that keeps the resolver
+// and the `scion hub env list` provenance reporter from drifting apart. It says
+// nothing about reporters that do not read the list; see envScopePrecedence for
+// the one that does not.
+func envScopesOutranking(order []string, scope string) []string {
+	at := slices.Index(order, scope)
+	if at < 0 {
+		return nil
+	}
+	return slices.Clone(order[at+1:])
+}
+
+// envScopeCollision is one env var key that is defined at some scope and also
+// at a scope that outranks it, so the lower scope's value is shadowed.
+type envScopeCollision struct {
+	// Key is the env var key defined in both places.
+	Key string
+	// ScopeIDs are the IDs, within the outranked scope, that define Key —
+	// for the runtime_broker scope these are broker IDs. Sorted.
+	ScopeIDs []string
+	// OutrankedBy names the scopes that outrank the outranked scope and also
+	// define Key, lowest precedence first.
+	OutrankedBy []string
+}
+
+// envScopeCollisions reports the keys defined at scope `target` that are also
+// defined at some scope outranking `target` under `order`, so that the value
+// set at `target` never reaches an agent that the higher scope also applies to.
+//
+// `order` is a parameter rather than a read of envScopePrecedence so that this
+// can be exercised against a ladder other than the one currently compiled in —
+// which is the only way to test the warning while the ordering change it exists
+// to announce has not landed yet.
+//
+// It deliberately OVER-reports: it matches on key alone and does not compare
+// values or check that the two scope IDs share any agent. A broker-scoped key
+// shadowed only by a user who never runs an agent on that broker is still
+// listed. For a warning about a silent, unmigratable behaviour flip, a false
+// positive costs a line of boot log and a false negative costs an operator
+// their pinned value.
+func envScopeCollisions(order []string, target string, vars []store.EnvVar) []envScopeCollision {
+	higher := envScopesOutranking(order, target)
+	if len(higher) == 0 {
+		return nil
+	}
+	// key -> scope IDs at the target scope, and key -> outranking scopes.
+	targetIDs := make(map[string]map[string]bool)
+	shadowedBy := make(map[string]map[string]bool)
+	for _, v := range vars {
+		switch {
+		case v.Scope == target:
+			if targetIDs[v.Key] == nil {
+				targetIDs[v.Key] = make(map[string]bool)
+			}
+			targetIDs[v.Key][v.ScopeID] = true
+		case slices.Contains(higher, v.Scope):
+			if shadowedBy[v.Key] == nil {
+				shadowedBy[v.Key] = make(map[string]bool)
+			}
+			shadowedBy[v.Key][v.Scope] = true
+		}
+	}
+
+	collisions := make([]envScopeCollision, 0, len(targetIDs))
+	for key, ids := range targetIDs {
+		scopes := shadowedBy[key]
+		if len(scopes) == 0 {
+			continue
+		}
+		// Report outranking scopes in precedence order, not alphabetically, so
+		// the log reads in the same direction as the ladder.
+		outrankedBy := make([]string, 0, len(scopes))
+		for _, scope := range higher {
+			if scopes[scope] {
+				outrankedBy = append(outrankedBy, scope)
+			}
+		}
+		scopeIDs := slices.Sorted(maps.Keys(ids))
+		collisions = append(collisions, envScopeCollision{Key: key, ScopeIDs: scopeIDs, OutrankedBy: outrankedBy})
+	}
+	slices.SortFunc(collisions, func(a, b envScopeCollision) int {
+		return strings.Compare(a.Key, b.Key)
+	})
+	return collisions
+}
+
+// WarnOutrankedBrokerEnvKeys logs, once at hub startup, every env var key that
+// is set at runtime_broker scope and also at a scope that outranks
+// runtime_broker — that is, every key whose broker-scoped value is silently not
+// the one agents receive.
+//
+// It exists because moving runtime_broker down the ladder (design §3.4 variant
+// 4-B) is a behaviour change with no migration available: the hub cannot tell a
+// value a broker operator pinned deliberately from one set by accident, so it
+// cannot fix them and must not try. Naming the affected keys at boot is the
+// only warning that can be offered, and it is one query per scope.
+//
+// Whether it does anything at all is decided by envScopePrecedence and nothing
+// else. UNDER THE LADDER THAT SHIPPED IN PHASE 10b, runtime_broker is the
+// weakest scope, so hub, project and user all outrank it, envScopesOutranking
+// returns those three, and THIS CHECK IS LIVE: it issues one query per
+// outranking scope and warns on every shadowed key. Do not read the call site
+// added at boot as a no-op.
+//
+// It goes inert only if runtime_broker is moved back to the top of that list,
+// at which point envScopesOutranking returns empty and this returns before
+// issuing a single query. The warning and the change it warns about are driven
+// by the same one line, in both directions.
+func (d *HTTPAgentDispatcher) WarnOutrankedBrokerEnvKeys(ctx context.Context) error {
+	higher := envScopesOutranking(envScopePrecedence, store.ScopeRuntimeBroker)
+	if len(higher) == 0 {
+		return nil
+	}
+
+	// One query per scope. An empty ScopeID is "no scope-ID filter" to the
+	// store, so each of these returns the scope's vars across every ID
+	// (entadapter/secret_store.go: the ScopeID predicate is only applied when
+	// the field is non-empty).
+	var vars []store.EnvVar
+	for _, scope := range append([]string{store.ScopeRuntimeBroker}, higher...) {
+		got, err := d.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: scope})
+		if err != nil {
+			return fmt.Errorf("listing %s-scoped env vars: %w", scope, err)
+		}
+		vars = append(vars, got...)
+	}
+
+	collisions := envScopeCollisions(envScopePrecedence, store.ScopeRuntimeBroker, vars)
+	if len(collisions) == 0 {
+		return nil
+	}
+
+	d.log.Warn("runtime_broker env vars are overridden by higher-precedence scopes; agents receive the higher scope's value",
+		"key_count", len(collisions),
+		"precedence_lowest_first", strings.Join(envScopePrecedence, " < "))
+	for _, c := range collisions {
+		d.log.Warn("broker-scoped env var is shadowed",
+			"key", c.Key,
+			"broker_ids", c.ScopeIDs,
+			"outranked_by", c.OutrankedBy)
+	}
+	return nil
+}
+
+// resolveEnvFromStorage queries Hub env var storage for every scope that
+// applies to the agent and returns a merged map. Scopes are applied lowest
+// precedence first; the order itself is stated in exactly one place,
+// envScopePrecedence above.
+//
+// The caller then overlays explicit agent config env on top of the result, so
+// agent config outranks every storage scope (see buildCreateRequest).
 func (d *HTTPAgentDispatcher) resolveEnvFromStorage(ctx context.Context, agent *store.Agent) (map[string]string, error) {
 	result := make(map[string]string)
+	if agent == nil {
+		return result, nil
+	}
 
-	// Query hub-scoped env vars (lowest precedence)
-	vars, err := d.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: d.hubID})
-	if err != nil {
-		if d.debug {
-			d.log.Warn("Failed to list hub env vars", "error", err)
+	for _, filter := range d.envScopesInPrecedenceOrder(agent) {
+		vars, err := d.store.ListEnvVars(ctx, filter)
+		if err != nil {
+			if d.debug {
+				d.log.Warn("Failed to list env vars", "scope", filter.Scope, "scope_id", filter.ScopeID, "error", err)
+			}
+			continue
 		}
-	} else {
 		if d.debug {
 			keys := make([]string, 0, len(vars))
 			for _, v := range vars {
 				keys = append(keys, v.Key)
 			}
-			d.log.Debug("resolveEnvFromStorage: hub scope", "count", len(vars), "keys", keys)
+			d.log.Debug("resolveEnvFromStorage: scope", "scope", filter.Scope, "scope_id", filter.ScopeID, "count", len(vars), "keys", keys)
 		}
 		for _, v := range vars {
+			if v.InjectionMode == store.InjectionModeAsNeeded {
+				continue
+			}
 			result[v.Key] = v.Value
 		}
-	}
-
-	// Query project-scoped env vars
-	if agent.ProjectID != "" {
-		vars, err := d.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "project", ScopeID: agent.ProjectID})
-		if err != nil {
-			if d.debug {
-				d.log.Warn("Failed to list project env vars", "error", err)
-			}
-		} else {
-			if d.debug {
-				keys := make([]string, 0, len(vars))
-				for _, v := range vars {
-					keys = append(keys, v.Key)
-				}
-				d.log.Debug("resolveEnvFromStorage: project scope", "project_id", agent.ProjectID, "count", len(vars), "keys", keys)
-			}
-			for _, v := range vars {
-				result[v.Key] = v.Value
-			}
-		}
-	} else if d.debug {
-		d.log.Debug("resolveEnvFromStorage: skipping project scope (empty projectID)")
-	}
-
-	// Query user-scoped env vars (higher precedence)
-	if agent.OwnerID != "" {
-		vars, err := d.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "user", ScopeID: agent.OwnerID})
-		if err != nil {
-			if d.debug {
-				d.log.Warn("Failed to list user env vars", "error", err)
-			}
-		} else {
-			if d.debug {
-				keys := make([]string, 0, len(vars))
-				for _, v := range vars {
-					keys = append(keys, v.Key)
-				}
-				d.log.Debug("resolveEnvFromStorage: user scope", "ownerID", agent.OwnerID, "count", len(vars), "keys", keys)
-			}
-			for _, v := range vars {
-				result[v.Key] = v.Value
-			}
-		}
-	} else if d.debug {
-		d.log.Debug("resolveEnvFromStorage: skipping user scope (empty ownerID)")
-	}
-
-	// Query runtime_broker-scoped env vars (if applicable)
-	if agent.RuntimeBrokerID != "" {
-		vars, err := d.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "runtime_broker", ScopeID: agent.RuntimeBrokerID})
-		if err != nil {
-			if d.debug {
-				d.log.Warn("Failed to list broker env vars", "error", err)
-			}
-		} else {
-			if d.debug {
-				keys := make([]string, 0, len(vars))
-				for _, v := range vars {
-					keys = append(keys, v.Key)
-				}
-				d.log.Debug("resolveEnvFromStorage: broker scope", "brokerID", agent.RuntimeBrokerID, "count", len(vars), "keys", keys)
-			}
-			for _, v := range vars {
-				result[v.Key] = v.Value
-			}
-		}
-	} else if d.debug {
-		d.log.Debug("resolveEnvFromStorage: skipping broker scope (empty brokerID)")
 	}
 
 	return result, nil
 }
 
+// resolveAsNeededForKeys resolves as_needed env vars and environment-type
+// secrets whose key/target matches one of the requested keys. It returns a
+// map suitable for passing to DispatchFinalizeEnv.
+//
+// This is the second pass of the two-pass env-gather resolution: the first
+// pass (resolveEnvFromStorage + resolveSecrets) skips as_needed entries, then
+// the broker reports which keys are still needed, and this function checks
+// whether any of those keys can be satisfied by as_needed entries.
+//
+// Known limitation: file-type as_needed secrets are not handled here because
+// DispatchFinalizeEnv only accepts a string key=value map. File-type secrets
+// that need on-demand injection would require a different mechanism.
+func (d *HTTPAgentDispatcher) resolveAsNeededForKeys(
+	ctx context.Context,
+	agent *store.Agent,
+	keys []string,
+	alternatives map[string][]string,
+) map[string]string {
+	result := make(map[string]string)
+	keySet := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		keySet[k] = struct{}{}
+	}
+
+	// Expand keySet with alternatives and build a reverse map so that when
+	// a stored var is keyed by an alternative name, we store its value under
+	// the canonical key (which is what the broker expects).
+	var altToCanonical map[string]string
+	resultIsCanonical := make(map[string]bool)
+	resultScopeIdx := make(map[string]int)
+	if len(alternatives) > 0 {
+		altToCanonical = make(map[string]string)
+		for canonical, alts := range alternatives {
+			for _, alt := range alts {
+				keySet[alt] = struct{}{}
+				altToCanonical[alt] = canonical
+			}
+		}
+	}
+
+	// 1. Check env_vars table (all scopes, in precedence order so last-wins).
+	for _, filter := range d.envScopesInPrecedenceOrder(agent) {
+		vars, err := d.store.ListEnvVars(ctx, filter)
+		if err != nil {
+			if d.debug {
+				d.log.Warn("resolveAsNeededForKeys: failed to list env vars",
+					"scope", filter.Scope, "scope_id", filter.ScopeID, "error", err)
+			}
+			continue
+		}
+		for _, v := range vars {
+			if v.InjectionMode != store.InjectionModeAsNeeded {
+				continue
+			}
+			if _, needed := keySet[v.Key]; needed {
+				canonical, isAlt := altToCanonical[v.Key]
+				resultKey := v.Key
+				if isAlt {
+					resultKey = canonical
+				}
+				currentScopeIdx := slices.Index(envScopePrecedence, filter.Scope)
+				isCanonical := !isAlt
+				storedScopeIdx, alreadySet := resultScopeIdx[resultKey]
+				if !alreadySet || currentScopeIdx > storedScopeIdx {
+					result[resultKey] = v.Value
+					resultIsCanonical[resultKey] = isCanonical
+					resultScopeIdx[resultKey] = currentScopeIdx
+				} else if currentScopeIdx == storedScopeIdx {
+					if isCanonical && !resultIsCanonical[resultKey] {
+						result[resultKey] = v.Value
+						resultIsCanonical[resultKey] = true
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Check secrets (all scopes via backend.Resolve).
+	// Only environment-type secrets can be mapped to env key=value pairs.
+	if d.secretBackend != nil {
+		var resolveOpts *secret.ResolveOpts
+		if len(agent.Ancestry) > 1 && d.authzService != nil {
+			agentID := agent.ID
+			ancestry := agent.Ancestry
+			resolveOpts = &secret.ResolveOpts{
+				AgentAncestry: ancestry,
+				AuthzCheck: func(s secret.SecretMeta) bool {
+					decision := d.authzService.CheckAccess(ctx, &agentIdentityWrapper{
+						AgentTokenClaims: &AgentTokenClaims{
+							Claims:    jwt.Claims{Subject: agentID},
+							ProjectID: agent.ProjectID,
+							Ancestry:  ancestry,
+						},
+					}, Resource{
+						Type: "secret",
+						ID:   s.ID,
+					}, ActionRead)
+					return decision.Allowed
+				},
+			}
+		}
+
+		resolved, err := d.secretBackend.Resolve(
+			ctx, agent.OwnerID, agent.ProjectID, agent.RuntimeBrokerID, resolveOpts)
+		if err != nil {
+			if d.debug {
+				d.log.Warn("resolveAsNeededForKeys: failed to resolve secrets", "error", err)
+			}
+		} else {
+			// Iterate in reverse: resolved is ordered lowest-precedence first
+			// (hub < user < project < runtime_broker), so walking backwards
+			// lets higher-precedence secrets win.
+			for i := len(resolved) - 1; i >= 0; i-- {
+				sv := resolved[i]
+				if sv.InjectionMode != store.InjectionModeAsNeeded {
+					continue
+				}
+				// Only environment-type secrets map to env vars.
+				if sv.SecretType != store.SecretTypeEnvironment && sv.SecretType != "" {
+					continue
+				}
+				target := sv.Target
+				if target == "" {
+					target = sv.Name
+				}
+				if _, needed := keySet[target]; needed {
+					// Store under the canonical key if this was an alternative match
+					resultKey := target
+					if canonical, isAlt := altToCanonical[target]; isAlt {
+						if _, already := result[canonical]; already {
+							continue // canonical key already matched; don't overwrite
+						}
+						resultKey = canonical
+					}
+					if _, alreadySet := result[resultKey]; !alreadySet {
+						result[resultKey] = sv.Value
+					}
+				}
+			}
+		}
+	}
+
+	if d.debug && len(result) > 0 {
+		resolvedKeys := make([]string, 0, len(result))
+		for k := range result {
+			resolvedKeys = append(resolvedKeys, k)
+		}
+		d.log.Debug("resolveAsNeededForKeys: resolved as_needed entries",
+			"count", len(result), "keys", resolvedKeys)
+	}
+
+	return result
+}
+
 // buildEnvSources creates a map of env key -> scope for reporting to the CLI.
+//
+// It walks the same scopes in the same order as resolveEnvFromStorage, from the
+// same envScopePrecedence list, so the source it reports is always the scope
+// whose value actually won and the two functions cannot drift apart. Agent
+// config is applied last because it outranks every storage scope.
 func (d *HTTPAgentDispatcher) buildEnvSources(ctx context.Context, agent *store.Agent, resolvedEnv map[string]string) map[string]string {
 	sources := make(map[string]string)
+	if agent == nil {
+		return sources
+	}
 
-	// Check hub scope (lowest precedence — later scopes override)
-	vars, err := d.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: store.ScopeHub, ScopeID: d.hubID})
-	if err == nil {
+	for _, filter := range d.envScopesInPrecedenceOrder(agent) {
+		vars, err := d.store.ListEnvVars(ctx, filter)
+		if err != nil {
+			if d.debug {
+				d.log.Warn("Failed to list env vars for source reporting", "scope", filter.Scope, "scope_id", filter.ScopeID, "error", err)
+			}
+			continue
+		}
+		label := envScopeSourceLabel(filter.Scope)
 		for _, v := range vars {
+			if v.InjectionMode == store.InjectionModeAsNeeded {
+				continue
+			}
 			if _, inResolved := resolvedEnv[v.Key]; inResolved {
-				sources[v.Key] = "hub"
+				sources[v.Key] = label
 			}
 		}
 	}
 
-	// Check project scope
-	if agent.ProjectID != "" {
-		vars, err := d.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "project", ScopeID: agent.ProjectID})
-		if err == nil {
-			for _, v := range vars {
-				if _, inResolved := resolvedEnv[v.Key]; inResolved {
-					sources[v.Key] = "project"
-				}
-			}
-		}
-	}
-
-	// Check user scope (overrides project)
-	if agent.OwnerID != "" {
-		vars, err := d.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "user", ScopeID: agent.OwnerID})
-		if err == nil {
-			for _, v := range vars {
-				if _, inResolved := resolvedEnv[v.Key]; inResolved {
-					sources[v.Key] = "user"
-				}
-			}
-		}
-	}
-
-	// Check config scope
+	// Check config scope (outranks every storage scope)
 	if agent.AppliedConfig != nil {
 		for k := range agent.AppliedConfig.Env {
 			if _, inResolved := resolvedEnv[k]; inResolved {
@@ -1143,12 +1666,21 @@ func (d *HTTPAgentDispatcher) buildEnvSources(ctx context.Context, agent *store.
 // of truth for resume: callers compute it from the agent's stored phase
 // (suspended → resume).
 func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *store.Agent, task string, resume bool) error {
+	ctx, span := tracer.Start(ctx, "hub.dispatch.start")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.agent.id", agent.ID),
+		attribute.String("scion.broker.id", agent.RuntimeBrokerID),
+	)
+
 	if err := requireRuntimeBrokerAssigned(agent); err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
 	endpoint, err := d.getBrokerEndpoint(ctx, agent.RuntimeBrokerID)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -1174,6 +1706,9 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 			resolvedEnv[k] = v
 		}
 	}
+
+	injectModelEnv(resolvedEnv, agent.AppliedConfig)
+	injectThinkingLevelEnv(resolvedEnv, agent.AppliedConfig)
 
 	// Merge env vars from Hub storage; storage vars fill in keys not already
 	// set (with a non-empty value) by explicit config env vars.
@@ -1229,6 +1764,39 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 	// brokers. Including it here ensures the broker always has the endpoint.
 	if d.hubEndpoint != "" {
 		resolvedEnv["SCION_HUB_ENDPOINT"] = d.hubEndpoint
+	}
+	// Include hub name so agents can label their Cloud Logging entries with
+	// the hub identity, matching the hub-scoped log query filter (labels.hub).
+	if d.hubName != "" {
+		resolvedEnv["SCION_HUB_NAME"] = d.hubName
+	}
+
+	// Inject canonical workspace sharing mode and git-ness so the broker can
+	// surface them in the container env on the start path.  The createAgent
+	// path carries these via WorkspaceMode in the request body; the startAgent
+	// path relies on resolvedEnv injection (this block) following the existing
+	// SCION_AGENT_ID / SCION_METADATA_MODE pattern.
+	//
+	// Resolve once so the switch below uses canonical constants — unrecognized
+	// or future wire labels safely fall back to shared-plain behavior.
+	resolvedMode := store.ResolveWorkspaceSharingMode(projectInfo.workspaceMode)
+	if projectInfo.workspaceMode != "" {
+		resolvedEnv["SCION_WORKSPACE_MODE"] = string(resolvedMode)
+	}
+	switch resolvedMode {
+	case store.SharingModeClonePerAgent, store.SharingModeWorktreePerAgent:
+		resolvedEnv["SCION_WORKSPACE_GIT"] = "true"
+	case store.SharingModeSharedPlain:
+		// For shared-plain, git-ness is detected from the applied GitClone config.
+		// Note: broker-local linked projects where the workspace is already a
+		// git repo on disk but has no HTTPS GitClone config cannot be detected
+		// as git-backed here. The broker's on-disk util.IsGitRepoDir check in
+		// buildStartContext covers this for the create path; on start/restart paths
+		// SCION_WORKSPACE_GIT will be absent for such workspaces. This is an
+		// acknowledged limitation noted in the design doc.
+		if agent.AppliedConfig != nil && agent.AppliedConfig.GitClone != nil {
+			resolvedEnv["SCION_WORKSPACE_GIT"] = "true"
+		}
 	}
 
 	// Inject GCP identity env vars so the broker can configure the
@@ -1360,6 +1928,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentStart(ctx context.Context, agent *sto
 		})
 	}
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -1400,10 +1969,56 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 		return err
 	}
 
-	// Build resolved env with fresh auth token and identity vars so the
-	// restarted container retains Hub connectivity. Without this, the
-	// broker's restartAgent handler has no token to inject.
+	// Build resolved env with all env vars, secrets, and a fresh auth token
+	// so the restarted container has full credentials and Hub connectivity.
+	// This mirrors the resolution in DispatchAgentStart — without it, env vars
+	// like GOOGLE_CLOUD_PROJECT are missing and auth provisioning fails.
 	resolvedEnv := make(map[string]string)
+
+	// Start with agent's applied config env (template/config-level vars) —
+	// same as DispatchAgentStart.
+	if agent.AppliedConfig != nil {
+		for k, v := range agent.AppliedConfig.Env {
+			resolvedEnv[k] = v
+		}
+	}
+
+	injectModelEnv(resolvedEnv, agent.AppliedConfig)
+	injectThinkingLevelEnv(resolvedEnv, agent.AppliedConfig)
+
+	// Merge env vars from Hub storage; storage vars fill in keys not already
+	// set (with a non-empty value) — same precedence as DispatchAgentStart.
+	envFromStorage, err := d.resolveEnvFromStorage(ctx, agent)
+	if err != nil {
+		if d.debug {
+			d.log.Warn("DispatchAgentRestart: failed to resolve env from storage", "error", err)
+		}
+	} else if len(envFromStorage) > 0 {
+		for k, v := range envFromStorage {
+			if existing, exists := resolvedEnv[k]; !exists || existing == "" {
+				resolvedEnv[k] = v
+			}
+		}
+	}
+
+	// Resolve type-aware secrets and inject environment-type secrets —
+	// same as DispatchAgentStart.
+	resolvedSecrets, secretErr := d.resolveSecrets(ctx, agent)
+	if secretErr != nil {
+		if d.debug {
+			d.log.Warn("DispatchAgentRestart: failed to resolve secrets", "error", secretErr)
+		}
+	} else {
+		for _, s := range resolvedSecrets {
+			if (s.Type == "environment" || s.Type == "") && s.Target != "" {
+				if existing, exists := resolvedEnv[s.Target]; !exists || existing == "" {
+					resolvedEnv[s.Target] = s.Value
+				}
+			}
+		}
+	}
+
+	// Identity vars at highest precedence (set after storage/secrets merge).
 	if agent.ID != "" {
 		resolvedEnv["SCION_AGENT_ID"] = agent.ID
 	}
@@ -1416,6 +2031,43 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 	}
 	if d.hubEndpoint != "" {
 		resolvedEnv["SCION_HUB_ENDPOINT"] = d.hubEndpoint
+	}
+	// Include hub name so agents can label their Cloud Logging entries with
+	// the hub identity, matching the hub-scoped log query filter (labels.hub).
+	if d.hubName != "" {
+		resolvedEnv["SCION_HUB_NAME"] = d.hubName
+	}
+
+	// Inject canonical workspace sharing mode and git-ness so the broker can
+	// surface them in the container env on the restart path.  Follows the same
+	// pattern as DispatchAgentStart (resolve once, switch on canonical constants).
+	projectInfo := d.resolveDispatchProjectInfo(ctx, agent)
+	resolvedMode := store.ResolveWorkspaceSharingMode(projectInfo.workspaceMode)
+	if projectInfo.workspaceMode != "" {
+		resolvedEnv["SCION_WORKSPACE_MODE"] = string(resolvedMode)
+	}
+	switch resolvedMode {
+	case store.SharingModeClonePerAgent, store.SharingModeWorktreePerAgent:
+		resolvedEnv["SCION_WORKSPACE_GIT"] = "true"
+	case store.SharingModeSharedPlain:
+		// See DispatchAgentStart for the acknowledged limitation: broker-local
+		// linked projects without a GitClone config cannot be detected as
+		// git-backed here.
+		if agent.AppliedConfig != nil && agent.AppliedConfig.GitClone != nil {
+			resolvedEnv["SCION_WORKSPACE_GIT"] = "true"
+		}
+	}
+
+	// Inject GCP identity env vars so the broker can configure the
+	// metadata-server sidecar correctly on restart — same as DispatchAgentStart.
+	if agent.AppliedConfig != nil {
+		if gcpID := agent.AppliedConfig.GCPIdentity; gcpID != nil {
+			resolvedEnv["SCION_METADATA_MODE"] = gcpID.MetadataMode
+			if gcpID.MetadataMode == store.GCPMetadataModeAssign {
+				resolvedEnv["SCION_METADATA_SA_EMAIL"] = gcpID.ServiceAccountEmail
+				resolvedEnv["SCION_METADATA_PROJECT_ID"] = gcpID.ProjectID
+			}
+		}
 	}
 
 	if d.tokenGenerator != nil {
@@ -1451,6 +2103,42 @@ func (d *HTTPAgentDispatcher) DispatchAgentRestart(ctx context.Context, agent *s
 			resolvedEnv["SCION_TRANSPORT_TOKEN_EXPIRY"] = tExpiry.UTC().Format(time.RFC3339)
 			if d.transportMode != "" {
 				resolvedEnv["SCION_TRANSPORT_MODE"] = d.transportMode
+			}
+		}
+	}
+
+	// GitHub App token minting for agent restart — same as DispatchAgentStart.
+	if d.githubAppMinter != nil && agent.ProjectID != "" {
+		project, projectErr := d.store.GetProject(ctx, agent.ProjectID)
+		if projectErr == nil {
+			mintProject := project
+			if project.GitHubInstallationID == nil {
+				if sourceProjectID := agent.Labels["scion.dev/github-token-source-project"]; sourceProjectID != "" {
+					if sg, sgErr := d.store.GetProject(ctx, sourceProjectID); sgErr == nil && sg.GitHubInstallationID != nil {
+						mintProject = sg
+					}
+				}
+			}
+			if mintProject.GitHubInstallationID != nil {
+				if resolvedEnv["GITHUB_TOKEN"] == "" {
+					token, expiry, mintErr := d.githubAppMinter.MintGitHubAppTokenForProject(ctx, mintProject)
+					if mintErr != nil {
+						if d.debug {
+							d.log.Warn("DispatchAgentRestart: GitHub App token minting failed",
+								"error", mintErr, "project_id", agent.ProjectID)
+						}
+					} else if token != "" {
+						resolvedEnv["GITHUB_TOKEN"] = token
+						resolvedEnv["SCION_GITHUB_APP_ENABLED"] = "true"
+						resolvedEnv["SCION_GITHUB_TOKEN_EXPIRY"] = expiry
+						resolvedEnv["SCION_GITHUB_TOKEN_PATH"] = "/tmp/.github-token"
+					}
+				} else {
+					d.log.Warn("DispatchAgentRestart: user GITHUB_TOKEN takes precedence over GitHub App token — user token will be used for gh CLI, GitHub App for git credential helper",
+						"project_id", agent.ProjectID)
+					resolvedEnv["SCION_USER_GITHUB_TOKEN"] = "true"
+					resolvedEnv["SCION_GITHUB_APP_ENABLED"] = "true"
+				}
 			}
 		}
 	}
@@ -1592,6 +2280,38 @@ func (d *HTTPAgentDispatcher) deferredCheckPrompt(ctx context.Context, agent *st
 }
 
 // =============================================================================
+// injectModelEnv sets SCION_MODEL in env from the agent's applied config model,
+// if a model is configured and the key is not already present in env.
+// env must be non-nil.
+func injectModelEnv(env map[string]string, cfg *store.AgentAppliedConfig) {
+	if cfg == nil || cfg.Model == "" {
+		return
+	}
+	if _, ok := env["SCION_MODEL"]; !ok {
+		env["SCION_MODEL"] = cfg.Model
+	}
+}
+
+// injectThinkingLevelEnv sets SCION_THINKING_LEVEL in env from the agent's
+// applied config, if a thinking level is configured and the key is not already
+// present in env. Mirrors the SCION_MODEL injector above and must be called
+// from exactly the same dispatch sites — a site that injects one and not the
+// other reproduces the annotation-drop bug on that path only, silently.
+// env must be non-nil.
+//
+// The env var is the terminal hop for thinking level: pkg/agent/run.go reads
+// SCION_THINKING_LEVEL from opts.Env under an "if not already set" guard, so a
+// hub-supplied value wins and this fix works against already-deployed brokers
+// without a wire-field change.
+func injectThinkingLevelEnv(env map[string]string, cfg *store.AgentAppliedConfig) {
+	if cfg == nil || cfg.ThinkingLevel == nil {
+		return
+	}
+	if _, ok := env["SCION_THINKING_LEVEL"]; !ok {
+		env["SCION_THINKING_LEVEL"] = strconv.Itoa(*cfg.ThinkingLevel)
+	}
+}
+
 // Cross-node lifecycle dispatch (B4-2)
 // =============================================================================
 
@@ -1771,7 +2491,29 @@ func (d *HTTPAgentDispatcher) deferredLifecycle(
 }
 
 // resolveSecrets queries secrets from all applicable scopes and merges them
-// into a flat list. Higher scopes override lower: user < project < runtime_broker.
+// into a flat list. Higher scopes override lower:
+//
+//	hub  <  user  <  project  <  runtime_broker
+//
+// 🔴 SECRETS AND ENV VARS DO NOT USE THE SAME ORDER. Compare
+// envScopePrecedence above: env vars rank runtime_broker LOWEST and user
+// HIGHEST; secrets rank them the other way round, on both axes.
+//
+// DO NOT READ THIS COMMENT AS DOCUMENTING A DESIGNED DIFFERENCE. NOBODY HAS
+// ESTABLISHED THAT THE DIVERGENCE IS INTENTIONAL. It is FILED, as issue #624,
+// and open. What this comment records is only what the code does today: the
+// secret order is implemented independently in pkg/secret (both backends build
+// the scope list in this order and merge last-wins, and scopePrecedence ranks
+// it numerically). So editing this comment to match the env one would make it
+// describe code that does not exist — the divergence has to be closed in
+// pkg/secret, under #624, or not at all.
+//
+// Phase 10 widened the gap rather than creating it: demoting runtime_broker for
+// env vars added the second axis. That makes the pull toward "harmonising" the
+// two stronger, and it is exactly the change that must not be made here.
+//
+// The hub rung was missing from this comment before Phase 10; both backends
+// have always queried it as the lowest scope.
 func (d *HTTPAgentDispatcher) resolveSecrets(ctx context.Context, agent *store.Agent) ([]ResolvedSecret, error) {
 	if d.secretBackend == nil {
 		if d.debug {
@@ -1815,16 +2557,23 @@ func (d *HTTPAgentDispatcher) resolveSecrets(ctx context.Context, agent *store.A
 	if err != nil {
 		return nil, err
 	}
-	result := make([]ResolvedSecret, len(resolved))
-	for i, sv := range resolved {
-		result[i] = ResolvedSecret{
+	result := make([]ResolvedSecret, 0, len(resolved))
+	for _, sv := range resolved {
+		// Only skip as_needed environment-type secrets (handled by the
+		// two-pass env-gather flow). File-type and variable-type secrets
+		// should always be placed regardless of injection mode — the
+		// as_needed concept does not apply to them.
+		if sv.InjectionMode == store.InjectionModeAsNeeded && (sv.SecretType == store.SecretTypeEnvironment || sv.SecretType == "") {
+			continue
+		}
+		result = append(result, ResolvedSecret{
 			Name:   sv.Name,
 			Type:   sv.SecretType,
 			Target: sv.Target,
 			Value:  sv.Value,
 			Source: sv.Scope,
 			Ref:    sv.SecretRef,
-		}
+		})
 	}
 	if d.debug {
 		names := make([]string, len(result))

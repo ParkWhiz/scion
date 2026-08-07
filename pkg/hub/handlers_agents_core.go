@@ -34,7 +34,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 	gouuid "github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
+
+var tracer = otel.Tracer("scion-hub")
 
 // parseLabelFilters parses label=key=value query parameters into a map and
 // validates the resulting labels against constraint rules.
@@ -94,6 +98,13 @@ type CreateAgentRequest struct {
 	// rather than create a brand-new one. When true and a stopped agent with
 	// the same name exists, the Hub recovers it instead of creating fresh.
 	Resume bool `json:"resume,omitempty"`
+	// ForceResume permits resuming an agent the Hub considers failed
+	// (phase=error), such as one whose host crashed mid-run. Without it such an
+	// agent is rejected as a duplicate. Only meaningful alongside Resume, and
+	// deliberately does NOT cover phase=running: a live agent must not be
+	// recreated out from under itself. The harness receives its resume flag so
+	// the prior session is continued rather than restarted fresh.
+	ForceResume bool `json:"forceResume,omitempty"`
 	// NoAuth indicates the agent should start with zero injected credentials.
 	// When true, the Hub skips secret resolution and the broker skips credential injection.
 	NoAuth bool `json:"noAuth,omitempty"`
@@ -209,7 +220,7 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	limit := 50
+	limit := 500
 	if l := query.Get("limit"); l != "" {
 		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
 			limit = parsed
@@ -376,6 +387,13 @@ func (s *Server) createAgentInProject(
 	notifySubscriberID string,
 ) {
 	ctx := r.Context()
+	ctx, span := tracer.Start(ctx, "hub.agent.create")
+	defer span.End()
+	// Note: HTTP error status is recorded by the otelhttp parent span.
+	span.SetAttributes(
+		attribute.String("scion.agent.name", req.Name),
+		attribute.String("scion.project.id", projectID),
+	)
 	hubCreateStart := time.Now()
 
 	// Verify project exists and get its configuration
@@ -386,6 +404,13 @@ func (s *Server) createAgentInProject(
 			return
 		}
 		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	// Reject agent creation in template projects
+	if project.IsTemplate() {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
+			"cannot create agents in a template project", nil)
 		return
 	}
 
@@ -488,16 +513,82 @@ func (s *Server) createAgentInProject(
 		}
 	}
 
+	// Hub operational default template — lowest tier. Below the request and
+	// below the project annotation, both of which have already had their chance
+	// above. In file mode hubAgentDefaults() is always the zero value, so this
+	// rung never fires there and file-mode dispatch is unchanged (design
+	// §3.2.4). The scheduler-dispatch path in server.go carries the identical
+	// rung; design §5.2 risk (d) is the two paths diverging again.
+	templateFromHubDefault := false
+	if req.Template == "" {
+		if d := s.hubAgentDefaults(); d.DefaultTemplate != "" {
+			req.Template = d.DefaultTemplate
+			templateFromHubDefault = true
+		}
+	}
+
 	// Resolve template if specified - the client may pass either a template ID or name
+	//
+	// DEGRADATION RULE (design §3.2.2) — when, and only when, the name came
+	// from the hub operational default, an unusable template must log a warning
+	// and continue with no template instead of failing the create. A hub-wide
+	// default naming a template that has since been deleted would otherwise
+	// mean "nobody in this deployment can create an agent" — an operational
+	// setting turned into an outage. Provenance comes from the
+	// templateFromHubDefault flag set above and is never inferred by re-reading
+	// the setting, which cannot distinguish a hub default from a user who
+	// happened to name the same template.
+	//
+	// TWO of the three unusable-template exits below degrade — not-found, and
+	// the file-less (still-pending) template. The design named the 404 as the
+	// instance; the file-less case is the same thing, because a stale hub
+	// default pointing at a pending template blocks every create in the
+	// deployment exactly as one pointing at a deleted template does.
+	//
+	// The store-error exit deliberately does NOT degrade, and the asymmetry is
+	// the point rather than an oversight — do not "finish the job" by adding it:
+	//
+	//   - The other two are DETERMINISTIC. The template genuinely is unusable,
+	//     it will still be unusable on the next create, and the operator gets
+	//     the same self-describing warning every time until they fix the
+	//     setting. That trades a permanent outage for a permanent, visible
+	//     warning.
+	//
+	//   - A store error is TRANSIENT, and it is an I-don't-know rather than a
+	//     this-is-broken. A DB blip is no evidence that the setting is stale.
+	//     Degrading it would mean some creates silently get no template and
+	//     others get one depending on store weather — intermittent silent
+	//     misconfiguration, harder to diagnose than the clean failure it
+	//     replaced, because the agent comes up looking fine and then behaves
+	//     differently from its siblings for a reason its own record cannot
+	//     explain.
+	//
+	//   - The deployment-outage argument does not carry here either: if
+	//     resolveTemplate is returning store errors then creates are already
+	//     failing for infrastructure reasons, and failing loudly is correct in
+	//     that state. This rule exists for stale SETTINGS, not unhealthy stores.
+	//
+	// This is a house convention, not a local judgement call. The pre-start hook
+	// resolution in handlers_agent_create_helpers.go draws the same line and
+	// writes down the same reasoning: "The hub fallback is entered only on a
+	// definitive 'no project hook' (ErrNotFound). Any other project-lookup
+	// failure (DB blip, duplicate rows) is ambiguous [...] On an ambiguous error
+	// we log and stage nothing." Same principle — never treat an ambiguous error
+	// as evidence — with one honest difference: that code can only log and do
+	// nothing, whereas here the caller is still on the other end of an HTTP
+	// request, so the ambiguous branch can and should return a real error.
 	var resolvedTemplate *store.Template
 	if req.Template != "" {
 		resolvedTemplate, err = s.resolveTemplate(ctx, req.Template, projectID)
-		if err != nil && err != store.ErrNotFound {
+		switch {
+		case err != nil && err != store.ErrNotFound:
+			// Always hard-fails, hub-default provenance included. See above.
 			writeErrorFromErr(w, err, "")
 			return
-		}
-		// If template was requested but not found, check if the broker has local access
-		if resolvedTemplate == nil {
+
+		case resolvedTemplate == nil:
+			// Template was requested but not found — check if the broker has
+			// local access and can resolve it from its own filesystem.
 			brokerHasLocal := false
 			if runtimeBrokerID != "" {
 				provider, err := s.store.GetProjectProvider(ctx, projectID, runtimeBrokerID)
@@ -505,29 +596,57 @@ func (s *Server) createAgentInProject(
 					brokerHasLocal = true
 				}
 			}
-			if !brokerHasLocal {
+			switch {
+			case brokerHasLocal:
+				// Template will be resolved locally by the broker
+			case templateFromHubDefault:
+				s.warnHubDefaultTemplateUnusable(ctx, req.Template, projectID, "not found")
+				req.Template = ""
+			default:
 				NotFound(w, "Template")
 				return
 			}
-			// Template will be resolved locally by the broker
-		}
 
-		// Guard: reject dispatch when the resolved template has no files and
-		// no content hash. This catches templates stuck in 'pending' state
-		// before they reach broker hydration (where the failure is opaque).
-		if resolvedTemplate != nil && len(resolvedTemplate.Files) == 0 && resolvedTemplate.ContentHash == "" {
+		case len(resolvedTemplate.Files) == 0 && resolvedTemplate.ContentHash == "":
+			// Guard: reject dispatch when the resolved template has no files and
+			// no content hash. This catches templates stuck in 'pending' state
+			// before they reach broker hydration (where the failure is opaque).
 			name := resolvedTemplate.Slug
 			if name == "" {
 				name = resolvedTemplate.Name
 			}
-			ValidationError(w, "template "+name+" has no files — sync template files first with: scion template sync "+name, nil)
-			return
+			if !templateFromHubDefault {
+				ValidationError(w, "template "+name+" has no files — sync template files first with: scion template sync "+name, nil)
+				return
+			}
+			s.warnHubDefaultTemplateUnusable(ctx, req.Template, projectID,
+				"template "+name+" has no files — sync template files first with: scion template sync "+name)
+			req.Template, resolvedTemplate = "", nil
 		}
 	}
 
-	// Resolve harness config: prefer the user's explicit choice, then template default.
+	// Resolve harness config: prefer the user's explicit choice, then the
+	// project-level default annotation, then the template default. The project
+	// annotation deliberately outranks the template so that harness_config
+	// follows the same precedence as every other project setting
+	// (request > project > template).
 	// Do NOT use req.Template as fallback since it may contain a UUID.
+	//
+	// MECHANISM NOTE — this path and the scheduler-dispatch path in
+	// server.go (dispatchAgentEventHandler) enforce the same rule by
+	// different means. Here the annotation is read inline, so by the time
+	// applyProjectDefaults runs below, AppliedConfig.HarnessConfig is
+	// already set and that function's harness-config branch cannot fire on
+	// this path. The scheduler path instead reads the annotation only to
+	// decide *not* to stamp the template, and lets applyProjectDefaults
+	// apply the project value. The asymmetry is forced: the scheduler needs
+	// tmpl.Slug for agent.Template even when it skips the harness stamp.
+	// Behaviourally identical today — keep the two in sync, and if you
+	// change applyProjectDefaults' harness handling, check BOTH paths.
 	harnessConfig := req.HarnessConfig
+	if harnessConfig == "" && project != nil && project.Annotations != nil {
+		harnessConfig = project.Annotations[projectSettingDefaultHarnessConfig]
+	}
 	if harnessConfig == "" {
 		harnessConfig = s.getHarnessConfigFromTemplate(resolvedTemplate, "")
 	}
@@ -633,6 +752,13 @@ func (s *Server) createAgentInProject(
 
 	// Apply project-level defaults (harness config, limits, resources) from annotations
 	applyProjectDefaults(agent.AppliedConfig, project)
+
+	// Hub operational agent_defaults — strictly between applyProjectDefaults
+	// and populateAgentConfig. See applyHubAgentDefaults for why that placement
+	// is the whole point.
+	if applyHubAgentDefaults(agent.AppliedConfig, s.hubAgentDefaults()) {
+		ctx = withHubDefaultHarnessConfig(ctx)
+	}
 
 	s.populateAgentConfig(ctx, agent, project, resolvedTemplate)
 
@@ -1109,6 +1235,15 @@ func (s *Server) buildEnvGatherResponse(ctx context.Context, agent *store.Agent,
 				continue
 			}
 		}
+		// Check hub-scope env_vars
+		if hubID := s.HubID(); hubID != "" {
+			vars, err := s.store.ListEnvVars(ctx, store.EnvVarFilter{Scope: "hub", ScopeID: hubID, Key: key})
+			if err == nil && len(vars) > 0 {
+				resp.HubWarnings = append(resp.HubWarnings,
+					fmt.Sprintf("%s is stored in Hub env storage (hub scope) but was not included in the dispatch — injection_mode may be as_needed", key))
+				continue
+			}
+		}
 		// Check secret backend
 		if s.secretBackend != nil {
 			if agent.OwnerID != "" {
@@ -1124,6 +1259,15 @@ func (s *Server) buildEnvGatherResponse(ctx context.Context, agent *store.Agent,
 				if err == nil && len(metas) > 0 {
 					resp.HubWarnings = append(resp.HubWarnings,
 						fmt.Sprintf("%s is stored in Hub secrets (project scope) but was not included in the dispatch — this may indicate a resolution issue", key))
+					continue
+				}
+			}
+			// Check hub-scope secrets
+			if hubID := s.HubID(); hubID != "" {
+				metas, err := s.secretBackend.List(ctx, secret.Filter{Scope: "hub", ScopeID: hubID, Name: key})
+				if err == nil && len(metas) > 0 {
+					resp.HubWarnings = append(resp.HubWarnings,
+						fmt.Sprintf("%s is stored in Hub secrets (hub scope) but was not included in the dispatch — injection_mode may be as_needed", key))
 					continue
 				}
 			}
@@ -1444,6 +1588,12 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Handle agent port-forward registration, tunnel, and proxy routes.
+	if action == "ports" || strings.HasPrefix(action, "ports/") {
+		s.handleAgentPorts(w, r, id, strings.TrimPrefix(strings.TrimPrefix(action, "ports"), "/"))
+		return
+	}
+
 	// Handle agent logs relay (GET, proxied to broker)
 	if action == "logs" {
 		s.handleAgentLogs(w, r, id)
@@ -1486,6 +1636,12 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 	// Handle agent-scoped secret creation: PUT /api/v1/agents/{id}/secrets/{key}
 	if action == "secrets" || strings.HasPrefix(action, "secrets/") {
 		s.handleAgentSecrets(w, r, id, strings.TrimPrefix(action, "secrets"))
+		return
+	}
+
+	// Handle agent session metrics summary (GET /api/v1/agents/{id}/metrics/summary)
+	if action == "metrics/summary" {
+		s.handleAgentMetricsSummary(w, r, id)
 		return
 	}
 
@@ -1618,7 +1774,9 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, id string) 
 			agent.AppliedConfig.Image = cfg.Image
 		}
 		if cfg.Model != "" {
-			agent.AppliedConfig.Model = cfg.Model
+			resolved := s.resolveModelAliasForAgent(ctx, agent, cfg.Model)
+			agent.AppliedConfig.Model = resolved
+			cfg.Model = resolved // ensures InlineConfig (set later) also carries resolved value
 		}
 		if cfg.ThinkingLevel != nil {
 			if tl := *cfg.ThinkingLevel; tl < 0 || tl > 100 {
@@ -1731,6 +1889,12 @@ func (s *Server) deleteAgent(w http.ResponseWriter, r *http.Request, id string) 
 // Hard-delete: permanently removes the agent record from the store.
 func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agent *store.Agent) {
 	ctx := r.Context()
+	ctx, span := tracer.Start(ctx, "hub.agent.delete")
+	defer span.End()
+	// Note: HTTP error status is recorded by the otelhttp parent span.
+	span.SetAttributes(
+		attribute.String("scion.agent.id", agent.ID),
+	)
 
 	// Enforce policy-based authorization: only the agent's creator (owner) or admins can delete
 	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
@@ -1778,6 +1942,9 @@ func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agen
 	if !isManagedAgentRuntime(agent.Runtime) && !force && !s.checkBrokerAvailability(w, r, agent) {
 		return
 	}
+
+	// Clear exposed ports — the agent is being deleted so its ports are unreachable.
+	s.clearExposedPortsForAgent(ctx, agent.ID)
 
 	now := time.Now()
 
@@ -1888,13 +2055,36 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, a
 		return
 	}
 
+	ctx, span := tracer.Start(r.Context(), "hub.agent.action")
+	defer span.End()
+	// Note: HTTP error status is recorded by the otelhttp parent span.
+	span.SetAttributes(
+		attribute.String("scion.agent.id", id),
+		attribute.String("scion.agent.action", action),
+	)
+	r = r.WithContext(ctx)
+
 	// For actions other than status/token refresh and outbound-message
 	// (self-access), we require user or agent authentication
 	// with appropriate scopes. Self-access endpoints enforce their own auth checks.
-	if action != api.AgentActionStatus &&
-		action != api.AgentActionTokenRefresh &&
-		action != api.AgentActionRefreshToken &&
-		action != api.AgentActionOutboundMessage {
+	selfAccess := action == api.AgentActionStatus ||
+		action == api.AgentActionMetrics ||
+		action == api.AgentActionTokenRefresh ||
+		action == api.AgentActionRefreshToken ||
+		action == api.AgentActionOutboundMessage
+
+	// Self-message: allow an agent to deliver a message to itself using its
+	// own token, without requiring the ScopeAgentLifecycle scope. This mirrors
+	// the outbound-message self-access pattern and is used by sciontool to
+	// send system notifications (e.g. port auto-expose) to the agent's own
+	// harness input.
+	if action == api.AgentActionMessage {
+		if claims := GetAgentFromContext(r.Context()); claims != nil && claims.Subject == id {
+			selfAccess = true
+		}
+	}
+
+	if !selfAccess {
 		userIdent := GetUserIdentityFromContext(r.Context())
 		agentIdent := GetAgentIdentityFromContext(r.Context())
 		if userIdent == nil && agentIdent == nil {
@@ -1953,6 +2143,8 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, a
 		s.handleAgentGitHubTokenRefresh(w, r, id)
 	case api.AgentActionOutboundMessage:
 		s.handleAgentOutboundMessage(w, r, id)
+	case api.AgentActionMetrics:
+		s.handleAgentMetrics(w, r, id)
 	case api.AgentActionMessages:
 		// Defence-in-depth: this action is normally intercepted earlier in
 		// handleAgentRoute (before the POST-only gate) so that GET requests

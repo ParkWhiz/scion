@@ -33,14 +33,15 @@ import (
 
 // OutboundMessageRequest is the request body for POST /api/v1/agents/{id}/outbound-message.
 type OutboundMessageRequest struct {
-	Recipient   string   `json:"recipient,omitempty"`
-	RecipientID string   `json:"recipient_id,omitempty"`
-	Msg         string   `json:"msg"`
-	Type        string   `json:"type,omitempty"`
-	Urgent      bool     `json:"urgent,omitempty"`
-	Attachments []string `json:"attachments,omitempty"`
-	Channel     string   `json:"channel,omitempty"`
-	ThreadID    string   `json:"thread_id,omitempty"`
+	Recipient   string            `json:"recipient,omitempty"`
+	RecipientID string            `json:"recipient_id,omitempty"`
+	Msg         string            `json:"msg"`
+	Type        string            `json:"type,omitempty"`
+	Urgent      bool              `json:"urgent,omitempty"`
+	Attachments []string          `json:"attachments,omitempty"`
+	Channel     string            `json:"channel,omitempty"`
+	ThreadID    string            `json:"thread_id,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 // handleAgentOutboundMessage handles POST /api/v1/agents/{id}/outbound-message.
@@ -189,6 +190,16 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
 		Attachments: req.Attachments,
 		Channel:     req.Channel,
 		ThreadID:    req.ThreadID,
+		Metadata:    req.Metadata,
+	}
+	// Propagate recipients and group_id from metadata for group-set messages.
+	if req.Metadata != nil {
+		if r, ok := req.Metadata["recipients"]; ok {
+			structuredMsg.Recipients = r
+		}
+		if gid, ok := req.Metadata["group_id"]; ok {
+			storeMsg.GroupID = gid
+		}
 	}
 
 	// Route through broker when available; otherwise persist and publish
@@ -500,12 +511,12 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 
 		case state.PhaseStopped:
 			writeError(w, http.StatusBadRequest, ErrCodeValidationError,
-				"Agent is stopped, not suspended — use 'scion start' to start a fresh session", nil)
+				"Agent is stopped, not suspended — use 'scion resume' to restart it with its previous state", nil)
 			return
 
 		case state.PhaseError:
 			writeError(w, http.StatusBadRequest, ErrCodeValidationError,
-				"Agent is in error state — use 'scion start' to restart", nil)
+				"Agent is in error state — use 'scion resume' to restart", nil)
 			return
 
 		default:
@@ -526,11 +537,11 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 			return
 		case state.PhaseStopped:
 			writeError(w, http.StatusConflict, ErrCodeAgentNotRunning,
-				fmt.Sprintf("Agent %q is stopped. Use 'scion start' to start a new session.", agent.Slug), nil)
+				fmt.Sprintf("Agent %q is stopped. Use 'scion resume' to restart it with its previous state.", agent.Slug), nil)
 			return
 		case state.PhaseError:
 			writeError(w, http.StatusConflict, ErrCodeAgentNotRunning,
-				fmt.Sprintf("Agent %q is in error state. Use 'scion start' to restart.", agent.Slug), nil)
+				fmt.Sprintf("Agent %q is in error state. Use 'scion resume' to restart.", agent.Slug), nil)
 			return
 		default:
 			writeError(w, http.StatusConflict, ErrCodeAgentNotRunning,
@@ -779,6 +790,7 @@ func (s *Server) handleGroupMessage(w http.ResponseWriter, r *http.Request, anch
 			}
 
 			agentMsg := *msg
+			agentMsg.Type = messages.TypeGroupSet
 			agentMsg.Recipient = "agent:" + agent.Slug
 			agentMsg.RecipientID = agent.ID
 			agentMsg.Recipients = recipientsSet
@@ -873,6 +885,7 @@ func (s *Server) handleGroupMessage(w http.ResponseWriter, r *http.Request, anch
 			}
 
 			userMsg := *msg
+			userMsg.Type = messages.TypeGroupSet
 			userMsg.Recipient = userRecip
 			userMsg.RecipientID = userID
 			userMsg.Recipients = recipientsSet
@@ -1135,8 +1148,9 @@ func (s *Server) publishBroadcastDeliveryFailed(ctx context.Context, targetAgent
 		Recipient:   msg.Sender,
 		RecipientID: senderAgent.ID,
 		Msg:         failMsg,
-		Type:        messages.TypeStateChange,
+		Type:        messages.TypeSystem,
 		Status:      "DELIVERY_FAILED",
+		Metadata:    map[string]string{"system_category": messages.SystemCategoryDeliveryFailed},
 	}
 
 	dispatcher := s.GetDispatcher()

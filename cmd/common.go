@@ -64,6 +64,7 @@ var (
 	agentImage            string
 	noAuth                bool
 	attach                bool
+	forceResume           bool
 	branch                string
 	workspace             string
 	runtimeBrokerID       string
@@ -377,6 +378,36 @@ func GetProjectID(hubCtx *HubContext) (string, error) {
 	return resp.Projects[0].ID, nil
 }
 
+// localResumeDecision mirrors the Hub's resumeInPlaceDecision
+// (pkg/hub/handlers_agent_create_helpers.go) for local (non-Hub) mode, so the
+// two paths present the same contract to the operator.
+//
+// Rules:
+//   - Suspended agents always get harness resume (--continue/--resume), even
+//     when invoked via 'start' (implicit resume).
+//   - Stopped agents always get a fresh session, even when invoked via
+//     'resume'. --force does not change this: a clean shutdown is not a crash.
+//   - Error-phase agents are refused without --force, matching the Hub's 409.
+//     With --force they continue the session interrupted mid-run.
+//
+// Returns the resume flag to hand the harness, plus whether this was an
+// implicit resume or a forced recovery (both purely for operator messaging).
+func localResumeDecision(savedPhase string, resume, force bool, agentName string) (effectiveResume, implicitResume, forcedRecovery bool, err error) {
+	if resume && savedPhase == string(state.PhaseError) && !force {
+		return false, false, false, fmt.Errorf("agent '%s' is in the error phase (e.g. after a host crash) and cannot be resumed without --force", agentName)
+	}
+
+	switch {
+	case savedPhase == string(state.PhaseSuspended):
+		return true, !resume, false, nil
+	case resume && force && savedPhase == string(state.PhaseError):
+		return true, false, true, nil
+	case resume && savedPhase == string(state.PhaseStopped):
+		return false, false, false, nil
+	}
+	return resume, false, false, nil
+}
+
 func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 	agentName := api.Slugify(args[0])
 	task := strings.Join(args[1:], " ")
@@ -506,18 +537,16 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 	}
 
 	// Determine harness resume behavior from the saved phase.
-	// Suspended agents always get harness resume (--continue/--resume),
-	// even when invoked via 'start' (implicit resume). Stopped agents
-	// always get a fresh session, even when invoked via 'resume'.
-	effectiveResume := resume
 	savedPhase := agent.GetSavedPhase(agentName, projectPath)
-	if savedPhase == string(state.PhaseSuspended) {
-		effectiveResume = true
-		if !resume {
-			statusf("Resuming agent '%s'...\n", agentName)
-		}
-	} else if resume && savedPhase == string(state.PhaseStopped) {
-		effectiveResume = false
+	effectiveResume, implicitResume, forcedRecovery, err := localResumeDecision(savedPhase, resume, forceResume, agentName)
+	if err != nil {
+		return err
+	}
+	if implicitResume {
+		statusf("Resuming agent '%s'...\n", agentName)
+	}
+	if forcedRecovery {
+		statusf("Force-resuming agent '%s' (saved phase: %s)...\n", agentName, savedPhase)
 	}
 
 	opts := api.StartOptions{
@@ -575,11 +604,9 @@ func RunAgent(cmd *cobra.Command, args []string, resume bool) error {
 	if debugMode && !noAuth {
 		localAuth := harness.GatherAuth()
 		util.Debugf("[auth] local credential preview:")
-		util.Debugf("[auth]   hasGeminiAPIKey=%t, hasGoogleAPIKey=%t", localAuth.GeminiAPIKey != "", localAuth.GoogleAPIKey != "")
-		util.Debugf("[auth]   hasAnthropicAPIKey=%t", localAuth.AnthropicAPIKey != "")
-		util.Debugf("[auth]   hasOAuthCreds=%t (%s)", localAuth.OAuthCreds != "", localAuth.OAuthCreds)
 		util.Debugf("[auth]   hasGoogleAppCredentials=%t", localAuth.GoogleAppCredentials != "")
 		util.Debugf("[auth]   cloudProject=%q, cloudRegion=%q", localAuth.GoogleCloudProject, localAuth.GoogleCloudRegion)
+		util.Debugf("[auth]   envVarCount=%d, fileCount=%d", len(localAuth.EnvVars), len(localAuth.Files))
 	}
 
 	// We still might want to show some progress in the CLI
@@ -733,6 +760,7 @@ func startAgentViaHub(hubCtx *HubContext, agentName, task string, resume bool, i
 		Workspace:       workspace,
 		Labels:          parsedLabels,
 		Resume:          resume,
+		ForceResume:     resume && forceResume,
 		Attach:          attach,
 		GatherEnv:       true, // Enable env-gather flow
 		Notify:          !startNoNotify,
@@ -789,11 +817,9 @@ func startAgentViaHub(hubCtx *HubContext, agentName, task string, resume bool, i
 		// Preview auth credentials visible from the CLI host
 		localAuth := harness.GatherAuth()
 		util.Debugf("[auth] CLI-side credential preview (what the broker will see via env/secrets):")
-		util.Debugf("[auth]   hasGeminiAPIKey=%t, hasGoogleAPIKey=%t", localAuth.GeminiAPIKey != "", localAuth.GoogleAPIKey != "")
-		util.Debugf("[auth]   hasAnthropicAPIKey=%t", localAuth.AnthropicAPIKey != "")
-		util.Debugf("[auth]   hasOAuthCreds=%t (%s)", localAuth.OAuthCreds != "", localAuth.OAuthCreds)
 		util.Debugf("[auth]   hasGoogleAppCredentials=%t", localAuth.GoogleAppCredentials != "")
 		util.Debugf("[auth]   cloudProject=%q, cloudRegion=%q", localAuth.GoogleCloudProject, localAuth.GoogleCloudRegion)
+		util.Debugf("[auth]   envVarCount=%d, fileCount=%d", len(localAuth.EnvVars), len(localAuth.Files))
 	}
 
 	// Detect non-git project for workspace bootstrap.
@@ -849,6 +875,9 @@ func startAgentViaHub(hubCtx *HubContext, agentName, task string, resume bool, i
 		action := "Starting"
 		if resume {
 			action = "Resuming"
+		}
+		if resume && forceResume {
+			action = "Force-resuming"
 		}
 		fmt.Printf("%s agent '%s'...\n", action, agentName)
 	}
@@ -1010,12 +1039,16 @@ func startAgentViaHub(hubCtx *HubContext, agentName, task string, resume bool, i
 					if agentID == "" {
 						agentID = agentName
 					}
+					attachOpts, transportSrc, err := resolveAttachOptions()
+					if err != nil {
+						return err
+					}
 					token := getHubAccessToken(hubCtx.Endpoint)
-					if token == "" {
+					if token == "" && transportSrc == nil {
 						return fmt.Errorf("no access token found for Hub\n\nPlease login first: scion hub auth login")
 					}
 					statusf("Attaching to agent '%s' via Hub...\n", agentName)
-					return wsclient.AttachToAgent(context.Background(), hubCtx.Endpoint, token, agentID)
+					return wsclient.AttachToAgent(context.Background(), hubCtx.Endpoint, token, agentID, attachOpts...)
 				}
 				if agentPhase == string(state.PhaseError) || agentPhase == string(state.PhaseStopped) {
 					return fmt.Errorf("agent '%s' failed to start (phase: %s)", agentName, agentPhase)
@@ -1111,14 +1144,23 @@ func startAgentViaHub(hubCtx *HubContext, agentName, task string, resume bool, i
 	}
 
 ready:
-	// Get access token for WebSocket authentication
+	// Resolve transport auth for IAP/Cloud Run traversal FIRST — in IAP mode
+	// there is no application-level token by design, so transport auth must be
+	// determined before deciding whether an app token is required.
+	attachOpts, transportSrc, err := resolveAttachOptions()
+	if err != nil {
+		return err
+	}
+
+	// Get access token for WebSocket authentication.
+	// Only require an application token when no transport source is configured.
 	token := getHubAccessToken(hubCtx.Endpoint)
-	if token == "" {
+	if token == "" && transportSrc == nil {
 		return fmt.Errorf("no access token found for Hub\n\nPlease login first: scion hub auth login")
 	}
 
 	statusf("Attaching to agent '%s' via Hub...\n", agentName)
-	return wsclient.AttachToAgent(context.Background(), hubCtx.Endpoint, token, agentID)
+	return wsclient.AttachToAgent(context.Background(), hubCtx.Endpoint, token, agentID, attachOpts...)
 }
 
 func createAgentWithBrokerResolution(ctx context.Context, hubCtx *HubContext, projectID string, req *hubclient.CreateAgentRequest) (*hubclient.CreateAgentResponse, error) {

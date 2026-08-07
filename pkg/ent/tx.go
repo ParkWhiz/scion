@@ -16,6 +16,8 @@ type Tx struct {
 	AccessPolicy *AccessPolicyClient
 	// Agent is the client for interacting with the Agent builders.
 	Agent *AgentClient
+	// AgentSessionMetrics is the client for interacting with the AgentSessionMetrics builders.
+	AgentSessionMetrics *AgentSessionMetricsClient
 	// AllowListEntry is the client for interacting with the AllowListEntry builders.
 	AllowListEntry *AllowListEntryClient
 	// ApiKey is the client for interacting with the ApiKey builders.
@@ -30,6 +32,8 @@ type Tx struct {
 	EnvVar *EnvVarClient
 	// GCPServiceAccount is the client for interacting with the GCPServiceAccount builders.
 	GCPServiceAccount *GCPServiceAccountClient
+	// GitHubResolutionCache is the client for interacting with the GitHubResolutionCache builders.
+	GitHubResolutionCache *GitHubResolutionCacheClient
 	// GithubInstallation is the client for interacting with the GithubInstallation builders.
 	GithubInstallation *GithubInstallationClient
 	// Group is the client for interacting with the Group builders.
@@ -66,6 +70,8 @@ type Tx struct {
 	Project *ProjectClient
 	// ProjectContributor is the client for interacting with the ProjectContributor builders.
 	ProjectContributor *ProjectContributorClient
+	// ProjectPreStartHook is the client for interacting with the ProjectPreStartHook builders.
+	ProjectPreStartHook *ProjectPreStartHookClient
 	// ProjectSyncState is the client for interacting with the ProjectSyncState builders.
 	ProjectSyncState *ProjectSyncStateClient
 	// RuntimeBroker is the client for interacting with the RuntimeBroker builders.
@@ -78,6 +84,8 @@ type Tx struct {
 	Secret *SecretClient
 	// Skill is the client for interacting with the Skill builders.
 	Skill *SkillClient
+	// SkillInjection is the client for interacting with the SkillInjection builders.
+	SkillInjection *SkillInjectionClient
 	// SkillRegistry is the client for interacting with the SkillRegistry builders.
 	SkillRegistry *SkillRegistryClient
 	// SkillVersion is the client for interacting with the SkillVersion builders.
@@ -223,6 +231,7 @@ func (tx *Tx) Client() *Client {
 func (tx *Tx) init() {
 	tx.AccessPolicy = NewAccessPolicyClient(tx.config)
 	tx.Agent = NewAgentClient(tx.config)
+	tx.AgentSessionMetrics = NewAgentSessionMetricsClient(tx.config)
 	tx.AllowListEntry = NewAllowListEntryClient(tx.config)
 	tx.ApiKey = NewApiKeyClient(tx.config)
 	tx.BrokerDispatch = NewBrokerDispatchClient(tx.config)
@@ -230,6 +239,7 @@ func (tx *Tx) init() {
 	tx.BrokerSecret = NewBrokerSecretClient(tx.config)
 	tx.EnvVar = NewEnvVarClient(tx.config)
 	tx.GCPServiceAccount = NewGCPServiceAccountClient(tx.config)
+	tx.GitHubResolutionCache = NewGitHubResolutionCacheClient(tx.config)
 	tx.GithubInstallation = NewGithubInstallationClient(tx.config)
 	tx.Group = NewGroupClient(tx.config)
 	tx.GroupMembership = NewGroupMembershipClient(tx.config)
@@ -248,12 +258,14 @@ func (tx *Tx) init() {
 	tx.PolicyBinding = NewPolicyBindingClient(tx.config)
 	tx.Project = NewProjectClient(tx.config)
 	tx.ProjectContributor = NewProjectContributorClient(tx.config)
+	tx.ProjectPreStartHook = NewProjectPreStartHookClient(tx.config)
 	tx.ProjectSyncState = NewProjectSyncStateClient(tx.config)
 	tx.RuntimeBroker = NewRuntimeBrokerClient(tx.config)
 	tx.Schedule = NewScheduleClient(tx.config)
 	tx.ScheduledEvent = NewScheduledEventClient(tx.config)
 	tx.Secret = NewSecretClient(tx.config)
 	tx.Skill = NewSkillClient(tx.config)
+	tx.SkillInjection = NewSkillInjectionClient(tx.config)
 	tx.SkillRegistry = NewSkillRegistryClient(tx.config)
 	tx.SkillVersion = NewSkillVersionClient(tx.config)
 	tx.SubscriptionTemplate = NewSubscriptionTemplateClient(tx.config)

@@ -33,6 +33,18 @@ func (f AgentFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.AgentMutation", m)
 }
 
+// The AgentSessionMetricsFunc type is an adapter to allow the use of ordinary
+// function as AgentSessionMetrics mutator.
+type AgentSessionMetricsFunc func(context.Context, *ent.AgentSessionMetricsMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f AgentSessionMetricsFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.AgentSessionMetricsMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.AgentSessionMetricsMutation", m)
+}
+
 // The AllowListEntryFunc type is an adapter to allow the use of ordinary
 // function as AllowListEntry mutator.
 type AllowListEntryFunc func(context.Context, *ent.AllowListEntryMutation) (ent.Value, error)
@@ -115,6 +127,18 @@ func (f GCPServiceAccountFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.GCPServiceAccountMutation", m)
+}
+
+// The GitHubResolutionCacheFunc type is an adapter to allow the use of ordinary
+// function as GitHubResolutionCache mutator.
+type GitHubResolutionCacheFunc func(context.Context, *ent.GitHubResolutionCacheMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f GitHubResolutionCacheFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.GitHubResolutionCacheMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.GitHubResolutionCacheMutation", m)
 }
 
 // The GithubInstallationFunc type is an adapter to allow the use of ordinary
@@ -333,6 +357,18 @@ func (f ProjectContributorFunc) Mutate(ctx context.Context, m ent.Mutation) (ent
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ProjectContributorMutation", m)
 }
 
+// The ProjectPreStartHookFunc type is an adapter to allow the use of ordinary
+// function as ProjectPreStartHook mutator.
+type ProjectPreStartHookFunc func(context.Context, *ent.ProjectPreStartHookMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f ProjectPreStartHookFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.ProjectPreStartHookMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ProjectPreStartHookMutation", m)
+}
+
 // The ProjectSyncStateFunc type is an adapter to allow the use of ordinary
 // function as ProjectSyncState mutator.
 type ProjectSyncStateFunc func(context.Context, *ent.ProjectSyncStateMutation) (ent.Value, error)
@@ -403,6 +439,18 @@ func (f SkillFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SkillMutation", m)
+}
+
+// The SkillInjectionFunc type is an adapter to allow the use of ordinary
+// function as SkillInjection mutator.
+type SkillInjectionFunc func(context.Context, *ent.SkillInjectionMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f SkillInjectionFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.SkillInjectionMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.SkillInjectionMutation", m)
 }
 
 // The SkillRegistryFunc type is an adapter to allow the use of ordinary

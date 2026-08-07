@@ -40,6 +40,7 @@ interface HarnessConfigEntry {
   scope: string;
 }
 import { isSharedWorkspace } from '../../shared/types.js';
+import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
 import { apiFetch, parseApiError } from '../../client/api.js';
 import '../shared/status-badge.js';
 
@@ -408,7 +409,9 @@ export class ScionPageAgentCreate extends LitElement {
       }
 
       if (settingsRes.ok) {
-        const data = (await settingsRes.json()) as { telemetryEnabled?: boolean };
+        const data = (await settingsRes.json()) as {
+          telemetryEnabled?: boolean;
+        };
         this.telemetryEnabled = data.telemetryEnabled ?? false;
       }
 
@@ -416,7 +419,9 @@ export class ScionPageAgentCreate extends LitElement {
         const data = (await harnessConfigsRes.json()) as {
           harnessConfigs?: HarnessConfigEntry[];
         };
-        this.harnessConfigs = data.harnessConfigs || [];
+        this.harnessConfigs = (data.harnessConfigs || []).sort((a, b) =>
+          (a.displayName || a.name).localeCompare(b.displayName || b.name)
+        );
       }
 
       // If returning from configure page, populate form from existing agent
@@ -536,11 +541,10 @@ export class ScionPageAgentCreate extends LitElement {
       }
 
       // Pass config options
-      const config: Record<string, unknown> = {
-        env: {
-          SCION_TELEMETRY_ENABLED: this.telemetryEnabled ? 'true' : 'false',
-        },
+      const env: Record<string, string> = {
+        SCION_TELEMETRY_ENABLED: this.telemetryEnabled ? 'true' : 'false',
       };
+      const config: Record<string, unknown> = { env };
 
       body.config = config;
 
@@ -768,7 +772,7 @@ private selectBrokerForProject(): void {
   /**
    * Select the default template and harness config for the current project using project settings.
    * Falls back to a template named "default", then the first available template.
-   * The harness config is determined by: template defaultHarnessConfig > template harness > project default > 'gemini'.
+   * The harness config is determined by: template defaultHarnessConfig > template harness > project default > 'gemini-cli'.
    */
   private async selectDefaultTemplate(): Promise<void> {
     const visible = this.filteredTemplates;
@@ -877,7 +881,9 @@ private selectBrokerForProject(): void {
       const res = await apiFetch(url);
       if (res.ok) {
         const data = (await res.json()) as { harnessConfigs?: HarnessConfigEntry[] };
-        this.harnessConfigs = data.harnessConfigs || [];
+        this.harnessConfigs = (data.harnessConfigs || []).sort((a, b) =>
+          (a.displayName || a.name).localeCompare(b.displayName || b.name)
+        );
       }
     } catch (err) {
       console.error('Failed to load harness configs:', err);
@@ -997,8 +1003,7 @@ private selectBrokerForProject(): void {
    */
   private setHarnessFromValue(value: string): void {
     const knownNames = this.harnessConfigs.map((hc) => hc.name);
-    const fallbackNames = ['gemini-cli', 'claude', 'codex', 'copilot', 'opencode'];
-    const available = knownNames.length > 0 ? knownNames : fallbackNames;
+    const available: readonly string[] = knownNames.length > 0 ? knownNames : KNOWN_HARNESS_NAMES;
 
     if (available.includes(value)) {
       this.harness = value;
@@ -1168,13 +1173,11 @@ private selectBrokerForProject(): void {
                       </sl-option>
                     `
                   )
-                : html`
-                    <sl-option value="gemini-cli">Gemini CLI</sl-option>
-                    <sl-option value="claude">Claude</sl-option>
-                    <sl-option value="codex">Codex</sl-option>
-                    <sl-option value="copilot">Copilot</sl-option>
-                    <sl-option value="opencode">OpenCode</sl-option>
-                  `}
+                : KNOWN_HARNESS_NAMES.map(
+                    (name) => html`
+                      <sl-option value=${name}>${harnessDisplayName(name)}</sl-option>
+                    `
+                  )}
               <sl-option value="__other__">Other...</sl-option>
             </sl-select>
             <div class="hint">

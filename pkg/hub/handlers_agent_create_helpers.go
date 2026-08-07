@@ -16,9 +16,11 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -144,10 +146,15 @@ func (s *Server) populateAgentConfig(ctx context.Context, agent *store.Agent, pr
 	}
 
 	// Populate workspace path for hub-managed projects and shared-workspace git projects.
+	// When the user provided a relative workspace (project subdirectory), preserve it
+	// verbatim -- the broker will resolve it against its own project root.
 	if project != nil && (project.GitRemote == "" || project.IsSharedWorkspace()) {
-		workspacePath, err := hubManagedProjectPath(project.Slug)
-		if err == nil {
-			agent.AppliedConfig.Workspace = workspacePath
+		existingWorkspace := agent.AppliedConfig.Workspace
+		if existingWorkspace == "" {
+			workspacePath, err := hubManagedProjectPath(project.Slug)
+			if err == nil {
+				agent.AppliedConfig.Workspace = workspacePath
+			}
 		}
 	}
 
@@ -211,6 +218,25 @@ func (s *Server) populateAgentConfig(ctx context.Context, agent *store.Agent, pr
 	// by slug (project scope first, then global) and stamp its ID and content
 	// hash so the broker can fetch it from Hub storage.
 	hcName := agent.AppliedConfig.HarnessConfig
+	// Record where the name came from, for the not-found log level below. A
+	// name that arrived from the project's default-harness-config annotation
+	// is operator-supplied and displaced the template, so failing to resolve
+	// it is worth a warning. Anything else — most often the template's bare
+	// Harness type — is the pre-existing normal case.
+	hcFromProjectAnnotation := hcName != "" && project != nil && project.Annotations != nil &&
+		project.Annotations[projectSettingDefaultHarnessConfig] == hcName
+	// A third provenance: the hub operational default_harness_config, applied
+	// by applyHubAgentDefaults just above the call to this function. Carried on
+	// the context rather than inferred by comparing hcName back against the
+	// setting — that comparison cannot tell "the hub defaulted it" from "the
+	// user named the same config the hub defaults to". Without this an operator
+	// cannot tell a bad hub default from a bad project annotation in the log.
+	// The !hcFromProjectAnnotation conjunct cannot currently be false when the
+	// ctx flag is true — if the annotation supplied the name then the slot was
+	// occupied and applyHubAgentDefaults never fired — so it is defence in
+	// depth, not a live case. Kept so the two provenances stay mutually
+	// exclusive by construction rather than by that reasoning holding.
+	hcFromHubDefault := hcName != "" && !hcFromProjectAnnotation && hubDefaultHarnessConfigFromContext(ctx)
 	if hcName == "" && resolvedTemplate != nil {
 		hcName = s.getHarnessConfigFromTemplate(resolvedTemplate, "")
 	}
@@ -252,6 +278,109 @@ func (s *Server) populateAgentConfig(ctx context.Context, agent *store.Agent, pr
 						"agent_id", agent.ID, "harness", hc.Harness)
 				}
 			}
+		} else {
+			// Not-found is not an error here — the broker may still resolve the
+			// name from its own search path — but it should not be entirely
+			// silent either. The level tracks provenance:
+			//
+			//   WARN  — the name came from the project's
+			//           scion.io/default-harness-config annotation. That
+			//           annotation now outranks the template, so a stale or
+			//           misspelled value displaced a known-good template value
+			//           and the agent dispatches with no ID or hash for the
+			//           broker to hydrate from Hub storage. An operator can fix
+			//           it, so say so loudly.
+			//
+			//   WARN  — the name came from the hub operational
+			//           agent_defaults.default_harness_config. Same argument,
+			//           one tier lower and deployment-wide: a stale hub default
+			//           silently costs every agent in the deployment its ID and
+			//           hash. The two are distinguished in the log attributes
+			//           so an operator knows which knob to turn.
+			//
+			//   DEBUG — anything else. Most often hcName is the template's bare
+			//           Harness type ("claude") rather than a stored
+			//           harness-config slug, via getHarnessConfigFromTemplate's
+			//           second branch. Harness configs are created through the
+			//           API rather than seeded, so "no HarnessConfig row whose
+			//           slug matches the harness type" is the default state of a
+			//           fresh deployment. Warning there would fire on every
+			//           single agent create and train operators to ignore it.
+			projectID := ""
+			if project != nil {
+				projectID = project.ID
+			}
+			level := slog.LevelDebug
+			if hcFromProjectAnnotation || hcFromHubDefault {
+				level = slog.LevelWarn
+			}
+			s.agentLifecycleLog.Log(ctx, level,
+				"harness config not found in project or global scope; "+
+					"agent will be dispatched without a config ID/hash and the broker must resolve it locally",
+				"slug", hcName, "agent_id", agent.ID, "project_id", projectID,
+				"from_project_annotation", hcFromProjectAnnotation,
+				"from_hub_default", hcFromHubDefault)
+		}
+	}
+
+	// Stamp the pre-start hook for broker delivery.
+	// Resolve the active hook and inline its script content into AppliedConfig
+	// so the broker can stage it without an extra Hub round-trip. Mirrors the
+	// HarnessConfigID stamping pattern above.
+	//
+	// Resolution is a two-step fallback (see
+	// .design/project-prestart-hooks-extensions.md section 1):
+	//   1. The project's active hook wins outright.
+	//   2. Otherwise the hub-wide active hook applies, if any.
+	//   3. Neither → no script staged.
+	// Either way the broker stages a single file (30-project-custom) and
+	// AppliedConfig.ProjectPreStartHookID records which hook it came from, so
+	// no scope-specific fields are needed downstream.
+	//
+	// The hub fallback is entered only on a definitive "no project hook"
+	// (ErrNotFound). Any other project-lookup failure (DB blip, duplicate rows)
+	// is ambiguous: the project may well have an override we simply failed to
+	// read, and silently staging the hub script in that case would run the
+	// wrong code. On an ambiguous error we log and stage nothing.
+	if project != nil && agent.AppliedConfig.ProjectPreStartHookID == "" {
+		hook, hookErr := s.store.GetActiveProjectPreStartHook(ctx, project.ID)
+		switch {
+		case hookErr == nil:
+			// 1. Project-scoped hook found — it takes precedence.
+		case errors.Is(hookErr, store.ErrNotFound):
+			// 2. No project hook — fall back to the hub-scoped hook, if any.
+			var hubErr error
+			hook, hubErr = s.store.GetActiveHubPreStartHook(ctx)
+			if hubErr != nil {
+				if !errors.Is(hubErr, store.ErrNotFound) {
+					s.agentLifecycleLog.Warn("failed to resolve hub pre-start hook", "error", hubErr)
+				}
+				hook = nil
+			}
+		default:
+			// 3. Ambiguous project lookup failure — stage nothing.
+			s.agentLifecycleLog.Warn("failed to resolve project pre-start hook; skipping hook staging",
+				"project_id", project.ID, "error", hookErr)
+			hook = nil
+		}
+
+		if hook != nil {
+			agent.AppliedConfig.ProjectPreStartHookID = hook.ID
+			agent.AppliedConfig.ProjectPreStartHookScript = hook.Script
+		}
+	}
+
+	// Resolve model size aliases (e.g. "extra-large" → "fable") so that
+	// AppliedConfig.Model and InlineConfig.Model carry the concrete model
+	// name. This prevents raw aliases from leaking into SCION_MODEL env var
+	// (set by httpdispatcher) and --model CLI flag (set by run.go).
+	if agent.AppliedConfig.Model != "" {
+		resolved := s.resolveModelAliasForAgent(ctx, agent, agent.AppliedConfig.Model)
+		if resolved != agent.AppliedConfig.Model {
+			agent.AppliedConfig.Model = resolved
+			if agent.AppliedConfig.InlineConfig != nil && agent.AppliedConfig.InlineConfig.Model != "" {
+				agent.AppliedConfig.InlineConfig.Model = resolved
+			}
 		}
 	}
 
@@ -287,6 +416,186 @@ func (s *Server) populateAgentConfig(ctx context.Context, agent *store.Agent, pr
 			}
 		}
 	}
+
+	// Apply project-level AutoExposePortsEnabled override.
+	// Only set the env var if the agent's own config does not already specify it,
+	// so agent-level settings take priority over project-level.
+	if project != nil && project.Annotations != nil {
+		if val, ok := project.Annotations[projectSettingAutoExposePortsEnabled]; ok {
+			enabled, err := strconv.ParseBool(val)
+			if err == nil {
+				if agent.AppliedConfig.InlineConfig == nil {
+					agent.AppliedConfig.InlineConfig = &api.ScionConfig{}
+				}
+				if agent.AppliedConfig.InlineConfig.Env == nil {
+					agent.AppliedConfig.InlineConfig.Env = make(map[string]string)
+				}
+				if _, exists := agent.AppliedConfig.InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"]; !exists {
+					agent.AppliedConfig.InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"] = strconv.FormatBool(enabled)
+				}
+			}
+		}
+	}
+
+	// Apply hub-level AutoExposePortsDefault as lowest-priority fallback.
+	// Injects SCION_AUTO_EXPOSE_PORTS if neither the agent config nor
+	// the project annotation already set it, respecting both true and false defaults.
+	s.mu.RLock()
+	hubAutoExposeDefault := s.config.AutoExposePortsDefault
+	s.mu.RUnlock()
+	if hubAutoExposeDefault != nil {
+		if agent.AppliedConfig.InlineConfig == nil {
+			agent.AppliedConfig.InlineConfig = &api.ScionConfig{}
+		}
+		if agent.AppliedConfig.InlineConfig.Env == nil {
+			agent.AppliedConfig.InlineConfig.Env = make(map[string]string)
+		}
+		if _, exists := agent.AppliedConfig.InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"]; !exists {
+			agent.AppliedConfig.InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"] = strconv.FormatBool(*hubAutoExposeDefault)
+		}
+	}
+
+	// Merge injected skills from hub/user/project scopes into InlineConfig.Skills
+	// so the provisioner's existing Step 3b handles them.
+	s.mergeInjectedSkills(ctx, agent, project)
+}
+
+// mergeInjectedSkills fetches injected-skills refs from hub, user, and project
+// scopes and merges them with template-level skills (highest precedence) into
+// agent.AppliedConfig.InlineConfig.Skills. Fetches are best-effort: errors are
+// logged and that scope's skills are omitted for this provisioning.
+func (s *Server) mergeInjectedSkills(ctx context.Context, agent *store.Agent, project *store.Project) {
+	if agent.AppliedConfig.InlineConfig == nil {
+		agent.AppliedConfig.InlineConfig = &api.ScionConfig{}
+	}
+
+	// Fetch hub-scope injected skills (system + user_defined).
+	// ErrNotFound is the normal case when no hub skills are configured; all
+	// other errors are unexpected and logged as warnings (best-effort).
+	var hubRefs []api.SkillReference
+	if hs, err := s.store.GetHubSetting(ctx, "injected_skills"); err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			slog.Warn("mergeInjectedSkills: failed to fetch hub injected skills setting", "error", err)
+		}
+	} else {
+		var setting api.HubSkillInjectionSetting
+		if err := json.Unmarshal(hs.Value, &setting); err != nil {
+			slog.Warn("mergeInjectedSkills: failed to unmarshal hub injected skills setting", "error", err)
+		} else {
+			hubRefs = append(setting.System, setting.UserDefined...)
+		}
+	}
+	for i := range hubRefs {
+		hubRefs[i].Scope = "hub"
+	}
+
+	// Fetch user-scope injected skills.
+	var userRefs []api.SkillReference
+	if agent.OwnerID != "" {
+		if sis, err := s.store.ListSkillInjections(ctx, store.SkillInjectionScopeUser, agent.OwnerID); err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				slog.Warn("mergeInjectedSkills: failed to fetch user injected skills", "error", err)
+			}
+			// continue, best-effort
+		} else {
+			for _, si := range sis {
+				userRefs = append(userRefs, si.ToSkillReference())
+			}
+		}
+	}
+	for i := range userRefs {
+		userRefs[i].Scope = "user"
+	}
+
+	// Fetch project-scope injected skills.
+	var projectRefs []api.SkillReference
+	if project != nil {
+		if sis, err := s.store.ListSkillInjections(ctx, store.SkillInjectionScopeProject, project.ID); err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				slog.Warn("mergeInjectedSkills: failed to fetch project injected skills", "error", err)
+			}
+			// continue, best-effort
+		} else {
+			for _, si := range sis {
+				projectRefs = append(projectRefs, si.ToSkillReference())
+			}
+		}
+	}
+	// Copy the slice to avoid mutating the original SkillReference values.
+	if len(projectRefs) > 0 {
+		copied := make([]api.SkillReference, len(projectRefs))
+		copy(copied, projectRefs)
+		projectRefs = copied
+	}
+	for i := range projectRefs {
+		projectRefs[i].Scope = "project"
+	}
+
+	// Template refs are already in InlineConfig.Skills (highest precedence).
+	// Copy the slice to avoid mutating the caller's InlineConfig.Skills in place.
+	var templateRefs []api.SkillReference
+	if len(agent.AppliedConfig.InlineConfig.Skills) > 0 {
+		templateRefs = make([]api.SkillReference, len(agent.AppliedConfig.InlineConfig.Skills))
+		copy(templateRefs, agent.AppliedConfig.InlineConfig.Skills)
+		for i := range templateRefs {
+			templateRefs[i].Scope = "template"
+		}
+	}
+
+	// Merge: hub → user → project → template (lowest to highest precedence).
+	merged := mergeSkillRefs(hubRefs, userRefs, projectRefs, templateRefs)
+	agent.AppliedConfig.InlineConfig.Skills = merged
+}
+
+// mergeSkillRefs deduplicates skill references by base URI across multiple scope
+// slices. Later slices have higher precedence. When the same base URI appears in
+// multiple scopes with different version pins, the higher-precedence entry wins.
+// A single warning is emitted per base URI where the winning version differs from
+// the first-seen version (version conflict). The result is returned in ascending
+// base-URI order for deterministic output.
+func mergeSkillRefs(scopes ...[]api.SkillReference) []api.SkillReference {
+	// seen holds the current winner (last write wins — highest precedence).
+	// first holds the initial entry per base URI so we can detect version conflicts
+	// without firing intermediate warnings for every overwrite in a 3+ scope chain.
+	seen := map[string]api.SkillReference{}
+	first := map[string]api.SkillReference{}
+	for _, refs := range scopes {
+		for _, ref := range refs {
+			base := skillBaseURI(ref.URI)
+			if _, ok := seen[base]; !ok {
+				first[base] = ref
+			}
+			seen[base] = ref
+		}
+	}
+	// Warn once per base URI where the final winner has a different version than
+	// the first-seen entry. This avoids misleading log noise when 3+ scopes
+	// conflict (e.g. labelling transient intermediates as "winner").
+	for base, winner := range seen {
+		orig := first[base]
+		if orig.URI != winner.URI {
+			slog.Warn("possible skill injection version conflict or duplicate URI",
+				"base_uri", base, "winner", winner.URI, "original", orig.URI)
+		}
+	}
+	// Build result slice using the already-computed keys from `seen` for the sort
+	// to avoid re-calling skillBaseURI O(n log n) times.
+	type entry struct {
+		base string
+		ref  api.SkillReference
+	}
+	entries := make([]entry, 0, len(seen))
+	for base, ref := range seen {
+		entries = append(entries, entry{base, ref})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].base < entries[j].base
+	})
+	result := make([]api.SkillReference, len(entries))
+	for i, e := range entries {
+		result[i] = e.ref
+	}
+	return result
 }
 
 // existingAgentResult describes the outcome of handleExistingAgent.
@@ -330,6 +639,31 @@ func (s *Server) createNotifySubscription(ctx context.Context, agentID, projectI
 			"subscriptionID", sub.ID, "agent_id", agentID,
 			"subscriberType", notifySubscriberType, "subscriberID", notifySubscriberID)
 	}
+}
+
+// resumeInPlaceDecision decides whether an existing agent in a terminal-ish
+// phase may be restarted in place rather than rejected as a duplicate, and
+// whether the harness should be handed its resume flag when that happens.
+//
+// Local (non-Hub) mode applies the same contract in localResumeDecision
+// (cmd/common.go); keep the two in step.
+//
+// A stopped agent restarts with a *fresh* harness session even when resume was
+// requested, mirroring the local CLI's effectiveResume. A forced recovery is
+// the opposite case: the agent died without a clean shutdown (typically a host
+// crash), so the whole point is to continue the interrupted session.
+//
+// phase=running is deliberately not forceable. A live agent must not be
+// recreated out from under itself, and an operator who truly wants that can
+// stop it first.
+func resumeInPlaceDecision(phase string, resume, force bool) (resumeInPlace, forcedRecovery bool) {
+	if !resume {
+		return false, false
+	}
+	if force && phase == string(state.PhaseError) {
+		return true, true
+	}
+	return phase == string(state.PhaseStopped), false
 }
 
 // handleExistingAgent encapsulates the full decision tree for an agent that
@@ -422,8 +756,8 @@ func (s *Server) handleExistingAgent(
 			existingAgent.Phase == string(state.PhaseStopped) ||
 			existingAgent.Phase == string(state.PhaseError)) {
 
-		// Resume a stopped agent in-place when explicitly requested.
-		if req.Resume && existingAgent.Phase == string(state.PhaseStopped) {
+		resumeInPlace, forcedRecovery := resumeInPlaceDecision(existingAgent.Phase, req.Resume, req.ForceResume)
+		if resumeInPlace {
 			if existingAgent.RuntimeBrokerID == "" && runtimeBrokerID != "" {
 				existingAgent.RuntimeBrokerID = runtimeBrokerID
 			}
@@ -445,7 +779,15 @@ func (s *Server) handleExistingAgent(
 
 			// A stopped agent restarts with a fresh harness session even when
 			// resume was requested (mirrors the local CLI's effectiveResume).
-			if err := dispatcher.DispatchAgentStart(ctx, existingAgent, req.Task, false); err != nil {
+			// A forced recovery is the opposite: the whole point is to continue
+			// the session the crash interrupted, so the harness resume flag is
+			// passed through.
+			if forcedRecovery {
+				s.agentLifecycleLog.Warn("Force-resuming agent from error phase",
+					"agent_id", existingAgent.ID, "agent", existingAgent.Name,
+					"container_status", existingAgent.ContainerStatus)
+			}
+			if err := dispatcher.DispatchAgentStart(ctx, existingAgent, req.Task, forcedRecovery); err != nil {
 				if isContainerNameConflict(err) {
 					Conflict(w, "Agent name is already in use by a stopped container. Please delete the existing agent or choose a different name.")
 				} else {
@@ -807,12 +1149,7 @@ func (s *Server) hasRequiredAuthCredentials(ctx context.Context, agent *store.Ag
 	}
 
 	// Explicit auth type selected or no authMeta — use config-driven check when available.
-	var keyGroups [][]string
-	if authMeta != nil {
-		keyGroups = harness.RequiredAuthEnvKeysFromConfig(authMeta, agent.AppliedConfig.HarnessAuth)
-	} else {
-		keyGroups = harness.RequiredAuthEnvKeys(harnessType, agent.AppliedConfig.HarnessAuth)
-	}
+	keyGroups := harness.RequiredAuthEnvKeysFromConfig(authMeta, agent.AppliedConfig.HarnessAuth)
 	if len(keyGroups) == 0 && authMeta == nil {
 		return true, nil
 	}

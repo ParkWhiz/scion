@@ -52,7 +52,7 @@ func init() {
 		},
 		{
 			Name:       "lifecycle",
-			KoanfPaths: []string{"server.hub.auto_suspend_stalled", "server.hub.soft_delete_retention", "server.hub.soft_delete_retain_files"},
+			KoanfPaths: []string{"server.hub.auto_suspend_stalled", "server.hub.stalled_threshold", "server.hub.soft_delete_retention", "server.hub.soft_delete_retain_files"},
 			New:        func() any { return &LifecycleSettings{} },
 		},
 		{
@@ -82,11 +82,19 @@ func init() {
 			New: func() any { return &TelemetrySettings{} },
 		},
 		{
+			Name: "auto_expose_ports",
+			KoanfPaths: []string{
+				"auto_expose_ports.enabled",
+			},
+			New: func() any { return &AutoExposePortsSettings{} },
+		},
+		{
 			Name: "agent_defaults",
 			KoanfPaths: []string{
 				"default_template", "default_harness_config",
 				"default_max_turns", "default_max_model_calls",
 				"default_max_duration", "default_resources",
+				"default_model", "default_thinking_level",
 			},
 			New: func() any { return &AgentDefaultsSettings{} },
 		},
@@ -108,6 +116,15 @@ func init() {
 			Name:       "notifications",
 			KoanfPaths: []string{"server.notification_channels"},
 			New:        func() any { return &NotificationsSettings{} },
+		},
+		{
+			// project_defaults is durable via DB but has no settings.yaml
+			// representation. It controls hub-level defaults applied at
+			// project creation time (e.g. default scratchpad shared dir).
+			// Absent DB row = compiled defaults (default_scratchpad=true).
+			Name:       "project_defaults",
+			KoanfPaths: nil,
+			New:        func() any { return &ProjectDefaultsSettings{} },
 		},
 	}
 
@@ -237,6 +254,7 @@ func compileSchemas() {
 			"type": "object",
 			"properties": map[string]interface{}{
 				"auto_suspend_stalled":     getSchemaProperty(root, "server", "hub", "auto_suspend_stalled"),
+				"stalled_threshold":        getSchemaProperty(root, "server", "hub", "stalled_threshold"),
 				"soft_delete_retention":    getSchemaProperty(root, "server", "hub", "soft_delete_retention"),
 				"soft_delete_retain_files": getSchemaProperty(root, "server", "hub", "soft_delete_retain_files"),
 			},
@@ -254,6 +272,13 @@ func compileSchemas() {
 			},
 			"additionalProperties": false,
 		},
+		"auto_expose_ports": {
+			"type": "object",
+			"properties": map[string]interface{}{
+				"enabled": map[string]interface{}{"type": "boolean"},
+			},
+			"additionalProperties": false,
+		},
 		"telemetry": buildTelemetrySchema(defs),
 		"agent_defaults": {
 			"type": "object",
@@ -264,6 +289,8 @@ func compileSchemas() {
 				"default_max_model_calls": getSchemaProperty(root, "default_max_model_calls"),
 				"default_max_duration":    getSchemaProperty(root, "default_max_duration"),
 				"default_resources":       getSchemaProperty(root, "default_resources"),
+				"default_model":           map[string]interface{}{"type": "string"},
+				"default_thinking_level":  map[string]interface{}{"type": "integer"},
 			},
 			"additionalProperties": false,
 		},
@@ -290,6 +317,15 @@ func compileSchemas() {
 			"additionalProperties": false,
 		},
 		"notifications": buildNotificationsSchema(),
+		// project_defaults schema is hand-written — like maintenance, it has
+		// no $defs in settings-v1.schema.json because it is runtime/DB state.
+		"project_defaults": {
+			"type": "object",
+			"properties": map[string]interface{}{
+				"default_scratchpad": map[string]interface{}{"type": "boolean"},
+			},
+			"additionalProperties": false,
+		},
 	}
 
 	rawSchemas = sectionSchemaMap

@@ -20,10 +20,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 )
@@ -33,20 +35,59 @@ var slugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 // Server is the A2A HTTP server that routes requests to the SDK handler.
 type Server struct {
 	bridge     *Bridge
-	config     *Config
+	config     *Config         // base config (kept for backward compat in non-snapshot paths)
+	snapshot   *SnapshotHolder // atomic snapshot of effective config (hot-apply)
 	metrics    *Metrics
 	log        *slog.Logger
 	sdkHandler http.Handler // SDK JSON-RPC handler
+	// Legacy validators — used only when snapshot is nil (tests, backward compat).
+	uatValidator *UATValidator
+	jwtValidator *JWTValidator
 }
 
 // NewServer creates a new A2A protocol server backed by the SDK.
 func NewServer(bridge *Bridge, cfg *Config, metrics *Metrics, log *slog.Logger, sdkHandler http.Handler) *Server {
-	return &Server{
+	s := &Server{
 		bridge:     bridge,
 		config:     cfg,
 		metrics:    metrics,
 		log:        log,
 		sdkHandler: sdkHandler,
+	}
+	// Initialize per-user auth validators based on the configured scheme.
+	switch cfg.Auth.Scheme {
+	case "hubUAT":
+		s.uatValidator = NewUATValidator(cfg.Hub.Endpoint, cfg.Auth.UATCacheTTL)
+	case "hubJWT":
+		// JWTValidator is initialized later via SetJWTValidator once the
+		// signing key is loaded (it may come from Secret Manager).
+	}
+	return s
+}
+
+// SetSnapshot wires the atomic config snapshot for hot-apply support.
+// When set, auth middleware and rate limiting read from the snapshot
+// instead of the static config pointer.
+func (s *Server) SetSnapshot(snap *SnapshotHolder) {
+	s.snapshot = snap
+}
+
+// SetJWTValidator sets the JWT validator for hubJWT mode. Called after the
+// signing key is loaded (which may require Secret Manager access).
+// Also updates the snapshot if one is wired.
+//
+// NOTE: not safe for concurrent use with Configure(). Currently only called
+// once during boot before the HTTP server starts.
+func (s *Server) SetJWTValidator(v *JWTValidator) {
+	s.jwtValidator = v
+	if s.snapshot != nil {
+		snap := s.snapshot.Load()
+		if snap != nil && snap.Auth.Scheme == "hubJWT" {
+			// Create a new snapshot with the validator set.
+			newSnap := *snap
+			newSnap.Auth.JWTValidator = v
+			s.snapshot.Store(&newSnap)
+		}
 	}
 }
 
@@ -71,14 +112,28 @@ func ValidateConfig(cfg *Config) error {
 	if cfg.Hub.User == "" {
 		return fmt.Errorf("hub.user is required")
 	}
-	if cfg.Auth.Scheme != "" && cfg.Auth.Scheme != "apiKey" && cfg.Auth.Scheme != "bearer" && cfg.Auth.Scheme != "none" {
-		return fmt.Errorf("unsupported auth.scheme: %q (supported: apiKey, bearer, none)", cfg.Auth.Scheme)
+	switch cfg.Auth.Scheme {
+	case "", "apiKey", "bearer", "none", "hubUAT", "hubJWT":
+		// valid
+	default:
+		return fmt.Errorf("unsupported auth.scheme: %q (supported: apiKey, bearer, none, hubUAT, hubJWT)", cfg.Auth.Scheme)
 	}
 	if (cfg.Auth.Scheme == "apiKey" || cfg.Auth.Scheme == "bearer") && cfg.Auth.APIKey == "" {
 		return fmt.Errorf("auth.api_key is required when auth.scheme is %q", cfg.Auth.Scheme)
 	}
-	if cfg.Auth.APIKey == "" && cfg.Auth.Scheme != "none" {
+	// api_key is required for legacy schemes and the default (empty) scheme.
+	// hubUAT and hubJWT do not use api_key — they validate per-user credentials instead.
+	if cfg.Auth.APIKey == "" && cfg.Auth.Scheme != "none" && cfg.Auth.Scheme != "hubUAT" && cfg.Auth.Scheme != "hubJWT" {
 		return fmt.Errorf("auth.api_key is required (set auth.scheme: \"none\" to explicitly disable authentication)")
+	}
+	if cfg.Auth.Scheme == "hubJWT" && cfg.Hub.SigningKey == "" && cfg.Hub.SigningKeySecret == "" {
+		return fmt.Errorf("hub.signing_key or hub.signing_key_secret is required when auth.scheme is hubJWT")
+	}
+	if cfg.Auth.UATCacheTTL < 0 {
+		return fmt.Errorf("auth.uat_cache_ttl must not be negative")
+	}
+	if cfg.Auth.UATCacheTTL > 300*time.Second {
+		return fmt.Errorf("auth.uat_cache_ttl must not exceed 300s")
 	}
 	if cfg.Bridge.Provider.URL != "" {
 		if _, err := url.Parse(cfg.Bridge.Provider.URL); err != nil {
@@ -90,12 +145,18 @@ func ValidateConfig(cfg *Config) error {
 
 // WarnOnOpenAuth logs a warning if the auth configuration leaves the bridge open.
 func (s *Server) WarnOnOpenAuth() {
-	if s.config.Auth.Scheme == "none" {
+	cfg := s.effectiveConfig()
+	switch cfg.Auth.Scheme {
+	case "none":
 		s.log.Warn("bridge auth is explicitly DISABLED (auth.scheme: none) — all requests will be accepted without authentication")
-	} else if s.config.Auth.Scheme == "" {
+	case "":
 		s.log.Warn("auth.scheme is empty: bridge will accept credentials from both X-API-Key and Authorization headers")
+	case "hubUAT":
+		s.log.Info("bridge auth: hubUAT — per-user Scion UAT authentication enabled")
+	case "hubJWT":
+		s.log.Info("bridge auth: hubJWT — per-user Scion JWT authentication enabled")
 	}
-	if s.config.RateLimit.TrustProxy {
+	if cfg.RateLimit.TrustProxy {
 		s.log.Warn("rate_limit.trust_proxy is enabled — X-Forwarded-For is trusted unconditionally, which allows clients to spoof their IP and bypass per-IP rate limits; consider adding network-level proxy restrictions")
 	}
 }
@@ -122,7 +183,11 @@ func (s *Server) Handler() http.Handler {
 
 	// Wrap with middleware chain: metrics -> rate limit -> auth.
 	handler := s.authMiddleware(mux)
-	handler = RateLimitMiddleware(handler, s.config.RateLimit)
+	if s.snapshot != nil {
+		handler = s.snapshotRateLimitMiddleware(handler)
+	} else {
+		handler = RateLimitMiddleware(handler, s.config.RateLimit)
+	}
 	handler = InstrumentHandler(handler, s.metrics)
 	return handler
 }
@@ -173,10 +238,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWellKnownAgentCard(w http.ResponseWriter, r *http.Request) {
+	cfg := s.effectiveConfig()
 	registry := map[string]interface{}{
 		"name":        "scion-a2a-bridge",
 		"description": "Scion A2A Protocol Bridge — exposes Scion agents as A2A endpoints",
-		"url":         s.config.Bridge.ExternalURL,
+		"url":         cfg.Bridge.ExternalURL,
 		"version":     "1.0.0",
 		"capabilities": map[string]bool{
 			"streaming":         true,
@@ -184,10 +250,10 @@ func (s *Server) handleWellKnownAgentCard(w http.ResponseWriter, r *http.Request
 		},
 	}
 
-	if s.config.Bridge.Provider.Organization != "" {
+	if cfg.Bridge.Provider.Organization != "" {
 		registry["provider"] = map[string]string{
-			"organization": s.config.Bridge.Provider.Organization,
-			"url":          s.config.Bridge.Provider.URL,
+			"organization": cfg.Bridge.Provider.Organization,
+			"url":          cfg.Bridge.Provider.URL,
 		}
 	}
 
@@ -285,7 +351,10 @@ func writeJSONRPCError(w http.ResponseWriter, id interface{}, code int, message 
 	json.NewEncoder(w).Encode(resp)
 }
 
-// authMiddleware validates API key authentication on non-public endpoints.
+// authMiddleware validates authentication on non-public endpoints.
+// When a snapshot is available, auth scheme and validators are read from the
+// snapshot for hot-apply support. Each request loads the snapshot once for
+// consistency even if a config swap happens mid-flight.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Public endpoints skip auth.
@@ -301,40 +370,174 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if s.config.Auth.Scheme == "none" {
+		// Resolve auth scheme and validators from snapshot (hot-apply) or static config.
+		var scheme string
+		var uatV *UATValidator
+		var jwtV *JWTValidator
+		var configAPIKey string
+
+		if s.snapshot != nil {
+			snap := s.snapshot.Load()
+			scheme = snap.Auth.Scheme
+			uatV = snap.Auth.UATValidator
+			jwtV = snap.Auth.JWTValidator
+			if jwtV == nil {
+				jwtV = s.jwtValidator
+			}
+			configAPIKey = snap.Auth.APIKey
+		} else {
+			scheme = s.config.Auth.Scheme
+			uatV = s.uatValidator
+			jwtV = s.jwtValidator
+			configAPIKey = s.config.Auth.APIKey
+		}
+
+		switch scheme {
+		case "none":
+			next.ServeHTTP(w, r)
+			return
+
+		case "hubUAT":
+			token := extractBearerOrAPIKey(r)
+			if !strings.HasPrefix(token, "scion_pat_") {
+				http.Error(w, "unauthorized: expected scion_pat_* token", http.StatusUnauthorized)
+				return
+			}
+			if uatV == nil {
+				s.log.Error("hubUAT scheme configured but UAT validator not initialized")
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			caller, err := uatV.Validate(r.Context(), token)
+			if err != nil {
+				s.log.Debug("UAT validation failed", "error", err)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			ctx := withCallerIdentity(r.Context(), caller)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+
+		case "hubJWT":
+			token := extractBearerToken(r)
+			if token == "" {
+				http.Error(w, "unauthorized: missing bearer token", http.StatusUnauthorized)
+				return
+			}
+			if jwtV == nil {
+				s.log.Error("hubJWT scheme configured but JWT validator not initialized")
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			caller, err := jwtV.Validate(token)
+			if err != nil {
+				s.log.Debug("JWT validation failed", "error", err)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			ctx := withCallerIdentity(r.Context(), caller)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+
+		default:
+			// Legacy schemes: "apiKey", "bearer", or "" (accept either header).
+			// No CallerIdentity is injected.
+			var apiKey string
+			switch scheme {
+			case "apiKey":
+				apiKey = r.Header.Get("X-API-Key")
+			case "bearer":
+				apiKey = extractBearerToken(r)
+			default:
+				// When auth.scheme is unset (empty), accept credentials from either
+				// X-API-Key or Authorization: Bearer headers for convenience.
+				apiKey = r.Header.Get("X-API-Key")
+				if apiKey == "" {
+					apiKey = extractBearerToken(r)
+				}
+			}
+
+			// Compare SHA-256 hashes to avoid leaking key length via timing.
+			expectedHash := sha256.Sum256([]byte(configAPIKey))
+			providedHash := sha256.Sum256([]byte(apiKey))
+			if subtle.ConstantTimeCompare(expectedHash[:], providedHash[:]) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		}
+	})
+}
+
+// snapshotRateLimitMiddleware uses the snapshot's pre-built rate limiter.
+// A nil limiter (rate limiting disabled) passes through.
+func (s *Server) snapshotRateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip rate limiting for operational endpoints.
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/metrics" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		var apiKey string
-		switch s.config.Auth.Scheme {
-		case "apiKey":
-			apiKey = r.Header.Get("X-API-Key")
-		case "bearer":
-			auth := r.Header.Get("Authorization")
-			if strings.HasPrefix(auth, "Bearer ") {
-				apiKey = strings.TrimPrefix(auth, "Bearer ")
-			}
-		default:
-			// When auth.scheme is unset (empty), accept credentials from either
-			// X-API-Key or Authorization: Bearer headers for convenience.
-			apiKey = r.Header.Get("X-API-Key")
-			if apiKey == "" {
-				auth := r.Header.Get("Authorization")
-				if strings.HasPrefix(auth, "Bearer ") {
-					apiKey = strings.TrimPrefix(auth, "Bearer ")
-				}
-			}
+		snap := s.snapshot.Load()
+		if snap.Limiter == nil {
+			next.ServeHTTP(w, r)
+			return
 		}
 
-		// Compare SHA-256 hashes to avoid leaking key length via timing.
-		expectedHash := sha256.Sum256([]byte(s.config.Auth.APIKey))
-		providedHash := sha256.Sum256([]byte(apiKey))
-		if subtle.ConstantTimeCompare(expectedHash[:], providedHash[:]) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		key := hashKey(extractBearerOrAPIKey(r))
+		if key == "" {
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				host = r.RemoteAddr
+			}
+			if snap.Config.RateLimit.TrustProxy {
+				if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+					if i := strings.Index(xff, ","); i >= 0 {
+						host = strings.TrimSpace(xff[:i])
+					} else {
+						host = strings.TrimSpace(xff)
+					}
+				}
+			}
+			key = host
+		}
+
+		if !snap.Limiter.Allow(key) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":"rate limit exceeded"}`))
 			return
 		}
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// effectiveConfig returns the effective config from the snapshot if available,
+// or the static config as fallback.
+func (s *Server) effectiveConfig() *Config {
+	if s.snapshot != nil {
+		snap := s.snapshot.Load()
+		return &snap.Config
+	}
+	return s.config
+}
+
+// extractBearerToken extracts the token from an Authorization: Bearer header.
+func extractBearerToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
+	}
+	return ""
+}
+
+// extractBearerOrAPIKey extracts a token from Authorization: Bearer or X-API-Key headers.
+func extractBearerOrAPIKey(r *http.Request) string {
+	if token := extractBearerToken(r); token != "" {
+		return token
+	}
+	return r.Header.Get("X-API-Key")
 }

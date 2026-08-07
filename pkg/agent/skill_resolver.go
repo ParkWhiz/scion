@@ -19,15 +19,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
-
-	"crypto/sha256"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
@@ -74,10 +74,12 @@ type ResolvedSkill struct {
 	As                 string
 	Version            string
 	Hash               string // Bundle content hash (sha256:...)
+	Scope              string // Injection scope (hub, user, project, template, platform, "")
 	Files              []ResolvedFile
 	Deprecated         bool   `json:"-"`
 	DeprecationMessage string `json:"-"`
 	ReplacementURI     string `json:"-"`
+	Optional           bool   `json:"-"` // Propagated from SkillReference for collision log level
 }
 
 // DestName returns the directory name to use when installing this skill.
@@ -98,6 +100,21 @@ type ResolvedFile struct {
 	URL  string
 	Hash string
 	Size int64
+	// Content holds the pre-fetched file bytes when available (e.g. from the
+	// GitHub resolver, which downloads each file during resolution for hashing).
+	// If non-nil, installOneSkill writes this directly and skips the network
+	// re-download, preventing unauthenticated requests that would 404 on
+	// private repos.
+	//
+	// The json:"-" tag intentionally excludes Content from the on-disk
+	// GitHubResolutionCache. Entries loaded from disk (e.g. after a broker
+	// restart within the TTL window) will have Content == nil and fall back
+	// to downloadSkillFile, which makes an unauthenticated request. For private
+	// repos this means the restart-within-TTL path has the same limitation as
+	// before this fix. A follow-up is needed to address that narrower window
+	// (e.g. by not caching private-repo entries to disk, or by re-fetching
+	// content when the disk-cache entry is used for install).
+	Content []byte `json:"-"`
 }
 
 // --- Context injection ---
@@ -155,6 +172,29 @@ func ResolveUserIDFromContext(ctx context.Context) string {
 	return v
 }
 
+type gitHubTokenKey struct{}
+
+// ContextWithGitHubToken returns a context carrying a GitHub token for the
+// install phase.
+//
+// When the Hub resolves a gh:// skill it returns raw.githubusercontent.com
+// URLs but, deliberately, not the credential behind them — a Hub-minted App
+// token must not travel in an API response body or be persisted to the
+// broker's on-disk resolution cache. The broker therefore supplies its own
+// GITHUB_TOKEN here, which downloadSkillFile presents when fetching from
+// GitHub. Public repos need no token; private repos require one that can read
+// the repo in question.
+func ContextWithGitHubToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, gitHubTokenKey{}, token)
+}
+
+// GitHubTokenFromContext retrieves the GitHub token for the install phase,
+// or "" if none was set.
+func GitHubTokenFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(gitHubTokenKey{}).(string)
+	return v
+}
+
 // --- Resolution record types ---
 
 // SkillResolutionRecord is written to agentHome/.scion/resolved-skills.json
@@ -163,6 +203,7 @@ type SkillResolutionRecord struct {
 	ResolvedAt string                 `json:"resolvedAt"`
 	Resolver   string                 `json:"resolver"`
 	Skills     []SkillResolutionEntry `json:"skills"`
+	Collisions []SkillCollisionEntry  `json:"collisions,omitempty"`
 }
 
 // SkillResolutionEntry records a single installed skill.
@@ -187,6 +228,131 @@ type FileEntry struct {
 	Hash string `json:"hash"`
 }
 
+// --- Destination-name collision resolution ---
+
+// scopeRank defines the precedence order for skill scopes when resolving
+// destination-name collisions. Higher rank wins.
+//
+// Precedence (highest to lowest): project > template > user > hub > platform > (unset)
+//
+// Rationale: project-level settings take precedence for destination-name
+// collisions, as approved in #654. Note: hub-side base-URI dedup
+// (mergeSkillRefs) uses the opposite order (template > project); the two
+// dedup passes operate on different dimensions (base URI vs dest name).
+var scopeRank = map[string]int{
+	"":         0,
+	"platform": 1,
+	"hub":      2,
+	"user":     3,
+	"template": 4,
+	"project":  5,
+}
+
+// SkillCollisionEntry records a single destination-name collision that was
+// resolved during skill installation. Persisted in resolved-skills.json.
+type SkillCollisionEntry struct {
+	DestName     string `json:"destName"`
+	WinnerURI    string `json:"winnerUri"`
+	WinnerScope  string `json:"winnerScope"`
+	DroppedURI   string `json:"droppedUri"`
+	DroppedScope string `json:"droppedScope"`
+}
+
+// deduplicateByDestName resolves destination-name collisions among resolved
+// skills using scope-based precedence. When two skills produce the same
+// DestName(), the skill with the higher scope rank wins. On equal scope,
+// the later entry wins (last-writer-wins, consistent with mergeSkillRefs).
+//
+// Returns the deduplicated list (preserving winner order of first appearance)
+// and a slice of collision entries for diagnostics.
+func deduplicateByDestName(ctx context.Context, skills []ResolvedSkill) ([]ResolvedSkill, []SkillCollisionEntry) {
+	type candidate struct {
+		index int
+		skill ResolvedSkill
+		dest  string
+	}
+
+	winners := map[string]*candidate{} // destName → winning candidate
+	var collisions []SkillCollisionEntry
+	var passthrough []ResolvedSkill // skills with DestName errors; cannot participate in dedup
+
+	for i, skill := range skills {
+		dest, err := skill.DestName()
+		if err != nil {
+			// Cannot participate in dedup; pass through so the install loop
+			// surfaces the DestName error with a clear diagnostic.
+			passthrough = append(passthrough, skill)
+			continue
+		}
+
+		existing, exists := winners[dest]
+		if !exists {
+			winners[dest] = &candidate{index: i, skill: skill, dest: dest}
+			continue
+		}
+
+		// Resolve collision: higher scope wins; on tie, later entry wins.
+		newRank := scopeRank[skill.Scope]
+		existingRank := scopeRank[existing.skill.Scope]
+
+		var winner, loser ResolvedSkill
+		if newRank >= existingRank {
+			winner = skill
+			loser = existing.skill
+			winners[dest] = &candidate{index: i, skill: skill, dest: dest}
+		} else {
+			winner = existing.skill
+			loser = skill
+		}
+
+		collisions = append(collisions, SkillCollisionEntry{
+			DestName:     dest,
+			WinnerURI:    winner.URI,
+			WinnerScope:  winner.Scope,
+			DroppedURI:   loser.URI,
+			DroppedScope: loser.Scope,
+		})
+
+		// Log at appropriate level: Debug for optional losers, Warn otherwise.
+		if loser.Optional {
+			slog.DebugContext(ctx, "skill destination-name collision resolved (optional skill dropped)",
+				"dest_name", dest,
+				"winner_uri", winner.URI,
+				"winner_scope", winner.Scope,
+				"dropped_uri", loser.URI,
+				"dropped_scope", loser.Scope,
+			)
+		} else {
+			slog.WarnContext(ctx, "skill destination-name collision resolved",
+				"dest_name", dest,
+				"winner_uri", winner.URI,
+				"winner_scope", winner.Scope,
+				"dropped_uri", loser.URI,
+				"dropped_scope", loser.Scope,
+			)
+		}
+	}
+
+	// Build deduplicated list preserving original order of winners.
+	// Collect and sort by first-appearance index so the output is deterministic.
+	sorted := make([]*candidate, 0, len(winners))
+	for _, c := range winners {
+		sorted = append(sorted, c)
+	}
+	slices.SortFunc(sorted, func(a, b *candidate) int {
+		return a.index - b.index
+	})
+	deduplicated := make([]ResolvedSkill, 0, len(sorted)+len(passthrough))
+	for _, c := range sorted {
+		deduplicated = append(deduplicated, c.skill)
+	}
+	// Append skills with DestName errors so installResolvedSkills surfaces
+	// the error rather than silently dropping the skill.
+	deduplicated = append(deduplicated, passthrough...)
+
+	return deduplicated, collisions
+}
+
 // --- Download, stage, verify, install ---
 
 // installResolvedSkills downloads, verifies, and installs resolved skills
@@ -197,20 +363,10 @@ func installResolvedSkills(
 	skillsDest string,
 	agentHome string,
 ) (*SkillResolutionRecord, error) {
-	// S6: Detect duplicate destinations
-	destMap := make(map[string]string) // destName → URI
-	for _, skill := range skills {
-		dest, err := skill.DestName()
-		if err != nil {
-			return nil, err
-		}
-		if existing, ok := destMap[dest]; ok {
-			return nil, fmt.Errorf(
-				"skill resolution conflict: two skills resolve to the same destination directory %q:\n  - %s\n  - %s",
-				dest, existing, skill.URI)
-		}
-		destMap[dest] = skill.URI
-	}
+	// S6: Resolve destination-name collisions via scope-based precedence.
+	// Previously this was a hard error; now collisions are resolved by dropping
+	// the lower-scope skill and logging a warning.
+	skills, collisions := deduplicateByDestName(ctx, skills)
 
 	if err := os.MkdirAll(skillsDest, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create skills directory: %w", err)
@@ -219,10 +375,14 @@ func installResolvedSkills(
 	record := &SkillResolutionRecord{
 		ResolvedAt: time.Now().UTC().Format(time.RFC3339),
 		Resolver:   "mock",
+		Collisions: collisions,
 	}
 
 	for _, skill := range skills {
-		dest, _ := skill.DestName() // already validated above
+		dest, err := skill.DestName()
+		if err != nil {
+			return nil, fmt.Errorf("skill %q has invalid destination name: %w", skill.URI, err)
+		}
 
 		entry, err := installOneSkill(ctx, skill, dest, skillsDest)
 		if err != nil {
@@ -260,10 +420,20 @@ func installOneSkill(ctx context.Context, skill ResolvedSkill, dest, skillsDest 
 					_ = os.RemoveAll(finalDest)
 				} else {
 					util.Debugf("provision: skill installed from cache: %s@%s", skill.Name, skill.Version)
+					slog.InfoContext(ctx, "skill_content_cache: cache hit",
+						"skill", skill.Name, "version", skill.Version,
+						"hash", truncHash(skill.Hash), "cache_hit", true)
 					return buildSkillEntry(skill, dest, skillsDest)
 				}
 			}
-			// Cache copy failed — fall through to download
+			// Cache entry unusable (copy or hash verification failed) — re-downloading.
+			slog.InfoContext(ctx, "skill_content_cache: cache error, re-downloading",
+				"skill", skill.Name, "version", skill.Version,
+				"hash", truncHash(skill.Hash), "cache_hit", false)
+		} else {
+			slog.InfoContext(ctx, "skill_content_cache: cache miss, will download",
+				"skill", skill.Name, "version", skill.Version,
+				"hash", truncHash(skill.Hash), "cache_hit", false)
 		}
 	}
 
@@ -282,6 +452,11 @@ func installOneSkill(ctx context.Context, skill ResolvedSkill, dest, skillsDest 
 		return nil, fmt.Errorf("failed to create skill staging dir: %w", err)
 	}
 
+	// Credential for raw.githubusercontent.com downloads of gh:// skills that
+	// the Hub resolved on our behalf. Empty for public repos and for skills
+	// that carry pre-fetched content.
+	ghToken := GitHubTokenFromContext(ctx)
+
 	var fileEntries []FileEntry
 
 	for _, f := range skill.Files {
@@ -299,17 +474,31 @@ func installOneSkill(ctx context.Context, skill ResolvedSkill, dest, skillsDest 
 			}
 		}
 
-		// S5: Download with transport constraints
-		if err := downloadSkillFile(ctx, f.URL, destPath, defaultMaxFileSize); err != nil {
+		// S5: Write pre-fetched content or download with transport constraints.
+		// GitHubSkillResolver carries content bytes from the authenticated
+		// resolution-phase download; using them here avoids a second,
+		// unauthenticated raw.githubusercontent.com request that would 404 on
+		// private repos.
+		//
+		// Note: entries loaded from the on-disk resolution cache have
+		// Content == nil (json:"-" strips it), so they fall through to
+		// downloadSkillFile. This means the post-restart, within-TTL path
+		// retains the pre-fix limitation for private repos. See the Content
+		// field doc on ResolvedFile for details.
+		if f.Content != nil {
+			if err := writeSkillFileContent(f.Content, destPath); err != nil {
+				return nil, fmt.Errorf("failed to write %s: %w", f.Path, err)
+			}
+		} else if err := downloadSkillFile(ctx, f.URL, destPath, defaultMaxFileSize, ghToken); err != nil {
 			return nil, fmt.Errorf("failed to download %s: %w", f.Path, err)
 		}
 
-		// S2: Verify per-file hash
-		actualHash, err := transfer.HashFile(destPath)
+		// S2: Verify per-file hash, in whichever format the resolver supplied.
+		actualHash, err := hashFileAs(destPath, f.Hash)
 		if err != nil {
 			return nil, fmt.Errorf("failed to hash %s: %w", f.Path, err)
 		}
-		if actualHash != f.Hash {
+		if f.Hash != "" && actualHash != f.Hash {
 			return nil, fmt.Errorf(
 				"hash mismatch for file %q in skill %q: expected %s, got %s",
 				f.Path, skill.URI, f.Hash, actualHash)
@@ -359,10 +548,13 @@ func installOneSkill(ctx context.Context, skill ResolvedSkill, dest, skillsDest 
 
 // buildSkillEntry creates a SkillResolutionEntry for a successfully installed skill.
 func buildSkillEntry(skill ResolvedSkill, dest, skillsDest string) (*SkillResolutionEntry, error) {
-	var scope string
-	parsed, err := api.ParseSkillURI(skill.URI)
-	if err == nil {
-		scope = parsed.Scope
+	scope := skill.Scope
+	if scope == "" {
+		// Fall back to URI-derived scope when the injection scope is not set.
+		parsed, err := api.ParseSkillURI(skill.URI)
+		if err == nil {
+			scope = parsed.Scope
+		}
 	}
 
 	var fileEntries []FileEntry
@@ -416,12 +608,44 @@ func verifyInstalledSkillHash(dir string, skill ResolvedSkill) error {
 		if err != nil {
 			return fmt.Errorf("missing file %s: %w", f.Path, err)
 		}
-		computed := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		if f.Hash == "" {
+			continue
+		}
+		computed := hashBytesAs(data, f.Hash)
 		if computed != f.Hash {
 			return fmt.Errorf("hash mismatch for %s: expected %s, got %s", f.Path, f.Hash, computed)
 		}
 	}
 	return nil
+}
+
+// hashFileAs hashes the file at path using the same algorithm as the expected
+// hash, so the two are directly comparable.
+//
+// Two formats reach the install phase:
+//
+//   - "sha256:<hex64>" — produced by the Hub's registry storage and by the
+//     local GitHubSkillResolver, which downloads content during resolution.
+//   - a bare git blob object ID (40 hex chars) — produced by the Hub's gh://
+//     resolution cache, which copies the "sha" field straight out of GitHub's
+//     Contents API and so never sees the file bytes.
+//
+// An empty expected hash means the resolver published no per-file digest; the
+// file is still hashed as sha256 so the resolution record has a usable value,
+// and the caller skips comparison.
+func hashFileAs(path, expected string) (string, error) {
+	if transfer.IsGitBlobHash(expected) {
+		return transfer.GitBlobHashFile(path)
+	}
+	return transfer.HashFile(path)
+}
+
+// hashBytesAs is the in-memory counterpart to hashFileAs.
+func hashBytesAs(data []byte, expected string) string {
+	if transfer.IsGitBlobHash(expected) {
+		return transfer.GitBlobHashBytes(data)
+	}
+	return transfer.HashBytes(data)
 }
 
 // validateFilePath checks that a relative path is safe for extraction.
@@ -473,8 +697,22 @@ func validateFilePath(path string) error {
 	return nil
 }
 
+// isGitHubHost reports whether host belongs to GitHub, and is therefore a
+// permitted recipient of a GitHub token.
+func isGitHubHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "github.com" ||
+		strings.HasSuffix(host, ".github.com") ||
+		strings.HasSuffix(host, ".githubusercontent.com")
+}
+
 // downloadSkillFile downloads a single file from a URL to a local path.
-func downloadSkillFile(ctx context.Context, fileURL, destPath string, maxSize int64) error {
+//
+// ghToken, when non-empty, is sent as a bearer credential — but only to
+// GitHub hosts. Registry skills are served from signed object-store URLs that
+// have no business seeing a GitHub token, so the host check is what keeps the
+// credential from leaking to an unrelated origin named in a Hub response.
+func downloadSkillFile(ctx context.Context, fileURL, destPath string, maxSize int64, ghToken string) error {
 	parsed, err := url.Parse(fileURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -507,6 +745,9 @@ func downloadSkillFile(ctx context.Context, fileURL, destPath string, maxSize in
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
+	}
+	if ghToken != "" && isGitHubHost(parsed.Hostname()) {
+		req.Header.Set("Authorization", "Bearer "+ghToken)
 	}
 
 	resp, err := client.Do(req)
@@ -541,6 +782,35 @@ func downloadSkillFile(ctx context.Context, fileURL, destPath string, maxSize in
 	// S5: Do not log the URL (may contain signed tokens)
 	util.Debugf("provision: downloaded skill file %s (%d bytes)", filepath.Base(destPath), n)
 
+	return nil
+}
+
+// writeSkillFileContent writes pre-fetched content bytes directly to destPath,
+// bypassing the network download. This is used when the resolver already holds
+// the file bytes in memory (e.g. GitHubSkillResolver downloads each file during
+// resolution for hashing) so that no second unauthenticated request is needed.
+//
+// Callers are responsible for pre-bounding content to a safe size. The GitHub
+// resolver enforces githubMaxFileSize (10 MB) before populating ResolvedFile.Content;
+// the check here is a defensive backstop for any future resolver that sets Content.
+func writeSkillFileContent(content []byte, destPath string) error {
+	if int64(len(content)) > defaultMaxFileSize {
+		return fmt.Errorf("pre-fetched content exceeds maximum size of %d bytes", defaultMaxFileSize)
+	}
+	f, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer func() { _ = f.Close() }() // safety net for panics / early returns
+	if _, err := f.Write(content); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+	// Explicit close to catch flush errors (e.g. disk full). The deferred
+	// close above is a no-op after an explicit close, so it is safe to leave.
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close file: %w", err)
+	}
+	util.Debugf("provision: wrote pre-fetched skill file %s (%d bytes)", filepath.Base(destPath), len(content))
 	return nil
 }
 

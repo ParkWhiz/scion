@@ -31,6 +31,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
@@ -78,6 +80,9 @@ type ServerConfig struct {
 
 	// Debug enables verbose debug logging.
 	Debug bool
+	// SlowRequestThreshold is the duration after which an HTTP request is
+	// logged as slow. Zero uses logging.DefaultSlowRequestThreshold.
+	SlowRequestThreshold time.Duration
 
 	// Hub integration settings
 	// HubEnabled indicates whether this Runtime Broker should connect to a Hub
@@ -203,6 +208,10 @@ type Server struct {
 	// Shared skill cache (content-addressed). Independent from templates and
 	// harness-configs so skill eviction doesn't affect other resource kinds.
 	skCache *templatecache.Cache
+
+	// Shared GitHub resolution cache (singleton per broker instance).
+	// Caches GitHub API resolution results to avoid redundant API calls.
+	ghResolutionCache *agent.GitHubResolutionCache
 
 	// Multi-key auth middleware
 	brokerAuthMiddleware *MultiKeyBrokerAuthMiddleware
@@ -345,13 +354,30 @@ func (s *Server) RuntimeName() string {
 // SwapRuntime replaces the broker's container runtime and agent manager.
 // This is called when the co-located hub detects a runtime configuration
 // change (e.g. during onboarding) so the broker picks up the new engine
-// without requiring a full server restart.
+// without requiring a full server restart. Running heartbeat services are
+// updated to use the new manager so they don't continue shelling out to
+// the old (possibly missing) runtime binary.
 func (s *Server) SwapRuntime(rt scionrt.Runtime) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	old := s.runtime.Name()
 	s.runtime = rt
-	s.manager = agent.NewManager(rt)
+	newMgr := agent.NewManager(rt)
+	s.manager = newMgr
+	s.mu.Unlock()
+
+	// Propagate the new manager to all running heartbeat services so they
+	// use the detected runtime binary instead of the stale one.
+	s.hubMu.RLock()
+	for _, conn := range s.hubConnections {
+		conn.mu.RLock()
+		hb := conn.Heartbeat
+		conn.mu.RUnlock()
+		if hb != nil {
+			hb.SwapManager(newMgr)
+		}
+	}
+	s.hubMu.RUnlock()
+
 	slog.Info("Runtime broker swapped container runtime",
 		"old", old,
 		"new", rt.Name(),
@@ -400,6 +426,22 @@ func (s *Server) initHubIntegration() error {
 		return fmt.Errorf("failed to initialize skill cache: %w", err)
 	}
 	s.skCache = skCache
+
+	// 1d. Initialize the GitHub resolution cache for broker-side caching of
+	// GitHub skill resolution metadata (not file content).
+	ghResDir, err := agent.GitHubResolutionCacheDir()
+	if err != nil {
+		slog.Warn("github resolution cache: cannot determine cache dir", "error", err)
+	} else {
+		ghCache, err := agent.NewGitHubResolutionCache(ghResDir, agent.DefaultResolutionCacheTTL)
+		if err != nil {
+			slog.Warn("github resolution cache: init failed (running uncached)", "error", err)
+			// nil cache is safe — resolver falls through to API call
+		} else {
+			s.ghResolutionCache = ghCache
+			slog.Info("GitHub resolution cache initialized", "dir", ghResDir, "ttl", agent.DefaultResolutionCacheTTL)
+		}
+	}
 
 	// 2. Initialize hub connections map (already done in New)
 
@@ -1282,10 +1324,15 @@ func agentsForProject(agents []api.AgentInfo, projectID string) []api.AgentInfo 
 }
 
 // RuntimeCommand implements AgentLookup interface.
-// It returns the container runtime command (e.g., "docker", "container").
+// It returns the container runtime command (e.g., "docker", "podman", "container").
+// The result reflects the currently detected runtime, which may change at any
+// time via SwapRuntime, so callers should not cache the return value.
 func (s *Server) RuntimeCommand() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.runtime == nil {
-		return "docker" // Default fallback
+		slog.Warn("RuntimeCommand called before runtime detection completed, falling back to docker")
+		return "docker"
 	}
 	return s.runtime.Name()
 }
@@ -1619,7 +1666,7 @@ func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	// Apply middleware in reverse order (last applied runs first)
 	h = s.recoveryMiddleware(h)
 	if s.requestLogger != nil {
-		h = logging.RequestLogMiddleware(s.requestLogger, "broker", logging.BrokerPathPatterns())(h)
+		h = logging.RequestLogMiddleware(s.requestLogger, "broker", logging.BrokerPathPatterns(), s.config.SlowRequestThreshold)(h)
 	} else {
 		h = s.loggingMiddleware(h)
 	}
@@ -1630,6 +1677,10 @@ func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	if s.brokerAuthMiddleware != nil {
 		h = s.brokerAuthMiddleware.Middleware(h)
 	}
+
+	// OTel HTTP tracing (outermost - wraps all middleware for full request lifecycle)
+	h = otelhttp.NewHandler(h, "broker")
+
 	return h
 }
 

@@ -144,8 +144,11 @@ const ROUTES: RouteConfig[] = [
   { pattern: /^\/admin\/users$/, tag: 'scion-page-admin-users', load: () => import('../components/pages/admin-users.js') },
   { pattern: /^\/admin\/groups$/, tag: 'scion-page-admin-groups', load: () => import('../components/pages/admin-groups.js') },
   { pattern: /^\/admin\/groups\/[^/]+$/, tag: 'scion-page-admin-group-detail', load: () => import('../components/pages/admin-group-detail.js') },
+  { pattern: /^\/health$/, tag: 'scion-page-health-dashboard', load: () => import('../components/pages/health-dashboard.js') },
+  { pattern: /^\/admin\/health$/, tag: 'scion-page-health-dashboard', load: () => import('../components/pages/health-dashboard.js') },
   { pattern: /^\/metrics$/, tag: 'scion-page-metrics', load: () => import('../components/pages/metrics-dashboard.js') },
   { pattern: /^\/admin\/metrics$/, tag: 'scion-page-metrics', load: () => import('../components/pages/metrics-dashboard.js') },
+  { pattern: /^\/admin\/diagnostics$/, tag: 'scion-page-diagnostics', load: () => import('../components/pages/diagnostics.js') },
   { pattern: /^\/admin\/maintenance$/, tag: 'scion-page-admin-maintenance', load: () => import('../components/pages/admin-maintenance.js') },
   { pattern: /^\/admin\/integrations$/, tag: 'scion-page-admin-integrations', load: () => import('../components/pages/admin-integrations.js') },
   { pattern: /^\/admin\/integrations\/[^/]+$/, tag: 'scion-page-admin-integrations', load: () => import('../components/pages/admin-integrations.js') },
@@ -159,6 +162,7 @@ const ROUTES: RouteConfig[] = [
   { pattern: /^\/profile\/tokens$/, tag: 'scion-page-profile-tokens', load: () => import('../components/pages/profile-tokens.js') },
   { pattern: /^\/profile\/telegram$/, tag: 'scion-page-profile-telegram', load: () => import('../components/pages/profile-telegram.js') },
   { pattern: /^\/profile\/discord$/, tag: 'scion-page-profile-discord', load: () => import('../components/pages/profile-discord.js') },
+  { pattern: /^\/profile\/skills$/, tag: 'scion-page-profile-skills', load: () => import('../components/pages/profile-skills.js') },
   { pattern: /^\/profile$/, tag: 'scion-page-profile-env-vars', load: () => import('../components/pages/profile-env-vars.js') },
   { pattern: /^\/github-app\/installed$/, tag: 'scion-page-github-app-setup', load: () => import('../components/pages/github-app-setup.js') },
   { pattern: /^\/projects\/new$/, tag: 'scion-page-project-create', load: () => import('../components/pages/project-create.js') },
@@ -169,6 +173,7 @@ const ROUTES: RouteConfig[] = [
   { pattern: /^\/projects\/[^/]+\/metrics$/, tag: 'scion-page-metrics', load: () => import('../components/pages/metrics-dashboard.js') },
   { pattern: /^\/projects\/[^/]+$/, tag: 'scion-page-project-detail', load: () => import('../components/pages/project-detail.js') },
   { pattern: /^\/agents\/new$/, tag: 'scion-page-agent-create', load: () => import('../components/pages/agent-create.js') },
+  { pattern: /^\/agents\/graph$/, tag: 'scion-page-agent-graph', load: () => import('../components/pages/agent-graph.js') },
   { pattern: /^\/agents\/[^/]+\/configure$/, tag: 'scion-page-agent-configure', load: () => import('../components/pages/agent-configure.js') },
   { pattern: /^\/agents\/[^/]+\/terminal$/, tag: 'scion-page-terminal', load: () => import('../components/pages/terminal.js') },
   { pattern: /^\/agents\/[^/]+$/, tag: 'scion-page-agent-detail', load: () => import('../components/pages/agent-detail.js') },
@@ -182,12 +187,12 @@ const STANDALONE_ROUTES = new Set(['scion-login-page', 'scion-page-invite', 'sci
 /**
  * Routes that render inside the profile shell instead of the main app shell
  */
-const PROFILE_ROUTES = new Set(['scion-page-profile-env-vars', 'scion-page-profile-secrets', 'scion-page-profile-settings', 'scion-page-profile-tokens', 'scion-page-profile-telegram', 'scion-page-profile-discord']);
+const PROFILE_ROUTES = new Set(['scion-page-profile-env-vars', 'scion-page-profile-secrets', 'scion-page-profile-settings', 'scion-page-profile-tokens', 'scion-page-profile-telegram', 'scion-page-profile-discord', 'scion-page-profile-skills']);
 
 /**
  * Routes that require admin role. Non-admin users are redirected to dashboard.
  */
-const ADMIN_ROUTES = new Set(['scion-page-settings', 'scion-page-admin-scheduler', 'scion-page-admin-maintenance', 'scion-page-admin-users', 'scion-page-admin-groups', 'scion-page-admin-group-detail', 'scion-page-admin-server-config', 'scion-page-admin-integrations', 'scion-page-admin-skill-registries', 'scion-page-admin-skill-registry-detail']);
+const ADMIN_ROUTES = new Set(['scion-page-settings', 'scion-page-admin-scheduler', 'scion-page-admin-maintenance', 'scion-page-admin-users', 'scion-page-admin-groups', 'scion-page-admin-group-detail', 'scion-page-admin-server-config', 'scion-page-admin-integrations', 'scion-page-admin-skill-registries', 'scion-page-admin-skill-registry-detail', 'scion-page-diagnostics', 'scion-page-health-dashboard']);
 
 /**
  * Initialize the client-side application

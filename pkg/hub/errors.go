@@ -60,6 +60,9 @@ const (
 	ErrCodeMissingEnvVars = "missing_env_vars"
 	ErrCodeCloneFailed    = "clone_failed"
 	ErrCodePullFailed     = "pull_failed"
+	// ErrCodeDiscoverFailed reports a remote-directory probe that could not be
+	// fetched or yielded nothing usable (see handleSkillsDiscoverDirectory).
+	ErrCodeDiscoverFailed = "discover_failed"
 
 	// Delivery error codes
 	ErrCodeAgentNotFound   = "agent_not_found"
@@ -106,7 +109,13 @@ func writeErrorFromErr(w http.ResponseWriter, err error, requestID string) {
 	var statusCode int
 	var code, message string
 
+	var permErr *secret.PermissionError
+
 	switch {
+	case errors.As(err, &permErr):
+		statusCode = http.StatusForbidden
+		code = ErrCodeForbidden
+		message = permErr.Error()
 	case errors.Is(err, store.ErrNotFound):
 		statusCode = http.StatusNotFound
 		code = ErrCodeNotFound

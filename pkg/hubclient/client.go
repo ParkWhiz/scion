@@ -18,6 +18,7 @@ package hubclient
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -99,6 +100,22 @@ type Client interface {
 
 	// Invites returns the invite code management operations interface.
 	Invites() InviteService
+
+	// ProjectInjectedSkills returns an InjectedSkillsService scoped to a project.
+	ProjectInjectedSkills(projectID string) InjectedSkillsService
+
+	// UserInjectedSkills returns an InjectedSkillsService scoped to the current user.
+	UserInjectedSkills() InjectedSkillsService
+
+	// ProjectPreStartHooks returns a ProjectPreStartHookService scoped to a project.
+	ProjectPreStartHooks(projectID string) ProjectPreStartHookService
+
+	// HubPreStartHooks returns the hub-scoped pre-start hook service.
+	HubPreStartHooks() HubPreStartHookService
+
+	// DiscoverSkillsDirectory calls POST /api/v1/skills/discover-directory and returns
+	// the list of skills found at the given GitHub directory URL.
+	DiscoverSkillsDirectory(ctx context.Context, req DiscoverSkillsDirectoryRequest) (*DiscoverSkillsDirectoryResponse, error)
 
 	// Health checks API availability.
 	Health(ctx context.Context) (*HealthResponse, error)
@@ -308,11 +325,14 @@ func (c *client) get(ctx context.Context, path string, headers http.Header) (*ht
 func (c *client) getWithQuery(ctx context.Context, path string, query url.Values, headers http.Header) (*http.Response, error) {
 	resp, err := c.transport.GetWithQuery(ctx, path, query, headers)
 	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-		_ = resp.Body.Close()
-		resp, err = c.transport.GetWithQuery(ctx, legacyPath, query, headers)
-		c.checkForDeprecation(resp)
-		return resp, err
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(ct, "application/json") {
+			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
+			_ = resp.Body.Close()
+			resp, err = c.transport.GetWithQuery(ctx, legacyPath, query, headers)
+			c.checkForDeprecation(resp)
+			return resp, err
+		}
 	}
 	return resp, err
 }
@@ -321,11 +341,14 @@ func (c *client) getWithQuery(ctx context.Context, path string, query url.Values
 func (c *client) post(ctx context.Context, path string, body interface{}, headers http.Header) (*http.Response, error) {
 	resp, err := c.transport.Post(ctx, path, body, headers)
 	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-		_ = resp.Body.Close()
-		resp, err = c.transport.Post(ctx, legacyPath, body, headers)
-		c.checkForDeprecation(resp)
-		return resp, err
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(ct, "application/json") {
+			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
+			_ = resp.Body.Close()
+			resp, err = c.transport.Post(ctx, legacyPath, body, headers)
+			c.checkForDeprecation(resp)
+			return resp, err
+		}
 	}
 	return resp, err
 }
@@ -334,11 +357,14 @@ func (c *client) post(ctx context.Context, path string, body interface{}, header
 func (c *client) put(ctx context.Context, path string, body interface{}, headers http.Header) (*http.Response, error) {
 	resp, err := c.transport.Put(ctx, path, body, headers)
 	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-		_ = resp.Body.Close()
-		resp, err = c.transport.Put(ctx, legacyPath, body, headers)
-		c.checkForDeprecation(resp)
-		return resp, err
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(ct, "application/json") {
+			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
+			_ = resp.Body.Close()
+			resp, err = c.transport.Put(ctx, legacyPath, body, headers)
+			c.checkForDeprecation(resp)
+			return resp, err
+		}
 	}
 	return resp, err
 }
@@ -347,11 +373,14 @@ func (c *client) put(ctx context.Context, path string, body interface{}, headers
 func (c *client) patch(ctx context.Context, path string, body interface{}, headers http.Header) (*http.Response, error) {
 	resp, err := c.transport.Patch(ctx, path, body, headers)
 	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-		_ = resp.Body.Close()
-		resp, err = c.transport.Patch(ctx, legacyPath, body, headers)
-		c.checkForDeprecation(resp)
-		return resp, err
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(ct, "application/json") {
+			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
+			_ = resp.Body.Close()
+			resp, err = c.transport.Patch(ctx, legacyPath, body, headers)
+			c.checkForDeprecation(resp)
+			return resp, err
+		}
 	}
 	return resp, err
 }
@@ -360,11 +389,14 @@ func (c *client) patch(ctx context.Context, path string, body interface{}, heade
 func (c *client) delete(ctx context.Context, path string, headers http.Header) (*http.Response, error) {
 	resp, err := c.transport.Delete(ctx, path, headers)
 	if err == nil && resp.StatusCode == http.StatusNotFound && strings.Contains(path, "/projects") {
-		legacyPath := strings.Replace(path, "/projects", "/groves", 1)
-		_ = resp.Body.Close()
-		resp, err = c.transport.Delete(ctx, legacyPath, headers)
-		c.checkForDeprecation(resp)
-		return resp, err
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(ct, "application/json") {
+			legacyPath := strings.Replace(path, "/projects", "/groves", 1)
+			_ = resp.Body.Close()
+			resp, err = c.transport.Delete(ctx, legacyPath, headers)
+			c.checkForDeprecation(resp)
+			return resp, err
+		}
 	}
 	return resp, err
 }
@@ -380,13 +412,48 @@ func (c *client) checkForDeprecation(resp *http.Response) {
 	}
 }
 
+// isProxyIntercepted reports whether a 2xx response looks like a proxy
+// intercept (non-JSON content type). GFE on Cloud Run returns "text/plain".
+func isProxyIntercepted(resp *http.Response) bool {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	ct := resp.Header.Get("Content-Type")
+	// If Content-Type is absent, pass through to DecodeResponse (which will
+	// succeed if the body is valid JSON, or fail with its own error).
+	// Compare case-insensitively per RFC 9110 §8.3.1.
+	return ct != "" && !strings.HasPrefix(strings.ToLower(ct), "application/json")
+}
+
+// HintProxyError returns err unchanged in most cases. If the error message
+// matches the pattern produced by apiclient.DecodeResponse when a proxy
+// intercepts a health endpoint and returns a non-JSON body, it appends a
+// diagnostic hint suggesting a Cloud Run / GFE configuration issue.
+//
+// Note: the trigger ("failed to decode response") fires for any JSON decode
+// failure, including a genuinely malformed response from the hub server
+// itself. In that (rare) scenario the proxy hint is a false positive. The
+// design accepted this trade-off: real servers set application/json and
+// decode correctly; a second decode failure after the Content-Type fallback
+// strongly suggests the proxy intercepted /health as well as /healthz.
+func HintProxyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "failed to decode response") {
+		return fmt.Errorf("%w\nHint: a reverse proxy may be intercepting "+
+			"/healthz and /health — check your Cloud Run or GFE configuration", err)
+	}
+	return err
+}
+
 // Health checks API availability.
 func (c *client) Health(ctx context.Context) (*HealthResponse, error) {
 	resp, err := c.get(ctx, "/healthz", nil)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode == 404 {
+	if resp.StatusCode == 404 || isProxyIntercepted(resp) {
 		_ = resp.Body.Close()
 		resp, err = c.get(ctx, "/health", nil)
 		if err != nil {

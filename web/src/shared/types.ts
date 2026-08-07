@@ -43,10 +43,12 @@ export interface AdminUser {
   displayName: string;
   avatarUrl?: string;
   role: UserRole;
-  status: 'active' | 'suspended';
+  status: 'active' | 'suspended' | 'invited';
   created: string;
   lastLogin?: string;
   lastSeen?: string;
+  invitedBy?: string;
+  inviteNote?: string;
   _capabilities?: Capabilities;
 }
 
@@ -177,7 +179,21 @@ export function isSharedWorkspace(project: Project): boolean {
  * Check whether a project uses worktree-per-agent workspace mode.
  */
 export function isWorktreeWorkspace(project: Project): boolean {
-  return !!project.gitRemote && project.labels?.['scion.dev/workspace-mode'] === 'worktree-per-agent';
+  return (
+    !!project.gitRemote && project.labels?.['scion.dev/workspace-mode'] === 'worktree-per-agent'
+  );
+}
+
+/**
+ * Exposed port registered by an agent for port forwarding.
+ */
+export interface ExposedPort {
+  port: number;
+  label?: string;
+  host?: string;
+  mode?: string;
+  exposedAt: string;
+  exposedBy: string;
 }
 
 /**
@@ -403,6 +419,7 @@ export interface Agent {
   taskSummary?: string;
   message?: string;
   lastSeen?: string;
+  lastActivityEvent?: string;
   // Backend sends "created"/"updated"; legacy frontend code uses "createdAt"/"updatedAt".
   // Accept both so existing pages and new API responses both work.
   created?: string;
@@ -429,6 +446,10 @@ export interface Agent {
   createdBy?: string;
   appliedConfig?: AgentAppliedConfig;
 
+  // Ordered ancestor chain [root, ..., parent]; last entry is the direct
+  // parent (user or spawning agent). Drives the lineage graph view.
+  ancestry?: string[];
+
   // Status tab fields (limits tracking)
   currentTurns?: number;
   currentModelCalls?: number;
@@ -437,6 +458,9 @@ export interface Agent {
 
   // Cloud Logging capability (from hub)
   cloudLogging?: boolean;
+
+  // Port forwarding
+  exposedPorts?: ExposedPort[];
 }
 
 /**
@@ -899,4 +923,113 @@ export interface Policy {
   created: string;
   updated: string;
   createdBy?: string;
+}
+
+/**
+ * Minimal pre-start hook fields used by the inherited-hub indicator.
+ */
+export interface PreStartHookSummary {
+  id: string;
+  name: string;
+  slug: string;
+  scope: 'project' | 'hub';
+  status: string;
+}
+
+/**
+ * Pre-start hook from the Hub API (project- or hub-scoped).
+ * Mirrors the Go `store.ProjectPreStartHook` struct.
+ */
+export interface PreStartHook extends PreStartHookSummary {
+  /** Empty for hub-scoped hooks. */
+  projectId?: string;
+  description?: string;
+  /** Raw script content. Bounded to 64 KB by the Hub API. */
+  script: string;
+  createdBy?: string;
+  updatedBy?: string;
+  created: string;
+  updated: string;
+}
+
+// =============================================================================
+// Session Metrics (DB-backed, from M3/M4 milestone)
+// =============================================================================
+
+/**
+ * A single agent session metrics record.
+ * Mirrors the Go `store.AgentSessionMetrics` struct.
+ */
+export interface AgentSessionMetrics {
+  id: string;
+  agentId: string;
+  projectId: string;
+  sessionId: string;
+  startedAt: string;
+  endedAt?: string;
+  status?: string;
+  turnCount?: number;
+  model?: string;
+  tokensInput?: number;
+  tokensOutput?: number;
+  tokensCached?: number;
+  tokensReasoning?: number;
+  toolCalls?: Record<string, ToolCallStats>;
+  languages?: string[];
+  createdAt: string;
+}
+
+/** Tool call statistics within a session. */
+export interface ToolCallStats {
+  calls: number;
+  success: number;
+  error: number;
+}
+
+/** Tool usage summary in aggregate responses. */
+export interface ToolUsageSummary {
+  name: string;
+  calls: number;
+  success: number;
+  error: number;
+}
+
+/** Model usage summary in aggregate responses. */
+export interface ModelUsageSummary {
+  model: string;
+  sessions: number;
+}
+
+/**
+ * Aggregate session metrics for a single agent.
+ * Response from GET /api/v1/agents/{id}/metrics/summary.
+ */
+export interface AgentMetricsSummary {
+  agentId: string;
+  totalSessions: number;
+  totalTokensInput: number;
+  totalTokensOutput: number;
+  totalTokensCached: number;
+  totalTokensReasoning: number;
+  totalToolCalls: number;
+  avgSessionDurationMs: number;
+  avgTokensPerSession: number;
+  mostUsedTools: ToolUsageSummary[];
+  mostUsedModels: ModelUsageSummary[];
+}
+
+/**
+ * Aggregate session metrics for a project.
+ * Response from GET /api/v1/projects/{id}/metrics/summary.
+ */
+export interface ProjectSessionMetricsSummary {
+  projectId: string;
+  totalSessions: number;
+  totalTokensInput: number;
+  totalTokensOutput: number;
+  totalTokensCached: number;
+  totalTokensReasoning: number;
+  activeAgents: number;
+  mostUsedTools: ToolUsageSummary[];
+  mostUsedModels: ModelUsageSummary[];
 }

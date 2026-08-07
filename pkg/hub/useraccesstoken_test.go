@@ -153,6 +153,9 @@ func (m *mockUserStore) ListUsers(context.Context, store.UserFilter, store.ListO
 }
 func (m *mockUserStore) DeleteUser(context.Context, string) error                    { return nil }
 func (m *mockUserStore) UpdateUserLastSeen(context.Context, string, time.Time) error { return nil }
+func (m *mockUserStore) IsUserInvitedOrActive(context.Context, string) (bool, error) {
+	return false, nil
+}
 
 // mockProjectStore implements store.ProjectStore for testing (minimal).
 type mockProjectStore struct {
@@ -236,6 +239,23 @@ func TestCreateToken(t *testing.T) {
 		}
 		if len(token.Scopes) != len(store.UATManageScopes) {
 			t.Errorf("expected %d expanded scopes, got %d", len(store.UATManageScopes), len(token.Scopes))
+		}
+	})
+
+	t.Run("accepts project:update", func(t *testing.T) {
+		_, token, err := svc.CreateToken(ctx, tid("user-1"), "proj-update-token", tid("project-1"),
+			[]string{"project:read", "project:update"}, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		found := false
+		for _, sc := range token.Scopes {
+			if sc == store.UATScopeProjectUpdate {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected project:update in token scopes, got %v", token.Scopes)
 		}
 	})
 

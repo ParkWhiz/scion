@@ -19,6 +19,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestYAMLConfigProvider_LoadNonExistent(t *testing.T) {
@@ -310,6 +312,187 @@ func TestResolvePluginConfig_BackendKeyNamesStrippedFromBothSources(t *testing.T
 	}
 }
 
+// setupTestHome sets HOME to a temp dir and creates the .scion subdirectory
+// so that GetGlobalDir() returns a predictable path. Returns the .scion dir
+// and the settings.yaml path within it.
+func setupTestHome(t *testing.T) (globalDir, settingsPath string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	globalDir = filepath.Join(home, ".scion")
+	if err := os.MkdirAll(globalDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath = filepath.Join(globalDir, "settings.yaml")
+	return globalDir, settingsPath
+}
+
+func TestAddPluginToMessageBrokerTypes_NewPlugin(t *testing.T) {
+	_, settingsPath := setupTestHome(t)
+
+	// Seed a minimal settings.yaml.
+	if err := os.WriteFile(settingsPath, []byte("server:\n  plugins: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AddPluginToMessageBrokerTypes("telegram"); err != nil {
+		t.Fatalf("AddPluginToMessageBrokerTypes() error: %v", err)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Parse back and verify.
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+
+	server := raw["server"].(map[string]interface{})
+	mb := server["message_broker"].(map[string]interface{})
+
+	if enabled, ok := mb["enabled"].(bool); !ok || !enabled {
+		t.Error("expected message_broker.enabled = true")
+	}
+
+	typesRaw, ok := mb["types"].([]interface{})
+	if !ok {
+		t.Fatal("expected message_broker.types to be a list")
+	}
+	if len(typesRaw) != 1 || typesRaw[0] != "telegram" {
+		t.Errorf("expected types=[telegram], got %v", typesRaw)
+	}
+}
+
+func TestAddPluginToMessageBrokerTypes_Idempotent(t *testing.T) {
+	_, settingsPath := setupTestHome(t)
+
+	if err := os.WriteFile(settingsPath, []byte("server:\n  message_broker:\n    enabled: true\n    types:\n      - telegram\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AddPluginToMessageBrokerTypes("telegram"); err != nil {
+		t.Fatalf("AddPluginToMessageBrokerTypes() error: %v", err)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+
+	server := raw["server"].(map[string]interface{})
+	mb := server["message_broker"].(map[string]interface{})
+	typesRaw := mb["types"].([]interface{})
+	if len(typesRaw) != 1 {
+		t.Errorf("expected types list to remain length 1 (idempotent), got %v", typesRaw)
+	}
+}
+
+func TestAddPluginToMessageBrokerTypes_PluginPresentButDisabled(t *testing.T) {
+	_, settingsPath := setupTestHome(t)
+
+	// Plugin is already in types but enabled is false.
+	if err := os.WriteFile(settingsPath, []byte("server:\n  message_broker:\n    enabled: false\n    types:\n      - telegram\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AddPluginToMessageBrokerTypes("telegram"); err != nil {
+		t.Fatalf("AddPluginToMessageBrokerTypes() error: %v", err)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+
+	server := raw["server"].(map[string]interface{})
+	mb := server["message_broker"].(map[string]interface{})
+
+	if enabled, ok := mb["enabled"].(bool); !ok || !enabled {
+		t.Error("expected message_broker.enabled = true after re-enabling")
+	}
+
+	typesRaw := mb["types"].([]interface{})
+	if len(typesRaw) != 1 || typesRaw[0] != "telegram" {
+		t.Errorf("expected types=[telegram] (no duplicate), got %v", typesRaw)
+	}
+}
+
+func TestAddPluginToMessageBrokerTypes_AppendsSecondPlugin(t *testing.T) {
+	_, settingsPath := setupTestHome(t)
+
+	if err := os.WriteFile(settingsPath, []byte("server:\n  message_broker:\n    enabled: true\n    types:\n      - telegram\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AddPluginToMessageBrokerTypes("discord"); err != nil {
+		t.Fatalf("AddPluginToMessageBrokerTypes() error: %v", err)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+
+	server := raw["server"].(map[string]interface{})
+	mb := server["message_broker"].(map[string]interface{})
+	typesRaw := mb["types"].([]interface{})
+	if len(typesRaw) != 2 {
+		t.Fatalf("expected 2 types, got %v", typesRaw)
+	}
+	if typesRaw[0] != "telegram" || typesRaw[1] != "discord" {
+		t.Errorf("expected [telegram discord], got %v", typesRaw)
+	}
+}
+
+func TestAddPluginToMessageBrokerTypes_NoSettingsFile(t *testing.T) {
+	_, settingsPath := setupTestHome(t)
+
+	// No settings.yaml exists yet — the function should create one.
+	if err := AddPluginToMessageBrokerTypes("slack"); err != nil {
+		t.Fatalf("AddPluginToMessageBrokerTypes() error: %v", err)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+
+	server := raw["server"].(map[string]interface{})
+	mb := server["message_broker"].(map[string]interface{})
+
+	if enabled, ok := mb["enabled"].(bool); !ok || !enabled {
+		t.Error("expected message_broker.enabled = true")
+	}
+
+	typesRaw := mb["types"].([]interface{})
+	if len(typesRaw) != 1 || typesRaw[0] != "slack" {
+		t.Errorf("expected types=[slack], got %v", typesRaw)
+	}
+}
+
 func TestIsSecretConfigKey(t *testing.T) {
 	for _, key := range []string{"bot_token", "webhook_secret", "public_key", "app_token", "signing_secret", "signing_key"} {
 		if !IsSecretConfigKey(key) {
@@ -320,6 +503,79 @@ func TestIsSecretConfigKey(t *testing.T) {
 		if IsSecretConfigKey(key) {
 			t.Errorf("expected %q to NOT be a secret config key", key)
 		}
+	}
+}
+
+func TestPluginSecretKeyMap_A2ABridge(t *testing.T) {
+	mappings, ok := PluginSecretKeyMap["a2a-bridge"]
+	if !ok {
+		t.Fatal("a2a-bridge not in PluginSecretKeyMap")
+	}
+	if len(mappings) != 1 {
+		t.Fatalf("expected 1 mapping, got %d", len(mappings))
+	}
+	if mappings[0].SecretKey != SecretA2AAPIKey {
+		t.Errorf("expected SecretKey=%q, got %q", SecretA2AAPIKey, mappings[0].SecretKey)
+	}
+	if mappings[0].ConfigKey != "api_key" {
+		t.Errorf("expected ConfigKey=%q, got %q", "api_key", mappings[0].ConfigKey)
+	}
+}
+
+func TestIsSecretConfigKey_A2AApiKey(t *testing.T) {
+	if !IsSecretConfigKey("api_key") {
+		t.Error("expected api_key to be a secret config key")
+	}
+}
+
+func TestAddSelfManagedPluginToSettings(t *testing.T) {
+	_, settingsPath := setupTestHome(t)
+
+	// Seed a minimal settings.yaml.
+	if err := os.WriteFile(settingsPath, []byte("server:\n  plugins: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	entry := SelfManagedPluginEntry{
+		Name:       "a2a-bridge",
+		Address:    "localhost:9090",
+		ConfigFile: "~/.scion/scion-a2a-bridge-admin.yaml",
+	}
+
+	if err := AddSelfManagedPluginToSettings(entry); err != nil {
+		t.Fatalf("AddSelfManagedPluginToSettings() error: %v", err)
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+
+	server := raw["server"].(map[string]interface{})
+	plugins := server["plugins"].(map[string]interface{})
+	broker := plugins["broker"].(map[string]interface{})
+
+	a2aEntry, ok := broker["a2a-bridge"].(map[string]interface{})
+	if !ok {
+		t.Fatal("a2a-bridge entry not found in broker map")
+	}
+
+	if sm, ok := a2aEntry["self_managed"].(bool); !ok || !sm {
+		t.Error("expected self_managed = true")
+	}
+	if mode, ok := a2aEntry["mode"].(string); !ok || mode != "self-managed" {
+		t.Errorf("expected mode = self-managed, got %v", a2aEntry["mode"])
+	}
+	if addr, ok := a2aEntry["address"].(string); !ok || addr != "localhost:9090" {
+		t.Errorf("expected address = localhost:9090, got %v", a2aEntry["address"])
+	}
+	if cf, ok := a2aEntry["config_file"].(string); !ok || cf != "~/.scion/scion-a2a-bridge-admin.yaml" {
+		t.Errorf("expected config_file, got %v", a2aEntry["config_file"])
 	}
 }
 

@@ -30,8 +30,6 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 
-	"context"
-
 	"github.com/GoogleCloudPlatform/scion/extras/scion-a2a-bridge/internal/state"
 )
 
@@ -258,6 +256,106 @@ func TestPerAgentCard(t *testing.T) {
 	}
 	if caps["pushNotifications"] != true {
 		t.Errorf("capabilities.pushNotifications = %v, want true", caps["pushNotifications"])
+	}
+}
+
+func TestPerAgentCardSupportedInterfaces(t *testing.T) {
+	_, ts, _ := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/projects/test-grove/agents/test-agent/.well-known/agent-card.json")
+	if err != nil {
+		t.Fatalf("GET agent card: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var card map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
+		t.Fatalf("decode agent card: %v", err)
+	}
+
+	ifaces, ok := card["supportedInterfaces"].([]interface{})
+	if !ok || len(ifaces) == 0 {
+		t.Fatal("expected non-empty supportedInterfaces array in agent card")
+	}
+
+	iface, ok := ifaces[0].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected supportedInterfaces[0] to be an object")
+	}
+
+	expectedURL := "https://a2a.test.example.com/projects/test-grove/agents/test-agent/jsonrpc"
+	if iface["url"] != expectedURL {
+		t.Errorf("supportedInterfaces[0].url = %q, want %q", iface["url"], expectedURL)
+	}
+	if iface["protocolBinding"] != "JSONRPC" {
+		t.Errorf("supportedInterfaces[0].protocolBinding = %q, want %q", iface["protocolBinding"], "JSONRPC")
+	}
+	if iface["protocolVersion"] != "1.0" {
+		t.Errorf("supportedInterfaces[0].protocolVersion = %q, want %q", iface["protocolVersion"], "1.0")
+	}
+}
+
+func TestGenerateAgentCardSupportedInterfaces(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.New(filepath.Join(dir, "card-test.db"))
+	if err != nil {
+		t.Fatalf("state.New: %v", err)
+	}
+	defer store.Close()
+
+	cfg := &Config{
+		Bridge: BridgeConfig{
+			ExternalURL: "https://bridge.example.com",
+		},
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := New(store, nil, nil, cfg, nil, log)
+
+	card := b.GenerateAgentCard(context.Background(), "my-project", "my-agent")
+
+	ifaces, ok := card["supportedInterfaces"].([]map[string]interface{})
+	if !ok || len(ifaces) == 0 {
+		t.Fatal("expected non-empty supportedInterfaces in generated card")
+	}
+
+	iface := ifaces[0]
+	wantURL := "https://bridge.example.com/projects/my-project/agents/my-agent/jsonrpc"
+	if iface["url"] != wantURL {
+		t.Errorf("supportedInterfaces[0].url = %q, want %q", iface["url"], wantURL)
+	}
+	if iface["protocolBinding"] != "JSONRPC" {
+		t.Errorf("supportedInterfaces[0].protocolBinding = %q, want %q", iface["protocolBinding"], "JSONRPC")
+	}
+	if iface["protocolVersion"] != "1.0" {
+		t.Errorf("supportedInterfaces[0].protocolVersion = %q, want %q", iface["protocolVersion"], "1.0")
+	}
+
+	// Verify the card round-trips through JSON with the expected shape.
+	data, err := json.Marshal(card)
+	if err != nil {
+		t.Fatalf("json.Marshal card: %v", err)
+	}
+
+	var roundTripped map[string]interface{}
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("json.Unmarshal card: %v", err)
+	}
+
+	rtIfaces, ok := roundTripped["supportedInterfaces"].([]interface{})
+	if !ok || len(rtIfaces) == 0 {
+		t.Fatal("expected supportedInterfaces after JSON round-trip")
+	}
+
+	rtIface, ok := rtIfaces[0].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected supportedInterfaces[0] to be an object after JSON round-trip")
+	}
+	if rtIface["url"] != wantURL {
+		t.Errorf("round-tripped url = %q, want %q", rtIface["url"], wantURL)
 	}
 }
 
@@ -537,6 +635,118 @@ func TestAuthorizeTaskReturnsNilNil(t *testing.T) {
 	}
 	if task == nil || task.ID != "owned-task" {
 		t.Errorf("AuthorizeTask(correct owner) = %v, want task with ID %q", task, "owned-task")
+	}
+}
+
+func TestSetJWTValidator_EnablesHubJWTAuth(t *testing.T) {
+	// Verify that calling SetJWTValidator on the server with a signing key
+	// initializes the JWTValidator so hubJWT auth works (and doesn't 500).
+	dir := t.TempDir()
+	store, err := state.New(filepath.Join(dir, "jwt-test.db"))
+	if err != nil {
+		t.Fatalf("state.New: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	signingKey := make([]byte, 32)
+	for i := range signingKey {
+		signingKey[i] = byte(i + 1) // deterministic key for test
+	}
+
+	cfg := &Config{
+		Bridge: BridgeConfig{
+			ExternalURL: "https://a2a.test.example.com",
+		},
+		Auth: AuthConfig{
+			Scheme: "hubJWT",
+		},
+		Projects: []ProjectConfig{
+			{
+				Slug:          "proj",
+				ExposedAgents: []string{"agent-1"},
+			},
+		},
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := New(store, nil, nil, cfg, nil, log)
+
+	executor := NewScionExecutor(b, log)
+	routeAuth := RouteKeyAuthenticator()
+	innerStore := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
+		Authenticator: routeAuth,
+	})
+	scopedStore := NewScopedTaskStore(innerStore)
+	sdkRequestHandler := a2asrv.NewHandler(
+		executor,
+		a2asrv.WithLogger(log),
+		a2asrv.WithCapabilityChecks(&a2a.AgentCapabilities{
+			Streaming:         true,
+			PushNotifications: false,
+		}),
+		a2asrv.WithTaskStore(scopedStore),
+	)
+	b.SetSDKRequestHandler(sdkRequestHandler)
+	sdkJSONRPCHandler := a2asrv.NewJSONRPCHandler(sdkRequestHandler)
+
+	srv := NewServer(b, cfg, nil, log, sdkJSONRPCHandler)
+
+	// Wire snapshot so the JWTValidator is propagated to the auth middleware.
+	snapshot := NewSnapshotHolder(BuildSnapshot(*cfg))
+	srv.SetSnapshot(snapshot)
+
+	// Simulate what main.go should do: call SetJWTValidator after loading key.
+	srv.SetJWTValidator(NewJWTValidator(signingKey))
+
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// Mint a valid JWT.
+	token := mintTestJWT(t, signingKey, validClaims())
+
+	// A request with a valid JWT should succeed (not 500).
+	rpcReq, _ := json.Marshal(jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tasks/get",
+		Params:  json.RawMessage(`{"id":"nonexistent"}`),
+	})
+	httpReq, _ := http.NewRequest(http.MethodPost,
+		ts.URL+"/projects/proj/agents/agent-1/jsonrpc",
+		bytes.NewReader(rpcReq))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	resp.Body.Close()
+
+	// Should be 200 (the RPC itself may error with task-not-found, but auth passes).
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("hubJWT auth status = %d, want 200 (auth should pass)", resp.StatusCode)
+	}
+
+	// Without JWT validator, requests should 500. Verify by clearing it.
+	// (Reset snapshot to one without JWTValidator.)
+	snapshot.Store(BuildSnapshot(*cfg))
+	srv.SetJWTValidator(nil)
+
+	httpReq, _ = http.NewRequest(http.MethodPost,
+		ts.URL+"/projects/proj/agents/agent-1/jsonrpc",
+		bytes.NewReader(rpcReq))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err = http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("without JWTValidator status = %d, want 500", resp.StatusCode)
 	}
 }
 

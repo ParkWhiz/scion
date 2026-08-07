@@ -34,8 +34,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
@@ -125,6 +128,9 @@ type ServerConfig struct {
 	BrokerAuthConfig BrokerAuthConfig
 	// HubEndpoint is the public endpoint URL for this Hub (used in broker join responses).
 	HubEndpoint string
+	// SlowRequestThreshold is the duration after which an HTTP request is
+	// logged as slow. Zero uses logging.DefaultSlowRequestThreshold.
+	SlowRequestThreshold time.Duration
 	// StalledThreshold is how long an agent can go without activity events
 	// before being marked as stalled (default: 5 minutes). Only applies to
 	// agents with a recent heartbeat (not already offline).
@@ -144,10 +150,30 @@ type ServerConfig struct {
 	// TelemetryDefault is the default telemetry enabled state for new agents.
 	// Exposed via GET /api/v1/settings/public so the web UI can pre-populate the checkbox.
 	TelemetryDefault *bool
+	// AutoExposePortsDefault is the default auto-expose-ports enabled state for new agents.
+	// Exposed via GET /api/v1/settings/public so the web UI can pre-populate the checkbox.
+	AutoExposePortsDefault *bool
 	// TelemetryConfig is the full hub-level telemetry config from settings.yaml.
 	// Used to populate default telemetry config on new agents when no per-agent
 	// or template-level telemetry config is set.
 	TelemetryConfig *api.TelemetryConfig
+	// AgentDefaults holds the hub operational agent_defaults section
+	// (Layer-1 settings, koanf keys default_template, default_harness_config,
+	// default_max_turns, default_max_model_calls, default_max_duration,
+	// default_resources).
+	//
+	// Written only by ApplySnapshot, under s.mu. Read only through
+	// s.hubAgentDefaults(), which also takes s.mu — never read this field
+	// directly from a request path (see operational_settings.go, the
+	// propagation goroutine writes it concurrently with request handling).
+	//
+	// In file mode this stays at its zero value: BuildLayer1SnapshotFromFile
+	// deliberately leaves the agent-defaults fields empty because a co-located
+	// broker reads the same settings.yaml and applies them itself at the
+	// BOTTOM of its own chain. Populating them hub-side as well would promote
+	// them to the hub tier and silently outrank broker profile resources and
+	// template limits. See the design's §3.2.4 and alternative A7.
+	AgentDefaults opsettings.AgentDefaultsSettings
 	// MaxSubscriptionsPerUser is the maximum number of notification subscriptions
 	// allowed per subscriber. Zero means unlimited (default).
 	MaxSubscriptionsPerUser int
@@ -190,6 +216,16 @@ type ServerConfig struct {
 	// TransportMinter mints transport-layer OIDC tokens for agents.
 	// Nil when TransportMode == "none" or unset.
 	TransportMinter TransportTokenMinter
+	// SchedulerIntervalSeconds is the root ticker interval for the background
+	// scheduler, in seconds. Default: 60. Increasing this reduces DB connection
+	// pressure on small deployments.
+	SchedulerIntervalSeconds int
+	// SchedulerMaxConcurrency limits the number of recurring handlers that may
+	// run simultaneously in a single tick. When nil (unset), the scheduler
+	// uses its built-in default of 2 so the fix for issue #367 is active
+	// out-of-the-box. Pointer-to-0 explicitly means unlimited.
+	SchedulerMaxConcurrency *int
+
 	// Workstation indicates non-production, single-user mode (e.g. local laptop).
 	// When true, /api/v1/system/* and other workstation-only endpoints are enabled.
 	Workstation bool
@@ -220,11 +256,15 @@ type MaintenanceConfig struct {
 
 // GitHubAppServerConfig holds the GitHub App configuration for the Hub server.
 type GitHubAppServerConfig struct {
-	AppID           int64
-	PrivateKeyPath  string
-	PrivateKey      string
-	WebhookSecret   string
-	APIBaseURL      string
+	AppID          int64
+	PrivateKeyPath string
+	PrivateKey     string
+	WebhookSecret  string
+	APIBaseURL     string
+	// RawBaseURL overrides the origin used to build raw file-content URLs
+	// (default https://raw.githubusercontent.com). Set alongside APIBaseURL
+	// for GitHub Enterprise or for tests that serve fixture content.
+	RawBaseURL      string
 	WebhooksEnabled bool
 	InstallationURL string
 }
@@ -448,6 +488,12 @@ type RemoteCreateAgentRequest struct {
 	// (e.g. "shared", "per-agent", "worktree-per-agent"). Threaded from the
 	// Hub so the broker can branch dispatch without re-deriving from labels.
 	WorkspaceMode string `json:"workspaceMode,omitempty"`
+
+	// ProvisionCredentials carries project-scope secrets for use by core provision
+	// logic (skill resolution, URI variable substitution, credential helpers).
+	// These are NEVER forwarded to the agent container environment or harness scripts.
+	// Populated by the Hub from project-scope secrets at dispatch time.
+	ProvisionCredentials map[string]string `json:"provisionCredentials,omitempty"`
 }
 
 // ResolvedSecret represents a secret resolved by the Hub for projection into an agent container.
@@ -504,6 +550,39 @@ type RemoteAgentConfig struct {
 
 	// GCPIdentity holds the GCP identity assignment for the agent.
 	GCPIdentity *RemoteGCPIdentityConfig `json:"gcpIdentity,omitempty"`
+
+	// ProjectPreStartHookScript is the active project pre-start hook script,
+	// inlined at agent-create time. The broker writes it to
+	// pre-start.d/30-project-custom before the agent starts.
+	ProjectPreStartHookScript string `json:"projectPreStartHookScript,omitempty"`
+
+	// HubAgentDefaults carries the hub's operational agent_defaults for
+	// application at the broker's LOW-precedence defaults tier — deliberately
+	// not folded into InlineConfig, which is a top-of-chain slot.
+	HubAgentDefaults *RemoteHubAgentDefaults `json:"hubAgentDefaults,omitempty"`
+}
+
+// RemoteHubAgentDefaults carries the four limit/resource operational
+// agent_defaults from the hub to a runtime broker.
+//
+// Only the fields that need no hub-side resolution travel here.
+// default_template and default_harness_config are absent by design: the hub
+// must resolve those itself so it can stamp TemplateID/TemplateHash and
+// HarnessConfigID/HarnessConfigHash, and they therefore ride the existing
+// AppliedConfig ladder instead.
+//
+// Version skew is safe by construction: a broker that predates this field
+// ignores the unknown JSON key, so hub defaults simply do not apply — which is
+// exactly today's behaviour. No capability negotiation is needed.
+//
+// Field-for-field JSON-compatible with api.HubAgentDefaults, which is the type
+// the broker decodes into; TestRemoteHubAgentDefaults_WireCompatibleWithBroker
+// pins that.
+type RemoteHubAgentDefaults struct {
+	MaxTurns      int               `json:"maxTurns,omitempty"`
+	MaxModelCalls int               `json:"maxModelCalls,omitempty"`
+	MaxDuration   string            `json:"maxDuration,omitempty"`
+	Resources     *api.ResourceSpec `json:"resources,omitempty"`
 }
 
 // RemoteGCPIdentityConfig holds GCP identity configuration sent from Hub to Broker.
@@ -529,12 +608,13 @@ type SecretKeyInfo struct {
 }
 
 type RemoteEnvRequirementsResponse struct {
-	AgentID    string                   `json:"agentId"`
-	Required   []string                 `json:"required"`
-	HubHas     []string                 `json:"hubHas"`
-	BrokerHas  []string                 `json:"brokerHas"`
-	Needs      []string                 `json:"needs"`
-	SecretInfo map[string]SecretKeyInfo `json:"secretInfo,omitempty"`
+	AgentID      string                   `json:"agentId"`
+	Required     []string                 `json:"required"`
+	HubHas       []string                 `json:"hubHas"`
+	BrokerHas    []string                 `json:"brokerHas"`
+	Needs        []string                 `json:"needs"`
+	SecretInfo   map[string]SecretKeyInfo `json:"secretInfo,omitempty"`
+	Alternatives map[string][]string      `json:"alternatives,omitempty"` // Maps canonical key in Needs to alternative key names from the same any_of group
 }
 
 // RemoteAgentInfo contains agent information from a remote runtime broker.
@@ -576,6 +656,7 @@ type Server struct {
 	auditLogger            AuditLogger             // Audit logger for security events
 	metrics                MetricsRecorder         // Metrics recorder for broker auth
 	controlChannel         *ControlChannelManager  // WebSocket control channel for runtime brokers
+	portTunnels            *PortTunnelManager      // Agent-held port-forward tunnels
 	authzService           *AuthzService           // Authorization service for policy evaluation
 	events                 EventPublisher          // Event publisher for real-time SSE updates
 	commandBus             CommandBus              // Inter-node dispatch signal bus (nil-safe; nil = no-op)
@@ -663,13 +744,16 @@ type Server struct {
 
 	// Subsystem loggers for handler methods
 	agentLifecycleLog *slog.Logger
-	messageLog        *slog.Logger
 	authLog           *slog.Logger
 	envSecretLog      *slog.Logger
-	templateLog       *slog.Logger
-	resourceLog       *slog.Logger
-	workspaceLog      *slog.Logger
+	groupsLog         *slog.Logger
 	maintenanceLog    *slog.Logger
+	messageLog        *slog.Logger
+	projectsLog       *slog.Logger
+	resourceLog       *slog.Logger
+	templateLog       *slog.Logger
+	workspaceLog      *slog.Logger
+	agentMetricsLog   *slog.Logger
 
 	// Cached rate limit info from the most recent GitHub App API call
 	githubAppRateLimit *githubapp.RateLimitInfo
@@ -699,6 +783,28 @@ type Server struct {
 	// updateTracker manages pending HA update timeouts and reconnect-based
 	// completion detection.
 	updateTracker *pendingUpdateTracker
+
+	// ghResolutionStore is the DB-backed GitHub skill resolution cache (nil when entClient is nil).
+	ghResolutionStore *GitHubResolutionStore
+}
+
+// groupsLogger returns the groups subsystem logger, falling back to
+// slog.Default() when the field is nil (e.g. in tests that construct Server
+// directly without the constructor).
+func (s *Server) groupsLogger() *slog.Logger {
+	if s.groupsLog != nil {
+		return s.groupsLog
+	}
+	return slog.Default()
+}
+
+// projectsLogger returns the projects subsystem logger, falling back to
+// slog.Default() when the field is nil.
+func (s *Server) projectsLogger() *slog.Logger {
+	if s.projectsLog != nil {
+		return s.projectsLog
+	}
+	return slog.Default()
 }
 
 func newInstanceID() string {
@@ -715,7 +821,11 @@ func (s *Server) InstanceID() string { return s.instanceID }
 func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Apply defaults for zero-value fields that have meaningful defaults.
 	defaults := DefaultServerConfig()
-	if cfg.StalledThreshold == 0 {
+	if cfg.StalledThreshold == 0 || cfg.StalledThreshold < 2*time.Minute {
+		if cfg.StalledThreshold != 0 {
+			slog.Warn("stalled_threshold below minimum 2m, using default",
+				"configured", cfg.StalledThreshold, "default", defaults.StalledThreshold)
+		}
 		cfg.StalledThreshold = defaults.StalledThreshold
 	}
 
@@ -733,16 +843,27 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		workstation: cfg.Workstation,
 		ctx:         srvCtx,
 		ctxCancel:   srvCancel,
+		portTunnels: NewPortTunnelManager(),
 
 		// Subsystem loggers
 		agentLifecycleLog: logging.Subsystem("hub.agent-lifecycle"),
-		messageLog:        logging.Subsystem("hub.messages"),
 		authLog:           logging.Subsystem("hub.auth"),
 		envSecretLog:      logging.Subsystem("hub.env-secrets"),
-		templateLog:       logging.Subsystem("hub.templates"),
-		resourceLog:       logging.Subsystem("hub.resources"),
-		workspaceLog:      logging.Subsystem("hub.workspace"),
+		groupsLog:         logging.Subsystem("hub.groups"),
 		maintenanceLog:    logging.Subsystem("hub.maintenance"),
+		messageLog:        logging.Subsystem("hub.messages"),
+		projectsLog:       logging.Subsystem("hub.projects"),
+		resourceLog:       logging.Subsystem("hub.resources"),
+		templateLog:       logging.Subsystem("hub.templates"),
+		workspaceLog:      logging.Subsystem("hub.workspace"),
+		agentMetricsLog:   logging.Subsystem("hub.agent-metrics"),
+	}
+
+	// Wire tunnel disconnect handler: when an agent's port-forward tunnel
+	// closes (readLoop exits), clear its exposed port registrations so stale
+	// ports are not advertised.
+	srv.portTunnels.onDisconnect = func(agentID string) {
+		srv.clearExposedPortsForAgent(context.Background(), agentID)
 	}
 
 	// Shared federation HTTP client: no redirect following to prevent
@@ -819,7 +940,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	srv.uatService = NewUserAccessTokenService(s, s, s)
 
 	// Initialize invite code service
-	srv.inviteService = NewInviteService(s, s)
+	srv.inviteService = NewInviteService(s)
 
 	// Initialize Telegram link service
 	srv.telegramLinkService = NewTelegramLinkService()
@@ -942,6 +1063,17 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// on owner_id are satisfied when the dev user creates projects/groups.
 	if cfg.DevAuthToken != "" {
 		seedDevUser(ctx, s, cfg.DevUserConfig)
+	}
+
+	// Seed platform skills into hub_settings["injected_skills"].system (idempotent).
+	// Runs on every startup so that the system list is always in sync with the binary.
+	if err := srv.seedPlatformSkillInsertions(ctx); err != nil {
+		slog.Warn("Failed to seed platform skill insertions", "error", err)
+	}
+
+	// Seed GitHub resolution cache settings into hub_settings["github_resolution_cache"] (idempotent).
+	if err := srv.seedGitHubResolutionCacheSettings(ctx); err != nil {
+		slog.Warn("Failed to seed github_resolution_cache settings", "error", err)
 	}
 
 	// Abort any maintenance operations/migrations left in "running" state from
@@ -1496,6 +1628,11 @@ func (s *Server) SetIntegrationHA(dbDriver string, client *ent.Client, dsn strin
 	s.entClient = client
 	s.databaseDSN = dsn
 
+	// Initialize GitHub resolution store when ent client is available
+	if client != nil {
+		s.ghResolutionStore = NewGitHubResolutionStore(client)
+	}
+
 	s.mu.Unlock()
 
 	if client != nil {
@@ -1871,6 +2008,11 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 		slog.Info("Configure via: hub.endpoint in server.yaml or SCION_SERVER_HUB_ENDPOINT env var")
 	}
 
+	// Set Hub name so agent log entries carry the hub label.
+	if s.config.HubName != "" {
+		dispatcher.SetHubName(s.config.HubName)
+	}
+
 	// Pass hub ID and secret backend to dispatcher if configured
 	dispatcher.SetHubID(s.hubID)
 	if s.secretBackend != nil {
@@ -1910,6 +2052,12 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 	dispatcher.SetHarnessConfigRepairer(s.syncHarnessConfigFromStorage)
 	dispatcher.SetTemplateRepairer(s.syncTemplateFromStorage)
 
+	// Wire the hub's operational agent_defaults so dispatch can carry the
+	// limit/resource ones to the broker's low-precedence tier. The accessor
+	// takes s.mu; it returns the zero value in file mode, where the wire field
+	// is then omitted and broker behaviour is unchanged.
+	dispatcher.SetHubAgentDefaultsProvider(s.hubAgentDefaults)
+
 	// Set image registry so bare image names are rewritten before dispatch
 	dispatcher.SetImageRegistry(s.resolveImageRegistry())
 
@@ -1928,7 +2076,7 @@ func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string
 		return "", fmt.Errorf("agent token service not initialized")
 	}
 
-	scopes := []AgentTokenScope{ScopeAgentStatusUpdate, ScopeAgentTokenRefresh, ScopeAgentNotify}
+	scopes := []AgentTokenScope{ScopeAgentStatusUpdate, ScopeAgentTokenRefresh, ScopeAgentNotify, ScopeAgentPortForward}
 
 	// In dev-auth mode, auto-grant agent creation and lifecycle scopes
 	// so agents can create sub-agents without explicit template configuration.
@@ -2176,7 +2324,7 @@ func (s *Server) messageEventHandler() EventHandler {
 		}
 
 		// Reconstruct structured message from payload to preserve traits like Plain.
-		structuredMsg := messages.NewInstruction("scheduler", "agent:"+agent.Slug, payload.Message)
+		structuredMsg := messages.NewSystemMessage("scheduler", "agent:"+agent.Slug, payload.Message, messages.SystemCategoryScheduler)
 		structuredMsg.SenderID = "SCHEDULER"
 		structuredMsg.RecipientID = agent.ID
 		structuredMsg.Plain = payload.Plain
@@ -2288,22 +2436,99 @@ func (s *Server) dispatchAgentEventHandler() EventHandler {
 			}
 		}
 
+		// Hub operational default template — lowest tier. Below the scheduled
+		// payload and below the project annotation, both of which have already
+		// had their chance above. Sets payload.Template and agent.Template
+		// together, matching the annotation rung's shape. In file mode
+		// hubAgentDefaults() is always the zero value so this never fires
+		// (design §3.2.4). This is the twin of the rung on the agent-create
+		// path in handlers_agents_core.go — design §5.2 risk (d) is these two
+		// diverging again, so both paths get both rungs, no exceptions.
+		templateFromHubDefault := false
+		if payload.Template == "" {
+			if d := s.hubAgentDefaults(); d.DefaultTemplate != "" {
+				payload.Template = d.DefaultTemplate
+				agent.Template = d.DefaultTemplate
+				templateFromHubDefault = true
+			}
+		}
+
 		// Resolve template if specified
 		if payload.Template != "" {
 			tmpl, tmplErr := s.resolveTemplate(ctx, payload.Template, evt.ProjectID)
+			// DEGRADATION RULE (design §3.2.2), the scheduler-path equivalent of
+			// the create path's. A resolve failure never fails a scheduled
+			// dispatch on this path, so there is no 404 to suppress — but a name
+			// that nothing can resolve must not be left on the agent record
+			// either, because the broker would then try to hydrate a template
+			// that does not exist. Clear it and say so. Gated on the
+			// templateFromHubDefault flag, never inferred from the setting.
+			//
+			// A genuine not-found only. A transient store error is deliberately
+			// excluded, for the reason spelled out at length on the create path
+			// in handlers_agents_core.go: a DB blip is not evidence that the
+			// setting is stale, and clearing on one would make some scheduled
+			// dispatches silently lose their template and others keep it
+			// depending on store weather. On a store error this path keeps its
+			// pre-existing behaviour — leave the name alone and let the broker
+			// try to resolve it locally.
+			//
+			// On the errors.Is limb: resolveTemplate collapses a miss to
+			// (nil, nil) — it swallows store.ErrNotFound at each of its three
+			// lookups — so with today's stores that limb does not fire, and
+			// tmpl == nil is doing all the work. It is kept deliberately, and it
+			// is not quite dead code: resolveTemplate swallows by equality
+			// (err != store.ErrNotFound), so a store that ever WRAPPED
+			// ErrNotFound would escape the swallow and arrive here, and this
+			// limb would correctly read it as a definitive miss rather than as
+			// an ambiguous failure. Checked at the time of writing: the ent
+			// adapter returns bare store.ErrNotFound from mapError and
+			// parseGetID, and nothing in pkg/store wraps it.
+			if templateFromHubDefault && tmpl == nil &&
+				(tmplErr == nil || errors.Is(tmplErr, store.ErrNotFound)) {
+				s.warnHubDefaultTemplateUnusable(ctx, payload.Template, evt.ProjectID, "not found")
+				payload.Template = ""
+				agent.Template = ""
+			}
 			if tmplErr == nil && tmpl != nil {
 				if tmpl.Slug != "" {
 					agent.Template = tmpl.Slug
 				}
-				harnessConfig := s.getHarnessConfigFromTemplate(tmpl, "")
-				if harnessConfig != "" {
-					agent.AppliedConfig.HarnessConfig = harnessConfig
+				// Only fall back to the template's harness config when the
+				// project has no default-harness-config annotation — the
+				// project setting outranks the template, matching the
+				// default-template block above and the agent-create path.
+				//
+				// MECHANISM NOTE — leaving AppliedConfig.HarnessConfig empty
+				// when the annotation is present is deliberate:
+				// applyProjectDefaults below is what actually applies the
+				// project value on this path. The agent-create path in
+				// handlers_agents_core.go reads the same annotation inline
+				// instead, which makes applyProjectDefaults' harness-config
+				// branch unreachable there. Behaviourally identical today —
+				// keep the two in sync, and if you change
+				// applyProjectDefaults' harness handling, check BOTH paths.
+				projectHarnessConfig := ""
+				if project != nil && project.Annotations != nil {
+					projectHarnessConfig = project.Annotations[projectSettingDefaultHarnessConfig]
+				}
+				if projectHarnessConfig == "" {
+					if harnessConfig := s.getHarnessConfigFromTemplate(tmpl, ""); harnessConfig != "" {
+						agent.AppliedConfig.HarnessConfig = harnessConfig
+					}
 				}
 			}
 		}
 
 		// Apply project-level defaults (harness config, limits, resources) from annotations
 		applyProjectDefaults(agent.AppliedConfig, project)
+
+		// Hub operational agent_defaults — strictly between applyProjectDefaults
+		// and populateAgentConfig, exactly as on the agent-create path. See
+		// applyHubAgentDefaults for why that placement is the whole point.
+		if applyHubAgentDefaults(agent.AppliedConfig, s.hubAgentDefaults()) {
+			ctx = withHubDefaultHarnessConfig(ctx)
+		}
 
 		s.populateAgentConfig(ctx, agent, project, nil)
 
@@ -2437,8 +2662,17 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	}
 	s.mu.Unlock()
 
-	// Initialize and start the scheduler
-	s.scheduler = NewScheduler(s.store, logging.Subsystem("hub.scheduler"))
+	// Initialize and start the scheduler. Interval and concurrency are
+	// configurable via server.scheduler in settings.yaml to let operators
+	// tune background load to match their DB capacity (see issue #367).
+	var schedOpts []SchedulerOption
+	if s.config.SchedulerIntervalSeconds > 0 {
+		schedOpts = append(schedOpts, WithTickInterval(time.Duration(s.config.SchedulerIntervalSeconds)*time.Second))
+	}
+	if s.config.SchedulerMaxConcurrency != nil {
+		schedOpts = append(schedOpts, WithMaxConcurrency(*s.config.SchedulerMaxConcurrency))
+	}
+	s.scheduler = NewScheduler(s.store, logging.Subsystem("hub.scheduler"), schedOpts...)
 	// Recurring sweeps are cluster-wide-once work: under multi-replica Postgres
 	// they must run on a single replica per tick (gated by an advisory lock),
 	// otherwise every replica would publish duplicate offline/stalled events and
@@ -2458,6 +2692,12 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	s.scheduler.RegisterRecurringSingleton("schedule-evaluator", 1, store.LockScheduleEvaluator, s.evaluateSchedulesHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-affinity-reap", 5, store.LockBrokerAffinityReap, s.brokerAffinityReapHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-message-sweep", 5, store.LockBrokerMessageSweep, s.brokerMessageSweepHandler())
+	s.scheduler.RegisterRecurringSingleton("exposed-ports-sweep", 5, store.LockExposedPortsSweep, s.exposedPortsSweepHandler())
+
+	// Register GitHub resolution cache TTL eviction (every 10 minutes)
+	if s.ghResolutionStore != nil {
+		s.scheduler.RegisterRecurringSingleton("github-resolution-cache-eviction", 10, store.LockGitHubResolutionCacheEviction, s.githubResolutionCacheEvictionHandler())
+	}
 
 	// Register GitHub App health check if the app is configured
 	s.mu.RLock()
@@ -2716,6 +2956,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/harness-configs", s.handleHarnessConfigs)
 	s.mux.HandleFunc("/api/v1/harness-configs/", s.handleHarnessConfigByID)
 
+	// Hub-scoped pre-start hooks. The project-scoped equivalents live under
+	// /api/v1/projects/{projectId}/pre-start-hooks (see handleProjectRoutes).
+	s.mux.HandleFunc("/api/v1/pre-start-hooks", s.handleHubPreStartHooks)
+	s.mux.HandleFunc("/api/v1/pre-start-hooks/", s.handleHubPreStartHookByID)
+
 	s.mux.HandleFunc("/api/v1/users", s.handleUsers)
 	s.mux.HandleFunc("/api/v1/users/", s.handleUserByID)
 
@@ -2724,6 +2969,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/env/", s.handleEnvVarByKey)
 	s.mux.HandleFunc("/api/v1/secrets", s.handleSecrets)
 	s.mux.HandleFunc("/api/v1/secrets/", s.handleSecretByKey)
+
+	// Session metrics (DB-backed, distinct from Cloud Monitoring metrics dashboard)
+	s.mux.HandleFunc("/api/v1/metrics/session/", s.handleSessionMetrics)
 
 	// Groups and Policies (Hub Permissions System)
 	s.mux.HandleFunc("/api/v1/groups", s.handleGroups)
@@ -2734,6 +2982,17 @@ func (s *Server) registerRoutes() {
 	// Principal resolution endpoints (Phase 4)
 	s.mux.HandleFunc("/api/v1/users/me/groups", s.handleMyGroups)
 	s.mux.HandleFunc("/api/v1/principals/", s.handlePrincipalRoutes)
+
+	// User-scoped injected-skills endpoints (/users/me/...)
+	s.mux.HandleFunc("/api/v1/users/me/injected-skills", s.handleUserMeInjectedSkills)
+	s.mux.HandleFunc("/api/v1/users/me/injected-skills/", func(w http.ResponseWriter, r *http.Request) {
+		entryID := strings.TrimPrefix(r.URL.Path, "/api/v1/users/me/injected-skills/")
+		entryID = strings.TrimSuffix(entryID, "/")
+		s.handleUserMeInjectedSkillByID(w, r, entryID)
+	})
+
+	// Hub-scope injected-skills endpoint
+	s.mux.HandleFunc("/api/v1/hub/settings/injected-skills", s.handleHubInjectedSkills)
 
 	// Broker registration endpoints (Runtime Broker HMAC authentication)
 	s.mux.HandleFunc("/api/v1/brokers", s.handleBrokersEndpoint)
@@ -2755,11 +3014,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/scheduler", s.handleAdminScheduler)
 	s.mux.HandleFunc("/api/v1/admin/allow-list", s.handleAdminAllowList)
 	s.mux.HandleFunc("/api/v1/admin/allow-list/", s.handleAdminAllowListByEmail)
+	s.mux.HandleFunc("/api/v1/admin/users/invite/bulk", s.handleAdminUserInviteBulk)
+	s.mux.HandleFunc("/api/v1/admin/users/invite", s.handleAdminUserInvite)
 	s.mux.HandleFunc("/api/v1/admin/invites", s.handleAdminInvites)
 	s.mux.HandleFunc("/api/v1/admin/invites/", s.handleAdminInviteByID)
 	s.mux.HandleFunc("/api/v1/admin/server-config/schema", s.handleAdminServerConfigSchema)
 	s.mux.HandleFunc("/api/v1/admin/server-config/sections/", s.handleAdminServerConfigSectionReset)
 	s.mux.HandleFunc("/api/v1/admin/server-config", s.handleAdminServerConfig)
+	s.mux.HandleFunc("/api/v1/admin/project-defaults", s.handleAdminProjectDefaults)
 	s.mux.HandleFunc("/api/v1/admin/agents/reset-auth-all", s.handleAdminResetAuthAll)
 	s.mux.HandleFunc("/api/v1/admin/gcp-quota", s.handleAdminGCPQuota)
 	s.mux.HandleFunc("/api/v1/admin/lifecycle-hooks", s.handleAdminLifecycleHooks)
@@ -2767,6 +3029,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/validate-resources", s.handleAdminValidateResources)
 	s.mux.HandleFunc("/api/v1/admin/integrations", s.handleAdminIntegrations)
 	s.mux.HandleFunc("/api/v1/admin/integrations/", s.handleAdminIntegrationByName)
+	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs/stream", s.handleDiagnosticsLogsStream)
+	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs", s.handleDiagnosticsLogs)
+	s.mux.HandleFunc("/api/v1/admin/health/summary", s.handleHealthSummary)
 	s.mux.HandleFunc("/api/v1/metrics/", s.handleMetricsDashboard)
 	s.mux.HandleFunc("/api/v1/admin/metrics-dashboard", s.handleAdminMetricsDashboard) // legacy backward-compat
 
@@ -2810,6 +3075,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/resources/import", s.handleResourcesImport)
 	s.mux.HandleFunc("/api/v1/resources/discover", s.handleResourcesDiscover)
 
+	// Skill directory discovery (batch-add support for injected skills). Registered
+	// as an exact path so it takes precedence over the /api/v1/skills/ subtree
+	// handler above.
+	s.mux.HandleFunc("/api/v1/skills/discover-directory", s.handleSkillsDiscoverDirectory)
+
 	// GitHub App webhook and setup callback (unauthenticated — uses webhook signature)
 	s.mux.HandleFunc("/api/v1/webhooks/github", s.handleGitHubWebhook)
 	s.mux.HandleFunc("/github-app/setup", s.handleGitHubAppSetup)
@@ -2837,7 +3107,7 @@ func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	// Apply middleware in reverse order (last applied runs first)
 	h = s.recoveryMiddleware(h)
 	if s.requestLogger != nil {
-		h = logging.RequestLogMiddleware(s.requestLogger, "hub", logging.HubPathPatterns())(h)
+		h = logging.RequestLogMiddleware(s.requestLogger, "hub", logging.HubPathPatterns(), s.config.SlowRequestThreshold)(h)
 	} else {
 		h = s.loggingMiddleware(h)
 	}
@@ -2868,6 +3138,10 @@ func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	if s.config.CORSEnabled {
 		h = s.corsMiddleware(h)
 	}
+
+	// OTel HTTP tracing (outermost - wraps all middleware for full request lifecycle)
+	h = otelhttp.NewHandler(h, "hub")
+
 	return h
 }
 
@@ -2968,8 +3242,16 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			level = slog.LevelWarn
 		}
 
-		if duration > 2*time.Second {
-			slog.Warn("Slow request",
+		// Log slow requests, exempting streaming responses.
+		contentType := strings.ToLower(wrapped.Header().Get("Content-Type"))
+		isStreaming := strings.HasPrefix(contentType, "text/event-stream")
+		isUpgrade := r.Header.Get("Upgrade") != ""
+		slowThreshold := s.config.SlowRequestThreshold
+		if slowThreshold <= 0 {
+			slowThreshold = logging.DefaultSlowRequestThreshold
+		}
+		if !isStreaming && !isUpgrade && duration > slowThreshold {
+			slog.Info("Slow request",
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.Duration("elapsed", duration),
@@ -3189,4 +3471,58 @@ func (s *Server) markBrokerOnline(brokerID, sessionID string) {
 func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
+// githubResolutionCacheEvictionHandler returns a recurring handler function that
+// purges expired GitHub skill resolution cache entries. This prevents the cache
+// table from growing unbounded and keeps queries fast.
+func (s *Server) githubResolutionCacheEvictionHandler() func(ctx context.Context) {
+	return func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		if s.ghResolutionStore == nil {
+			return
+		}
+
+		if err := s.ghResolutionStore.PurgeExpired(ctx); err != nil {
+			slog.Error("Scheduler: github resolution cache eviction failed", "error", err)
+		}
+	}
+}
+
+// seedGitHubResolutionCacheSettings seeds the github_resolution_cache section
+// in hub_settings with default TTL values. This runs on every startup so operators
+// can see and adjust the cache behavior via the settings UI.
+// Idempotent: calling more than once produces the same result.
+func (s *Server) seedGitHubResolutionCacheSettings(ctx context.Context) error {
+	settingValue := map[string]interface{}{
+		"branch_ref_ttl_minutes": 30,
+		"sha_ref_ttl_hours":      24,
+		"enabled":                true,
+	}
+
+	value, err := json.Marshal(settingValue)
+	if err != nil {
+		return fmt.Errorf("seedGitHubResolutionCacheSettings: marshal: %w", err)
+	}
+
+	// Check if the setting already exists to avoid spurious revision bumps
+	_, getErr := s.store.GetHubSetting(ctx, "github_resolution_cache")
+	if getErr == nil {
+		// Setting exists; skip upsert to avoid revision churn
+		slog.Debug("seedGitHubResolutionCacheSettings: setting already exists; skipping")
+		return nil
+	}
+	if !errors.Is(getErr, store.ErrNotFound) {
+		return fmt.Errorf("seedGitHubResolutionCacheSettings: read existing setting: %w", getErr)
+	}
+
+	// Setting doesn't exist; create it with expectedRevision=-1 (upsert pattern)
+	if _, upsertErr := s.store.UpsertHubSetting(ctx, "github_resolution_cache", value, "seed", -1, "seeded"); upsertErr != nil {
+		return fmt.Errorf("seedGitHubResolutionCacheSettings: upsert: %w", upsertErr)
+	}
+
+	slog.Info("Seeded github_resolution_cache settings into hub_settings")
+	return nil
 }

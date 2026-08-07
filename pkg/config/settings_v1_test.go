@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/stretchr/testify/assert"
@@ -141,6 +142,49 @@ default_template: claude
 
 	assert.Equal(t, "prod", vs.ActiveProfile)
 	assert.Equal(t, "claude", vs.DefaultTemplate)
+}
+
+// TestLoadVersionedSettings_GlobalHarnessConfigNotOverriddenByProjectDefaults
+// verifies that when a user sets default_harness_config and default_template in
+// their global settings, initializing a project (which writes the embedded
+// project defaults into the project settings file) does not override those
+// global values.
+//
+// Regression test for GoogleCloudPlatform/scion#212.
+func TestLoadVersionedSettings_GlobalHarnessConfigNotOverriddenByProjectDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	t.Setenv("HOME", tmpDir)
+
+	// Set up global settings with custom default_harness_config and default_template.
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	require.NoError(t, os.MkdirAll(globalScionDir, 0755))
+
+	globalSettings := `
+schema_version: "1"
+default_harness_config: opencode
+default_template: my-template
+`
+	require.NoError(t, os.WriteFile(filepath.Join(globalScionDir, "settings.yaml"), []byte(globalSettings), 0644))
+
+	// Set up a project directory with the embedded project defaults — this is
+	// exactly what scion init writes into the project settings file.
+	projectDir := filepath.Join(tmpDir, "my-project", ".scion")
+	require.NoError(t, os.MkdirAll(projectDir, 0755))
+
+	projectDefaults, err := GetProjectDefaultSettingsYAML()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(projectDir, "settings.yaml"), projectDefaults, 0644))
+
+	// Load merged settings. The project defaults must NOT override the user's
+	// global preferences for default_harness_config and default_template.
+	vs, err := LoadVersionedSettings(projectDir)
+	require.NoError(t, err)
+
+	assert.Equal(t, "opencode", vs.DefaultHarnessConfig,
+		"global default_harness_config should not be overridden by project defaults (issue #212)")
+	assert.Equal(t, "my-template", vs.DefaultTemplate,
+		"global default_template should not be overridden by project defaults")
 }
 
 func TestLoadVersionedSettings_GroveOverride(t *testing.T) {
@@ -666,6 +710,80 @@ func TestLoadEffectiveSettings_NoUserFiles(t *testing.T) {
 	_ = warnings
 }
 
+func TestLoadEffectiveSettings_WarnOnIgnoredSettingsFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	originalHome := os.Getenv("HOME")
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	_ = os.Setenv("HOME", tmpDir)
+
+	projectDir := filepath.Join(tmpDir, "my-project", ".scion")
+	require.NoError(t, os.MkdirAll(projectDir, 0755))
+
+	t.Run("non-empty file without schema_version produces warning", func(t *testing.T) {
+		// Write settings with real keys but no schema_version, no harnesses,
+		// and no v1 runtime indicators — this file will be silently ignored.
+		settingsContent := "default_template: my-template\n"
+		settingsPath := filepath.Join(projectDir, "settings.yaml")
+		require.NoError(t, os.WriteFile(settingsPath, []byte(settingsContent), 0644))
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		_, warnings, err := LoadEffectiveSettings(projectDir)
+		require.NoError(t, err)
+
+		found := false
+		for _, w := range warnings {
+			if strings.Contains(w, "no schema_version field") && strings.Contains(w, settingsPath) {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "expected warning about missing schema_version, got warnings: %v", warnings)
+	})
+
+	t.Run("empty file does not produce warning", func(t *testing.T) {
+		settingsPath := filepath.Join(projectDir, "settings.yaml")
+		require.NoError(t, os.WriteFile(settingsPath, []byte(""), 0644))
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		_, warnings, err := LoadEffectiveSettings(projectDir)
+		require.NoError(t, err)
+
+		for _, w := range warnings {
+			assert.NotContains(t, w, "no schema_version field",
+				"empty file should not produce schema_version warning")
+		}
+	})
+
+	t.Run("file with only comments does not produce warning", func(t *testing.T) {
+		settingsPath := filepath.Join(projectDir, "settings.yaml")
+		require.NoError(t, os.WriteFile(settingsPath, []byte("# just a comment\n"), 0644))
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		_, warnings, err := LoadEffectiveSettings(projectDir)
+		require.NoError(t, err)
+
+		for _, w := range warnings {
+			assert.NotContains(t, w, "no schema_version field",
+				"comment-only file should not produce schema_version warning")
+		}
+	})
+
+	t.Run("legacy format file does not produce warning", func(t *testing.T) {
+		// Write a file with harnesses key (legacy format)
+		settingsPath := filepath.Join(projectDir, "settings.yaml")
+		require.NoError(t, os.WriteFile(settingsPath, []byte("harnesses:\n  claude:\n    image: test\n"), 0644))
+		defer func() { _ = os.Remove(settingsPath) }()
+
+		_, warnings, err := LoadEffectiveSettings(projectDir)
+		require.NoError(t, err)
+		for _, w := range warnings {
+			assert.NotContains(t, w, "no schema_version field",
+				"legacy format file should not produce schema_version warning")
+		}
+	})
+}
+
 // --- Default settings compatibility tests ---
 
 func TestGetDefaultSettingsData_ProducesSameEffectiveDefaults(t *testing.T) {
@@ -1046,10 +1164,102 @@ func TestResolveHarnessConfig_WithProfileOverrides(t *testing.T) {
 	assert.Equal(t, "example.com/gemini:staging", hc.Image, "image should be overridden by profile")
 	assert.Equal(t, "scion", hc.User, "user should remain from base config")
 	assert.Equal(t, "base_value", hc.Env["BASE_KEY"], "base env should be preserved")
-	assert.Equal(t, "profile_value", hc.Env["PROFILE_KEY"], "profile env should be merged")
+	// G3-full: profiles.<p>.env is no longer merged. The fixture still SETS
+	// PROFILE_KEY above — leave it there, it is the injected value whose absence
+	// this asserts. Before G3-full this line read
+	//   assert.Equal(t, "profile_value", hc.Env["PROFILE_KEY"], "profile env should be merged")
+	// and the removal is a breaking change, not a correction of a wrong expectation.
+	assert.NotContains(t, hc.Env, "PROFILE_KEY", "G3-full: profile env is no longer an injection point")
+	// harness_overrides env SURVIVES G3-full — unchanged, and deliberately so.
 	assert.Equal(t, "override_value", hc.Env["OVERRIDE_KEY"], "override env should be merged")
 	assert.Len(t, hc.Volumes, 1, "profile volume should be appended")
 	assert.Equal(t, "/mnt/vol", hc.Volumes[0].Target)
+}
+
+// TestResolveHarnessConfig_ProfileEnvNotMerged pins the G3-full removal: the
+// profiles.<p>.env injection point no longer exists in ResolveHarnessConfig.
+//
+// Read the fixture carefully before changing it; three separate traps apply.
+//
+//  1. EXISTENCE CONTROL. An "env key is absent" assertion passes for free if the
+//     profile was never located at all — ResolveHarnessConfig returns baseConfig
+//     early when vs.Profiles[profileName] is missing, and an empty profileName
+//     falls back to ActiveProfile. So this test asserts the profile's VOLUME is
+//     appended. That merge sits in the same block the deleted env merge sat in,
+//     and it proves the profile was found and applied. Without it the absence
+//     below measures nothing.
+//
+//  2. THE HARNESS OVERRIDE IS DELIBERATELY POPULATED, AND ONLY FOR ONE KEY.
+//     profiles.<p>.harness_overrides.<hc>.env is merged AFTER profile env and
+//     therefore OUTRANKS it, so it can mask this deletion — but Env is a
+//     per-key map and mergeMaps overlays key by key, so it masks ONLY the keys
+//     it itself sets. PROFILE_ONLY_KEY is set by the profile and NOT by the
+//     override, which is what keeps the deletion observable.
+//
+//     Leaving the override unset entirely would also work, but this fixture is
+//     strictly better: it additionally pins that harness_overrides SURVIVES
+//     G3-full, and it exercises the both-populated state, which is the real
+//     configuration users are left in after the migration.
+//
+//  3. SHARED_KEY is NOT asserting "harness-config env replaces profile env".
+//     That claim was in the findings matrix, it was backwards, and it was
+//     retracted: before G3-full the profile value WON this key. The assertion
+//     below says the base value is left undisturbed because the merge that used
+//     to overwrite it is gone. Nothing remains to be replaced, so the removal
+//     does not vindicate the old claim — it makes it vacuous.
+func TestResolveHarnessConfig_ProfileEnvNotMerged(t *testing.T) {
+	vs := &VersionedSettings{
+		ActiveProfile: "dev",
+		HarnessConfigs: map[string]HarnessConfigEntry{
+			"gemini": {
+				Harness: "gemini",
+				Image:   "example.com/gemini:latest",
+				Env: map[string]string{
+					"SHARED_KEY": "from-harness-config",
+				},
+			},
+		},
+		Profiles: map[string]V1ProfileConfig{
+			"dev": {
+				Runtime: "docker",
+				Env: map[string]string{
+					"SHARED_KEY":       "from-profile",
+					"PROFILE_ONLY_KEY": "from-profile",
+				},
+				// Populated, but NOT for PROFILE_ONLY_KEY — see trap 2 above.
+				HarnessOverrides: map[string]V1HarnessOverride{
+					"gemini": {Env: map[string]string{"OVERLAP_KEY": "from-override"}},
+				},
+				Volumes: []api.VolumeMount{{Source: "/profile/vol", Target: "/mnt/profile"}},
+			},
+		},
+	}
+
+	// profileName passed explicitly rather than relying on ActiveProfile.
+	hc, err := vs.ResolveHarnessConfig("dev", "gemini")
+	require.NoError(t, err)
+
+	// Existence control — must come first. If this fails, every env assertion
+	// below is vacuous and the test result means nothing.
+	require.Len(t, hc.Volumes, 1, "existence control: the profile must have been found and merged")
+	require.Equal(t, "/mnt/profile", hc.Volumes[0].Target, "existence control: the merged volume must be the profile's")
+
+	// The removal itself: a key that ONLY profile env supplied is gone.
+	assert.NotContains(t, hc.Env, "PROFILE_ONLY_KEY",
+		"G3-full: profiles.<p>.env is no longer an injection point, so a profile-only key must not appear")
+
+	// The base value survives untouched. See trap 3 — this is not a claim that
+	// harness-config env outranks profile env.
+	assert.Equal(t, "from-harness-config", hc.Env["SHARED_KEY"],
+		"harness_configs.<hc>.env must be left undisturbed now that the profile merge is gone")
+
+	// The two surviving env sources, pinned here so this test distinguishes
+	// "G3-full removed a rank" from "G3-full removed the tier". Without these a
+	// change that wiped out all settings env would still pass the assertion above.
+	assert.Equal(t, "from-override", hc.Env["OVERLAP_KEY"],
+		"profiles.<p>.harness_overrides.<hc>.env SURVIVES G3-full")
+	assert.Contains(t, hc.Env, "SHARED_KEY",
+		"harness_configs.<hc>.env SURVIVES G3-full — it is the migration path for the removed profile env")
 }
 
 func TestResolveHarnessConfig_NotFound(t *testing.T) {
@@ -2921,8 +3131,8 @@ hub:
 	version, _ := DetectSettingsFormat(data)
 	assert.Equal(t, "1", version, "legacy file should be migrated to v1 after UpdateSetting")
 
-	// Verify the update was applied
-	assert.Contains(t, string(data), "grove_id: my-grove-id")
+	// Verify the update was applied (struct tags now use project_id)
+	assert.Contains(t, string(data), "project_id: my-grove-id")
 
 	// Verify original values were preserved
 	assert.Contains(t, string(data), "active_profile: local")
@@ -3908,8 +4118,109 @@ func TestWorkspaceStorageConfig_BackendUnset_IsLocal(t *testing.T) {
 	assert.Nil(t, ws.NFS, "no NFS block when backend is local/empty")
 }
 
+// ============================================================================
+// Scheduler Config Tests
+// ============================================================================
+
+func TestConvertV1ServerToGlobalConfig_Scheduler(t *testing.T) {
+	v1 := &V1ServerConfig{
+		Scheduler: &V1SchedulerConfig{
+			IntervalSeconds: 120,
+			MaxConcurrency:  intPtr(3),
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.Equal(t, 120, gc.Scheduler.IntervalSeconds)
+	require.NotNil(t, gc.Scheduler.MaxConcurrency)
+	assert.Equal(t, 3, *gc.Scheduler.MaxConcurrency)
+}
+
+func TestConvertV1ServerToGlobalConfig_SchedulerNil(t *testing.T) {
+	v1 := &V1ServerConfig{}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.Equal(t, 0, gc.Scheduler.IntervalSeconds, "nil scheduler should leave defaults (zero)")
+	assert.Nil(t, gc.Scheduler.MaxConcurrency, "nil scheduler should leave MaxConcurrency nil (use scheduler default)")
+}
+
+func TestConvertGlobalToV1ServerConfig_Scheduler(t *testing.T) {
+	gc := DefaultGlobalConfig()
+	gc.Scheduler.IntervalSeconds = 180
+	gc.Scheduler.MaxConcurrency = intPtr(2)
+	v1 := ConvertGlobalToV1ServerConfig(&gc)
+	require.NotNil(t, v1.Scheduler)
+	assert.Equal(t, 180, v1.Scheduler.IntervalSeconds)
+	require.NotNil(t, v1.Scheduler.MaxConcurrency)
+	assert.Equal(t, 2, *v1.Scheduler.MaxConcurrency)
+}
+
+func TestConvertGlobalToV1ServerConfig_SchedulerZeroOmitted(t *testing.T) {
+	gc := DefaultGlobalConfig()
+	// Zero/nil values — scheduler block should not be emitted
+	v1 := ConvertGlobalToV1ServerConfig(&gc)
+	assert.Nil(t, v1.Scheduler, "zero-value scheduler should be omitted in V1")
+}
+
+func TestSchedulerMaxConcurrency_ExplicitZeroRoundTrips(t *testing.T) {
+	// Regression: explicit max_concurrency=0 (unlimited) must survive the
+	// V1 → Global → V1 round-trip and not be confused with "unset".
+	v1 := &V1ServerConfig{
+		Scheduler: &V1SchedulerConfig{
+			MaxConcurrency: intPtr(0),
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	require.NotNil(t, gc.Scheduler.MaxConcurrency, "explicit 0 must not be nil")
+	assert.Equal(t, 0, *gc.Scheduler.MaxConcurrency)
+
+	v1Out := ConvertGlobalToV1ServerConfig(gc)
+	require.NotNil(t, v1Out.Scheduler, "scheduler block must be emitted for explicit 0")
+	require.NotNil(t, v1Out.Scheduler.MaxConcurrency)
+	assert.Equal(t, 0, *v1Out.Scheduler.MaxConcurrency)
+}
+
+func TestVersionedEnvKeyMapper_Scheduler(t *testing.T) {
+	tests := []struct {
+		env  string
+		want string
+	}{
+		{"SCION_SERVER_SCHEDULER_INTERVAL_SECONDS", "server.scheduler.interval_seconds"},
+		{"SCION_SERVER_SCHEDULER_MAX_CONCURRENCY", "server.scheduler.max_concurrency"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.env, func(t *testing.T) {
+			got := versionedEnvKeyMapper(tt.env)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestConvertV1ServerToGlobalConfig_StalledThresholdValid(t *testing.T) {
+	v1 := &V1ServerConfig{
+		Hub: &V1ServerHubConfig{
+			StalledThreshold: "10m",
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.Equal(t, 10*time.Minute, gc.Hub.StalledThreshold)
+}
+
+func TestConvertV1ServerToGlobalConfig_StalledThresholdInvalidIgnored(t *testing.T) {
+	v1 := &V1ServerConfig{
+		Hub: &V1ServerHubConfig{
+			StalledThreshold: "not-a-duration",
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	// Invalid duration string should be ignored; StalledThreshold stays at zero value.
+	assert.Equal(t, time.Duration(0), gc.Hub.StalledThreshold)
+}
+
 // --- Helper ---
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+func intPtr(i int) *int {
+	return &i
 }

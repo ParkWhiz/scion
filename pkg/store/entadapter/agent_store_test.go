@@ -18,6 +18,7 @@ package entadapter
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -306,6 +307,40 @@ func TestAgentStore_UpdateAgentStatus(t *testing.T) {
 	assert.ErrorIs(t, s.UpdateAgentStatus(ctx, uuid.NewString(), store.AgentStatusUpdate{Phase: "running"}), store.ErrNotFound)
 }
 
+func TestAgentStore_UpdateAgentExposedPorts(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	a := makeAgent(projectID, "ports")
+	require.NoError(t, s.CreateAgent(ctx, a))
+
+	exposedAt := time.Now().UTC().Truncate(time.Second)
+	ports := []store.ExposedPort{{
+		Port:      3000,
+		Label:     "dev",
+		Host:      "127.0.0.1",
+		Mode:      "rw",
+		ExposedAt: exposedAt,
+		ExposedBy: "agent",
+	}}
+	require.NoError(t, s.UpdateAgentExposedPorts(ctx, a.ID, ports))
+
+	got, err := s.GetAgent(ctx, a.ID)
+	require.NoError(t, err)
+	require.Len(t, got.ExposedPorts, 1)
+	assert.Equal(t, ports[0].Port, got.ExposedPorts[0].Port)
+	assert.Equal(t, ports[0].Label, got.ExposedPorts[0].Label)
+	assert.Equal(t, ports[0].Host, got.ExposedPorts[0].Host)
+	assert.Equal(t, ports[0].Mode, got.ExposedPorts[0].Mode)
+	assert.Equal(t, ports[0].ExposedBy, got.ExposedPorts[0].ExposedBy)
+
+	require.NoError(t, s.UpdateAgentExposedPorts(ctx, a.ID, nil))
+	got, err = s.GetAgent(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.ExposedPorts)
+	assert.ErrorIs(t, s.UpdateAgentExposedPorts(ctx, uuid.NewString(), ports), store.ErrNotFound)
+}
+
 // TestAgentStore_TerminalPhaseClearsStalledActivity verifies that transitioning
 // to a terminal phase (stopped/error) without an explicit activity clears a
 // lingering live activity such as "stalled", while preserving terminal
@@ -574,6 +609,87 @@ func TestAgentStore_LabelFiltering(t *testing.T) {
 			assert.ElementsMatch(t, tt.wantIDs, gotIDs)
 		})
 	}
+}
+
+// TestListAgents_CursorPagination verifies ListAgents honors ListOptions.Cursor
+// and enumerates every agent across pages with no gaps or duplicates. Before the
+// keyset-pagination fix the cursor was ignored, so a caller could only ever see
+// the first page.
+func TestListAgents_CursorPagination(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	const total = 125 // more than one page when using a small limit
+	created := make(map[string]bool, total)
+	for i := 0; i < total; i++ {
+		a := makeAgent(projectID, fmt.Sprintf("cursor-%03d", i))
+		require.NoError(t, s.CreateAgent(ctx, a))
+		created[a.ID] = true
+	}
+
+	// Walk through pages using a limit of 25 to exercise cursor across 5 pages.
+	const pageSize = 25
+	seen := make(map[string]bool, total)
+	cursor := ""
+	for pages := 0; ; pages++ {
+		require.LessOrEqual(t, pages, total, "pagination did not terminate")
+		page, err := s.ListAgents(ctx, store.AgentFilter{}, store.ListOptions{Limit: pageSize, Cursor: cursor})
+		require.NoError(t, err)
+		for _, a := range page.Items {
+			require.False(t, seen[a.ID], "duplicate agent across pages: %s", a.ID)
+			seen[a.ID] = true
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+
+	assert.Len(t, seen, total, "cursor pagination must enumerate every agent")
+	for id := range created {
+		assert.True(t, seen[id], "agent missing from pagination: %s", id)
+	}
+}
+
+// TestListAgents_DefaultLimit verifies that ListAgents with Limit=0 returns up
+// to 500 agents (the new default), not the old default of 50.
+func TestListAgents_DefaultLimit(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	const total = 75 // more than the old default of 50, less than new default of 500
+	for i := 0; i < total; i++ {
+		a := makeAgent(projectID, fmt.Sprintf("default-%03d", i))
+		require.NoError(t, s.CreateAgent(ctx, a))
+	}
+
+	// Limit=0 should use the default limit of 500, so all 75 agents are returned.
+	result, err := s.ListAgents(ctx, store.AgentFilter{}, store.ListOptions{Limit: 0})
+	require.NoError(t, err)
+	assert.Equal(t, total, result.TotalCount)
+	assert.Len(t, result.Items, total, "with the default limit of 500, all %d agents should be returned", total)
+	assert.Empty(t, result.NextCursor, "no next page should exist when all agents fit in one page")
+}
+
+// TestListAgents_MaxLimit verifies that ListAgents with a Limit exceeding 500 is
+// capped at the max of 500.
+func TestListAgents_MaxLimit(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	// Create 510 agents — just over the max limit.
+	const total = 510
+	for i := 0; i < total; i++ {
+		a := makeAgent(projectID, fmt.Sprintf("max-%03d", i))
+		require.NoError(t, s.CreateAgent(ctx, a))
+	}
+
+	// Requesting a limit above the max (1000) should cap at 500.
+	result, err := s.ListAgents(ctx, store.AgentFilter{}, store.ListOptions{Limit: 1000})
+	require.NoError(t, err)
+	assert.Equal(t, total, result.TotalCount, "TotalCount should reflect all agents")
+	assert.Len(t, result.Items, 500, "Limit>500 must be capped at maxAgentListLimit=500")
+	assert.NotEmpty(t, result.NextCursor, "more agents exist, so NextCursor must be set")
 }
 
 // ids extracts the agent IDs from a slice for order-independent comparison.

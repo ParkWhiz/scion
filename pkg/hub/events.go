@@ -22,6 +22,7 @@ import (
 	"sync"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
 
 // EventPublisher defines the interface for publishing Hub events.
@@ -38,6 +39,7 @@ type EventPublisher interface {
 	PublishBrokerStatus(ctx context.Context, brokerID, status string)
 	PublishNotification(ctx context.Context, notif *store.Notification)
 	PublishUserMessage(ctx context.Context, msg *store.Message)
+	PublishAgentPorts(ctx context.Context, agent *store.Agent)
 	PublishAllowListChanged(ctx context.Context, action string, email string)
 	PublishInviteChanged(ctx context.Context, action string, inviteID string, codePrefix string)
 	// PublishDispatchDone emits a slim completion event on
@@ -69,6 +71,7 @@ func (noopEventPublisher) PublishBrokerDisconnected(_ context.Context, _ string,
 func (noopEventPublisher) PublishBrokerStatus(_ context.Context, _, _ string)                {}
 func (noopEventPublisher) PublishNotification(_ context.Context, _ *store.Notification)      {}
 func (noopEventPublisher) PublishUserMessage(_ context.Context, _ *store.Message)            {}
+func (noopEventPublisher) PublishAgentPorts(_ context.Context, _ *store.Agent)               {}
 func (noopEventPublisher) PublishAllowListChanged(_ context.Context, _, _ string)            {}
 func (noopEventPublisher) PublishInviteChanged(_ context.Context, _, _, _ string)            {}
 func (noopEventPublisher) PublishDispatchDone(_ context.Context, _ string)                   {}
@@ -102,35 +105,37 @@ type AgentDetail struct {
 
 // AgentStatusEvent is published when an agent's status changes.
 type AgentStatusEvent struct {
-	AgentID         string       `json:"agentId"`
-	ProjectID       string       `json:"projectId"`
-	GroveID         string       `json:"groveId"`
-	Phase           string       `json:"phase,omitempty"`
-	Activity        string       `json:"activity,omitempty"`
-	Detail          *AgentDetail `json:"detail,omitempty"`
-	ContainerStatus string       `json:"containerStatus,omitempty"`
+	AgentID           string       `json:"agentId"`
+	ProjectID         string       `json:"projectId"`
+	GroveID           string       `json:"groveId"`
+	Phase             string       `json:"phase,omitempty"`
+	Activity          string       `json:"activity,omitempty"`
+	Detail            *AgentDetail `json:"detail,omitempty"`
+	ContainerStatus   string       `json:"containerStatus,omitempty"`
+	LastActivityEvent string       `json:"lastActivityEvent,omitempty"`
 }
 
 // AgentCreatedEvent is published when an agent is created.
 // Unlike status deltas this carries the full agent snapshot so that
 // subscribers can render a complete row without an extra REST fetch.
 type AgentCreatedEvent struct {
-	AgentID         string `json:"agentId"`
-	ProjectID       string `json:"projectId"`
-	GroveID         string `json:"groveId"`
-	Name            string `json:"name"`
-	Slug            string `json:"slug"`
-	Template        string `json:"template,omitempty"`
-	Phase           string `json:"phase,omitempty"`
-	Activity        string `json:"activity,omitempty"`
-	ContainerStatus string `json:"containerStatus,omitempty"`
-	Image           string `json:"image,omitempty"`
-	Runtime         string `json:"runtime,omitempty"`
-	RuntimeBrokerID string `json:"runtimeBrokerId,omitempty"`
-	CreatedBy       string `json:"createdBy,omitempty"`
-	Visibility      string `json:"visibility,omitempty"`
-	TaskSummary     string `json:"taskSummary,omitempty"`
-	Created         string `json:"created,omitempty"`
+	AgentID         string   `json:"agentId"`
+	ProjectID       string   `json:"projectId"`
+	GroveID         string   `json:"groveId"`
+	Name            string   `json:"name"`
+	Slug            string   `json:"slug"`
+	Template        string   `json:"template,omitempty"`
+	Phase           string   `json:"phase,omitempty"`
+	Activity        string   `json:"activity,omitempty"`
+	ContainerStatus string   `json:"containerStatus,omitempty"`
+	Image           string   `json:"image,omitempty"`
+	Runtime         string   `json:"runtime,omitempty"`
+	RuntimeBrokerID string   `json:"runtimeBrokerId,omitempty"`
+	CreatedBy       string   `json:"createdBy,omitempty"`
+	Visibility      string   `json:"visibility,omitempty"`
+	TaskSummary     string   `json:"taskSummary,omitempty"`
+	Created         string   `json:"created,omitempty"`
+	Ancestry        []string `json:"ancestry,omitempty"`
 }
 
 // AgentDeletedEvent is published when an agent is deleted.
@@ -138,6 +143,14 @@ type AgentDeletedEvent struct {
 	AgentID   string `json:"agentId"`
 	ProjectID string `json:"projectId"`
 	GroveID   string `json:"groveId"`
+}
+
+// AgentPortsEvent is published when an agent's exposed ports change.
+type AgentPortsEvent struct {
+	AgentID   string              `json:"agentId"`
+	ProjectID string              `json:"projectId"`
+	GroveID   string              `json:"groveId"`
+	Ports     []store.ExposedPort `json:"ports"`
 }
 
 // ProjectCreatedEvent is published when a project is created.
@@ -244,12 +257,24 @@ type ChannelEventPublisher struct {
 	mu          sync.RWMutex
 	subscribers map[string][]chan Event
 	closed      bool
+	log         *slog.Logger
+}
+
+// logger returns the events subsystem logger, falling back to slog.Default()
+// when the field is nil (e.g. in tests that construct ChannelEventPublisher
+// directly).
+func (p *ChannelEventPublisher) logger() *slog.Logger {
+	if p.log != nil {
+		return p.log
+	}
+	return slog.Default()
 }
 
 // NewChannelEventPublisher creates a new ChannelEventPublisher.
 func NewChannelEventPublisher() *ChannelEventPublisher {
 	p := &ChannelEventPublisher{
 		subscribers: make(map[string][]chan Event),
+		log:         logging.Subsystem("hub.events"),
 	}
 	p.sink = p.publish
 	return p
@@ -267,6 +292,8 @@ func (p *ChannelEventPublisher) Subscribe(patterns ...string) (<-chan Event, fun
 	}
 	p.mu.Unlock()
 
+	p.logger().Info("subscriber added", "patterns", patterns)
+
 	unsubscribe := func() {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -279,6 +306,7 @@ func (p *ChannelEventPublisher) Subscribe(patterns ...string) (<-chan Event, fun
 				}
 			}
 		}
+		p.logger().Info("subscriber removed", "patterns", patterns)
 	}
 
 	return ch, unsubscribe
@@ -289,7 +317,7 @@ func (p *ChannelEventPublisher) Subscribe(patterns ...string) (<-chan Event, fun
 func (p *ChannelEventPublisher) publish(subject string, event interface{}) {
 	data, err := json.Marshal(event)
 	if err != nil {
-		slog.Error("Failed to marshal event", "subject", subject, "error", err)
+		p.logger().Error("Failed to marshal event", "subject", subject, "error", err)
 		return
 	}
 
@@ -302,17 +330,23 @@ func (p *ChannelEventPublisher) publish(subject string, event interface{}) {
 		return
 	}
 
+	matched := 0
 	for pattern, subs := range p.subscribers {
 		if subjectMatchesPattern(pattern, subject) {
 			for _, ch := range subs {
 				select {
 				case ch <- evt:
+					matched++
 				default:
 					// Drop event on full buffer (backpressure)
+					p.logger().Debug("event dropped (subscriber buffer full)",
+						"subject", subject, "pattern", pattern)
 				}
 			}
 		}
 	}
+
+	p.logger().Debug("event published", "subject", subject, "subscribers", matched)
 }
 
 // PublishRaw publishes an arbitrary event on the given subject.
@@ -340,6 +374,8 @@ func (p *ChannelEventPublisher) Close() {
 			}
 		}
 	}
+
+	p.logger().Info("event publisher closed", "subscriber_channels", len(seen))
 }
 
 // PublishAgentStatus publishes an agent status event to both agent-specific
@@ -352,6 +388,9 @@ func (p *eventBuilder) PublishAgentStatus(_ context.Context, agent *store.Agent)
 		Phase:           agent.Phase,
 		Activity:        agent.Activity,
 		ContainerStatus: agent.ContainerStatus,
+	}
+	if !agent.LastActivityEvent.IsZero() {
+		evt.LastActivityEvent = agent.LastActivityEvent.Format("2006-01-02T15:04:05Z07:00")
 	}
 
 	detail := AgentDetail{
@@ -393,6 +432,7 @@ func (p *eventBuilder) PublishAgentCreated(_ context.Context, agent *store.Agent
 		CreatedBy:       agent.CreatedBy,
 		Visibility:      agent.Visibility,
 		TaskSummary:     agent.TaskSummary,
+		Ancestry:        agent.Ancestry,
 	}
 	if !agent.Created.IsZero() {
 		evt.Created = agent.Created.Format("2006-01-02T15:04:05Z07:00")
@@ -416,6 +456,21 @@ func (p *eventBuilder) PublishAgentDeleted(_ context.Context, agentID, projectID
 	if projectID != "" {
 		p.sink("project."+projectID+".agent.deleted", evt)
 		p.sink("grove."+projectID+".agent.deleted", evt)
+	}
+}
+
+// PublishAgentPorts publishes an agent ports event when the exposed ports change.
+func (p *eventBuilder) PublishAgentPorts(_ context.Context, agent *store.Agent) {
+	evt := AgentPortsEvent{
+		AgentID:   agent.ID,
+		ProjectID: agent.ProjectID,
+		GroveID:   agent.ProjectID,
+		Ports:     agent.ExposedPorts,
+	}
+	p.sink("agent."+agent.ID+".ports", evt)
+	if agent.ProjectID != "" {
+		p.sink("project."+agent.ProjectID+".agent.ports", evt)
+		p.sink("grove."+agent.ProjectID+".agent.ports", evt)
 	}
 }
 

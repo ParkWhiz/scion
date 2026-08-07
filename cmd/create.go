@@ -143,7 +143,7 @@ arguments are provided, an empty prompt.md is created for later editing.`,
 		if hubErr == nil && hctx != nil && hctx.Client != nil {
 			hubResolver := agent.NewHubSkillResolver(hctx.Client.Skills())
 			resolver := agent.NewRoutingSkillResolver(hubResolver)
-			ghResolver := agent.NewGitHubSkillResolver()
+			ghResolver := agent.NewGitHubSkillResolverWithCredentials(os.Getenv("GITHUB_TOKEN"), nil, nil)
 			resolver.Register("gh", ghResolver)
 
 			registrySvc := hctx.Client.SkillRegistries()
@@ -322,7 +322,7 @@ func init() {
 	createCmd.Flags().StringVarP(&templateName, "type", "t", "", "Template to use")
 	createCmd.Flags().StringVarP(&agentImage, "image", "i", "", "Container image to use (overrides template)")
 	createCmd.Flags().StringVarP(&branch, "branch", "b", "", "Git branch to use for the agent workspace")
-	createCmd.Flags().StringVarP(&workspace, "workspace", "w", "", "Host path to mount as /workspace")
+	createCmd.Flags().StringVarP(&workspace, "workspace", "w", "", "Host path or project-relative subdirectory to mount as /workspace")
 	createCmd.Flags().StringVar(&runtimeBrokerID, "broker", "", "Preferred runtime broker ID or name")
 	createCmd.Flags().StringVar(&harnessConfigFlag, "harness-config", "", "Named harness configuration to use")
 	createCmd.Flags().StringVar(&harnessConfigFlag, "harness", "h", "Named harness configuration to use (alias for --harness-config)")

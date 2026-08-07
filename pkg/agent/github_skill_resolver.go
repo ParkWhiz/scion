@@ -17,6 +17,7 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,11 +49,12 @@ const (
 // GitHubSkillResolver resolves skills from GitHub repositories
 // using the GitHub Contents API.
 type GitHubSkillResolver struct {
-	httpClient      *http.Client
-	token           string // GITHUB_TOKEN for authenticated requests
-	apiBase         string // Default: githubAPIBase, override in tests
-	rawBase         string // Default: githubRawBase, override in tests
-	resolutionCache *GitHubResolutionCache
+	httpClient           *http.Client
+	token                string            // Default GITHUB_TOKEN for authenticated requests
+	provisionCredentials map[string]string // Per-URI named credentials from ProvisionCredentials
+	apiBase              string            // Default: githubAPIBase, override in tests
+	rawBase              string            // Default: githubRawBase, override in tests
+	resolutionCache      *GitHubResolutionCache
 }
 
 // NewGitHubSkillResolver creates a resolver for gh:// and GitHub URL skills.
@@ -61,8 +63,18 @@ type GitHubSkillResolver struct {
 // are reused to avoid redundant GitHub API calls.
 func NewGitHubSkillResolver() *GitHubSkillResolver {
 	var cache *GitHubResolutionCache
-	if cacheDir, err := githubResolutionCacheDir(); err == nil {
-		cache, _ = NewGitHubResolutionCache(cacheDir, DefaultResolutionCacheTTL)
+	cacheDir, cacheDirErr := GitHubResolutionCacheDir()
+	if cacheDirErr != nil {
+		// Print to stderr unconditionally: without a cache every request hits the
+		// GitHub API fresh, directly contributing to rate-limit exhaustion.
+		fmt.Fprintf(os.Stderr, "github: WARNING: failed to determine resolution cache dir: %v; proceeding without cache\n", cacheDirErr)
+	} else {
+		var cacheErr error
+		cache, cacheErr = NewGitHubResolutionCache(cacheDir, DefaultResolutionCacheTTL)
+		if cacheErr != nil {
+			// Same rationale: operators need to see cache failures in production logs.
+			fmt.Fprintf(os.Stderr, "github: WARNING: failed to initialize resolution cache at %s: %v (proceeding without cache)\n", cacheDir, cacheErr)
+		}
 	}
 	return &GitHubSkillResolver{
 		httpClient:      &http.Client{Timeout: githubAPITimeout},
@@ -71,6 +83,109 @@ func NewGitHubSkillResolver() *GitHubSkillResolver {
 		rawBase:         githubRawBase,
 		resolutionCache: cache,
 	}
+}
+
+// NewGitHubSkillResolverWithCredentials constructs a resolver with an explicit
+// default token and a named-credential map for per-URI lookup.
+//
+// Token resolution order for bare gh:// URIs (no ?token= suffix):
+//  1. defaultToken (from req.ResolvedEnv["GITHUB_TOKEN"] — GitHub App or env-type secret).
+//  2. GITHUB_TOKEN from the broker process environment (os.Getenv, set by NewGitHubSkillResolver).
+//  3. GITHUB_TOKEN from provisionCredentials (project secret of any type).
+//  4. No token — unauthenticated calls, subject to GitHub's 60 req/hr per-IP limit.
+//
+// provisionCredentials maps secret name → value; may be nil.
+// If cache is non-nil, it is used as the singleton resolution cache (e.g., from
+// the broker server struct) instead of the per-resolver cache created by
+// NewGitHubSkillResolver. Pass nil to get the default per-resolver cache behavior.
+func NewGitHubSkillResolverWithCredentials(defaultToken string, provisionCredentials map[string]string, cache *GitHubResolutionCache) *GitHubSkillResolver {
+	r := NewGitHubSkillResolver()
+	if defaultToken != "" {
+		r.token = defaultToken
+	} else if r.token == "" {
+		// Neither an explicit token nor the broker-env GITHUB_TOKEN is available.
+		// Fall back to a project-scoped provision credential named GITHUB_TOKEN.
+		// This covers projects that store GITHUB_TOKEN as a secret but not as an
+		// env-type secret (which would have been included in req.ResolvedEnv).
+		if val := provisionCredentials["GITHUB_TOKEN"]; val != "" {
+			r.token = val
+		}
+	}
+	r.provisionCredentials = provisionCredentials
+	// If a singleton cache is provided (e.g., from the broker server struct),
+	// use it instead of the per-resolver cache created by NewGitHubSkillResolver.
+	if cache != nil {
+		r.resolutionCache = cache
+	}
+	return r
+}
+
+// normalizeGitHubName uppercases a GitHub name and replaces hyphens and dots
+// with underscores to produce a valid env-var-style key segment.
+func normalizeGitHubName(name string) string {
+	s := strings.ToUpper(name)
+	s = strings.ReplaceAll(s, "-", "_")
+	s = strings.ReplaceAll(s, ".", "_")
+	return s
+}
+
+// deriveGitHubTokenKey converts a GitHub owner/repo pair into the conventional
+// project secret key name: GH_{OWNER}__{REPO}.
+func deriveGitHubTokenKey(owner, repo string) string {
+	return "GH_" + normalizeGitHubName(owner) + "__" + normalizeGitHubName(repo)
+}
+
+// deriveGitHubOwnerKey converts a GitHub owner into the owner-level
+// fallback key: GH_{OWNER}.
+func deriveGitHubOwnerKey(owner string) string {
+	return "GH_" + normalizeGitHubName(owner)
+}
+
+// tokenForRef returns the appropriate GitHub token for the given ref.
+//
+// Resolution precedence:
+//  1. Explicit ?token=SECRET_NAME on the URI — looked up in provisionCredentials.
+//  2. Repo-specific convention key GH_{OWNER}__{REPO} from provisionCredentials.
+//  3. Owner-level convention key GH_{OWNER} from provisionCredentials.
+//  4. Default GITHUB_TOKEN cascade (r.token).
+//  5. Empty string — unauthenticated; works for public repos.
+//
+// If ?token= is present but the named secret is missing, an error is returned.
+// Missing convention keys are not errors — the resolver silently falls through.
+func (r *GitHubSkillResolver) tokenForRef(ref *GitHubSkillRef) (string, error) {
+	// Priority 1: Explicit ?token= override.
+	if ref.TokenSecretName != "" {
+		// In Go, reading from a nil map is safe and returns "". Both nil map and
+		// missing/empty key produce the same error: the secret is unavailable.
+		if val := r.provisionCredentials[ref.TokenSecretName]; val != "" {
+			return val, nil
+		}
+		return "", fmt.Errorf("secret %q not found in ProvisionCredentials; ensure it is set at project scope", ref.TokenSecretName)
+	}
+
+	// Priority 2: Repo-specific convention key (GH_OWNER__REPO).
+	repoKey := deriveGitHubTokenKey(ref.Owner, ref.Repo)
+	if val := r.provisionCredentials[repoKey]; val != "" {
+		util.Debugf("github: using credential %s for %s/%s", repoKey, ref.Owner, ref.Repo)
+		return val, nil
+	}
+
+	// Priority 3: Owner-level convention key (GH_OWNER).
+	ownerKey := deriveGitHubOwnerKey(ref.Owner)
+	if val := r.provisionCredentials[ownerKey]; val != "" {
+		util.Debugf("github: using credential %s for %s/%s", ownerKey, ref.Owner, ref.Repo)
+		return val, nil
+	}
+
+	// Priority 4: Default GITHUB_TOKEN cascade.
+	if r.token != "" {
+		util.Debugf("github: no convention credential for %s/%s, using default", ref.Owner, ref.Repo)
+		return r.token, nil
+	}
+
+	// Priority 5: No credential available — unauthenticated.
+	fmt.Fprintf(os.Stderr, "github: WARNING: no credential available for %s/%s, attempting unauthenticated\n", ref.Owner, ref.Repo)
+	return "", nil
 }
 
 func (r *GitHubSkillResolver) ResolverName() string { return "github" }
@@ -100,10 +215,33 @@ func (r *GitHubSkillResolver) Resolve(ctx context.Context, refs []api.SkillRefer
 	return result, nil
 }
 
+// resolutionCacheKey returns a canonical cache key for a skill ref.
+// A SHA-256 hash of the token is included so that different credentials
+// produce separate cache entries, preventing cross-credential cache sharing
+// of private content. The raw token is never used as a key value.
+func resolutionCacheKey(ghRef *GitHubSkillRef, token string) string {
+	var tokenSuffix string
+	if token != "" {
+		h := sha256.Sum256([]byte(token))
+		tokenSuffix = "#" + hex.EncodeToString(h[:8]) // 16-char hex prefix of hash
+	}
+	return fmt.Sprintf("gh://%s/%s/%s@%s%s",
+		ghRef.Owner, ghRef.Repo, ghRef.SkillPath, ghRef.Ref, tokenSuffix)
+}
+
 func (r *GitHubSkillResolver) resolveOne(ctx context.Context, ghRef *GitHubSkillRef, ref api.SkillReference) (*ResolvedSkill, error) {
-	// Check resolution cache first
+	// Resolve credential first — before cache check.
+	// This ensures: (1) missing credentials fail immediately, (2) the token
+	// hash is available for the cache key, isolating cache entries per credential.
+	token, err := r.tokenForRef(ghRef)
+	if err != nil {
+		return nil, err
+	}
+
+	cacheKey := resolutionCacheKey(ghRef, token)
 	if r.resolutionCache != nil {
-		if cached, ok := r.resolutionCache.Get(ref.URI); ok {
+		if cached, ok := r.resolutionCache.Get(cacheKey); ok {
+			// No separate tokenForRef needed here — token already validated above.
 			util.Debugf("github: resolution cache hit for %s", ref.URI)
 			result := cached
 			result.As = ref.As
@@ -111,12 +249,12 @@ func (r *GitHubSkillResolver) resolveOne(ctx context.Context, ghRef *GitHubSkill
 		}
 	}
 
-	commitSHA, err := r.resolveCommitSHA(ctx, ghRef)
+	commitSHA, err := r.resolveCommitSHA(ctx, ghRef, token)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve ref for %s: %w", ghRef.Raw, err)
 	}
 
-	contents, err := r.listContents(ctx, ghRef, commitSHA)
+	contents, err := r.listContents(ctx, ghRef, commitSHA, token)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +276,7 @@ func (r *GitHubSkillResolver) resolveOne(ctx context.Context, ghRef *GitHubSkill
 			continue
 		}
 
-		content, err := r.downloadRawFile(ctx, ghRef, commitSHA, entry.Path)
+		content, err := r.downloadRawFile(ctx, ghRef, commitSHA, entry.Path, token)
 		if err != nil {
 			return nil, fmt.Errorf("failed to download %s: %w", entry.Path, err)
 		}
@@ -147,10 +285,11 @@ func (r *GitHubSkillResolver) resolveOne(ctx context.Context, ghRef *GitHubSkill
 		relPath := strings.TrimPrefix(entry.Path, ghRef.SkillPath+"/")
 
 		resolvedFiles = append(resolvedFiles, ResolvedFile{
-			Path: relPath,
-			URL:  r.rawContentURL(ghRef, commitSHA, entry.Path),
-			Hash: hash,
-			Size: int64(len(content)),
+			Path:    relPath,
+			URL:     r.rawContentURL(ghRef, commitSHA, entry.Path),
+			Hash:    hash,
+			Size:    int64(len(content)),
+			Content: content, // Carry bytes so install phase skips unauthenticated re-download.
 		})
 		fileInfos = append(fileInfos, transfer.FileInfo{Path: relPath, Hash: hash})
 	}
@@ -163,17 +302,19 @@ func (r *GitHubSkillResolver) resolveOne(ctx context.Context, ghRef *GitHubSkill
 	bundleHash := transfer.ComputeContentHash(fileInfos)
 
 	resolved := &ResolvedSkill{
-		Name:    ghRef.SkillName,
-		URI:     ghRef.Raw,
-		As:      ref.As,
-		Version: commitSHA[:12],
-		Hash:    bundleHash,
-		Files:   resolvedFiles,
+		Name:     ghRef.SkillName,
+		URI:      ghRef.Raw,
+		As:       ref.As,
+		Version:  commitSHA[:12],
+		Hash:     bundleHash,
+		Scope:    ref.Scope,
+		Files:    resolvedFiles,
+		Optional: ref.Optional,
 	}
 
-	// Store in resolution cache
+	// Store in resolution cache under the token-hashed key.
 	if r.resolutionCache != nil {
-		r.resolutionCache.Put(ref.URI, *resolved)
+		r.resolutionCache.Put(cacheKey, *resolved)
 	}
 
 	return resolved, nil
@@ -188,10 +329,45 @@ type githubContentEntry struct {
 	DownloadURL string `json:"download_url"`
 }
 
-func (r *GitHubSkillResolver) resolveCommitSHA(ctx context.Context, ghRef *GitHubSkillRef) (string, error) {
+// isFullCommitSHA reports whether s is a complete 40-character lowercase
+// hexadecimal commit SHA. Such a ref is already fully resolved and requires
+// no GitHub API call to "resolve" it further.
+func isFullCommitSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *GitHubSkillResolver) resolveCommitSHA(ctx context.Context, ghRef *GitHubSkillRef, token string) (string, error) {
 	ref := ghRef.Ref
 	if ref == "" {
 		ref = "HEAD"
+	}
+
+	// Warn before any API call path — including listContents and downloadRawFile
+	// called by the parent resolveOne after this function returns. Even when the
+	// full-SHA short-circuit below skips the SHA-lookup call, those subsequent
+	// calls still go out unauthenticated; the operator needs advance notice.
+	// Unauthenticated GitHub API calls are limited to 60/hr per outbound IP
+	// (shared across all broker instances on Cloud Run / Cloud NAT).
+	// To fix: set GITHUB_TOKEN in the project secrets or the broker's environment.
+	if token == "" {
+		fmt.Fprintf(os.Stderr, "github: WARNING: no GITHUB_TOKEN configured for %s; "+
+			"making unauthenticated GitHub API call (limit: 60 req/hr per IP). "+
+			"Set a GITHUB_TOKEN project secret or broker env var to increase the limit.\n", ghRef.Raw)
+	}
+
+	// Short-circuit: if the ref is already a full 40-char lowercase hex commit SHA,
+	// no API call is needed — the ref IS the resolved SHA.
+	if isFullCommitSHA(ref) {
+		util.Debugf("github: ref %s is already a full SHA, skipping resolveCommitSHA API call", ref)
+		return ref, nil
 	}
 
 	reqURL := fmt.Sprintf("%s/repos/%s/%s/commits/%s", r.apiBase,
@@ -201,7 +377,7 @@ func (r *GitHubSkillResolver) resolveCommitSHA(ctx context.Context, ghRef *GitHu
 		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3.sha")
-	r.setAuthHeader(req)
+	r.setAuthHeader(req, token)
 
 	resp, err := r.doWithRetry(ctx, req)
 	if err != nil {
@@ -227,7 +403,7 @@ func (r *GitHubSkillResolver) resolveCommitSHA(ctx context.Context, ghRef *GitHu
 	return sha, nil
 }
 
-func (r *GitHubSkillResolver) listContents(ctx context.Context, ghRef *GitHubSkillRef, commitSHA string) ([]githubContentEntry, error) {
+func (r *GitHubSkillResolver) listContents(ctx context.Context, ghRef *GitHubSkillRef, commitSHA string, token string) ([]githubContentEntry, error) {
 	escapedPath := escapePathSegments(ghRef.SkillPath)
 	reqURL := fmt.Sprintf("%s/repos/%s/%s/contents/%s?ref=%s",
 		r.apiBase, url.PathEscape(ghRef.Owner), url.PathEscape(ghRef.Repo), escapedPath, url.QueryEscape(commitSHA))
@@ -237,7 +413,7 @@ func (r *GitHubSkillResolver) listContents(ctx context.Context, ghRef *GitHubSki
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	r.setAuthHeader(req)
+	r.setAuthHeader(req, token)
 
 	resp, err := r.doWithRetry(ctx, req)
 	if err != nil {
@@ -261,14 +437,14 @@ func (r *GitHubSkillResolver) listContents(ctx context.Context, ghRef *GitHubSki
 	return entries, nil
 }
 
-func (r *GitHubSkillResolver) downloadRawFile(ctx context.Context, ghRef *GitHubSkillRef, commitSHA, filePath string) ([]byte, error) {
+func (r *GitHubSkillResolver) downloadRawFile(ctx context.Context, ghRef *GitHubSkillRef, commitSHA, filePath string, token string) ([]byte, error) {
 	reqURL := r.rawContentURL(ghRef, commitSHA, filePath)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	r.setAuthHeader(req)
+	r.setAuthHeader(req, token)
 
 	resp, err := r.doWithRetry(ctx, req)
 	if err != nil {
@@ -303,9 +479,9 @@ func escapePathSegments(p string) string {
 	return strings.Join(segments, "/")
 }
 
-func (r *GitHubSkillResolver) setAuthHeader(req *http.Request) {
-	if r.token != "" {
-		req.Header.Set("Authorization", "Bearer "+r.token)
+func (r *GitHubSkillResolver) setAuthHeader(req *http.Request, token string) {
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 }
 

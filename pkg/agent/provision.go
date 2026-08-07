@@ -15,6 +15,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -356,12 +357,29 @@ func (m *AgentManager) Provision(ctx context.Context, opts api.StartOptions) (*a
 		}
 		inlineCfg.AuthSelectedType = opts.HarnessAuth
 	}
-	agentDir, _, _, cfg, err := GetAgent(ctx, opts.Name, opts.Template, opts.Image, opts.HarnessConfig, opts.ProjectPath, opts.Profile, "created", opts.Branch, opts.Workspace, inlineCfg)
+	agentDir, agentHome, _, cfg, err := GetAgent(ctx, opts.Name, opts.Template, opts.Image, opts.HarnessConfig, opts.ProjectPath, opts.Profile, "created", opts.Branch, opts.Workspace, inlineCfg)
 	if err == nil {
 		_ = UpdateAgentConfig(opts.Name, opts.ProjectPath, "created", m.Runtime.Name(), opts.Profile)
 	}
 	if err != nil {
 		return cfg, err
+	}
+
+	// Stage the project-level pre-start hook script if one was inlined into
+	// opts at agent-create time. The script is written at
+	// pre-start.d/30-project-custom so it runs after the harness provisioner
+	// (20-harness-provision). A staging failure is fatal — the project owner
+	// explicitly configured this script and a silent skip would be misleading.
+	//
+	// Called unconditionally: with an empty script the helper removes any
+	// previously staged file, so a hook that no longer applies cannot survive
+	// on a reused agent home.
+	//
+	// Use agentHome from GetAgent (which resolves the project path correctly
+	// for non-git/external projects) rather than recomputing from opts.ProjectPath,
+	// which may be a marker file rather than a directory for such projects.
+	if err := harness.WriteProjectPreStartHook(agentHome, opts.ProjectPreStartHookScript); err != nil {
+		return cfg, fmt.Errorf("stage project pre-start hook: %w", err)
 	}
 
 	// Persist harness auth override to the on-disk config (for sciontool).
@@ -395,6 +413,57 @@ func resolveHarnessConfigDir(ctx context.Context, name, projectPath string, temp
 		return config.LoadHarnessConfigDir(hcPath)
 	}
 	return config.FindHarnessConfigDir(name, projectPath, templatePaths...)
+}
+
+// resolveProjectRoot determines the project root directory on this broker.
+// Used for resolving relative --workspace paths against the project's logical root.
+func resolveProjectRoot(settings *config.VersionedSettings, projectDir string) string {
+	if settings != nil && settings.WorkspacePath != "" {
+		return settings.WorkspacePath
+	}
+	if filepath.Base(projectDir) == config.DotScion {
+		return filepath.Dir(projectDir)
+	}
+	return projectDir
+}
+
+// resolveWorkspaceSubdir resolves a relative workspace subdirectory path
+// against a project root, with containment checks to prevent directory
+// traversal and symlink escapes.
+func resolveWorkspaceSubdir(projectRoot, subdir string) (string, error) {
+	if filepath.IsAbs(subdir) {
+		return "", fmt.Errorf("workspace subdir must be relative, got absolute path: %s", subdir)
+	}
+
+	cleaned := filepath.Clean(subdir)
+	if cleaned == "." {
+		return projectRoot, nil
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("workspace subdir %q escapes project root (contains '..')", subdir)
+	}
+
+	joined := filepath.Join(projectRoot, cleaned)
+
+	if _, err := os.Stat(joined); os.IsNotExist(err) {
+		return "", fmt.Errorf("workspace subdirectory does not exist: %s", joined)
+	}
+
+	realRoot, err := filepath.EvalSymlinks(projectRoot)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve project root: %w", err)
+	}
+	realJoined, err := filepath.EvalSymlinks(joined)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve workspace subdir: %w", err)
+	}
+
+	rel, err := filepath.Rel(realRoot, realJoined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("workspace subdir %q resolves to %s which is outside project root %s", subdir, realJoined, realRoot)
+	}
+
+	return realJoined, nil
 }
 
 func ProvisionAgent(ctx context.Context, agentName string, templateName string, agentImage string, harnessConfig string, projectPath string, profileName string, optionalStatus string, branch string, workspace string, inlineConfig ...*api.ScionConfig) (string, string, *api.ScionConfig, error) {
@@ -481,6 +550,12 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	// Check for git clone mode from context
 	gitClone := api.GitCloneFromContext(ctx)
 
+	// Reject relative workspace for git-clone projects early, before the
+	// workspace resolution logic where gitClone takes priority.
+	if gitClone != nil && workspace != "" && !filepath.IsAbs(workspace) {
+		return "", "", nil, fmt.Errorf("relative --workspace is not supported for git-clone projects; use an absolute path or remove --workspace")
+	}
+
 	// Workspace Resolution Logic
 	if gitClone != nil {
 		// Git clone mode: ensure the workspace directory exists and is ready
@@ -511,18 +586,30 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	} else if workspace != "" {
 		// Case 1: Explicit Workspace provided
 		// This overrides everything else. We mount this path directly.
-		absWorkspace, err := filepath.Abs(workspace)
-		if err != nil {
-			return "", "", nil, fmt.Errorf("failed to resolve absolute path for workspace %s: %w", workspace, err)
+		if filepath.IsAbs(workspace) {
+			// Current behavior: mount this exact host path
+			absWorkspace, err := filepath.Abs(workspace)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("failed to resolve absolute path for workspace %s: %w", workspace, err)
+			}
+			if _, err := os.Stat(absWorkspace); os.IsNotExist(err) {
+				return "", "", nil, fmt.Errorf("workspace path does not exist: %s", absWorkspace)
+			}
+			workspaceSource = absWorkspace
+			agentWorkspace = ""
+			explicitWorkspace = true
+		} else {
+			// NEW: resolve relative subdir against project root
+			// (gitClone + relative workspace is rejected above)
+			projectRoot := resolveProjectRoot(settings, projectDir)
+			resolved, err := resolveWorkspaceSubdir(projectRoot, workspace)
+			if err != nil {
+				return "", "", nil, err
+			}
+			workspaceSource = resolved
+			agentWorkspace = ""
+			explicitWorkspace = true
 		}
-
-		if _, err := os.Stat(absWorkspace); os.IsNotExist(err) {
-			return "", "", nil, fmt.Errorf("workspace path does not exist: %s", absWorkspace)
-		}
-
-		workspaceSource = absWorkspace
-		agentWorkspace = "" // We are not using the managed local workspace directory
-		explicitWorkspace = true
 
 	} else if isGit {
 		// Case 2: Git Repository (and no explicit workspace)
@@ -892,6 +979,12 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 
 	// Step 4: Inject agent instructions
 
+	// Load mandatory preamble — prepended to all agent instructions.
+	mandatoryPreamble, err := loadMandatoryPreamble(resources.MandatoryBoilerplateFS())
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to load mandatory boilerplate: %w", err)
+	}
+
 	// Determine whether inline config provided content directly (already resolved).
 	// If so, we skip template-based file resolution for that field.
 	inlineProvidedAgentInstructions := inlineCfg != nil && inlineCfg.AgentInstructions != ""
@@ -927,13 +1020,19 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 					return "", "", nil, fmt.Errorf("failed to resolve agent_instructions: %w", err)
 				}
 			}
-			if content != nil {
-				util.Debugf("ProvisionAgent: injecting agent instructions (%d bytes) into %s", len(content), agentHome)
-				if err := h.InjectAgentInstructions(agentHome, content); err != nil {
+			composed := composeInstructions(mandatoryPreamble, content)
+			if composed != nil {
+				util.Debugf("ProvisionAgent: injecting agent instructions (%d bytes) into %s", len(composed), agentHome)
+				if err := h.InjectAgentInstructions(agentHome, composed); err != nil {
 					return "", "", nil, fmt.Errorf("failed to inject agent instructions: %w", err)
 				}
 			} else {
-				util.Debugf("ProvisionAgent: agent_instructions resolved to nil, skipping injection")
+				util.Debugf("ProvisionAgent: both mandatory preamble and template content are nil, skipping injection")
+			}
+		} else if len(mandatoryPreamble) > 0 {
+			util.Debugf("ProvisionAgent: no agent_instructions configured; injecting mandatory preamble only (%d bytes)", len(mandatoryPreamble))
+			if err := h.InjectAgentInstructions(agentHome, mandatoryPreamble); err != nil {
+				return "", "", nil, fmt.Errorf("failed to inject agent instructions: %w", err)
 			}
 		} else {
 			util.Debugf("ProvisionAgent: no agent_instructions configured and no agents.md found in template")
@@ -974,8 +1073,14 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		// No template chain, but inline config may have content fields
 		if finalScionCfg.AgentInstructions != "" {
 			content := []byte(finalScionCfg.AgentInstructions)
-			util.Debugf("ProvisionAgent: injecting inline agent_instructions (%d bytes, no template)", len(content))
-			if err := h.InjectAgentInstructions(agentHome, content); err != nil {
+			composed := composeInstructions(mandatoryPreamble, content)
+			util.Debugf("ProvisionAgent: injecting inline agent_instructions (%d bytes, no template)", len(composed))
+			if err := h.InjectAgentInstructions(agentHome, composed); err != nil {
+				return "", "", nil, fmt.Errorf("failed to inject agent instructions: %w", err)
+			}
+		} else if len(mandatoryPreamble) > 0 {
+			util.Debugf("ProvisionAgent: injecting mandatory preamble only (%d bytes, no template, no inline instructions)", len(mandatoryPreamble))
+			if err := h.InjectAgentInstructions(agentHome, mandatoryPreamble); err != nil {
 				return "", "", nil, fmt.Errorf("failed to inject agent instructions: %w", err)
 			}
 		}
@@ -1005,8 +1110,18 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 			if settings.Telemetry != nil {
 				settingsCfg.Telemetry = config.ConvertV1TelemetryToAPI(settings.Telemetry)
 			}
-			// Template has highest priority, so it should override settings.
-			// We construct a config with ONLY the settings env, then merge finalScionCfg over it.
+			// Template has highest priority IN THIS MERGE, so it overrides
+			// settings here. We construct a config with ONLY the settings env,
+			// then merge finalScionCfg over it.
+			//
+			// This is no longer the whole story for the CONTAINER env. In
+			// broker mode, harness-config env is separately injected into
+			// opts.Env by resolveAuthEnvOverlay (run.go), and opts.Env is
+			// passed as extraEnv to buildAgentEnv (run.go), where it overrides
+			// finalScionCfg.Env. So for a key declared by both the template and
+			// the harness config, the harness-config value is what reaches the
+			// container, even though the template wins the merge below.
+			// Pinned by TestBrokerMode_HarnessConfigEnvOutranksTemplateEnv.
 			finalScionCfg = config.MergeScionConfig(settingsCfg, finalScionCfg)
 		}
 
@@ -1032,6 +1147,54 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		}
 	}
 
+	// Hub operational agent_defaults: below the template and below inline
+	// config (both of which have already populated finalScionCfg by the merge
+	// at step 2b), above this broker's own settings.yaml defaults (applied
+	// immediately below). Same only-if-zero shape as that block, so the two
+	// tiers compose without either needing to know about the other.
+	//
+	// The placement IS the design. Move this after the settings block and the
+	// hub tier loses to settings.yaml; stamp these values hub-side into
+	// InlineConfig instead and they arrive as top-of-chain and beat a
+	// template's explicit max_turns — the inversion this channel exists to
+	// avoid (design §3.2.1, rejected alternative A5).
+	//
+	// The hub sends nothing in file mode, so this never fires there and
+	// file-mode behaviour is unchanged: a co-located broker reads the same
+	// settings.yaml and applies these values itself at the BOTTOM tier below.
+	// The rank of hub agent_defaults is therefore mode-dependent — bottom of
+	// the broker chain in file mode, just above broker settings in Postgres
+	// mode. That is deliberate; see design §3.2.4 and alternative A7.
+	//
+	// Note the asymmetry for Resources: "above this broker's own settings.yaml
+	// defaults" means default_resources ONLY. Broker profile resources and
+	// harness overrides live in that same file but are merged in step 2e ABOVE,
+	// so they win per-field over the hub default_resources applied here — while
+	// broker default_max_turns loses to hub default_max_turns. The hub tier
+	// therefore sits in a different place for Resources than for the three
+	// scalars. That falls out of the insertion point the design specifies and is
+	// the conservative direction (§3.2.4 explicitly does not want hub defaults
+	// silently overriding broker profile resources).
+	if hd := api.HubAgentDefaultsFromContext(ctx); hd != nil && finalScionCfg != nil {
+		if finalScionCfg.MaxTurns == 0 && hd.MaxTurns > 0 {
+			finalScionCfg.MaxTurns = hd.MaxTurns
+		}
+		if finalScionCfg.MaxModelCalls == 0 && hd.MaxModelCalls > 0 {
+			finalScionCfg.MaxModelCalls = hd.MaxModelCalls
+		}
+		if finalScionCfg.MaxDuration == "" && hd.MaxDuration != "" {
+			finalScionCfg.MaxDuration = hd.MaxDuration
+		}
+		if hd.Resources != nil {
+			// Hub defaults in BASE position: per-field merge with the
+			// agent/template value winning any field it sets. MergeResourceSpec
+			// returns base itself when override is nil, so copy first rather
+			// than aliasing the context's spec into the persisted config.
+			base := *hd.Resources
+			finalScionCfg.Resources = config.MergeResourceSpec(&base, finalScionCfg.Resources)
+		}
+	}
+
 	// Apply default limits from settings (hub global defaults) if not already set
 	// by template or inline config. Priority: agent > template > settings defaults.
 	if settings != nil && finalScionCfg != nil {
@@ -1052,6 +1215,23 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 				// Merge: settings defaults are lower priority, so use them as base
 				finalScionCfg.Resources = config.MergeResourceSpec(settings.DefaultResources, finalScionCfg.Resources)
 			}
+		}
+	}
+
+	// Apply built-in resource defaults as the LOWEST-priority tier, below the
+	// settings defaults above. Docker and Podman emit cgroup flags only for
+	// non-empty fields, so an agent that reaches this point with no CPU limit
+	// runs completely unconstrained and can saturate every core on the host.
+	//
+	// Only the CPU limit is filled in, and only when nothing else supplied one;
+	// MergeResourceSpec keeps every field that a higher tier already set, so an
+	// explicit memory-only configuration still gains a CPU limit here.
+	// Gated by runtime.enforce_resource_defaults (default true) so an operator
+	// can restore the previous unlimited behaviour without a rollback.
+	if finalScionCfg != nil && config.ShouldEnforceResourceDefaults(settings) {
+		if finalScionCfg.Resources == nil || finalScionCfg.Resources.Limits.CPU == "" {
+			finalScionCfg.Resources = config.MergeResourceSpec(
+				config.BuiltinDefaultResources(), finalScionCfg.Resources)
 		}
 	}
 
@@ -1229,6 +1409,53 @@ func shouldInjectSkill(fm skillFrontmatter, injCtx workspaceSkillsInjectionConte
 		util.Debugf("provision: unknown inject_when=%q for skill %q, skipping", fm.InjectWhen, fm.Name)
 		return false
 	}
+}
+
+// loadMandatoryPreamble reads all .md files from the mandatory boilerplate FS
+// in lexical filename order and concatenates them separated by double newlines.
+// Returns nil if the FS contains no non-empty .md files.
+func loadMandatoryPreamble(boilerplateFS fs.FS) ([]byte, error) {
+	if boilerplateFS == nil {
+		return nil, nil
+	}
+	entries, err := fs.ReadDir(boilerplateFS, ".")
+	if err != nil {
+		return nil, fmt.Errorf("read mandatory boilerplate: %w", err)
+	}
+	var parts [][]byte
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		data, err := fs.ReadFile(boilerplateFS, e.Name())
+		if err != nil {
+			return nil, fmt.Errorf("read mandatory boilerplate %s: %w", e.Name(), err)
+		}
+		if len(bytes.TrimSpace(data)) > 0 {
+			parts = append(parts, bytes.TrimRight(data, "\r\n"))
+		}
+	}
+	if len(parts) == 0 {
+		return nil, nil
+	}
+	return bytes.Join(parts, []byte("\n\n")), nil
+}
+
+// composeInstructions prepends the mandatory preamble to template content.
+// If preamble is nil/empty, returns templateContent unchanged.
+// If templateContent is nil/empty, returns preamble alone.
+func composeInstructions(preamble, templateContent []byte) []byte {
+	if len(preamble) == 0 {
+		return templateContent
+	}
+	if len(bytes.TrimSpace(templateContent)) == 0 {
+		return preamble
+	}
+	result := make([]byte, 0, len(preamble)+2+len(templateContent))
+	result = append(result, preamble...)
+	result = append(result, '\n', '\n')
+	result = append(result, templateContent...)
+	return result
 }
 
 // injectPlatformSkills copies platform skills from the embedded filesystem
@@ -1629,6 +1856,28 @@ func GetAgent(ctx context.Context, agentName string, templateName string, agentI
 	}
 
 	finalCfg := config.MergeScionConfig(mergedCfg, agentCfg)
+
+	// Resolve model size aliases for existing agents.
+	// Mirrors the alias resolution in ProvisionAgent (line 778-785).
+	// This covers the case where scion-agent.json was written with a raw alias
+	// (e.g. by applyInlineConfigUpdate before the hub-side fix) or where the
+	// agent was created before the hub resolved aliases at storage time.
+	if finalCfg.Model != "" {
+		hcName := finalCfg.HarnessConfig
+		if hcName == "" {
+			hcName = finalCfg.DefaultHarnessConfig
+		}
+		if hcName != "" {
+			hcDir, err := resolveHarnessConfigDir(ctx, hcName, projectPath)
+			if err == nil && hcDir != nil && hcDir.Config.ModelAliases != nil {
+				resolved := config.ResolveModelAlias(finalCfg.Model, hcDir.Config.ModelAliases)
+				if resolved != finalCfg.Model {
+					util.Debugf("GetAgent: resolved model alias %q → %q", finalCfg.Model, resolved)
+					finalCfg.Model = resolved
+				}
+			}
+		}
+	}
 
 	// Ensure Info is populated from agent-info.json if available
 	if agentInfo != nil {

@@ -37,8 +37,8 @@ import (
 // the legacy SQLite agent store so listing behavior is identical across
 // backends.
 const (
-	defaultAgentListLimit = 50
-	maxAgentListLimit     = 200
+	defaultAgentListLimit = 500
+	maxAgentListLimit     = 500
 )
 
 // AgentStore implements the store.AgentStore sub-interface using the Ent ORM.
@@ -107,6 +107,7 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 		Runtime:             a.Runtime,
 		RuntimeBrokerID:     a.RuntimeBrokerID,
 		WebPTYEnabled:       a.WebPtyEnabled,
+		ExposedPorts:        a.ExposedPorts,
 		TaskSummary:         a.TaskSummary,
 		Message:             a.Message,
 		Created:             a.Created,
@@ -178,6 +179,7 @@ func (s *AgentStore) CreateAgent(ctx context.Context, a *store.Agent) error {
 		SetRuntime(a.Runtime).
 		SetRuntimeBrokerID(a.RuntimeBrokerID).
 		SetWebPtyEnabled(a.WebPTYEnabled).
+		SetExposedPorts(a.ExposedPorts).
 		SetTaskSummary(a.TaskSummary).
 		SetMessage(a.Message).
 		SetCreated(now).
@@ -402,6 +404,14 @@ func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, o
 		limit = maxAgentListLimit
 	}
 
+	if opts.Cursor != "" {
+		pred, err := s.agentCursorPredicate(ctx, opts.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query.Where(pred)
+	}
+
 	// Fetch one extra row to detect whether a further page exists.
 	rows, err := query.
 		Order(agent.ByCreated(entsql.OrderDesc())).
@@ -494,6 +504,23 @@ func agentFilterPredicates(filter store.AgentFilter) ([]predicate.Agent, error) 
 	}
 
 	return preds, nil
+}
+
+// agentCursorPredicate builds the keyset predicate for paginating after the
+// agent identified by cursor (an agent ID).
+func (s *AgentStore) agentCursorPredicate(ctx context.Context, cursor string) (predicate.Agent, error) {
+	cursorUID, err := parseUUID(cursor)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cursor: %w", err)
+	}
+	c, err := s.client.Agent.Get(ctx, cursorUID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cursor: %w", mapError(err))
+	}
+	return agent.Or(
+		agent.CreatedLT(c.Created),
+		agent.And(agent.CreatedEQ(c.Created), agent.IDLT(cursorUID)),
+	), nil
 }
 
 // UpdateAgentStatus applies a partial, status-only update. It is the hottest
@@ -610,6 +637,29 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 		return mapError(err)
 	}
 	return tx.Commit()
+}
+
+// UpdateAgentExposedPorts applies a partial exposed-port update without using
+// the whole-record optimistic-lock path. Port registration must not race with
+// high-frequency status writes.
+func (s *AgentStore) UpdateAgentExposedPorts(ctx context.Context, id string, ports []store.ExposedPort) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+
+	affected, err := s.client.Agent.Update().
+		Where(agent.IDEQ(uid)).
+		SetExposedPorts(ports).
+		SetUpdated(time.Now()).
+		Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if affected == 0 {
+		return store.ErrNotFound
+	}
+	return nil
 }
 
 // PurgeDeletedAgents permanently removes soft-deleted agents older than cutoff.
@@ -894,4 +944,104 @@ func (s *AgentStore) ReassignProjectBroker(ctx context.Context, oldBrokerID, new
 		return 0, err
 	}
 	return affected, nil
+}
+
+// AggregateAgentHealth computes health-oriented counts via GROUP BY queries
+// instead of loading full agent records. The approach uses three lightweight
+// queries:
+//  1. COUNT(*) GROUP BY phase            → ByPhase + Total
+//  2. COUNT(*) GROUP BY runtime_broker_id, phase, activity → ByBroker
+//  3. SELECT name WHERE phase/activity ∈ unhealthy (limit 100 each)
+func (s *AgentStore) AggregateAgentHealth(ctx context.Context) (*store.AgentHealthAggregate, error) {
+	result := &store.AgentHealthAggregate{
+		ByPhase:  make(map[string]int),
+		ByBroker: make(map[string]store.AgentBrokerCounts),
+	}
+
+	// 1. Count agents by phase (non-deleted only).
+	var phaseCounts []struct {
+		Phase string `json:"phase"`
+		Count int    `json:"count"`
+	}
+	err := s.client.Agent.Query().
+		Where(agent.DeletedAtIsNil()).
+		GroupBy(agent.FieldPhase).
+		Aggregate(ent.Count()).
+		Scan(ctx, &phaseCounts)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate phase counts: %w", err)
+	}
+	for _, pc := range phaseCounts {
+		result.ByPhase[pc.Phase] += pc.Count
+		result.Total += pc.Count
+	}
+
+	// 2. Count agents by broker, phase, and activity for per-broker health tallies.
+	var brokerCounts []struct {
+		BrokerID string `json:"runtime_broker_id"`
+		Phase    string `json:"phase"`
+		Activity string `json:"activity"`
+		Count    int    `json:"count"`
+	}
+	err = s.client.Agent.Query().
+		Where(agent.DeletedAtIsNil(), agent.RuntimeBrokerIDNEQ("")).
+		GroupBy(agent.FieldRuntimeBrokerID, agent.FieldPhase, agent.FieldActivity).
+		Aggregate(ent.Count()).
+		Scan(ctx, &brokerCounts)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate broker counts: %w", err)
+	}
+	for _, bc := range brokerCounts {
+		bid := bc.BrokerID
+		if bid == "" {
+			continue
+		}
+		entry := result.ByBroker[bid]
+		entry.Count += bc.Count
+		if bc.Phase != "error" && bc.Activity != "stalled" && bc.Activity != "crashed" {
+			entry.Healthy += bc.Count
+		}
+		result.ByBroker[bid] = entry
+	}
+
+	// 3. Fetch names of unhealthy agents (capped lists).
+	const unhealthyCap = 100
+
+	stalledAgents, err := s.client.Agent.Query().
+		Where(agent.DeletedAtIsNil(), agent.ActivityEQ("stalled")).
+		Select(agent.FieldName).
+		Limit(unhealthyCap).
+		All(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("query stalled agents: %w", err)
+	}
+	for _, a := range stalledAgents {
+		result.StalledNames = append(result.StalledNames, a.Name)
+	}
+
+	crashedAgents, err := s.client.Agent.Query().
+		Where(agent.DeletedAtIsNil(), agent.ActivityEQ("crashed")).
+		Select(agent.FieldName).
+		Limit(unhealthyCap).
+		All(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("query crashed agents: %w", err)
+	}
+	for _, a := range crashedAgents {
+		result.CrashedNames = append(result.CrashedNames, a.Name)
+	}
+
+	erroredAgents, err := s.client.Agent.Query().
+		Where(agent.DeletedAtIsNil(), agent.PhaseEQ("error")).
+		Select(agent.FieldName).
+		Limit(unhealthyCap).
+		All(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("query errored agents: %w", err)
+	}
+	for _, a := range erroredAgents {
+		result.ErroredNames = append(result.ErroredNames, a.Name)
+	}
+
+	return result, nil
 }

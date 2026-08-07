@@ -98,9 +98,27 @@ Persistence settings for the Hub.
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `dev_mode` | bool | `false` | Enable insecure development authentication. |
+| `mode` | string | `"oauth"` | Selects the exclusive human auth mode: `"oauth"` (default), `"proxy"`, or `"dev"`. |
+| `dev_mode` | bool | `false` | Enable insecure development authentication (used in `"dev"` mode). |
 | `dev_token` | string | | Static token for dev mode. |
 | `authorized_domains` | list | `[]` | Limit access to specific email domains. |
+
+### Proxy Auth (`server.auth.proxy`)
+
+Proxy authentication configuration (consulted when `server.auth.mode` is set to `"proxy"`). See [Proxy Auth (Google IAP)](/scion/hosted/ha/auth-proxy-iap/) for the full deployment guide.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `provider` | string | | Selects the proxy auth provider: `"iap"` or `"header"`. |
+| `require_trusted_proxy_ip` | bool | `false` | Enables defense-in-depth IP allowlisting. Uses the trusted_proxies CIDR list. |
+
+#### Google IAP Settings (`server.auth.proxy.iap`)
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `audience` | string | | **MANDATORY for IAP.** The expected audience claim (`aud`) in the IAP-signed JWT assertion. Supported formats are Cloud Run native path or GCE/GKE GCLB backend service path. |
+| `issuer` | string | `"https://cloud.google.com/iap"` | The expected JWT issuer. Override only for mock/testing setups. |
+| `jwks_url` | string | `"https://www.gstatic.com/iap/verify/public_key-jwk"` | The URL to retrieve public keys for signature verification. Override only for testing. |
 
 ### Transport Auth (`server.auth.transport`)
 
@@ -177,8 +195,17 @@ Backend for managing encrypted secrets. The `local` backend is read-only and rej
 | `gcp_project_id` | string | | GCP Project ID for Secret Manager. Required when `backend` is `gcpsm`. |
 | `gcp_credentials` | string | | Path to GCP service account JSON or the JSON content itself. Optional if using Application Default Credentials. |
 
-:::caution
-The `local` backend does not store secret values. Any attempt to create or update secrets will fail with a 501 error. Configure `gcpsm` to use the secret management features.
+### Scheduler (`server.scheduler`)
+
+Controls the background task scheduler in the Hub. This regulates the tick interval and concurrency of recurring maintenance tasks (such as telemetry aggregation, session cleanups, and heartbeats) to match database capacity.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `interval_seconds` | integer | `60` | The root ticker interval in seconds. All recurring background tasks fire at multiples of this interval. Increasing this value reduces database connection pressure on smaller deployments. |
+| `max_concurrency` | integer | `2` | Limits the number of recurring maintenance tasks that can execute concurrently in a single tick. By default, this is capped at `2` to avoid database connection pool saturation. Set to `0` for unlimited concurrency (legacy behavior) or a higher value for larger deployments. |
+
+:::note[Database Stability]
+Configuring a modest concurrency limit (such as the default `2`) is highly recommended for small or single-node database instances to prevent sudden spikes in database connection usage.
 :::
 
 ## Environment Variables
@@ -199,6 +226,8 @@ All server settings can be overridden via environment variables using the `SCION
 - `server.secrets.backend` -> `SCION_SERVER_SECRETS_BACKEND`
 - `server.secrets.gcp_project_id` -> `SCION_SERVER_SECRETS_GCPPROJECTID`
 - `server.secrets.gcp_credentials` -> `SCION_SERVER_SECRETS_GCPCREDENTIALS`
+- `server.scheduler.interval_seconds` -> `SCION_SERVER_SCHEDULER_INTERVAL_SECONDS`
+- `server.scheduler.max_concurrency` -> `SCION_SERVER_SCHEDULER_MAX_CONCURRENCY`
 
 ### Logging Environment Variables
 
@@ -223,7 +252,10 @@ When `server.hub.public_url` is not explicitly set, the Hub endpoint injected in
 1. `SCION_SERVER_HUB_PUBLIC_URL` or `server.hub.public_url` — explicit Hub public URL.
 2. Project-level `hub.endpoint` setting.
 3. `SCION_SERVER_BASE_URL` — the server's public base URL (also used for OAuth redirects).
-4. Auto-computed `http://localhost:{port}` (last resort).
+4. **IAP Audience Derivation** (in Hosted HA mode with IAP authentication):
+   - For **Cloud Run** IAP audiences (`/projects/<number>/locations/<region>/services/<service>`), Scion can auto-derive the Hub's URL using the legacy Cloud Run URL format (`https://<service>-<number>.<region>.run.app`). Newer Cloud Run services use a different URL format (`https://<service>-<hash>-<region>.a.run.app`) where the hash cannot be derived from the project number — for those services, set `SCION_SERVER_BASE_URL` explicitly instead of relying on auto-derivation.
+   - For **GKE/GCLB** backend-service IAP audiences (`/projects/<number>/global/backendServices/<id>`), a URL cannot be derived from the ID. If `SCION_SERVER_BASE_URL` (or other explicit URL settings) is not set, Scion will log a warning at startup and fall back to `localhost`, which is likely unreachable from dispatched agents.
+5. Auto-computed `http://localhost:{port}` (last resort).
 
 For local development where the Hub runs on `localhost` but agents are in containers, set `server.broker.container_hub_endpoint` to a container-accessible address like `http://host.containers.internal:8080`.
 
@@ -413,10 +445,11 @@ Settings that can be changed at runtime and are shared across all replicas. Stor
 | `lifecycle` | `auto_suspend_stalled`, `soft_delete_retention`, `soft_delete_retain_files` |
 | `maintenance` | `admin_mode`, `maintenance_message` (durable + cluster-wide) |
 | `telemetry` | Full `telemetry.*` subtree (enabled, cloud, hub, local, filter, resource) |
-| `agent_defaults` | `default_template`, `default_harness_config`, `default_max_turns`, `default_max_model_calls`, `default_max_duration`, `default_resources` |
+| `agent_defaults` | `default_template`, `default_harness_config`, `default_max_turns`, `default_max_model_calls`, `default_max_duration`, `default_resources`, `default_model`, `default_thinking_level` |
 | `endpoints` | `hub.public_url`, `image_registry` |
 | `github_app` | `app_id`, `api_base_url`, `webhooks_enabled`, `installation_url`, `private_key_path` |
 | `notifications` | `notification_channels[]` |
+| `project_defaults` | `default_scratchpad` |
 | *(reserved)* `global_defaults` | Reserved for future hub-resource design — not implemented |
 
 ### Precedence

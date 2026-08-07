@@ -75,6 +75,22 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	newArgs := []string{"run", "-t"}
 
 	// Apply resource constraints from config.
+	//
+	// TODO(cgroup-limits): rootless Podman on cgroup v1 cannot set resource
+	// limits at all — passing --cpus (or --memory) makes the container fail to
+	// start, and the error is returned from here, so the agent start fails hard
+	// rather than degrading to an unlimited container. Docker itself is not
+	// affected; the exposure is in the sibling adapter in podman.go, which has
+	// an identical block and carries the same TODO.
+	//
+	// This matters now that config.BuiltinDefaultResources() supplies a default
+	// limits.cpu of "2" for every agent, so --cpus is emitted on hosts that
+	// previously never saw it. The planned fix is to probe the host once and
+	// skip the resource flags with a warning when limits are unsupported;
+	// podman.go already detects rootless mode (detectRootlessMode), so only the
+	// cgroup-version half of the probe is missing. That probe is deliberately
+	// not implemented here. Until it lands, affected deployments must opt out
+	// via `runtime.enforce_resource_defaults: false`.
 	if config.Resources != nil {
 		if config.Resources.Limits.Memory != "" {
 			bytes, err := util.ParseMemory(config.Resources.Limits.Memory)
@@ -252,8 +268,21 @@ func (r *DockerRuntime) Attach(ctx context.Context, id string) error {
 }
 
 func (r *DockerRuntime) ImageExists(ctx context.Context, image string) (bool, error) {
-	_, err := runSimpleCommand(ctx, r.Command, "image", "inspect", image)
-	return err == nil, nil
+	out, err := runSimpleCommand(ctx, r.Command, "image", "inspect", image)
+	if err == nil {
+		return true, nil
+	}
+	// Exit-code errors could mean "image not found" OR a daemon-level failure
+	// (e.g. daemon unreachable). Both produce exec.ExitError with a non-zero
+	// exit code, so we inspect the command output to distinguish the two.
+	// Docker prints "No such image" when the image genuinely does not exist.
+	if isExitError(err) {
+		if isImageNotFoundOutput(out) {
+			return false, nil
+		}
+		return false, err
+	}
+	return false, err
 }
 
 func (r *DockerRuntime) ImageID(ctx context.Context, image string) (string, error) {

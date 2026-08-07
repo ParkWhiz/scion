@@ -31,6 +31,9 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/provision"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // startContext holds all the resolved state needed to start an agent.
@@ -101,10 +104,15 @@ type startContextInputs struct {
 // The caller may further customize the returned startContext before calling
 // mgr.Start or mgr.Provision.
 func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (*startContext, error) {
+	ctx, span := tracer.Start(ctx, "broker.agent.provision")
+	defer span.End()
+	span.SetAttributes(attribute.String("scion.agent.name", in.Name))
+
 	// --- Hub-managed project path resolution ---
 	if in.ProjectSlug != "" && in.ProjectPath == "" {
 		globalDir, err := config.GetGlobalDir()
 		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			return nil, &startContextError{Status: http.StatusInternalServerError, Message: "Failed to get global dir: " + err.Error()}
 		}
 		projectsPath := filepath.Join(globalDir, "projects", in.ProjectSlug)
@@ -311,6 +319,21 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		env["SCION_PROJECT_PATH"] = in.ProjectPath
 	}
 
+	// Emit canonical workspace sharing mode.
+	// On the create path, in.WorkspaceMode carries the wire label and we
+	// resolve it to the canonical value here. On start/restart paths,
+	// in.WorkspaceMode is empty but the hub pre-resolves the canonical value
+	// into resolvedEnv["SCION_WORKSPACE_MODE"] (see httpdispatcher.go); it was
+	// already merged into env in step 1 above, so the var is already present.
+	// Either way, we ensure a guaranteed non-empty value with a safe default.
+	if in.WorkspaceMode != "" {
+		env["SCION_WORKSPACE_MODE"] = string(store.ResolveWorkspaceSharingMode(in.WorkspaceMode))
+	}
+	if env["SCION_WORKSPACE_MODE"] == "" {
+		// Empty or unrecognized — default to shared-plain for backward compatibility.
+		env["SCION_WORKSPACE_MODE"] = string(store.SharingModeSharedPlain)
+	}
+
 	// 6. Broker identity
 	if s.config.BrokerName != "" {
 		env["SCION_BROKER_NAME"] = s.config.BrokerName
@@ -387,6 +410,7 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		opts.Profile = in.Config.Profile
 		opts.Branch = in.Config.Branch
 		opts.SharedWorkspace = in.Config.SharedWorkspace
+		opts.ProjectPreStartHookScript = in.Config.ProjectPreStartHookScript
 	}
 
 	if in.InlineConfig != nil {
@@ -411,6 +435,7 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	if hubConn != nil && in.Config != nil {
 		templatePath, err := s.hydrateTemplate(ctx, in.Config, hubConn)
 		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			return nil, &startContextError{
 				Status:      http.StatusInternalServerError,
 				Message:     "Failed to hydrate template: " + err.Error(),
@@ -432,6 +457,7 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	if hubConn != nil && in.Config != nil {
 		hcPath, err := s.hydrateHarnessConfig(ctx, in.Config, hubConn)
 		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			return nil, &startContextError{
 				Status:      http.StatusInternalServerError,
 				Message:     "Failed to hydrate harness-config: " + err.Error(),
@@ -452,6 +478,9 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	}
 
 	// --- Shared workspace mode (git-workspace hybrid) ---
+	// Deprecated: SCION_SHARED_WORKSPACE — superseded by SCION_WORKSPACE_MODE +
+	// SCION_WORKSPACE_GIT. Kept for compatibility during the transition period.
+	// Removal is tracked in https://github.com/ptone/scion/issues/575.
 	if in.Config != nil && in.Config.SharedWorkspace {
 		env["SCION_SHARED_WORKSPACE"] = "true"
 		if s.config.Debug {
@@ -494,6 +523,28 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 				"cloneURL", gc.URL, "branch", gc.Branch, "depth", gc.Depth)
 		}
 	}
+
+	// --- SCION_WORKSPACE_GIT ---
+	// Emit when the workspace is (or will be) a git repository. Mode alone is
+	// insufficient because shared-plain may or may not be git-backed.
+	//
+	// Priority:
+	//  1. worktreeProvisioned: host-side worktree was set up — always git.
+	//  2. opts.GitClone != nil: in-container clone configured — always git.
+	//  3. opts.Workspace on disk: shared-plain git workspace (check .git).
+	//  4. in.ResolvedEnv fallback: hub-injected on start/restart paths before
+	//     the on-disk workspace exists (e.g. clone-per-agent pre-clone).
+	isGitWorkspace := worktreeProvisioned || opts.GitClone != nil
+	if !isGitWorkspace && opts.Workspace != "" {
+		isGitWorkspace = util.IsGitRepoDir(opts.Workspace)
+	}
+	if !isGitWorkspace {
+		isGitWorkspace = in.ResolvedEnv["SCION_WORKSPACE_GIT"] == "true"
+	}
+	if isGitWorkspace {
+		env["SCION_WORKSPACE_GIT"] = "true"
+	}
+	// Absent when false — avoids encoding a "false" string agents must parse.
 
 	// --- Env + telemetry + secrets ---
 	opts.Env = env
@@ -810,4 +861,27 @@ func hasWorkspaceContent(dir string) bool {
 		}
 	}
 	return false
+}
+
+// withHubAgentDefaults attaches the hub's operational agent_defaults from a
+// create request to the provisioning context, so ProvisionAgent can apply them
+// at its own low-precedence tier (below template and inline config, above this
+// broker's settings.yaml defaults).
+//
+// The value rides the context rather than a new ProvisionAgent parameter,
+// following ContextWithBrokerMode / ContextWithHarnessConfigPath /
+// ContextWithGitClone — ProvisionAgent already takes eleven arguments.
+//
+// Returns ctx unchanged when the hub sent nothing, which is every local
+// dispatch, every file-mode hub (design §3.2.4), and every hub that predates
+// the wire field. An empty-but-non-nil value is treated as absent too, so a
+// downstream nil check is the only gate needed.
+func withHubAgentDefaults(ctx context.Context, cfg *CreateAgentConfig) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cfg == nil || cfg.HubAgentDefaults.IsEmpty() {
+		return ctx
+	}
+	return api.ContextWithHubAgentDefaults(ctx, cfg.HubAgentDefaults)
 }

@@ -28,14 +28,36 @@ You can tell Scion exactly which directory to use as the workspace. This is usef
 - Using a shared directory across multiple agents.
 - Working on a path outside the current repository without creating a worktree.
 
+### Absolute vs. Relative Paths
+
+The `--workspace` (or `-w`) flag accepts both **absolute host paths** and **project-relative paths**, distinguished automatically by `filepath.IsAbs()`:
+
+#### Absolute Paths
+
+If you specify an absolute host path, Scion mounts that exact directory directly.
+
 ```bash
-# Mount a specific directory
-scion start my-agent "fix bugs" --workspace ./my-service
+# Mount a specific absolute host path
+scion start my-agent "run analysis" --workspace /home/user/my-service
 ```
 
 - **Behavior**: The specified directory is mounted directly to `/workspace`.
 - **Isolation**: **None**. Changes made by the agent are immediately visible on the host and to any other agents sharing this directory.
 - **Git**: No new worktree or branch is created, even if inside a repo.
+
+#### Relative Paths (Contained Subdirectory Mounts)
+
+If you specify a relative path, it is interpreted as a subdirectory scoped to your project's **logical root** (or current working directory). This allows you to confine an agent to a specific subdirectory, such as a package in a monorepo:
+
+```bash
+# Scope the agent to a project subdirectory
+scion start my-agent "fix web bugs" --workspace packages/web
+```
+
+- **Behavior**: Scion resolves the subdirectory path against the project root, performs strict containment checks (preventing directory traversal and escaping via symlinks), and mounts only that subtree to `/workspace`.
+- **Isolation**: The agent has **full containment** — it cannot see or access any files or folders outside of that specific subdirectory.
+- **Support**: Supported for directory (non-git) projects — both linked and hub-managed.
+- **Git-Clone Projects Limitation**: Relative `--workspace` paths are **not supported** for per-agent git (clone-based) projects and will be rejected with an error. For those projects, use an absolute path or omit the `--workspace` flag.
 
 ---
 
@@ -164,6 +186,13 @@ scion start my-agent --no-hub "fix the bug"
 
 Project Shared Directories provide a persistent, mutable storage layer that can be shared between multiple agents within a single project. This is ideal for sharing build artifacts, shared caches, or state files without relying on version control or the Hub database.
 
+### Default Scratchpad Auto-Provisioning
+
+To ensure that newly created projects have an immediate space for agent file transfers, message attachments, and logs, the Hub can automatically provision a default shared directory named `scratchpad` upon project creation.
+
+- **Auto-Provisioning Toggle**: This behavior is controlled by the `project_defaults.default_scratchpad` setting in the Hub's operational settings (default is **`ON` / `true`**).
+- **Inbound Message Attachments**: In isolated workspace modes, Scion automatically routes agent message attachments through the default `scratchpad` shared volume to prevent silent delivery failures.
+
 ### Managing Shared Directories
 
 You can manage shared directories using the `scion shared-dir` CLI commands:
@@ -184,11 +213,101 @@ scion shared-dir remove <name>
 
 ### Mounting Shared Directories
 
-When an agent is created in a project that has shared directories, they are automatically mounted into the agent's container. 
+When an agent is created in a project that has shared directories, they are automatically mounted into the agent's container.
 
-By default, they are available at two locations within the agent:
-- **Standard Path:** `/scion-volumes/<name>`
-- **Workspace Path:** `/workspace/.scion-volumes/<name>`
+Each shared directory's mount location depends on its `in_workspace` setting:
+- **`in_workspace: false` (default):** `/scion-volumes/<name>` — mounted at the standard volume path, outside the workspace.
+- **`in_workspace: true`:** `/workspace/.scion-volumes/<name>` — mounted inside the workspace tree.
+
+A shared directory is mounted at one of these locations, not both.
+
+### Common Patterns
+
+Shared directories are most useful when several agents in a project need to exchange data outside of version control. The patterns below show typical setups.
+
+#### Shared Build Caches
+
+Agents working on the same project can reuse a compilation cache instead of rebuilding from scratch, dramatically speeding up warm builds.
+
+```bash
+# Create a shared cache, mounted outside the workspace (default)
+scion shared-dir create build-cache
+```
+
+Point the toolchain's cache at the mount. For a Go project, set `GOCACHE` to the shared path in each agent (for example, in the agent's shell profile or start command):
+
+```bash
+export GOCACHE=/scion-volumes/build-cache
+```
+
+The same approach works for other caches — for example a Bazel `--output_base=/scion-volumes/build-cache`, or a `node_modules/.cache` symlinked into the mount. All agents read from and write to the same cache, so the first agent to compile a target populates it for the rest.
+
+#### Shared Artifacts (Producer/Consumer)
+
+One agent produces build artifacts or data files that another consumes — a build/test or build/deploy split.
+
+```bash
+scion shared-dir create artifacts
+```
+
+The **producer** agent writes its output to the mount:
+
+```bash
+go build -o /scion-volumes/artifacts/myservice ./cmd/myservice
+```
+
+The **consumer** agent picks the artifact up from the same path for testing or deployment:
+
+```bash
+/scion-volumes/artifacts/myservice --run-tests
+```
+
+Because the mount is a plain directory, no Hub round-trip or git commit is needed to hand data between agents.
+
+#### Shared Context / Knowledge Base
+
+A directory of reference material — design docs, research findings, or generated context — that every agent can read, and selected agents can write to.
+
+```bash
+# Read/write for agents that curate the knowledge base
+scion shared-dir create knowledge --in-workspace
+```
+
+With `--in-workspace`, the directory mounts at `/workspace/.scion-volumes/knowledge`, keeping reference material alongside the code an agent is editing. A research agent writes its findings:
+
+```bash
+echo "## API rate limits: 100 req/s per token" >> /workspace/.scion-volumes/knowledge/notes.md
+```
+
+A developer agent reads them while working. To make a knowledge base read-only for consumers so they cannot accidentally overwrite curated content, create it with `--read-only`:
+
+```bash
+scion shared-dir create knowledge --read-only
+```
+
+#### Coordination Files
+
+Lightweight, file-based signalling between agents — status markers, lock files, or simple message passing — without a message broker.
+
+```bash
+scion shared-dir create coordination
+```
+
+For example, a build agent signals that a phase is complete by writing a marker file:
+
+```bash
+# Producer signals completion
+touch /scion-volumes/coordination/build.done
+```
+
+A downstream agent waits for the marker before starting its work:
+
+```bash
+# Consumer waits for the signal
+until [ -f /scion-volumes/coordination/build.done ]; do sleep 5; done
+```
+
+The same pattern supports simple lock files (create a file to claim a resource, remove it to release) or drop-box message passing (write a request file, poll for a response file). Keep coordination files small and treat them as ephemeral signals rather than durable state.
 
 ### Web Dashboard File Viewer
 
@@ -226,3 +345,9 @@ scion delete <agent-name>
 - **Worktrees**: The worktree directory is removed and git metadata is pruned.
 - **Branches**: By default, the branch is deleted. Use `--preserve-branch` (or `-b`) to keep it.
 - **Explicit Workspaces**: Directories mounted via `--workspace` are **NOT** deleted. Scion only cleans up resources it created.
+
+:::caution[Committed is not Pushed]
+Committing changes within your agent's workspace is **not** an automatic guarantee of safety.
+- **`--preserve-branch` does not push:** The `--preserve-branch` (or `-b`) flag only keeps the agent's branch inside the *local* repository clone on the host/broker. It does **not** push the branch to a remote origin repository.
+- **Avoid losing work:** If you are operating on an ephemeral or remote broker container (where the local clone is discarded when the agent is deleted), any unpushed commits on the agent's branch will be **permanently lost**. Always ensure your agents run `git push` (or you push manually from the workspace) to save your commits upstream before deleting the agent.
+:::

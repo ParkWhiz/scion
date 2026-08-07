@@ -33,10 +33,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
 )
 
 const (
-	defaultAgentCacheTTL = 5 * time.Minute
+	defaultAgentCacheTTL = 30 * time.Second
 	defaultDBPath        = "discord.db"
 
 	// dedupTTL is how long a message ID is remembered for deduplication.
@@ -58,7 +59,7 @@ type Config struct {
 	BotToken       string
 	ApplicationID  string
 	PublicKey      string
-	GuildID        string // empty = global commands
+	GuildIDs       []string // parsed from comma-separated "guild_ids" config value; empty = global commands
 	DBPath         string
 	MentionRouting bool
 }
@@ -87,6 +88,8 @@ func (e *hubError) userFacingMessage() string {
 		return "Target agent not found. Use `/scion agents` to see available agents."
 	case "forbidden":
 		return "You don't have permission to message this agent."
+	case "agent_not_running":
+		return "Agent is not running. It may be stopped, suspended, or in error state."
 	case "broker_auth_failed", "unauthorized":
 		return "Authentication error — please contact an administrator."
 	default:
@@ -152,11 +155,13 @@ type DiscordBroker struct {
 	webhooks  *WebhookManager
 
 	gatewayConnected bool // set true in handleReady, false on disconnect
+	bootstrapDone    bool // set true after first successful bootstrap subscription
 
 	threadParents map[string]string // channelID -> parentID (cached thread lookups)
 
 	agentCacheTTL  time.Duration
 	projectSlugMap map[string]string // injected by hub: projectID -> slug
+	downloadsPath  string            // override for file download directory; empty = default
 
 	config *Config
 
@@ -215,6 +220,36 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 	// Phase 1: Bot token configuration.
 	botToken, hasBotToken := config["bot_token"]
 	if hasBotToken && botToken != "" {
+		// Close old session, store, and sendQueue if they exist (handles Restart/reconfigure).
+		// Clearing subs ensures Subscribe("*") triggers startGateway() on the new session.
+		if b.session != nil {
+			oldSession := b.session
+			oldStore := b.store
+			oldSendQueue := b.sendQueue
+			b.session = nil
+			b.store = nil
+			b.sendQueue = nil
+			b.subs = make(map[string]bool)
+			b.gatewayConnected = false
+			b.bootstrapDone = false
+			// Release lock while closing old resources — session.Close() sleeps
+			// for 1s internally, and store/sendQueue may block on cleanup.
+			// Matches the pattern in Close() (lines 802-831).
+			b.mu.Unlock()
+			if closeErr := oldSession.Close(); closeErr != nil {
+				b.log.Warn("Failed to close old discord session on reconfigure", "error", closeErr)
+			}
+			if oldSendQueue != nil {
+				oldSendQueue.Close()
+			}
+			if oldStore != nil {
+				if closeErr := oldStore.Close(); closeErr != nil {
+					b.log.Warn("Failed to close old store on reconfigure", "error", closeErr)
+				}
+			}
+			b.mu.Lock()
+		}
+
 		// Create a discordgo session but do NOT open the gateway yet.
 		// Gateway connection happens on first Subscribe().
 		session, err := discordgo.New("Bot " + botToken)
@@ -235,8 +270,20 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 			BotToken:       botToken,
 			ApplicationID:  config["application_id"],
 			PublicKey:      config["public_key"],
-			GuildID:        config["guild_id"],
 			MentionRouting: true, // default
+		}
+
+		// Parse guild IDs: prefer "guild_ids" (comma-separated), fall back to "guild_id" for backward compat.
+		guildIDsRaw := config["guild_ids"]
+		if guildIDsRaw == "" {
+			guildIDsRaw = config["guild_id"]
+		}
+		if guildIDsRaw != "" {
+			for _, id := range strings.Split(guildIDsRaw, ",") {
+				if trimmed := strings.TrimSpace(id); trimmed != "" {
+					cfg.GuildIDs = append(cfg.GuildIDs, trimmed)
+				}
+			}
 		}
 
 		if v, ok := config["mention_routing"]; ok && v != "" {
@@ -295,9 +342,14 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 			b.agentCacheTTL = d
 		}
 
+		// Parse optional downloads directory override.
+		if v, ok := config["downloads_path"]; ok && v != "" {
+			b.downloadsPath = v
+		}
+
 		b.log.Info("Discord broker phase 1 configured",
 			"application_id", cfg.ApplicationID,
-			"guild_id", cfg.GuildID,
+			"guild_ids", cfg.GuildIDs,
 			"db_path", cfg.DBPath,
 			"mention_routing", cfg.MentionRouting,
 		)
@@ -305,19 +357,38 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 
 	// Phase 2: Hub credentials and component handlers.
 	if b.hubURL != "" && b.session != nil {
-		// Create hub client.
-		b.hubClient = NewHTTPHubClient(b.hubURL, b.hmacKey, b.brokerID)
+		// Resolve transport auth for IAP-protected hub endpoints.
+		// Uses the same ResolveBrokerTransport pattern as the runtime broker.
+		transportMode := config["transport_mode"]
+		transportAudience := config["transport_audience"]
+		src, mode, err := transportauth.ResolveBrokerTransport(transportMode, transportAudience, nil)
+		if err != nil {
+			b.log.Warn("Failed to resolve transport auth, continuing without IAP tokens", "error", err)
+		}
+		if src != nil {
+			if b.httpClient == nil {
+				b.httpClient = &http.Client{Timeout: 10 * time.Second}
+			}
+			b.httpClient.Transport = transportauth.Wrap(b.httpClient.Transport, src, mode)
+			b.log.Info("Transport auth configured for Discord broker",
+				"mode", transportMode, "audience", transportAudience)
+		}
+
+		// Create hub client, sharing the broker's (possibly wrapped) httpClient.
+		b.hubClient = NewHTTPHubClient(b.hubURL, b.hmacKey, b.brokerID, b.httpClient)
 
 		// Create component handlers.
 		appID := ""
-		guildID := ""
+		var guildIDs []string
 		if b.config != nil {
 			appID = b.config.ApplicationID
-			guildID = b.config.GuildID
+			guildIDs = b.config.GuildIDs
 		}
-		b.commands = NewCommandHandler(b.store, b.session, b.hubClient, b.deliverInbound, appID, guildID, b.agentCacheTTL, b.log)
+		sendSearchRoot := config["send_search_root"]
+		b.commands = NewCommandHandler(b.store, b.session, b.hubClient, b.deliverInbound, appID, guildIDs, b.agentCacheTTL, sendSearchRoot, b.log)
 		b.callbacks = NewCallbackHandler(b.store, b.session, b.hubClient, b.deliverInbound, b.log)
-		b.registration = NewRegistrationHandler(b.store, b.session, b.hubURL, b.hmacKey, b.brokerID, b.log)
+		registerURL := config["register_url"]
+		b.registration = NewRegistrationHandler(b.store, b.session, b.hubURL, registerURL, b.hmacKey, b.brokerID, b.httpClient, b.log)
 
 		// Parse hub-injected project slug map (projectID -> slug).
 		if slugMapJSON, ok := config["project_slug_map"]; ok && slugMapJSON != "" {
@@ -343,24 +414,31 @@ func (b *DiscordBroker) Configure(config map[string]string) error {
 		// Subscribe(), which triggers startGateway() on the first call.
 		// Host callbacks are wired after Configure() returns, so we defer
 		// the request in a goroutine that retries until they're available.
-		go func() {
-			for i := 0; i < 20; i++ {
-				time.Sleep(500 * time.Millisecond)
-				b.mu.RLock()
-				hc := b.hostCallbacks
-				b.mu.RUnlock()
-				if hc == nil {
-					continue
+		if !b.bootstrapDone {
+			b.bootstrapDone = true // set immediately to prevent duplicate goroutines
+			go func() {
+				for i := 0; i < 20; i++ {
+					time.Sleep(500 * time.Millisecond)
+					b.mu.RLock()
+					hc := b.hostCallbacks
+					b.mu.RUnlock()
+					if hc == nil {
+						continue
+					}
+					if err := hc.RequestSubscription(projectcompat.AllProjectsPattern()); err != nil {
+						b.log.Warn("Failed to request bootstrap subscription", "error", err)
+						continue
+					}
+					b.log.Info("Requested bootstrap subscription for Discord Gateway")
+					return
 				}
-				if err := hc.RequestSubscription(projectcompat.AllProjectsPattern()); err != nil {
-					b.log.Warn("Failed to request bootstrap subscription", "error", err)
-					continue
-				}
-				b.log.Info("Requested bootstrap subscription for Discord Gateway")
-				return
-			}
-			b.log.Error("Bootstrap subscription timed out — host callbacks never became available")
-		}()
+				b.log.Warn("Bootstrap subscription timed out — this is expected in standalone gRPC mode where the Hub drives subscriptions via Subscribe() RPC")
+				// Reset flag so a future Configure can retry bootstrap.
+				b.mu.Lock()
+				b.bootstrapDone = false
+				b.mu.Unlock()
+			}()
+		}
 	}
 
 	return nil
@@ -617,16 +695,34 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 		}
 
 		if needsFilter && store != nil {
-			link, linkErr := store.GetChannelLink(ctx, channelID)
-			if linkErr == nil && link != nil {
-				if isAgentToAgent && !link.ShowAgentToAgent {
-					b.log.Debug("Filtering agent-to-agent message", "channel_id", channelID)
-					continue
-				}
-				if isStateChange && !link.ShowStateChanges {
-					b.log.Debug("Filtering state change notification", "channel_id", channelID)
-					continue
-				}
+			// Use resolveChannelLink so threads fall back to their parent
+			// channel's link. Links are only ever stored on parent channels
+			// (saveChannelLink rewrites thread IDs to the parent), so a direct
+			// GetChannelLink on a thread snowflake always returns nil and would
+			// filter out every message in every thread.
+			link, linkErr := resolveChannelLink(ctx, session, store, channelID)
+			if linkErr != nil {
+				b.log.Warn("Failed to look up channel link; applying fail-closed filter",
+					"channel_id", channelID, "error", linkErr)
+				link = nil
+			}
+			// Fail closed: a missing link, an inactive link, or a failed lookup
+			// is treated the same as a link with observe settings disabled.
+			// Channels with no link row at all should not receive observe
+			// traffic; defaulting to "deliver everything" leaked agent-to-agent
+			// traffic and state changes into channels with observe mode off.
+			showAgentToAgent := link != nil && link.Active && link.ShowAgentToAgent
+			showStateChanges := link != nil && link.Active && link.ShowStateChanges
+
+			if isAgentToAgent && !showAgentToAgent {
+				b.log.Debug("Filtering agent-to-agent message",
+					"channel_id", channelID, "linked", link != nil)
+				continue
+			}
+			if isStateChange && !showStateChanges {
+				b.log.Debug("Filtering state change notification",
+					"channel_id", channelID, "linked", link != nil)
+				continue
 			}
 		}
 
@@ -645,11 +741,19 @@ func (b *DiscordBroker) Publish(ctx context.Context, topic string, msg *messages
 			// Send via webhook with per-agent identity.
 			// For threads (forum channels, text channel threads), create the
 			// webhook on the parent channel and execute with thread_id.
+			//
+			// When observe embeds are present (agent-to-agent messages), send
+			// only the embed — passing text content alongside embeds causes
+			// Discord to display the message body twice.
+			webhookText := text
+			if len(observeEmbeds) > 0 {
+				webhookText = ""
+			}
 			parentID, isThread := b.resolveThreadParent(channelID)
 			if isThread && parentID != "" {
-				_, err = webhooks.SendAsAgentInThread(parentID, channelID, senderSlug, text, observeEmbeds, nil, files)
+				_, err = webhooks.SendAsAgentInThread(parentID, channelID, senderSlug, webhookText, observeEmbeds, nil, files)
 			} else {
-				_, err = webhooks.SendAsAgent(channelID, senderSlug, text, observeEmbeds, nil, files)
+				_, err = webhooks.SendAsAgent(channelID, senderSlug, webhookText, observeEmbeds, nil, files)
 			}
 			if err != nil {
 				// Fallback to bot API if webhook send fails.
@@ -914,14 +1018,62 @@ func (b *DiscordBroker) handleGuildCreate(_ *discordgo.Session, g *discordgo.Gui
 		"guild_name", g.Name,
 		"member_count", g.MemberCount,
 	)
+
+	// Update guild name for all existing channel links in this guild.
+	// This handles guild renames and populates the name for pre-migration links.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.store.UpdateGuildName(ctx, g.ID, g.Name); err != nil {
+		b.log.Error("Failed to update guild name for channel links", "guild_id", g.ID, "error", err)
+	}
+
+	b.mu.RLock()
+	commands := b.commands
+	config := b.config
+	b.mu.RUnlock()
+
+	if config == nil || commands == nil {
+		return
+	}
+
+	// If guild_ids is configured (non-empty), register commands for allowed guilds.
+	if len(config.GuildIDs) > 0 {
+		allowed := false
+		for _, id := range config.GuildIDs {
+			if id == g.ID {
+				allowed = true
+				break
+			}
+		}
+		if allowed {
+			go func(guildID, guildName string) {
+				if err := commands.RegisterCommandsForGuild(guildID); err != nil {
+					b.log.Error("Failed to register commands for guild", "guild_id", guildID, "guild_name", guildName, "error", err)
+				}
+			}(g.ID, g.Name)
+		} else {
+			b.log.Info("Guild not in guild_ids allow-list, skipping command registration",
+				"guild_id", g.ID, "guild_name", g.Name)
+		}
+	}
+	// If guild_ids is empty (global mode), no action needed — global commands propagate automatically.
 }
 
 // handleGuildDelete is called when the bot is removed from a guild or
 // when a guild becomes unavailable.
 func (b *DiscordBroker) handleGuildDelete(_ *discordgo.Session, g *discordgo.GuildDelete) {
-	b.log.Info("Discord guild unavailable",
-		"guild_id", g.ID,
-	)
+	if g.Unavailable {
+		// Discord outage — guild temporarily unavailable, do not deactivate.
+		b.log.Debug("Guild temporarily unavailable", "guild_id", g.ID)
+		return
+	}
+	// Bot was removed from guild — deactivate all channel links.
+	b.log.Info("Bot removed from guild, deactivating channel links", "guild_id", g.ID)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.store.DeactivateLinksForGuild(ctx, g.ID); err != nil {
+		b.log.Error("Failed to deactivate channel links for removed guild", "guild_id", g.ID, "error", err)
+	}
 }
 
 // handleMessageCreate is called for every new message in channels the bot
@@ -1021,6 +1173,20 @@ func (b *DiscordBroker) handleInteractionCreate(s *discordgo.Session, i *discord
 			store := b.store
 			go func() {
 				HandleModalSubmit(s, i, store, b.deliverInbound, b.log)
+			}()
+		} else if strings.HasPrefix(data.CustomID, "secret:") {
+			if commands == nil {
+				return
+			}
+			// Secret modal submission — defer then process async.
+			_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Flags: discordgo.MessageFlagsEphemeral,
+				},
+			})
+			go func() {
+				commands.HandleSecretModalSubmit(s, i)
 			}()
 		}
 
@@ -1122,7 +1288,7 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		if isBotMentioned(m, botUserID) {
 			unresolved := extractUnresolvedMentions(m.Content, botUserID, agents)
 			if len(unresolved) > 0 {
-				errMsg := fmt.Sprintf("Unknown agent: %q. Use `/scion agents` to see available agents.", unresolved[0])
+				errMsg := fmt.Sprintf("Unknown agent: %s. Use `/scion agents` to see available agents.", strings.Join(unresolved, ", "))
 				s.ChannelMessageSend(channelID, errMsg)
 			}
 		}
@@ -1149,6 +1315,29 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 			// User resolution via store mapping is not yet wired up.
 			return "", false
 		})
+
+		// If the user typed an unknown @mention at the start, show an error
+		// instead of silently routing to the default agent.
+		hasUnknownStartMention := false
+		for _, sm := range classified.StartMentions {
+			if sm.Kind == "unknown" {
+				hasUnknownStartMention = true
+				break
+			}
+		}
+		if hasUnknownStartMention && countAgentStartMentions(classified) == 0 {
+			var unresolved []string
+			for _, sm := range classified.StartMentions {
+				if sm.Kind == "unknown" {
+					unresolved = append(unresolved, sm.Name)
+				}
+			}
+			if len(unresolved) > 0 {
+				errMsg := fmt.Sprintf("Unknown agent: %s. Use `/scion agents` to see available agents.", strings.Join(unresolved, ", "))
+				s.ChannelMessageSend(channelID, errMsg)
+				return
+			}
+		}
 	}
 
 	// Determine which agent slugs are start-mentions (to strip from text).
@@ -1167,8 +1356,12 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 	// Filter targets to only start-mention agents, or exclude body-mention agents if no start-mentions exist.
 	// Body-mention agents will be handled by the TypeMention delivery loop.
 	if !isAll {
-		if len(classified.StartMentions) > 0 {
-			startMentionSet := make(map[string]bool, len(classified.StartMentions))
+		// Count only agent-kind start mentions for filtering.
+		// Unknown-kind start mentions (non-existent agents) must not
+		// trigger filtering, otherwise they empty the target list.
+		agentStartMentions := countAgentStartMentions(classified)
+		if agentStartMentions > 0 {
+			startMentionSet := make(map[string]bool, agentStartMentions)
 			for _, sm := range classified.StartMentions {
 				if sm.Kind == "agent" {
 					startMentionSet[strings.ToLower(sm.Name)] = true
@@ -1203,7 +1396,7 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		}
 
 		// If body-mention filter emptied targets, restore default agent so instruction is delivered.
-		if len(targets) == 0 && len(classified.StartMentions) == 0 && effectiveDefault != "" && !hasNonBotMentions(m.Message, botUserID) {
+		if len(targets) == 0 && agentStartMentions == 0 && effectiveDefault != "" && !hasNonBotMentions(m.Message, botUserID) {
 			text := strings.TrimSpace(m.Content)
 			if text != "" && !strings.HasPrefix(text, "/") {
 				targets = []string{effectiveDefault}
@@ -1222,7 +1415,7 @@ func (b *DiscordBroker) handleIncomingMessage(s *discordgo.Session, m *discordgo
 		if att == nil || att.URL == "" {
 			continue
 		}
-		agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, link.ProjectSlug)
+		agentPath, placeholder, err := b.downloadDiscordAttachment(ctx, att, link.ProjectSlug, link.ProjectID)
 		if err != nil {
 			b.log.Error("Failed to download Discord attachment",
 				"filename", att.Filename, "error", err)
@@ -1473,38 +1666,6 @@ func (b *DiscordBroker) getProjectAgents(ctx context.Context, projectID string) 
 	return slugs
 }
 
-// --- Dynamic subscription management ---
-
-func (b *DiscordBroker) subscribeForProject(projectID string) {
-	pattern := projectcompat.ProjectPattern(projectID)
-
-	b.mu.RLock()
-	hc := b.hostCallbacks
-	b.mu.RUnlock()
-
-	if hc != nil {
-		if err := hc.RequestSubscription(pattern); err != nil {
-			b.log.Warn("Failed to request subscription via host callbacks",
-				"pattern", pattern, "error", err)
-		}
-	}
-}
-
-func (b *DiscordBroker) unsubscribeForProject(projectID string) {
-	pattern := projectcompat.ProjectPattern(projectID)
-
-	b.mu.RLock()
-	hc := b.hostCallbacks
-	b.mu.RUnlock()
-
-	if hc != nil {
-		if err := hc.CancelSubscription(pattern); err != nil {
-			b.log.Warn("Failed to cancel subscription via host callbacks",
-				"pattern", pattern, "error", err)
-		}
-	}
-}
-
 // --- Routing helpers ---
 
 // resolveThreadParent checks if a Discord channel ID refers to a thread.
@@ -1533,6 +1694,11 @@ func (b *DiscordBroker) resolveThreadParent(channelID string) (parentID string, 
 	if ch == nil || err != nil {
 		ch, err = session.Channel(channelID)
 		if err != nil {
+			// Intentionally NOT cached: a transient REST failure must not
+			// poison the cache. Returning ("", false) lets the caller
+			// retry on the next lookup. Compare with the fix in
+			// commands.go's resolveChannelLink (issue #576).
+			b.log.Error("Failed to resolve thread parent", "channel_id", channelID, "error", err)
 			return "", false
 		}
 	}
@@ -1836,15 +2002,15 @@ func (b *DiscordBroker) resolveProjectSlug(ctx context.Context, projectID string
 const maxDiscordAttachmentSize = 25 * 1024 * 1024 // 25 MB
 
 // downloadDiscordAttachment downloads a file from a Discord message attachment
-// and saves it to the agent's workspace downloads directory. Returns the
-// agent-relative path and a placeholder string for the message body.
+// and saves it so the agent can access it. Returns the agent-visible path and
+// a placeholder string for the message body.
 //
-// NOTE: This writes to the host filesystem at /home/scion/.scion/projects/<slug>/downloads/.
-// The agent container must share this volume mount for the file to be visible
-// at /workspace/downloads/. This works in single-VM / shared-dir setups but
-// will NOT work when agents and the plugin run in separate pods with isolated
-// volumes. See #397 for the tracked fix.
-func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *discordgo.MessageAttachment, projectSlug string) (agentPath, placeholder string, err error) {
+// The function uses a three-tier fallback for the destination directory:
+//  1. downloadsPath config (highest priority, supports {project_slug} placeholder)
+//  2. Shared dir infrastructure via config.SharedDirHostPath — writes to the host
+//     and exposes the file at /scion-volumes/scratchpad/.attachments/_discord/
+//  3. Legacy /home/scion/.scion/projects/<slug>/downloads/ (last resort)
+func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *discordgo.MessageAttachment, projectSlug, projectID string) (agentPath, placeholder string, err error) {
 	if projectSlug == "" {
 		return "", "", fmt.Errorf("project slug is empty")
 	}
@@ -1872,10 +2038,33 @@ func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *disc
 	if fileName == "" || fileName == "." || fileName == "/" {
 		fileName = att.ID
 	}
-	timestamp := time.Now().Unix()
+	timestamp := time.Now().UnixNano()
 	destName := fmt.Sprintf("discord_%d_%s", timestamp, fileName)
 
-	hostDir := filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
+	// Route attachments through the shared dir infrastructure so container-based
+	// agents can access them at /scion-volumes/scratchpad/.attachments/_discord/.
+	// Use configured downloads_path as highest-priority override for edge cases.
+	var hostDir string
+	var useSharedDir bool
+	if b.downloadsPath != "" {
+		hostDir = strings.ReplaceAll(b.downloadsPath, "{project_slug}", projectSlug)
+	} else if projectID != "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr == nil {
+			// NOTE: SharedDirHostPath is a pure path computation; it does not verify that
+			// "scratchpad" is actually configured on the project. If it is not configured,
+			// the file will be written to the host but won't be visible inside the agent
+			// container. Projects using container-based agents should always have
+			// scratchpad configured.
+			sharedDirBase := config.SharedDirHostPath(home, projectSlug, projectID, "scratchpad")
+			hostDir = filepath.Join(sharedDirBase, ".attachments", "_discord")
+			useSharedDir = true
+		}
+	}
+	if hostDir == "" {
+		// Fallback to legacy path when shared dir resolution fails.
+		hostDir = filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
+	}
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
 		return "", "", fmt.Errorf("create downloads dir: %w", err)
 	}
@@ -1893,7 +2082,15 @@ func (b *DiscordBroker) downloadDiscordAttachment(ctx context.Context, att *disc
 		return "", "", fmt.Errorf("write file: %w", err)
 	}
 
-	agentPath = filepath.Join("/workspace/downloads", destName)
+	// Derive the agent-visible path.
+	if b.downloadsPath != "" {
+		agentPath = filepath.Join(strings.ReplaceAll(b.downloadsPath, "{project_slug}", projectSlug), destName)
+	} else if useSharedDir {
+		agentPath = filepath.Join("/scion-volumes/scratchpad/.attachments/_discord", destName)
+	} else {
+		agentPath = filepath.Join("/workspace/downloads", destName)
+	}
+	agentPath = filepath.ToSlash(agentPath)
 	contentType := att.ContentType
 	if contentType == "" {
 		contentType = "file"

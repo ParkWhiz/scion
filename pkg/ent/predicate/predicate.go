@@ -12,6 +12,9 @@ type AccessPolicy func(*sql.Selector)
 // Agent is the predicate function for agent builders.
 type Agent func(*sql.Selector)
 
+// AgentSessionMetrics is the predicate function for agentsessionmetrics builders.
+type AgentSessionMetrics func(*sql.Selector)
+
 // AllowListEntry is the predicate function for allowlistentry builders.
 type AllowListEntry func(*sql.Selector)
 
@@ -32,6 +35,9 @@ type EnvVar func(*sql.Selector)
 
 // GCPServiceAccount is the predicate function for gcpserviceaccount builders.
 type GCPServiceAccount func(*sql.Selector)
+
+// GitHubResolutionCache is the predicate function for githubresolutioncache builders.
+type GitHubResolutionCache func(*sql.Selector)
 
 // GithubInstallation is the predicate function for githubinstallation builders.
 type GithubInstallation func(*sql.Selector)
@@ -87,6 +93,9 @@ type Project func(*sql.Selector)
 // ProjectContributor is the predicate function for projectcontributor builders.
 type ProjectContributor func(*sql.Selector)
 
+// ProjectPreStartHook is the predicate function for projectprestarthook builders.
+type ProjectPreStartHook func(*sql.Selector)
+
 // ProjectSyncState is the predicate function for projectsyncstate builders.
 type ProjectSyncState func(*sql.Selector)
 
@@ -104,6 +113,9 @@ type Secret func(*sql.Selector)
 
 // Skill is the predicate function for skill builders.
 type Skill func(*sql.Selector)
+
+// SkillInjection is the predicate function for skillinjection builders.
+type SkillInjection func(*sql.Selector)
 
 // SkillRegistry is the predicate function for skillregistry builders.
 type SkillRegistry func(*sql.Selector)

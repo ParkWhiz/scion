@@ -15,7 +15,7 @@ var (
 		{Name: "name", Type: field.TypeString},
 		{Name: "description", Type: field.TypeString, Nullable: true},
 		{Name: "scope_type", Type: field.TypeEnum, Enums: []string{"hub", "project", "resource"}},
-		{Name: "scope_id", Type: field.TypeString, Nullable: true},
+		{Name: "scope_id", Type: field.TypeString, Default: ""},
 		{Name: "resource_type", Type: field.TypeString},
 		{Name: "resource_id", Type: field.TypeString, Nullable: true},
 		{Name: "actions", Type: field.TypeJSON, Nullable: true},
@@ -33,6 +33,13 @@ var (
 		Name:       "access_policies",
 		Columns:    AccessPoliciesColumns,
 		PrimaryKey: []*schema.Column{AccessPoliciesColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "accesspolicy_name_scope_type_scope_id",
+				Unique:  true,
+				Columns: []*schema.Column{AccessPoliciesColumns[1], AccessPoliciesColumns[3], AccessPoliciesColumns[4]},
+			},
+		},
 	}
 	// AgentsColumns holds the columns for the "agents" table.
 	AgentsColumns = []*schema.Column{
@@ -61,6 +68,7 @@ var (
 		{Name: "runtime", Type: field.TypeString, Nullable: true},
 		{Name: "runtime_broker_id", Type: field.TypeString, Nullable: true},
 		{Name: "web_pty_enabled", Type: field.TypeBool, Default: false},
+		{Name: "exposed_ports", Type: field.TypeJSON, Nullable: true},
 		{Name: "task_summary", Type: field.TypeString, Nullable: true},
 		{Name: "message", Type: field.TypeString, Nullable: true},
 		{Name: "applied_config", Type: field.TypeString, Nullable: true, Size: 2147483647},
@@ -82,7 +90,7 @@ var (
 		ForeignKeys: []*schema.ForeignKey{
 			{
 				Symbol:     "agents_projects_agents",
-				Columns:    []*schema.Column{AgentsColumns[36]},
+				Columns:    []*schema.Column{AgentsColumns[37]},
 				RefColumns: []*schema.Column{ProjectsColumns[0]},
 				OnDelete:   schema.NoAction,
 			},
@@ -91,7 +99,49 @@ var (
 			{
 				Name:    "agent_slug_project_id",
 				Unique:  true,
-				Columns: []*schema.Column{AgentsColumns[1], AgentsColumns[36]},
+				Columns: []*schema.Column{AgentsColumns[1], AgentsColumns[37]},
+			},
+		},
+	}
+	// AgentSessionMetricsColumns holds the columns for the "agent_session_metrics" table.
+	AgentSessionMetricsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "agent_id", Type: field.TypeString},
+		{Name: "grove_id", Type: field.TypeString},
+		{Name: "session_id", Type: field.TypeString},
+		{Name: "started_at", Type: field.TypeTime},
+		{Name: "ended_at", Type: field.TypeTime, Nullable: true},
+		{Name: "status", Type: field.TypeString, Nullable: true},
+		{Name: "turn_count", Type: field.TypeInt, Nullable: true, Default: 0},
+		{Name: "model", Type: field.TypeString, Nullable: true},
+		{Name: "tokens_input", Type: field.TypeInt64, Nullable: true, Default: 0},
+		{Name: "tokens_output", Type: field.TypeInt64, Nullable: true, Default: 0},
+		{Name: "tokens_cached", Type: field.TypeInt64, Nullable: true, Default: 0},
+		{Name: "tokens_reasoning", Type: field.TypeInt64, Nullable: true, Default: 0},
+		{Name: "tool_calls", Type: field.TypeJSON, Nullable: true},
+		{Name: "languages", Type: field.TypeJSON, Nullable: true},
+		{Name: "created_at", Type: field.TypeTime},
+	}
+	// AgentSessionMetricsTable holds the schema information for the "agent_session_metrics" table.
+	AgentSessionMetricsTable = &schema.Table{
+		Name:       "agent_session_metrics",
+		Columns:    AgentSessionMetricsColumns,
+		PrimaryKey: []*schema.Column{AgentSessionMetricsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "agentsessionmetrics_agent_id",
+				Unique:  false,
+				Columns: []*schema.Column{AgentSessionMetricsColumns[1]},
+			},
+			{
+				Name:    "agentsessionmetrics_grove_id",
+				Unique:  false,
+				Columns: []*schema.Column{AgentSessionMetricsColumns[2]},
+			},
+			{
+				Name:    "agentsessionmetrics_started_at",
+				Unique:  false,
+				Columns: []*schema.Column{AgentSessionMetricsColumns[4]},
 			},
 		},
 	}
@@ -275,6 +325,36 @@ var (
 				Name:    "gcpserviceaccount_scope_scope_id",
 				Unique:  false,
 				Columns: []*schema.Column{GcpServiceAccountsColumns[1], GcpServiceAccountsColumns[2]},
+			},
+		},
+	}
+	// GithubResolutionCacheColumns holds the columns for the "github_resolution_cache" table.
+	GithubResolutionCacheColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "cache_key", Type: field.TypeString, Unique: true},
+		{Name: "original_uri", Type: field.TypeString},
+		{Name: "commit_sha", Type: field.TypeString},
+		{Name: "file_entries", Type: field.TypeJSON},
+		{Name: "bundle_hash", Type: field.TypeString},
+		{Name: "token_scope", Type: field.TypeString, Default: "public"},
+		{Name: "expires_at", Type: field.TypeTime},
+		{Name: "create_time", Type: field.TypeTime},
+	}
+	// GithubResolutionCacheTable holds the schema information for the "github_resolution_cache" table.
+	GithubResolutionCacheTable = &schema.Table{
+		Name:       "github_resolution_cache",
+		Columns:    GithubResolutionCacheColumns,
+		PrimaryKey: []*schema.Column{GithubResolutionCacheColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "githubresolutioncache_cache_key",
+				Unique:  true,
+				Columns: []*schema.Column{GithubResolutionCacheColumns[1]},
+			},
+			{
+				Name:    "githubresolutioncache_expires_at",
+				Unique:  false,
+				Columns: []*schema.Column{GithubResolutionCacheColumns[7]},
 			},
 		},
 	}
@@ -832,6 +912,44 @@ var (
 			},
 		},
 	}
+	// ProjectPreStartHooksColumns holds the columns for the "project_pre_start_hooks" table.
+	ProjectPreStartHooksColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "scope", Type: field.TypeEnum, Enums: []string{"project", "hub"}, Default: "project"},
+		{Name: "project_id", Type: field.TypeString, Nullable: true, Default: ""},
+		{Name: "name", Type: field.TypeString},
+		{Name: "slug", Type: field.TypeString},
+		{Name: "description", Type: field.TypeString, Nullable: true},
+		{Name: "script", Type: field.TypeString},
+		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "archived"}, Default: "active"},
+		{Name: "created_by", Type: field.TypeString, Nullable: true},
+		{Name: "updated_by", Type: field.TypeString, Nullable: true},
+		{Name: "created", Type: field.TypeTime},
+		{Name: "updated", Type: field.TypeTime},
+	}
+	// ProjectPreStartHooksTable holds the schema information for the "project_pre_start_hooks" table.
+	ProjectPreStartHooksTable = &schema.Table{
+		Name:       "project_pre_start_hooks",
+		Columns:    ProjectPreStartHooksColumns,
+		PrimaryKey: []*schema.Column{ProjectPreStartHooksColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "projectprestarthook_scope_project_id_slug",
+				Unique:  true,
+				Columns: []*schema.Column{ProjectPreStartHooksColumns[1], ProjectPreStartHooksColumns[2], ProjectPreStartHooksColumns[4]},
+			},
+			{
+				Name:    "projectprestarthook_project_id_status",
+				Unique:  false,
+				Columns: []*schema.Column{ProjectPreStartHooksColumns[2], ProjectPreStartHooksColumns[7]},
+			},
+			{
+				Name:    "projectprestarthook_scope_status",
+				Unique:  false,
+				Columns: []*schema.Column{ProjectPreStartHooksColumns[1], ProjectPreStartHooksColumns[7]},
+			},
+		},
+	}
 	// ProjectSyncStateColumns holds the columns for the "project_sync_state" table.
 	ProjectSyncStateColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
@@ -1053,6 +1171,36 @@ var (
 			},
 		},
 	}
+	// SkillInjectionsColumns holds the columns for the "skill_injections" table.
+	SkillInjectionsColumns = []*schema.Column{
+		{Name: "id", Type: field.TypeUUID},
+		{Name: "scope", Type: field.TypeEnum, Enums: []string{"project", "user"}},
+		{Name: "scope_id", Type: field.TypeString},
+		{Name: "skill_uri", Type: field.TypeString},
+		{Name: "skill_as", Type: field.TypeString, Nullable: true},
+		{Name: "optional", Type: field.TypeBool, Default: false},
+		{Name: "sort_order", Type: field.TypeInt, Default: 0},
+		{Name: "created_at", Type: field.TypeTime},
+		{Name: "created_by", Type: field.TypeString, Nullable: true},
+	}
+	// SkillInjectionsTable holds the schema information for the "skill_injections" table.
+	SkillInjectionsTable = &schema.Table{
+		Name:       "skill_injections",
+		Columns:    SkillInjectionsColumns,
+		PrimaryKey: []*schema.Column{SkillInjectionsColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "skillinjection_scope_scope_id",
+				Unique:  false,
+				Columns: []*schema.Column{SkillInjectionsColumns[1], SkillInjectionsColumns[2]},
+			},
+			{
+				Name:    "skillinjection_scope_scope_id_skill_uri",
+				Unique:  true,
+				Columns: []*schema.Column{SkillInjectionsColumns[1], SkillInjectionsColumns[2], SkillInjectionsColumns[3]},
+			},
+		},
+	}
 	// SkillRegistriesColumns holds the columns for the "skill_registries" table.
 	SkillRegistriesColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
@@ -1205,9 +1353,11 @@ var (
 		{Name: "display_name", Type: field.TypeString},
 		{Name: "avatar_url", Type: field.TypeString, Nullable: true},
 		{Name: "role", Type: field.TypeEnum, Enums: []string{"admin", "member", "viewer"}, Default: "member"},
-		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "suspended"}, Default: "active"},
+		{Name: "status", Type: field.TypeEnum, Enums: []string{"active", "suspended", "invited"}, Default: "active"},
 		{Name: "preferences", Type: field.TypeJSON, Nullable: true},
 		{Name: "created", Type: field.TypeTime},
+		{Name: "invited_by", Type: field.TypeString, Nullable: true},
+		{Name: "invite_note", Type: field.TypeString, Nullable: true},
 		{Name: "last_login", Type: field.TypeTime, Nullable: true},
 		{Name: "last_seen", Type: field.TypeTime, Nullable: true},
 	}
@@ -1220,7 +1370,7 @@ var (
 			{
 				Name:    "user_last_seen",
 				Unique:  false,
-				Columns: []*schema.Column{UsersColumns[9]},
+				Columns: []*schema.Column{UsersColumns[11]},
 			},
 		},
 	}
@@ -1285,6 +1435,7 @@ var (
 	Tables = []*schema.Table{
 		AccessPoliciesTable,
 		AgentsTable,
+		AgentSessionMetricsTable,
 		AllowListTable,
 		APIKeysTable,
 		BrokerDispatchTable,
@@ -1292,6 +1443,7 @@ var (
 		BrokerSecretsTable,
 		EnvVarsTable,
 		GcpServiceAccountsTable,
+		GithubResolutionCacheTable,
 		GithubInstallationsTable,
 		GroupsTable,
 		GroupMembershipsTable,
@@ -1310,12 +1462,14 @@ var (
 		PolicyBindingsTable,
 		ProjectsTable,
 		ProjectContributorsTable,
+		ProjectPreStartHooksTable,
 		ProjectSyncStateTable,
 		RuntimeBrokersTable,
 		SchedulesTable,
 		ScheduledEventsTable,
 		SecretsTable,
 		SkillsTable,
+		SkillInjectionsTable,
 		SkillRegistriesTable,
 		SkillVersionsTable,
 		SubscriptionTemplatesTable,
@@ -1328,6 +1482,9 @@ var (
 
 func init() {
 	AgentsTable.ForeignKeys[0].RefTable = ProjectsTable
+	AgentSessionMetricsTable.Annotation = &entsql.Annotation{
+		Table: "agent_session_metrics",
+	}
 	AllowListTable.Annotation = &entsql.Annotation{
 		Table: "allow_list",
 	}
@@ -1348,6 +1505,9 @@ func init() {
 	}
 	GcpServiceAccountsTable.Annotation = &entsql.Annotation{
 		Table: "gcp_service_accounts",
+	}
+	GithubResolutionCacheTable.Annotation = &entsql.Annotation{
+		Table: "github_resolution_cache",
 	}
 	GithubInstallationsTable.Annotation = &entsql.Annotation{
 		Table: "github_installations",
@@ -1398,6 +1558,9 @@ func init() {
 	}
 	ProjectContributorsTable.Annotation = &entsql.Annotation{
 		Table: "project_contributors",
+	}
+	ProjectPreStartHooksTable.Annotation = &entsql.Annotation{
+		Table: "project_pre_start_hooks",
 	}
 	ProjectSyncStateTable.Annotation = &entsql.Annotation{
 		Table: "project_sync_state",

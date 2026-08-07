@@ -158,6 +158,166 @@ func TestApplySettingsUpdates_PreservesServerKeys(t *testing.T) {
 	}
 }
 
+func TestApplySettingsUpdates_AutoExposePortsNilEnabled(t *testing.T) {
+	// When AutoExposePorts is provided but Enabled is nil, the key should be
+	// deleted to avoid persisting an empty auto_expose_ports: {} block.
+	raw := map[string]interface{}{
+		"schema_version": "1",
+		"auto_expose_ports": map[string]interface{}{
+			"enabled": true,
+		},
+	}
+
+	req := &ServerConfigUpdateRequest{
+		AutoExposePorts: &config.AutoExposePortsSettings{
+			Enabled: nil, // nil signals deletion
+		},
+	}
+
+	applySettingsUpdates(raw, req)
+
+	if _, ok := raw["auto_expose_ports"]; ok {
+		t.Error("expected auto_expose_ports key to be deleted when Enabled is nil")
+	}
+}
+
+func TestApplySettingsUpdates_AutoExposePortsWithEnabled(t *testing.T) {
+	// When AutoExposePorts is provided with a non-nil Enabled, the key should
+	// be set normally.
+	raw := map[string]interface{}{
+		"schema_version": "1",
+	}
+
+	enabled := true
+	req := &ServerConfigUpdateRequest{
+		AutoExposePorts: &config.AutoExposePortsSettings{
+			Enabled: &enabled,
+		},
+	}
+
+	applySettingsUpdates(raw, req)
+
+	aep, ok := raw["auto_expose_ports"]
+	if !ok {
+		t.Fatal("expected auto_expose_ports key to be present")
+	}
+	aepMap, ok := aep.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected auto_expose_ports to be a map, got %T", aep)
+	}
+	if aepMap["enabled"] != true {
+		t.Errorf("expected enabled=true, got %v", aepMap["enabled"])
+	}
+}
+
+func TestApplySettingsUpdates_AutoExposePortsNilRequest(t *testing.T) {
+	// When AutoExposePorts itself is nil in the request, the existing value
+	// should be preserved (no change).
+	raw := map[string]interface{}{
+		"schema_version": "1",
+		"auto_expose_ports": map[string]interface{}{
+			"enabled": true,
+		},
+	}
+
+	req := &ServerConfigUpdateRequest{
+		AutoExposePorts: nil,
+	}
+
+	applySettingsUpdates(raw, req)
+
+	if _, ok := raw["auto_expose_ports"]; !ok {
+		t.Error("expected auto_expose_ports to be preserved when request field is nil")
+	}
+}
+
+// TestApplySettingsUpdates_ClearFieldsToBlank is a regression test for
+// ptone/scion#860: clearing a field to blank in the admin UI should delete
+// the key from settings.yaml, not preserve the old value.
+//
+// Round-trip: set value → save → clear to blank → save → confirm deleted.
+func TestApplySettingsUpdates_ClearFieldsToBlank(t *testing.T) {
+	// Step 1: Start with existing settings containing the fields we'll clear.
+	raw := map[string]interface{}{
+		"schema_version":          "1",
+		"default_max_duration":    "2h",
+		"default_max_turns":       200,
+		"default_max_model_calls": 500,
+		"default_model":           "gemini-2.0-flash",
+		"default_thinking_level":  3,
+	}
+
+	// Verify they're present.
+	for _, key := range []string{
+		"default_max_duration", "default_max_turns",
+		"default_max_model_calls", "default_model", "default_thinking_level",
+	} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("precondition: expected %q to be present", key)
+		}
+	}
+
+	// Step 2: Send an update with empty/zero values to clear each field.
+	emptyStr := ""
+	zeroInt := 0
+	req := &ServerConfigUpdateRequest{
+		DefaultMaxDuration:   &emptyStr,
+		DefaultMaxTurns:      &zeroInt,
+		DefaultMaxModelCalls: &zeroInt,
+		DefaultModel:         &emptyStr,
+		DefaultThinkingLevel: &zeroInt,
+	}
+
+	applySettingsUpdates(raw, req)
+
+	// Step 3: Verify all fields are deleted from the raw map.
+	for _, key := range []string{
+		"default_max_duration", "default_max_turns",
+		"default_max_model_calls", "default_model", "default_thinking_level",
+	} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("expected %q to be deleted after clearing to blank, but it still exists with value %v", key, raw[key])
+		}
+	}
+
+	// schema_version should still be present (not affected).
+	if _, ok := raw["schema_version"]; !ok {
+		t.Error("schema_version should be preserved")
+	}
+}
+
+// TestApplySettingsUpdates_OmittedFieldsPreserved verifies that when a field
+// is NOT included in the update request (nil pointer), the existing value is
+// preserved. This is the complement of TestApplySettingsUpdates_ClearFieldsToBlank.
+func TestApplySettingsUpdates_OmittedFieldsPreserved(t *testing.T) {
+	raw := map[string]interface{}{
+		"schema_version":       "1",
+		"default_max_duration": "2h",
+		"default_max_turns":    200,
+		"default_model":        "gemini-2.0-flash",
+	}
+
+	// Request with nil pointers — fields are omitted, not cleared.
+	req := &ServerConfigUpdateRequest{
+		DefaultMaxDuration: nil,
+		DefaultMaxTurns:    nil,
+		DefaultModel:       nil,
+	}
+
+	applySettingsUpdates(raw, req)
+
+	// All fields should be preserved.
+	if raw["default_max_duration"] != "2h" {
+		t.Errorf("expected default_max_duration to be preserved as '2h', got %v", raw["default_max_duration"])
+	}
+	if raw["default_max_turns"] != 200 {
+		t.Errorf("expected default_max_turns to be preserved as 200, got %v", raw["default_max_turns"])
+	}
+	if raw["default_model"] != "gemini-2.0-flash" {
+		t.Errorf("expected default_model to be preserved as 'gemini-2.0-flash', got %v", raw["default_model"])
+	}
+}
+
 func serverConfigForMaskTest() config.V1ServerConfig {
 	return config.V1ServerConfig{
 		Auth: &config.V1AuthConfig{

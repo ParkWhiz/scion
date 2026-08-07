@@ -39,6 +39,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
+	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
 )
 
 const (
@@ -284,13 +285,30 @@ func (b *TelegramBrokerV2) Configure(config map[string]string) error {
 		}
 	}
 
-	// Create hub client.
-	b.hubClient = NewHTTPHubClient(b.hubURL, b.hmacKey, b.brokerID)
+	// Resolve transport auth for IAP-protected hub endpoints.
+	// Uses the same ResolveBrokerTransport pattern as the runtime broker.
+	transportMode := config["transport_mode"]
+	transportAudience := config["transport_audience"]
+	src, mode, tErr := transportauth.ResolveBrokerTransport(transportMode, transportAudience, nil)
+	if tErr != nil {
+		b.log.Warn("Failed to resolve transport auth, continuing without IAP tokens", "error", tErr)
+	}
+	if src != nil {
+		if b.httpClient == nil {
+			b.httpClient = &http.Client{Timeout: 10 * time.Second}
+		}
+		b.httpClient.Transport = transportauth.Wrap(b.httpClient.Transport, src, mode)
+		b.log.Info("Transport auth configured for Telegram v2 broker",
+			"mode", transportMode, "audience", transportAudience)
+	}
+
+	// Create hub client, sharing the broker's (possibly wrapped) httpClient.
+	b.hubClient = NewHTTPHubClient(b.hubURL, b.hmacKey, b.brokerID, b.httpClient)
 
 	// Create component handlers.
 	b.commands = NewCommandHandler(b.store, b.api, b.hubClient, bot.Username, b.log)
 	b.callbacks = NewCallbackHandler(b.store, b.api, b.hubClient, b.log)
-	b.registration = NewRegistrationHandler(b.store, b.api, b.hubURL, b.hmacKey, b.brokerID, b.log)
+	b.registration = NewRegistrationHandler(b.store, b.api, b.hubURL, b.hmacKey, b.brokerID, b.httpClient, b.log)
 
 	// Handle v1 migration: import chat routes as group links.
 	if routesJSON, ok := config["v1_chat_routes"]; ok && routesJSON != "" {
@@ -569,6 +587,32 @@ func (b *TelegramBrokerV2) Publish(ctx context.Context, topic string, msg *messa
 
 	// Determine the project and agent from the topic.
 	projectID, agentSlug := parseTopicComponents(topic)
+
+	// Route system messages to linked groups (similar to state-change
+	// with notify_in_group). System messages are operational notices and
+	// do not need DM routing.
+	if msg != nil && msg.Type == messages.TypeSystem {
+		if store != nil && projectID != "" {
+			links, _ := store.GetGroupLinksForProject(ctx, projectID)
+			for _, link := range links {
+				if link.Active && link.NotifyInGroup {
+					text := FormatSystemCard(msg)
+					if text != "" {
+						if sq != nil {
+							if _, err := sq.Send(ctx, link.ChatID, text, "HTML", nil, 0); err != nil {
+								b.log.Warn("Failed to send system message group notification",
+									"chat_id", link.ChatID, "error", err)
+							}
+						} else if _, err := api.SendMessage(ctx, link.ChatID, text, "HTML"); err != nil {
+							b.log.Warn("Failed to send system message group notification",
+								"chat_id", link.ChatID, "error", err)
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
 
 	// Route state-change notifications to the user's personal DM
 	// instead of the group chat.
@@ -2009,7 +2053,7 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 	var attachmentPath, placeholder string
 	if tgMsg.Photo != nil || tgMsg.Document != nil || tgMsg.Audio != nil || tgMsg.Video != nil {
 		var err error
-		attachmentPath, placeholder, err = b.downloadTelegramFile(ctx, tgMsg, link.ProjectSlug)
+		attachmentPath, placeholder, err = b.downloadTelegramFile(ctx, tgMsg, link.ProjectSlug, link.ProjectID)
 		if err != nil {
 			b.log.Error("Failed to download telegram file", "error", err)
 			b.api.SendMessage(ctx, chatID, "Failed to process attachment: "+err.Error(), "")
@@ -2197,9 +2241,15 @@ func (b *TelegramBrokerV2) handleGroupMessage(tgMsg *TGMessage) {
 const maxTelegramFileSize = 20 * 1024 * 1024 // 20 MB
 
 // downloadTelegramFile downloads a photo, document, audio, or video from a
-// Telegram message and saves it to the configured downloads directory.
-// Returns the agent-relative path and a placeholder string for the message body.
-func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, tgMsg *TGMessage, projectSlug string) (agentPath, placeholder string, err error) {
+// Telegram message and saves it so the agent can access it. Returns the
+// agent-visible path and a placeholder string for the message body.
+//
+// The function uses a three-tier fallback for the destination directory:
+//  1. downloadsPath config (highest priority)
+//  2. Shared dir infrastructure via config.SharedDirHostPath — writes to the host
+//     and exposes the file at /scion-volumes/scratchpad/.attachments/_telegram/
+//  3. Legacy /home/scion/.scion/projects/<slug>/downloads/ (last resort)
+func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, tgMsg *TGMessage, projectSlug, projectID string) (agentPath, placeholder string, err error) {
 	var fileID, fileName, fileType string
 	var fileSize int64
 
@@ -2267,14 +2317,29 @@ func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, tgMsg *TGMe
 	}
 	defer body.Close()
 
-	timestamp := time.Now().Unix()
+	timestamp := time.Now().UnixNano()
 	destName := fmt.Sprintf("tg_%d_%s", timestamp, fileName)
 
-	// Use configured downloads_path if set; otherwise default to project dir.
+	// Route attachments through the shared dir infrastructure so container-based
+	// agents can access them at /scion-volumes/scratchpad/.attachments/_telegram/.
 	var hostDir string
+	var useSharedDir bool
 	if b.downloadsPath != "" {
 		hostDir = b.downloadsPath
-	} else {
+	} else if projectID != "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr == nil {
+			// NOTE: SharedDirHostPath is a pure path computation; it does not verify that
+			// "scratchpad" is actually configured on the project. If it is not configured,
+			// the file will be written to the host but won't be visible inside the agent
+			// container. Projects using container-based agents should always have
+			// scratchpad configured.
+			sharedDirBase := config.SharedDirHostPath(home, projectSlug, projectID, "scratchpad")
+			hostDir = filepath.Join(sharedDirBase, ".attachments", "_telegram")
+			useSharedDir = true
+		}
+	}
+	if hostDir == "" {
 		hostDir = filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
 	}
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
@@ -2293,11 +2358,10 @@ func (b *TelegramBrokerV2) downloadTelegramFile(ctx context.Context, tgMsg *TGMe
 		return "", "", fmt.Errorf("write file: %w", err)
 	}
 
-	// Derive the agent-visible path from the same base used to save the file.
-	// When a custom downloads_path is configured, the agent sees that path
-	// directly; otherwise it sees the conventional /workspace/downloads mount.
 	if b.downloadsPath != "" {
 		agentPath = filepath.Join(b.downloadsPath, destName)
+	} else if useSharedDir {
+		agentPath = filepath.Join("/scion-volumes/scratchpad/.attachments/_telegram", destName)
 	} else {
 		agentPath = filepath.Join("/workspace/downloads", destName)
 	}
@@ -2528,38 +2592,6 @@ func (b *TelegramBrokerV2) getProjectAgents(ctx context.Context, projectID strin
 	}
 
 	return agentSlugs(agents)
-}
-
-// --- Dynamic subscription management ---
-
-func (b *TelegramBrokerV2) subscribeForProject(projectID string) {
-	pattern := projectcompat.ProjectPattern(projectID)
-
-	b.mu.RLock()
-	hc := b.hostCallbacks
-	b.mu.RUnlock()
-
-	if hc != nil {
-		if err := hc.RequestSubscription(pattern); err != nil {
-			b.log.Warn("Failed to request subscription via host callbacks",
-				"pattern", pattern, "error", err)
-		}
-	}
-}
-
-func (b *TelegramBrokerV2) unsubscribeForProject(projectID string) {
-	pattern := projectcompat.ProjectPattern(projectID)
-
-	b.mu.RLock()
-	hc := b.hostCallbacks
-	b.mu.RUnlock()
-
-	if hc != nil {
-		if err := hc.CancelSubscription(pattern); err != nil {
-			b.log.Warn("Failed to cancel subscription via host callbacks",
-				"pattern", pattern, "error", err)
-		}
-	}
 }
 
 // --- Hub delivery (reuses the same pattern as v1) ---

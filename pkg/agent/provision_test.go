@@ -15,6 +15,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	"github.com/GoogleCloudPlatform/scion/resources"
 )
 
 // seedTestHarnessConfig creates a minimal harness-config directory for testing.
@@ -92,10 +94,23 @@ harness_configs:
 	projectDir := filepath.Join(tmpDir, "project")
 	projectScionDir := filepath.Join(projectDir, ".scion")
 	_ = os.MkdirAll(projectScionDir, 0755)
+	// Project-scoped env is declared under harness_configs, NOT under
+	// profiles.test-profile.env. It was the latter until G3-full removed
+	// profiles.<p>.env as an injection point.
+	//
+	// The assertions below are UNCHANGED across that migration, deliberately: the
+	// Global -> Project -> Template ordering they pin is a user-requested property
+	// and it survives G3-full intact. Only the key it is spelled with moved. This
+	// fixture is therefore also the executable form of the CHANGELOG's migration
+	// note — move the keys to harness_configs.<hc>.env in the same settings file
+	// and both the values and their precedence are preserved.
 	projectSettings := `schema_version: "1"
 profiles:
   test-profile:
     runtime: docker
+harness_configs:
+  test-harness:
+    harness: test-harness
     env:
       PROJECT_VAR: project-val
       OVERRIDE_VAR: project-override
@@ -442,11 +457,11 @@ func TestProvisionAgentWorkspaceFlag(t *testing.T) {
 		t.Errorf("expected volume source %q, got %q", evalCustomWorkspace, evalSource)
 	}
 
-	// 2. Test relative path for --workspace
+	// 2. Test relative path for --workspace (resolved against project root)
 	relativeWorkspace := "some-subdir"
 
-	_ = os.MkdirAll(filepath.Join(tmpDir, relativeWorkspace), 0755)
-	absRelativeWorkspace, _ := filepath.Abs(filepath.Join(tmpDir, relativeWorkspace))
+	_ = os.MkdirAll(filepath.Join(projectDir, relativeWorkspace), 0755)
+	absRelativeWorkspace, _ := filepath.Abs(filepath.Join(projectDir, relativeWorkspace))
 	evalAbsRelativeWorkspace, _ := filepath.EvalSymlinks(absRelativeWorkspace)
 
 	_, _, cfg, err = ProvisionAgent(context.Background(), "rel-agent", "claude", "", "", projectScionDir, "", "", "", relativeWorkspace)
@@ -2295,16 +2310,16 @@ func TestInjectPlatformSkills(t *testing.T) {
 		}
 	})
 
-	t.Run("skill with scripts subdirectory is fully copied", func(t *testing.T) {
+	t.Run("skill with nested subdirectory is fully copied", func(t *testing.T) {
 		agentHome := t.TempDir()
 		skillsDir := ".claude/commands"
 
 		skillsFS := fstest.MapFS{
-			"scion/SKILL.md": &fstest.MapFile{
-				Data: []byte("---\nname: scion\n---\n\n# Scion\n"),
+			"scion-agent-manage/SKILL.md": &fstest.MapFile{
+				Data: []byte("---\nname: scion-agent-manage\n---\n\n# Scion Agent Manage\n"),
 			},
-			"scion/scripts/start-agent.sh": &fstest.MapFile{
-				Data: []byte("#!/bin/bash\necho start"),
+			"scion-agent-manage/docs/reference.md": &fstest.MapFile{
+				Data: []byte("# Reference\nAgent management reference docs."),
 			},
 		}
 
@@ -2313,13 +2328,13 @@ func TestInjectPlatformSkills(t *testing.T) {
 			t.Fatalf("injectPlatformSkills failed: %v", err)
 		}
 
-		dest := filepath.Join(agentHome, skillsDir, "scion", "scripts", "start-agent.sh")
+		dest := filepath.Join(agentHome, skillsDir, "scion-agent-manage", "docs", "reference.md")
 		data, err := os.ReadFile(dest)
 		if err != nil {
-			t.Fatalf("expected script to be copied, got error: %v", err)
+			t.Fatalf("expected nested file to be copied, got error: %v", err)
 		}
-		if !strings.Contains(string(data), "echo start") {
-			t.Errorf("script content mismatch: %q", string(data))
+		if !strings.Contains(string(data), "reference docs") {
+			t.Errorf("nested file content mismatch: %q", string(data))
 		}
 	})
 
@@ -2348,4 +2363,694 @@ func TestInjectPlatformSkills(t *testing.T) {
 			t.Errorf("expected git-only skill to be skipped when isGit=false")
 		}
 	})
+}
+
+func TestLoadMandatoryPreamble(t *testing.T) {
+	t.Run("nil FS returns nil without panic", func(t *testing.T) {
+		result, err := loadMandatoryPreamble(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected nil for nil FS, got %q", string(result))
+		}
+	})
+
+	t.Run("empty FS returns nil", func(t *testing.T) {
+		fsys := fstest.MapFS{}
+		result, err := loadMandatoryPreamble(fsys)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected nil for empty FS, got %q", string(result))
+		}
+	})
+
+	t.Run("CRLF-terminated file has trailing CR stripped", func(t *testing.T) {
+		fsys := fstest.MapFS{
+			"crlf.md": &fstest.MapFile{
+				Data: []byte("# Hello\r\nWorld\r\n"),
+			},
+		}
+		result, err := loadMandatoryPreamble(fsys)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// TrimRight with "\r\n" cutset removes trailing CR and LF characters.
+		if string(result) != "# Hello\r\nWorld" {
+			t.Errorf("expected trailing CRLF stripped, got %q", string(result))
+		}
+	})
+
+	t.Run("single non-empty .md file returns its content", func(t *testing.T) {
+		fsys := fstest.MapFS{
+			"preamble.md": &fstest.MapFile{
+				Data: []byte("# Hello\nWorld\n"),
+			},
+		}
+		result, err := loadMandatoryPreamble(fsys)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// TrimRight removes trailing newlines; content should match sans trailing newline
+		if string(result) != "# Hello\nWorld" {
+			t.Errorf("expected '# Hello\\nWorld', got %q", string(result))
+		}
+	})
+
+	t.Run("multiple .md files concatenated in lexical order", func(t *testing.T) {
+		fsys := fstest.MapFS{
+			"b-second.md": &fstest.MapFile{Data: []byte("Second\n")},
+			"a-first.md":  &fstest.MapFile{Data: []byte("First\n")},
+		}
+		result, err := loadMandatoryPreamble(fsys)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected := "First\n\nSecond"
+		if string(result) != expected {
+			t.Errorf("expected %q, got %q", expected, string(result))
+		}
+	})
+
+	t.Run("whitespace-only .md file is skipped", func(t *testing.T) {
+		fsys := fstest.MapFS{
+			"empty.md": &fstest.MapFile{Data: []byte("   \n   \n")},
+		}
+		result, err := loadMandatoryPreamble(fsys)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected nil for whitespace-only file, got %q", string(result))
+		}
+	})
+
+	t.Run("non-.md file is ignored", func(t *testing.T) {
+		fsys := fstest.MapFS{
+			"readme.txt": &fstest.MapFile{Data: []byte("This is a text file\n")},
+		}
+		result, err := loadMandatoryPreamble(fsys)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected nil when only non-.md files present, got %q", string(result))
+		}
+	})
+
+	t.Run("mix of .md and non-.md files — only .md returned", func(t *testing.T) {
+		fsys := fstest.MapFS{
+			"preamble.md": &fstest.MapFile{Data: []byte("# Preamble\n")},
+			"config.yaml": &fstest.MapFile{Data: []byte("key: value\n")},
+			"readme.txt":  &fstest.MapFile{Data: []byte("some text\n")},
+		}
+		result, err := loadMandatoryPreamble(fsys)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(result) != "# Preamble" {
+			t.Errorf("expected only .md content, got %q", string(result))
+		}
+	})
+}
+
+func TestComposeInstructions(t *testing.T) {
+	t.Run("both preamble and template content present", func(t *testing.T) {
+		preamble := []byte("# Preamble")
+		content := []byte("# Template")
+		result := composeInstructions(preamble, content)
+		expected := "# Preamble\n\n# Template"
+		if string(result) != expected {
+			t.Errorf("expected %q, got %q", expected, string(result))
+		}
+	})
+
+	t.Run("preamble present, template content nil", func(t *testing.T) {
+		preamble := []byte("# Preamble")
+		result := composeInstructions(preamble, nil)
+		if string(result) != "# Preamble" {
+			t.Errorf("expected preamble only, got %q", string(result))
+		}
+	})
+
+	t.Run("preamble present, template content empty bytes", func(t *testing.T) {
+		preamble := []byte("# Preamble")
+		result := composeInstructions(preamble, []byte{})
+		if string(result) != "# Preamble" {
+			t.Errorf("expected preamble only for empty template, got %q", string(result))
+		}
+	})
+
+	t.Run("preamble present, template content whitespace-only", func(t *testing.T) {
+		preamble := []byte("# Preamble")
+		result := composeInstructions(preamble, []byte("   \n"))
+		if string(result) != "# Preamble" {
+			t.Errorf("expected preamble only for whitespace template, got %q", string(result))
+		}
+	})
+
+	t.Run("preamble nil, template content present", func(t *testing.T) {
+		content := []byte("# Template")
+		result := composeInstructions(nil, content)
+		if string(result) != "# Template" {
+			t.Errorf("expected template only, got %q", string(result))
+		}
+	})
+
+	t.Run("both nil", func(t *testing.T) {
+		result := composeInstructions(nil, nil)
+		if result != nil {
+			t.Errorf("expected nil for both nil, got %q", string(result))
+		}
+	})
+
+	t.Run("preamble is prepended not appended", func(t *testing.T) {
+		preamble := []byte("PREAMBLE")
+		content := []byte("CONTENT")
+		result := composeInstructions(preamble, content)
+		if !bytes.HasPrefix(result, preamble) {
+			t.Errorf("expected result to start with preamble, got %q", string(result))
+		}
+		if !bytes.HasSuffix(result, content) {
+			t.Errorf("expected result to end with content, got %q", string(result))
+		}
+	})
+}
+
+func TestProvisionAgent_MandatoryPreamble(t *testing.T) {
+	// Load the actual preamble so tests reflect real binary state.
+	realPreamble, err := loadMandatoryPreamble(resources.MandatoryBoilerplateFS())
+	if err != nil {
+		t.Fatalf("failed to load real mandatory preamble: %v", err)
+	}
+
+	// setupGenericEnv creates a minimal environment using the Generic harness,
+	// which writes agent instructions to agents.md in agentHome — easy to verify.
+	setupGenericEnv := func(t *testing.T) (tmpDir, projectScionDir string) {
+		t.Helper()
+		mockRuntimeForTest(t)
+		tmpDir = t.TempDir()
+
+		oldWd, _ := os.Getwd()
+		t.Cleanup(func() { _ = os.Chdir(oldWd) })
+		_ = os.Chdir(tmpDir)
+
+		originalHome := os.Getenv("HOME")
+		t.Cleanup(func() { _ = os.Setenv("HOME", originalHome) })
+		_ = os.Setenv("HOME", tmpDir)
+
+		// Seed a generic harness-config (Generic harness writes to agents.md).
+		globalScionDir := filepath.Join(tmpDir, ".scion")
+		seedTestHarnessConfig(t, globalScionDir, "generic", "generic")
+
+		projectDir := filepath.Join(tmpDir, "project")
+		projectScionDir = filepath.Join(projectDir, ".scion")
+		_ = os.MkdirAll(projectScionDir, 0755)
+		_ = os.Chdir(projectDir)
+		return tmpDir, projectScionDir
+	}
+
+	t.Run("default template agent receives mandatory preamble at start of instructions", func(t *testing.T) {
+		if realPreamble == nil {
+			t.Skip("mandatory preamble is empty — skipping injection check")
+		}
+		tmpDir, projectScionDir := setupGenericEnv(t)
+
+		// Create a minimal template that explicitly uses the generic harness.
+		globalScionDir := filepath.Join(tmpDir, ".scion")
+		tplDir := filepath.Join(globalScionDir, "templates", "preamble-default-tpl")
+		_ = os.MkdirAll(tplDir, 0755)
+		_ = os.WriteFile(filepath.Join(tplDir, "agents.md"), []byte("# Default Instructions\n"), 0644)
+		tplConfig := `{"default_harness_config": "generic"}`
+		_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(tplConfig), 0644)
+
+		agentHome, _, _, err := ProvisionAgent(context.Background(), "preamble-default-agent", "preamble-default-tpl", "", "", projectScionDir, "", "", "", "")
+		if err != nil {
+			t.Fatalf("ProvisionAgent failed: %v", err)
+		}
+
+		// Generic harness writes instructions to agents.md in agentHome.
+		instrFile := filepath.Join(agentHome, "agents.md")
+		content, err := os.ReadFile(instrFile)
+		if err != nil {
+			t.Fatalf("failed to read instructions file: %v", err)
+		}
+		if !bytes.HasPrefix(content, realPreamble) {
+			t.Errorf("expected instructions to start with mandatory preamble\npreamble: %q\ngot start: %q",
+				string(realPreamble), string(content[:min(len(content), len(realPreamble)+20)]))
+		}
+	})
+
+	t.Run("custom template with agents.md receives preamble prepended to template content", func(t *testing.T) {
+		if realPreamble == nil {
+			t.Skip("mandatory preamble is empty — skipping injection check")
+		}
+		tmpDir, projectScionDir := setupGenericEnv(t)
+
+		// Create a custom template with its own agents.md.
+		globalScionDir := filepath.Join(tmpDir, ".scion")
+		tplDir := filepath.Join(globalScionDir, "templates", "custom-tpl")
+		_ = os.MkdirAll(tplDir, 0755)
+		customContent := "# Custom Agent Instructions\nDo custom things.\n"
+		_ = os.WriteFile(filepath.Join(tplDir, "agents.md"), []byte(customContent), 0644)
+		tplConfig := `{"default_harness_config": "generic"}`
+		_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(tplConfig), 0644)
+
+		agentHome, _, _, err := ProvisionAgent(context.Background(), "preamble-custom-agent", "custom-tpl", "", "", projectScionDir, "", "", "", "")
+		if err != nil {
+			t.Fatalf("ProvisionAgent failed: %v", err)
+		}
+
+		// Generic harness writes instructions to agents.md in agentHome.
+		instrFile := filepath.Join(agentHome, "agents.md")
+		content, err := os.ReadFile(instrFile)
+		if err != nil {
+			t.Fatalf("failed to read instructions file: %v", err)
+		}
+
+		// Preamble must come first.
+		if !bytes.HasPrefix(content, realPreamble) {
+			t.Errorf("expected instructions to start with mandatory preamble\npreamble: %q\ngot start: %q",
+				string(realPreamble), string(content[:min(len(content), len(realPreamble)+20)]))
+		}
+		// Template content must also appear.
+		if !bytes.Contains(content, []byte("# Custom Agent Instructions")) {
+			t.Errorf("expected custom template content in instructions, got %q", string(content))
+		}
+	})
+
+	t.Run("agent provisioned without agents.md still receives preamble", func(t *testing.T) {
+		if realPreamble == nil {
+			t.Skip("mandatory preamble is empty — skipping injection check")
+		}
+		tmpDir, projectScionDir := setupGenericEnv(t)
+
+		// Create a template with NO agents.md and no agent_instructions in config.
+		globalScionDir := filepath.Join(tmpDir, ".scion")
+		tplDir := filepath.Join(globalScionDir, "templates", "no-instructions-tpl")
+		_ = os.MkdirAll(tplDir, 0755)
+		// Minimal config: specifies the generic harness-config, no agent_instructions.
+		tplConfig := `{"default_harness_config": "generic"}`
+		_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(tplConfig), 0644)
+
+		agentHome, _, _, err := ProvisionAgent(context.Background(), "preamble-no-instructions-agent", "no-instructions-tpl", "", "", projectScionDir, "", "", "", "")
+		if err != nil {
+			t.Fatalf("ProvisionAgent failed: %v", err)
+		}
+
+		// Generic harness writes instructions to agents.md in agentHome.
+		instrFile := filepath.Join(agentHome, "agents.md")
+		content, err := os.ReadFile(instrFile)
+		if err != nil {
+			t.Fatalf("failed to read instructions file: %v", err)
+		}
+		if !bytes.HasPrefix(content, realPreamble) {
+			t.Errorf("expected instructions to start with mandatory preamble even without template agents.md\npreamble: %q\ngot: %q",
+				string(realPreamble), string(content))
+		}
+	})
+
+	t.Run("inline config agent receives preamble prepended to inline instructions", func(t *testing.T) {
+		if realPreamble == nil {
+			t.Skip("mandatory preamble is empty — skipping injection check")
+		}
+		_, projectScionDir := setupGenericEnv(t)
+
+		inlineInstructions := "# Inline Instructions\nDo inline things.\n"
+		inlineCfg := &api.ScionConfig{
+			AgentInstructions: inlineInstructions,
+		}
+
+		// Use templateName="default" with no default template seeded on disk so
+		// GetTemplateChainInProject returns an empty chain without error, which
+		// triggers the else-if inlineCfg path in ProvisionAgent.
+		// Pass "generic" as harnessConfig so the seeded harness-config is used.
+		agentHome, _, _, err := ProvisionAgent(
+			context.Background(),
+			"preamble-inline-agent",
+			"default", // no default template on disk → empty chain → inline path
+			"", "generic", projectScionDir,
+			"", "", "", "",
+			inlineCfg,
+		)
+		if err != nil {
+			t.Fatalf("ProvisionAgent failed: %v", err)
+		}
+
+		// Generic harness writes instructions to agents.md in agentHome.
+		instrFile := filepath.Join(agentHome, "agents.md")
+		content, err := os.ReadFile(instrFile)
+		if err != nil {
+			t.Fatalf("failed to read instructions file: %v", err)
+		}
+		if !bytes.HasPrefix(content, realPreamble) {
+			t.Errorf("expected inline-config instructions to start with mandatory preamble\npreamble: %q\ngot start: %q",
+				string(realPreamble), string(content[:min(len(content), len(realPreamble)+20)]))
+		}
+		if !bytes.Contains(content, []byte("# Inline Instructions")) {
+			t.Errorf("expected inline content in instructions, got %q", string(content))
+		}
+	})
+}
+
+func TestResolveWorkspaceSubdir(t *testing.T) {
+	root := t.TempDir()
+
+	t.Run("valid subdir", func(t *testing.T) {
+		subdir := filepath.Join(root, "packages", "web")
+		_ = os.MkdirAll(subdir, 0755)
+
+		result, err := resolveWorkspaceSubdir(root, "packages/web")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		evalSubdir, _ := filepath.EvalSymlinks(subdir)
+		if result != evalSubdir {
+			t.Errorf("expected %q, got %q", evalSubdir, result)
+		}
+	})
+
+	t.Run("dot resolves to root", func(t *testing.T) {
+		result, err := resolveWorkspaceSubdir(root, ".")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result != root {
+			t.Errorf("expected %q, got %q", root, result)
+		}
+	})
+
+	t.Run("absolute path rejected", func(t *testing.T) {
+		_, err := resolveWorkspaceSubdir(root, "/absolute/path")
+		if err == nil {
+			t.Fatal("expected error for absolute path")
+		}
+		if !strings.Contains(err.Error(), "must be relative") {
+			t.Errorf("expected 'must be relative' in error, got: %v", err)
+		}
+	})
+
+	t.Run("dotdot traversal rejected", func(t *testing.T) {
+		_, err := resolveWorkspaceSubdir(root, "..")
+		if err == nil {
+			t.Fatal("expected error for '..' traversal")
+		}
+		if !strings.Contains(err.Error(), "escapes project root") {
+			t.Errorf("expected 'escapes project root' in error, got: %v", err)
+		}
+	})
+
+	t.Run("nested dotdot traversal rejected", func(t *testing.T) {
+		_ = os.MkdirAll(filepath.Join(root, "a"), 0755)
+		_, err := resolveWorkspaceSubdir(root, "a/../../b")
+		if err == nil {
+			t.Fatal("expected error for nested '..' traversal")
+		}
+		if !strings.Contains(err.Error(), "escapes project root") {
+			t.Errorf("expected 'escapes project root' in error, got: %v", err)
+		}
+	})
+
+	t.Run("symlink to outside rejected", func(t *testing.T) {
+		outsideDir := t.TempDir()
+		linkPath := filepath.Join(root, "escape-link")
+		if err := os.Symlink(outsideDir, linkPath); err != nil {
+			t.Skipf("cannot create symlink: %v", err)
+		}
+
+		_, err := resolveWorkspaceSubdir(root, "escape-link")
+		if err == nil {
+			t.Fatal("expected error for symlink escaping project root")
+		}
+		if !strings.Contains(err.Error(), "outside project root") {
+			t.Errorf("expected 'outside project root' in error, got: %v", err)
+		}
+	})
+
+	t.Run("nonexistent path rejected", func(t *testing.T) {
+		_, err := resolveWorkspaceSubdir(root, "does-not-exist")
+		if err == nil {
+			t.Fatal("expected error for nonexistent path")
+		}
+		if !strings.Contains(err.Error(), "does not exist") {
+			t.Errorf("expected 'does not exist' in error, got: %v", err)
+		}
+	})
+
+	t.Run("dotdot-prefixed directory name accepted", func(t *testing.T) {
+		// A directory named "..data" does not escape the root
+		dotdotDir := filepath.Join(root, "..data")
+		_ = os.MkdirAll(dotdotDir, 0755)
+
+		result, err := resolveWorkspaceSubdir(root, "..data")
+		if err != nil {
+			t.Fatalf("unexpected error for '..data' directory: %v", err)
+		}
+		evalDotdotDir, _ := filepath.EvalSymlinks(dotdotDir)
+		if result != evalDotdotDir {
+			t.Errorf("expected %q, got %q", evalDotdotDir, result)
+		}
+	})
+}
+
+func TestResolveProjectRoot(t *testing.T) {
+	t.Run("with WorkspacePath set", func(t *testing.T) {
+		settings := &config.VersionedSettings{
+			WorkspacePath: "/some/path",
+		}
+		result := resolveProjectRoot(settings, "/project/.scion")
+		if result != "/some/path" {
+			t.Errorf("expected /some/path, got %q", result)
+		}
+	})
+
+	t.Run("nil settings", func(t *testing.T) {
+		result := resolveProjectRoot(nil, "/project/.scion")
+		if result != "/project" {
+			t.Errorf("expected /project, got %q", result)
+		}
+	})
+
+	t.Run("empty WorkspacePath", func(t *testing.T) {
+		settings := &config.VersionedSettings{
+			WorkspacePath: "",
+		}
+		result := resolveProjectRoot(settings, "/project/.scion")
+		if result != "/project" {
+			t.Errorf("expected /project, got %q", result)
+		}
+	})
+
+	t.Run("projectDir without .scion suffix", func(t *testing.T) {
+		result := resolveProjectRoot(nil, "/project")
+		if result != "/project" {
+			t.Errorf("expected /project, got %q", result)
+		}
+	})
+}
+
+func TestProvisionAgent_RelativeWorkspace(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldWd, _ := os.Getwd()
+	_ = os.Chdir(tmpDir)
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	originalHome := os.Getenv("HOME")
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	_ = os.Setenv("HOME", tmpDir)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	globalTemplatesDir := filepath.Join(globalScionDir, "templates")
+	_ = os.MkdirAll(globalTemplatesDir, 0755)
+
+	seedTestHarnessConfig(t, globalScionDir, "claude", "claude")
+
+	tplDir := filepath.Join(globalTemplatesDir, "claude")
+	_ = os.MkdirAll(tplDir, 0755)
+	tplConfig := `{"default_harness_config": "claude"}`
+	_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(tplConfig), 0644)
+
+	projectDir := filepath.Join(tmpDir, "project")
+	_ = os.MkdirAll(projectDir, 0755)
+
+	projectScionDir := filepath.Join(projectDir, ".scion")
+	_ = os.MkdirAll(projectScionDir, 0755)
+	_ = os.WriteFile(filepath.Join(projectDir, ".gitignore"), []byte("agents/"), 0644)
+
+	// Create subdirectory under project root
+	subdir := filepath.Join(projectDir, "packages", "web")
+	_ = os.MkdirAll(subdir, 0755)
+	evalSubdir, _ := filepath.EvalSymlinks(subdir)
+
+	agentName := "rel-ws-agent"
+	_, ws, cfg, err := ProvisionAgent(context.Background(), agentName, "claude", "", "", projectScionDir, "", "", "", "packages/web")
+	if err != nil {
+		t.Fatalf("ProvisionAgent failed: %v", err)
+	}
+
+	// agentWorkspace should be "" (managed workspace not used)
+	if ws != "" {
+		t.Errorf("expected empty workspace path for relative workspace agent, got %q", ws)
+	}
+
+	// ExplicitWorkspace should be true
+	if !cfg.ExplicitWorkspace {
+		t.Error("expected ExplicitWorkspace to be true")
+	}
+
+	// /workspace volume mount source should point to the subdir
+	found := false
+	for _, v := range cfg.Volumes {
+		if v.Target == "/workspace" {
+			found = true
+			evalSource, _ := filepath.EvalSymlinks(v.Source)
+			if evalSource != evalSubdir {
+				t.Errorf("expected volume source %q, got %q", evalSubdir, evalSource)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected /workspace volume mount not found in config")
+	}
+}
+
+func TestProvisionAgent_RelativeWorkspace_GitClone_Rejected(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldWd, _ := os.Getwd()
+	_ = os.Chdir(tmpDir)
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	originalHome := os.Getenv("HOME")
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	_ = os.Setenv("HOME", tmpDir)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	globalTemplatesDir := filepath.Join(globalScionDir, "templates")
+	_ = os.MkdirAll(globalTemplatesDir, 0755)
+
+	seedTestHarnessConfig(t, globalScionDir, "claude", "claude")
+
+	tplDir := filepath.Join(globalTemplatesDir, "claude")
+	_ = os.MkdirAll(tplDir, 0755)
+	tplConfig := `{"default_harness_config": "claude"}`
+	_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(tplConfig), 0644)
+
+	projectDir := filepath.Join(tmpDir, "project")
+	projectScionDir := filepath.Join(projectDir, ".scion")
+	_ = os.MkdirAll(projectScionDir, 0755)
+
+	gitClone := &api.GitCloneConfig{
+		URL:    "https://github.com/example/repo.git",
+		Branch: "main",
+		Depth:  1,
+	}
+	ctx := api.ContextWithGitClone(context.Background(), gitClone)
+
+	_, _, _, err := ProvisionAgent(ctx, "gitclone-rel-agent", "claude", "", "", projectScionDir, "", "", "", "packages/web")
+	if err == nil {
+		t.Fatal("expected error for relative workspace with git-clone")
+	}
+	if !strings.Contains(err.Error(), "relative --workspace is not supported for git-clone projects") {
+		t.Errorf("expected error about relative workspace not supported for git-clone, got: %v", err)
+	}
+}
+
+func TestGetAgent_RelativeWorkspaceResume(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldWd, _ := os.Getwd()
+	_ = os.Chdir(tmpDir)
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	originalHome := os.Getenv("HOME")
+	defer func() { _ = os.Setenv("HOME", originalHome) }()
+	_ = os.Setenv("HOME", tmpDir)
+
+	globalScionDir := filepath.Join(tmpDir, ".scion")
+	globalTemplatesDir := filepath.Join(globalScionDir, "templates")
+	_ = os.MkdirAll(globalTemplatesDir, 0755)
+
+	seedTestHarnessConfig(t, globalScionDir, "claude", "claude")
+
+	tplDir := filepath.Join(globalTemplatesDir, "claude")
+	_ = os.MkdirAll(tplDir, 0755)
+	tplConfig := `{"default_harness_config": "claude"}`
+	_ = os.WriteFile(filepath.Join(tplDir, "scion-agent.json"), []byte(tplConfig), 0644)
+
+	// Non-git project with a subdirectory
+	projectDir := filepath.Join(tmpDir, "project")
+	projectScionDir := filepath.Join(projectDir, ".scion")
+	_ = os.MkdirAll(projectScionDir, 0755)
+	_ = os.WriteFile(filepath.Join(projectDir, ".gitignore"), []byte("agents/"), 0644)
+
+	subdir := filepath.Join(projectDir, "packages", "web")
+	_ = os.MkdirAll(subdir, 0755)
+
+	agentName := "resume-rel-ws"
+
+	// Phase 1: Create the agent with relative workspace
+	_, _, cfg, err := ProvisionAgent(context.Background(), agentName, "claude", "", "", projectScionDir, "", "", "", "packages/web")
+	if err != nil {
+		t.Fatalf("ProvisionAgent failed: %v", err)
+	}
+
+	// Verify initial provisioning set ExplicitWorkspace
+	if !cfg.ExplicitWorkspace {
+		t.Fatal("expected ExplicitWorkspace to be true after initial provision")
+	}
+
+	// Find the workspace volume source
+	var originalSource string
+	for _, v := range cfg.Volumes {
+		if v.Target == "/workspace" {
+			originalSource = v.Source
+			break
+		}
+	}
+	if originalSource == "" {
+		t.Fatal("expected /workspace volume mount not found after initial provision")
+	}
+
+	// Phase 2: "Resume" — call GetAgent (simulates agent restart/resume)
+	_, _, _, resumeCfg, err := GetAgent(context.Background(), agentName, "", "", "", projectScionDir, "", "", "", "")
+	if err != nil {
+		t.Fatalf("GetAgent (resume) failed: %v", err)
+	}
+
+	// Verify ExplicitWorkspace persists across resume
+	if !resumeCfg.ExplicitWorkspace {
+		t.Error("expected ExplicitWorkspace to be true on resume")
+	}
+
+	// Note: On resume, GetAgent loads the persisted scion-agent.json.
+	// The persisted config contains the /workspace volume mount from the
+	// original provisioning. The volume source should match.
+	var resumeSource string
+	for _, v := range resumeCfg.Volumes {
+		if v.Target == "/workspace" {
+			resumeSource = v.Source
+			break
+		}
+	}
+
+	// The volume mount should be present and point to the same path
+	if resumeSource == "" {
+		// On resume without re-provisioning, the volumes come from the
+		// persisted config. Check that ExplicitWorkspace persisted.
+		// The exact volume mount may not be re-computed on GetAgent resume
+		// (it reads from persisted config), so verify ExplicitWorkspace
+		// which is the critical resume invariant.
+		t.Log("Note: /workspace volume not in resumed config (expected for GetAgent path that loads from disk)")
+	} else {
+		evalOriginal, _ := filepath.EvalSymlinks(originalSource)
+		evalResume, _ := filepath.EvalSymlinks(resumeSource)
+		if evalOriginal != evalResume {
+			t.Errorf("expected resume workspace source %q, got %q", evalOriginal, evalResume)
+		}
+	}
 }

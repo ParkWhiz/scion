@@ -56,13 +56,14 @@ type Agent struct {
 	StalledFromActivity string `json:"stalledFromActivity,omitempty"` // Activity before stalled; empty when not stalled
 
 	// Runtime configuration
-	Image           string `json:"image,omitempty"`
-	Detached        bool   `json:"detached"`
-	Runtime         string `json:"runtime,omitempty"`         // docker, kubernetes, apple
-	RuntimeBrokerID string `json:"runtimeBrokerId,omitempty"` // FK to RuntimeBroker.ID
-	WebPTYEnabled   bool   `json:"webPtyEnabled,omitempty"`
-	TaskSummary     string `json:"taskSummary,omitempty"`
-	Message         string `json:"message,omitempty"`
+	Image           string        `json:"image,omitempty"`
+	Detached        bool          `json:"detached"`
+	Runtime         string        `json:"runtime,omitempty"`         // docker, kubernetes, apple
+	RuntimeBrokerID string        `json:"runtimeBrokerId,omitempty"` // FK to RuntimeBroker.ID
+	WebPTYEnabled   bool          `json:"webPtyEnabled,omitempty"`
+	ExposedPorts    []ExposedPort `json:"exposedPorts,omitempty"`
+	TaskSummary     string        `json:"taskSummary,omitempty"`
+	Message         string        `json:"message,omitempty"`
 
 	// Enriched fields (populated by Hub when returning data, not persisted)
 	Project           string `json:"project,omitempty"`           // Project name (resolved from ProjectID)
@@ -92,6 +93,17 @@ type Agent struct {
 
 	// Optimistic locking
 	StateVersion int64 `json:"stateVersion"`
+}
+
+// ExposedPort is a Hub-registered local port that may be reached through an
+// authenticated agent-held tunnel.
+type ExposedPort struct {
+	Port      int       `json:"port"`
+	Label     string    `json:"label,omitempty"`
+	Host      string    `json:"host,omitempty"`
+	Mode      string    `json:"mode,omitempty"`
+	ExposedAt time.Time `json:"exposedAt"`
+	ExposedBy string    `json:"exposedBy"`
 }
 
 // MarshalJSON implements custom marshaling to support legacy groveId field.
@@ -172,6 +184,16 @@ type AgentAppliedConfig struct {
 
 	// GCPIdentity holds the GCP identity assignment for this agent.
 	GCPIdentity *GCPIdentityConfig `json:"gcpIdentity,omitempty"`
+
+	// ProjectPreStartHookID is the ID of the active pre-start hook for this
+	// agent's project at creation time. Used for audit and lineage tracking.
+	ProjectPreStartHookID string `json:"projectPreStartHookId,omitempty"`
+
+	// ProjectPreStartHookScript is the script content of the active pre-start
+	// hook, inlined at agent-create time for zero-latency delivery to the broker.
+	// Bounded to 64 KB at the Hub API layer. When non-empty, the broker stages it
+	// into $HOME/.scion/hooks/pre-start.d/30-project-custom before container start.
+	ProjectPreStartHookScript string `json:"projectPreStartHookScript,omitempty"`
 }
 
 // Project type constants.
@@ -183,6 +205,12 @@ type AgentAppliedConfig struct {
 const (
 	ProjectTypeLinked     = "linked"      // Broker-linked project (local project linked to hub)
 	ProjectTypeHubManaged = "hub-managed" // Hub-managed workspace
+)
+
+// Project classification labels.
+const (
+	// LabelTemplate marks a project as a project template.
+	LabelTemplate = "scion.io/template"
 )
 
 // Workspace mode constants for git projects.
@@ -212,9 +240,11 @@ const (
 	SharingModeClonePerAgent WorkspaceSharingMode = "clone-per-agent"
 
 	// SharingModeWorktreePerAgent: each agent gets its own git worktree over
-	// one shared checkout. The shared checkout + all worktrees live on NFS.
+	// one shared checkout. Supported on Hub-managed git projects (Phase 1+).
+	// On Docker/VM runtimes the shared base and worktrees live on node-local
+	// storage; on Kubernetes the NFS backend is required (node-local worktrees
+	// on K8s are not supported and fall back to clone-per-agent).
 	// Maps from label value "worktree-per-agent".
-	// Note: not yet on Hub-managed projects — reserved for Phase 1+.
 	SharingModeWorktreePerAgent WorkspaceSharingMode = "worktree-per-agent"
 )
 
@@ -334,6 +364,11 @@ func (p *Project) IsSharedWorkspace() bool {
 // per-agent git worktrees over a shared base clone.
 func (p *Project) IsWorktreePerAgent() bool {
 	return p.GitRemote != "" && p.Labels[LabelWorkspaceMode] == WorkspaceModeWorktreePerAgent
+}
+
+// IsTemplate returns true if this project is marked as a project template.
+func (p *Project) IsTemplate() bool {
+	return p.Labels[LabelTemplate] == "true"
 }
 
 // RuntimeBroker represents a compute node in the Hub database.
@@ -671,7 +706,11 @@ type User struct {
 
 	// Access control
 	Role   string `json:"role"`   // admin, member, viewer
-	Status string `json:"status"` // active, suspended
+	Status string `json:"status"` // active, suspended, invited
+
+	// Invite provenance (populated for status=invited users)
+	InvitedBy  *string `json:"invitedBy,omitempty"`  // ID or email of admin who invited this user
+	InviteNote *string `json:"inviteNote,omitempty"` // Optional note from the inviting admin
 
 	// Preferences (stored as JSON)
 	Preferences *UserPreferences `json:"preferences,omitempty"`
@@ -694,6 +733,13 @@ const (
 	UserRoleAdmin  = "admin"
 	UserRoleMember = "member"
 	UserRoleViewer = "viewer"
+)
+
+// UserStatus constants
+const (
+	UserStatusActive    = "active"
+	UserStatusSuspended = "suspended"
+	UserStatusInvited   = "invited"
 )
 
 // Visibility constants - re-exported from api package for convenience.
@@ -1427,32 +1473,36 @@ const UATPrefix = "scion_pat_"
 
 // UAT scope constants define the allowed capability scopes.
 const (
-	UATScopeProjectRead   = "project:read"
-	UATScopeAgentCreate   = "agent:create"
-	UATScopeAgentRead     = "agent:read"
-	UATScopeAgentList     = "agent:list"
-	UATScopeAgentStart    = "agent:start"
-	UATScopeAgentStop     = "agent:stop"
-	UATScopeAgentDelete   = "agent:delete"
-	UATScopeAgentMessage  = "agent:message"
-	UATScopeAgentAttach   = "agent:attach"
-	UATScopeAgentDispatch = "agent:dispatch"
-	UATScopeAgentManage   = "agent:manage" // Convenience alias
+	UATScopeProjectRead     = "project:read"
+	UATScopeProjectUpdate   = "project:update"
+	UATScopeAgentCreate     = "agent:create"
+	UATScopeAgentRead       = "agent:read"
+	UATScopeAgentList       = "agent:list"
+	UATScopeAgentStart      = "agent:start"
+	UATScopeAgentStop       = "agent:stop"
+	UATScopeAgentDelete     = "agent:delete"
+	UATScopeAgentMessage    = "agent:message"
+	UATScopeAgentAttach     = "agent:attach"
+	UATScopeAgentPortAccess = "agent:port_access"
+	UATScopeAgentDispatch   = "agent:dispatch"
+	UATScopeAgentManage     = "agent:manage" // Convenience alias
 )
 
 // UATValidScopes is the set of all valid UAT scope strings.
 var UATValidScopes = map[string]bool{
-	UATScopeProjectRead:   true,
-	UATScopeAgentCreate:   true,
-	UATScopeAgentRead:     true,
-	UATScopeAgentList:     true,
-	UATScopeAgentStart:    true,
-	UATScopeAgentStop:     true,
-	UATScopeAgentDelete:   true,
-	UATScopeAgentMessage:  true,
-	UATScopeAgentAttach:   true,
-	UATScopeAgentDispatch: true,
-	UATScopeAgentManage:   true,
+	UATScopeProjectRead:     true,
+	UATScopeProjectUpdate:   true,
+	UATScopeAgentCreate:     true,
+	UATScopeAgentRead:       true,
+	UATScopeAgentList:       true,
+	UATScopeAgentStart:      true,
+	UATScopeAgentStop:       true,
+	UATScopeAgentDelete:     true,
+	UATScopeAgentMessage:    true,
+	UATScopeAgentAttach:     true,
+	UATScopeAgentPortAccess: true,
+	UATScopeAgentDispatch:   true,
+	UATScopeAgentManage:     true,
 }
 
 // UATManageScopes are the scopes expanded from the agent:manage alias.
@@ -1463,6 +1513,7 @@ var UATManageScopes = []string{
 	UATScopeAgentStart,
 	UATScopeAgentStop,
 	UATScopeAgentDelete,
+	UATScopeAgentPortAccess,
 	UATScopeAgentDispatch,
 }
 
@@ -2110,3 +2161,99 @@ const (
 	SkillVersionStatusDeprecated = "deprecated"
 	SkillVersionStatusArchived   = "archived"
 )
+
+// =============================================================================
+// Skill Injections (Injected-Skills List)
+// =============================================================================
+
+// SkillInjection is one entry in a project's or user's injected-skills list.
+type SkillInjection struct {
+	ID        string    `json:"id"`
+	Scope     string    `json:"scope"`
+	ScopeID   string    `json:"scopeId"`
+	SkillURI  string    `json:"skillUri"`
+	SkillAs   string    `json:"skillAs,omitempty"`
+	Optional  bool      `json:"optional"`
+	SortOrder int       `json:"sortOrder"`
+	CreatedAt time.Time `json:"createdAt"`
+	CreatedBy string    `json:"createdBy,omitempty"`
+}
+
+// ToSkillReference converts to the api.SkillReference wire type used by the provisioner.
+func (si SkillInjection) ToSkillReference() api.SkillReference {
+	return api.SkillReference{URI: si.SkillURI, As: si.SkillAs, Optional: si.Optional}
+}
+
+// SkillInjectionScope constants for skill injection scope values.
+const (
+	SkillInjectionScopeProject = "project"
+	SkillInjectionScopeUser    = "user"
+)
+
+// =============================================================================
+// Agent Session Metrics (Hub Metrics Reporting)
+// =============================================================================
+
+// AgentSessionMetrics represents a pre-aggregated session-level telemetry
+// record reported by sciontool on session-end.
+type AgentSessionMetrics struct {
+	ID              string         `json:"id"`
+	AgentID         string         `json:"agentId"`
+	ProjectID       string         `json:"projectId"`
+	SessionID       string         `json:"sessionId"`
+	StartedAt       time.Time      `json:"startedAt"`
+	EndedAt         *time.Time     `json:"endedAt,omitempty"`
+	Status          string         `json:"status,omitempty"`
+	TurnCount       int            `json:"turnCount,omitempty"`
+	Model           string         `json:"model,omitempty"`
+	TokensInput     int64          `json:"tokensInput,omitempty"`
+	TokensOutput    int64          `json:"tokensOutput,omitempty"`
+	TokensCached    int64          `json:"tokensCached,omitempty"`
+	TokensReasoning int64          `json:"tokensReasoning,omitempty"`
+	ToolCalls       map[string]any `json:"toolCalls,omitempty"`
+	Languages       []string       `json:"languages,omitempty"`
+	CreatedAt       time.Time      `json:"createdAt"`
+}
+
+// AgentSessionMetricsAggregates holds SQL-level aggregation results for
+// session metrics (COUNT, SUM). Fields that require per-row inspection (tool
+// calls, model distribution) are not included — those are derived from list
+// queries.
+type AgentSessionMetricsAggregates struct {
+	Count           int   `json:"count"`
+	SumTokensInput  int64 `json:"sumTokensInput"`
+	SumTokensOutput int64 `json:"sumTokensOutput"`
+	SumTokensCached int64 `json:"sumTokensCached"`
+	SumTokensReason int64 `json:"sumTokensReasoning"`
+	SumTurnCount    int64 `json:"sumTurnCount"`
+}
+
+// MarshalJSON implements custom marshaling to support legacy groveId field.
+func (m AgentSessionMetrics) MarshalJSON() ([]byte, error) {
+	type Alias AgentSessionMetrics
+	return json.Marshal(&struct {
+		Alias
+		GroveID string `json:"groveId"`
+	}{
+		Alias:   Alias(m),
+		GroveID: m.ProjectID,
+	})
+}
+
+// UnmarshalJSON implements custom unmarshaling to support legacy groveId field.
+func (m *AgentSessionMetrics) UnmarshalJSON(data []byte) error {
+	type Alias AgentSessionMetrics
+	aux := &struct {
+		GroveID string `json:"groveId"`
+		*Alias
+	}{
+		Alias: (*Alias)(m),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if m.ProjectID == "" && aux.GroveID != "" {
+		m.ProjectID = aux.GroveID
+	}
+	return nil
+}

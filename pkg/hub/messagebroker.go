@@ -669,8 +669,9 @@ func (p *MessageBrokerProxy) publishDeliveryFailed(ctx context.Context, projectI
 		Sender:    "system",
 		Recipient: msg.Sender,
 		Msg:       failMsg,
-		Type:      messages.TypeStateChange,
+		Type:      messages.TypeSystem,
 		Status:    "DELIVERY_FAILED",
+		Metadata:  map[string]string{"system_category": messages.SystemCategoryDeliveryFailed},
 	}
 	structuredMsg.RecipientID = senderAgent.ID
 

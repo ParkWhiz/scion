@@ -185,6 +185,17 @@ func (r *PodmanRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 	}
 
 	// Apply resource constraints from config.
+	//
+	// TODO(cgroup-limits): when r.Rootless is true and the host is on cgroup v1,
+	// Podman cannot apply resource limits and rejects these flags, so the agent
+	// fails to start instead of falling back to an unlimited container. This is
+	// now reachable by default because config.BuiltinDefaultResources() supplies
+	// limits.cpu "2" for every agent. detectRootlessMode already gives us half
+	// the signal; the fix is to also probe
+	// `podman info --format '{{.Host.CgroupsVersion}}'` at construction and skip
+	// these flags with a warning when limits are unsupported. Not implemented
+	// here — affected deployments must set
+	// `runtime.enforce_resource_defaults: false` until it lands.
 	if config.Resources != nil {
 		if config.Resources.Limits.Memory != "" {
 			bytes, err := util.ParseMemory(config.Resources.Limits.Memory)
@@ -369,8 +380,21 @@ func (r *PodmanRuntime) Attach(ctx context.Context, id string) error {
 }
 
 func (r *PodmanRuntime) ImageExists(ctx context.Context, image string) (bool, error) {
-	_, err := runSimpleCommand(ctx, r.Command, "image", "inspect", image)
-	return err == nil, nil
+	out, err := runSimpleCommand(ctx, r.Command, "image", "inspect", image)
+	if err == nil {
+		return true, nil
+	}
+	// Exit-code errors could mean "image not found" OR a daemon-level failure
+	// (e.g. daemon unreachable). Both produce exec.ExitError with a non-zero
+	// exit code, so we inspect the command output to distinguish the two.
+	// Podman prints "image not known" when the image genuinely does not exist.
+	if isExitError(err) {
+		if isImageNotFoundOutput(out) {
+			return false, nil
+		}
+		return false, err
+	}
+	return false, err
 }
 
 func (r *PodmanRuntime) ImageID(ctx context.Context, image string) (string, error) {

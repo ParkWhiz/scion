@@ -175,7 +175,7 @@ This is also the token that Claude's `capture_auth.py` stores automatically afte
 
 ### Vertex Model Garden (`vertex-ai`)
 
-Uses Google Cloud's Vertex AI endpoints with Application Default Credentials (ADC). Scion supports two primary ways to authenticate in Hub mode: via an assigned GCP Identity (Service Account) or an injected ADC file secret. Supported by Claude, Gemini, and OpenCode (Codex, Copilot, and Hermes do not support Vertex AI).
+Uses Google Cloud's Vertex AI endpoints with Application Default Credentials (ADC). Scion supports two primary ways to authenticate in Hub mode: via an assigned GCP Identity (Service Account) or an injected ADC file secret. Supported by Claude, Gemini, OpenCode, and Antigravity (Codex, Copilot, and Hermes do not support Vertex AI).
 
 **Required Sources:**
 - **Assigned GCP Identity** (Hub Mode): If the agent is assigned a Hub-managed GCP Service Account via metadata emulation, Vertex AI will automatically use it. This is the recommended and most secure approach.
@@ -209,6 +209,18 @@ scion hub secret set GOOGLE_CLOUD_REGION "us-east5"
 :::note
 **Direct Hub secret access from agents is explicitly blocked for security.** The Hub injects secrets into the agent at startup.
 The `gcloud-adc` secret automatically writes the ADC file to the well-known GCP path inside the container. Scion does **not** set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable by default when using `gcloud-adc`. If you need to use `GOOGLE_APPLICATION_CREDENTIALS` as an alternative for Vertex AI or to point to a non-standard path, set it up as a standard environment variable secret alongside your file secret.
+:::
+
+:::tip[Claude Vertex AI Translation]
+For the Claude harness, Scion automatically translates `GOOGLE_CLOUD_PROJECT` to the `ANTHROPIC_VERTEX_PROJECT_ID` environment variable during container provisioning. This ensures that Claude Code's native Vertex AI client authenticates and operates correctly with Vertex Model Garden endpoints without manual environment adjustments.
+:::
+
+:::tip[Antigravity Vertex AI & ADC]
+For the Antigravity harness, `vertex-ai` authentication is powered entirely by Google Cloud Application Default Credentials (ADC) plus the Google Cloud project (`GOOGLE_CLOUD_PROJECT`) and location/region (`GOOGLE_CLOUD_LOCATION` or `GOOGLE_CLOUD_REGION`) environment variables, and no longer requires `AGY_TOKEN`. At runtime, Scion sets the `AGY_ADC_AUTH` environment variable to `true` and maps `gcloud-adc` (if uploaded) to `GOOGLE_APPLICATION_CREDENTIALS`. This mode requires AGY CLI >= 1.1.10.
+:::
+
+:::caution[Defensive Auth Protection]
+To prevent auth state corruption across container restarts, Scion implements a strict defensive guard rejecting known harness implementation names (e.g., `container-script`) from being stored or written as authentication types into `opts.HarnessAuth` or `scion-agent.json`. This ensures that previous backfill scripts or configurations cannot accidentally pollute the agent's authentication setup and cause self-perpetuating "not logged in" errors on subsequent runs.
 :::
 
 ### Harness specific credential file (`auth-file`)
@@ -420,3 +432,9 @@ If GitHub App integration is not available, you can use a Personal Access Token.
 3. Scion injects this token into the agent container as an environment variable (`GITHUB_TOKEN`), which Git uses for HTTPS authentication.
 
 For detailed instructions on setting this up, see [Git-Based Projects](/scion/workstation/git-projects/).
+
+### Multi-Repository (Convention-Based) Secrets
+
+When your templates reference skills or repositories across multiple GitHub owners or organizations, a single default `GITHUB_TOKEN` may not have the required permissions.
+
+To address this, Scion supports **convention-based multi-GitHub credential resolution** using project secrets (e.g., `GH_OWNER__REPO` or `GH_OWNER`). For setup examples, precedence rules, and naming conventions, see the [GitHub Multi-Repo Credentials](/scion/hosted/user/secrets/#github-multi-repo-credentials) section in the Secrets Guide.

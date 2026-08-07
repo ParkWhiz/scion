@@ -656,9 +656,18 @@ func WarnDeprecatedTemplateFields(cfg *api.ScionConfig) []string {
 }
 
 // NormalizeModelAlias normalizes shorthand model alias names to their canonical form.
+// Handles single-letter shortcuts (S/M/L) and the XL shorthand in addition
+// to case normalization.
 func NormalizeModelAlias(model string) string {
 	model = strings.ToLower(model)
-	if model == "xl" {
+	switch model {
+	case "s":
+		return "small"
+	case "m":
+		return "medium"
+	case "l":
+		return "large"
+	case "xl":
 		return "extra-large"
 	}
 	return model
@@ -728,6 +737,19 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	if override.Model != "" {
 		result.Model = override.Model
 	}
+	// ThinkingLevel is a *int: nil means "unset", so a nil override never
+	// clobbers a base value. Copy the pointee rather than the pointer — the
+	// merge's shallow copy above already aliases base's fields, and adding a
+	// second alias to a caller-owned struct is a trap for the next editor
+	// (at provision.go the override is opts.InlineConfig, which is reachable
+	// from the broker's request struct).
+	if override.ThinkingLevel != nil {
+		v := *override.ThinkingLevel
+		result.ThinkingLevel = &v
+	}
+	// Secrets is deliberately NOT cased here. Secrets reach agents via
+	// start_context.go; a merge case would create a second, competing secret
+	// channel with its own precedence rules.
 	if override.Kubernetes != nil {
 		result.Kubernetes = mergeKubernetesConfig(result.Kubernetes, override.Kubernetes)
 	}
@@ -838,8 +860,18 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	}
 
 	// Skills: append (deferred override semantics per #230).
+	// Annotate override skills with "template" scope for destination-name
+	// collision resolution on the local (non-hub) provisioning path.
+	// Copy the slice to avoid mutating the caller's config.
 	if len(override.Skills) > 0 {
-		result.Skills = append(result.Skills, override.Skills...)
+		annotated := make([]api.SkillReference, len(override.Skills))
+		copy(annotated, override.Skills)
+		for i := range annotated {
+			if annotated[i].Scope == "" {
+				annotated[i].Scope = "template"
+			}
+		}
+		result.Skills = append(result.Skills, annotated...)
 	}
 
 	return &result
@@ -911,6 +943,9 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 	if override.Cloud != nil {
 		if result.Cloud == nil {
 			result.Cloud = &api.TelemetryCloudConfig{}
+		} else {
+			cloudCopy := *result.Cloud
+			result.Cloud = &cloudCopy
 		}
 		if override.Cloud.Enabled != nil {
 			result.Cloud.Enabled = override.Cloud.Enabled
@@ -927,6 +962,9 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 		if override.Cloud.TLS != nil {
 			if result.Cloud.TLS == nil {
 				result.Cloud.TLS = &api.TelemetryTLS{}
+			} else {
+				tlsCopy := *result.Cloud.TLS
+				result.Cloud.TLS = &tlsCopy
 			}
 			if override.Cloud.TLS.Enabled != nil {
 				result.Cloud.TLS.Enabled = override.Cloud.TLS.Enabled
@@ -941,6 +979,9 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 		if override.Cloud.Batch != nil {
 			if result.Cloud.Batch == nil {
 				result.Cloud.Batch = &api.TelemetryBatch{}
+			} else {
+				batchCopy := *result.Cloud.Batch
+				result.Cloud.Batch = &batchCopy
 			}
 			if override.Cloud.Batch.MaxSize > 0 {
 				result.Cloud.Batch.MaxSize = override.Cloud.Batch.MaxSize
@@ -952,10 +993,19 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 		if override.Cloud.Provider != "" {
 			result.Cloud.Provider = override.Cloud.Provider
 		}
+		if override.Cloud.GCPProjectID != nil {
+			result.Cloud.GCPProjectID = override.Cloud.GCPProjectID
+		}
+		if override.Cloud.CloudLogging != nil {
+			result.Cloud.CloudLogging = override.Cloud.CloudLogging
+		}
 	}
 	if override.Hub != nil {
 		if result.Hub == nil {
 			result.Hub = &api.TelemetryHubConfig{}
+		} else {
+			hubCopy := *result.Hub
+			result.Hub = &hubCopy
 		}
 		if override.Hub.Enabled != nil {
 			result.Hub.Enabled = override.Hub.Enabled
@@ -967,6 +1017,9 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 	if override.Local != nil {
 		if result.Local == nil {
 			result.Local = &api.TelemetryLocalConfig{}
+		} else {
+			localCopy := *result.Local
+			result.Local = &localCopy
 		}
 		if override.Local.Enabled != nil {
 			result.Local.Enabled = override.Local.Enabled
@@ -981,6 +1034,9 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 	if override.Filter != nil {
 		if result.Filter == nil {
 			result.Filter = &api.TelemetryFilterConfig{}
+		} else {
+			filterCopy := *result.Filter
+			result.Filter = &filterCopy
 		}
 		if override.Filter.Enabled != nil {
 			result.Filter.Enabled = override.Filter.Enabled
@@ -991,6 +1047,9 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 		if override.Filter.Events != nil {
 			if result.Filter.Events == nil {
 				result.Filter.Events = &api.TelemetryEventsConfig{}
+			} else {
+				eventsCopy := *result.Filter.Events
+				result.Filter.Events = &eventsCopy
 			}
 			if override.Filter.Events.Include != nil {
 				result.Filter.Events.Include = override.Filter.Events.Include
@@ -1002,6 +1061,9 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 		if override.Filter.Attributes != nil {
 			if result.Filter.Attributes == nil {
 				result.Filter.Attributes = &api.TelemetryAttributesConfig{}
+			} else {
+				attrCopy := *result.Filter.Attributes
+				result.Filter.Attributes = &attrCopy
 			}
 			if override.Filter.Attributes.Redact != nil {
 				result.Filter.Attributes.Redact = override.Filter.Attributes.Redact
@@ -1013,6 +1075,9 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 		if override.Filter.Sampling != nil {
 			if result.Filter.Sampling == nil {
 				result.Filter.Sampling = &api.TelemetrySamplingConfig{}
+			} else {
+				sampCopy := *result.Filter.Sampling
+				result.Filter.Sampling = &sampCopy
 			}
 			if override.Filter.Sampling.Default != nil {
 				result.Filter.Sampling.Default = override.Filter.Sampling.Default

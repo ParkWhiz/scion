@@ -20,6 +20,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
 
 // BrokerAuthEventType defines the type of broker authentication event.
@@ -94,6 +96,9 @@ const (
 	InviteAuditInviteRevoked    InviteAuditEventType = "invite_revoked"
 	InviteAuditInviteDeleted    InviteAuditEventType = "invite_deleted"
 	InviteAuditLoginDenied      InviteAuditEventType = "login_denied"
+	InviteAuditUserActivated    InviteAuditEventType = "user_activated"
+	InviteAuditUserInvited      InviteAuditEventType = "user_invited"
+	InviteAuditUserInvitedBulk  InviteAuditEventType = "user_invited_bulk"
 )
 
 // InviteAuditEvent represents an auditable event for the invite/allow-list system.
@@ -169,6 +174,20 @@ type LifecycleHookExecutionEvent struct {
 	Timestamp         time.Time                       `json:"timestamp"`
 }
 
+// ---------------------------------------------------------------------------
+// Agent Secret Read audit events
+// ---------------------------------------------------------------------------
+
+// AgentSecretReadEvent represents an auditable agent secret read event.
+type AgentSecretReadEvent struct {
+	AgentID    string    `json:"agentId"`
+	ProjectID  string    `json:"projectId"`
+	SecretKey  string    `json:"secretKey"`
+	Success    bool      `json:"success"`
+	FailReason string    `json:"failReason,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
 // AuditLogger defines the interface for logging audit events.
 type AuditLogger interface {
 	// LogBrokerAuthEvent logs a broker authentication event.
@@ -181,12 +200,15 @@ type AuditLogger interface {
 	LogLifecycleHookEvent(ctx context.Context, event *LifecycleHookEvent) error
 	// LogLifecycleHookExecutionEvent logs a lifecycle-hook execution event (M5).
 	LogLifecycleHookExecutionEvent(ctx context.Context, event *LifecycleHookExecutionEvent) error
+	// LogAgentSecretReadEvent logs an agent secret read event.
+	LogAgentSecretReadEvent(ctx context.Context, event *AgentSecretReadEvent) error
 }
 
 // LogAuditLogger is a simple implementation that logs to the standard logger.
 type LogAuditLogger struct {
 	prefix string
 	debug  bool
+	log    *slog.Logger
 }
 
 // NewLogAuditLogger creates a new log-based audit logger.
@@ -197,11 +219,55 @@ func NewLogAuditLogger(prefix string, debug bool) *LogAuditLogger {
 	return &LogAuditLogger{
 		prefix: prefix,
 		debug:  debug,
+		log:    logging.Subsystem("hub.audit"),
 	}
 }
 
-// LogBrokerAuthEvent is a no-op implementation satisfying the AuditLogger interface.
+// logger returns the audit subsystem logger, falling back to slog.Default()
+// when the field is nil (e.g. in tests that construct LogAuditLogger directly).
+func (l *LogAuditLogger) logger() *slog.Logger {
+	if l.log != nil {
+		return l.log
+	}
+	return slog.Default()
+}
+
+// LogBrokerAuthEvent logs a broker authentication event to the standard logger.
 func (l *LogAuditLogger) LogBrokerAuthEvent(ctx context.Context, event *BrokerAuthEvent) error {
+	if event == nil {
+		return nil
+	}
+	level := slog.LevelInfo
+	if !event.Success {
+		level = slog.LevelWarn
+	} else if event.EventType == BrokerAuthEventAuthSuccess {
+		level = slog.LevelDebug
+	}
+
+	attrs := []slog.Attr{
+		slog.String("event_type", string(event.EventType)),
+		slog.String("broker_id", event.BrokerID),
+		slog.Bool("success", event.Success),
+	}
+
+	if event.BrokerName != "" {
+		attrs = append(attrs, slog.String("broker_name", event.BrokerName))
+	}
+	if event.ActorID != "" {
+		attrs = append(attrs, slog.String("actor_id", event.ActorID))
+	}
+	if event.ActorType != "" {
+		attrs = append(attrs, slog.String("actor_type", event.ActorType))
+	}
+	if event.FailReason != "" {
+		attrs = append(attrs, slog.String("fail_reason", event.FailReason))
+	}
+	for k, v := range event.Details {
+		attrs = append(attrs, slog.String(k, v))
+	}
+
+	l.logger().LogAttrs(ctx, level, "broker auth event", attrs...)
+
 	return nil
 }
 
@@ -239,7 +305,7 @@ func (l *LogAuditLogger) LogInviteAuditEvent(ctx context.Context, event *InviteA
 		attrs = append(attrs, slog.String(k, v))
 	}
 
-	slog.LogAttrs(ctx, level, "authz: "+string(event.EventType), attrs...)
+	l.logger().LogAttrs(ctx, level, "authz: "+string(event.EventType), attrs...)
 
 	return nil
 }
@@ -263,7 +329,7 @@ func (l *LogAuditLogger) LogGCPTokenEvent(ctx context.Context, event *GCPTokenEv
 		attrs = append(attrs, slog.String("fail_reason", event.FailReason))
 	}
 
-	slog.LogAttrs(ctx, level, "GCP token audit event", attrs...)
+	l.logger().LogAttrs(ctx, level, "GCP token audit event", attrs...)
 
 	return nil
 }
@@ -286,7 +352,7 @@ func (l *LogAuditLogger) LogLifecycleHookEvent(ctx context.Context, event *Lifec
 		attrs = append(attrs, slog.String("fail_reason", event.FailReason))
 	}
 
-	slog.LogAttrs(ctx, level, "lifecycle hook audit event", attrs...)
+	l.logger().LogAttrs(ctx, level, "lifecycle hook audit event", attrs...)
 
 	return nil
 }
@@ -317,9 +383,50 @@ func (l *LogAuditLogger) LogLifecycleHookExecutionEvent(ctx context.Context, eve
 		attrs = append(attrs, slog.String("fail_reason", event.FailReason))
 	}
 
-	slog.LogAttrs(ctx, level, "lifecycle hook execution event", attrs...)
+	l.logger().LogAttrs(ctx, level, "lifecycle hook execution event", attrs...)
 
 	return nil
+}
+
+// LogAgentSecretReadEvent logs an agent secret read event to the standard logger.
+func (l *LogAuditLogger) LogAgentSecretReadEvent(ctx context.Context, event *AgentSecretReadEvent) error {
+	level := slog.LevelInfo
+	if !event.Success {
+		level = slog.LevelWarn
+	}
+
+	attrs := []slog.Attr{
+		slog.String("event_type", "agent_secret_read"),
+		slog.String("agent_id", event.AgentID),
+		slog.String("project_id", event.ProjectID),
+		slog.String("secret_key", event.SecretKey),
+		slog.Bool("success", event.Success),
+	}
+	if event.FailReason != "" {
+		attrs = append(attrs, slog.String("fail_reason", event.FailReason))
+	}
+
+	l.logger().LogAttrs(ctx, level, "agent secret read event", attrs...)
+
+	return nil
+}
+
+// LogAgentSecretRead logs an agent secret read event through the AuditLogger interface.
+func LogAgentSecretRead(ctx context.Context, logger AuditLogger, agentID, projectID, secretKey string, success bool, failReason string) {
+	if logger == nil {
+		return
+	}
+
+	event := &AgentSecretReadEvent{
+		AgentID:    agentID,
+		ProjectID:  projectID,
+		SecretKey:  secretKey,
+		Success:    success,
+		FailReason: failReason,
+		Timestamp:  time.Now(),
+	}
+
+	_ = logger.LogAgentSecretReadEvent(ctx, event)
 }
 
 // AuditableBrokerAuthMiddleware creates middleware that logs authentication events.
@@ -363,17 +470,28 @@ func AuditableBrokerAuthMiddleware(svc *BrokerAuthService, logger AuditLogger) f
 				return
 			}
 
-			// Log success
-			event.EventType = BrokerAuthEventAuthSuccess
-			event.Success = true
-
-			if logger != nil {
-				_ = logger.LogBrokerAuthEvent(r.Context(), event)
+			// Set broker-specific identity context and resolve on-behalf-of
+			ctx := contextWithBrokerIdentity(r.Context(), identity)
+			ctx, userIdent, ok := svc.applyOnBehalfOf(ctx, w, r, identity)
+			if !ok {
+				return
 			}
 
-			// Set both broker-specific and generic identity contexts
-			ctx := contextWithBrokerIdentity(r.Context(), identity)
-			ctx = contextWithIdentity(ctx, identity)
+			// Populate on-behalf-of details in the audit event before logging
+			event.EventType = BrokerAuthEventAuthSuccess
+			event.Success = true
+			if userIdent != nil {
+				if event.Details == nil {
+					event.Details = make(map[string]string)
+				}
+				event.Details["on_behalf_of_email"] = userIdent.Email()
+				event.Details["on_behalf_of_user_id"] = userIdent.ID()
+			}
+
+			if logger != nil {
+				_ = logger.LogBrokerAuthEvent(ctx, event)
+			}
+
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

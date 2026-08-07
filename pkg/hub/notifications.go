@@ -26,6 +26,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // NotificationDispatcher listens for agent status events, matches them against
@@ -121,7 +122,12 @@ func (nd *NotificationDispatcher) handleEvent(evt Event) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, span := tracer.Start(context.Background(), "hub.notification.evaluate")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.event.type", evt.Subject),
+		attribute.String("scion.agent.id", statusEvt.AgentID),
+	)
 
 	// Collect subscriptions from both scopes: agent-scoped first (more specific),
 	// then project-scoped.
@@ -249,6 +255,13 @@ func (nd *NotificationDispatcher) handleDeletedEvent(evt Event) {
 
 // storeAndDispatch creates a notification record and dispatches it to the subscriber.
 func (nd *NotificationDispatcher) storeAndDispatch(ctx context.Context, sub *store.NotificationSubscription, evt AgentStatusEvent) {
+	ctx, span := tracer.Start(ctx, "hub.notification.dispatch")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("scion.subscription.id", sub.ID),
+		attribute.String("scion.agent.id", evt.AgentID),
+	)
+
 	agent, err := nd.store.GetAgent(ctx, evt.AgentID)
 	if err != nil {
 		nd.log.Error("Failed to get agent for notification",
@@ -338,21 +351,22 @@ func (nd *NotificationDispatcher) dispatchToAgent(ctx context.Context, sub *stor
 
 	dispatcher := nd.getDispatcher()
 	if dispatcher == nil {
-		nd.log.Warn("No dispatcher available, skipping notification dispatch",
-			"subscriberID", sub.SubscriberID)
-		// Mark dispatched anyway (best-effort)
-		if err := nd.store.MarkNotificationDispatched(ctx, notif.ID); err != nil {
-			nd.log.Error("Failed to mark notification dispatched", "notificationID", notif.ID, "error", err)
-		}
+		nd.log.Error("No dispatcher available; notification NOT dispatched",
+			"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+		// Do NOT mark as dispatched — the notification was never delivered.
+		// Leaving it undelivered preserves the record and makes the failure
+		// explicit; a future retry mechanism can sweep for undelivered
+		// notifications and redeliver them once a dispatcher is available.
 		return
 	}
 
 	if subscriber.RuntimeBrokerID == "" {
-		nd.log.Warn("Subscriber agent has no runtime broker, skipping dispatch",
-			"subscriberID", sub.SubscriberID)
-		if err := nd.store.MarkNotificationDispatched(ctx, notif.ID); err != nil {
-			nd.log.Error("Failed to mark notification dispatched", "notificationID", notif.ID, "error", err)
-		}
+		nd.log.Error("Subscriber agent has no runtime broker; notification NOT dispatched",
+			"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+		// Do NOT mark as dispatched — the notification was never delivered.
+		// Leaving it undelivered preserves the record and makes the failure
+		// explicit; a future retry mechanism can sweep for undelivered
+		// notifications and redeliver them once a broker is assigned.
 		return
 	}
 

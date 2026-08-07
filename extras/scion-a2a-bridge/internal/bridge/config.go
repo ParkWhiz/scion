@@ -14,7 +14,9 @@
 
 package bridge
 
-import "time"
+import (
+	"time"
+)
 
 // Config holds the complete bridge configuration.
 type Config struct {
@@ -61,16 +63,26 @@ type PluginConfig struct {
 
 // AuthConfig holds external authentication settings for A2A clients.
 type AuthConfig struct {
+	// Scheme selects the auth mode.
+	// Existing: "apiKey" | "bearer" | "none"
+	// New:      "hubUAT" | "hubJWT"
 	Scheme string `yaml:"scheme"`
+
+	// APIKey is the shared static key for "apiKey" and "bearer" schemes.
+	// Not used for hubUAT or hubJWT.
 	APIKey string `yaml:"api_key"`
+
+	// UATCacheTTL is the UAT introspection cache TTL for hubUAT mode.
+	// Default: 60s. Maximum: 300s.
+	UATCacheTTL time.Duration `yaml:"uat_cache_ttl"`
 }
 
 // ProjectConfig configures a project exposed via the bridge.
 type ProjectConfig struct {
-	Slug            string   `yaml:"slug"`
-	DefaultTemplate string   `yaml:"default_template"`
-	AutoProvision   bool     `yaml:"auto_provision"`
-	ExposedAgents   []string `yaml:"exposed_agents"`
+	Slug            string   `yaml:"slug" json:"slug"`
+	DefaultTemplate string   `yaml:"default_template" json:"default_template"`
+	AutoProvision   bool     `yaml:"auto_provision" json:"auto_provision"`
+	ExposedAgents   []string `yaml:"exposed_agents" json:"exposed_agents"`
 }
 
 // GroveConfig is a legacy alias for ProjectConfig.

@@ -328,6 +328,12 @@ type CreateAgentRequest struct {
 	// (e.g. "shared", "per-agent", "worktree-per-agent"). Threaded from the
 	// Hub so the broker can branch dispatch without re-deriving from labels.
 	WorkspaceMode string `json:"workspaceMode,omitempty"`
+
+	// ProvisionCredentials carries project-scope secrets for use by core provision
+	// logic (skill resolution, URI variable substitution, credential helpers).
+	// These are NEVER forwarded to the agent container environment or harness scripts.
+	// Populated by the Hub from project-scope secrets at dispatch time.
+	ProvisionCredentials map[string]string `json:"provisionCredentials,omitempty"`
 }
 
 // UnmarshalJSON implements custom unmarshaling to support legacy grove fields.
@@ -424,6 +430,19 @@ type CreateAgentConfig struct {
 
 	// GCPIdentity holds the GCP identity assignment for the agent.
 	GCPIdentity *GCPIdentityConfig `json:"gcpIdentity,omitempty"`
+
+	// ProjectPreStartHookScript is the active project pre-start hook script,
+	// inlined at agent-create time. The broker writes it to
+	// pre-start.d/30-project-custom before the agent container starts.
+	ProjectPreStartHookScript string `json:"projectPreStartHookScript,omitempty"`
+
+	// HubAgentDefaults carries the hub's operational agent_defaults
+	// (limits/resources). Applied during provisioning at a tier BELOW the
+	// template and inline config and ABOVE this broker's own settings.yaml
+	// defaults — deliberately not merged into InlineConfig, which is a
+	// top-of-chain slot. Nil when the hub sent none: local dispatch, a
+	// file-mode hub, or a hub that predates the field. See design §3.2.3.
+	HubAgentDefaults *api.HubAgentDefaults `json:"hubAgentDefaults,omitempty"`
 }
 
 // GCPIdentityConfig holds GCP identity configuration passed from Hub to Broker.
@@ -443,12 +462,13 @@ type CreateAgentResponse struct {
 // and the merged environment is missing required keys. The broker returns
 // HTTP 202 with this payload instead of starting the agent.
 type EnvRequirementsResponse struct {
-	AgentID    string                       `json:"agentId"`
-	Required   []string                     `json:"required"`
-	HubHas     []string                     `json:"hubHas"`
-	BrokerHas  []string                     `json:"brokerHas"` // Deprecated: always empty; kept for API compatibility
-	Needs      []string                     `json:"needs"`
-	SecretInfo map[string]api.SecretKeyInfo `json:"secretInfo,omitempty"`
+	AgentID      string                       `json:"agentId"`
+	Required     []string                     `json:"required"`
+	HubHas       []string                     `json:"hubHas"`
+	BrokerHas    []string                     `json:"brokerHas"` // Deprecated: always empty; kept for API compatibility
+	Needs        []string                     `json:"needs"`
+	SecretInfo   map[string]api.SecretKeyInfo `json:"secretInfo,omitempty"`
+	Alternatives map[string][]string          `json:"alternatives,omitempty"` // Maps canonical key in Needs to alternative key names from the same any_of group
 }
 
 // ============================================================================

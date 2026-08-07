@@ -49,6 +49,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dbmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/hubmetrics"
+	"github.com/GoogleCloudPlatform/scion/pkg/observability/hubtracing"
 	scionplugin "github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin/grpcbroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
@@ -58,6 +59,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	gcputil "github.com/GoogleCloudPlatform/scion/pkg/util/gcp"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/GoogleCloudPlatform/scion/web"
 	"github.com/knadh/koanf/v2"
@@ -253,6 +255,24 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 			log.Fatalf("Hub server failed to start: %v", hubInitErr)
 		}
 
+		// Wire hub OTel tracing export to Cloud Trace.
+		if os.Getenv("SCION_TRACING_ENABLED") == "true" && cfg.Hub.GCPProjectID != "" {
+			tp, tpErr := hubtracing.NewTracerProvider(ctx, cfg.Hub.GCPProjectID,
+				hubtracing.WithHubID(hubSrv.HubID()),
+				hubtracing.WithHubName(cfg.Hub.ResolveHubName()),
+			)
+			if tpErr != nil {
+				log.Printf("WARNING: hub tracing export disabled: %v", tpErr)
+			} else {
+				defer func() {
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					_ = tp.Shutdown(shutdownCtx)
+				}()
+				log.Printf("Hub OTel tracing enabled (project: %s)", cfg.Hub.GCPProjectID)
+			}
+		}
+
 		// Wire hub OTel metrics export to Cloud Monitoring.
 		if cfg.Hub.GCPProjectID != "" {
 			mp, mpErr := hubmetrics.NewMeterProvider(ctx, cfg.Hub.GCPProjectID,
@@ -374,6 +394,9 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 
 	// 13. Start Broker
 	if cfg.RuntimeBroker.Enabled {
+		if err := requireImageRegistryForBroker(); err != nil {
+			return err
+		}
 		if err := startRuntimeBroker(ctx, cmd, cfg, hubSrv, webSrv, s, hubEndpoint, devAuthToken, brokerSettings, globalDir, requestLogger, messageLogger, &wg, errCh); err != nil {
 			return err
 		}
@@ -394,6 +417,8 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		hubSrv.SetDispatcher(dispatcher)
 		log.Printf("Agent dispatcher configured (HTTP-based)")
 
+		warnShadowedBrokerEnv(ctx, dispatcher)
+
 		// Initialize message broker from versioned settings.
 		// Uses FanOutBroker to support multiple simultaneous broker plugins.
 		if vs, err := config.LoadVersionedSettings(""); err == nil && vs.Server != nil {
@@ -405,28 +430,30 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 				}
 				if !vs.Server.MessageBroker.Enabled {
 					vs.Server.MessageBroker.Enabled = true
-					seen := make(map[string]bool, len(vs.Server.MessageBroker.Types))
-					for _, t := range vs.Server.MessageBroker.Types {
-						seen[t] = true
-					}
-					for name := range vs.Server.Plugins.Broker {
-						if !seen[name] {
-							vs.Server.MessageBroker.Types = append(vs.Server.MessageBroker.Types, name)
-							seen[name] = true
-						}
-					}
-					log.Printf("Auto-enabled message broker for configured broker plugin(s): %v", vs.Server.MessageBroker.Types)
+					log.Printf("Auto-enabled message broker for configured broker plugin(s)")
 				}
 			}
 
-			// Auto-populate: if message_broker.enabled but types is empty while
-			// broker plugins exist, populate types from the plugin list.
-			if vs.Server.Plugins != nil && vs.Server.MessageBroker != nil &&
-				vs.Server.MessageBroker.Enabled && len(vs.Server.MessageBroker.Types) == 0 && len(vs.Server.Plugins.Broker) > 0 {
-				for name := range vs.Server.Plugins.Broker {
-					vs.Server.MessageBroker.Types = append(vs.Server.MessageBroker.Types, name)
+			// Reconcile: ensure every configured broker plugin is listed in
+			// message_broker.types (in-memory AND on disk). Covers both empty
+			// and partially-populated type lists.
+			if vs.Server.Plugins != nil && vs.Server.MessageBroker != nil && len(vs.Server.Plugins.Broker) > 0 {
+				typesSet := make(map[string]bool, len(vs.Server.MessageBroker.Types))
+				for _, t := range vs.Server.MessageBroker.Types {
+					typesSet[t] = true
 				}
-				log.Printf("NOTICE: message_broker.types was empty — auto-populated from plugins: %v", vs.Server.MessageBroker.Types)
+				for name := range vs.Server.Plugins.Broker {
+					if !typesSet[name] {
+						vs.Server.MessageBroker.Types = append(vs.Server.MessageBroker.Types, name)
+						hub.SettingsWriteMu.Lock()
+						if err := config.AddPluginToMessageBrokerTypes(name); err != nil {
+							log.Printf("Warning: failed to persist %s to message_broker.types: %v", name, err)
+						} else {
+							log.Printf("NOTICE: auto-added %q to message_broker.types (was configured but missing)", name)
+						}
+						hub.SettingsWriteMu.Unlock()
+					}
+				}
 			}
 
 			// Warn on plugin-not-in-types
@@ -522,6 +549,14 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 										hubCreds["project_slug_map"] = string(jsonBytes)
 									}
 								}
+								// Inject transport auth config so plugins can authenticate
+								// with IAP-protected hub endpoints.
+								if cfg.Auth.Transport != nil && cfg.Auth.Transport.Mode != "" {
+									hubCreds["transport_mode"] = cfg.Auth.Transport.Mode
+								}
+								if cfg.Auth.Transport != nil && cfg.Auth.Transport.OIDCAudience != "" {
+									hubCreds["transport_audience"] = cfg.Auth.Transport.OIDCAudience
+								}
 								if cfg.Database.Driver != "" && cfg.Database.Driver != "sqlite" {
 									hubCreds["database_driver"] = cfg.Database.Driver
 									hubCreds["database_url"] = cfg.Database.URL
@@ -588,6 +623,38 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	}
 }
 
+// brokerEnvShadowWarner is the single method warnShadowedBrokerEnv needs. It
+// exists so the boot wiring can be exercised without standing up a hub.Server.
+type brokerEnvShadowWarner interface {
+	WarnOutrankedBrokerEnvKeys(context.Context) error
+}
+
+// warnShadowedBrokerEnv runs the one-shot boot check for runtime_broker-scoped
+// env vars that a higher-precedence scope now overrides. It is the operator-
+// facing half of demoting runtime_broker to the weakest env storage scope: the
+// hub cannot tell a deliberately pinned broker value from an accidental one, so
+// it must not migrate them, and naming them once at boot is the only warning
+// available.
+//
+// It runs SYNCHRONOUSLY, and that is the point. Behind a goroutine it would
+// reproduce the exact defect it exists to report: if ctx were cancelled between
+// here and the point the queries ran, no warning would ever be emitted and the
+// diff would still look done. A handful of small SELECTs on a path that runs
+// once per process is not worth that trade.
+//
+// The failure branch says DID NOT RUN rather than "failed", because from the
+// operator's side those are one event: no list of shadowed keys was produced.
+// The absence of warnings below must not be read as "nothing is shadowed".
+func warnShadowedBrokerEnv(ctx context.Context, w brokerEnvShadowWarner) {
+	if w == nil {
+		return
+	}
+	if err := w.WarnOutrankedBrokerEnvKeys(ctx); err != nil {
+		slog.Warn("Broker env shadow check DID NOT RUN. Treat the absence of shadowed-key warnings as unknown, not as none.",
+			"error", err)
+	}
+}
+
 // initServerLogging initializes all logging subsystems and returns cleanup functions.
 func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *slog.Logger, messageLogger *slog.Logger, err error) {
 	useGCP := os.Getenv("SCION_LOG_GCP") == "true"
@@ -606,6 +673,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	}
 
 	hubName := resolveHubNameFromEnv()
+	hubID := resolveHubIDFromEnv()
 
 	// Initialize OTel logging
 	ctx := context.Background()
@@ -621,14 +689,30 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	// If Cloud Logging becomes unavailable (e.g. during a metadata
 	// service outage), the circuit breaker opens and the hub falls back to
 	// local-only logging automatically.
+	// Check env var first (SCION_CLOUD_LOGGING), then fall back to settings.
+	// When the env var is set (even to "false"), it takes precedence over
+	// the settings value. Only consult settings when the env var is unset.
+	var cloudLoggingEnabled bool
+	if os.Getenv(logging.EnvCloudLogging) != "" {
+		cloudLoggingEnabled = logging.IsCloudLoggingEnabled()
+	} else {
+		projectPath := ""
+		if globalMode {
+			projectPath = "global"
+		}
+		if vs, err := config.LoadVersionedSettings(projectPath); err == nil && vs.Telemetry != nil && vs.Telemetry.Cloud != nil && vs.Telemetry.Cloud.CloudLogging != nil {
+			cloudLoggingEnabled = *vs.Telemetry.Cloud.CloudLogging
+		}
+	}
 	var cloudHandler slog.Handler
-	if logging.IsCloudLoggingEnabled() {
+	if cloudLoggingEnabled {
 		logLevel := logging.ResolveLogLevel(enableDebug)
-		cfg := logging.CloudLoggingConfig{
+		logCfg := logging.CloudLoggingConfig{
 			Component: component,
 			HubName:   hubName,
+			HubID:     hubID,
 		}
-		ch, cloudLogCleanup, cloudErr := logging.NewCloudHandler(ctx, cfg, logLevel)
+		ch, cloudLogCleanup, cloudErr := logging.NewCloudHandler(ctx, logCfg, logLevel)
 		if cloudErr != nil {
 			log.Printf("Warning: failed to initialize Cloud Logging: %v", cloudErr)
 		} else {
@@ -650,6 +734,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 		FilePath:   os.Getenv(logging.EnvRequestLogPath),
 		Component:  component,
 		HubName:    hubName,
+		HubID:      hubID,
 		UseGCP:     useGCP,
 		Foreground: serverStartForeground,
 		Level:      logging.ResolveLogLevel(enableDebug),
@@ -672,6 +757,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	msgLogCfg := logging.MessageLoggerConfig{
 		Component: component,
 		HubName:   hubName,
+		HubID:     hubID,
 		UseGCP:    useGCP,
 		Level:     logging.ResolveLogLevel(enableDebug),
 	}
@@ -839,7 +925,7 @@ func validateHostedHAPreflight(cfg *config.GlobalConfig) error {
 	}
 
 	if cfg.Auth.Mode != "proxy" {
-		return fmt.Errorf("hosted HA deployment requires server.auth.mode=proxy for Cloud Run IAP; got %q", cfg.Auth.Mode)
+		return fmt.Errorf("hosted HA deployment requires server.auth.mode=proxy for IAP authentication; got %q", cfg.Auth.Mode)
 	}
 	if cfg.Auth.Proxy == nil || cfg.Auth.Proxy.Provider != "iap" {
 		provider := ""
@@ -852,9 +938,14 @@ func validateHostedHAPreflight(cfg *config.GlobalConfig) error {
 		return fmt.Errorf("hosted HA deployment requires server.auth.proxy.iap.audience")
 	}
 	proxyAudience := strings.TrimRight(strings.TrimSpace(cfg.Auth.Proxy.IAP.Audience), "/")
-	if !isCloudRunIAPAudience(proxyAudience) {
-		return fmt.Errorf("hosted HA deployment requires a Cloud Run native IAP audience (/projects/<number>/locations/<region>/services/<service>); got %q", proxyAudience)
+	if !isSupportedIAPAudience(proxyAudience) {
+		return fmt.Errorf("hosted HA deployment requires a supported IAP audience: Cloud Run (/projects/<number>/locations/<region>/services/<service>) or GCLB (/projects/<number>/global/backendServices/<id>); got %q", proxyAudience)
 	}
+	// Normalize the audience in-place so downstream consumers (IAP JWT
+	// validation, endpoint derivation) see the trimmed value.  Without this
+	// a trailing slash would pass preflight but cause a runtime audience
+	// mismatch in IAP token verification.
+	cfg.Auth.Proxy.IAP.Audience = proxyAudience
 
 	if cfg.Auth.Transport == nil {
 		return fmt.Errorf("hosted HA deployment requires server.auth.transport; do not use server.transport")
@@ -867,11 +958,11 @@ func validateHostedHAPreflight(cfg *config.GlobalConfig) error {
 		return fmt.Errorf("hosted HA deployment requires server.auth.transport.oidc_audience")
 	}
 	// Note: transport.oidc_audience and proxy.iap.audience are intentionally
-	// allowed to differ. proxy.iap.audience is the Cloud Run native IAP
-	// audience path used for validating incoming IAP-signed JWTs, while
+	// allowed to differ. proxy.iap.audience is the IAP audience resource path
+	// (Cloud Run or GCLB) used for validating incoming IAP-signed JWTs, while
 	// transport.oidc_audience is the audience minted into OIDC tokens for
 	// dispatched agents (typically the IAP OAuth client ID). IAP requires
-	// the OAuth client ID format for token validation, not the Cloud Run path.
+	// the OAuth client ID format for token validation, not the resource path.
 	if strings.TrimSpace(cfg.Auth.Transport.PlatformAuthSA) == "" {
 		return fmt.Errorf("hosted HA deployment requires server.auth.transport.platform_auth_sa")
 	}
@@ -879,15 +970,32 @@ func validateHostedHAPreflight(cfg *config.GlobalConfig) error {
 	return nil
 }
 
-func isCloudRunIAPAudience(audience string) bool {
+// isSupportedIAPAudience returns true when audience is a recognised IAP
+// audience path.  Two formats are accepted:
+//
+//   - Cloud Run:  /projects/<number>/locations/<region>/services/<service>
+//   - GCLB:       /projects/<number>/global/backendServices/<id>
+//
+// Everything else is rejected (fail-closed).
+func isSupportedIAPAudience(audience string) bool {
 	parts := strings.Split(strings.TrimSpace(audience), "/")
-	if len(parts) != 7 {
-		return false
-	}
-	return parts[0] == "" &&
+	// Cloud Run format: 7 parts ["", "projects", <n>, "locations", <r>, "services", <s>]
+	if len(parts) == 7 &&
+		parts[0] == "" &&
 		parts[1] == "projects" && parts[2] != "" &&
 		parts[3] == "locations" && parts[4] != "" &&
-		parts[5] == "services" && parts[6] != ""
+		parts[5] == "services" && parts[6] != "" {
+		return true
+	}
+	// GCLB backend-service format: 6 parts ["", "projects", <n>, "global", "backendServices", <id>]
+	if len(parts) == 6 &&
+		parts[0] == "" &&
+		parts[1] == "projects" && parts[2] != "" &&
+		parts[3] == "global" &&
+		parts[4] == "backendServices" && parts[5] != "" {
+		return true
+	}
+	return false
 }
 
 // checkServerPorts checks that required server ports are available.
@@ -1154,6 +1262,12 @@ func resolveHubEndpoint(cfg *config.GlobalConfig, brokerSettings *config.Setting
 			log.Printf("Hub endpoint derived from IAP audience: %s", cloudRunURL)
 			return cloudRunURL
 		}
+		// GCLB/GKE audiences cannot be used to derive a URL; warn if no
+		// explicit base URL was provided (all earlier return paths above
+		// would have caught an explicit one).
+		if isSupportedIAPAudience(strings.TrimRight(strings.TrimSpace(cfg.Auth.Proxy.IAP.Audience), "/")) {
+			log.Println("Warning: GKE/GCLB IAP audience detected but SCION_SERVER_BASE_URL not set; hub endpoint will fall back to localhost which is likely unreachable from dispatched agents")
+		}
 	}
 
 	port := cfg.Hub.Port
@@ -1207,6 +1321,16 @@ func parseAdminEmails(cfg *config.GlobalConfig) []string {
 		log.Printf("Admin emails configured: %v", adminEmailList)
 	}
 	return adminEmailList
+}
+
+// resolveHubIDFromEnv resolves the hub instance ID from environment variables,
+// falling back to the deterministic hostname-derived default. This is used
+// during early logging init before the full config is loaded.
+func resolveHubIDFromEnv() string {
+	if v := os.Getenv("SCION_SERVER_HUB_HUBID"); v != "" {
+		return v
+	}
+	return config.DefaultHubID()
 }
 
 // resolveHubNameFromEnv resolves the hub display name from environment variables,
@@ -1269,10 +1393,14 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		AdminEmails:                  adminEmailList,
 		UserAccessMode:               cfg.Auth.UserAccessMode,
 		HubEndpoint:                  hubEndpoint,
+		SlowRequestThreshold:         cfg.SlowRequestThreshold,
+		StalledThreshold:             cfg.Hub.StalledThreshold,
 		SoftDeleteRetention:          cfg.Hub.SoftDeleteRetention,
 		SoftDeleteRetainFiles:        cfg.Hub.SoftDeleteRetainFiles,
 		AdminMode:                    adminMode,
 		MaintenanceMessage:           maintenanceMessage,
+		SchedulerIntervalSeconds:     cfg.Scheduler.IntervalSeconds,
+		SchedulerMaxConcurrency:      cfg.Scheduler.MaxConcurrency, // *int: nil = use default, *0 = unlimited
 		Workstation:                  !hostedMode,
 		DevUserConfig: hub.DevUserConfig{
 			Username:    cfg.Auth.Username,
@@ -1347,6 +1475,21 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 	if hostedMode && hubCfg.SharedSigningSecret == "" {
 		log.Println("WARNING: hosted mode is enabled but no session secret is configured. " +
 			"Set --session-secret or SCION_SERVER_SESSION_SECRET to avoid cross-replica session failures.")
+	}
+
+	// Derive TelemetryProjectID using a priority chain:
+	// 1. Explicit telemetry.cloud.gcp_project_id setting (highest priority)
+	// 2. Derived from scion-telemetry-gcp-credentials SA key JSON
+	// 3. Existing GCPProjectID fallback (SA minting project, handled in server.go)
+	if pid := telemetryGCPProjectFromSettings(cfg); pid != "" {
+		hubCfg.TelemetryProjectID = pid
+		log.Printf("Telemetry project ID from settings: %s", pid)
+	}
+	if hubCfg.TelemetryProjectID == "" && secretBackend != nil {
+		if pid := telemetryGCPProjectFromSecret(ctx, secretBackend, cfg.Hub.ResolveHubID()); pid != "" {
+			hubCfg.TelemetryProjectID = pid
+			log.Printf("Telemetry project ID derived from SA credentials: %s", pid)
+		}
 	}
 
 	// Construct proxy authenticator when auth mode is "proxy"
@@ -1867,21 +2010,22 @@ func initWebServer(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Se
 	}
 
 	webCfg := hub.WebServerConfig{
-		Port:               webPort,
-		Host:               webHost,
-		AssetsDir:          webAssetsDir,
-		Debug:              enableDebug,
-		SessionSecret:      sessionSecret,
-		BaseURL:            baseURL,
-		DevAuthToken:       devAuthToken,
-		AuthMode:           cfg.Auth.Mode,
-		AuthorizedDomains:  webAuthorizedDomains,
-		AdminEmails:        webAdminEmails,
-		UserAccessMode:     cfg.Auth.UserAccessMode,
-		AdminMode:          adminMode,
-		MaintenanceMessage: maintenanceMessage,
-		EnableTestLogin:    enableTestLogin,
-		ProxyAuthenticator: webProxyAuth,
+		Port:                 webPort,
+		Host:                 webHost,
+		AssetsDir:            webAssetsDir,
+		Debug:                enableDebug,
+		SessionSecret:        sessionSecret,
+		BaseURL:              baseURL,
+		DevAuthToken:         devAuthToken,
+		AuthMode:             cfg.Auth.Mode,
+		AuthorizedDomains:    webAuthorizedDomains,
+		AdminEmails:          webAdminEmails,
+		UserAccessMode:       cfg.Auth.UserAccessMode,
+		AdminMode:            adminMode,
+		MaintenanceMessage:   maintenanceMessage,
+		EnableTestLogin:      enableTestLogin,
+		ProxyAuthenticator:   webProxyAuth,
+		SlowRequestThreshold: cfg.SlowRequestThreshold,
 	}
 	if enableTestLogin {
 		slog.Warn("Test login endpoint is enabled (--enable-test-login). This allows bypass of authentication and MUST NOT be used in production!")
@@ -2094,6 +2238,7 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		CORSMaxAge:                    cfg.RuntimeBroker.CORSMaxAge,
 		AllowContainerScriptHarnesses: cfg.RuntimeBroker.AllowContainerScriptHarnesses,
 		Debug:                         enableDebug,
+		SlowRequestThreshold:          cfg.SlowRequestThreshold,
 
 		HubEnabled:           hubEndpointForRH != "",
 		HubToken:             devAuthToken,
@@ -2500,6 +2645,38 @@ func resolveMaintenanceConfig(cfg *config.GlobalConfig) hub.MaintenanceConfig {
 	return mc
 }
 
+// requireImageRegistryForBroker checks that an image registry is available from
+// at least one source before starting the runtime broker. The broker needs a
+// registry to pull agent container images; without one, image pulls fail with
+// opaque 404 errors at dispatch time. This check fails fast at startup with an
+// actionable error instead.
+//
+// Sources checked (in priority order):
+//  1. SCION_IMAGE_REGISTRY env var
+//  2. SCION_MAINTENANCE_IMAGE_REGISTRY env var
+//  3. image_registry in versioned settings (settings.yaml)
+func requireImageRegistryForBroker() error {
+	if v := os.Getenv("SCION_IMAGE_REGISTRY"); v != "" {
+		return nil
+	}
+	if v := os.Getenv("SCION_MAINTENANCE_IMAGE_REGISTRY"); v != "" {
+		return nil
+	}
+	vs, _, err := config.LoadEffectiveSettings("")
+	if err != nil {
+		slog.Debug("Failed to load settings while checking image registry", "error", err)
+	}
+	if err == nil && vs != nil && vs.IsImageRegistryConfigured("") {
+		return nil
+	}
+	return fmt.Errorf("image_registry is not configured, but the runtime broker requires it.\n\n" +
+		"The runtime broker pulls container images to run agents. Without a registry,\n" +
+		"image pulls will fail. To fix this:\n\n" +
+		"  Option 1: scion config set --global image_registry <your-registry>\n" +
+		"  Option 2: export SCION_IMAGE_REGISTRY=<your-registry>\n\n" +
+		"See image-build/README.md for instructions on building and pushing images")
+}
+
 // migrateInlineSecrets performs a one-shot migration of secret config keys found
 // in the raw inline settings.yaml config into the secret backend. This prevents
 // existing users who followed the Telegram/Discord READMEs (which have
@@ -2613,4 +2790,26 @@ func injectPluginSecretsIntoConfig(ctx context.Context, sb secret.SecretBackend,
 		cfg[m.ConfigKey] = sv.Value
 	}
 	return cfg
+}
+
+// telemetryGCPProjectFromSettings returns the explicit telemetry.cloud.gcp_project_id
+// setting value, or "" if not configured.
+func telemetryGCPProjectFromSettings(cfg *config.GlobalConfig) string {
+	if cfg.TelemetryConfig == nil || cfg.TelemetryConfig.Cloud == nil {
+		return ""
+	}
+	if cfg.TelemetryConfig.Cloud.GCPProjectID == nil {
+		return ""
+	}
+	return *cfg.TelemetryConfig.Cloud.GCPProjectID
+}
+
+// telemetryGCPProjectFromSecret reads the scion-telemetry-gcp-credentials hub
+// secret and extracts the project_id from the SA key JSON.
+func telemetryGCPProjectFromSecret(ctx context.Context, sb secret.SecretBackend, hubID string) string {
+	sw, err := sb.Get(ctx, "scion-telemetry-gcp-credentials", secret.ScopeHub, hubID)
+	if err != nil || sw == nil || sw.Value == "" {
+		return ""
+	}
+	return gcputil.ParseProjectID([]byte(sw.Value))
 }

@@ -18,6 +18,7 @@ import (
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/accesspolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsessionmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/allowlistentry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/apikey"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerdispatch"
@@ -26,6 +27,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubresolutioncache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/group"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/groupmembership"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/harnessconfig"
@@ -43,12 +45,14 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectcontributor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectprestarthook"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectsyncstate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schedule"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledevent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skill"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillinjection"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillregistry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillversion"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/subscriptiontemplate"
@@ -66,6 +70,8 @@ type Client struct {
 	AccessPolicy *AccessPolicyClient
 	// Agent is the client for interacting with the Agent builders.
 	Agent *AgentClient
+	// AgentSessionMetrics is the client for interacting with the AgentSessionMetrics builders.
+	AgentSessionMetrics *AgentSessionMetricsClient
 	// AllowListEntry is the client for interacting with the AllowListEntry builders.
 	AllowListEntry *AllowListEntryClient
 	// ApiKey is the client for interacting with the ApiKey builders.
@@ -80,6 +86,8 @@ type Client struct {
 	EnvVar *EnvVarClient
 	// GCPServiceAccount is the client for interacting with the GCPServiceAccount builders.
 	GCPServiceAccount *GCPServiceAccountClient
+	// GitHubResolutionCache is the client for interacting with the GitHubResolutionCache builders.
+	GitHubResolutionCache *GitHubResolutionCacheClient
 	// GithubInstallation is the client for interacting with the GithubInstallation builders.
 	GithubInstallation *GithubInstallationClient
 	// Group is the client for interacting with the Group builders.
@@ -116,6 +124,8 @@ type Client struct {
 	Project *ProjectClient
 	// ProjectContributor is the client for interacting with the ProjectContributor builders.
 	ProjectContributor *ProjectContributorClient
+	// ProjectPreStartHook is the client for interacting with the ProjectPreStartHook builders.
+	ProjectPreStartHook *ProjectPreStartHookClient
 	// ProjectSyncState is the client for interacting with the ProjectSyncState builders.
 	ProjectSyncState *ProjectSyncStateClient
 	// RuntimeBroker is the client for interacting with the RuntimeBroker builders.
@@ -128,6 +138,8 @@ type Client struct {
 	Secret *SecretClient
 	// Skill is the client for interacting with the Skill builders.
 	Skill *SkillClient
+	// SkillInjection is the client for interacting with the SkillInjection builders.
+	SkillInjection *SkillInjectionClient
 	// SkillRegistry is the client for interacting with the SkillRegistry builders.
 	SkillRegistry *SkillRegistryClient
 	// SkillVersion is the client for interacting with the SkillVersion builders.
@@ -153,6 +165,7 @@ func (c *Client) init() {
 	c.Schema = migrate.NewSchema(c.driver)
 	c.AccessPolicy = NewAccessPolicyClient(c.config)
 	c.Agent = NewAgentClient(c.config)
+	c.AgentSessionMetrics = NewAgentSessionMetricsClient(c.config)
 	c.AllowListEntry = NewAllowListEntryClient(c.config)
 	c.ApiKey = NewApiKeyClient(c.config)
 	c.BrokerDispatch = NewBrokerDispatchClient(c.config)
@@ -160,6 +173,7 @@ func (c *Client) init() {
 	c.BrokerSecret = NewBrokerSecretClient(c.config)
 	c.EnvVar = NewEnvVarClient(c.config)
 	c.GCPServiceAccount = NewGCPServiceAccountClient(c.config)
+	c.GitHubResolutionCache = NewGitHubResolutionCacheClient(c.config)
 	c.GithubInstallation = NewGithubInstallationClient(c.config)
 	c.Group = NewGroupClient(c.config)
 	c.GroupMembership = NewGroupMembershipClient(c.config)
@@ -178,12 +192,14 @@ func (c *Client) init() {
 	c.PolicyBinding = NewPolicyBindingClient(c.config)
 	c.Project = NewProjectClient(c.config)
 	c.ProjectContributor = NewProjectContributorClient(c.config)
+	c.ProjectPreStartHook = NewProjectPreStartHookClient(c.config)
 	c.ProjectSyncState = NewProjectSyncStateClient(c.config)
 	c.RuntimeBroker = NewRuntimeBrokerClient(c.config)
 	c.Schedule = NewScheduleClient(c.config)
 	c.ScheduledEvent = NewScheduledEventClient(c.config)
 	c.Secret = NewSecretClient(c.config)
 	c.Skill = NewSkillClient(c.config)
+	c.SkillInjection = NewSkillInjectionClient(c.config)
 	c.SkillRegistry = NewSkillRegistryClient(c.config)
 	c.SkillVersion = NewSkillVersionClient(c.config)
 	c.SubscriptionTemplate = NewSubscriptionTemplateClient(c.config)
@@ -284,6 +300,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		config:                   cfg,
 		AccessPolicy:             NewAccessPolicyClient(cfg),
 		Agent:                    NewAgentClient(cfg),
+		AgentSessionMetrics:      NewAgentSessionMetricsClient(cfg),
 		AllowListEntry:           NewAllowListEntryClient(cfg),
 		ApiKey:                   NewApiKeyClient(cfg),
 		BrokerDispatch:           NewBrokerDispatchClient(cfg),
@@ -291,6 +308,7 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		BrokerSecret:             NewBrokerSecretClient(cfg),
 		EnvVar:                   NewEnvVarClient(cfg),
 		GCPServiceAccount:        NewGCPServiceAccountClient(cfg),
+		GitHubResolutionCache:    NewGitHubResolutionCacheClient(cfg),
 		GithubInstallation:       NewGithubInstallationClient(cfg),
 		Group:                    NewGroupClient(cfg),
 		GroupMembership:          NewGroupMembershipClient(cfg),
@@ -309,12 +327,14 @@ func (c *Client) Tx(ctx context.Context) (*Tx, error) {
 		PolicyBinding:            NewPolicyBindingClient(cfg),
 		Project:                  NewProjectClient(cfg),
 		ProjectContributor:       NewProjectContributorClient(cfg),
+		ProjectPreStartHook:      NewProjectPreStartHookClient(cfg),
 		ProjectSyncState:         NewProjectSyncStateClient(cfg),
 		RuntimeBroker:            NewRuntimeBrokerClient(cfg),
 		Schedule:                 NewScheduleClient(cfg),
 		ScheduledEvent:           NewScheduledEventClient(cfg),
 		Secret:                   NewSecretClient(cfg),
 		Skill:                    NewSkillClient(cfg),
+		SkillInjection:           NewSkillInjectionClient(cfg),
 		SkillRegistry:            NewSkillRegistryClient(cfg),
 		SkillVersion:             NewSkillVersionClient(cfg),
 		SubscriptionTemplate:     NewSubscriptionTemplateClient(cfg),
@@ -342,6 +362,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		config:                   cfg,
 		AccessPolicy:             NewAccessPolicyClient(cfg),
 		Agent:                    NewAgentClient(cfg),
+		AgentSessionMetrics:      NewAgentSessionMetricsClient(cfg),
 		AllowListEntry:           NewAllowListEntryClient(cfg),
 		ApiKey:                   NewApiKeyClient(cfg),
 		BrokerDispatch:           NewBrokerDispatchClient(cfg),
@@ -349,6 +370,7 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		BrokerSecret:             NewBrokerSecretClient(cfg),
 		EnvVar:                   NewEnvVarClient(cfg),
 		GCPServiceAccount:        NewGCPServiceAccountClient(cfg),
+		GitHubResolutionCache:    NewGitHubResolutionCacheClient(cfg),
 		GithubInstallation:       NewGithubInstallationClient(cfg),
 		Group:                    NewGroupClient(cfg),
 		GroupMembership:          NewGroupMembershipClient(cfg),
@@ -367,12 +389,14 @@ func (c *Client) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 		PolicyBinding:            NewPolicyBindingClient(cfg),
 		Project:                  NewProjectClient(cfg),
 		ProjectContributor:       NewProjectContributorClient(cfg),
+		ProjectPreStartHook:      NewProjectPreStartHookClient(cfg),
 		ProjectSyncState:         NewProjectSyncStateClient(cfg),
 		RuntimeBroker:            NewRuntimeBrokerClient(cfg),
 		Schedule:                 NewScheduleClient(cfg),
 		ScheduledEvent:           NewScheduledEventClient(cfg),
 		Secret:                   NewSecretClient(cfg),
 		Skill:                    NewSkillClient(cfg),
+		SkillInjection:           NewSkillInjectionClient(cfg),
 		SkillRegistry:            NewSkillRegistryClient(cfg),
 		SkillVersion:             NewSkillVersionClient(cfg),
 		SubscriptionTemplate:     NewSubscriptionTemplateClient(cfg),
@@ -408,16 +432,16 @@ func (c *Client) Close() error {
 // In order to add hooks to a specific client, call: `client.Node.Use(...)`.
 func (c *Client) Use(hooks ...Hook) {
 	for _, n := range []interface{ Use(...Hook) }{
-		c.AccessPolicy, c.Agent, c.AllowListEntry, c.ApiKey, c.BrokerDispatch,
-		c.BrokerJoinToken, c.BrokerSecret, c.EnvVar, c.GCPServiceAccount,
-		c.GithubInstallation, c.Group, c.GroupMembership, c.HarnessConfig,
-		c.HubSetting, c.IntegrationConfig, c.IntegrationUpdate, c.InviteCode,
-		c.LifecycleHook, c.LifecycleHookAgentPhase, c.MaintenanceOperation,
-		c.MaintenanceOperationRun, c.Message, c.Notification,
+		c.AccessPolicy, c.Agent, c.AgentSessionMetrics, c.AllowListEntry, c.ApiKey,
+		c.BrokerDispatch, c.BrokerJoinToken, c.BrokerSecret, c.EnvVar,
+		c.GCPServiceAccount, c.GitHubResolutionCache, c.GithubInstallation, c.Group,
+		c.GroupMembership, c.HarnessConfig, c.HubSetting, c.IntegrationConfig,
+		c.IntegrationUpdate, c.InviteCode, c.LifecycleHook, c.LifecycleHookAgentPhase,
+		c.MaintenanceOperation, c.MaintenanceOperationRun, c.Message, c.Notification,
 		c.NotificationSubscription, c.PolicyBinding, c.Project, c.ProjectContributor,
-		c.ProjectSyncState, c.RuntimeBroker, c.Schedule, c.ScheduledEvent, c.Secret,
-		c.Skill, c.SkillRegistry, c.SkillVersion, c.SubscriptionTemplate, c.Template,
-		c.User, c.UserAccessToken,
+		c.ProjectPreStartHook, c.ProjectSyncState, c.RuntimeBroker, c.Schedule,
+		c.ScheduledEvent, c.Secret, c.Skill, c.SkillInjection, c.SkillRegistry,
+		c.SkillVersion, c.SubscriptionTemplate, c.Template, c.User, c.UserAccessToken,
 	} {
 		n.Use(hooks...)
 	}
@@ -427,16 +451,16 @@ func (c *Client) Use(hooks ...Hook) {
 // In order to add interceptors to a specific client, call: `client.Node.Intercept(...)`.
 func (c *Client) Intercept(interceptors ...Interceptor) {
 	for _, n := range []interface{ Intercept(...Interceptor) }{
-		c.AccessPolicy, c.Agent, c.AllowListEntry, c.ApiKey, c.BrokerDispatch,
-		c.BrokerJoinToken, c.BrokerSecret, c.EnvVar, c.GCPServiceAccount,
-		c.GithubInstallation, c.Group, c.GroupMembership, c.HarnessConfig,
-		c.HubSetting, c.IntegrationConfig, c.IntegrationUpdate, c.InviteCode,
-		c.LifecycleHook, c.LifecycleHookAgentPhase, c.MaintenanceOperation,
-		c.MaintenanceOperationRun, c.Message, c.Notification,
+		c.AccessPolicy, c.Agent, c.AgentSessionMetrics, c.AllowListEntry, c.ApiKey,
+		c.BrokerDispatch, c.BrokerJoinToken, c.BrokerSecret, c.EnvVar,
+		c.GCPServiceAccount, c.GitHubResolutionCache, c.GithubInstallation, c.Group,
+		c.GroupMembership, c.HarnessConfig, c.HubSetting, c.IntegrationConfig,
+		c.IntegrationUpdate, c.InviteCode, c.LifecycleHook, c.LifecycleHookAgentPhase,
+		c.MaintenanceOperation, c.MaintenanceOperationRun, c.Message, c.Notification,
 		c.NotificationSubscription, c.PolicyBinding, c.Project, c.ProjectContributor,
-		c.ProjectSyncState, c.RuntimeBroker, c.Schedule, c.ScheduledEvent, c.Secret,
-		c.Skill, c.SkillRegistry, c.SkillVersion, c.SubscriptionTemplate, c.Template,
-		c.User, c.UserAccessToken,
+		c.ProjectPreStartHook, c.ProjectSyncState, c.RuntimeBroker, c.Schedule,
+		c.ScheduledEvent, c.Secret, c.Skill, c.SkillInjection, c.SkillRegistry,
+		c.SkillVersion, c.SubscriptionTemplate, c.Template, c.User, c.UserAccessToken,
 	} {
 		n.Intercept(interceptors...)
 	}
@@ -449,6 +473,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.AccessPolicy.mutate(ctx, m)
 	case *AgentMutation:
 		return c.Agent.mutate(ctx, m)
+	case *AgentSessionMetricsMutation:
+		return c.AgentSessionMetrics.mutate(ctx, m)
 	case *AllowListEntryMutation:
 		return c.AllowListEntry.mutate(ctx, m)
 	case *ApiKeyMutation:
@@ -463,6 +489,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.EnvVar.mutate(ctx, m)
 	case *GCPServiceAccountMutation:
 		return c.GCPServiceAccount.mutate(ctx, m)
+	case *GitHubResolutionCacheMutation:
+		return c.GitHubResolutionCache.mutate(ctx, m)
 	case *GithubInstallationMutation:
 		return c.GithubInstallation.mutate(ctx, m)
 	case *GroupMutation:
@@ -499,6 +527,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.Project.mutate(ctx, m)
 	case *ProjectContributorMutation:
 		return c.ProjectContributor.mutate(ctx, m)
+	case *ProjectPreStartHookMutation:
+		return c.ProjectPreStartHook.mutate(ctx, m)
 	case *ProjectSyncStateMutation:
 		return c.ProjectSyncState.mutate(ctx, m)
 	case *RuntimeBrokerMutation:
@@ -511,6 +541,8 @@ func (c *Client) Mutate(ctx context.Context, m Mutation) (Value, error) {
 		return c.Secret.mutate(ctx, m)
 	case *SkillMutation:
 		return c.Skill.mutate(ctx, m)
+	case *SkillInjectionMutation:
+		return c.SkillInjection.mutate(ctx, m)
 	case *SkillRegistryMutation:
 		return c.SkillRegistry.mutate(ctx, m)
 	case *SkillVersionMutation:
@@ -855,6 +887,139 @@ func (c *AgentClient) mutate(ctx context.Context, m *AgentMutation) (Value, erro
 		return (&AgentDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown Agent mutation op: %q", m.Op())
+	}
+}
+
+// AgentSessionMetricsClient is a client for the AgentSessionMetrics schema.
+type AgentSessionMetricsClient struct {
+	config
+}
+
+// NewAgentSessionMetricsClient returns a client for the AgentSessionMetrics from the given config.
+func NewAgentSessionMetricsClient(c config) *AgentSessionMetricsClient {
+	return &AgentSessionMetricsClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `agentsessionmetrics.Hooks(f(g(h())))`.
+func (c *AgentSessionMetricsClient) Use(hooks ...Hook) {
+	c.hooks.AgentSessionMetrics = append(c.hooks.AgentSessionMetrics, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `agentsessionmetrics.Intercept(f(g(h())))`.
+func (c *AgentSessionMetricsClient) Intercept(interceptors ...Interceptor) {
+	c.inters.AgentSessionMetrics = append(c.inters.AgentSessionMetrics, interceptors...)
+}
+
+// Create returns a builder for creating a AgentSessionMetrics entity.
+func (c *AgentSessionMetricsClient) Create() *AgentSessionMetricsCreate {
+	mutation := newAgentSessionMetricsMutation(c.config, OpCreate)
+	return &AgentSessionMetricsCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of AgentSessionMetrics entities.
+func (c *AgentSessionMetricsClient) CreateBulk(builders ...*AgentSessionMetricsCreate) *AgentSessionMetricsCreateBulk {
+	return &AgentSessionMetricsCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *AgentSessionMetricsClient) MapCreateBulk(slice any, setFunc func(*AgentSessionMetricsCreate, int)) *AgentSessionMetricsCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &AgentSessionMetricsCreateBulk{err: fmt.Errorf("calling to AgentSessionMetricsClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*AgentSessionMetricsCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &AgentSessionMetricsCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for AgentSessionMetrics.
+func (c *AgentSessionMetricsClient) Update() *AgentSessionMetricsUpdate {
+	mutation := newAgentSessionMetricsMutation(c.config, OpUpdate)
+	return &AgentSessionMetricsUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *AgentSessionMetricsClient) UpdateOne(_m *AgentSessionMetrics) *AgentSessionMetricsUpdateOne {
+	mutation := newAgentSessionMetricsMutation(c.config, OpUpdateOne, withAgentSessionMetrics(_m))
+	return &AgentSessionMetricsUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *AgentSessionMetricsClient) UpdateOneID(id uuid.UUID) *AgentSessionMetricsUpdateOne {
+	mutation := newAgentSessionMetricsMutation(c.config, OpUpdateOne, withAgentSessionMetricsID(id))
+	return &AgentSessionMetricsUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for AgentSessionMetrics.
+func (c *AgentSessionMetricsClient) Delete() *AgentSessionMetricsDelete {
+	mutation := newAgentSessionMetricsMutation(c.config, OpDelete)
+	return &AgentSessionMetricsDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *AgentSessionMetricsClient) DeleteOne(_m *AgentSessionMetrics) *AgentSessionMetricsDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *AgentSessionMetricsClient) DeleteOneID(id uuid.UUID) *AgentSessionMetricsDeleteOne {
+	builder := c.Delete().Where(agentsessionmetrics.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &AgentSessionMetricsDeleteOne{builder}
+}
+
+// Query returns a query builder for AgentSessionMetrics.
+func (c *AgentSessionMetricsClient) Query() *AgentSessionMetricsQuery {
+	return &AgentSessionMetricsQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeAgentSessionMetrics},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a AgentSessionMetrics entity by its id.
+func (c *AgentSessionMetricsClient) Get(ctx context.Context, id uuid.UUID) (*AgentSessionMetrics, error) {
+	return c.Query().Where(agentsessionmetrics.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *AgentSessionMetricsClient) GetX(ctx context.Context, id uuid.UUID) *AgentSessionMetrics {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// Hooks returns the client hooks.
+func (c *AgentSessionMetricsClient) Hooks() []Hook {
+	return c.hooks.AgentSessionMetrics
+}
+
+// Interceptors returns the client interceptors.
+func (c *AgentSessionMetricsClient) Interceptors() []Interceptor {
+	return c.inters.AgentSessionMetrics
+}
+
+func (c *AgentSessionMetricsClient) mutate(ctx context.Context, m *AgentSessionMetricsMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&AgentSessionMetricsCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&AgentSessionMetricsUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&AgentSessionMetricsUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&AgentSessionMetricsDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown AgentSessionMetrics mutation op: %q", m.Op())
 	}
 }
 
@@ -1786,6 +1951,139 @@ func (c *GCPServiceAccountClient) mutate(ctx context.Context, m *GCPServiceAccou
 		return (&GCPServiceAccountDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown GCPServiceAccount mutation op: %q", m.Op())
+	}
+}
+
+// GitHubResolutionCacheClient is a client for the GitHubResolutionCache schema.
+type GitHubResolutionCacheClient struct {
+	config
+}
+
+// NewGitHubResolutionCacheClient returns a client for the GitHubResolutionCache from the given config.
+func NewGitHubResolutionCacheClient(c config) *GitHubResolutionCacheClient {
+	return &GitHubResolutionCacheClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `githubresolutioncache.Hooks(f(g(h())))`.
+func (c *GitHubResolutionCacheClient) Use(hooks ...Hook) {
+	c.hooks.GitHubResolutionCache = append(c.hooks.GitHubResolutionCache, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `githubresolutioncache.Intercept(f(g(h())))`.
+func (c *GitHubResolutionCacheClient) Intercept(interceptors ...Interceptor) {
+	c.inters.GitHubResolutionCache = append(c.inters.GitHubResolutionCache, interceptors...)
+}
+
+// Create returns a builder for creating a GitHubResolutionCache entity.
+func (c *GitHubResolutionCacheClient) Create() *GitHubResolutionCacheCreate {
+	mutation := newGitHubResolutionCacheMutation(c.config, OpCreate)
+	return &GitHubResolutionCacheCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of GitHubResolutionCache entities.
+func (c *GitHubResolutionCacheClient) CreateBulk(builders ...*GitHubResolutionCacheCreate) *GitHubResolutionCacheCreateBulk {
+	return &GitHubResolutionCacheCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *GitHubResolutionCacheClient) MapCreateBulk(slice any, setFunc func(*GitHubResolutionCacheCreate, int)) *GitHubResolutionCacheCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &GitHubResolutionCacheCreateBulk{err: fmt.Errorf("calling to GitHubResolutionCacheClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*GitHubResolutionCacheCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &GitHubResolutionCacheCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for GitHubResolutionCache.
+func (c *GitHubResolutionCacheClient) Update() *GitHubResolutionCacheUpdate {
+	mutation := newGitHubResolutionCacheMutation(c.config, OpUpdate)
+	return &GitHubResolutionCacheUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *GitHubResolutionCacheClient) UpdateOne(_m *GitHubResolutionCache) *GitHubResolutionCacheUpdateOne {
+	mutation := newGitHubResolutionCacheMutation(c.config, OpUpdateOne, withGitHubResolutionCache(_m))
+	return &GitHubResolutionCacheUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *GitHubResolutionCacheClient) UpdateOneID(id uuid.UUID) *GitHubResolutionCacheUpdateOne {
+	mutation := newGitHubResolutionCacheMutation(c.config, OpUpdateOne, withGitHubResolutionCacheID(id))
+	return &GitHubResolutionCacheUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for GitHubResolutionCache.
+func (c *GitHubResolutionCacheClient) Delete() *GitHubResolutionCacheDelete {
+	mutation := newGitHubResolutionCacheMutation(c.config, OpDelete)
+	return &GitHubResolutionCacheDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *GitHubResolutionCacheClient) DeleteOne(_m *GitHubResolutionCache) *GitHubResolutionCacheDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *GitHubResolutionCacheClient) DeleteOneID(id uuid.UUID) *GitHubResolutionCacheDeleteOne {
+	builder := c.Delete().Where(githubresolutioncache.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &GitHubResolutionCacheDeleteOne{builder}
+}
+
+// Query returns a query builder for GitHubResolutionCache.
+func (c *GitHubResolutionCacheClient) Query() *GitHubResolutionCacheQuery {
+	return &GitHubResolutionCacheQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeGitHubResolutionCache},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a GitHubResolutionCache entity by its id.
+func (c *GitHubResolutionCacheClient) Get(ctx context.Context, id uuid.UUID) (*GitHubResolutionCache, error) {
+	return c.Query().Where(githubresolutioncache.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *GitHubResolutionCacheClient) GetX(ctx context.Context, id uuid.UUID) *GitHubResolutionCache {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// Hooks returns the client hooks.
+func (c *GitHubResolutionCacheClient) Hooks() []Hook {
+	return c.hooks.GitHubResolutionCache
+}
+
+// Interceptors returns the client interceptors.
+func (c *GitHubResolutionCacheClient) Interceptors() []Interceptor {
+	return c.inters.GitHubResolutionCache
+}
+
+func (c *GitHubResolutionCacheClient) mutate(ctx context.Context, m *GitHubResolutionCacheMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&GitHubResolutionCacheCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&GitHubResolutionCacheUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&GitHubResolutionCacheUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&GitHubResolutionCacheDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown GitHubResolutionCache mutation op: %q", m.Op())
 	}
 }
 
@@ -4391,6 +4689,139 @@ func (c *ProjectContributorClient) mutate(ctx context.Context, m *ProjectContrib
 	}
 }
 
+// ProjectPreStartHookClient is a client for the ProjectPreStartHook schema.
+type ProjectPreStartHookClient struct {
+	config
+}
+
+// NewProjectPreStartHookClient returns a client for the ProjectPreStartHook from the given config.
+func NewProjectPreStartHookClient(c config) *ProjectPreStartHookClient {
+	return &ProjectPreStartHookClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `projectprestarthook.Hooks(f(g(h())))`.
+func (c *ProjectPreStartHookClient) Use(hooks ...Hook) {
+	c.hooks.ProjectPreStartHook = append(c.hooks.ProjectPreStartHook, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `projectprestarthook.Intercept(f(g(h())))`.
+func (c *ProjectPreStartHookClient) Intercept(interceptors ...Interceptor) {
+	c.inters.ProjectPreStartHook = append(c.inters.ProjectPreStartHook, interceptors...)
+}
+
+// Create returns a builder for creating a ProjectPreStartHook entity.
+func (c *ProjectPreStartHookClient) Create() *ProjectPreStartHookCreate {
+	mutation := newProjectPreStartHookMutation(c.config, OpCreate)
+	return &ProjectPreStartHookCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of ProjectPreStartHook entities.
+func (c *ProjectPreStartHookClient) CreateBulk(builders ...*ProjectPreStartHookCreate) *ProjectPreStartHookCreateBulk {
+	return &ProjectPreStartHookCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *ProjectPreStartHookClient) MapCreateBulk(slice any, setFunc func(*ProjectPreStartHookCreate, int)) *ProjectPreStartHookCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &ProjectPreStartHookCreateBulk{err: fmt.Errorf("calling to ProjectPreStartHookClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*ProjectPreStartHookCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &ProjectPreStartHookCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for ProjectPreStartHook.
+func (c *ProjectPreStartHookClient) Update() *ProjectPreStartHookUpdate {
+	mutation := newProjectPreStartHookMutation(c.config, OpUpdate)
+	return &ProjectPreStartHookUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *ProjectPreStartHookClient) UpdateOne(_m *ProjectPreStartHook) *ProjectPreStartHookUpdateOne {
+	mutation := newProjectPreStartHookMutation(c.config, OpUpdateOne, withProjectPreStartHook(_m))
+	return &ProjectPreStartHookUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *ProjectPreStartHookClient) UpdateOneID(id uuid.UUID) *ProjectPreStartHookUpdateOne {
+	mutation := newProjectPreStartHookMutation(c.config, OpUpdateOne, withProjectPreStartHookID(id))
+	return &ProjectPreStartHookUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for ProjectPreStartHook.
+func (c *ProjectPreStartHookClient) Delete() *ProjectPreStartHookDelete {
+	mutation := newProjectPreStartHookMutation(c.config, OpDelete)
+	return &ProjectPreStartHookDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *ProjectPreStartHookClient) DeleteOne(_m *ProjectPreStartHook) *ProjectPreStartHookDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *ProjectPreStartHookClient) DeleteOneID(id uuid.UUID) *ProjectPreStartHookDeleteOne {
+	builder := c.Delete().Where(projectprestarthook.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &ProjectPreStartHookDeleteOne{builder}
+}
+
+// Query returns a query builder for ProjectPreStartHook.
+func (c *ProjectPreStartHookClient) Query() *ProjectPreStartHookQuery {
+	return &ProjectPreStartHookQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeProjectPreStartHook},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a ProjectPreStartHook entity by its id.
+func (c *ProjectPreStartHookClient) Get(ctx context.Context, id uuid.UUID) (*ProjectPreStartHook, error) {
+	return c.Query().Where(projectprestarthook.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *ProjectPreStartHookClient) GetX(ctx context.Context, id uuid.UUID) *ProjectPreStartHook {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// Hooks returns the client hooks.
+func (c *ProjectPreStartHookClient) Hooks() []Hook {
+	return c.hooks.ProjectPreStartHook
+}
+
+// Interceptors returns the client interceptors.
+func (c *ProjectPreStartHookClient) Interceptors() []Interceptor {
+	return c.inters.ProjectPreStartHook
+}
+
+func (c *ProjectPreStartHookClient) mutate(ctx context.Context, m *ProjectPreStartHookMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&ProjectPreStartHookCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&ProjectPreStartHookUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&ProjectPreStartHookUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&ProjectPreStartHookDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown ProjectPreStartHook mutation op: %q", m.Op())
+	}
+}
+
 // ProjectSyncStateClient is a client for the ProjectSyncState schema.
 type ProjectSyncStateClient struct {
 	config
@@ -5186,6 +5617,139 @@ func (c *SkillClient) mutate(ctx context.Context, m *SkillMutation) (Value, erro
 		return (&SkillDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
 	default:
 		return nil, fmt.Errorf("ent: unknown Skill mutation op: %q", m.Op())
+	}
+}
+
+// SkillInjectionClient is a client for the SkillInjection schema.
+type SkillInjectionClient struct {
+	config
+}
+
+// NewSkillInjectionClient returns a client for the SkillInjection from the given config.
+func NewSkillInjectionClient(c config) *SkillInjectionClient {
+	return &SkillInjectionClient{config: c}
+}
+
+// Use adds a list of mutation hooks to the hooks stack.
+// A call to `Use(f, g, h)` equals to `skillinjection.Hooks(f(g(h())))`.
+func (c *SkillInjectionClient) Use(hooks ...Hook) {
+	c.hooks.SkillInjection = append(c.hooks.SkillInjection, hooks...)
+}
+
+// Intercept adds a list of query interceptors to the interceptors stack.
+// A call to `Intercept(f, g, h)` equals to `skillinjection.Intercept(f(g(h())))`.
+func (c *SkillInjectionClient) Intercept(interceptors ...Interceptor) {
+	c.inters.SkillInjection = append(c.inters.SkillInjection, interceptors...)
+}
+
+// Create returns a builder for creating a SkillInjection entity.
+func (c *SkillInjectionClient) Create() *SkillInjectionCreate {
+	mutation := newSkillInjectionMutation(c.config, OpCreate)
+	return &SkillInjectionCreate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// CreateBulk returns a builder for creating a bulk of SkillInjection entities.
+func (c *SkillInjectionClient) CreateBulk(builders ...*SkillInjectionCreate) *SkillInjectionCreateBulk {
+	return &SkillInjectionCreateBulk{config: c.config, builders: builders}
+}
+
+// MapCreateBulk creates a bulk creation builder from the given slice. For each item in the slice, the function creates
+// a builder and applies setFunc on it.
+func (c *SkillInjectionClient) MapCreateBulk(slice any, setFunc func(*SkillInjectionCreate, int)) *SkillInjectionCreateBulk {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() != reflect.Slice {
+		return &SkillInjectionCreateBulk{err: fmt.Errorf("calling to SkillInjectionClient.MapCreateBulk with wrong type %T, need slice", slice)}
+	}
+	builders := make([]*SkillInjectionCreate, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		builders[i] = c.Create()
+		setFunc(builders[i], i)
+	}
+	return &SkillInjectionCreateBulk{config: c.config, builders: builders}
+}
+
+// Update returns an update builder for SkillInjection.
+func (c *SkillInjectionClient) Update() *SkillInjectionUpdate {
+	mutation := newSkillInjectionMutation(c.config, OpUpdate)
+	return &SkillInjectionUpdate{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOne returns an update builder for the given entity.
+func (c *SkillInjectionClient) UpdateOne(_m *SkillInjection) *SkillInjectionUpdateOne {
+	mutation := newSkillInjectionMutation(c.config, OpUpdateOne, withSkillInjection(_m))
+	return &SkillInjectionUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// UpdateOneID returns an update builder for the given id.
+func (c *SkillInjectionClient) UpdateOneID(id uuid.UUID) *SkillInjectionUpdateOne {
+	mutation := newSkillInjectionMutation(c.config, OpUpdateOne, withSkillInjectionID(id))
+	return &SkillInjectionUpdateOne{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// Delete returns a delete builder for SkillInjection.
+func (c *SkillInjectionClient) Delete() *SkillInjectionDelete {
+	mutation := newSkillInjectionMutation(c.config, OpDelete)
+	return &SkillInjectionDelete{config: c.config, hooks: c.Hooks(), mutation: mutation}
+}
+
+// DeleteOne returns a builder for deleting the given entity.
+func (c *SkillInjectionClient) DeleteOne(_m *SkillInjection) *SkillInjectionDeleteOne {
+	return c.DeleteOneID(_m.ID)
+}
+
+// DeleteOneID returns a builder for deleting the given entity by its id.
+func (c *SkillInjectionClient) DeleteOneID(id uuid.UUID) *SkillInjectionDeleteOne {
+	builder := c.Delete().Where(skillinjection.ID(id))
+	builder.mutation.id = &id
+	builder.mutation.op = OpDeleteOne
+	return &SkillInjectionDeleteOne{builder}
+}
+
+// Query returns a query builder for SkillInjection.
+func (c *SkillInjectionClient) Query() *SkillInjectionQuery {
+	return &SkillInjectionQuery{
+		config: c.config,
+		ctx:    &QueryContext{Type: TypeSkillInjection},
+		inters: c.Interceptors(),
+	}
+}
+
+// Get returns a SkillInjection entity by its id.
+func (c *SkillInjectionClient) Get(ctx context.Context, id uuid.UUID) (*SkillInjection, error) {
+	return c.Query().Where(skillinjection.ID(id)).Only(ctx)
+}
+
+// GetX is like Get, but panics if an error occurs.
+func (c *SkillInjectionClient) GetX(ctx context.Context, id uuid.UUID) *SkillInjection {
+	obj, err := c.Get(ctx, id)
+	if err != nil {
+		panic(err)
+	}
+	return obj
+}
+
+// Hooks returns the client hooks.
+func (c *SkillInjectionClient) Hooks() []Hook {
+	return c.hooks.SkillInjection
+}
+
+// Interceptors returns the client interceptors.
+func (c *SkillInjectionClient) Interceptors() []Interceptor {
+	return c.inters.SkillInjection
+}
+
+func (c *SkillInjectionClient) mutate(ctx context.Context, m *SkillInjectionMutation) (Value, error) {
+	switch m.Op() {
+	case OpCreate:
+		return (&SkillInjectionCreate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdate:
+		return (&SkillInjectionUpdate{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpUpdateOne:
+		return (&SkillInjectionUpdateOne{config: c.config, hooks: c.Hooks(), mutation: m}).Save(ctx)
+	case OpDelete, OpDeleteOne:
+		return (&SkillInjectionDelete{config: c.config, hooks: c.Hooks(), mutation: m}).Exec(ctx)
+	default:
+		return nil, fmt.Errorf("ent: unknown SkillInjection mutation op: %q", m.Op())
 	}
 }
 
@@ -6038,25 +6602,27 @@ func (c *UserAccessTokenClient) mutate(ctx context.Context, m *UserAccessTokenMu
 // hooks and interceptors per client, for fast access.
 type (
 	hooks struct {
-		AccessPolicy, Agent, AllowListEntry, ApiKey, BrokerDispatch, BrokerJoinToken,
-		BrokerSecret, EnvVar, GCPServiceAccount, GithubInstallation, Group,
-		GroupMembership, HarnessConfig, HubSetting, IntegrationConfig,
-		IntegrationUpdate, InviteCode, LifecycleHook, LifecycleHookAgentPhase,
-		MaintenanceOperation, MaintenanceOperationRun, Message, Notification,
-		NotificationSubscription, PolicyBinding, Project, ProjectContributor,
+		AccessPolicy, Agent, AgentSessionMetrics, AllowListEntry, ApiKey,
+		BrokerDispatch, BrokerJoinToken, BrokerSecret, EnvVar, GCPServiceAccount,
+		GitHubResolutionCache, GithubInstallation, Group, GroupMembership,
+		HarnessConfig, HubSetting, IntegrationConfig, IntegrationUpdate, InviteCode,
+		LifecycleHook, LifecycleHookAgentPhase, MaintenanceOperation,
+		MaintenanceOperationRun, Message, Notification, NotificationSubscription,
+		PolicyBinding, Project, ProjectContributor, ProjectPreStartHook,
 		ProjectSyncState, RuntimeBroker, Schedule, ScheduledEvent, Secret, Skill,
-		SkillRegistry, SkillVersion, SubscriptionTemplate, Template, User,
-		UserAccessToken []ent.Hook
+		SkillInjection, SkillRegistry, SkillVersion, SubscriptionTemplate, Template,
+		User, UserAccessToken []ent.Hook
 	}
 	inters struct {
-		AccessPolicy, Agent, AllowListEntry, ApiKey, BrokerDispatch, BrokerJoinToken,
-		BrokerSecret, EnvVar, GCPServiceAccount, GithubInstallation, Group,
-		GroupMembership, HarnessConfig, HubSetting, IntegrationConfig,
-		IntegrationUpdate, InviteCode, LifecycleHook, LifecycleHookAgentPhase,
-		MaintenanceOperation, MaintenanceOperationRun, Message, Notification,
-		NotificationSubscription, PolicyBinding, Project, ProjectContributor,
+		AccessPolicy, Agent, AgentSessionMetrics, AllowListEntry, ApiKey,
+		BrokerDispatch, BrokerJoinToken, BrokerSecret, EnvVar, GCPServiceAccount,
+		GitHubResolutionCache, GithubInstallation, Group, GroupMembership,
+		HarnessConfig, HubSetting, IntegrationConfig, IntegrationUpdate, InviteCode,
+		LifecycleHook, LifecycleHookAgentPhase, MaintenanceOperation,
+		MaintenanceOperationRun, Message, Notification, NotificationSubscription,
+		PolicyBinding, Project, ProjectContributor, ProjectPreStartHook,
 		ProjectSyncState, RuntimeBroker, Schedule, ScheduledEvent, Secret, Skill,
-		SkillRegistry, SkillVersion, SubscriptionTemplate, Template, User,
-		UserAccessToken []ent.Interceptor
+		SkillInjection, SkillRegistry, SkillVersion, SubscriptionTemplate, Template,
+		User, UserAccessToken []ent.Interceptor
 	}
 )

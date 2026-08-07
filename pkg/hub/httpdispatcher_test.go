@@ -19,6 +19,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -48,30 +49,32 @@ func createTestStore(t *testing.T) store.Store {
 
 // mockRuntimeBrokerClient is a mock implementation of RuntimeBrokerClient for testing.
 type mockRuntimeBrokerClient struct {
-	createCalled     bool
-	startCalled      bool
-	stopCalled       bool
-	restartCalled    bool
-	deleteCalled     bool
-	messageCalled    bool
-	cleanupCalled    bool
-	lastBrokerID     string
-	lastEndpoint     string
-	lastAgentID      string
-	lastTask         string
-	lastProjectPath  string
-	lastProjectSlug  string
-	lastMessage      string
-	lastInterrupt    bool
-	lastResolvedEnv  map[string]string
-	lastInlineConfig *api.ScionConfig
-	lastCreateReq    *RemoteCreateAgentRequest
-	lastDeleteOpts   struct{ deleteFiles, removeBranch bool }
-	returnErr        error
-	cleanupErr       error
-	startReturnResp  *RemoteAgentResponse // custom start response if set
-	cleanupCalls     int
-	cleanupSlugs     []string
+	createCalled           bool
+	startCalled            bool
+	stopCalled             bool
+	restartCalled          bool
+	deleteCalled           bool
+	messageCalled          bool
+	cleanupCalled          bool
+	lastBrokerID           string
+	lastEndpoint           string
+	lastAgentID            string
+	lastTask               string
+	lastProjectPath        string
+	lastProjectSlug        string
+	lastMessage            string
+	lastInterrupt          bool
+	lastResolvedEnv        map[string]string
+	lastRestartResolvedEnv map[string]string
+	lastInlineConfig       *api.ScionConfig
+	lastCreateReq          *RemoteCreateAgentRequest
+	lastDeleteOpts         struct{ deleteFiles, removeBranch bool }
+	returnErr              error
+	cleanupErr             error
+	startReturnResp        *RemoteAgentResponse // custom start response if set
+	cleanupCalls           int
+	cleanupSlugs           []string
+	createWithGatherFunc   func(ctx context.Context, brokerID, brokerEndpoint string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error)
 }
 
 func (m *mockRuntimeBrokerClient) CreateAgent(ctx context.Context, brokerID, brokerEndpoint string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, error) {
@@ -134,6 +137,7 @@ func (m *mockRuntimeBrokerClient) RestartAgent(ctx context.Context, brokerID, br
 	m.lastBrokerID = brokerID
 	m.lastEndpoint = brokerEndpoint
 	m.lastAgentID = agentID
+	m.lastRestartResolvedEnv = resolvedEnv
 	return m.returnErr
 }
 
@@ -193,6 +197,9 @@ func (m *mockRuntimeBrokerClient) CreateAgentWithGather(ctx context.Context, bro
 	m.lastBrokerID = brokerID
 	m.lastEndpoint = brokerEndpoint
 	m.lastCreateReq = req
+	if m.createWithGatherFunc != nil {
+		return m.createWithGatherFunc(ctx, brokerID, brokerEndpoint, req)
+	}
 	if m.returnErr != nil {
 		return nil, nil, m.returnErr
 	}
@@ -1375,22 +1382,24 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ResolvesEnvFromStorage(t *testin
 
 	// Store an env var in project scope (simulating API key stored in hub)
 	if err := memStore.CreateEnvVar(ctx, &store.EnvVar{
-		ID:      tid("ev-project-1"),
-		Key:     "GEMINI_API_KEY",
-		Value:   "test-api-key-123",
-		Scope:   "project",
-		ScopeID: tid("project-env"),
+		ID:            tid("ev-project-1"),
+		Key:           "GEMINI_API_KEY",
+		Value:         "test-api-key-123",
+		Scope:         "project",
+		ScopeID:       tid("project-env"),
+		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
 	}
 
 	// Store a user-scoped env var
 	if err := memStore.CreateEnvVar(ctx, &store.EnvVar{
-		ID:      tid("ev-user-1"),
-		Key:     "CUSTOM_VAR",
-		Value:   "user-value",
-		Scope:   "user",
-		ScopeID: "owner-1",
+		ID:            tid("ev-user-1"),
+		Key:           "CUSTOM_VAR",
+		Value:         "user-value",
+		Scope:         "user",
+		ScopeID:       "owner-1",
+		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
 	}
@@ -1468,11 +1477,12 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_ConfigEnvTakesPrecedence(t *test
 
 	// Store an env var that conflicts with config env
 	if err := memStore.CreateEnvVar(ctx, &store.EnvVar{
-		ID:      tid("ev-prec-1"),
-		Key:     "API_KEY",
-		Value:   "storage-value",
-		Scope:   "project",
-		ScopeID: tid("project-prec"),
+		ID:            tid("ev-prec-1"),
+		Key:           "API_KEY",
+		Value:         "storage-value",
+		Scope:         "project",
+		ScopeID:       tid("project-prec"),
+		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
 	}
@@ -1531,11 +1541,12 @@ func TestHTTPAgentDispatcher_DispatchAgentStart_StorageOverridesEmptyConfigEnv(t
 
 	// Store an env var that should override the empty config value
 	if err := memStore.CreateEnvVar(ctx, &store.EnvVar{
-		ID:      tid("ev-empty-1"),
-		Key:     "GEMINI_API_KEY",
-		Value:   "stored-api-key",
-		Scope:   "project",
-		ScopeID: tid("project-empty-env"),
+		ID:            tid("ev-empty-1"),
+		Key:           "GEMINI_API_KEY",
+		Value:         "stored-api-key",
+		Scope:         "project",
+		ScopeID:       tid("project-empty-env"),
+		InjectionMode: store.InjectionModeAlways,
 	}); err != nil {
 		t.Fatalf("failed to set env var: %v", err)
 	}
@@ -2246,11 +2257,12 @@ func TestBuildCreateRequest_ResolvesStorageEnvVars(t *testing.T) {
 
 	// Store a user-scoped env var
 	envVar := &store.EnvVar{
-		ID:      tid("ev-1"),
-		Key:     "GEMINI_API_KEY",
-		Value:   "stored-key-value",
-		Scope:   "user",
-		ScopeID: tid("user-1"),
+		ID:            tid("ev-1"),
+		Key:           "GEMINI_API_KEY",
+		Value:         "stored-key-value",
+		Scope:         "user",
+		ScopeID:       tid("user-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, envVar); err != nil {
 		t.Fatalf("failed to create env var: %v", err)
@@ -2299,11 +2311,12 @@ func TestBuildCreateRequest_ConfigEnvOverridesStorage(t *testing.T) {
 
 	// Store a user-scoped env var with the same key as config env
 	envVar := &store.EnvVar{
-		ID:      tid("ev-1"),
-		Key:     "MY_KEY",
-		Value:   "storage-value",
-		Scope:   "user",
-		ScopeID: tid("user-1"),
+		ID:            tid("ev-1"),
+		Key:           "MY_KEY",
+		Value:         "storage-value",
+		Scope:         "user",
+		ScopeID:       tid("user-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, envVar); err != nil {
 		t.Fatalf("failed to create env var: %v", err)
@@ -2363,11 +2376,12 @@ func TestBuildCreateRequest_ResolvesProjectAndUserScopes(t *testing.T) {
 
 	// Store a project-scoped env var
 	projectEnv := &store.EnvVar{
-		ID:      tid("ev-project"),
-		Key:     "SHARED_KEY",
-		Value:   "project-value",
-		Scope:   "project",
-		ScopeID: tid("project-1"),
+		ID:            tid("ev-project"),
+		Key:           "SHARED_KEY",
+		Value:         "project-value",
+		Scope:         "project",
+		ScopeID:       tid("project-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, projectEnv); err != nil {
 		t.Fatalf("failed to create project env var: %v", err)
@@ -2375,11 +2389,12 @@ func TestBuildCreateRequest_ResolvesProjectAndUserScopes(t *testing.T) {
 
 	// Store a user-scoped env var with the same key (higher precedence)
 	userEnv := &store.EnvVar{
-		ID:      tid("ev-user"),
-		Key:     "SHARED_KEY",
-		Value:   "user-value",
-		Scope:   "user",
-		ScopeID: tid("user-1"),
+		ID:            tid("ev-user"),
+		Key:           "SHARED_KEY",
+		Value:         "user-value",
+		Scope:         "user",
+		ScopeID:       tid("user-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, userEnv); err != nil {
 		t.Fatalf("failed to create user env var: %v", err)
@@ -2387,11 +2402,12 @@ func TestBuildCreateRequest_ResolvesProjectAndUserScopes(t *testing.T) {
 
 	// Store a project-only env var
 	projectOnly := &store.EnvVar{
-		ID:      tid("ev-project-only"),
-		Key:     "GROVE_ONLY_KEY",
-		Value:   "project-only-value",
-		Scope:   "project",
-		ScopeID: tid("project-1"),
+		ID:            tid("ev-project-only"),
+		Key:           "GROVE_ONLY_KEY",
+		Value:         "project-only-value",
+		Scope:         "project",
+		ScopeID:       tid("project-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, projectOnly); err != nil {
 		t.Fatalf("failed to create project-only env var: %v", err)
@@ -2444,11 +2460,12 @@ func TestDispatchAgentCreate_IncludesStorageEnvVars(t *testing.T) {
 
 	// Store user-scoped env vars
 	envVar := &store.EnvVar{
-		ID:      tid("ev-1"),
-		Key:     "API_TOKEN",
-		Value:   "secret-token-123",
-		Scope:   "user",
-		ScopeID: tid("user-1"),
+		ID:            tid("ev-1"),
+		Key:           "API_TOKEN",
+		Value:         "secret-token-123",
+		Scope:         "user",
+		ScopeID:       tid("user-1"),
+		InjectionMode: store.InjectionModeAlways,
 	}
 	if err := memStore.CreateEnvVar(ctx, envVar); err != nil {
 		t.Fatalf("failed to create env var: %v", err)
@@ -3366,6 +3383,89 @@ func TestBuildCreateRequest_NoAuth_SkipsSecrets(t *testing.T) {
 	})
 }
 
+// mockProvisionCredsBackend extends mockSecretBackend with List and Get support
+// for testing provisionCredentials collection.
+type mockProvisionCredsBackend struct {
+	mockSecretBackend
+	projectSecrets []secret.SecretMeta
+	secretValues   map[string]*secret.SecretWithValue
+}
+
+func (m *mockProvisionCredsBackend) List(_ context.Context, filter secret.Filter) ([]secret.SecretMeta, error) {
+	if filter.Scope == secret.ScopeProject {
+		return m.projectSecrets, nil
+	}
+	return nil, nil
+}
+
+func (m *mockProvisionCredsBackend) Get(_ context.Context, name, scope, scopeID string) (*secret.SecretWithValue, error) {
+	if sv, ok := m.secretValues[name]; ok {
+		return sv, nil
+	}
+	return nil, nil
+}
+
+func TestBuildCreateRequest_NoAuth_ProvisionCredentialsSurvive(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("host-1"),
+		Name:     "test-host",
+		Slug:     "test-host",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetSecretBackend(&mockProvisionCredsBackend{
+		mockSecretBackend: mockSecretBackend{
+			secrets: []secret.SecretWithValue{
+				{SecretMeta: secret.SecretMeta{Name: "CLAUDE_AUTH", SecretType: "file", Target: "~/.claude/.credentials.json"}, Value: "secret-data"},
+			},
+		},
+		projectSecrets: []secret.SecretMeta{
+			{Name: "GH_EXAMPLE", SecretType: "environment", Scope: secret.ScopeProject},
+		},
+		secretValues: map[string]*secret.SecretWithValue{
+			"GH_EXAMPLE": {SecretMeta: secret.SecretMeta{Name: "GH_EXAMPLE", SecretType: "environment"}, Value: "ghp_token123"},
+		},
+	})
+
+	agent := &store.Agent{
+		ID:              tid("agent-noauth-prov"),
+		Name:            "noauth-prov-agent",
+		Slug:            "noauth-prov-agent",
+		OwnerID:         tid("user-1"),
+		ProjectID:       tid("project-1"),
+		RuntimeBrokerID: tid("host-1"),
+		AppliedConfig:   &store.AgentAppliedConfig{NoAuth: true},
+	}
+
+	req, err := dispatcher.buildCreateRequest(ctx, agent, "TestNoAuthProvisionCreds")
+	if err != nil {
+		t.Fatalf("buildCreateRequest failed: %v", err)
+	}
+
+	// ProvisionCredentials must be populated even under NoAuth — they serve
+	// skill resolution (gh:// tokens), not harness auth.
+	if req.ProvisionCredentials == nil {
+		t.Fatal("expected ProvisionCredentials to be non-nil with NoAuth=true")
+	}
+	if req.ProvisionCredentials["GH_EXAMPLE"] != "ghp_token123" {
+		t.Errorf("expected ProvisionCredentials[GH_EXAMPLE]=%q, got %q", "ghp_token123", req.ProvisionCredentials["GH_EXAMPLE"])
+	}
+
+	// ResolvedSecrets must still be suppressed under NoAuth.
+	if len(req.ResolvedSecrets) != 0 {
+		t.Errorf("expected no resolved secrets with NoAuth=true, got %d", len(req.ResolvedSecrets))
+	}
+}
+
 func TestHTTPAgentDispatcher_DispatchAgentCreate_AppliesImageRegistry(t *testing.T) {
 	ctx := context.Background()
 	memStore := createTestStore(t)
@@ -3503,5 +3603,825 @@ func TestHTTPAgentDispatcher_DispatchAgentCreate_FullyQualifiedImageNotRewritten
 	if mockClient.lastCreateReq.Config.Image != "ghcr.io/custom/image:v2" {
 		t.Errorf("expected fully-qualified image to be unchanged, got %q",
 			mockClient.lastCreateReq.Config.Image)
+	}
+}
+
+func TestBuildCreateRequest_RelativeWorkspaceSurvives(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	// Create the project with a GitRemote so it is treated as a linked project
+	// (not hub-managed). This ensures buildCreateRequest looks up the
+	// provider's LocalPath.
+	project := &store.Project{
+		ID:        tid("project-relws"),
+		Name:      "test-project",
+		Slug:      "test-project-relws",
+		GitRemote: "https://github.com/example/repo.git",
+	}
+	if err := memStore.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Create a runtime broker
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-relws"),
+		Name:     "test-broker",
+		Slug:     "test-broker-relws",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	// Add a project provider record WITH a local path
+	provider := &store.ProjectProvider{
+		ProjectID:  tid("project-relws"),
+		BrokerID:   tid("broker-relws"),
+		BrokerName: "test-broker",
+		LocalPath:  "/home/user/projects/myproject/.scion",
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := memStore.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	t.Run("relative workspace survives", func(t *testing.T) {
+		agent := &store.Agent{
+			ID:              tid("agent-relws-1"),
+			Name:            "test-agent-rel",
+			Slug:            "test-agent-rel",
+			ProjectID:       tid("project-relws"),
+			RuntimeBrokerID: tid("broker-relws"),
+			AppliedConfig: &store.AgentAppliedConfig{
+				Workspace: "packages/web",
+			},
+		}
+
+		err := dispatcher.DispatchAgentCreate(ctx, agent)
+		if err != nil {
+			t.Fatalf("DispatchAgentCreate failed: %v", err)
+		}
+
+		if !mockClient.createCalled {
+			t.Fatal("expected CreateAgent to be called")
+		}
+		if mockClient.lastCreateReq.Config == nil {
+			t.Fatal("expected Config to be present in create request")
+		}
+		if mockClient.lastCreateReq.Config.Workspace != "packages/web" {
+			t.Errorf("expected relative workspace 'packages/web' to survive, got %q",
+				mockClient.lastCreateReq.Config.Workspace)
+		}
+	})
+
+	t.Run("absolute workspace still cleared", func(t *testing.T) {
+		mockClient.createCalled = false
+		mockClient.lastCreateReq = nil
+
+		agent := &store.Agent{
+			ID:              tid("agent-relws-2"),
+			Name:            "test-agent-abs",
+			Slug:            "test-agent-abs",
+			ProjectID:       tid("project-relws"),
+			RuntimeBrokerID: tid("broker-relws"),
+			AppliedConfig: &store.AgentAppliedConfig{
+				Workspace: "/hub/managed/path",
+			},
+		}
+
+		err := dispatcher.DispatchAgentCreate(ctx, agent)
+		if err != nil {
+			t.Fatalf("DispatchAgentCreate failed: %v", err)
+		}
+
+		if !mockClient.createCalled {
+			t.Fatal("expected CreateAgent to be called")
+		}
+		if mockClient.lastCreateReq.Config == nil {
+			t.Fatal("expected Config to be present in create request")
+		}
+		if mockClient.lastCreateReq.Config.Workspace != "" {
+			t.Errorf("expected absolute workspace to be cleared, got %q",
+				mockClient.lastCreateReq.Config.Workspace)
+		}
+	})
+}
+
+// TestHTTPAgentDispatcher_DispatchAgentStart_InjectsWorkspaceMode verifies that
+// DispatchAgentStart injects SCION_WORKSPACE_MODE (canonical) and SCION_WORKSPACE_GIT
+// into resolvedEnv for each of the three workspace sharing modes.
+func TestHTTPAgentDispatcher_DispatchAgentStart_InjectsWorkspaceMode(t *testing.T) {
+	ctx := context.Background()
+
+	type testCase struct {
+		name               string
+		workspaceModeLabel string // project label value (wire format)
+		gitRemote          string
+		appliedGitClone    *api.GitCloneConfig
+		wantMode           string
+		wantGit            bool
+	}
+
+	cases := []testCase{
+		{
+			name:               "shared-plain no git",
+			workspaceModeLabel: store.WorkspaceModeShared,
+			wantMode:           "shared-plain",
+			wantGit:            false,
+		},
+		{
+			name:               "shared-plain with git clone in applied config",
+			workspaceModeLabel: store.WorkspaceModeShared,
+			gitRemote:          "https://github.com/example/repo.git",
+			appliedGitClone:    &api.GitCloneConfig{URL: "https://github.com/example/repo.git"},
+			wantMode:           "shared-plain",
+			wantGit:            true,
+		},
+		{
+			name:               "clone-per-agent",
+			workspaceModeLabel: store.WorkspaceModePerAgent,
+			gitRemote:          "https://github.com/example/repo.git",
+			wantMode:           "clone-per-agent",
+			wantGit:            true,
+		},
+		{
+			name:               "worktree-per-agent",
+			workspaceModeLabel: store.WorkspaceModeWorktreePerAgent,
+			gitRemote:          "https://github.com/example/repo.git",
+			wantMode:           "worktree-per-agent",
+			wantGit:            true,
+		},
+		{
+			// When no workspace mode label is set, the hub does not inject
+			// SCION_WORKSPACE_MODE. The broker applies the shared-plain default
+			// in buildStartContext when the key is absent from resolvedEnv.
+			name:               "empty label: hub does not inject mode",
+			workspaceModeLabel: "",
+			wantMode:           "", // absent from hub-injected resolvedEnv
+			wantGit:            false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			memStore := createTestStore(t)
+
+			labels := map[string]string{}
+			if tc.workspaceModeLabel != "" {
+				labels[store.LabelWorkspaceMode] = tc.workspaceModeLabel
+			}
+			project := &store.Project{
+				ID:        tid("proj-wm-" + tc.name),
+				Name:      "workspace-mode-test",
+				Slug:      "workspace-mode-test",
+				GitRemote: tc.gitRemote,
+				Labels:    labels,
+			}
+			if err := memStore.CreateProject(ctx, project); err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			broker := &store.RuntimeBroker{
+				ID:       tid("broker-wm-" + tc.name),
+				Name:     "test-broker",
+				Slug:     "test-broker",
+				Endpoint: "http://localhost:9800",
+				Status:   store.BrokerStatusOnline,
+			}
+			if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+				t.Fatalf("failed to create runtime broker: %v", err)
+			}
+
+			mockClient := &mockRuntimeBrokerClient{}
+			dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+			agent := &store.Agent{
+				ID:              tid("agent-wm-" + tc.name),
+				Name:            "test-agent",
+				Slug:            "test-agent",
+				ProjectID:       project.ID,
+				RuntimeBrokerID: broker.ID,
+				AppliedConfig: &store.AgentAppliedConfig{
+					GitClone: tc.appliedGitClone,
+				},
+			}
+
+			if err := dispatcher.DispatchAgentStart(ctx, agent, "", false); err != nil {
+				t.Fatalf("DispatchAgentStart failed: %v", err)
+			}
+
+			env := mockClient.lastResolvedEnv
+			if got := env["SCION_WORKSPACE_MODE"]; got != tc.wantMode {
+				t.Errorf("SCION_WORKSPACE_MODE: got %q, want %q", got, tc.wantMode)
+			}
+			if tc.wantGit {
+				if env["SCION_WORKSPACE_GIT"] != "true" {
+					t.Errorf("SCION_WORKSPACE_GIT: got %q, want %q", env["SCION_WORKSPACE_GIT"], "true")
+				}
+			} else {
+				if _, present := env["SCION_WORKSPACE_GIT"]; present {
+					t.Errorf("SCION_WORKSPACE_GIT: expected absent (false), but got %q", env["SCION_WORKSPACE_GIT"])
+				}
+			}
+		})
+	}
+}
+
+// TestHTTPAgentDispatcher_DispatchAgentRestart_InjectsWorkspaceMode verifies that
+// DispatchAgentRestart injects SCION_WORKSPACE_MODE and SCION_WORKSPACE_GIT into
+// resolvedEnv, following the same semantics as DispatchAgentStart. Uses a table
+// matching the DispatchAgentStart test cases so coverage is symmetric.
+func TestHTTPAgentDispatcher_DispatchAgentRestart_InjectsWorkspaceMode(t *testing.T) {
+	ctx := context.Background()
+
+	type testCase struct {
+		name               string
+		workspaceModeLabel string
+		gitRemote          string
+		appliedGitClone    *api.GitCloneConfig
+		wantMode           string
+		wantGit            bool
+	}
+
+	cases := []testCase{
+		{
+			name:               "shared-plain no git",
+			workspaceModeLabel: store.WorkspaceModeShared,
+			wantMode:           "shared-plain",
+			wantGit:            false,
+		},
+		{
+			name:               "shared-plain with git clone in applied config",
+			workspaceModeLabel: store.WorkspaceModeShared,
+			gitRemote:          "https://github.com/example/repo.git",
+			appliedGitClone:    &api.GitCloneConfig{URL: "https://github.com/example/repo.git"},
+			wantMode:           "shared-plain",
+			wantGit:            true,
+		},
+		{
+			name:               "clone-per-agent",
+			workspaceModeLabel: store.WorkspaceModePerAgent,
+			gitRemote:          "https://github.com/example/repo.git",
+			wantMode:           "clone-per-agent",
+			wantGit:            true,
+		},
+		{
+			name:               "worktree-per-agent",
+			workspaceModeLabel: store.WorkspaceModeWorktreePerAgent,
+			gitRemote:          "https://github.com/example/repo.git",
+			wantMode:           "worktree-per-agent",
+			wantGit:            true,
+		},
+		{
+			// When no workspace mode label is set, the hub does not inject
+			// SCION_WORKSPACE_MODE. The broker applies the shared-plain default.
+			name:               "empty label: hub does not inject mode",
+			workspaceModeLabel: "",
+			wantMode:           "",
+			wantGit:            false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			memStore := createTestStore(t)
+
+			labels := map[string]string{}
+			if tc.workspaceModeLabel != "" {
+				labels[store.LabelWorkspaceMode] = tc.workspaceModeLabel
+			}
+			project := &store.Project{
+				ID:        tid("proj-rwm-" + tc.name),
+				Name:      "restart-wm-test",
+				Slug:      "restart-wm-test",
+				GitRemote: tc.gitRemote,
+				Labels:    labels,
+			}
+			if err := memStore.CreateProject(ctx, project); err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			broker := &store.RuntimeBroker{
+				ID:       tid("broker-rwm-" + tc.name),
+				Name:     "test-broker",
+				Slug:     "test-broker",
+				Endpoint: "http://localhost:9800",
+				Status:   store.BrokerStatusOnline,
+			}
+			if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+				t.Fatalf("failed to create runtime broker: %v", err)
+			}
+
+			mockClient := &mockRuntimeBrokerClient{}
+			dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+			agent := &store.Agent{
+				ID:              tid("agent-rwm-" + tc.name),
+				Name:            "test-agent",
+				Slug:            "test-agent",
+				ProjectID:       project.ID,
+				RuntimeBrokerID: broker.ID,
+				AppliedConfig: &store.AgentAppliedConfig{
+					GitClone: tc.appliedGitClone,
+				},
+			}
+
+			if err := dispatcher.DispatchAgentRestart(ctx, agent); err != nil {
+				t.Fatalf("DispatchAgentRestart failed: %v", err)
+			}
+
+			env := mockClient.lastRestartResolvedEnv
+			if got := env["SCION_WORKSPACE_MODE"]; got != tc.wantMode {
+				t.Errorf("SCION_WORKSPACE_MODE: got %q, want %q", got, tc.wantMode)
+			}
+			if tc.wantGit {
+				if env["SCION_WORKSPACE_GIT"] != "true" {
+					t.Errorf("SCION_WORKSPACE_GIT: got %q, want %q", env["SCION_WORKSPACE_GIT"], "true")
+				}
+			} else {
+				if _, present := env["SCION_WORKSPACE_GIT"]; present {
+					t.Errorf("SCION_WORKSPACE_GIT: expected absent (false), but got %q", env["SCION_WORKSPACE_GIT"])
+				}
+			}
+		})
+	}
+}
+
+// TestInjectThinkingLevelEnv covers the hub-side SCION_THINKING_LEVEL
+// injector (Gap 1A). The injector is the only channel that carries a
+// project-annotation thinking level to the harness: the annotation lands in
+// AppliedConfig.ThinkingLevel but has no wire field, and pkg/agent/run.go
+// reads the value from the environment.
+func TestInjectThinkingLevelEnv(t *testing.T) {
+	level := func(i int) *int { return &i }
+
+	tests := []struct {
+		name string
+		env  map[string]string
+		cfg  *store.AgentAppliedConfig
+		want map[string]string
+	}{
+		{
+			name: "set from applied config",
+			env:  map[string]string{},
+			cfg:  &store.AgentAppliedConfig{ThinkingLevel: level(7)},
+			want: map[string]string{"SCION_THINKING_LEVEL": "7"},
+		},
+		{
+			name: "zero is a real value, not unset",
+			env:  map[string]string{},
+			cfg:  &store.AgentAppliedConfig{ThinkingLevel: level(0)},
+			want: map[string]string{"SCION_THINKING_LEVEL": "0"},
+		},
+		{
+			name: "nil config is a no-op",
+			env:  map[string]string{},
+			cfg:  nil,
+			want: map[string]string{},
+		},
+		{
+			name: "nil thinking level is a no-op",
+			env:  map[string]string{},
+			cfg:  &store.AgentAppliedConfig{},
+			want: map[string]string{},
+		},
+		{
+			// An explicit env entry outranks the applied config, matching
+			// injectModelEnv and the guard in pkg/agent/run.go.
+			name: "already present in env is not overwritten",
+			env:  map[string]string{"SCION_THINKING_LEVEL": "3"},
+			cfg:  &store.AgentAppliedConfig{ThinkingLevel: level(7)},
+			want: map[string]string{"SCION_THINKING_LEVEL": "3"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			injectThinkingLevelEnv(tt.env, tt.cfg)
+
+			if len(tt.env) != len(tt.want) {
+				t.Fatalf("env = %v, want %v", tt.env, tt.want)
+			}
+			for k, want := range tt.want {
+				if got := tt.env[k]; got != want {
+					t.Errorf("env[%q] = %q, want %q", k, got, want)
+				}
+			}
+		})
+	}
+}
+
+// setupFinalizeEnvTest creates a broker, project, project provider and agent
+// ready for DispatchFinalizeEnv tests.
+func setupFinalizeEnvTest(t *testing.T, ctx context.Context, memStore store.Store, asNeededVars []store.EnvVar) *store.Agent {
+	t.Helper()
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-finalize"),
+		Name:     "finalize-broker",
+		Slug:     "finalize-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	project := &store.Project{
+		ID:   tid("project-finalize"),
+		Name: "finalize-project",
+		Slug: "finalize-project",
+	}
+	if err := memStore.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	provider := &store.ProjectProvider{
+		ProjectID:  tid("project-finalize"),
+		BrokerID:   tid("broker-finalize"),
+		BrokerName: "finalize-broker",
+		LocalPath:  "/home/user/project/.scion",
+		Status:     store.BrokerStatusOnline,
+	}
+	if err := memStore.AddProjectProvider(ctx, provider); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	for i, v := range asNeededVars {
+		v.Scope = "project"
+		v.ScopeID = tid("project-finalize")
+		v.InjectionMode = store.InjectionModeAsNeeded
+		if v.ID == "" {
+			v.ID = tid("ev-finalize-" + string(rune('0'+i)))
+		}
+		asNeededVars[i] = v
+		if err := memStore.CreateEnvVar(ctx, &asNeededVars[i]); err != nil {
+			t.Fatalf("failed to create env var %q: %v", v.Key, err)
+		}
+	}
+
+	return &store.Agent{
+		ID:              tid("agent-finalize"),
+		Name:            "finalize-agent",
+		Slug:            "finalize-agent",
+		ProjectID:       tid("project-finalize"),
+		OwnerID:         "owner-1",
+		RuntimeBrokerID: tid("broker-finalize"),
+		AppliedConfig:   &store.AgentAppliedConfig{},
+	}
+}
+
+func TestDispatchFinalizeEnv_PartialAutoResolve(t *testing.T) {
+	// Scenario: broker needs two keys (DB_HOST, API_KEY). The CLI provides
+	// DB_HOST, but API_KEY is available as an as_needed env var. After the
+	// first create call reports API_KEY still needed, the second-pass
+	// resolution should satisfy it without returning ErrEnvStillMissing.
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	agent := setupFinalizeEnvTest(t, ctx, memStore, []store.EnvVar{
+		{Key: "API_KEY", Value: "auto-resolved-key"},
+	})
+
+	callCount := 0
+	mockClient := &mockRuntimeBrokerClient{
+		createWithGatherFunc: func(_ context.Context, _, _ string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error) {
+			callCount++
+			if callCount == 1 {
+				// First call: broker says API_KEY is still needed
+				return nil, &RemoteEnvRequirementsResponse{
+					AgentID: req.ID,
+					Needs:   []string{"API_KEY"},
+				}, nil
+			}
+			// Second call: all resolved — check API_KEY was merged
+			if v, ok := req.ResolvedEnv["API_KEY"]; !ok || v != "auto-resolved-key" {
+				t.Errorf("second call: expected API_KEY='auto-resolved-key', got %q (ok=%v)", v, ok)
+			}
+			if v, ok := req.ResolvedEnv["DB_HOST"]; !ok || v != "cli-provided-host" {
+				t.Errorf("second call: expected DB_HOST='cli-provided-host', got %q (ok=%v)", v, ok)
+			}
+			return &RemoteAgentResponse{
+				Agent: &RemoteAgentInfo{
+					ID:    req.ID,
+					Slug:  req.Slug,
+					Name:  req.Name,
+					Phase: string(state.PhaseRunning),
+				},
+				Created: true,
+			}, nil, nil
+		},
+	}
+
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	err := dispatcher.DispatchFinalizeEnv(ctx, agent, map[string]string{
+		"DB_HOST": "cli-provided-host",
+	})
+	if err != nil {
+		t.Fatalf("DispatchFinalizeEnv returned unexpected error: %v", err)
+	}
+
+	if callCount != 2 {
+		t.Errorf("expected 2 CreateAgentWithGather calls, got %d", callCount)
+	}
+}
+
+func TestDispatchFinalizeEnv_FullAutoResolveInFinalize(t *testing.T) {
+	// Scenario: after merging CLI-provided env, the broker still needs two
+	// keys (SECRET_A, SECRET_B) — but both are available as as_needed env
+	// vars. The second pass resolves them all; no ErrEnvStillMissing.
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	agent := setupFinalizeEnvTest(t, ctx, memStore, []store.EnvVar{
+		{Key: "SECRET_A", Value: "val-a"},
+		{Key: "SECRET_B", Value: "val-b"},
+	})
+
+	callCount := 0
+	mockClient := &mockRuntimeBrokerClient{
+		createWithGatherFunc: func(_ context.Context, _, _ string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return nil, &RemoteEnvRequirementsResponse{
+					AgentID: req.ID,
+					Needs:   []string{"SECRET_A", "SECRET_B"},
+				}, nil
+			}
+			// Verify both keys were merged
+			for _, k := range []string{"SECRET_A", "SECRET_B"} {
+				if _, ok := req.ResolvedEnv[k]; !ok {
+					t.Errorf("second call: expected %s in ResolvedEnv", k)
+				}
+			}
+			return &RemoteAgentResponse{
+				Agent: &RemoteAgentInfo{
+					ID:    req.ID,
+					Slug:  req.Slug,
+					Name:  req.Name,
+					Phase: string(state.PhaseRunning),
+				},
+				Created: true,
+			}, nil, nil
+		},
+	}
+
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	err := dispatcher.DispatchFinalizeEnv(ctx, agent, map[string]string{
+		"CLI_VAR": "cli-value",
+	})
+	if err != nil {
+		t.Fatalf("DispatchFinalizeEnv returned unexpected error: %v", err)
+	}
+
+	if callCount != 2 {
+		t.Errorf("expected 2 CreateAgentWithGather calls, got %d", callCount)
+	}
+}
+
+func TestDispatchFinalizeEnv_NoAsNeededMatches(t *testing.T) {
+	// Scenario: broker still needs keys after CLI env merge, but no as_needed
+	// entries match. Behavior is unchanged — ErrEnvStillMissing is returned.
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	// No as_needed vars
+	agent := setupFinalizeEnvTest(t, ctx, memStore, nil)
+
+	callCount := 0
+	mockClient := &mockRuntimeBrokerClient{
+		createWithGatherFunc: func(_ context.Context, _, _ string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error) {
+			callCount++
+			return nil, &RemoteEnvRequirementsResponse{
+				AgentID: req.ID,
+				Needs:   []string{"MISSING_VAR"},
+			}, nil
+		},
+	}
+
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	err := dispatcher.DispatchFinalizeEnv(ctx, agent, map[string]string{
+		"SOME_VAR": "some-value",
+	})
+
+	var stillMissing *ErrEnvStillMissing
+	if !errors.As(err, &stillMissing) {
+		t.Fatalf("expected ErrEnvStillMissing, got: %v", err)
+	}
+
+	if len(stillMissing.Requirements.Needs) != 1 || stillMissing.Requirements.Needs[0] != "MISSING_VAR" {
+		t.Errorf("expected Needs=[MISSING_VAR], got %v", stillMissing.Requirements.Needs)
+	}
+
+	// Should only have called once — no second pass since no as_needed matched
+	if callCount != 1 {
+		t.Errorf("expected 1 CreateAgentWithGather call, got %d", callCount)
+	}
+}
+
+// TestDispatchAgentStart_IncludesHubName verifies that when hubName is set on
+// the dispatcher, SCION_HUB_NAME is injected into resolvedEnv for DispatchAgentStart.
+func TestDispatchAgentStart_IncludesHubName(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hubname-start"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetHubName("my-test-hub")
+
+	agent := &store.Agent{
+		ID:              tid("agent-hubname-start"),
+		Name:            "hubname-start-agent",
+		Slug:            "hubname-start-agent",
+		ProjectID:       tid("project-hubname-start"),
+		OwnerID:         tid("user-hubname-start"),
+		RuntimeBrokerID: tid("broker-hubname-start"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+		},
+	}
+
+	err := dispatcher.DispatchAgentStart(ctx, agent, "", false)
+	if err != nil {
+		t.Fatalf("DispatchAgentStart failed: %v", err)
+	}
+
+	if !mockClient.startCalled {
+		t.Fatal("expected StartAgent to be called")
+	}
+
+	if mockClient.lastResolvedEnv == nil {
+		t.Fatal("expected resolvedEnv to be non-nil")
+	}
+
+	if got, ok := mockClient.lastResolvedEnv["SCION_HUB_NAME"]; !ok {
+		t.Error("SCION_HUB_NAME missing from resolvedEnv — hubName not injected on start path")
+	} else if got != "my-test-hub" {
+		t.Errorf("SCION_HUB_NAME = %q, want %q", got, "my-test-hub")
+	}
+}
+
+// TestDispatchAgentStart_OmitsHubNameWhenEmpty verifies that when hubName is
+// NOT set on the dispatcher, SCION_HUB_NAME is absent from resolvedEnv.
+func TestDispatchAgentStart_OmitsHubNameWhenEmpty(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hubname-empty"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	// No SetHubName call — hubName stays empty.
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+
+	agent := &store.Agent{
+		ID:              tid("agent-hubname-empty"),
+		Name:            "hubname-empty-agent",
+		Slug:            "hubname-empty-agent",
+		ProjectID:       tid("project-hubname-empty"),
+		OwnerID:         tid("user-hubname-empty"),
+		RuntimeBrokerID: tid("broker-hubname-empty"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+		},
+	}
+
+	err := dispatcher.DispatchAgentStart(ctx, agent, "", false)
+	if err != nil {
+		t.Fatalf("DispatchAgentStart failed: %v", err)
+	}
+
+	if !mockClient.startCalled {
+		t.Fatal("expected StartAgent to be called")
+	}
+
+	if _, ok := mockClient.lastResolvedEnv["SCION_HUB_NAME"]; ok {
+		t.Error("SCION_HUB_NAME should not be present when hubName is empty")
+	}
+}
+
+// TestDispatchAgentRestart_IncludesHubName verifies that SCION_HUB_NAME is
+// injected into resolvedEnv on the restart path when hubName is set.
+func TestDispatchAgentRestart_IncludesHubName(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hubname-restart"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetHubName("restart-hub")
+
+	agent := &store.Agent{
+		ID:              tid("agent-hubname-restart"),
+		Name:            "hubname-restart-agent",
+		Slug:            "hubname-restart-agent",
+		ProjectID:       tid("project-hubname-restart"),
+		OwnerID:         tid("user-hubname-restart"),
+		RuntimeBrokerID: tid("broker-hubname-restart"),
+		AppliedConfig:   &store.AgentAppliedConfig{},
+	}
+
+	err := dispatcher.DispatchAgentRestart(ctx, agent)
+	if err != nil {
+		t.Fatalf("DispatchAgentRestart failed: %v", err)
+	}
+
+	if !mockClient.restartCalled {
+		t.Fatal("expected RestartAgent to be called")
+	}
+
+	env := mockClient.lastRestartResolvedEnv
+	if got, ok := env["SCION_HUB_NAME"]; !ok {
+		t.Error("SCION_HUB_NAME missing from restart resolvedEnv — hubName not injected on restart path")
+	} else if got != "restart-hub" {
+		t.Errorf("SCION_HUB_NAME = %q, want %q", got, "restart-hub")
+	}
+}
+
+// TestDispatchAgentCreate_IncludesHubName verifies that SCION_HUB_NAME is
+// injected into the create request's resolvedEnv when hubName is set.
+func TestDispatchAgentCreate_IncludesHubName(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	broker := &store.RuntimeBroker{
+		ID:       tid("broker-hubname-create"),
+		Name:     "test-broker",
+		Slug:     "test-broker",
+		Endpoint: "http://localhost:9800",
+		Status:   store.BrokerStatusOnline,
+	}
+	if err := memStore.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create runtime broker: %v", err)
+	}
+
+	mockClient := &mockRuntimeBrokerClient{}
+	dispatcher := NewHTTPAgentDispatcherWithClient(memStore, mockClient, false, slog.Default())
+	dispatcher.SetHubName("create-hub")
+
+	agent := &store.Agent{
+		ID:              tid("agent-hubname-create"),
+		Name:            "hubname-create-agent",
+		Slug:            "hubname-create-agent",
+		ProjectID:       tid("project-hubname-create"),
+		OwnerID:         tid("user-hubname-create"),
+		RuntimeBrokerID: tid("broker-hubname-create"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			HarnessConfig: "claude",
+			Task:          "test task",
+		},
+	}
+
+	err := dispatcher.DispatchAgentCreate(ctx, agent)
+	if err != nil {
+		t.Fatalf("DispatchAgentCreate failed: %v", err)
+	}
+
+	if !mockClient.createCalled {
+		t.Fatal("expected CreateAgent to be called")
+	}
+
+	env := mockClient.lastCreateReq.ResolvedEnv
+	if got, ok := env["SCION_HUB_NAME"]; !ok {
+		t.Error("SCION_HUB_NAME missing from create request resolvedEnv — hubName not injected on create path")
+	} else if got != "create-hub" {
+		t.Errorf("SCION_HUB_NAME = %q, want %q", got, "create-hub")
 	}
 }

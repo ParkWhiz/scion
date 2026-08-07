@@ -7,6 +7,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/accesspolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsessionmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/allowlistentry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/apikey"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerdispatch"
@@ -15,6 +16,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubresolutioncache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/group"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/groupmembership"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/harnessconfig"
@@ -32,6 +34,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectcontributor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectprestarthook"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectsyncstate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schedule"
@@ -39,6 +42,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schema"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skill"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillinjection"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillregistry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillversion"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/subscriptiontemplate"
@@ -58,6 +62,10 @@ func init() {
 	accesspolicyDescName := accesspolicyFields[1].Descriptor()
 	// accesspolicy.NameValidator is a validator for the "name" field. It is called by the builders before save.
 	accesspolicy.NameValidator = accesspolicyDescName.Validators[0].(func(string) error)
+	// accesspolicyDescScopeID is the schema descriptor for scope_id field.
+	accesspolicyDescScopeID := accesspolicyFields[4].Descriptor()
+	// accesspolicy.DefaultScopeID holds the default value on creation for the scope_id field.
+	accesspolicy.DefaultScopeID = accesspolicyDescScopeID.Default.(string)
 	// accesspolicyDescResourceType is the schema descriptor for resource_type field.
 	accesspolicyDescResourceType := accesspolicyFields[5].Descriptor()
 	// accesspolicy.ResourceTypeValidator is a validator for the "resource_type" field. It is called by the builders before save.
@@ -115,23 +123,65 @@ func init() {
 	// agent.DefaultWebPtyEnabled holds the default value on creation for the web_pty_enabled field.
 	agent.DefaultWebPtyEnabled = agentDescWebPtyEnabled.Default.(bool)
 	// agentDescCreated is the schema descriptor for created field.
-	agentDescCreated := agentFields[30].Descriptor()
+	agentDescCreated := agentFields[31].Descriptor()
 	// agent.DefaultCreated holds the default value on creation for the created field.
 	agent.DefaultCreated = agentDescCreated.Default.(func() time.Time)
 	// agentDescUpdated is the schema descriptor for updated field.
-	agentDescUpdated := agentFields[31].Descriptor()
+	agentDescUpdated := agentFields[32].Descriptor()
 	// agent.DefaultUpdated holds the default value on creation for the updated field.
 	agent.DefaultUpdated = agentDescUpdated.Default.(func() time.Time)
 	// agent.UpdateDefaultUpdated holds the default value on update for the updated field.
 	agent.UpdateDefaultUpdated = agentDescUpdated.UpdateDefault.(func() time.Time)
 	// agentDescStateVersion is the schema descriptor for state_version field.
-	agentDescStateVersion := agentFields[36].Descriptor()
+	agentDescStateVersion := agentFields[37].Descriptor()
 	// agent.DefaultStateVersion holds the default value on creation for the state_version field.
 	agent.DefaultStateVersion = agentDescStateVersion.Default.(int64)
 	// agentDescID is the schema descriptor for id field.
 	agentDescID := agentFields[0].Descriptor()
 	// agent.DefaultID holds the default value on creation for the id field.
 	agent.DefaultID = agentDescID.Default.(func() uuid.UUID)
+	agentsessionmetricsFields := schema.AgentSessionMetrics{}.Fields()
+	_ = agentsessionmetricsFields
+	// agentsessionmetricsDescAgentID is the schema descriptor for agent_id field.
+	agentsessionmetricsDescAgentID := agentsessionmetricsFields[1].Descriptor()
+	// agentsessionmetrics.AgentIDValidator is a validator for the "agent_id" field. It is called by the builders before save.
+	agentsessionmetrics.AgentIDValidator = agentsessionmetricsDescAgentID.Validators[0].(func(string) error)
+	// agentsessionmetricsDescGroveID is the schema descriptor for grove_id field.
+	agentsessionmetricsDescGroveID := agentsessionmetricsFields[2].Descriptor()
+	// agentsessionmetrics.GroveIDValidator is a validator for the "grove_id" field. It is called by the builders before save.
+	agentsessionmetrics.GroveIDValidator = agentsessionmetricsDescGroveID.Validators[0].(func(string) error)
+	// agentsessionmetricsDescSessionID is the schema descriptor for session_id field.
+	agentsessionmetricsDescSessionID := agentsessionmetricsFields[3].Descriptor()
+	// agentsessionmetrics.SessionIDValidator is a validator for the "session_id" field. It is called by the builders before save.
+	agentsessionmetrics.SessionIDValidator = agentsessionmetricsDescSessionID.Validators[0].(func(string) error)
+	// agentsessionmetricsDescTurnCount is the schema descriptor for turn_count field.
+	agentsessionmetricsDescTurnCount := agentsessionmetricsFields[7].Descriptor()
+	// agentsessionmetrics.DefaultTurnCount holds the default value on creation for the turn_count field.
+	agentsessionmetrics.DefaultTurnCount = agentsessionmetricsDescTurnCount.Default.(int)
+	// agentsessionmetricsDescTokensInput is the schema descriptor for tokens_input field.
+	agentsessionmetricsDescTokensInput := agentsessionmetricsFields[9].Descriptor()
+	// agentsessionmetrics.DefaultTokensInput holds the default value on creation for the tokens_input field.
+	agentsessionmetrics.DefaultTokensInput = agentsessionmetricsDescTokensInput.Default.(int64)
+	// agentsessionmetricsDescTokensOutput is the schema descriptor for tokens_output field.
+	agentsessionmetricsDescTokensOutput := agentsessionmetricsFields[10].Descriptor()
+	// agentsessionmetrics.DefaultTokensOutput holds the default value on creation for the tokens_output field.
+	agentsessionmetrics.DefaultTokensOutput = agentsessionmetricsDescTokensOutput.Default.(int64)
+	// agentsessionmetricsDescTokensCached is the schema descriptor for tokens_cached field.
+	agentsessionmetricsDescTokensCached := agentsessionmetricsFields[11].Descriptor()
+	// agentsessionmetrics.DefaultTokensCached holds the default value on creation for the tokens_cached field.
+	agentsessionmetrics.DefaultTokensCached = agentsessionmetricsDescTokensCached.Default.(int64)
+	// agentsessionmetricsDescTokensReasoning is the schema descriptor for tokens_reasoning field.
+	agentsessionmetricsDescTokensReasoning := agentsessionmetricsFields[12].Descriptor()
+	// agentsessionmetrics.DefaultTokensReasoning holds the default value on creation for the tokens_reasoning field.
+	agentsessionmetrics.DefaultTokensReasoning = agentsessionmetricsDescTokensReasoning.Default.(int64)
+	// agentsessionmetricsDescCreatedAt is the schema descriptor for created_at field.
+	agentsessionmetricsDescCreatedAt := agentsessionmetricsFields[15].Descriptor()
+	// agentsessionmetrics.DefaultCreatedAt holds the default value on creation for the created_at field.
+	agentsessionmetrics.DefaultCreatedAt = agentsessionmetricsDescCreatedAt.Default.(func() time.Time)
+	// agentsessionmetricsDescID is the schema descriptor for id field.
+	agentsessionmetricsDescID := agentsessionmetricsFields[0].Descriptor()
+	// agentsessionmetrics.DefaultID holds the default value on creation for the id field.
+	agentsessionmetrics.DefaultID = agentsessionmetricsDescID.Default.(func() uuid.UUID)
 	allowlistentryFields := schema.AllowListEntry{}.Fields()
 	_ = allowlistentryFields
 	// allowlistentryDescEmail is the schema descriptor for email field.
@@ -314,6 +364,36 @@ func init() {
 	gcpserviceaccountDescID := gcpserviceaccountFields[0].Descriptor()
 	// gcpserviceaccount.DefaultID holds the default value on creation for the id field.
 	gcpserviceaccount.DefaultID = gcpserviceaccountDescID.Default.(func() uuid.UUID)
+	githubresolutioncacheFields := schema.GitHubResolutionCache{}.Fields()
+	_ = githubresolutioncacheFields
+	// githubresolutioncacheDescCacheKey is the schema descriptor for cache_key field.
+	githubresolutioncacheDescCacheKey := githubresolutioncacheFields[1].Descriptor()
+	// githubresolutioncache.CacheKeyValidator is a validator for the "cache_key" field. It is called by the builders before save.
+	githubresolutioncache.CacheKeyValidator = githubresolutioncacheDescCacheKey.Validators[0].(func(string) error)
+	// githubresolutioncacheDescOriginalURI is the schema descriptor for original_uri field.
+	githubresolutioncacheDescOriginalURI := githubresolutioncacheFields[2].Descriptor()
+	// githubresolutioncache.OriginalURIValidator is a validator for the "original_uri" field. It is called by the builders before save.
+	githubresolutioncache.OriginalURIValidator = githubresolutioncacheDescOriginalURI.Validators[0].(func(string) error)
+	// githubresolutioncacheDescCommitSha is the schema descriptor for commit_sha field.
+	githubresolutioncacheDescCommitSha := githubresolutioncacheFields[3].Descriptor()
+	// githubresolutioncache.CommitShaValidator is a validator for the "commit_sha" field. It is called by the builders before save.
+	githubresolutioncache.CommitShaValidator = githubresolutioncacheDescCommitSha.Validators[0].(func(string) error)
+	// githubresolutioncacheDescBundleHash is the schema descriptor for bundle_hash field.
+	githubresolutioncacheDescBundleHash := githubresolutioncacheFields[5].Descriptor()
+	// githubresolutioncache.BundleHashValidator is a validator for the "bundle_hash" field. It is called by the builders before save.
+	githubresolutioncache.BundleHashValidator = githubresolutioncacheDescBundleHash.Validators[0].(func(string) error)
+	// githubresolutioncacheDescTokenScope is the schema descriptor for token_scope field.
+	githubresolutioncacheDescTokenScope := githubresolutioncacheFields[6].Descriptor()
+	// githubresolutioncache.DefaultTokenScope holds the default value on creation for the token_scope field.
+	githubresolutioncache.DefaultTokenScope = githubresolutioncacheDescTokenScope.Default.(string)
+	// githubresolutioncacheDescCreateTime is the schema descriptor for create_time field.
+	githubresolutioncacheDescCreateTime := githubresolutioncacheFields[8].Descriptor()
+	// githubresolutioncache.DefaultCreateTime holds the default value on creation for the create_time field.
+	githubresolutioncache.DefaultCreateTime = githubresolutioncacheDescCreateTime.Default.(func() time.Time)
+	// githubresolutioncacheDescID is the schema descriptor for id field.
+	githubresolutioncacheDescID := githubresolutioncacheFields[0].Descriptor()
+	// githubresolutioncache.DefaultID holds the default value on creation for the id field.
+	githubresolutioncache.DefaultID = githubresolutioncacheDescID.Default.(func() uuid.UUID)
 	githubinstallationFields := schema.GithubInstallation{}.Fields()
 	_ = githubinstallationFields
 	// githubinstallationDescAccountLogin is the schema descriptor for account_login field.
@@ -784,6 +864,38 @@ func init() {
 	projectcontributorDescID := projectcontributorFields[0].Descriptor()
 	// projectcontributor.DefaultID holds the default value on creation for the id field.
 	projectcontributor.DefaultID = projectcontributorDescID.Default.(func() uuid.UUID)
+	projectprestarthookFields := schema.ProjectPreStartHook{}.Fields()
+	_ = projectprestarthookFields
+	// projectprestarthookDescProjectID is the schema descriptor for project_id field.
+	projectprestarthookDescProjectID := projectprestarthookFields[2].Descriptor()
+	// projectprestarthook.DefaultProjectID holds the default value on creation for the project_id field.
+	projectprestarthook.DefaultProjectID = projectprestarthookDescProjectID.Default.(string)
+	// projectprestarthookDescName is the schema descriptor for name field.
+	projectprestarthookDescName := projectprestarthookFields[3].Descriptor()
+	// projectprestarthook.NameValidator is a validator for the "name" field. It is called by the builders before save.
+	projectprestarthook.NameValidator = projectprestarthookDescName.Validators[0].(func(string) error)
+	// projectprestarthookDescSlug is the schema descriptor for slug field.
+	projectprestarthookDescSlug := projectprestarthookFields[4].Descriptor()
+	// projectprestarthook.SlugValidator is a validator for the "slug" field. It is called by the builders before save.
+	projectprestarthook.SlugValidator = projectprestarthookDescSlug.Validators[0].(func(string) error)
+	// projectprestarthookDescScript is the schema descriptor for script field.
+	projectprestarthookDescScript := projectprestarthookFields[6].Descriptor()
+	// projectprestarthook.ScriptValidator is a validator for the "script" field. It is called by the builders before save.
+	projectprestarthook.ScriptValidator = projectprestarthookDescScript.Validators[0].(func(string) error)
+	// projectprestarthookDescCreated is the schema descriptor for created field.
+	projectprestarthookDescCreated := projectprestarthookFields[10].Descriptor()
+	// projectprestarthook.DefaultCreated holds the default value on creation for the created field.
+	projectprestarthook.DefaultCreated = projectprestarthookDescCreated.Default.(func() time.Time)
+	// projectprestarthookDescUpdated is the schema descriptor for updated field.
+	projectprestarthookDescUpdated := projectprestarthookFields[11].Descriptor()
+	// projectprestarthook.DefaultUpdated holds the default value on creation for the updated field.
+	projectprestarthook.DefaultUpdated = projectprestarthookDescUpdated.Default.(func() time.Time)
+	// projectprestarthook.UpdateDefaultUpdated holds the default value on update for the updated field.
+	projectprestarthook.UpdateDefaultUpdated = projectprestarthookDescUpdated.UpdateDefault.(func() time.Time)
+	// projectprestarthookDescID is the schema descriptor for id field.
+	projectprestarthookDescID := projectprestarthookFields[0].Descriptor()
+	// projectprestarthook.DefaultID holds the default value on creation for the id field.
+	projectprestarthook.DefaultID = projectprestarthookDescID.Default.(func() uuid.UUID)
 	projectsyncstateFields := schema.ProjectSyncState{}.Fields()
 	_ = projectsyncstateFields
 	// projectsyncstateDescBrokerID is the schema descriptor for broker_id field.
@@ -976,6 +1088,24 @@ func init() {
 	skillDescID := skillFields[0].Descriptor()
 	// skill.DefaultID holds the default value on creation for the id field.
 	skill.DefaultID = skillDescID.Default.(func() uuid.UUID)
+	skillinjectionFields := schema.SkillInjection{}.Fields()
+	_ = skillinjectionFields
+	// skillinjectionDescOptional is the schema descriptor for optional field.
+	skillinjectionDescOptional := skillinjectionFields[5].Descriptor()
+	// skillinjection.DefaultOptional holds the default value on creation for the optional field.
+	skillinjection.DefaultOptional = skillinjectionDescOptional.Default.(bool)
+	// skillinjectionDescSortOrder is the schema descriptor for sort_order field.
+	skillinjectionDescSortOrder := skillinjectionFields[6].Descriptor()
+	// skillinjection.DefaultSortOrder holds the default value on creation for the sort_order field.
+	skillinjection.DefaultSortOrder = skillinjectionDescSortOrder.Default.(int)
+	// skillinjectionDescCreatedAt is the schema descriptor for created_at field.
+	skillinjectionDescCreatedAt := skillinjectionFields[7].Descriptor()
+	// skillinjection.DefaultCreatedAt holds the default value on creation for the created_at field.
+	skillinjection.DefaultCreatedAt = skillinjectionDescCreatedAt.Default.(func() time.Time)
+	// skillinjectionDescID is the schema descriptor for id field.
+	skillinjectionDescID := skillinjectionFields[0].Descriptor()
+	// skillinjection.DefaultID holds the default value on creation for the id field.
+	skillinjection.DefaultID = skillinjectionDescID.Default.(func() uuid.UUID)
 	skillregistryFields := schema.SkillRegistry{}.Fields()
 	_ = skillregistryFields
 	// skillregistryDescName is the schema descriptor for name field.

@@ -42,6 +42,11 @@ import (
 // the lock_version token.
 const maxCASRetries = 5
 
+// maxProjectListLimit caps the maximum number of projects returned per
+// ListProjects call, preventing resource exhaustion from excessively large
+// limit values. Mirrors maxAgentListLimit in the agent store.
+const maxProjectListLimit = 1000
+
 // ProjectStore implements store.ProjectStore, store.RuntimeBrokerStore,
 // store.ProjectProviderStore and store.ProjectSyncStateStore using Ent ORM.
 //
@@ -421,6 +426,13 @@ func (s *ProjectStore) ListProjects(ctx context.Context, filter store.ProjectFil
 	if filter.Slug != "" {
 		query.Where(project.SlugEqualFold(filter.Slug))
 	}
+	if filter.IsTemplate != nil {
+		if *filter.IsTemplate {
+			query.Where(projectLabelContains(store.LabelTemplate, "true"))
+		} else {
+			query.Where(projectLabelNotContains(store.LabelTemplate, "true"))
+		}
+	}
 
 	totalCount, err := query.Clone().Count(ctx)
 	if err != nil {
@@ -429,7 +441,10 @@ func (s *ProjectStore) ListProjects(ctx context.Context, filter store.ProjectFil
 
 	limit := opts.Limit
 	if limit <= 0 {
-		limit = 50
+		limit = 500
+	}
+	if limit > maxProjectListLimit {
+		limit = maxProjectListLimit
 	}
 
 	if opts.Cursor != "" {

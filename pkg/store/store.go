@@ -125,6 +125,15 @@ type Store interface {
 
 	// HubSetting operations (Two-Tier Settings Architecture)
 	HubSettingStore
+
+	// SkillInjection operations (Injected-Skills List)
+	SkillInjectionStore
+
+	// ProjectPreStartHook operations (Project-Level Pre-Start Customization Scripts)
+	ProjectPreStartHookStore
+
+	// AgentSessionMetrics operations (Hub Metrics Reporting)
+	AgentSessionMetricsStore
 }
 
 // AgentStore defines agent-related persistence operations.
@@ -157,6 +166,9 @@ type AgentStore interface {
 	// UpdateAgentStatus updates only status-related fields.
 	// This is a partial update that doesn't require version checking.
 	UpdateAgentStatus(ctx context.Context, id string, status AgentStatusUpdate) error
+
+	// UpdateAgentExposedPorts updates only exposed port registrations.
+	UpdateAgentExposedPorts(ctx context.Context, id string, ports []ExposedPort) error
 
 	// PurgeDeletedAgents permanently removes soft-deleted agents older than cutoff.
 	// Returns the number of agents purged.
@@ -192,6 +204,11 @@ type AgentStore interface {
 	// active remote brokers are left untouched. Returns the number of projects
 	// updated.
 	ReassignProjectBroker(ctx context.Context, oldBrokerID, newBrokerID string) (int, error)
+
+	// AggregateAgentHealth returns lightweight health-oriented counts and lists
+	// for the health-summary endpoint without fetching full agent records.
+	// This avoids the O(N) deserialization cost of ListAgents on large installations.
+	AggregateAgentHealth(ctx context.Context) (*AgentHealthAggregate, error)
 }
 
 // AgentFilter defines criteria for filtering agents.
@@ -224,6 +241,27 @@ type AgentFilter struct {
 	// Labels, when non-empty, restricts results to agents whose labels
 	// contain all specified key-value pairs (AND semantics).
 	Labels map[string]string
+}
+
+// AgentHealthAggregate holds pre-computed counts and short lists used by the
+// health-summary endpoint. It avoids loading full agent records.
+type AgentHealthAggregate struct {
+	Total   int            // Total number of non-deleted agents
+	ByPhase map[string]int // Count per lifecycle phase
+
+	// Per-broker counts: map[brokerID] → {count, healthy}
+	ByBroker map[string]AgentBrokerCounts
+
+	// Names of agents in unhealthy states (capped at 100 per list).
+	StalledNames []string
+	CrashedNames []string
+	ErroredNames []string
+}
+
+// AgentBrokerCounts holds per-broker agent tallies.
+type AgentBrokerCounts struct {
+	Count   int
+	Healthy int
 }
 
 // AgentStatusUpdate contains fields for status-only updates.
@@ -312,6 +350,11 @@ type ProjectFilter struct {
 	// this value. Used with MemberProjectIDs to return "shared" projects (member
 	// but not owner).
 	ExcludeOwnerID string
+
+	// IsTemplate, when non-nil, restricts results to template projects
+	// (true) or non-template projects (false). Template projects carry the
+	// scion.io/template: "true" label.
+	IsTemplate *bool
 }
 
 // RuntimeBrokerStore defines runtime broker persistence operations.
@@ -557,6 +600,11 @@ type UserStore interface {
 
 	// ListUsers returns users matching the filter criteria.
 	ListUsers(ctx context.Context, filter UserFilter, opts ListOptions) (*ListResult[User], error)
+
+	// IsUserInvitedOrActive returns true if a User record exists with the
+	// given email and status in ("invited", "active"). Used by the
+	// invite_only authorization gate as a replacement for IsEmailAllowListed.
+	IsUserInvitedOrActive(ctx context.Context, email string) (bool, error)
 }
 
 // UserFilter defines criteria for filtering users.
@@ -988,6 +1036,9 @@ type NotificationStore interface {
 	AcknowledgeAllNotifications(ctx context.Context, subscriberType, subscriberID string) error
 
 	// MarkNotificationDispatched marks a notification as dispatched.
+	// Call this only after delivery was at least attempted (success or failure).
+	// Do NOT call it when delivery was skipped entirely (e.g. no broker, no
+	// dispatcher) — that would silently lose the notification.
 	// Returns ErrNotFound if the notification doesn't exist.
 	MarkNotificationDispatched(ctx context.Context, id string) error
 
@@ -1346,6 +1397,46 @@ type SkillRegistryStore interface {
 // Hub Settings (Two-Tier Settings Architecture)
 // =============================================================================
 
+// =============================================================================
+// Skill Injections (Injected-Skills List)
+// =============================================================================
+
+// SkillInjectionStore defines persistence operations for the injected-skills
+// list scoped to a project or user.
+type SkillInjectionStore interface {
+	// ListSkillInjections returns all skill injections for the given scope+scopeID,
+	// ordered by sort_order ascending.
+	ListSkillInjections(ctx context.Context, scope, scopeID string) ([]SkillInjection, error)
+
+	// AddSkillInjection creates a new skill injection entry.
+	// If si.ID is empty, an ID is auto-generated and written back to si.ID on
+	// success. Callers that need a stable ID before the call can pre-populate
+	// si.ID with any valid UUID string.
+	// Returns ErrAlreadyExists if an entry with the same (scope, scope_id, skill_uri) already exists.
+	AddSkillInjection(ctx context.Context, si *SkillInjection) error
+
+	// UpdateSkillInjection updates the mutable fields of a skill injection entry.
+	// Returns ErrNotFound if the entry with the given ID does not exist.
+	UpdateSkillInjection(ctx context.Context, si *SkillInjection) error
+
+	// RemoveSkillInjection deletes a skill injection entry by ID.
+	// Returns ErrNotFound if the entry doesn't exist.
+	RemoveSkillInjection(ctx context.Context, id string) error
+
+	// SetSkillInjections atomically replaces the full list for a scope+scopeID.
+	// All existing entries for (scope, scopeID) are deleted and the new entries
+	// are inserted in a single transaction. SortOrder is taken from each entry;
+	// callers should set it before calling (handlers default to request position).
+	// Phase 3 note: provisioner integration will call this with []SkillInjection
+	// constructed from the merged hub+project+user lists.
+	SetSkillInjections(ctx context.Context, scope, scopeID string, entries []SkillInjection, createdBy string) error
+
+	// DeleteSkillInjectionsByScope removes all skill injection entries for the
+	// given scope+scopeID. Used during project or user deletion to cascade-clean
+	// rows that have no FK cascade. Returns the number of rows deleted.
+	DeleteSkillInjectionsByScope(ctx context.Context, scope, scopeID string) (int, error)
+}
+
 // HubSettingStore defines persistence operations for operational hub settings.
 // Each setting is a section (e.g. "access", "telemetry") with a JSON value.
 type HubSettingStore interface {
@@ -1372,4 +1463,36 @@ type HubSettingStore interface {
 	// the origin field. Rows with updated_by="seed" get origin="seeded";
 	// all other non-_meta rows get origin="managed". Idempotent.
 	BackfillOrigin(ctx context.Context) error
+}
+
+// =============================================================================
+// Agent Session Metrics (Hub Metrics Reporting)
+// =============================================================================
+
+// AgentSessionMetricsStore defines operations for agent session metrics.
+type AgentSessionMetricsStore interface {
+	// CreateAgentSessionMetrics creates a new session metrics record.
+	CreateAgentSessionMetrics(ctx context.Context, m *AgentSessionMetrics) error
+
+	// GetAgentSessionMetrics retrieves a session metrics record by ID.
+	// Returns ErrNotFound if the record doesn't exist.
+	GetAgentSessionMetrics(ctx context.Context, id string) (*AgentSessionMetrics, error)
+
+	// ListAgentSessionMetricsByAgent returns all session metrics for an agent,
+	// ordered by started_at DESC.
+	ListAgentSessionMetricsByAgent(ctx context.Context, agentID string) ([]*AgentSessionMetrics, error)
+
+	// ListAgentSessionMetricsByProject returns all session metrics for a project,
+	// ordered by started_at DESC.
+	ListAgentSessionMetricsByProject(ctx context.Context, projectID string) ([]*AgentSessionMetrics, error)
+
+	// AggregateByAgent returns SQL-level aggregate totals for an agent's sessions.
+	AggregateByAgent(ctx context.Context, agentID string) (*AgentSessionMetricsAggregates, error)
+
+	// AggregateByProject returns SQL-level aggregate totals for a project's sessions.
+	AggregateByProject(ctx context.Context, projectID string) (*AgentSessionMetricsAggregates, error)
+
+	// CountDistinctAgentsByProject returns the number of distinct agents with
+	// session metrics in a project.
+	CountDistinctAgentsByProject(ctx context.Context, projectID string) (int, error)
 }

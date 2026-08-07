@@ -17,14 +17,15 @@
 /**
  * View Toggle Component
  *
- * A compact two-button toggle for switching between grid (card) and list (table) views.
- * Persists the selected view in localStorage and dispatches a `view-change` CustomEvent.
+ * A compact toggle for switching between grid (card), list (table), and graph
+ * (inline tree) views. Persists the selected view in localStorage and
+ * dispatches a `view-change` CustomEvent.
  */
 
-import { LitElement, html, css } from 'lit';
+import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 
-export type ViewMode = 'grid' | 'list';
+export type ViewMode = 'grid' | 'list' | 'graph';
 
 @customElement('scion-view-toggle')
 export class ScionViewToggle extends LitElement {
@@ -40,6 +41,13 @@ export class ScionViewToggle extends LitElement {
   @property({ type: String })
   storageKey = '';
 
+  /**
+   * Whether to show the graph-view segment. Set to false on pages
+   * that have no graph representation (e.g. the projects list).
+   */
+  @property({ type: Boolean })
+  showGraph = true;
+
   static override styles = css`
     :host {
       display: inline-flex;
@@ -52,7 +60,8 @@ export class ScionViewToggle extends LitElement {
       overflow: hidden;
     }
 
-    button {
+    button,
+    a {
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -63,23 +72,28 @@ export class ScionViewToggle extends LitElement {
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
       padding: 0;
+      text-decoration: none;
       transition: all 150ms ease;
     }
 
-    button:first-child {
+    button:not(:last-child),
+    a:not(:last-child) {
       border-right: 1px solid var(--scion-border, #e2e8f0);
     }
 
-    button:hover:not(.active) {
+    button:hover:not(.active),
+    a:hover:not(.active) {
       background: var(--scion-bg-subtle, #f1f5f9);
     }
 
-    button.active {
+    button.active,
+    a.active {
       background: var(--scion-primary, #3b82f6);
       color: white;
     }
 
-    button sl-icon {
+    button sl-icon,
+    a sl-icon {
       font-size: 0.875rem;
     }
   `;
@@ -88,7 +102,7 @@ export class ScionViewToggle extends LitElement {
     super.connectedCallback();
     if (this.storageKey) {
       const stored = localStorage.getItem(this.storageKey) as ViewMode | null;
-      if (stored === 'grid' || stored === 'list') {
+      if (stored === 'grid' || stored === 'list' || stored === 'graph') {
         this.view = stored;
       }
     }
@@ -109,6 +123,18 @@ export class ScionViewToggle extends LitElement {
     );
   }
 
+  private renderGraphSegment() {
+    return html`
+      <button
+        class=${this.view === 'graph' ? 'active' : ''}
+        title="Graph view"
+        @click=${() => this.setView('graph')}
+      >
+        <sl-icon name="diagram-3"></sl-icon>
+      </button>
+    `;
+  }
+
   override render() {
     return html`
       <div class="toggle-group">
@@ -126,6 +152,7 @@ export class ScionViewToggle extends LitElement {
         >
           <sl-icon name="list-ul"></sl-icon>
         </button>
+        ${this.showGraph ? this.renderGraphSegment() : nothing}
       </div>
     `;
   }

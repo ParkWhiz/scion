@@ -372,13 +372,15 @@ type TelemetryConfig struct {
 
 // TelemetryCloudConfig holds cloud OTLP forwarding settings.
 type TelemetryCloudConfig struct {
-	Enabled  *bool             `json:"enabled,omitempty" yaml:"enabled,omitempty"`
-	Endpoint string            `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
-	Protocol string            `json:"protocol,omitempty" yaml:"protocol,omitempty"`
-	Headers  map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
-	TLS      *TelemetryTLS     `json:"tls,omitempty" yaml:"tls,omitempty"`
-	Batch    *TelemetryBatch   `json:"batch,omitempty" yaml:"batch,omitempty"`
-	Provider string            `json:"provider,omitempty" yaml:"provider,omitempty"`
+	Enabled      *bool             `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+	Endpoint     string            `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
+	Protocol     string            `json:"protocol,omitempty" yaml:"protocol,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	TLS          *TelemetryTLS     `json:"tls,omitempty" yaml:"tls,omitempty"`
+	Batch        *TelemetryBatch   `json:"batch,omitempty" yaml:"batch,omitempty"`
+	Provider     string            `json:"provider,omitempty" yaml:"provider,omitempty"`
+	GCPProjectID *string           `json:"gcp_project_id,omitempty" yaml:"gcp_project_id,omitempty"`
+	CloudLogging *bool             `json:"cloud_logging,omitempty" yaml:"cloud_logging,omitempty"`
 }
 
 // TelemetryTLS holds TLS settings for OTLP export.
@@ -499,24 +501,14 @@ func (c *ScionConfig) IsDetached() bool {
 }
 
 type AuthConfig struct {
-	// Google/Gemini auth
-	GeminiAPIKey         string
-	GoogleAPIKey         string
+	// GCP shared fields — used across vertex-ai harnesses and have
+	// special handling. These remain as first-class fields because they
+	// participate in multi-source fallback resolution (e.g.
+	// GOOGLE_CLOUD_PROJECT | GCP_PROJECT | ANTHROPIC_VERTEX_PROJECT_ID)
+	// and are referenced by ResolveAuth for vertex-ai credential translation.
 	GoogleAppCredentials string
 	GoogleCloudProject   string
 	GoogleCloudRegion    string
-	OAuthCreds           string
-
-	// Anthropic auth
-	AnthropicAPIKey  string
-	ClaudeOAuthToken string // CLAUDE_CODE_OAUTH_TOKEN (long-lived, from `claude setup-token`)
-	ClaudeAuthFile   string // ~/.claude/.credentials.json path (rotating refresh-token store)
-
-	// OpenAI/Codex auth
-	OpenAIAPIKey     string
-	CodexAPIKey      string
-	CodexAuthFile    string
-	OpenCodeAuthFile string
 
 	// GCP metadata server mode ("block", "passthrough", "assign").
 	// When "assign", a GCP service account is available via the metadata
@@ -528,9 +520,15 @@ type AuthConfig struct {
 
 	// EnvVars holds config-driven auth env vars gathered from harness
 	// config metadata (auth.types[*].required_env). These flow through
-	// the auth pipeline alongside the hardcoded fields above, enabling
-	// new harnesses to declare auth requirements without Go code changes.
+	// the auth pipeline as the sole source of per-provider credentials,
+	// enabling harnesses to declare auth requirements without Go code changes.
 	EnvVars map[string]string
+
+	// Files holds config-driven file-based auth credentials gathered from
+	// harness config metadata (auth.types[*].required_files). Each entry
+	// maps a field name (e.g. "ClaudeAuthFile") to the host path of the
+	// credential file. These replace the former per-provider file fields.
+	Files map[string]string
 }
 
 // ResolvedAuth represents the single best auth method selected by a harness's
@@ -592,10 +590,11 @@ type AgentInfo struct {
 	Warnings   []string          `json:"warnings,omitempty"`
 
 	// Timestamps
-	Created   time.Time `json:"created,omitempty"`   // When the agent was created
-	Updated   time.Time `json:"updated,omitempty"`   // Last modification timestamp
-	LastSeen  time.Time `json:"lastSeen,omitempty"`  // Last heartbeat/status report
-	DeletedAt time.Time `json:"deletedAt,omitempty"` // When the agent was soft-deleted
+	Created           time.Time `json:"created,omitempty"`           // When the agent was created
+	Updated           time.Time `json:"updated,omitempty"`           // Last modification timestamp
+	LastSeen          time.Time `json:"lastSeen,omitempty"`          // Last heartbeat/status report
+	LastActivityEvent time.Time `json:"lastActivityEvent,omitempty"` // Last meaningful activity change
+	DeletedAt         time.Time `json:"deletedAt,omitempty"`         // When the agent was soft-deleted
 
 	// Ownership & access
 	CreatedBy  string   `json:"createdBy,omitempty"`  // User/system that created the agent
@@ -684,6 +683,33 @@ type SkillReference struct {
 	URI      string `json:"uri" yaml:"uri" koanf:"uri"`
 	As       string `json:"as,omitempty" yaml:"as,omitempty" koanf:"as"`
 	Optional bool   `json:"optional,omitempty" yaml:"optional,omitempty" koanf:"optional"`
+	// Scope indicates the injection source of this skill reference.
+	// Valid values: "hub", "user", "project", "template", "platform", "" (empty = lowest precedence).
+	// Used for destination-name collision resolution: higher-scope skills win.
+	Scope string `json:"scope,omitempty" yaml:"scope,omitempty" koanf:"scope"`
+}
+
+// SkillInjectionEntry is the API representation of one injected-skills list entry.
+type SkillInjectionEntry struct {
+	ID        string `json:"id,omitempty"` // set on read, not required on write
+	SkillURI  string `json:"skillUri"`
+	SkillAs   string `json:"skillAs,omitempty"`
+	Optional  bool   `json:"optional,omitempty"`
+	SortOrder int    `json:"sortOrder,omitempty"`
+	// Enriched fields (populated when URI maps to a known skill bank entry):
+	SkillName string `json:"skillName,omitempty"`
+	SkillSlug string `json:"skillSlug,omitempty"`
+}
+
+// SkillInjectionList is the list response wrapper for injected-skills endpoints.
+type SkillInjectionList struct {
+	Entries []SkillInjectionEntry `json:"entries"`
+}
+
+// HubSkillInjectionSetting is the value stored in hub_settings["injected_skills"].
+type HubSkillInjectionSetting struct {
+	System      []SkillReference `json:"system"`       // seeded from binary, immutable
+	UserDefined []SkillReference `json:"user_defined"` // admin-managed
 }
 
 // SecretKeyInfo provides metadata about a required secret key, including
@@ -811,6 +837,59 @@ func HarnessConfigPathFromContext(ctx context.Context) string {
 	return v
 }
 
+// HubAgentDefaults carries the Hub's operational agent_defaults limit/resource
+// fields to a runtime broker, for application at the broker's LOW-precedence
+// defaults tier.
+//
+// These four fields need no Hub-side resolution (unlike default_template and
+// default_harness_config, which the Hub must resolve so it can stamp IDs and
+// hashes), so they deliberately do NOT travel in AppliedConfig / InlineConfig.
+// Anything the Hub stamps into InlineConfig arrives at the broker as
+// top-of-chain and would outrank a template that sets max_turns explicitly —
+// the exact precedence inversion this channel exists to avoid.
+//
+// The zero value means "the Hub supplied no defaults"; callers leave the
+// pointer nil in that case so an unset field is indistinguishable on the wire
+// from a Hub that predates the field. See design §3.2.3.
+type HubAgentDefaults struct {
+	MaxTurns      int           `json:"maxTurns,omitempty"`
+	MaxModelCalls int           `json:"maxModelCalls,omitempty"`
+	MaxDuration   string        `json:"maxDuration,omitempty"`
+	Resources     *ResourceSpec `json:"resources,omitempty"`
+}
+
+// IsEmpty reports whether no default carries a value. An empty set is not put
+// on the wire, which is what keeps file-mode dispatch byte-identical to the
+// pre-change behaviour (the file-mode snapshot leaves these fields zero).
+func (d *HubAgentDefaults) IsEmpty() bool {
+	if d == nil {
+		return true
+	}
+	return d.MaxTurns == 0 && d.MaxModelCalls == 0 && d.MaxDuration == "" && d.Resources == nil
+}
+
+type hubAgentDefaultsContextKey struct{}
+
+// ContextWithHubAgentDefaults records the Hub's operational agent_defaults on
+// the context so provisioning can apply them at its own low-precedence tier.
+// Modelled on ContextWithBrokerMode / ContextWithHarnessConfigPath: the value
+// rides the context rather than growing ProvisionAgent's already-long
+// parameter list.
+func ContextWithHubAgentDefaults(ctx context.Context, d *HubAgentDefaults) context.Context {
+	return context.WithValue(ctx, hubAgentDefaultsContextKey{}, d)
+}
+
+// HubAgentDefaultsFromContext returns the Hub's operational agent_defaults from
+// the context, or nil if the Hub sent none (local mode, file-mode Hub, or a Hub
+// that predates the field).
+func HubAgentDefaultsFromContext(ctx context.Context) *HubAgentDefaults {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(hubAgentDefaultsContextKey{}).(*HubAgentDefaults)
+	return v
+}
+
 type StartOptions struct {
 	Name              string
 	Task              string
@@ -836,6 +915,12 @@ type StartOptions struct {
 	InlineConfig      *ScionConfig    // Inline config from --config flag, merged over template config
 	SharedDirs        []SharedDir     // Project-level shared directories (from Hub, merged with settings)
 	ExtraHosts        []string        // Extra --add-host entries for container networking (e.g. "example.com:host-gateway")
+
+	// ProjectPreStartHookScript is the project-owner-supplied shell script
+	// inlined from the project's active ProjectPreStartHook at agent-create
+	// time. If non-empty, the broker writes it to pre-start.d/30-project-custom
+	// before the agent container starts.
+	ProjectPreStartHookScript string
 }
 
 type StatusEvent struct {

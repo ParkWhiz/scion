@@ -14,6 +14,7 @@ import (
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/accesspolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsessionmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/allowlistentry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/apikey"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerdispatch"
@@ -22,6 +23,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubresolutioncache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/group"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/groupmembership"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/harnessconfig"
@@ -39,12 +41,14 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectcontributor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectprestarthook"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectsyncstate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schedule"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledevent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skill"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillinjection"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillregistry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillversion"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/subscriptiontemplate"
@@ -113,6 +117,7 @@ func checkColumn(t, c string) error {
 		columnCheck = sql.NewColumnCheck(map[string]func(string) bool{
 			accesspolicy.Table:             accesspolicy.ValidColumn,
 			agent.Table:                    agent.ValidColumn,
+			agentsessionmetrics.Table:      agentsessionmetrics.ValidColumn,
 			allowlistentry.Table:           allowlistentry.ValidColumn,
 			apikey.Table:                   apikey.ValidColumn,
 			brokerdispatch.Table:           brokerdispatch.ValidColumn,
@@ -120,6 +125,7 @@ func checkColumn(t, c string) error {
 			brokersecret.Table:             brokersecret.ValidColumn,
 			envvar.Table:                   envvar.ValidColumn,
 			gcpserviceaccount.Table:        gcpserviceaccount.ValidColumn,
+			githubresolutioncache.Table:    githubresolutioncache.ValidColumn,
 			githubinstallation.Table:       githubinstallation.ValidColumn,
 			group.Table:                    group.ValidColumn,
 			groupmembership.Table:          groupmembership.ValidColumn,
@@ -138,12 +144,14 @@ func checkColumn(t, c string) error {
 			policybinding.Table:            policybinding.ValidColumn,
 			project.Table:                  project.ValidColumn,
 			projectcontributor.Table:       projectcontributor.ValidColumn,
+			projectprestarthook.Table:      projectprestarthook.ValidColumn,
 			projectsyncstate.Table:         projectsyncstate.ValidColumn,
 			runtimebroker.Table:            runtimebroker.ValidColumn,
 			schedule.Table:                 schedule.ValidColumn,
 			scheduledevent.Table:           scheduledevent.ValidColumn,
 			secret.Table:                   secret.ValidColumn,
 			skill.Table:                    skill.ValidColumn,
+			skillinjection.Table:           skillinjection.ValidColumn,
 			skillregistry.Table:            skillregistry.ValidColumn,
 			skillversion.Table:             skillversion.ValidColumn,
 			subscriptiontemplate.Table:     subscriptiontemplate.ValidColumn,

@@ -172,6 +172,7 @@ type CreateAgentRequest struct {
 	Annotations     map[string]string `json:"annotations,omitempty"`
 	Config          *api.ScionConfig  `json:"config,omitempty"`
 	Resume          bool              `json:"resume,omitempty"`
+	ForceResume     bool              `json:"forceResume,omitempty"`
 	Attach          bool              `json:"attach,omitempty"`        // If true, signals interactive attach mode to the broker/harness
 	ProvisionOnly   bool              `json:"provisionOnly,omitempty"` // If true, provision only (write task to prompt.md) without starting
 	// WorkspaceFiles is populated for non-git workspace bootstrap.
@@ -515,14 +516,15 @@ func (s *agentService) SendStructuredMessage(ctx context.Context, agentID string
 
 // OutboundMessageRequest is the request body for sending an agent-to-human outbound message.
 type OutboundMessageRequest struct {
-	Recipient   string   `json:"recipient,omitempty"`
-	RecipientID string   `json:"recipient_id,omitempty"`
-	Msg         string   `json:"msg"`
-	Type        string   `json:"type,omitempty"`
-	Urgent      bool     `json:"urgent,omitempty"`
-	Attachments []string `json:"attachments,omitempty"`
-	Channel     string   `json:"channel,omitempty"`
-	ThreadID    string   `json:"thread_id,omitempty"`
+	Recipient   string            `json:"recipient,omitempty"`
+	RecipientID string            `json:"recipient_id,omitempty"`
+	Msg         string            `json:"msg"`
+	Type        string            `json:"type,omitempty"`
+	Urgent      bool              `json:"urgent,omitempty"`
+	Attachments []string          `json:"attachments,omitempty"`
+	Channel     string            `json:"channel,omitempty"`
+	ThreadID    string            `json:"thread_id,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 // SendOutboundMessage sends a message from an agent to a human inbox.

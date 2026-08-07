@@ -17,12 +17,15 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -45,6 +48,7 @@ var msgNotify bool
 var msgWake bool
 var msgChannel string
 var msgThreadID string
+var msgCC string
 
 // messageCmd represents the message command
 var messageCmd = &cobra.Command{
@@ -135,6 +139,22 @@ Examples:
 			return fmt.Errorf("--notify cannot be combined with --broadcast or --all")
 		}
 
+		// Validate --cc restrictions
+		if msgCC != "" {
+			if msgBroadcast || msgAll {
+				return fmt.Errorf("--cc cannot be combined with --broadcast or --all")
+			}
+			if msgRaw {
+				return fmt.Errorf("--cc cannot be combined with --raw")
+			}
+			if msgIn != "" || msgAt != "" {
+				return fmt.Errorf("--cc cannot be combined with --in or --at")
+			}
+			if userRecipient != "" {
+				return fmt.Errorf("--cc cannot be used with user recipients")
+			}
+		}
+
 		// Validate user-recipient restrictions
 		if userRecipient != "" {
 			if msgBroadcast || msgAll {
@@ -188,6 +208,24 @@ Examples:
 			return fmt.Errorf("--attach cannot be combined with --in or --at")
 		}
 
+		// Validate attachment file paths exist
+		for _, p := range msgAttach {
+			resolved := resolveAttachmentPath(p)
+			if resolved == "" {
+				return fmt.Errorf("attachment %q: path is outside allowed roots (/workspace, /scion-volumes)", p)
+			}
+			info, err := os.Stat(resolved)
+			if err != nil {
+				return fmt.Errorf("attachment %q: %w", p, err)
+			}
+			if !info.Mode().IsRegular() {
+				if info.IsDir() {
+					return fmt.Errorf("attachment %q: is a directory, not a regular file", p)
+				}
+				return fmt.Errorf("attachment %q: is not a regular file", p)
+			}
+		}
+
 		// Check if Hub should be used
 		var hubCtx *HubContext
 		var err error
@@ -232,6 +270,20 @@ Examples:
 		// --notify requires Hub mode
 		if msgNotify && hubCtx == nil {
 			return fmt.Errorf("--notify requires Hub mode (use 'scion hub enable' first)")
+		}
+
+		// --cc requires Hub mode
+		if msgCC != "" && hubCtx == nil {
+			return fmt.Errorf("--cc requires Hub mode (use 'scion hub enable' first)")
+		}
+
+		// Stage attachments to shared volume (after Hub mode confirmed)
+		if len(msgAttach) > 0 && hubCtx != nil {
+			staged, err := stageAttachments(msgAttach)
+			if err != nil {
+				return fmt.Errorf("attachment staging failed: %w", err)
+			}
+			msgAttach = staged
 		}
 
 		// Group-targeted messages: fan out to each recipient
@@ -495,6 +547,17 @@ func sendMessageViaHub(hubCtx *HubContext, agentName string, message string, int
 			fmt.Printf("Subscribed to notifications for agent '%s'.\n", agentName)
 		}
 	}
+
+	// @mention and --cc fan-out: send TypeMention messages to mentioned agents
+	var mentionNames []string
+	// Parse @mentions from message body
+	mentionNames = append(mentionNames, extractMentions(message)...)
+	// Parse --cc flag
+	mentionNames = append(mentionNames, parseCCFlag(msgCC)...)
+	if len(mentionNames) > 0 {
+		sendMentionMessages(hubCtx, sender, "agent:"+agentName, message, mentionNames, agentSvc)
+	}
+
 	return nil
 }
 
@@ -590,6 +653,13 @@ func sendGroupMessageViaHub(hubCtx *HubContext, recipients []messages.GroupRecip
 	}
 	agentSvc := hubCtx.Client.ProjectAgents(projectID)
 
+	// Build the recipients string once before the fan-out loop.
+	recipientStrs := make([]string, len(recipients))
+	for i, r := range recipients {
+		recipientStrs[i] = r.String()
+	}
+	recipientsStr := messages.FormatGroupRecipients(sender, recipientStrs)
+
 	if !isJSONOutput() {
 		fmt.Printf("Sending message to %d recipients...\n", len(recipients))
 	}
@@ -615,6 +685,8 @@ func sendGroupMessageViaHub(hubCtx *HubContext, recipients []messages.GroupRecip
 			case messages.RecipientAgent:
 				slug := api.Slugify(recip.Name)
 				msg := buildStructuredMessage(sender, "agent:"+slug, message)
+				msg.Type = messages.TypeGroupSet
+				msg.Recipients = recipientsStr
 				msg.Metadata = map[string]string{"group_id": groupID}
 				if _, err := agentSvc.SendStructuredMessage(ctx, slug, msg, interrupt, false, false); err != nil {
 					results[idx] = recipientResult{Recipient: recipStr, Status: "failed", Error: err.Error()}
@@ -644,11 +716,12 @@ func sendGroupMessageViaHub(hubCtx *HubContext, recipients []messages.GroupRecip
 				outMsg := &hubclient.OutboundMessageRequest{
 					Recipient:   userRecip,
 					Msg:         message,
-					Type:        "instruction",
+					Type:        messages.TypeGroupSet,
 					Urgent:      interrupt,
 					Attachments: msgAttach,
 					Channel:     msgChannel,
 					ThreadID:    msgThreadID,
+					Metadata:    map[string]string{"recipients": recipientsStr, "group_id": groupID},
 				}
 				if err := agentSvc.SendOutboundMessage(ctx, senderAgent, outMsg); err != nil {
 					results[idx] = recipientResult{Recipient: recipStr, Status: "failed", Error: err.Error()}
@@ -677,12 +750,49 @@ func sendGroupMessageViaHub(hubCtx *HubContext, recipients []messages.GroupRecip
 		fmt.Printf("Group delivery complete: %d/%d delivered.\n", delivered, len(recipients))
 	}
 
+	// @mention and --cc fan-out for group messages: mentioned agents that are
+	// not already group recipients receive a TypeMention notification.
+	// This runs regardless of partial delivery — mention recipients are
+	// independent of the group.
+	var mentionNames []string
+	mentionNames = append(mentionNames, extractMentions(message)...)
+	mentionNames = append(mentionNames, parseCCFlag(msgCC)...)
+	if len(mentionNames) > 0 {
+		// Build a mention source that reflects the group
+		recipientStrs := make([]string, len(recipients))
+		for i, r := range recipients {
+			recipientStrs[i] = r.String()
+		}
+		mentionSource := "group[" + strings.Join(recipientStrs, ",") + "]"
+
+		// Collect group recipient slugs to exclude from mentions
+		groupSlugs := make(map[string]bool)
+		for _, r := range recipients {
+			if r.Kind == messages.RecipientAgent {
+				groupSlugs[api.Slugify(r.Name)] = true
+			}
+		}
+
+		// Filter out names already in the group
+		var filtered []string
+		for _, name := range mentionNames {
+			if !groupSlugs[api.Slugify(name)] {
+				filtered = append(filtered, name)
+			}
+		}
+
+		if len(filtered) > 0 {
+			sendMentionMessages(hubCtx, sender, mentionSource, message, filtered, agentSvc)
+		}
+	}
+
 	if delivered == 0 {
 		return fmt.Errorf("group delivery failed: 0/%d recipients received the message", len(recipients))
 	}
 	if delivered < len(recipients) {
 		return fmt.Errorf("group delivery partially failed: %d/%d delivered", delivered, len(recipients))
 	}
+
 	return nil
 }
 
@@ -799,6 +909,139 @@ func validateChannel(hubCtx *HubContext, channel string) error {
 	return fmt.Errorf("channel %q is not registered; available channels: %s", channel, strings.Join(available, ", "))
 }
 
+// extractMentions scans message text for @name tokens and returns a deduplicated
+// list of mentioned names (without the @ prefix). Trailing punctuation (except
+// underscores and hyphens) is stripped from each token.
+func extractMentions(text string) []string {
+	var mentions []string
+	seen := make(map[string]bool)
+	for _, word := range strings.Fields(text) {
+		if !strings.HasPrefix(word, "@") {
+			continue
+		}
+		name := strings.TrimPrefix(word, "@")
+		name = strings.TrimRightFunc(name, func(r rune) bool {
+			return unicode.IsPunct(r) && r != '_' && r != '-'
+		})
+		if name == "" {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if !seen[lower] {
+			seen[lower] = true
+			mentions = append(mentions, name)
+		}
+	}
+	return mentions
+}
+
+// parseCCFlag parses the --cc flag value into a slice of agent names.
+// Names are comma-separated and whitespace-trimmed.
+func parseCCFlag(cc string) []string {
+	if cc == "" {
+		return nil
+	}
+	parts := strings.Split(cc, ",")
+	var names []string
+	seen := make(map[string]bool)
+	for _, p := range parts {
+		name := strings.TrimSpace(p)
+		if name == "" {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if !seen[lower] {
+			seen[lower] = true
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// maxMentionRecipients caps the number of mention recipients to avoid spam.
+const maxMentionRecipients = 10
+
+// sendMentionMessages resolves @mentions and --cc names against project agents
+// and sends TypeMention messages to each resolved agent. The primary recipient
+// is excluded from mentions. Unresolved names produce stderr warnings but do
+// not fail the primary send.
+func sendMentionMessages(hubCtx *HubContext, sender, primaryRecipient, messageText string, mentionNames []string, agentSvc hubclient.AgentService) {
+	if len(mentionNames) == 0 {
+		return
+	}
+
+	// List project agents for resolution
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := agentSvc.List(ctx, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not list project agents for @mention resolution: %s\n", err)
+		return
+	}
+	if resp == nil {
+		return
+	}
+
+	// Build lookup map of known agents (slug -> slug with original case)
+	knownAgents := make(map[string]string, len(resp.Agents))
+	for _, a := range resp.Agents {
+		knownAgents[strings.ToLower(a.Name)] = a.Name
+	}
+
+	// Determine the primary recipient's slug for dedup
+	primarySlug := strings.ToLower(strings.TrimPrefix(primaryRecipient, "agent:"))
+
+	// Resolve mentions and deduplicate
+	var resolved []string
+	seen := make(map[string]bool)
+	seen[primarySlug] = true // skip primary recipient
+
+	for _, name := range mentionNames {
+		if len(resolved) >= maxMentionRecipients {
+			fmt.Fprintf(os.Stderr, "Warning: too many @mentions; only the first %d will receive mention notifications\n", maxMentionRecipients)
+			break
+		}
+		lower := strings.ToLower(name)
+		if seen[lower] {
+			continue
+		}
+		seen[lower] = true
+
+		slug, ok := knownAgents[lower]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "Warning: @%s does not match any agent in this project; skipping mention\n", name)
+			continue
+		}
+		resolved = append(resolved, slug)
+	}
+
+	if len(resolved) == 0 {
+		return
+	}
+
+	// Send TypeMention to each resolved agent
+	var wg sync.WaitGroup
+	for _, slug := range resolved {
+		wg.Add(1)
+		go func(agentSlug string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			mentionMsg := messages.NewMention(sender, "agent:"+agentSlug, messageText, primaryRecipient)
+			if _, err := agentSvc.SendStructuredMessage(ctx, agentSlug, mentionMsg, false, false, false); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to send mention to @%s: %s\n", agentSlug, err)
+				return
+			}
+			if !isJSONOutput() {
+				fmt.Fprintf(os.Stderr, "Mention notification sent to @%s.\n", agentSlug)
+			}
+		}(slug)
+	}
+	wg.Wait()
+}
+
 func init() {
 	messageCmd.Flags().BoolVarP(&msgInterrupt, "interrupt", "i", false, "Interrupt the harness before sending the message")
 	messageCmd.Flags().BoolVarP(&msgBroadcast, "broadcast", "b", false, "Send the message to all running agents in the current project")
@@ -807,11 +1050,156 @@ func init() {
 	messageCmd.Flags().StringVar(&msgAt, "at", "", "Schedule message delivery at an absolute time (ISO 8601, e.g. 2026-02-28T14:00:00Z)")
 	messageCmd.Flags().BoolVar(&msgPlain, "plain", false, "Mark for plain-text delivery (message still flows as structured JSON internally)")
 	messageCmd.Flags().BoolVar(&msgRaw, "raw", false, "Send literal bytes via tmux send-keys with no trailing Enter (supports control keys like arrows and Escape)")
-	messageCmd.Flags().StringArrayVar(&msgAttach, "attach", nil, "Attach file path(s), repeatable")
+	messageCmd.Flags().StringArrayVar(&msgAttach, "attach", nil, "Attach file path(s), repeatable; use paths under /workspace or /scion-volumes (bare relative paths resolve to /workspace). Absolute paths outside these roots are silently dropped on delivery.")
 	messageCmd.Flags().BoolVar(&msgNotify, "notify", false, "Subscribe to notifications for the target agent (completed, waiting for input, etc.)")
 	messageCmd.Flags().BoolVarP(&msgWake, "wake", "w", false, "Resume a suspended agent before delivering the message")
 	messageCmd.Flags().StringVar(&msgChannel, "channel", "", "Target a specific message channel (e.g. telegram, gchat, web)")
 	messageCmd.Flags().StringVar(&msgThreadID, "thread-id", "", "Target a specific thread within the channel")
+	messageCmd.Flags().StringVar(&msgCC, "cc", "", "CC additional agents (comma-separated names); each receives a mention notification")
 	messageCmd.AddCommand(messageChannelsCmd)
 	rootCmd.AddCommand(messageCmd)
+}
+
+// resolveAttachmentPath resolves a relative or absolute attachment path.
+// Relative paths are resolved relative to /workspace. Absolute paths outside
+// /workspace and /scion-volumes are filtered out with a warning. Returns ""
+// for filtered paths.
+func resolveAttachmentPath(p string) string {
+	if !filepath.IsAbs(p) {
+		p = filepath.Join("/workspace", p)
+	}
+
+	// Resolve symlinks to prevent directory traversal via symlinks
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		// If we can't resolve (e.g., file doesn't exist yet), fall back to Clean
+		resolved = filepath.Clean(p)
+	}
+
+	if strings.HasPrefix(resolved, "/workspace/") || resolved == "/workspace" ||
+		strings.HasPrefix(resolved, "/scion-volumes/") || resolved == "/scion-volumes" {
+		return resolved
+	}
+
+	fmt.Fprintf(os.Stderr, "Warning: attachment path %q is outside allowed roots "+
+		"(/workspace, /scion-volumes); skipping\n", p)
+	return ""
+}
+
+// copyFile copies the file at src to dst, preserving permissions.
+func copyFile(src, dst string) (err error) {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = srcFile.Close() }()
+
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := dstFile.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+// uniqueDest returns a unique destination path in dir for basename. If basename
+// already exists in dir, appends _1, _2, etc. before the extension.
+func uniqueDest(dir, basename string) (string, error) {
+	dest := filepath.Join(dir, basename)
+	_, err := os.Stat(dest)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return dest, nil
+		}
+		return "", err
+	}
+
+	ext := filepath.Ext(basename)
+	name := strings.TrimSuffix(basename, ext)
+	for i := 1; ; i++ {
+		candidate := filepath.Join(dir, fmt.Sprintf("%s_%d%s", name, i, ext))
+		_, err := os.Stat(candidate)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return candidate, nil
+			}
+			return "", err
+		}
+	}
+}
+
+// stageAttachments copies attachment files to the scratchpad shared volume
+// and returns the new paths. Returns an error if the scratchpad is not
+// available — attachments require shared storage for cross-agent delivery.
+func stageAttachments(paths []string) (staged []string, err error) {
+	scratchpad := "/scion-volumes/scratchpad"
+
+	// Check scratchpad availability — hard error if absent
+	if _, err := os.Stat(scratchpad); os.IsNotExist(err) {
+		return nil, fmt.Errorf("scratchpad volume not available at %s; "+
+			"attachments require a scratchpad shared volume for cross-agent "+
+			"file transfer. Create one with: scion shared-dir create scratchpad",
+			scratchpad)
+	}
+
+	// Determine agent slug for per-agent directory
+	agentSlug := os.Getenv("SCION_AGENT_NAME")
+	if agentSlug == "" {
+		agentSlug = "_user"
+	}
+
+	// Generate per-message staging directory under agent slug
+	msgID := api.NewUUID()
+	stageDir := filepath.Join(scratchpad, ".attachments", agentSlug, msgID)
+	if err := os.MkdirAll(stageDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create attachment staging directory: %w", err)
+	}
+
+	// Clean up staging directory if we return an error
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(stageDir)
+		}
+	}()
+
+	staged = make([]string, 0, len(paths))
+	for _, p := range paths {
+		// Resolve path
+		resolved := resolveAttachmentPath(p)
+		if resolved == "" {
+			continue // filtered out (warning already printed)
+		}
+
+		// Validate file exists and is a regular file
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("attachment %q: %w", p, err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("attachment %q: not a regular file", p)
+		}
+
+		// Copy to staging directory (handle duplicate basenames)
+		dest, err := uniqueDest(stageDir, filepath.Base(resolved))
+		if err != nil {
+			return nil, fmt.Errorf("failed to determine destination for attachment %q: %w", p, err)
+		}
+		if err := copyFile(resolved, dest); err != nil {
+			return nil, fmt.Errorf("failed to stage attachment %q: %w", p, err)
+		}
+		staged = append(staged, dest)
+	}
+
+	return staged, nil
 }
