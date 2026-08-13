@@ -78,6 +78,7 @@ type IntegrationManager interface {
 	GetDeploymentMode(pluginType, name string) plugin.DeploymentMode
 	ConfigureBroker(name string, extra map[string]string) error
 	ReplaceBrokerConfig(name string, cfg map[string]string) error
+	RestartBrokerPlugin(name string, cfg map[string]string) error
 	Reconnect(pluginType, name string) error
 	BrokerHealthCheck(name string) (status, message string, details map[string]string, err error)
 	BrokerInfo(name string) (version, channelID string, capabilities []string, err error)
@@ -166,6 +167,8 @@ var knownPluginCatalog = []KnownPlugin{
 	{Name: "discord", Platform: "discord", BinaryName: "scion-plugin-discord", SourceDir: "extras/scion-discord", Description: "Chat integration — built and managed by the Hub"},
 	{Name: "slack", Platform: "slack", BinaryName: "scion-plugin-slack", SourceDir: "extras/scion-slack", Description: "Chat integration — built and managed by the Hub"},
 	{Name: "a2a-bridge", Platform: "a2a", BinaryName: "scion-a2a-bridge", SourceDir: "extras/scion-a2a-bridge", SelfManaged: true, Description: "External service — installed separately, managed via admin UI"},
+	{Name: "chat-app", Platform: "gchat", BinaryName: "scion-chat-app", SourceDir: "extras/scion-chat-app", SelfManaged: true, Description: "Google Chat integration — installed separately, managed via admin UI"},
+	{Name: "teams", Platform: "teams", BinaryName: "scion-plugin-teams", SourceDir: "extras/scion-teams", Description: "Chat integration — built and managed by the Hub"},
 }
 
 var knownPluginSet = func() map[string]bool {
@@ -661,20 +664,25 @@ func (s *Server) handleRestartIntegration(w http.ResponseWriter, r *http.Request
 	}
 	SettingsWriteMu.Unlock()
 
-	// reconfigureIntegration pushes new config to the running plugin process
-	// (via ReplaceBrokerConfig) without killing it, so the existing spoke's
-	// RPC connection remains valid — no refreshBrokerSpoke needed here.
-	// However the spoke may never have been added (e.g. first install before
-	// a full hub restart), so ensure it exists.
-	if err := s.reconfigureIntegration(r.Context(), mgr, name); err != nil {
+	// Resolve the latest config from file + secrets + hub wiring creds.
+	merged := s.resolveIntegrationMergedConfig(r.Context(), mgr, name)
+
+	// Full process restart: kill the old plugin process and start a new one
+	// with the resolved config. This ensures a fresh go-plugin handshake and
+	// new MuxBroker connections for host callbacks, fixing stale callback
+	// issues that arise when a plugin was initially started with incomplete
+	// config (e.g. first-time install before the user configures bot_token).
+	if err := mgr.RestartBrokerPlugin(name, merged); err != nil {
 		slog.Error("Failed to restart integration", "plugin", name, "error", err)
 		InternalError(w)
 		return
 	}
 
-	// Ensure the plugin is wired as a FanOut spoke — it may have been
-	// installed mid-session and never added at startup.
-	s.ensureBrokerSpoke(mgr, name)
+	// Replace the FanOut spoke with a fresh RPC connection to the restarted
+	// plugin process. The old spoke wraps a dead connection from the killed
+	// process. refreshBrokerSpoke replaces an existing spoke or adds a new
+	// one if none existed (e.g. first install before a full hub restart).
+	s.refreshBrokerSpoke(mgr, name)
 
 	// Post-restart validation: check that the plugin is wired into the FanOut.
 	warnings := s.validateIntegrationWiring(name)
@@ -1082,6 +1090,12 @@ func createSelfManagedAdminConfig(pluginName, configFilePath string) error {
 		content += "provider_org: \"\"\n"
 		content += "provider_url: \"\"\n"
 		content += "projects_json: \"[]\"\n"
+	case "chat-app":
+		content += "project_id: \"\"\n"
+		content += "credentials: \"\"\n"
+		content += "listen_address: \":8443\"\n"
+		content += "external_url: \"\"\n"
+		content += "service_account_email: \"\"\n"
 	}
 
 	return os.WriteFile(resolved, []byte(content), 0600)
@@ -1102,19 +1116,43 @@ func createBridgeConfigTemplate(name, configFilePath, hubEndpoint string) error 
 		return fmt.Errorf("create config dir: %w", err)
 	}
 
-	content := "# Scion A2A bridge bootstrap configuration\n"
-	content += "# This file is operator-managed. Edit it to configure listen addresses,\n"
-	content += "# TLS, state database, and signing key settings.\n"
-	content += "hub:\n"
-	content += "  endpoint: \"" + hubEndpoint + "\"\n"
-	content += "plugin:\n"
-	content += "  listen_address: \"localhost:9090\"\n"
-	content += "# bridge:\n"
-	content += "#   listen_address: \":8081\"\n"
-	content += "# state:\n"
-	content += "#   database: \"~/.scion/scion-a2a-bridge.db\"\n"
-	content += "# logging:\n"
-	content += "#   level: \"info\"\n"
+	var content string
+	switch name {
+	case "chat-app":
+		content = "# Scion Google Chat app bootstrap configuration\n"
+		content += "# This file is operator-managed. Edit it to configure listen addresses,\n"
+		content += "# GCP credentials, and state database settings.\n"
+		content += "hub:\n"
+		content += "  endpoint: \"" + hubEndpoint + "\"\n"
+		content += "plugin:\n"
+		content += "  listen_address: \"localhost:9090\"\n"
+		content += "platforms:\n"
+		content += "  google_chat:\n"
+		content += "    enabled: true\n"
+		content += "    project_id: \"\"\n"
+		content += "    credentials: \"\"\n"
+		content += "    listen_address: \":8443\"\n"
+		content += "    external_url: \"\"\n"
+		content += "    service_account_email: \"\"\n"
+		content += "# state:\n"
+		content += "#   database: \"~/.scion/scion-chat-app.db\"\n"
+		content += "# logging:\n"
+		content += "#   level: \"info\"\n"
+	default:
+		content = "# Scion A2A bridge bootstrap configuration\n"
+		content += "# This file is operator-managed. Edit it to configure listen addresses,\n"
+		content += "# TLS, state database, and signing key settings.\n"
+		content += "hub:\n"
+		content += "  endpoint: \"" + hubEndpoint + "\"\n"
+		content += "plugin:\n"
+		content += "  listen_address: \"localhost:9090\"\n"
+		content += "# bridge:\n"
+		content += "#   listen_address: \":8081\"\n"
+		content += "# state:\n"
+		content += "#   database: \"~/.scion/scion-a2a-bridge.db\"\n"
+		content += "# logging:\n"
+		content += "#   level: \"info\"\n"
+	}
 
 	return os.WriteFile(resolved, []byte(content), 0600)
 }
@@ -1346,6 +1384,8 @@ func resolvePlatform(name string) string {
 		return "gchat"
 	case "a2a-bridge":
 		return "a2a"
+	case "teams":
+		return "teams"
 	default:
 		return name
 	}
@@ -1508,9 +1548,12 @@ func (s *Server) getPluginHubCreds(ctx context.Context, name string) map[string]
 	return creds
 }
 
-// reconfigureIntegration reloads config for a plugin and calls ConfigureBroker.
-// For self-managed plugins, it falls back to Reconnect on ConfigureBroker failure.
-func (s *Server) reconfigureIntegration(ctx context.Context, mgr IntegrationManager, name string) error {
+// resolveIntegrationMergedConfig builds the full merged config map for a plugin
+// by reading the config file, injecting secrets from the secret backend,
+// carrying over runtime keys, and applying hub wiring credentials. The returned
+// map is ready to be pushed to the plugin via ReplaceBrokerConfig or
+// RestartBrokerPlugin.
+func (s *Server) resolveIntegrationMergedConfig(ctx context.Context, mgr IntegrationManager, name string) map[string]string {
 	pluginCfg := mgr.GetPluginConfig("broker", name)
 
 	// Re-read config file if one is configured. Prefer the immutable
@@ -1531,7 +1574,7 @@ func (s *Server) reconfigureIntegration(ctx context.Context, mgr IntegrationMana
 	}
 	merged, err := config.ResolvePluginConfig(configFile, inlineToPass)
 	if err != nil {
-		slog.Error("Failed to resolve config for reconfigure", "plugin", name, "error", err)
+		slog.Error("Failed to resolve config for integration", "plugin", name, "error", err)
 		merged = make(map[string]string)
 	}
 
@@ -1575,6 +1618,15 @@ func (s *Server) reconfigureIntegration(ctx context.Context, mgr IntegrationMana
 	if configFile != "" {
 		merged["config_file"] = configFile
 	}
+
+	return merged
+}
+
+// reconfigureIntegration reloads config for a plugin and calls ReplaceBrokerConfig
+// to push new config to the running process without restarting it.
+// For self-managed plugins, it falls back to Reconnect on failure.
+func (s *Server) reconfigureIntegration(ctx context.Context, mgr IntegrationManager, name string) error {
+	merged := s.resolveIntegrationMergedConfig(ctx, mgr, name)
 
 	if err := mgr.ReplaceBrokerConfig(name, merged); err != nil {
 		if mgr.IsSelfManaged("broker", name) {

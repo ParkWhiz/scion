@@ -72,6 +72,37 @@ export SCION_SERVER_OAUTH_CLI_GITHUB_CLIENTID="your-client-id"
 export SCION_SERVER_OAUTH_CLI_GITHUB_CLIENTSECRET="your-client-secret"
 ```
 
+### External OIDC Login Provider Support
+
+For enterprise SSO setups, Scion supports authenticating Web UI users via an external OpenID Connect (OIDC) identity provider (such as Okta, Keycloak, or Ping Identity) as an alternative to standard Google/GitHub OAuth.
+
+#### How It Works
+- **OIDC Discovery**: The Hub automatically discovers authorization and token endpoints by fetching the provider's standard metadata configuration from `{issuer_url}/.well-known/openid-configuration` with a **1-hour TTL discovery cache** to ensure high performance and zero-downtime key rotation.
+- **Dynamic Login Button**: When enabled, the Web Dashboard dynamically renders a custom login button using your configured `display_name` alongside any active Google or GitHub OAuth buttons.
+- **Public Client Support**: For OIDC public clients (like Keycloak public clients), the Hub allows the `client_secret` to be left empty or omitted, removing client secret validation from the token exchange workflow.
+
+#### Configuration
+
+To enable the external OIDC login provider, add the `oidc_login` section to your Hub's static `settings.yaml` bootstrap file:
+
+```yaml
+oidc_login:
+  enabled: true
+  display_name: "Corporate SSO"                         # Text shown on the login button
+  issuer_url: "https://sso.example.com/auth/realms/main" # Base OIDC issuer URL
+  client_id: "scion-client"                              # Client ID registered with the provider
+  client_secret: "secret-value"                          # Client secret (can be empty for public clients)
+  scopes: ["openid", "email", "profile"]                 # Custom scopes (defaults to openid, email, profile)
+```
+
+Alternatively, you can configure these settings via environment variables at startup:
+- `SCION_SERVER_OIDC_LOGIN_ENABLED="true"`
+- `SCION_SERVER_OIDC_LOGIN_DISPLAY_NAME="Corporate SSO"`
+- `SCION_SERVER_OIDC_LOGIN_ISSUER_URL="https://sso.example.com/auth/realms/main"`
+- `SCION_SERVER_OIDC_LOGIN_CLIENT_ID="scion-client"`
+- `SCION_SERVER_OIDC_LOGIN_CLIENT_SECRET="secret-value"`
+- `SCION_SERVER_OIDC_LOGIN_SCOPES="openid,email,profile"`
+
 ## Domain Authorization
 
 You can restrict authentication to specific email domains using the `SCION_AUTHORIZED_DOMAINS` setting. This provides an additional layer of access control beyond OAuth authentication.
@@ -100,6 +131,127 @@ auth:
 - **Non-empty list**: Only emails from listed domains can authenticate.
 - **Case insensitive**: `Example.COM` matches `example.com`.
 - **Exact match**: Subdomains must be listed explicitly.
+
+## OIDC Identity Provider (IdP)
+
+When enabled, the Scion Hub can act as a minimal OpenID Connect (OIDC) Identity Provider. This allows running agents inside containers to request short-lived, cryptographically signed OIDC tokens to prove their identity to external systems.
+
+### Configuration
+Enable the OIDC IdP feature in `settings.yaml`:
+
+```yaml
+server:
+  oidc:
+    enabled: true
+    # IssuerURL defaults to the Hub's public endpoint if empty.
+    # Must be valid HTTPS in hosted mode (HTTP allowed in workstation mode).
+    issuer_url: "https://hub.scion.dev"
+    token_lifetime: "15m"
+```
+
+### Endpoints
+When active, the Hub exposes standard OIDC discovery and key endpoints:
+- `/.well-known/openid-configuration`: Returns OIDC discovery metadata.
+- `/.well-known/jwks.json`: Publishes the public keys (JWKS) used to verify token signatures.
+- `POST /api/v1/agent/identity-token`: Endpoint for agents to request tokens.
+
+### Token Issuance and Rotation
+- **Token Signing**: Tokens are RS256-signed using keys generated and managed by the Hub's secrets backend.
+- **Key Rotation**: The Hub rotates signing keys every 24 hours automatically, maintaining a key overlap period to ensure seamless token verification during transitions.
+- **Audience Scope**: Tokens are minted targeting specific external audiences.
+
+### Agent Identity Token API
+For programmatic or custom integrations where `sciontool` is not available, agents can request OIDC identity tokens directly from the Hub's token endpoint.
+
+* **Endpoint:** `POST /api/v1/agent/identity-token`
+* **Authentication:** Requires a valid Agent Token header (e.g. `X-Scion-Agent-Token: <scion JWT>`).
+* **Request Body:** Must be JSON and include the mandatory `audience` parameter targeting the external service.
+
+**Example Request:**
+
+```http
+POST /api/v1/agent/identity-token HTTP/1.1
+Host: hub.scion.dev
+X-Scion-Agent-Token: <agent_jwt_token>
+Content-Type: application/json
+
+{
+  "audience": "https://vault.example.com"
+}
+```
+
+:::caution[Audience is Mandatory]
+The `audience` parameter is strictly required in the JSON body. If the `audience` field is missing, empty, or the request body is malformed, the Hub will immediately reject the call with an HTTP `400 Bad Request` status.
+:::
+
+**Example Response (HTTP 200 OK):**
+
+```json
+{
+  "token": "eyJhbGciOiJSUzI1NiIsImtpZCI6Ii4uLiJ9...",
+  "expires_at": "2026-08-11T12:15:00Z"
+}
+```
+
+### In-Agent Retrieval
+From inside any authorized agent container, retrieve an OIDC identity token using `sciontool`:
+
+```bash
+sciontool identity-token --audience="https://vault.example.com"
+```
+
+Use this token to authenticate agents to external services like HashiCorp Vault, AWS IAM Roles for Service Accounts (IRSA), or GCP Workload Identity Federation (WIF).
+
+---
+
+## OIDC-Based Federation
+
+Scion supports inbound OIDC-based federation authentication. This allows external identities (such as other Scion Hubs, Google Cloud Service Accounts, or Firebase/Google users) to authenticate against the Hub API using OIDC ID tokens from trusted issuers.
+
+### Configuration and Runtime Management
+
+Federation authentication is feature-gated. It can be configured initially at bootstrap via the `server.federation` block in `settings.yaml`, or managed dynamically at runtime via the **Admin UI** (using the `opsettings` pattern).
+
+#### Runtime Administration (Admin UI)
+When running in database mode, administrators can manage OIDC federation configuration directly in the Admin UI without restarting the Hub:
+* **Issuer CRUD**: Create, read, update, and delete trusted OIDC issuers dynamically. The interface provides conditional input fields based on the selected identity/issuer type.
+* **Hot-Reloading**: Changes saved in the UI are immediately applied cluster-wide. The backend utilizes an `atomic.Pointer` to hot-reload the `FederationAuthenticator`, ensuring a zero-downtime, lock-free path for inbound federated requests.
+* **Semantic Validation**: The Admin API performs strict semantic validation on save, preventing malformed issuer rules or invalid URLs from reaching the live runtime.
+
+#### Static Bootstrap Configuration (`settings.yaml`)
+Alternatively, or for initial bootstrapping, you can configure federation statically in your configuration file.
+
+:::note[OIDC Wiring Guarantee]
+Federation and OIDC configurations are fully wired end-to-end into the server's config schemas (`config.GlobalConfig` and `V1ServerConfig`), ensuring no federation fields are silently dropped on file load. In combo-server setups, standard `/.well-known/` discovery endpoints are routed correctly and are not intercepted by the SPA catch-all routing.
+:::
+
+```yaml
+server:
+  federation:
+    enabled: true
+    trusted_issuers:
+      - issuer_url: "https://hub.other-org.com"
+        # Optional: Explicit JWKS URL (retrieved via discovery if omitted)
+        jwks_url: "https://hub.other-org.com/.well-known/jwks.json"
+        expected_audience: "https://hub.scion.dev"
+        # Optional restriction lists
+        allowed_projects: ["project-uuid-1", "project-uuid-2"]
+        allowed_root_users: ["user@other-org.com"]
+        # Default scopes/roles for identities from this issuer
+        default_scopes: ["project:read", "agent:status:update"]
+        issuer_type: "hub" # hub, service_account, or user
+```
+
+### How It Works
+- **Multi-Issuer Support**: The federation authenticator handles multiple external trust domains simultaneously.
+- **JWKS Caching**: Public verification keys are cached locally with RS256-signature pinning and automatic refresh to eliminate per-request latency.
+- **Federation Access Middleware**: Requests carrying external OIDC tokens pass through the `RequireFederationAccess` scope-gated middleware, validating token authenticity, issuer rules, and matching scopes.
+- **Identity Types**:
+  - `hub`: Identifies requests originating from federated partner Hubs.
+  - `service_account`: Authenticates automated workloads via GCP Service Accounts.
+  - `user`: Maps OIDC tokens to standard user identities, with configurable `default_role` (defaults to `viewer`) and domain restrictions using wildcards (e.g. `allowed_emails: ["*@example.com"]`).
+
+---
 
 ## Development Authentication (Dev Auth)
 

@@ -86,4 +86,13 @@ func init() {
 	// Label flags
 	startCmd.Flags().StringArrayVar(&labelFlags, "label", nil, "Label in key=value format (repeatable)")
 
+	// Agent role flag
+	startCmd.Flags().StringVar(&agentRoleFlag, "role", "",
+		"Agent role for Hub API access: none, readonly, baseline, full\n"+
+			"Members can grant up to baseline; admins up to full.\n"+
+			"Capped by project max_agent_role setting. Default: project ceiling.")
+
+	// GCP service account assignment flag
+	startCmd.Flags().StringVar(&serviceAccountFlag, "service-account", "", "GCP service account ID to assign to this agent (requires Hub mode)")
+
 }

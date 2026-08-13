@@ -16,16 +16,26 @@ package chatapp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	goplugin "github.com/hashicorp/go-plugin"
+)
+
+const (
+	// dedupTTL is how long a message fingerprint is remembered for deduplication.
+	dedupTTL = 5 * time.Minute
 )
 
 // MessageHandler is called when a message is received from the Hub via the broker plugin.
@@ -41,6 +51,9 @@ type BrokerServer struct {
 	subscriptions map[string]bool
 	configured    bool
 	channelName   string
+
+	sentIDs   map[string]time.Time
+	sentIDsMu sync.Mutex
 }
 
 // Compile-time interface checks.
@@ -53,12 +66,15 @@ func NewBrokerServer(handler MessageHandler, log *slog.Logger) *BrokerServer {
 		handler:       handler,
 		log:           log,
 		subscriptions: make(map[string]bool),
+		sentIDs:       make(map[string]time.Time),
 	}
 }
 
 // SetHandler replaces the message handler after construction, allowing
 // deferred wiring (e.g. to a notification relay created later).
 func (b *BrokerServer) SetHandler(handler MessageHandler) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.handler = handler
 }
 
@@ -82,15 +98,67 @@ func (b *BrokerServer) Publish(ctx context.Context, topic string, msg *messages.
 	if msg == nil {
 		return nil
 	}
+
+	// Dedup check: compute SHA256 fingerprint and skip if seen within TTL.
+	dedupKey := msgDedupKey(msg)
+	if dedupKey != "" {
+		b.sentIDsMu.Lock()
+		if t, ok := b.sentIDs[dedupKey]; ok && time.Since(t) < dedupTTL {
+			b.sentIDsMu.Unlock()
+			b.log.Debug("skipping duplicate message",
+				"topic", topic,
+				"sender", msg.Sender,
+				"dedup_key", dedupKey,
+			)
+			return nil
+		}
+		b.sentIDs[dedupKey] = time.Now()
+		b.pruneSentIDsLocked()
+		b.sentIDsMu.Unlock()
+	}
+
 	b.log.Debug("received message via broker",
 		"topic", topic,
 		"sender", msg.Sender,
 		"type", msg.Type,
 	)
-	if b.handler != nil {
-		return b.handler(ctx, topic, msg)
+	b.mu.RLock()
+	h := b.handler
+	b.mu.RUnlock()
+	if h != nil {
+		return h(ctx, topic, msg)
 	}
 	return nil
+}
+
+// msgDedupKey returns a stable SHA256 fingerprint for a message, used to detect
+// duplicate deliveries of the same logical message.
+func msgDedupKey(msg *messages.StructuredMessage) string {
+	if msg == nil || msg.Msg == "" {
+		return ""
+	}
+	h := sha256.New()
+	h.Write([]byte(msg.Sender))
+	h.Write([]byte("|"))
+	h.Write([]byte(msg.Recipient))
+	h.Write([]byte("|"))
+	h.Write([]byte(msg.Timestamp))
+	h.Write([]byte("|"))
+	h.Write([]byte(msg.Type))
+	h.Write([]byte("|"))
+	h.Write([]byte(msg.Msg))
+	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+// pruneSentIDsLocked removes dedup entries older than dedupTTL.
+// Must be called with b.sentIDsMu held.
+func (b *BrokerServer) pruneSentIDsLocked() {
+	now := time.Now()
+	for k, t := range b.sentIDs {
+		if now.Sub(t) > dedupTTL {
+			delete(b.sentIDs, k)
+		}
+	}
 }
 
 // ChannelName returns the configured channel name in a thread-safe manner.
@@ -282,4 +350,240 @@ func (s *PluginServer) Close() error {
 		return s.listener.Close()
 	}
 	return nil
+}
+
+// --- Attachment helpers ---
+
+const (
+	// MaxAttachmentSize is the maximum file size for chat attachment uploads (25 MB).
+	// Shared by all platform adapters (Google Chat, Discord, etc.).
+	MaxAttachmentSize = 25 * 1024 * 1024
+
+	// gchatAttachmentDir is the subdirectory under .attachments for Google Chat files.
+	gchatAttachmentDir = "_gchat"
+)
+
+// ResolveOutboundAttachments converts agent-side attachment paths from a
+// StructuredMessage into Attachment structs with resolved host-side paths.
+// Paths that cannot be resolved or exceed the size limit are skipped with a
+// logged warning.
+func ResolveOutboundAttachments(log *slog.Logger, attachmentPaths []string, projectSlug, projectID string) []Attachment {
+	if len(attachmentPaths) == 0 {
+		return nil
+	}
+
+	var result []Attachment
+	for _, agentPath := range attachmentPaths {
+		if agentPath == "" {
+			continue
+		}
+
+		hostPath := resolveAgentPath(agentPath, projectSlug, projectID)
+		if hostPath == "" {
+			log.Warn("cannot resolve attachment path, skipping",
+				"agent_path", agentPath)
+			continue
+		}
+
+		fi, err := os.Stat(hostPath)
+		if err != nil {
+			log.Warn("attachment file not found, skipping",
+				"agent_path", agentPath,
+				"host_path", hostPath,
+				"error", err)
+			continue
+		}
+		if fi.IsDir() {
+			log.Warn("attachment path is a directory, skipping",
+				"agent_path", agentPath,
+				"host_path", hostPath)
+			continue
+		}
+		if fi.Size() > MaxAttachmentSize {
+			log.Warn("attachment file too large, skipping",
+				"agent_path", agentPath,
+				"size", fi.Size(),
+				"max", MaxAttachmentSize)
+			continue
+		}
+
+		result = append(result, Attachment{
+			Filename: filepath.Base(hostPath),
+			Path:     hostPath,
+			Size:     fi.Size(),
+		})
+	}
+	return result
+}
+
+// SizeLimitErrorCard returns a Card notifying the user that an attachment
+// exceeds the size limit. When size is 0 (unknown), the message omits the
+// specific file size.
+func SizeLimitErrorCard(filename string, size int64) Card {
+	var detail string
+	if size > 0 {
+		detail = fmt.Sprintf(
+			"The file `%s` is %s, which exceeds the 25 MB attachment limit.\n\nPlease reduce the file size and try again.",
+			filename,
+			formatFileSize(size),
+		)
+	} else {
+		detail = fmt.Sprintf(
+			"The file `%s` exceeds the 25 MB attachment limit.\n\nPlease reduce the file size and try again.",
+			filename,
+		)
+	}
+	return Card{
+		Header: CardHeader{
+			Title:    "⚠️ Attachment Too Large",
+			Subtitle: filename,
+		},
+		Sections: []CardSection{
+			{
+				Widgets: []Widget{
+					{
+						Type:    WidgetText,
+						Content: detail,
+					},
+				},
+			},
+		},
+	}
+}
+
+// resolveGChatAttachmentDir returns the host-side directory for storing
+// Google Chat attachments in the shared scratchpad volume.
+func resolveGChatAttachmentDir(projectSlug, projectID, conversationID string) (string, error) {
+	if projectSlug == "" || projectID == "" {
+		return "", fmt.Errorf("project slug or ID is empty")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving home directory: %w", err)
+	}
+
+	sharedDirBase := sharedDirHostPath(home, projectSlug, projectID, "scratchpad")
+	return filepath.Join(sharedDirBase, ".attachments", gchatAttachmentDir, conversationID), nil
+}
+
+// resolveAgentPath translates agent-side container paths to host-side paths.
+//
+// Supported paths:
+//   - /scion-volumes/<name>/<file> → shared dir host path
+//   - /workspace/.scion-volumes/<name>/<file> → same as above
+//   - Absolute paths starting with / that are already host paths → returned as-is
+func resolveAgentPath(agentPath, projectSlug, projectID string) string {
+	// Handle /scion-volumes/<name>/... paths.
+	if strings.HasPrefix(agentPath, "/scion-volumes/") {
+		return resolveSharedDirPath(agentPath, projectSlug, projectID)
+	}
+
+	// Handle /workspace/.scion-volumes/<name>/... paths.
+	if strings.HasPrefix(agentPath, "/workspace/.scion-volumes/") {
+		containerPath := "/scion-volumes/" + strings.TrimPrefix(agentPath, "/workspace/.scion-volumes/")
+		return resolveSharedDirPath(containerPath, projectSlug, projectID)
+	}
+
+	// For absolute paths that aren't container paths, only allow paths
+	// under known safe directories to prevent arbitrary file exfiltration.
+	if strings.HasPrefix(agentPath, "/") {
+		safePrefixes := []string{"/workspace/", "/scion-volumes/"}
+		for _, prefix := range safePrefixes {
+			if strings.HasPrefix(agentPath, prefix) {
+				clean := filepath.ToSlash(filepath.Clean(agentPath))
+				// Re-check prefix after Clean to prevent traversal (e.g. /workspace/../etc/passwd).
+				if strings.HasPrefix(clean, prefix) {
+					if _, err := os.Stat(clean); err == nil {
+						return clean
+					}
+				}
+				break
+			}
+		}
+	}
+
+	return ""
+}
+
+// resolveSharedDirPath converts a /scion-volumes/<name>/... path to the host-side path.
+func resolveSharedDirPath(containerPath, projectSlug, projectID string) string {
+	if projectSlug == "" || projectID == "" {
+		return ""
+	}
+
+	trimmed := strings.TrimPrefix(containerPath, "/scion-volumes/")
+	if trimmed == "" || trimmed == containerPath {
+		return ""
+	}
+
+	parts := strings.SplitN(trimmed, "/", 2)
+	sharedDirName := parts[0]
+	if sharedDirName == "" || sharedDirName == "." || sharedDirName == ".." || strings.ContainsAny(sharedDirName, "/\\") {
+		return ""
+	}
+
+	relPath := ""
+	if len(parts) > 1 {
+		relPath = filepath.Clean(parts[1])
+		if strings.HasPrefix(relPath, "..") || filepath.IsAbs(relPath) {
+			return ""
+		}
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+
+	base := sharedDirHostPath(home, projectSlug, projectID, sharedDirName)
+	if relPath == "" || relPath == "." {
+		return base
+	}
+
+	hostPath := filepath.Join(base, relPath)
+	// Verify the resolved path doesn't escape the shared dir.
+	if !strings.HasPrefix(hostPath, base+string(filepath.Separator)) {
+		return ""
+	}
+	return hostPath
+}
+
+// sanitizePathComponent removes characters that are unsafe in file paths.
+func sanitizePathComponent(s string) string {
+	s = filepath.Base(s)
+	s = strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r == '\x00' {
+			return '_'
+		}
+		return r
+	}, s)
+	if s == "." || s == ".." || s == "" {
+		return ""
+	}
+	return s
+}
+
+// formatFileSize returns a human-readable file size string.
+func formatFileSize(bytes int64) string {
+	const mb = 1024 * 1024
+	if bytes >= mb {
+		return fmt.Sprintf("%.1f MB", float64(bytes)/float64(mb))
+	}
+	return fmt.Sprintf("%.1f KB", float64(bytes)/1024.0)
+}
+
+// sharedDirHostPath computes the host-side directory path for a shared
+// directory. This replicates the logic from pkg/config.SharedDirHostPath
+// to avoid pulling in the full config package with its heavy transitive
+// dependencies (ent, koanf, rclone, etc.).
+//
+// Path format: ~/.scion/project-configs/<slug>__<shortUUID>/shared-dirs/<name>
+func sharedDirHostPath(home, slug, projectID, sharedDirName string) string {
+	shortUUID := strings.ReplaceAll(projectID, "-", "")
+	if len(shortUUID) > 8 {
+		shortUUID = shortUUID[:8]
+	}
+	dirName := fmt.Sprintf("%s__%s", slug, shortUUID)
+	return filepath.Join(home, ".scion", "project-configs", dirName, "shared-dirs", sharedDirName)
 }

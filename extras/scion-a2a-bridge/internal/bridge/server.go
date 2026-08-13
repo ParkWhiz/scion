@@ -28,9 +28,22 @@ import (
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
 
 var slugRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// BridgePathPatterns returns URL patterns for the A2A bridge API.
+// These patterns are used by RequestLogMiddleware to extract project and agent
+// IDs from the request path for structured log enrichment.
+func BridgePathPatterns() []logging.PathPattern {
+	return []logging.PathPattern{
+		{Prefix: "/projects/", ProjectIdx: 0, AgentIdx: 2}, // /projects/{slug}/agents/{slug}/...
+		{Prefix: "/groves/", ProjectIdx: 0, AgentIdx: 2},   // /groves/{slug}/agents/{slug}/...
+	}
+}
 
 // Server is the A2A HTTP server that routes requests to the SDK handler.
 type Server struct {
@@ -113,17 +126,17 @@ func ValidateConfig(cfg *Config) error {
 		return fmt.Errorf("hub.user is required")
 	}
 	switch cfg.Auth.Scheme {
-	case "", "apiKey", "bearer", "none", "hubUAT", "hubJWT":
+	case "", "apiKey", "bearer", "none", "hubUAT", "hubJWT", "federation":
 		// valid
 	default:
-		return fmt.Errorf("unsupported auth.scheme: %q (supported: apiKey, bearer, none, hubUAT, hubJWT)", cfg.Auth.Scheme)
+		return fmt.Errorf("unsupported auth.scheme: %q (supported: apiKey, bearer, none, hubUAT, hubJWT, federation)", cfg.Auth.Scheme)
 	}
 	if (cfg.Auth.Scheme == "apiKey" || cfg.Auth.Scheme == "bearer") && cfg.Auth.APIKey == "" {
 		return fmt.Errorf("auth.api_key is required when auth.scheme is %q", cfg.Auth.Scheme)
 	}
 	// api_key is required for legacy schemes and the default (empty) scheme.
-	// hubUAT and hubJWT do not use api_key — they validate per-user credentials instead.
-	if cfg.Auth.APIKey == "" && cfg.Auth.Scheme != "none" && cfg.Auth.Scheme != "hubUAT" && cfg.Auth.Scheme != "hubJWT" {
+	// hubUAT, hubJWT, and federation do not use api_key — they validate per-user/agent credentials instead.
+	if cfg.Auth.APIKey == "" && cfg.Auth.Scheme != "none" && cfg.Auth.Scheme != "hubUAT" && cfg.Auth.Scheme != "hubJWT" && cfg.Auth.Scheme != "federation" {
 		return fmt.Errorf("auth.api_key is required (set auth.scheme: \"none\" to explicitly disable authentication)")
 	}
 	if cfg.Auth.Scheme == "hubJWT" && cfg.Hub.SigningKey == "" && cfg.Hub.SigningKeySecret == "" {
@@ -155,6 +168,8 @@ func (s *Server) WarnOnOpenAuth() {
 		s.log.Info("bridge auth: hubUAT — per-user Scion UAT authentication enabled")
 	case "hubJWT":
 		s.log.Info("bridge auth: hubJWT — per-user Scion JWT authentication enabled")
+	case "federation":
+		s.log.Info("bridge auth: federation — pass-through OIDC federation authentication enabled (hub validates tokens)")
 	}
 	if cfg.RateLimit.TrustProxy {
 		s.log.Warn("rate_limit.trust_proxy is enabled — X-Forwarded-For is trusted unconditionally, which allows clients to spoof their IP and bypass per-IP rate limits; consider adding network-level proxy restrictions")
@@ -168,6 +183,10 @@ func (s *Server) Handler() http.Handler {
 	// Top-level well-known agent card (registry).
 	mux.HandleFunc("GET /.well-known/agent-card.json", s.handleWellKnownAgentCard)
 
+	// OIDC discovery proxy — publicly exposes the hub's IAP-protected OIDC endpoints.
+	mux.HandleFunc("GET /.well-known/openid-configuration", s.handleOIDCDiscoveryProxy)
+	mux.HandleFunc("GET /.well-known/jwks.json", s.handleJWKSProxy)
+
 	// Per-agent routes — the SDK handler handles JSON-RPC protocol.
 	mux.HandleFunc("GET /projects/{projectSlug}/agents/{agentSlug}/.well-known/agent-card.json", s.handleAgentCard)
 	mux.HandleFunc("POST /projects/{projectSlug}/agents/{agentSlug}/jsonrpc", s.handleJSONRPC)
@@ -179,9 +198,9 @@ func (s *Server) Handler() http.Handler {
 	// Health, readiness, and metrics.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
-	mux.Handle("GET /metrics", MetricsHandler())
+	mux.Handle("GET /metrics", MetricsHandler(prometheus.DefaultGatherer))
 
-	// Wrap with middleware chain: metrics -> rate limit -> auth.
+	// Wrap with middleware chain: request-log -> metrics -> rate limit -> auth.
 	handler := s.authMiddleware(mux)
 	if s.snapshot != nil {
 		handler = s.snapshotRateLimitMiddleware(handler)
@@ -189,7 +208,22 @@ func (s *Server) Handler() http.Handler {
 		handler = RateLimitMiddleware(handler, s.config.RateLimit)
 	}
 	handler = InstrumentHandler(handler, s.metrics)
-	return handler
+	handler = logging.RequestLogMiddleware(
+		s.log, "scion-a2a-bridge", BridgePathPatterns(), 0,
+	)(handler)
+
+	// Internal endpoints — behind Hub-JWT auth with service claim pin,
+	// NOT the external authMiddleware (which enforces the A2A auth_scheme
+	// and would leave the endpoint open when scheme is "none").
+	internalMux := http.NewServeMux()
+	internalMux.HandleFunc("POST /internal/sweep", s.handleInternalSweep)
+
+	// Combine: internal routes (with their own auth) + external routes.
+	combinedMux := http.NewServeMux()
+	combinedMux.Handle("/internal/", s.hubJWTAuthMiddleware(internalMux))
+	combinedMux.Handle("/", handler) // handler is the existing middleware chain
+
+	return combinedMux
 }
 
 // SDKRequestHandler returns the a2asrv.RequestHandler for use with other transports (gRPC, REST).
@@ -211,7 +245,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	checks := map[string]string{}
 	ready := true
 
-	if err := s.bridge.store.Ping(); err != nil {
+	if err := s.bridge.store.Ping(r.Context()); err != nil {
 		s.log.Error("readiness check: database ping failed", "error", err)
 		checks["database"] = "error"
 		ready = false
@@ -317,6 +351,9 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Opportunistic sweep: fire at most once per interval per instance.
+	s.bridge.maybeOpportunisticSweep(r.Context())
+
 	// Enforce request body size limit to prevent memory exhaustion.
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB
 
@@ -357,8 +394,11 @@ func writeJSONRPCError(w http.ResponseWriter, id interface{}, code int, message 
 // consistency even if a config swap happens mid-flight.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Public endpoints skip auth.
-		if r.URL.Path == "/.well-known/agent-card.json" || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+		// Public/operational endpoints skip auth.
+		if r.URL.Path == "/.well-known/agent-card.json" ||
+			r.URL.Path == "/.well-known/openid-configuration" ||
+			r.URL.Path == "/.well-known/jwks.json" ||
+			r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/metrics" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -433,6 +473,31 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			if err != nil {
 				s.log.Debug("JWT validation failed", "error", err)
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			ctx := withCallerIdentity(r.Context(), caller)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+
+		case "federation":
+			// Federation pass-through: decode the JWT WITHOUT verification
+			// for bridge-local bookkeeping (task isolation, logging).
+			// The hub validates the token via X-Scion-Federation-Token.
+			//
+			// NOTE: The bridge decodes federation tokens WITHOUT signature verification.
+			// This is by design: the hub validates the token via its FederationAuthenticator
+			// when the bridge passes it in the X-Scion-Federation-Token header.
+			// Bridge-level signature verification requires public OIDC discovery
+			// endpoints, which is tracked as issue #930.
+			token := extractBearerToken(r)
+			if token == "" {
+				http.Error(w, "unauthorized: missing bearer token", http.StatusUnauthorized)
+				return
+			}
+			caller, err := decodeFederationToken(token)
+			if err != nil {
+				s.log.Debug("federation token decode failed", "error", err)
+				http.Error(w, "unauthorized: malformed token", http.StatusUnauthorized)
 				return
 			}
 			ctx := withCallerIdentity(r.Context(), caller)
@@ -523,6 +588,50 @@ func (s *Server) effectiveConfig() *Config {
 		return &snap.Config
 	}
 	return s.config
+}
+
+// hubJWTAuthMiddleware validates Hub-issued JWTs and pins the service claim.
+// This protects internal endpoints (like /internal/sweep) that must only be
+// callable by the Hub scheduler, not by arbitrary Hub users.
+func (s *Server) hubJWTAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.jwtValidator == nil {
+			http.Error(w, "sweep endpoint not configured", http.StatusServiceUnavailable)
+			return
+		}
+
+		token := extractBearerToken(r)
+		if token == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		identity, err := s.jwtValidator.Validate(token)
+		if err != nil {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		// PIN THE SERVICE CLAIM — this is the security-critical detail.
+		// Without this check, any valid Hub user token can trigger sweeps.
+		if identity.Role != "service" {
+			http.Error(w, "forbidden: service role required", http.StatusForbidden)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// handleInternalSweep runs the bridge sweep: reap stale tasks + purge old events.
+func (s *Server) handleInternalSweep(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	s.bridge.RunSweep(ctx)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok"}`))
 }
 
 // extractBearerToken extracts the token from an Authorization: Bearer header.

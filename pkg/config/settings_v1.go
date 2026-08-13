@@ -289,6 +289,10 @@ type VersionedSettings struct {
 	DefaultModel         string `json:"default_model,omitempty" yaml:"default_model,omitempty" koanf:"default_model"`
 	DefaultThinkingLevel *int   `json:"default_thinking_level,omitempty" yaml:"default_thinking_level,omitempty" koanf:"default_thinking_level"`
 
+	// Default agent authorization
+	DefaultMaxAgentRole string `json:"default_max_agent_role,omitempty" yaml:"default_max_agent_role,omitempty" koanf:"default_max_agent_role"`
+	DefaultAgentRole    string `json:"default_agent_role,omitempty" yaml:"default_agent_role,omitempty" koanf:"default_agent_role"`
+
 	// AutoInjectGcloudADC controls whether the host's gcloud Application Default
 	// Credentials file is automatically injected into agent containers in
 	// co-located (workstation) mode.
@@ -296,11 +300,19 @@ type VersionedSettings struct {
 
 	// AutoExposePorts controls whether ports are automatically exposed in agent containers.
 	AutoExposePorts *AutoExposePortsSettings `json:"auto_expose_ports,omitempty" yaml:"auto_expose_ports,omitempty" koanf:"auto_expose_ports"`
+
+	// ProjectDefaults controls hub-level defaults applied at project creation time.
+	ProjectDefaults *ProjectDefaultsSettings `json:"project_defaults,omitempty" yaml:"project_defaults,omitempty" koanf:"project_defaults"`
 }
 
 // AutoExposePortsSettings holds the auto-expose ports configuration.
 type AutoExposePortsSettings struct {
 	Enabled *bool `json:"enabled,omitempty" yaml:"enabled,omitempty" koanf:"enabled"`
+}
+
+// ProjectDefaultsSettings holds project creation defaults in settings.yaml.
+type ProjectDefaultsSettings struct {
+	DefaultScratchpad *bool `json:"default_scratchpad,omitempty" yaml:"default_scratchpad,omitempty" koanf:"default_scratchpad"`
 }
 
 // V1ServerConfig holds server-side configuration in the versioned settings format.
@@ -341,6 +353,16 @@ type V1ServerConfig struct {
 
 	// Scheduler configures the Hub background task scheduler.
 	Scheduler *V1SchedulerConfig `json:"scheduler,omitempty" yaml:"scheduler,omitempty" koanf:"scheduler"`
+
+	// OIDCLogin configures an external OIDC provider for web login
+	// (the Hub as Relying Party, not as IdP).
+	OIDCLogin *V1OIDCLoginConfig `json:"oidc_login,omitempty" yaml:"oidc_login,omitempty" koanf:"oidc_login"`
+
+	// OIDC configures the OIDC Identity Provider feature.
+	OIDC *OIDCProviderConfig `json:"oidc,omitempty" yaml:"oidc,omitempty" koanf:"oidc"`
+
+	// Federation configures hub-hub federation authentication.
+	Federation *V1FederationConfig `json:"federation,omitempty" yaml:"federation,omitempty" koanf:"federation"`
 }
 
 // V1GitHubAppConfig holds the GitHub App configuration in settings.yaml format.
@@ -368,6 +390,39 @@ type V1SchedulerConfig struct {
 	// pool saturation) is active out-of-the-box. Set to 0 for unlimited
 	// (pre-fix behavior), or a higher value for larger deployments.
 	MaxConcurrency *int `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty" koanf:"max_concurrency"`
+}
+
+// V1OIDCLoginConfig holds configuration for an external OIDC login provider
+// in the versioned settings format (snake_case).
+type V1OIDCLoginConfig struct {
+	Enabled      *bool    `json:"enabled,omitempty" yaml:"enabled,omitempty" koanf:"enabled"`
+	DisplayName  string   `json:"display_name,omitempty" yaml:"display_name,omitempty" koanf:"display_name"`
+	IssuerURL    string   `json:"issuer_url,omitempty" yaml:"issuer_url,omitempty" koanf:"issuer_url"`
+	ClientID     string   `json:"client_id,omitempty" yaml:"client_id,omitempty" koanf:"client_id"`
+	ClientSecret string   `json:"client_secret,omitempty" yaml:"client_secret,omitempty" koanf:"client_secret"`
+	Scopes       []string `json:"scopes,omitempty" yaml:"scopes,omitempty" koanf:"scopes"`
+}
+
+// V1FederationConfig is the admin API wire format for federation settings.
+type V1FederationConfig struct {
+	Enabled          *bool                   `json:"enabled,omitempty" yaml:"enabled,omitempty" koanf:"enabled"`
+	TrustedIssuers   []V1TrustedIssuerConfig `json:"trusted_issuers,omitempty" yaml:"trusted_issuers,omitempty" koanf:"trusted_issuers"`
+	Algorithms       []string                `json:"algorithms,omitempty" yaml:"algorithms,omitempty" koanf:"algorithms"`
+	RefreshInterval  string                  `json:"refresh_interval,omitempty" yaml:"refresh_interval,omitempty" koanf:"refresh_interval"`
+	DebounceInterval string                  `json:"debounce_interval,omitempty" yaml:"debounce_interval,omitempty" koanf:"debounce_interval"`
+}
+
+// V1TrustedIssuerConfig is the admin API wire format for a single trusted issuer.
+type V1TrustedIssuerConfig struct {
+	IssuerURL        string   `json:"issuer_url" yaml:"issuer_url" koanf:"issuer_url"`
+	JWKSURL          string   `json:"jwks_url,omitempty" yaml:"jwks_url,omitempty" koanf:"jwks_url"`
+	ExpectedAudience string   `json:"expected_audience,omitempty" yaml:"expected_audience,omitempty" koanf:"expected_audience"`
+	AllowedProjects  []string `json:"allowed_projects,omitempty" yaml:"allowed_projects,omitempty" koanf:"allowed_projects"`
+	AllowedRootUsers []string `json:"allowed_root_users,omitempty" yaml:"allowed_root_users,omitempty" koanf:"allowed_root_users"`
+	DefaultScopes    []string `json:"default_scopes,omitempty" yaml:"default_scopes,omitempty" koanf:"default_scopes"`
+	IssuerType       string   `json:"issuer_type,omitempty" yaml:"issuer_type,omitempty" koanf:"issuer_type"`
+	DefaultRole      string   `json:"default_role,omitempty" yaml:"default_role,omitempty" koanf:"default_role"`
+	AllowedEmails    []string `json:"allowed_emails,omitempty" yaml:"allowed_emails,omitempty" koanf:"allowed_emails"`
 }
 
 // V1NotificationChannelConfig holds configuration for an external notification channel.
@@ -446,6 +501,13 @@ type V1ServerHubConfig struct {
 	SoftDeleteRetention string `json:"soft_delete_retention,omitempty" yaml:"soft_delete_retention,omitempty" koanf:"soft_delete_retention"`
 	// SoftDeleteRetainFiles controls whether workspace files are preserved during soft-delete.
 	SoftDeleteRetainFiles *bool `json:"soft_delete_retain_files,omitempty" yaml:"soft_delete_retain_files,omitempty" koanf:"soft_delete_retain_files"`
+	// GCPIAMCheckMode controls whether IAM actAs permission is checked when
+	// binding a GCP service account to an agent.
+	// "off" (default) or "enforce".
+	GCPIAMCheckMode string `json:"gcp_iam_check_mode,omitempty" yaml:"gcp_iam_check_mode,omitempty" koanf:"gcp_iam_check_mode"`
+	// GCPIAMDenyUnknownPolicy controls behavior when deny policies cannot be
+	// evaluated. "fail-open" (default) or "fail-closed".
+	GCPIAMDenyUnknownPolicy string `json:"gcp_iam_deny_unknown_policy,omitempty" yaml:"gcp_iam_deny_unknown_policy,omitempty" koanf:"gcp_iam_deny_unknown_policy"`
 	// AutoSuspendStalled controls whether stalled agents are automatically suspended.
 	AutoSuspendStalled *bool `json:"auto_suspend_stalled,omitempty" yaml:"auto_suspend_stalled,omitempty" koanf:"auto_suspend_stalled"`
 	// StalledThreshold is how long before an agent is marked stalled (e.g., "5m", "10m").
@@ -775,6 +837,16 @@ type V1CloudRunConfig struct {
 	Region string `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
 }
 
+// V1CloudRunInstancesConfig holds Cloud Run Instances runtime settings.
+// This is the per-agent-instance variant of Cloud Run, where each agent
+// gets its own Cloud Run service instance.
+type V1CloudRunInstancesConfig struct {
+	// ProjectID is the GCP project ID for Cloud Run Instances API calls.
+	ProjectID string `json:"project_id,omitempty" yaml:"project_id,omitempty" koanf:"project_id"`
+	// Region is the GCP region for Cloud Run instances (e.g. "us-central1").
+	Region string `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
+}
+
 // V1RuntimeConfig extends RuntimeConfig with a Type field.
 type V1RuntimeConfig struct {
 	Type              string            `json:"type,omitempty" yaml:"type,omitempty" koanf:"type"`
@@ -787,6 +859,8 @@ type V1RuntimeConfig struct {
 	ListAllNamespaces bool              `json:"list_all_namespaces,omitempty" yaml:"list_all_namespaces,omitempty" koanf:"list_all_namespaces"`
 	// CloudRun holds Cloud Run-specific settings when Type is "cloudrun".
 	CloudRun *V1CloudRunConfig `json:"cloudrun,omitempty" yaml:"cloudrun,omitempty" koanf:"cloudrun"`
+	// CloudRunInstances holds Cloud Run Instances-specific settings when Type is "cloudrun-instances".
+	CloudRunInstances *V1CloudRunInstancesConfig `json:"cloudrun_instances,omitempty" yaml:"cloudrun_instances,omitempty" koanf:"cloudrun_instances"`
 }
 
 // V1RuntimeDefaultsConfig holds runtime-wide behaviour that is not specific to
@@ -1343,6 +1417,12 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Hub.SoftDeleteRetainFiles != nil {
 			gc.Hub.SoftDeleteRetainFiles = *v1.Hub.SoftDeleteRetainFiles
 		}
+		if v1.Hub.GCPIAMCheckMode != "" {
+			gc.Hub.GCPIAMCheckMode = v1.Hub.GCPIAMCheckMode
+		}
+		if v1.Hub.GCPIAMDenyUnknownPolicy != "" {
+			gc.Hub.GCPIAMDenyUnknownPolicy = v1.Hub.GCPIAMDenyUnknownPolicy
+		}
 		if v1.Hub.AutoSuspendStalled != nil {
 			gc.Hub.AutoSuspendStalled = *v1.Hub.AutoSuspendStalled
 		}
@@ -1539,9 +1619,10 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		}
 	}
 
-	// Workspace storage NFS defaults (conditional on backend=nfs)
+	// Workspace storage — thread into GlobalConfig so the hub can read it.
 	if v1.WorkspaceStorage != nil {
 		v1.WorkspaceStorage.ApplyNFSDefaults()
+		gc.WorkspaceStorage = v1.WorkspaceStorage
 	}
 
 	// GitHub App
@@ -1559,6 +1640,46 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 	if v1.Scheduler != nil {
 		gc.Scheduler.IntervalSeconds = v1.Scheduler.IntervalSeconds
 		gc.Scheduler.MaxConcurrency = v1.Scheduler.MaxConcurrency // both are *int; nil propagates
+	}
+
+	// OIDC Identity Provider
+	if v1.OIDC != nil {
+		gc.OIDC = *v1.OIDC
+	}
+
+	// OIDC Login (external OIDC provider for web login)
+	if v1.OIDCLogin != nil {
+		if v1.OIDCLogin.Enabled != nil {
+			gc.OIDCLogin.Enabled = *v1.OIDCLogin.Enabled
+		}
+		gc.OIDCLogin.DisplayName = v1.OIDCLogin.DisplayName
+		gc.OIDCLogin.IssuerURL = v1.OIDCLogin.IssuerURL
+		gc.OIDCLogin.ClientID = v1.OIDCLogin.ClientID
+		gc.OIDCLogin.ClientSecret = v1.OIDCLogin.ClientSecret
+		if len(v1.OIDCLogin.Scopes) > 0 {
+			gc.OIDCLogin.Scopes = v1.OIDCLogin.Scopes
+		}
+	}
+
+	// Federation
+	if v1.Federation != nil {
+		if v1.Federation.Enabled != nil {
+			gc.Federation.Enabled = *v1.Federation.Enabled
+		}
+		for _, vi := range v1.Federation.TrustedIssuers {
+			gc.Federation.TrustedIssuers = append(gc.Federation.TrustedIssuers, TrustedIssuerConfig(vi))
+		}
+		gc.Federation.Algorithms = v1.Federation.Algorithms
+		if v1.Federation.RefreshInterval != "" {
+			if d, err := time.ParseDuration(v1.Federation.RefreshInterval); err == nil {
+				gc.Federation.Cache.RefreshInterval = d
+			}
+		}
+		if v1.Federation.DebounceInterval != "" {
+			if d, err := time.ParseDuration(v1.Federation.DebounceInterval); err == nil {
+				gc.Federation.Cache.DebounceInterval = d
+			}
+		}
 	}
 
 	return &gc
@@ -1723,6 +1844,41 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		v1.Scheduler = &V1SchedulerConfig{
 			IntervalSeconds: gc.Scheduler.IntervalSeconds,
 			MaxConcurrency:  gc.Scheduler.MaxConcurrency,
+		}
+	}
+
+	// OIDC Login config (external OIDC provider for web login)
+	if gc.OIDCLogin.Enabled || gc.OIDCLogin.IssuerURL != "" {
+		v1.OIDCLogin = &V1OIDCLoginConfig{
+			Enabled:      &gc.OIDCLogin.Enabled,
+			DisplayName:  gc.OIDCLogin.DisplayName,
+			IssuerURL:    gc.OIDCLogin.IssuerURL,
+			ClientID:     gc.OIDCLogin.ClientID,
+			ClientSecret: gc.OIDCLogin.ClientSecret,
+			Scopes:       gc.OIDCLogin.Scopes,
+		}
+	}
+
+	// OIDC Identity Provider config
+	if gc.OIDC.Enabled || gc.OIDC.IssuerURL != "" {
+		oidc := gc.OIDC
+		v1.OIDC = &oidc
+	}
+
+	// Federation
+	if gc.Federation.Enabled || len(gc.Federation.TrustedIssuers) > 0 {
+		v1.Federation = &V1FederationConfig{
+			Enabled:    &gc.Federation.Enabled,
+			Algorithms: gc.Federation.Algorithms,
+		}
+		if gc.Federation.Cache.RefreshInterval > 0 {
+			v1.Federation.RefreshInterval = gc.Federation.Cache.RefreshInterval.String()
+		}
+		if gc.Federation.Cache.DebounceInterval > 0 {
+			v1.Federation.DebounceInterval = gc.Federation.Cache.DebounceInterval.String()
+		}
+		for _, ti := range gc.Federation.TrustedIssuers {
+			v1.Federation.TrustedIssuers = append(v1.Federation.TrustedIssuers, V1TrustedIssuerConfig(ti))
 		}
 	}
 
@@ -2034,6 +2190,11 @@ func LoadEffectiveSettings(projectPath string) (*VersionedSettings, []string, er
 		if missingSchemaVersion {
 			warnings = append(warnings, `settings.yaml contains v1 runtime fields (type, cloudrun, gke, list_all_namespaces) but is missing 'schema_version: "1"'; add it as the first line to silence this warning`)
 		}
+		// Apply DB-backed settings overlay (co-located hub+broker mode).
+		// DB values win over file values for runtimes, profiles, harness_configs.
+		if o := globalOverlay; o != nil {
+			o.Apply(vs)
+		}
 		return vs, warnings, nil
 	}
 
@@ -2073,6 +2234,10 @@ func LoadEffectiveSettings(projectPath string) (*VersionedSettings, []string, er
 	}
 	vs, legacyWarnings := AdaptLegacySettings(legacy)
 	warnings = append(warnings, legacyWarnings...)
+	// Apply DB-backed settings overlay (co-located hub+broker mode).
+	if o := globalOverlay; o != nil {
+		o.Apply(vs)
+	}
 	return vs, warnings, nil
 }
 

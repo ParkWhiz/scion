@@ -38,12 +38,14 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/imagecheck"
+	"github.com/GoogleCloudPlatform/scion/pkg/lifecyclehooks"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dbmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
@@ -153,6 +155,9 @@ type ServerConfig struct {
 	// AutoExposePortsDefault is the default auto-expose-ports enabled state for new agents.
 	// Exposed via GET /api/v1/settings/public so the web UI can pre-populate the checkbox.
 	AutoExposePortsDefault *bool
+	// DefaultScratchpad controls whether new projects automatically get a
+	// "scratchpad" shared directory. When nil, the compiled default (true) applies.
+	DefaultScratchpad *bool
 	// TelemetryConfig is the full hub-level telemetry config from settings.yaml.
 	// Used to populate default telemetry config on new agents when no per-agent
 	// or template-level telemetry config is set.
@@ -194,6 +199,15 @@ type ServerConfig struct {
 	SecretBackend secret.SecretBackend
 	// MaintenanceConfig holds configuration for routine maintenance operations.
 	MaintenanceConfig MaintenanceConfig
+	// GCPIAMCheckMode controls whether IAM actAs permission is checked when
+	// binding a GCP service account to an agent.
+	// "off" (default) or "enforce". See sa_assign_gate.go for the constants.
+	GCPIAMCheckMode string
+	// GCPIAMDenyUnknownPolicy controls behavior when the Policy Troubleshooter
+	// cannot evaluate deny policies (e.g., Hub SA lacks org-level permissions).
+	// "fail-open" (default): if allow is granted and deny is unknown, treat as
+	// allowed. "fail-closed": treat as indeterminate (denied).
+	GCPIAMDenyUnknownPolicy string
 	// GCPProjectID is the GCP project ID used for minting service accounts.
 	// If empty, auto-detected from the metadata server when running on GCE/Cloud Run.
 	GCPProjectID string
@@ -231,6 +245,29 @@ type ServerConfig struct {
 	Workstation bool
 	// DevUserConfig holds optional identity overrides for the development user.
 	DevUserConfig DevUserConfig
+
+	// OIDCLogin holds configuration for an external OIDC provider for web login.
+	OIDCLogin config.OIDCLoginConfig
+	// OIDCConfig holds configuration for the OIDC Identity Provider feature.
+	// When Enabled, the hub initializes an OIDCKeyManager and exposes OIDC endpoints.
+	OIDCConfig config.OIDCProviderConfig
+
+	// Federation holds configuration for hub-hub federation authentication.
+	// When Federation.Enabled is true, the server initializes a FederationAuthenticator
+	// and injects it into the auth middleware.
+	Federation config.FederationConfig
+
+	// Mode is the server mode (e.g. "workstation", "dev", "hosted").
+	// Used by the federation authenticator to enforce HTTPS on issuer URLs
+	// in non-dev/non-workstation modes.
+	Mode string
+
+	// WorkspaceStorageConfig selects the workspace storage backend for
+	// hub-managed project workspaces. When Backend is "nfs" or
+	// "cloudrun-volume", hubManagedProjectPath returns a path on the
+	// configured durable mount instead of the node-local home directory.
+	// Nil or Backend=="" / "local" preserves the legacy ephemeral behavior.
+	WorkspaceStorageConfig *config.V1WorkspaceStorageConfig
 }
 
 // MaintenanceConfig holds configuration for routine maintenance operation executors.
@@ -673,12 +710,16 @@ type Server struct {
 	// statelessEmbeddedBroker is true when the embedded broker identity is a
 	// replica-independent API adapter rather than a process-owned control channel.
 	statelessEmbeddedBroker bool
-	runtimeReloadFunc       func() bool        // Callback to reload the co-located broker runtime; returns true if swapped
-	workstation             bool               // True when running in workstation (non-production) mode
-	scheduler               *Scheduler         // Unified scheduler for recurring tasks
-	cleanupOnce             sync.Once          // Ensures CleanupResources runs only once
-	ctx                     context.Context    // Server-lifetime context; cancelled on Shutdown
-	ctxCancel               context.CancelFunc // Cancels ctx
+	runtimeReloadFunc       func() bool // Callback to reload the co-located broker runtime; returns true if swapped
+	workstation             bool        // True when running in workstation (non-production) mode
+	// webdavLocks stores per-project WebDAV lock systems keyed by project ID.
+	// This replaces the per-request webdav.NewMemLS() so that locks survive
+	// across HTTP requests within a single instance.
+	webdavLocks sync.Map           // map[string]webdav.LockSystem
+	scheduler   *Scheduler         // Unified scheduler for recurring tasks
+	cleanupOnce sync.Once          // Ensures CleanupResources runs only once
+	ctx         context.Context    // Server-lifetime context; cancelled on Shutdown
+	ctxCancel   context.CancelFunc // Cancels ctx
 
 	logQueryService  *LogQueryService         // Cloud Logging query service (nil = disabled)
 	metricsDashboard *MetricsDashboardService // Cloud Monitoring metrics dashboard (nil = disabled)
@@ -689,8 +730,25 @@ type Server struct {
 	// Discord link service for code-based account linking (nil = disabled)
 	discordLinkService *DiscordLinkService
 
+	// Teams link service for code-based account linking (nil = disabled)
+	teamsLinkService *TeamsLinkService
+
 	// Plugin manager for broker integration admin API (nil = no integrations)
 	pluginManager IntegrationManager
+
+	// Web chat store for webchat_* tables (thread prefs, chat threads, etc.) — nil = disabled.
+	webChatStore WebChatStore
+
+	// Chat notifier for human mention + DM received notifications (W6). Nil-safe.
+	chatNotifier *ChatNotifier
+
+	// Attachment file store for chat attachments (W7). Nil = attachments disabled.
+	// HA limitation: LocalDiskAttachmentStore is single-node only; see attachments.go.
+	attachmentStore AttachmentStore
+
+	// Presence manager for in-memory user presence tracking (nil = disabled).
+	// Single-node only; see design §4.5 HA limitation.
+	presenceManager *PresenceManager
 
 	// Channel registry for external notification delivery (nil = disabled)
 	channelRegistry *ChannelRegistry
@@ -700,11 +758,37 @@ type Server struct {
 	transportAudience string
 	transportMode     string
 
+	// OIDC identity provider (nil = OIDC IdP disabled)
+	oidcKeyManager       *OIDCKeyManager
+	oidcIssuerURL        string
+	oidcTokenRateLimiter *GCPTokenRateLimiter // per-agent rate limiter for OIDC identity token requests
+	oidcTokenLifetime    time.Duration        // validity duration for OIDC identity tokens
+
 	// GCP token generator for agent identity (nil = GCP identity disabled)
 	gcpTokenGenerator GCPTokenGenerator
 
 	// GCP IAM admin for minting service accounts (nil = minting disabled)
 	gcpIAMAdmin GCPServiceAccountAdmin
+
+	// Caller-permission checker for the agent service-account assignment
+	// surface, and the mode gating whether it is consulted. Both are ALWAYS
+	// set explicitly in NewServer — nil is a wiring bug and denies, it is not
+	// a way to switch the check off. Turning the check off is done by
+	// installing store.NewDisabledCallerPermissionChecker, which is a value
+	// somebody has to construct and pass. See saAssignCheckerFor.
+	saAssignChecker     store.CallerPermissionChecker
+	saAssignCheckMode   string
+	denyUnknownFailOpen bool
+
+	// The same pair for the lifecycle-hook execution-identity surface. A
+	// SEPARATE field rather than a shared one, deliberately: the two surfaces
+	// degrade differently when the check is off (agent assign falls back to
+	// policy-gated, hook identity falls back to ungated), so an operator must
+	// be able to reason about — and eventually enable — them independently.
+	// Sharing one field would make that impossible and would hide the
+	// difference behind a single innocuous-looking setting.
+	hookIdentityChecker   store.CallerPermissionChecker
+	hookIdentityCheckMode string
 
 	// GCP token rate limiter (nil = no rate limiting)
 	gcpTokenRateLimiter *GCPTokenRateLimiter
@@ -761,6 +845,10 @@ type Server struct {
 	// Shared HTTP client for federation proxy calls (no redirect following).
 	federationClient *http.Client
 
+	// federationAuth holds the current FederationAuthenticator.
+	// Swapped atomically by ApplySnapshot; read by the auth middleware.
+	federationAuth atomic.Pointer[FederationAuthenticator]
+
 	imageBuildActive atomic.Bool
 	imagePullActive  atomic.Bool
 
@@ -786,6 +874,15 @@ type Server struct {
 
 	// ghResolutionStore is the DB-backed GitHub skill resolution cache (nil when entClient is nil).
 	ghResolutionStore *GitHubResolutionStore
+
+	// nonceCacheStore is the DB-backed HMAC nonce replay cache (nil when entClient is nil).
+	// When set, it replaces the in-memory NonceCache in BrokerAuthService for
+	// cross-instance replay protection.
+	nonceCacheStore *NonceCacheStore
+
+	// chatLinkStore is the DB-backed chat link code store (nil when entClient is nil).
+	// When non-nil, Telegram/Discord/Teams link services delegate to it.
+	chatLinkStore *ChatLinkStore
 }
 
 // groupsLogger returns the groups subsystem logger, falling back to
@@ -948,14 +1045,30 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Initialize Discord link service
 	srv.discordLinkService = NewDiscordLinkService()
 
-	// Initialize OAuth service if configured
-	if cfg.OAuthConfig.IsConfigured() {
-		srv.oauthService = NewOAuthService(cfg.OAuthConfig)
+	// Initialize Teams link service
+	srv.teamsLinkService = NewTeamsLinkService()
+
+	// Validate OIDC login configuration at startup (fail fast).
+	if cfg.OIDCLogin.Enabled {
+		if err := validateOIDCLoginConfig(&cfg.OIDCLogin); err != nil {
+			return nil, fmt.Errorf("invalid OIDC login configuration: %w", err)
+		}
+	}
+
+	// Initialize OAuth service if configured (traditional OAuth or OIDC login)
+	oidcLoginCfg := &cfg.OIDCLogin // may be zero-value (Enabled=false)
+	if cfg.OAuthConfig.IsConfigured() || cfg.OIDCLogin.Enabled {
+		srv.oauthService = NewOAuthService(cfg.OAuthConfig, oidcLoginCfg)
 		slog.Info("OAuth service initialized")
 		// Log which providers are configured
 		logOAuthProviders("Web", cfg.OAuthConfig.Web)
 		logOAuthProviders("CLI", cfg.OAuthConfig.CLI)
 		logOAuthProviders("Device", cfg.OAuthConfig.Device)
+		if cfg.OIDCLogin.Enabled {
+			slog.Info("OIDC login provider configured",
+				"displayName", cfg.OIDCLogin.DisplayName,
+				"issuerUrl", cfg.OIDCLogin.IssuerURL)
+		}
 	} else {
 		slog.Info("OAuth service NOT configured - no providers available")
 		slog.Info("To enable OAuth, set environment variables SCION_SERVER_OAUTH_CLI_GOOGLE_CLIENTID, etc.")
@@ -988,6 +1101,51 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		slog.Info("Transport token minter configured",
 			"mode", cfg.TransportMode,
 			"audience", cfg.TransportAudience)
+	}
+
+	// Initialize OIDC Identity Provider key manager if enabled
+	if cfg.OIDCConfig.Enabled {
+		oidcIssuerURL := cfg.OIDCConfig.IssuerURL
+		if oidcIssuerURL == "" {
+			oidcIssuerURL = cfg.HubEndpoint
+		}
+		if oidcIssuerURL == "" {
+			return nil, fmt.Errorf("OIDC is enabled but no issuer URL configured (set oidc.issuer_url or hub.endpoint)")
+		}
+		oidcIssuerURL = strings.TrimRight(oidcIssuerURL, "/")
+
+		oidcMgr, err := NewOIDCKeyManager(ctx, OIDCKeyManagerConfig{
+			Store:                   s,
+			Backend:                 srv.secretBackend,
+			HubID:                   srv.hubID,
+			IssuerURL:               oidcIssuerURL,
+			RequireStableSigningKey: cfg.RequireStableSigningKey,
+			Log:                     logging.Subsystem("hub.oidc"),
+		})
+		if err != nil {
+			if isGCPBackend || cfg.RequireStableSigningKey {
+				return nil, fmt.Errorf("OIDC key manager: %w", err)
+			}
+			slog.Warn("Failed to initialize OIDC key manager", "error", err)
+		} else {
+			srv.oidcKeyManager = oidcMgr
+			srv.oidcIssuerURL = oidcIssuerURL
+
+			// Start background loops for key cleanup and cross-instance refresh.
+			oidcMgr.StartCleanupLoop(ctx)
+			oidcMgr.StartRefreshLoop(ctx)
+
+			// OIDC identity token lifetime: use config if set, else default 15m
+			srv.oidcTokenLifetime = 15 * time.Minute
+			if cfg.OIDCConfig.TokenLifetime > 0 {
+				srv.oidcTokenLifetime = cfg.OIDCConfig.TokenLifetime
+			}
+
+			// Per-agent rate limiter for OIDC identity token requests (0.5 req/sec avg, burst 30)
+			srv.oidcTokenRateLimiter = NewGCPTokenRateLimiter(0.5, 30)
+
+			slog.Info("OIDC Identity Provider enabled", "issuer_url", oidcIssuerURL)
+		}
 	}
 
 	// Initialize control channel manager
@@ -1056,8 +1214,86 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Initialize authorization service
 	srv.authzService = NewAuthzService(s, logging.Subsystem("hub.auth"))
 
+	// Wire the caller-permission checker for agent service-account assignment.
+	//
+	// GCP IAM check mode: read from config, default to "off" (Q1 ruling).
+	// When "enforce", the PT checker (wired later in server_foreground.go)
+	// gates SA assignment. The disabled checker installed here is the default
+	// until a real checker replaces it via SetSAAssignChecker.
+	//
+	// Installed explicitly rather than left nil on purpose: a nil checker
+	// denies, so "forgot to wire it" and "chose to switch it off" cannot be
+	// confused for one another. See NewDisabledCallerPermissionChecker.
+	gcpIAMMode := cfg.GCPIAMCheckMode
+	switch gcpIAMMode {
+	case SAAssignCheckEnforce:
+		srv.saAssignCheckMode = SAAssignCheckEnforce
+		srv.hookIdentityCheckMode = SAAssignCheckEnforce
+	case SAAssignCheckOff, "":
+		srv.saAssignCheckMode = SAAssignCheckOff
+		srv.hookIdentityCheckMode = SAAssignCheckOff
+	default:
+		slog.Warn("unrecognised gcpIamCheckMode value, defaulting to off",
+			"value", gcpIAMMode)
+		srv.saAssignCheckMode = SAAssignCheckOff
+		srv.hookIdentityCheckMode = SAAssignCheckOff
+	}
+
+	// Parse deny-unknown fallback policy (default: fail-open).
+	srv.denyUnknownFailOpen = true
+	switch cfg.GCPIAMDenyUnknownPolicy {
+	case "fail-closed":
+		srv.denyUnknownFailOpen = false
+	case "fail-open", "":
+		srv.denyUnknownFailOpen = true
+	default:
+		slog.Warn("unrecognised gcpIamDenyUnknownPolicy value, defaulting to fail-open",
+			"value", cfg.GCPIAMDenyUnknownPolicy)
+	}
+	slog.Info("GCP deny-unknown fallback policy",
+		"policy", cfg.GCPIAMDenyUnknownPolicy,
+		"failOpen", srv.denyUnknownFailOpen)
+
+	srv.saAssignChecker = store.NewDisabledCallerPermissionChecker()
+	if srv.saAssignCheckMode == SAAssignCheckOff {
+		// Names the SURFACE and what it degrades to, not the feature. The same
+		// disabled checker means "policy-gated only" here and "ungated"
+		// elsewhere; a message about "the IAM check" would mislead about the
+		// other one.
+		slog.Warn("GCP caller-permission checking is OFF for agent service-account assignment: "+
+			"assignment is gated by Hub policy only, and no caller is checked for "+
+			store.PermissionActAs+" on the target account",
+			"surface", SurfaceAgentAssign, "mode", srv.saAssignCheckMode)
+	} else {
+		slog.Info("GCP caller-permission checking is ENFORCE for agent service-account assignment",
+			"surface", SurfaceAgentAssign, "mode", srv.saAssignCheckMode)
+	}
+
+	// Same wiring for the lifecycle-hook execution-identity surface, installed
+	// separately because it degrades to something strictly worse. See the
+	// field comment and SurfaceHookExecutionIdentity.
+	srv.hookIdentityChecker = store.NewDisabledCallerPermissionChecker()
+	if srv.hookIdentityCheckMode == SAAssignCheckOff {
+		slog.Warn("GCP caller-permission checking is OFF for lifecycle-hook execution identity: "+
+			"any caller who may write a hook may run it as any in-scope verified service account, "+
+			"and no caller is checked for "+store.PermissionActAs+" on it. Unlike agent "+
+			"service-account assignment, this surface has NO second policy layer to fall back on",
+			"surface", lifecyclehooks.SurfaceHookExecutionIdentity,
+			"mode", srv.hookIdentityCheckMode)
+	} else {
+		slog.Info("GCP caller-permission checking is ENFORCE for lifecycle-hook execution identity",
+			"surface", lifecyclehooks.SurfaceHookExecutionIdentity,
+			"mode", srv.hookIdentityCheckMode)
+	}
+
 	// Seed default policies and groups (idempotent)
 	seedDefaultPoliciesAndGroups(ctx, s)
+
+	// Backfill the per-project service-account assign policy onto projects
+	// that predate it (idempotent). Projects nobody touches never run
+	// createProjectMembersGroupAndPolicy again, so without this their members
+	// would silently lose assign when the gate moves to ActionAssign.
+	backfillProjectAssignPolicies(ctx, s)
 
 	// Seed the dev user when dev-auth is enabled so that Ent FK constraints
 	// on owner_id are satisfied when the dev user creates projects/groups.
@@ -1085,6 +1321,38 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 			"runs", runs, "migrations", migrations)
 	}
 
+	// Initialize federation authenticator if enabled.
+	if cfg.Federation.Enabled {
+		// Derive mode for HTTPS enforcement.
+		federationMode := cfg.Mode
+		if federationMode == "" {
+			if cfg.Workstation {
+				federationMode = "workstation"
+			} else {
+				federationMode = "hosted"
+			}
+		}
+		// Use the OIDC issuer URL as the default expected audience.
+		federationAudience := srv.oidcIssuerURL
+		if federationAudience == "" {
+			federationAudience = cfg.OIDCConfig.IssuerURL
+		}
+
+		fa, err := NewFederationAuthenticator(
+			cfg.Federation,
+			federationAudience,
+			srv.federationClient,
+			federationMode,
+			logging.Subsystem("hub.federation"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("federation authenticator init: %w", err)
+		}
+		srv.federationAuth.Store(fa)
+		slog.Info("Federation authenticator enabled",
+			"trusted_issuers", len(cfg.Federation.TrustedIssuers))
+	}
+
 	// Build unified auth configuration
 	srv.authConfig = AuthConfig{
 		Mode:               "production",
@@ -1094,8 +1362,10 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		AgentTokenSvc:      srv.agentTokenService,
 		UserTokenSvc:       srv.userTokenService,
 		UATSvc:             srv.uatService,
+		BrokerAuthSvc:      srv.brokerAuthService,
 		TrustedProxies:     cfg.TrustedProxies,
 		ProxyAuthenticator: cfg.ProxyAuth,
+		FederationAuth:     &srv.federationAuth,
 		AuthMode:           cfg.AuthMode,
 		Debug:              cfg.Debug,
 		Logger:             srv.authLog,
@@ -1610,6 +1880,55 @@ func (s *Server) GetMessageBrokerProxy() *MessageBrokerProxy {
 	return s.messageBrokerProxy
 }
 
+// SetWebChatStore sets the webchat store for thread prefs and chat threads API.
+// It also initializes the ChatNotifier for human-mention and DM notifications (W6).
+func (s *Server) SetWebChatStore(wcs WebChatStore) {
+	s.mu.Lock()
+	s.webChatStore = wcs
+	// Initialize ChatNotifier with the store; presence checker is nil (W5 stub).
+	s.chatNotifier = NewChatNotifier(s.store, s.events, wcs, nil, s.messageLog)
+	// Wire into existing broker proxy if already started (startup order varies).
+	if s.messageBrokerProxy != nil {
+		s.messageBrokerProxy.chatNotifier = s.chatNotifier
+	}
+	s.mu.Unlock()
+}
+
+// SetAttachmentStore sets the attachment file store for upload/download (W7).
+func (s *Server) SetAttachmentStore(as AttachmentStore) {
+	s.mu.Lock()
+	s.attachmentStore = as
+	s.mu.Unlock()
+}
+
+// getChatNotifier returns the chat notifier, or nil if not initialized.
+func (s *Server) getChatNotifier() *ChatNotifier {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.chatNotifier
+}
+
+// InitPresenceManager creates and starts the presence manager for real-time
+// user presence tracking. It seeds the in-memory map from User.last_seen.
+// Call this after the event publisher is wired.
+func (s *Server) InitPresenceManager() {
+	pm := NewPresenceManager(s.events, s.store)
+	pm.SeedFromStore(s.ctx, s.store)
+	s.mu.Lock()
+	s.presenceManager = pm
+	s.mu.Unlock()
+}
+
+// StopPresenceManager shuts down the presence manager's background goroutine.
+func (s *Server) StopPresenceManager() {
+	s.mu.RLock()
+	pm := s.presenceManager
+	s.mu.RUnlock()
+	if pm != nil {
+		pm.Stop()
+	}
+}
+
 // SetPluginManager sets the plugin manager for broker integration admin API.
 func (s *Server) SetPluginManager(m IntegrationManager) {
 	s.mu.Lock()
@@ -1631,6 +1950,28 @@ func (s *Server) SetIntegrationHA(dbDriver string, client *ent.Client, dsn strin
 	// Initialize GitHub resolution store when ent client is available
 	if client != nil {
 		s.ghResolutionStore = NewGitHubResolutionStore(client)
+	}
+
+	// Initialize DB-backed nonce cache store and wire it into the broker auth
+	// service for cross-instance HMAC replay protection.
+	if client != nil && s.brokerAuthService != nil {
+		s.nonceCacheStore = NewNonceCacheStore(client)
+		s.brokerAuthService.SetNonceCacheStore(s.nonceCacheStore)
+	}
+
+	// Initialize DB-backed chat link code store and wire it into link services
+	// so codes are shared across Hub instances.
+	if client != nil {
+		s.chatLinkStore = NewChatLinkStore(client)
+		if s.telegramLinkService != nil {
+			s.telegramLinkService.SetStore(s.chatLinkStore)
+		}
+		if s.discordLinkService != nil {
+			s.discordLinkService.SetStore(s.chatLinkStore)
+		}
+		if s.teamsLinkService != nil {
+			s.teamsLinkService.SetStore(s.chatLinkStore)
+		}
 	}
 
 	s.mu.Unlock()
@@ -1752,6 +2093,13 @@ func (s *Server) GetStore() store.Store {
 	return s.store
 }
 
+// GetAuthzService returns the authorization service.
+func (s *Server) GetAuthzService() *AuthzService {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.authzService
+}
+
 // GetBrokerAuthService returns the broker authentication service.
 func (s *Server) GetBrokerAuthService() *BrokerAuthService {
 	s.mu.RLock()
@@ -1838,6 +2186,62 @@ func (s *Server) SetGCPServiceAccountAdmin(a GCPServiceAccountAdmin) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcpIAMAdmin = a
+}
+
+// DenyUnknownFailOpen returns the configured deny-unknown fallback policy.
+// Used by server_foreground.go to pass the setting to the PT checker constructor.
+func (s *Server) DenyUnknownFailOpen() bool {
+	return s.denyUnknownFailOpen
+}
+
+// SetSAAssignChecker replaces the caller-permission checker for the agent
+// service-account assignment surface. Both SetSAAssignChecker and
+// SetHookIdentityChecker should typically be called with the same cached
+// checker instance so that the two surfaces share one cache.
+func (s *Server) SetSAAssignChecker(c store.CallerPermissionChecker) {
+	s.mu.Lock()
+	old := s.saAssignChecker
+	s.saAssignChecker = c
+	s.mu.Unlock()
+
+	// Drain stale entries from the outgoing checker. Entries cached under the
+	// old checker's inner would produce decisions against the wrong backend
+	// if the reference leaked (it shouldn't, but belt-and-suspenders).
+	if cc, ok := old.(*CachedCallerPermissionChecker); ok {
+		cc.InvalidateAll()
+	}
+}
+
+// SetHookIdentityChecker replaces the caller-permission checker for the
+// lifecycle-hook execution-identity surface.
+func (s *Server) SetHookIdentityChecker(c store.CallerPermissionChecker) {
+	s.mu.Lock()
+	old := s.hookIdentityChecker
+	s.hookIdentityChecker = c
+	s.mu.Unlock()
+
+	// Drain stale entries — same rationale as SetSAAssignChecker.
+	if cc, ok := old.(*CachedCallerPermissionChecker); ok {
+		cc.InvalidateAll()
+	}
+}
+
+// invalidateActAsCache removes cached actAs decisions for a specific SA.
+// Called after SA deletion and Hub-initiated IAM mutations (mint path).
+// No-op if the configured checkers do not support invalidation (e.g.
+// DisabledCallerPermissionChecker when gcpIamCheckMode=off).
+func (s *Server) invalidateActAsCache(saEmail string) {
+	s.mu.RLock()
+	assignChecker := s.saAssignChecker
+	hookChecker := s.hookIdentityChecker
+	s.mu.RUnlock()
+
+	if c, ok := assignChecker.(*CachedCallerPermissionChecker); ok {
+		c.InvalidateForSA(saEmail)
+	}
+	if c, ok := hookChecker.(*CachedCallerPermissionChecker); ok {
+		c.InvalidateForSA(saEmail)
+	}
 }
 
 // SetGCPProjectID sets the GCP project ID used for minting service accounts.
@@ -1949,6 +2353,7 @@ func (s *Server) StartMessageBroker(b eventbus.EventBus) {
 
 	proxy := NewMessageBrokerProxy(b, s.store, s.events, s.GetDispatcher, logging.Subsystem("hub.broker"))
 	proxy.messageLog = s.dedicatedMessageLog
+	proxy.chatNotifier = s.chatNotifier // W6: wire DM notification trigger
 	s.messageBrokerProxy = proxy
 	proxy.Start()
 
@@ -2066,8 +2471,11 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 
 // GenerateAgentToken generates a JWT for an agent.
 // This is a convenience method that delegates to the token service.
-// Additional scopes are merged with the default scopes (status update, token refresh, and notify).
-func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string, additionalScopes ...AgentTokenScope) (string, error) {
+// Base scopes are determined by the passed role.
+// Dev-auth mode overrides to full if the role would be more restrictive,
+// preserving dev-mode behavior where all agents get full access.
+// Additional scopes are merged with the role-based defaults, deduplicated.
+func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string, role AgentRole, additionalScopes []AgentTokenScope) (string, error) {
 	s.mu.RLock()
 	tokenService := s.agentTokenService
 	s.mu.RUnlock()
@@ -2076,13 +2484,14 @@ func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string
 		return "", fmt.Errorf("agent token service not initialized")
 	}
 
-	scopes := []AgentTokenScope{ScopeAgentStatusUpdate, ScopeAgentTokenRefresh, ScopeAgentNotify, ScopeAgentPortForward}
-
-	// In dev-auth mode, auto-grant agent creation and lifecycle scopes
-	// so agents can create sub-agents without explicit template configuration.
-	if s.config.DevAuthToken != "" {
-		scopes = append(scopes, ScopeAgentCreate, ScopeAgentLifecycle)
+	// Use the specified role for base scopes.
+	// Dev-auth mode overrides to full if the role would be more restrictive,
+	// preserving dev-mode behavior where all agents get full access.
+	effectiveRole := role
+	if s.config.DevAuthToken != "" && CompareRoles(role, AgentRoleFull) < 0 {
+		effectiveRole = AgentRoleFull
 	}
+	scopes := ScopesForRole(effectiveRole)
 
 	// Merge additional scopes, deduplicating
 	seen := make(map[AgentTokenScope]bool, len(scopes))
@@ -2694,9 +3103,27 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	s.scheduler.RegisterRecurringSingleton("broker-message-sweep", 5, store.LockBrokerMessageSweep, s.brokerMessageSweepHandler())
 	s.scheduler.RegisterRecurringSingleton("exposed-ports-sweep", 5, store.LockExposedPortsSweep, s.exposedPortsSweepHandler())
 
+	// A2A bridge sweep — conditional on the bridge being registered as a standalone plugin.
+	if a2aExternalURL := s.getA2ABridgeExternalURL(); a2aExternalURL != "" {
+		s.scheduler.RegisterRecurringSingleton(
+			"a2a-bridge-sweep", 5, store.LockA2ABridgeSweep,
+			s.a2aBridgeSweepHandler(a2aExternalURL),
+		)
+	}
+
 	// Register GitHub resolution cache TTL eviction (every 10 minutes)
 	if s.ghResolutionStore != nil {
 		s.scheduler.RegisterRecurringSingleton("github-resolution-cache-eviction", 10, store.LockGitHubResolutionCacheEviction, s.githubResolutionCacheEvictionHandler())
+	}
+
+	// Register HMAC nonce cache TTL eviction (every 5 minutes)
+	if s.nonceCacheStore != nil {
+		s.scheduler.RegisterRecurringSingleton("nonce-cache-eviction", 5, store.LockNonceCacheEviction, s.nonceCacheEvictionHandler())
+	}
+
+	// Register chat link code TTL eviction (every 5 minutes)
+	if s.chatLinkStore != nil {
+		s.scheduler.RegisterRecurringSingleton("chat-link-code-eviction", 5, store.LockChatLinkCodeEviction, s.chatLinkCodeEvictionHandler())
 	}
 
 	// Register GitHub App health check if the app is configured
@@ -2724,9 +3151,17 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 		}
 	}
 
-	// Start rate limiter cleanup goroutine (exits when ctx is cancelled).
+	// Start rate limiter cleanup goroutines (exit when ctx is cancelled).
 	if s.gcpTokenRateLimiter != nil {
 		s.gcpTokenRateLimiter.StartCleanup(ctx)
+	}
+	if s.oidcTokenRateLimiter != nil {
+		s.oidcTokenRateLimiter.StartCleanup(ctx)
+	}
+
+	// Start OIDC key cleanup loop to remove expired rotated keys from JWKS.
+	if s.oidcKeyManager != nil {
+		s.oidcKeyManager.StartCleanupLoop(ctx)
 	}
 
 	// Start notification dispatcher (uses the current event publisher).
@@ -2822,6 +3257,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.lifecycleHookEvaluator.Stop()
 	}
 
+	// Stop presence manager before closing event publisher
+	if s.presenceManager != nil {
+		s.presenceManager.Stop()
+	}
+
 	// Close event publisher
 	if s.events != nil {
 		s.events.Close()
@@ -2875,6 +3315,13 @@ func (s *Server) CleanupResources(ctx context.Context) error {
 		}
 		if s.discordLinkService != nil {
 			s.discordLinkService.Close()
+		}
+		if s.teamsLinkService != nil {
+			s.teamsLinkService.Close()
+		}
+		// Stop presence manager before closing event publisher
+		if s.presenceManager != nil {
+			s.presenceManager.Stop()
 		}
 		if s.events != nil {
 			s.events.Close()
@@ -2947,6 +3394,20 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/templates", s.handleTemplatesV2)
 	s.mux.HandleFunc("/api/v1/templates/", s.handleTemplateByIDV2)
 
+	// Scope-addressed service accounts. The project-nested routes under
+	// /api/v1/projects/{id}/gcp-service-accounts remain registered and
+	// unchanged; these routes exist for scopes that have no project to nest
+	// under.
+	//
+	// The by-id subtree serves PARENTLESS accounts only -- hub and user scope.
+	// A project-scoped account is 404 there, so this is not a second address
+	// for accounts that already have one; it is the only address for accounts
+	// that have none. P4 registered the collection alone because it only
+	// needed to list; P5 needs to view, re-verify and delete a hub-scoped
+	// account from a UI and a CLI that are not inside any project.
+	s.mux.HandleFunc("/api/v1/gcp-service-accounts", s.handleGCPServiceAccounts)
+	s.mux.HandleFunc("/api/v1/gcp-service-accounts/", s.handleGCPServiceAccountByID)
+
 	s.mux.HandleFunc("/api/v1/skills", s.handleSkills)
 	s.mux.HandleFunc("/api/v1/skills/", s.handleSkillByID)
 
@@ -3011,6 +3472,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/maintenance/operations/", s.handleAdminMaintenanceOps)
 	s.mux.HandleFunc("/api/v1/admin/maintenance/migrations/", s.handleAdminMaintenanceMigrations)
 	s.mux.HandleFunc("/api/v1/admin/maintenance/check-updates", s.handleCheckForUpdates)
+	s.mux.HandleFunc("/api/v1/admin/maintenance/restart", s.handleAdminRestart)
 	s.mux.HandleFunc("/api/v1/admin/scheduler", s.handleAdminScheduler)
 	s.mux.HandleFunc("/api/v1/admin/allow-list", s.handleAdminAllowList)
 	s.mux.HandleFunc("/api/v1/admin/allow-list/", s.handleAdminAllowListByEmail)
@@ -3028,6 +3490,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/lifecycle-hooks/", s.handleAdminLifecycleHookByID)
 	s.mux.HandleFunc("/api/v1/admin/validate-resources", s.handleAdminValidateResources)
 	s.mux.HandleFunc("/api/v1/admin/integrations", s.handleAdminIntegrations)
+	s.mux.HandleFunc("/api/v1/admin/integrations/teams/manifest", s.handleTeamsManifestDownload)
 	s.mux.HandleFunc("/api/v1/admin/integrations/", s.handleAdminIntegrationByName)
 	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs/stream", s.handleDiagnosticsLogsStream)
 	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs", s.handleDiagnosticsLogs)
@@ -3043,6 +3506,25 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/messages", s.handleMessages)
 	s.mux.HandleFunc("/api/v1/messages/", s.handleMessageRoutes)
 	s.mux.HandleFunc("/api/v1/message-channels", s.handleMessageChannels)
+
+	// Chat thread prefs (Phase 3 — visibility mode persistence)
+	s.mux.HandleFunc("/api/v1/chat/prefs", s.handleChatPrefs)
+
+	// Chat thread endpoints (Phase 5 — thread rail, legacy)
+	s.mux.HandleFunc("/api/v1/chat/threads", s.handleChatThreads)
+	s.mux.HandleFunc("/api/v1/chat/threads/", s.handleChatThreadRoutes)
+
+	// Wave-2 chat endpoints (conversation REST API)
+	s.mux.HandleFunc("/api/v1/chat/spaces", s.handleChatSpaces)
+	s.mux.HandleFunc("/api/v1/chat/spaces/", s.handleChatSpaceRoutes)
+	s.mux.HandleFunc("/api/v1/chat/conversations/", s.handleChatConversationRoutes)
+	s.mux.HandleFunc("/api/v1/chat/topics/", s.handleChatTopicRoutes)
+	s.mux.HandleFunc("/api/v1/chat/dms", s.handleChatDMs)
+	s.mux.HandleFunc("/api/v1/chat/user-prefs", s.handleChatUserPrefs)
+	s.mux.HandleFunc("/api/v1/chat/presence", s.handleChatPresence)
+	s.mux.HandleFunc("/api/v1/chat/search", s.handleChatSearch)
+	s.mux.HandleFunc("/api/v1/chat/attachments", s.handleChatAttachments)
+	s.mux.HandleFunc("/api/v1/chat/attachments/", s.handleChatAttachmentByID)
 
 	// WebSocket control channel endpoint for Runtime Brokers
 	s.mux.HandleFunc("/api/v1/runtime-brokers/connect", s.handleRuntimeBrokerConnect)
@@ -3071,6 +3553,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/discord/link/verify", s.handleDiscordLinkVerify)
 	s.mux.HandleFunc("/api/v1/discord/link/status", s.handleDiscordLinkStatus)
 
+	// Teams account linking endpoints
+	s.mux.HandleFunc("/api/v1/teams/link", s.handleTeamsLink)
+	s.mux.HandleFunc("/api/v1/teams/link/verify", s.handleTeamsLinkVerify)
+	s.mux.HandleFunc("/api/v1/teams/link/status", s.handleTeamsLinkStatus)
+
 	// Unified resource import endpoint (templates + harness-configs, global + project)
 	s.mux.HandleFunc("/api/v1/resources/import", s.handleResourcesImport)
 	s.mux.HandleFunc("/api/v1/resources/discover", s.handleResourcesDiscover)
@@ -3095,6 +3582,13 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/api/v1/system/apple-dns", s.requireWorkstation(http.HandlerFunc(s.handleAppleDNS)))
 	s.mux.Handle("/api/v1/system/registry", s.requireWorkstation(http.HandlerFunc(s.handleSystemRegistry)))
 	s.mux.Handle("/api/v1/system/workstation-settings", s.requireWorkstation(http.HandlerFunc(s.handleWorkstationSettings)))
+
+	// OIDC Identity Provider endpoints (unauthenticated — public metadata)
+	if s.oidcKeyManager != nil {
+		s.mux.HandleFunc("GET /.well-known/openid-configuration", s.handleOIDCDiscovery)
+		s.mux.HandleFunc("GET /.well-known/jwks.json", s.handleJWKS)
+		s.mux.HandleFunc("POST /api/v1/agent/identity-token", s.handleAgentIdentityToken)
+	}
 
 	// Workstation-only filesystem endpoints
 	s.mux.Handle("/api/v1/system/fs/list", s.requireWorkstation(http.HandlerFunc(s.handleFSList)))
@@ -3491,6 +3985,48 @@ func (s *Server) githubResolutionCacheEvictionHandler() func(ctx context.Context
 	}
 }
 
+// nonceCacheEvictionHandler returns a recurring handler function that purges
+// expired HMAC nonce cache entries from the database. This prevents the nonce
+// table from growing unbounded and reclaims storage for nonces whose TTL has
+// passed.
+func (s *Server) nonceCacheEvictionHandler() func(ctx context.Context) {
+	return func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		if s.nonceCacheStore == nil {
+			return
+		}
+
+		purged, err := s.nonceCacheStore.PurgeExpired(ctx)
+		if err != nil {
+			slog.Error("Scheduler: nonce cache eviction failed", "error", err)
+			return
+		}
+		if purged > 0 {
+			slog.Info("Scheduler: nonce cache eviction completed", "purged", purged)
+		}
+	}
+}
+
+// chatLinkCodeEvictionHandler returns a recurring handler function that
+// purges expired chat link code entries. This prevents the chat_link_codes
+// table from growing unbounded.
+func (s *Server) chatLinkCodeEvictionHandler() func(ctx context.Context) {
+	return func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		if s.chatLinkStore == nil {
+			return
+		}
+
+		if err := s.chatLinkStore.PurgeExpired(ctx); err != nil {
+			slog.Error("Scheduler: chat link code eviction failed", "error", err)
+		}
+	}
+}
+
 // seedGitHubResolutionCacheSettings seeds the github_resolution_cache section
 // in hub_settings with default TTL values. This runs on every startup so operators
 // can see and adjust the cache behavior via the settings UI.
@@ -3525,4 +4061,62 @@ func (s *Server) seedGitHubResolutionCacheSettings(ctx context.Context) error {
 
 	slog.Info("Seeded github_resolution_cache settings into hub_settings")
 	return nil
+}
+
+// getA2ABridgeExternalURL returns the external URL of the A2A bridge if it is
+// registered as a standalone plugin, or "" if not configured. Used to
+// conditionally register the Hub-driven sweep scheduler job.
+func (s *Server) getA2ABridgeExternalURL() string {
+	if s.pluginManager == nil {
+		return ""
+	}
+	cfg := s.pluginManager.GetPluginConfig("broker", "a2a-bridge")
+	return cfg["external_url"]
+}
+
+// a2aBridgeSweepHandler returns a recurring handler that POSTs to the bridge's
+// /internal/sweep endpoint with a Hub-minted service JWT. The bridge validates
+// the token and runs the sweep (reap stale tasks + purge old events).
+func (s *Server) a2aBridgeSweepHandler(externalURL string) func(ctx context.Context) {
+	return func(ctx context.Context) {
+		if s.userTokenService == nil {
+			slog.Warn("a2a-bridge-sweep: user token service not available, skipping")
+			return
+		}
+
+		// Mint a short-lived JWT with a service claim. The bridge's
+		// hubJWTAuthMiddleware pins on role=="service" — without this
+		// claim, any valid user token could trigger sweeps.
+		token, _, err := s.userTokenService.GenerateAccessToken(
+			"hub-scheduler",        // userID — synthetic service identity
+			"hub-scheduler@system", // email
+			"Hub Scheduler",        // displayName
+			"service",              // role — the pinned service claim
+			ClientTypeAPI,          // clientType
+		)
+		if err != nil {
+			slog.Error("a2a-bridge-sweep: failed to mint sweep token", "error", err)
+			return
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", externalURL+"/internal/sweep", nil)
+		if err != nil {
+			slog.Error("a2a-bridge-sweep: failed to create request", "error", err)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		sweepClient := &http.Client{Timeout: 30 * time.Second}
+		resp, err := sweepClient.Do(req)
+		if err != nil {
+			slog.Error("a2a-bridge-sweep: request failed", "error", err)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			slog.Warn("a2a-bridge-sweep: non-200 response",
+				"status", resp.StatusCode, "url", externalURL)
+		}
+	}
 }

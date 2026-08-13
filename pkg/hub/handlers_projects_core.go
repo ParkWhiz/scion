@@ -129,6 +129,10 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 	query := r.URL.Query()
 
@@ -356,6 +360,23 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		project.SharedDirs = s.defaultProjectSharedDirs()
 	}
 
+	// Apply hub-level default agent roles to new projects.
+	if defaults := s.hubAgentDefaults(); defaults.DefaultMaxAgentRole != "" || defaults.DefaultAgentRole != "" {
+		if project.Annotations == nil {
+			project.Annotations = make(map[string]string)
+		}
+		if defaults.DefaultMaxAgentRole != "" {
+			if _, exists := project.Annotations[projectSettingMaxAgentRole]; !exists {
+				project.Annotations[projectSettingMaxAgentRole] = defaults.DefaultMaxAgentRole
+			}
+		}
+		if defaults.DefaultAgentRole != "" {
+			if _, exists := project.Annotations[projectSettingDefaultAgentRole]; !exists {
+				project.Annotations[projectSettingDefaultAgentRole] = defaults.DefaultAgentRole
+			}
+		}
+	}
+
 	if err := s.store.CreateProject(ctx, project); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
@@ -366,6 +387,9 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 
 	// Create project members group and policy (best-effort)
 	s.createProjectMembersGroupAndPolicy(ctx, project)
+
+	// Ensure the #general chat topic exists for this project (best-effort).
+	s.ensureProjectGeneralTopic(ctx, project)
 
 	// For git projects, try to auto-associate a GitHub App installation so that
 	// clone/pull operations can mint tokens. This covers the case where the app
@@ -490,6 +514,37 @@ func (s *Server) createProjectGroup(ctx context.Context, project *store.Project)
 			}
 		}
 	}
+}
+
+// ensureProjectGeneralTopic creates the #general chat topic for a project if
+// the webchat store is configured. Best-effort: failures are logged but do not
+// block project creation.
+func (s *Server) ensureProjectGeneralTopic(ctx context.Context, project *store.Project) {
+	if s.webChatStore == nil {
+		return
+	}
+	createdBy := project.CreatedBy
+	if createdBy == "" {
+		createdBy = "system"
+	}
+	topicID, created, err := s.webChatStore.EnsureGeneralTopic(ctx, project.ID, createdBy)
+	if err != nil {
+		s.projectsLogger().Warn("failed to create #general topic for project",
+			"project_id", project.ID, "error", err)
+		return
+	}
+
+	// Only publish the created event when a new topic was actually inserted.
+	// EnsureGeneralTopic is idempotent (ON CONFLICT DO NOTHING), so
+	// re-calling it for an existing project must not emit a spurious event.
+	if !created {
+		return
+	}
+	topic, err := s.webChatStore.GetTopic(ctx, topicID)
+	if err != nil || topic == nil {
+		return
+	}
+	s.events.PublishChatTopicEvent(ctx, project.ID, "created", *topic)
 }
 
 // createProjectMembersGroupAndPolicy creates an explicit members group for a project
@@ -667,14 +722,91 @@ func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project
 		s.projectsLogger().Warn("failed to bind project member policy",
 			"project_id", project.ID, "policy", policyName, "error", err.Error())
 	}
+
+	// Create the project-level service-account assign policy alongside it.
+	// See projectAssignPolicyName in seed.go for why it is project-scoped and
+	// what reach it preserves.
+	ensureProjectAssignPolicy(ctx, s.store, project, membersGroup.ID)
 }
 
 // hubManagedProjectPath returns the filesystem path for a hub-managed project workspace.
 // It prefers projects/<slug> and falls back to groves/<slug> for backward compatibility
 // with workspaces created before the grove-to-project rename.
+//
+// When the server has a workspace storage config with backend "nfs" or
+// "cloudrun-volume", the NFS/volume-backed path is returned instead.
+// A backward-compatible fallback checks the NFS path first, then the
+// legacy local path, so existing local deployments continue to work
+// when NFS is first configured.
+func (s *Server) hubManagedProjectPath(slug string) (string, error) {
+	if err := validateProjectSlug(slug); err != nil {
+		return "", err
+	}
+
+	wsCfg := s.config.WorkspaceStorageConfig
+
+	// --- NFS backend ---
+	if wsCfg != nil && wsCfg.Backend == "nfs" && wsCfg.NFS != nil && len(wsCfg.NFS.Shares) > 0 {
+		share := wsCfg.NFS.Shares[0]
+		mountBase := filepath.Join(wsCfg.NFS.MountRoot, share.ID)
+		nfsPath := filepath.Join(mountBase, "hub-projects", slug)
+		if hasWorkspaceContent(nfsPath) {
+			return nfsPath, nil
+		}
+		// Fallback: check legacy local path for backward compatibility
+		if localPath, err := localProjectPath(slug); err == nil && hasWorkspaceContent(localPath) {
+			return localPath, nil
+		}
+		// Neither has content — return NFS path (new projects go to NFS)
+		return nfsPath, nil
+	}
+
+	// --- Cloud Run volume backend ---
+	if wsCfg != nil && wsCfg.Backend == "cloudrun-volume" && wsCfg.CloudRunVolume != nil {
+		subPathRoot := wsCfg.CloudRunVolume.SubPathRoot
+		if subPathRoot == "" {
+			subPathRoot = "projects"
+		}
+		crPath := filepath.Join("/mnt", wsCfg.CloudRunVolume.VolumeName, subPathRoot, "hub-projects", slug)
+		if hasWorkspaceContent(crPath) {
+			return crPath, nil
+		}
+		// Fallback: check legacy local path
+		if localPath, err := localProjectPath(slug); err == nil && hasWorkspaceContent(localPath) {
+			return localPath, nil
+		}
+		return crPath, nil
+	}
+
+	// --- Default: local ephemeral path (existing behavior) ---
+	return localProjectPath(slug)
+}
+
+// hubManagedProjectPath is the package-level backward-compatible wrapper used by
+// callers that don't have access to a Server (e.g. resolveHubProjectSharedDirPath).
+// It always returns the local path. Server-method callers should prefer
+// s.hubManagedProjectPath for durable-storage awareness.
 func hubManagedProjectPath(slug string) (string, error) {
+	return localProjectPath(slug)
+}
+
+// validateProjectSlug rejects empty slugs and slugs containing path-traversal
+// characters (/, \, ..) to prevent directory-traversal attacks.
+func validateProjectSlug(slug string) error {
 	if slug == "" {
-		return "", fmt.Errorf("project slug must not be empty")
+		return fmt.Errorf("project slug must not be empty")
+	}
+	if strings.Contains(slug, "/") || strings.Contains(slug, "\\") || strings.Contains(slug, "..") {
+		return fmt.Errorf("project slug contains invalid characters")
+	}
+	return nil
+}
+
+// localProjectPath returns the legacy local filesystem path for a hub-managed
+// project workspace under ~/.scion/projects/<slug>, with groves/<slug> fallback.
+func localProjectPath(slug string) (string, error) {
+	if err := validateProjectSlug(slug); err != nil {
+		return "", err
 	}
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
@@ -688,7 +820,6 @@ func hubManagedProjectPath(slug string) (string, error) {
 	if hasWorkspaceContent(grovesPath) {
 		return grovesPath, nil
 	}
-	// Neither has content — return projects path (will be created on demand)
 	return projectsPath, nil
 }
 
@@ -715,7 +846,7 @@ func hasWorkspaceContent(dir string) bool {
 // hub connection settings. Unlike regular projects, hub-managed projects store
 // settings directly in the .scion directory (no split storage or marker files).
 func (s *Server) initHubManagedProject(project *store.Project) error {
-	workspacePath, err := hubManagedProjectPath(project.Slug)
+	workspacePath, err := s.hubManagedProjectPath(project.Slug)
 	if err != nil {
 		return err
 	}
@@ -765,7 +896,7 @@ func (s *Server) initHubManagedProject(project *store.Project) error {
 // seeds the .scion project structure on top. If the clone fails, the workspace
 // directory is cleaned up and an error is returned.
 func (s *Server) cloneSharedWorkspaceProject(ctx context.Context, project *store.Project) error {
-	workspacePath, err := hubManagedProjectPath(project.Slug)
+	workspacePath, err := s.hubManagedProjectPath(project.Slug)
 	if err != nil {
 		return err
 	}
@@ -941,7 +1072,7 @@ func (s *Server) syncWorkspaceOnStop(ctx context.Context, agent *store.Agent) {
 	}
 
 	// Download from GCS to Hub filesystem
-	workspacePath, err := hubManagedProjectPath(project.Slug)
+	workspacePath, err := s.hubManagedProjectPath(project.Slug)
 	if err != nil {
 		s.agentLifecycleLog.Warn("syncWorkspaceOnStop: failed to get project path", "agent_id", agent.ID, "error", err)
 		return
@@ -1065,6 +1196,23 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 			project.SharedDirs = s.defaultProjectSharedDirs()
 		}
 
+		// Apply hub-level default agent roles to new projects.
+		if defaults := s.hubAgentDefaults(); defaults.DefaultMaxAgentRole != "" || defaults.DefaultAgentRole != "" {
+			if project.Annotations == nil {
+				project.Annotations = make(map[string]string)
+			}
+			if defaults.DefaultMaxAgentRole != "" {
+				if _, exists := project.Annotations[projectSettingMaxAgentRole]; !exists {
+					project.Annotations[projectSettingMaxAgentRole] = defaults.DefaultMaxAgentRole
+				}
+			}
+			if defaults.DefaultAgentRole != "" {
+				if _, exists := project.Annotations[projectSettingDefaultAgentRole]; !exists {
+					project.Annotations[projectSettingDefaultAgentRole] = defaults.DefaultAgentRole
+				}
+			}
+		}
+
 		if err := s.store.CreateProject(ctx, project); err != nil {
 			writeErrorFromErr(w, err, "")
 			return
@@ -1076,6 +1224,9 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 
 		// Create project members group and policy (best-effort)
 		s.createProjectMembersGroupAndPolicy(ctx, project)
+
+		// Ensure the #general chat topic exists for this project (best-effort).
+		s.ensureProjectGeneralTopic(ctx, project)
 
 		// Auto-link brokers that have auto_provide enabled
 		s.autoLinkProviders(ctx, project)
@@ -1700,6 +1851,10 @@ func (s *Server) handleProjectAgents(w http.ResponseWriter, r *http.Request, pro
 
 // listProjectAgents lists agents within a specific project
 func (s *Server) listProjectAgents(w http.ResponseWriter, r *http.Request, projectID string) {
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 	query := r.URL.Query()
 
@@ -1794,7 +1949,16 @@ func (s *Server) createProjectAgent(w http.ResponseWriter, r *http.Request, proj
 		return
 	}
 
-	// Resolve caller identity for creator tracking
+	// Authorization for every caller kind. This route had no gate at all before
+	// #591: any agent token could create an agent in any project, and it is the
+	// route the CLI uses for create/start/sync. The URL project implies no
+	// isolation by itself.
+	if !s.authorizeAgentCreate(w, r, projectID) {
+		return
+	}
+
+	// Resolve caller identity for creator tracking (attribution only — the
+	// authorization decision is made above).
 	var createdBy string
 	var creatorName string
 	var ancestry []string
@@ -1822,6 +1986,10 @@ func (s *Server) createProjectAgent(w http.ResponseWriter, r *http.Request, proj
 
 // getProjectAgent gets an agent by ID within a specific project
 func (s *Server) getProjectAgent(w http.ResponseWriter, r *http.Request, projectID, agentID string) {
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 
 	// Try to get by slug first (more common case)
@@ -2025,27 +2193,13 @@ func (s *Server) handleProjectAgentAction(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// For interactive actions, enforce policy-based authorization (owner or admin only)
+	// For interactive actions, enforce lifecycle authorization for every caller
+	// kind: users via policy, agents via ScopeAgentLifecycle within their own
+	// project, everything else denied. authorizeAgentLifecycle logs the denial.
 	switch action {
 	case api.AgentActionStart, api.AgentActionStop, api.AgentActionSuspend, api.AgentActionRestart, api.AgentActionMessage, api.AgentActionExec:
-		if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-			decision := s.authzService.CheckAccess(ctx, userIdent, agentResource(agent), ActionAttach)
-			if !decision.Allowed {
-				s.projectsLogger().Warn("agent authz check failed",
-					"agent_id", agent.ID,
-					"agent_slug", agent.Slug,
-					"agent_owner_id", agent.OwnerID,
-					"agent_created_by", agent.CreatedBy,
-					"user_id", userIdent.ID(),
-					"user_email", userIdent.Email(),
-					"user_role", userIdent.Role(),
-					"action", action,
-					"decision_reason", decision.Reason,
-				)
-				writeError(w, http.StatusForbidden, ErrCodeForbidden,
-					"Only the agent's creator can interact with it", nil)
-				return
-			}
+		if !s.authorizeAgentLifecycle(w, r, agent) {
+			return
 		}
 	}
 
@@ -2109,6 +2263,10 @@ func (s *Server) handleProjectByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getProject(w http.ResponseWriter, r *http.Request, id string) {
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 	project, err := s.store.GetProject(ctx, id)
 	if err != nil {
@@ -2149,13 +2307,8 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 
-	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-		decision := s.authzService.CheckAccess(ctx, userIdent, projectResource(project), ActionUpdate)
-		if !decision.Allowed {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"You do not have permission to update this project", nil)
-			return
-		}
+	if !s.authorize(w, r, projectResource(project), ActionUpdate) {
+		return
 	}
 
 	var updates struct {
@@ -2273,7 +2426,7 @@ func (s *Server) migrateProjectSlug(ctx context.Context, project *store.Project,
 
 	// Migrate hub-managed project filesystem paths (best-effort).
 	// Derive newPath from oldPath's parent to preserve the directory type (groves/ vs projects/).
-	if oldPath, err := hubManagedProjectPath(oldSlug); err == nil {
+	if oldPath, err := s.hubManagedProjectPath(oldSlug); err == nil {
 		if _, statErr := os.Stat(oldPath); statErr == nil {
 			newPath := filepath.Join(filepath.Dir(oldPath), newSlug)
 			if _, statErr := os.Stat(newPath); os.IsNotExist(statErr) {
@@ -2322,13 +2475,8 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 
-	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-		decision := s.authzService.CheckAccess(ctx, userIdent, projectResource(project), ActionDelete)
-		if !decision.Allowed {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"You do not have permission to delete this project", nil)
-			return
-		}
+	if !s.authorize(w, r, projectResource(project), ActionDelete) {
+		return
 	}
 
 	// Dispatch agent deletions to runtime brokers so containers are stopped
@@ -2412,15 +2560,17 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 
-	// For hub-native and shared-workspace projects, remove the filesystem directory.
+	// For hub-native and shared-workspace projects, remove the filesystem directory
+	// and clean up the per-project WebDAV lock store to prevent memory leaks.
 	if (project.GitRemote == "" || project.IsSharedWorkspace()) && project.Slug != "" {
-		if projectPath, err := hubManagedProjectPath(project.Slug); err == nil {
+		if projectPath, err := s.hubManagedProjectPath(project.Slug); err == nil {
 			if err := util.RemoveAllSafe(projectPath); err != nil {
 				s.projectsLogger().Warn("failed to remove hub-managed project directory",
 					"project_id", id, "slug", project.Slug, "path", projectPath, "error", err)
 			}
 		}
 	}
+	s.webdavLocks.Delete(id)
 
 	// Clean up the project-configs directory (~/.scion/project-configs/<slug>__<short-uuid>/).
 	// This stores external settings, templates, and agent homes for both

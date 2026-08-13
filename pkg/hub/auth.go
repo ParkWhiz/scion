@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
@@ -43,6 +44,18 @@ type AuthConfig struct {
 	UserTokenSvc *UserTokenService
 	// UATSvc handles user access token validation
 	UATSvc *UserAccessTokenService
+	// BrokerAuthSvc is the broker HMAC authentication service.
+	//
+	// UnifiedAuthMiddleware does not validate broker signatures itself:
+	// BrokerAuthMiddleware, which runs later in the chain, does. This field tells
+	// UnifiedAuthMiddleware whether that downstream validator is actually
+	// installed and active (it is only installed when the service is non-nil, see
+	// Server.applyMiddleware, and it no-ops when the service is disabled).
+	//
+	// When it is not, a request carrying X-Scion-Broker-ID must be rejected rather
+	// than passed through, because nothing further down the chain will ever
+	// establish an identity for it. See issue #591.
+	BrokerAuthSvc *BrokerAuthService
 	// TrustedProxies is a list of trusted proxy IPs/CIDRs
 	TrustedProxies []string
 	// ProxyAuthenticator is the configured proxy authenticator (for proxy auth mode).
@@ -54,6 +67,11 @@ type AuthConfig struct {
 	ProxyUserProvisioner func(ctx context.Context, info *ProxyUserInfo) (UserIdentity, error)
 	// AuthMode is the exclusive human auth mode: "oauth", "proxy", "dev".
 	AuthMode string
+	// FederationAuth points to the server's atomic.Pointer for the
+	// FederationAuthenticator. nil when federation was never configured.
+	// The middleware loads from this pointer on each request to see
+	// hot-reloaded authenticators.
+	FederationAuth *atomic.Pointer[FederationAuthenticator]
 	// Debug enables verbose logging
 	Debug bool
 	// Logger is the subsystem logger for auth middleware (defaults to slog.Default())
@@ -71,10 +89,19 @@ const (
 	tokenTypeAgent
 )
 
+// brokerAuthActive reports whether BrokerAuthMiddleware will actually validate
+// broker HMAC signatures for this service. It mirrors that middleware's own skip
+// conditions exactly (nil service, or service disabled) so that the two cannot
+// drift: if this returns false, nothing downstream authenticates a broker request.
+func brokerAuthActive(svc *BrokerAuthService) bool {
+	return svc != nil && svc.config.Enabled
+}
+
 // UnifiedAuthMiddleware creates middleware that handles all authentication types.
 // It processes tokens in priority order:
 // 1. Agent tokens (X-Scion-Agent-Token or agent JWT in Bearer)
-// 2. Broker HMAC auth (X-Scion-Broker-ID header) - passed through to BrokerAuthMiddleware
+// 2. Broker HMAC auth (X-Scion-Broker-ID header) - deferred to BrokerAuthMiddleware
+// when that middleware is installed and enabled; rejected outright when it is not
 // 3. Development tokens (scion_dev_* prefix)
 // 4. User access tokens (scion_pat_* prefix)
 // 5. User JWTs
@@ -140,9 +167,58 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				// Bearer token wasn't an agent token, continue to user auth
 			}
 
+			// Step 1.5: Federation OIDC token (X-Scion-Federation-Token header)
+			if federationToken := r.Header.Get(FederationTokenHeader); federationToken != "" {
+				var fedAuth *FederationAuthenticator
+				if cfg.FederationAuth != nil {
+					fedAuth = cfg.FederationAuth.Load()
+				}
+				if fedAuth == nil {
+					// Header present but federation not enabled — reject, don't silently ignore
+					writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+						"federation authentication is not configured", nil)
+					return
+				}
+				identity, err := fedAuth.Authenticate(federationToken)
+				if err != nil {
+					if cfg.Debug {
+						log.Debug("Federation token validation failed", "error", err)
+					}
+					writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+						"invalid federation token", nil)
+					return
+				}
+				ctx = contextWithIdentity(ctx, identity)
+				ctx = contextWithAuthType(ctx, AuthTypeFederation)
+				if cfg.Debug {
+					log.Debug("Federated identity authenticated",
+						"issuer", identity.IssuerURL(),
+						"type", identity.Type(),
+						"id", identity.ID())
+				}
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
 			// Step 2: Check for broker HMAC authentication (X-Scion-Broker-ID header)
-			// If present, pass through to BrokerAuthMiddleware which runs next
+			// If present, defer to BrokerAuthMiddleware, which runs later in the
+			// chain and validates the HMAC signature.
+			//
+			// This branch sets an auth-type label only — it never establishes an
+			// identity. Deferring is therefore only safe when BrokerAuthMiddleware
+			// is actually installed and enabled; otherwise the request would reach
+			// the handlers with no identity and no signature check at all. Fail
+			// closed instead of passing it through (#591, design §8.1).
 			if brokerID := r.Header.Get("X-Scion-Broker-ID"); brokerID != "" {
+				if !brokerAuthActive(cfg.BrokerAuthSvc) {
+					log.Warn("Rejecting broker-authenticated request: broker authentication is not available",
+						slog.String("broker_id", brokerID),
+						slog.String("path", r.URL.Path),
+					)
+					writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+						"broker authentication is not enabled", nil)
+					return
+				}
 				if cfg.Debug {
 					log.Debug("Broker auth headers present, deferring to BrokerAuthMiddleware", "brokerID", brokerID)
 				}
@@ -380,6 +456,10 @@ func isUnauthenticatedEndpoint(path string) bool {
 	case "/api/v1/webhooks/github": // GitHub App webhook (uses webhook signature verification)
 		return true
 	case "/github-app/setup": // GitHub App post-installation callback (browser redirect)
+		return true
+	case "/.well-known/openid-configuration": // OIDC discovery document (public metadata)
+		return true
+	case "/.well-known/jwks.json": // OIDC JSON Web Key Set (public keys)
 		return true
 	}
 	return false

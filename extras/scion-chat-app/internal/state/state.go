@@ -35,13 +35,15 @@ type UserMapping struct {
 
 // SpaceLink associates a platform space/channel with a project.
 type SpaceLink struct {
-	SpaceID      string
-	Platform     string
-	ProjectID    string
-	ProjectSlug  string
-	LinkedBy     string
-	LinkedAt     time.Time
-	DefaultAgent string
+	SpaceID          string
+	Platform         string
+	ProjectID        string
+	ProjectSlug      string
+	LinkedBy         string
+	LinkedAt         time.Time
+	DefaultAgent     string
+	ShowAgentToAgent bool
+	ShowStateChanges bool
 }
 
 // AgentSubscription tracks a user's subscription to agent activity notifications.
@@ -114,6 +116,15 @@ func (s *Store) migrate() error {
 			subscribed_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (platform_user_id, platform, agent_id, grove_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS thread_defaults (
+			space_id    TEXT NOT NULL,
+			thread_id   TEXT NOT NULL,
+			agent_slug  TEXT NOT NULL,
+			platform    TEXT NOT NULL DEFAULT 'google_chat',
+			set_by      TEXT NOT NULL DEFAULT '',
+			set_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (space_id, thread_id, platform)
+		)`,
 	}
 
 	for _, m := range migrations {
@@ -125,6 +136,8 @@ func (s *Store) migrate() error {
 	// Additive column migrations (idempotent — ignore "duplicate column" errors).
 	addColumns := []string{
 		`ALTER TABLE space_links ADD COLUMN default_agent TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE space_links ADD COLUMN show_agent_to_agent INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE space_links ADD COLUMN show_state_changes INTEGER NOT NULL DEFAULT 1`,
 	}
 	for _, m := range addColumns {
 		if _, err := s.db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -255,16 +268,33 @@ func (s *Store) GetUserMappingByHubID(hubUserID string) (*UserMapping, error) {
 	return m, nil
 }
 
+// GetUserMappingByHubEmail returns the user mapping for the given hub email, or nil, nil if not found.
+func (s *Store) GetUserMappingByHubEmail(hubEmail string) (*UserMapping, error) {
+	m := &UserMapping{}
+	err := s.db.QueryRow(
+		`SELECT platform_user_id, platform, hub_user_id, hub_user_email, registered_at, registered_by
+		 FROM user_mappings WHERE hub_user_email = ? COLLATE NOCASE`,
+		hubEmail,
+	).Scan(&m.PlatformUserID, &m.Platform, &m.HubUserID, &m.HubUserEmail, &m.RegisteredAt, &m.RegisteredBy)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get user mapping by hub email: %w", err)
+	}
+	return m, nil
+}
+
 // --- Space Links ---
 
 // GetSpaceLink returns the space link for the given space, or nil, nil if not found.
 func (s *Store) GetSpaceLink(spaceID, platform string) (*SpaceLink, error) {
 	l := &SpaceLink{}
 	err := s.db.QueryRow(
-		`SELECT space_id, platform, grove_id, grove_slug, linked_by, linked_at, default_agent
+		`SELECT space_id, platform, grove_id, grove_slug, linked_by, linked_at, default_agent, show_agent_to_agent, show_state_changes
 		 FROM space_links WHERE space_id = ? AND platform = ?`,
 		spaceID, platform,
-	).Scan(&l.SpaceID, &l.Platform, &l.ProjectID, &l.ProjectSlug, &l.LinkedBy, &l.LinkedAt, &l.DefaultAgent)
+	).Scan(&l.SpaceID, &l.Platform, &l.ProjectID, &l.ProjectSlug, &l.LinkedBy, &l.LinkedAt, &l.DefaultAgent, &l.ShowAgentToAgent, &l.ShowStateChanges)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -277,9 +307,9 @@ func (s *Store) GetSpaceLink(spaceID, platform string) (*SpaceLink, error) {
 // SetSpaceLink inserts or replaces a space link.
 func (s *Store) SetSpaceLink(l *SpaceLink) error {
 	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO space_links (space_id, platform, grove_id, grove_slug, linked_by, linked_at, default_agent)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		l.SpaceID, l.Platform, l.ProjectID, l.ProjectSlug, l.LinkedBy, l.LinkedAt, l.DefaultAgent,
+		`INSERT OR REPLACE INTO space_links (space_id, platform, grove_id, grove_slug, linked_by, linked_at, default_agent, show_agent_to_agent, show_state_changes)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		l.SpaceID, l.Platform, l.ProjectID, l.ProjectSlug, l.LinkedBy, l.LinkedAt, l.DefaultAgent, l.ShowAgentToAgent, l.ShowStateChanges,
 	)
 	if err != nil {
 		return fmt.Errorf("set space link: %w", err)
@@ -302,7 +332,7 @@ func (s *Store) DeleteSpaceLink(spaceID, platform string) error {
 // ListSpaceLinks returns all space links.
 func (s *Store) ListSpaceLinks() ([]SpaceLink, error) {
 	rows, err := s.db.Query(
-		`SELECT space_id, platform, grove_id, grove_slug, linked_by, linked_at, default_agent FROM space_links`,
+		`SELECT space_id, platform, grove_id, grove_slug, linked_by, linked_at, default_agent, show_agent_to_agent, show_state_changes FROM space_links`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list space links: %w", err)
@@ -312,7 +342,7 @@ func (s *Store) ListSpaceLinks() ([]SpaceLink, error) {
 	var links []SpaceLink
 	for rows.Next() {
 		var l SpaceLink
-		if err := rows.Scan(&l.SpaceID, &l.Platform, &l.ProjectID, &l.ProjectSlug, &l.LinkedBy, &l.LinkedAt, &l.DefaultAgent); err != nil {
+		if err := rows.Scan(&l.SpaceID, &l.Platform, &l.ProjectID, &l.ProjectSlug, &l.LinkedBy, &l.LinkedAt, &l.DefaultAgent, &l.ShowAgentToAgent, &l.ShowStateChanges); err != nil {
 			return nil, fmt.Errorf("scan space link: %w", err)
 		}
 		links = append(links, l)
@@ -335,6 +365,30 @@ func (s *Store) SetDefaultAgent(spaceID, platform, agentSlug string) error {
 // ClearDefaultAgent removes the default agent for a space link.
 func (s *Store) ClearDefaultAgent(spaceID, platform string) error {
 	return s.SetDefaultAgent(spaceID, platform, "")
+}
+
+// SetShowAgentToAgent updates the observe mode setting for a space link.
+func (s *Store) SetShowAgentToAgent(spaceID, platform string, show bool) error {
+	_, err := s.db.Exec(
+		`UPDATE space_links SET show_agent_to_agent = ? WHERE space_id = ? AND platform = ?`,
+		show, spaceID, platform,
+	)
+	if err != nil {
+		return fmt.Errorf("set show_agent_to_agent: %w", err)
+	}
+	return nil
+}
+
+// SetShowStateChanges updates the state change notification setting for a space link.
+func (s *Store) SetShowStateChanges(spaceID, platform string, show bool) error {
+	_, err := s.db.Exec(
+		`UPDATE space_links SET show_state_changes = ? WHERE space_id = ? AND platform = ?`,
+		show, spaceID, platform,
+	)
+	if err != nil {
+		return fmt.Errorf("set show_state_changes: %w", err)
+	}
+	return nil
 }
 
 // --- Agent Subscriptions ---
@@ -402,6 +456,61 @@ func (s *Store) ListAgentSubscriptions(agentID, projectID string) ([]AgentSubscr
 		subs = append(subs, sub)
 	}
 	return subs, rows.Err()
+}
+
+// --- Thread Defaults ---
+
+// GetThreadDefault returns the agent slug for the given thread, or "" if not set.
+func (s *Store) GetThreadDefault(spaceID, threadID, platform string) (string, error) {
+	var agentSlug string
+	err := s.db.QueryRow(
+		`SELECT agent_slug FROM thread_defaults WHERE space_id = ? AND thread_id = ? AND platform = ?`,
+		spaceID, threadID, platform,
+	).Scan(&agentSlug)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get thread default: %w", err)
+	}
+	return agentSlug, nil
+}
+
+// SetThreadDefault inserts or replaces a thread-level default agent.
+func (s *Store) SetThreadDefault(spaceID, threadID, platform, agentSlug, setBy string) error {
+	_, err := s.db.Exec(
+		`INSERT OR REPLACE INTO thread_defaults (space_id, thread_id, platform, agent_slug, set_by, set_at)
+		 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		spaceID, threadID, platform, agentSlug, setBy,
+	)
+	if err != nil {
+		return fmt.Errorf("set thread default: %w", err)
+	}
+	return nil
+}
+
+// DeleteThreadDefault removes a thread-level default agent.
+func (s *Store) DeleteThreadDefault(spaceID, threadID, platform string) error {
+	_, err := s.db.Exec(
+		`DELETE FROM thread_defaults WHERE space_id = ? AND thread_id = ? AND platform = ?`,
+		spaceID, threadID, platform,
+	)
+	if err != nil {
+		return fmt.Errorf("delete thread default: %w", err)
+	}
+	return nil
+}
+
+// DeleteThreadDefaultsForSpace removes all thread-level defaults for a space.
+func (s *Store) DeleteThreadDefaultsForSpace(spaceID string) error {
+	_, err := s.db.Exec(
+		`DELETE FROM thread_defaults WHERE space_id = ?`,
+		spaceID,
+	)
+	if err != nil {
+		return fmt.Errorf("delete thread defaults for space: %w", err)
+	}
+	return nil
 }
 
 // ListUserSubscriptions returns all subscriptions for the given platform user.

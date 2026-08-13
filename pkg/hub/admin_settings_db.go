@@ -248,6 +248,26 @@ func applySnapshotToResponse(resp *ServerConfigResponse, snap Layer1Snapshot) {
 			Enabled: snap.AutoExposePortsEnabled,
 		}
 	}
+
+	// Federation — populate from snapshot's FederationConfig.
+	if snap.FederationConfig != nil {
+		gc := &config.GlobalConfig{Federation: *snap.FederationConfig}
+		v1Server := config.ConvertGlobalToV1ServerConfig(gc)
+		resp.Federation = v1Server.Federation
+	}
+
+	// Runtimes / Profiles / HarnessConfigs — snapshot values override file
+	// values. An empty map (len 0, non-nil) from the snapshot is intentional
+	// (admin cleared the section) and must replace the file-loaded defaults.
+	if snap.Runtimes != nil {
+		resp.Runtimes = snap.Runtimes
+	}
+	if snap.Profiles != nil {
+		resp.Profiles = snap.Profiles
+	}
+	if snap.HarnessConfigs != nil {
+		resp.HarnessConfigs = snap.HarnessConfigs
+	}
 }
 
 // buildSectionMetadata reads the OperationalSettings cache to determine
@@ -475,15 +495,24 @@ func (s *Server) handlePutServerConfigDB(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Warn about unclassified keys — accepted for shape compatibility with
-	// file mode but not written to DB. Clients can see what was skipped via
-	// the ignored_keys field in the response.
+	// BREAKING CHANGE (issue #938): Reject unclassified keys (e.g.
+	// schema_version, workspace_path, active_profile) with 422 instead of
+	// silently accepting with 200 and dropping them. Previously callers
+	// (including the admin UI) believed the save succeeded when nothing was
+	// persisted. The admin UI frontend handles this via handleSaveError's
+	// default case, which displays body.message to the user.
 	if len(unclassifiedKeys) > 0 {
 		sort.Strings(unclassifiedKeys)
-		slog.Warn("PUT server-config: ignoring unclassified keys (not Layer-0, not Layer-1)",
+		slog.Warn("PUT server-config: rejecting unclassified keys (not Layer-0, not Layer-1)",
 			"keys", unclassifiedKeys,
 			"user", updatedBy,
 		)
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]interface{}{
+			"error":   "unclassified_keys_rejected",
+			"message": "These settings cannot be persisted in database mode. They must be configured via settings.yaml / deployment tooling.",
+			"keys":    unclassifiedKeys,
+		})
+		return
 	}
 
 	// Build per-section documents from the request.
@@ -493,6 +522,48 @@ func (s *Server) handlePutServerConfigDB(w http.ResponseWriter, r *http.Request,
 		slog.Error("PUT server-config: failed to build section documents", "error", err)
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to build section documents", nil)
 		return
+	}
+
+	// Validate federation semantics (beyond JSON schema).
+	if doc, ok := sectionDocs["federation"]; ok {
+		var fedSettings opsettings.FederationSettings
+		if err := json.Unmarshal(doc, &fedSettings); err == nil {
+			// Validate duration strings before conversion (which silently
+			// falls back to zero for invalid values). Invalid durations like
+			// "1hour" would fail at time.ParseDuration during ApplySnapshot.
+			if fedSettings.RefreshInterval != "" {
+				if _, err := time.ParseDuration(fedSettings.RefreshInterval); err != nil {
+					writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError,
+						fmt.Sprintf("invalid refresh_interval %q: %v", fedSettings.RefreshInterval, err), nil)
+					return
+				}
+			}
+			if fedSettings.DebounceInterval != "" {
+				if _, err := time.ParseDuration(fedSettings.DebounceInterval); err != nil {
+					writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError,
+						fmt.Sprintf("invalid debounce_interval %q: %v", fedSettings.DebounceInterval, err), nil)
+					return
+				}
+			}
+
+			fedCfg := convertFederationSettingsToConfig(fedSettings)
+			if errs := fedCfg.Validate(); len(errs) > 0 {
+				var errMsgs []string
+				for _, e := range errs {
+					errMsgs = append(errMsgs, e.Error())
+				}
+				writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError,
+					"federation config validation failed", map[string]interface{}{
+						"errors": errMsgs,
+					})
+				return
+			}
+		} else {
+			slog.Warn("PUT server-config: failed to deserialize federation section for validation",
+				"error", err,
+				"user", updatedBy,
+			)
+		}
 	}
 
 	// Validate ALL sections before writing ANY (atomic: all-or-nothing).
@@ -575,11 +646,6 @@ func (s *Server) handlePutServerConfigDB(w http.ResponseWriter, r *http.Request,
 			"applied":          appliedKeys,
 			"requires_restart": []string{},
 		},
-	}
-
-	// Report ignored unclassified keys so clients/UI can see what was skipped.
-	if len(unclassifiedKeys) > 0 {
-		resp["ignored_keys"] = unclassifiedKeys
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -817,6 +883,19 @@ func extractKoanfKeysFromRequest(req *ServerConfigUpdateRequest) []string {
 		}
 	}
 
+	// Federation keys — emit all 5 koanf paths when the federation field
+	// is present. The section doc builder handles per-field presence;
+	// ClassifyKeys only needs at least one key to activate the section.
+	if req.Federation != nil {
+		keys = append(keys,
+			"server.federation.enabled",
+			"server.federation.trusted_issuers",
+			"server.federation.algorithms",
+			"server.federation.refresh_interval",
+			"server.federation.debounce_interval",
+		)
+	}
+
 	return keys
 }
 
@@ -828,7 +907,8 @@ func extractKoanfKeysFromRequest(req *ServerConfigUpdateRequest) []string {
 // make them invisible.
 //
 // Only the clearable Layer-1 fields are checked here:
-// admin_emails, user_access_mode, notification_channels, public_url.
+// admin_emails, user_access_mode, notification_channels, public_url,
+// runtimes, profiles, harness_configs.
 func appendPresenceAwareKeys(keys []string, rawBody []byte) []string {
 	fp, err := parseFieldPresence(rawBody)
 	if err != nil {
@@ -866,6 +946,17 @@ func appendPresenceAwareKeys(keys []string, rawBody []byte) []string {
 	// public_url: present in hub but empty → add the key.
 	if !keySet["server.hub.public_url"] && hubFP.has("public_url") {
 		keys = append(keys, "server.hub.public_url")
+	}
+
+	// Map-of-objects sections: present as null or {} → add the key to clear.
+	if !keySet["runtimes"] && fp.has("runtimes") {
+		keys = append(keys, "runtimes")
+	}
+	if !keySet["profiles"] && fp.has("profiles") {
+		keys = append(keys, "profiles")
+	}
+	if !keySet["harness_configs"] && fp.has("harness_configs") {
+		keys = append(keys, "harness_configs")
 	}
 
 	return keys
@@ -1051,11 +1142,83 @@ func buildSingleSectionDoc(req *ServerConfigUpdateRequest, secName string, fp *f
 		}
 		doc = d
 
+	case "runtimes":
+		if req.Runtimes != nil {
+			doc = req.Runtimes
+		} else if fp.has("runtimes") {
+			// Explicitly sent as null or {} → clear to empty map.
+			doc = map[string]config.V1RuntimeConfig{}
+		} else {
+			return nil, nil
+		}
+
+	case "profiles":
+		if req.Profiles != nil {
+			doc = req.Profiles
+		} else if fp.has("profiles") {
+			// Explicitly sent as null or {} → clear to empty map.
+			doc = map[string]config.V1ProfileConfig{}
+		} else {
+			return nil, nil
+		}
+
+	case "harness_configs":
+		if req.HarnessConfigs != nil {
+			doc = req.HarnessConfigs
+		} else if fp.has("harness_configs") {
+			// Explicitly sent as null or {} → clear to empty map.
+			doc = map[string]config.HarnessConfigEntry{}
+		} else {
+			return nil, nil
+		}
+
+	case "federation":
+		fedSettings := opsettings.FederationSettings{}
+		if req.Federation != nil {
+			fedSettings.Enabled = req.Federation.Enabled
+			fedSettings.TrustedIssuers = req.Federation.TrustedIssuers
+			fedSettings.Algorithms = req.Federation.Algorithms
+			fedSettings.RefreshInterval = req.Federation.RefreshInterval
+			fedSettings.DebounceInterval = req.Federation.DebounceInterval
+		}
+		doc = &fedSettings
+
 	default:
 		return nil, nil
 	}
 
 	return json.Marshal(doc)
+}
+
+// convertFederationSettingsToConfig maps FederationSettings to config.FederationConfig
+// for semantic validation.
+func convertFederationSettingsToConfig(fs opsettings.FederationSettings) config.FederationConfig {
+	fc := config.FederationConfig{
+		Algorithms: fs.Algorithms,
+	}
+	if fs.Enabled != nil {
+		fc.Enabled = *fs.Enabled
+	}
+	for _, vi := range fs.TrustedIssuers {
+		fc.TrustedIssuers = append(fc.TrustedIssuers, config.TrustedIssuerConfig(vi))
+	}
+	if fs.RefreshInterval != "" {
+		if d, err := time.ParseDuration(fs.RefreshInterval); err == nil {
+			fc.Cache.RefreshInterval = d
+		} else {
+			slog.Warn("convertFederationSettingsToConfig: invalid refresh_interval duration, using zero",
+				"value", fs.RefreshInterval, "error", err)
+		}
+	}
+	if fs.DebounceInterval != "" {
+		if d, err := time.ParseDuration(fs.DebounceInterval); err == nil {
+			fc.Cache.DebounceInterval = d
+		} else {
+			slog.Warn("convertFederationSettingsToConfig: invalid debounce_interval duration, using zero",
+				"value", fs.DebounceInterval, "error", err)
+		}
+	}
+	return fc
 }
 
 // mapKeys returns the keys of a map as a sorted slice.

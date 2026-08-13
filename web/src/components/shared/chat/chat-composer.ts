@@ -1,0 +1,690 @@
+/**
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * Chat composer component.
+ *
+ * Textarea with:
+ * - Character counter (rune-aware via Intl.Segmenter where available)
+ * - 2000 character limit with visual feedback (AC10)
+ * - Defaults to plain: false (design section 4.7)
+ * - Sends via `chat-send` custom event: {text, plain, interrupt, mentions}
+ * - @-mention autocomplete integration (Phase 4)
+ * - The composer knows nothing about the network
+ * - Send on Enter (Shift+Enter for newline)
+ * - Interrupt toggle
+ */
+
+import { LitElement, html, css, nothing } from 'lit';
+import { customElement, property, state } from 'lit/decorators.js';
+import type { Agent } from '../../../shared/types.js';
+import type { MentionAcceptDetail } from './mention-autocomplete.js';
+import './mention-autocomplete.js';
+
+/** Maximum message length in rune count. */
+const MAX_MESSAGE_LENGTH = 2000;
+
+/** Uploaded attachment info returned from the server. */
+export interface UploadedAttachment {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  url: string;
+}
+
+/** Event detail for the chat-send custom event. */
+export interface ChatSendDetail {
+  text: string;
+  plain: boolean;
+  interrupt: boolean;
+  onSuccess: () => void;
+  mentions: string[];
+  /** W7: Attachment IDs to include with the message. */
+  attachmentIds: string[];
+}
+
+/** Member info for human mention in v2 mode. */
+export interface MemberInfo {
+  id: string;
+  name: string;
+  email: string;
+  avatarUrl?: string;
+  kind: 'user' | 'agent';
+}
+
+/**
+ * Count "runes" (user-perceived characters) in a string.
+ * Uses Intl.Segmenter where available, falls back to spread length.
+ */
+function countRunes(text: string): number {
+  if (typeof Intl !== 'undefined' && 'Segmenter' in Intl) {
+    const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
+    let count = 0;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    for (const _ of segmenter.segment(text)) count++;
+    return count;
+  }
+  // Fallback: spread into an array (handles surrogate pairs but not all grapheme clusters)
+  return [...text].length;
+}
+
+@customElement('scion-chat-composer')
+export class ScionChatComposer extends LitElement {
+  /** Whether the send button should be disabled (e.g. while sending). */
+  @property({ type: Boolean })
+  disabled = false;
+
+  /** Agents available for @-mention (passed from parent). */
+  @property({ type: Array })
+  agents: Agent[] = [];
+
+  // ---- Wave-2 v2 properties ----
+
+  /** Members available for @-mention in v2 mode. */
+  @property({ type: Array })
+  members: MemberInfo[] = [];
+
+  /** Default agent slug for this thread (v2 mode). */
+  @property()
+  defaultAgent = '';
+
+  /** Conversation mode: 'thread' or 'dm' (v2 mode). */
+  @property()
+  conversationMode: 'thread' | 'dm' | '' = '';
+
+  /** DM peer name (v2 DM mode). */
+  @property()
+  peerName = '';
+
+  /** Project ID for upload authz scope (v2 mode). */
+  @property()
+  projectId = '';
+
+  @state() private text = '';
+  @state() private plain = false;
+  @state() private interrupt = false;
+  @state() private runeCount = 0;
+
+  /** Live mention override for the destination chip. */
+  @state() private liveMentionOverride = '';
+
+  /** W7: Pending file uploads before send. */
+  @state() private pendingFiles: UploadedAttachment[] = [];
+
+  /** W7: Upload in progress. */
+  @state() private uploading = false;
+
+  /** Set of accepted mention slugs. Filtered to those still present on send. */
+  private acceptedMentions = new Set<string>();
+
+  static override styles = css`
+    :host {
+      display: block;
+    }
+
+    .composer {
+      display: flex;
+      flex-direction: column;
+      gap: 0.375rem;
+      padding: 0.75rem 1rem;
+      border-top: 1px solid var(--scion-border, #e2e8f0);
+      background: var(--scion-surface, #ffffff);
+    }
+
+    .input-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 0.5rem;
+    }
+
+    .textarea-wrapper {
+      flex: 1;
+      position: relative;
+    }
+
+    sl-textarea::part(base) {
+      font-size: 0.875rem;
+      border-radius: 0.75rem;
+    }
+
+    sl-textarea::part(textarea) {
+      resize: none;
+    }
+
+    .send-btn {
+      flex-shrink: 0;
+    }
+
+    .footer-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }
+
+    .options {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .options label {
+      display: flex;
+      align-items: center;
+      gap: 0.25rem;
+      font-size: 0.75rem;
+      color: var(--scion-text-muted, #64748b);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .char-counter {
+      font-size: 0.6875rem;
+      color: var(--scion-text-muted, #64748b);
+      white-space: nowrap;
+    }
+
+    .char-counter.warn {
+      color: var(--scion-warning-600, #d97706);
+    }
+
+    .char-counter.over {
+      color: var(--scion-danger-600, #dc2626);
+      font-weight: 600;
+    }
+
+    /* Destination chip (v2) */
+    .destination-chip {
+      display: flex;
+      align-items: center;
+      gap: 0.375rem;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.75rem;
+      color: var(--scion-text-muted, #64748b);
+      background: var(--scion-bg-subtle, #f1f5f9);
+      border-radius: 0.5rem 0.5rem 0 0;
+      border: 1px solid var(--scion-border, #e2e8f0);
+      border-bottom: none;
+      margin: 0 1rem;
+      margin-bottom: -1px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .destination-chip .arrow {
+      font-weight: 700;
+      color: var(--scion-primary, #3b82f6);
+    }
+
+    .destination-chip .agent-name {
+      font-weight: 600;
+      color: var(--scion-text, #1e293b);
+    }
+
+    .destination-chip .hint {
+      font-style: italic;
+      opacity: 0.8;
+    }
+
+    .destination-chip .mention-override {
+      font-weight: 600;
+      color: var(--scion-warning-600, #d97706);
+    }
+
+    .destination-chip.dm {
+      background: var(--scion-primary-50, #eff6ff);
+    }
+
+    /* W7: File upload styles */
+    .attach-btn {
+      flex-shrink: 0;
+    }
+
+    .attach-btn::part(base) {
+      font-size: 1rem;
+    }
+
+    .pending-files {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.375rem;
+      padding: 0 0.25rem;
+    }
+
+    .pending-file {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      padding: 0.25rem 0.5rem;
+      background: var(--scion-bg-subtle, #f1f5f9);
+      border: 1px solid var(--scion-border, #e2e8f0);
+      border-radius: 0.375rem;
+      font-size: 0.6875rem;
+      color: var(--scion-text, #1e293b);
+      max-width: 200px;
+    }
+
+    .pending-file img {
+      width: 24px;
+      height: 24px;
+      object-fit: cover;
+      border-radius: 0.25rem;
+    }
+
+    .pending-file .file-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+
+    .pending-file .remove-btn {
+      cursor: pointer;
+      color: var(--scion-text-muted, #94a3b8);
+      padding: 0;
+      line-height: 1;
+      background: none;
+      border: none;
+      font-size: 0.875rem;
+    }
+
+    .pending-file .remove-btn:hover {
+      color: var(--scion-danger-600, #dc2626);
+    }
+
+    .upload-progress {
+      font-size: 0.6875rem;
+      color: var(--scion-text-muted, #64748b);
+      padding: 0 0.25rem;
+    }
+  `;
+
+  override render() {
+    const isOverLimit = this.runeCount > MAX_MESSAGE_LENGTH;
+    const isNearLimit = this.runeCount > MAX_MESSAGE_LENGTH * 0.9;
+    const hasContent = this.text.trim().length > 0 || this.pendingFiles.length > 0;
+    const canSend = hasContent && !isOverLimit && !this.disabled && !this.uploading;
+
+    const counterClass = isOverLimit ? 'over' : isNearLimit ? 'warn' : '';
+
+    return html`
+      ${this.conversationMode ? this.renderDestinationChip() : nothing}
+      <div class="composer">
+        ${this.pendingFiles.length > 0 ? this.renderPendingFiles() : nothing}
+        ${this.uploading ? html`<div class="upload-progress">Uploading...</div>` : nothing}
+        <div class="input-row">
+          ${this.conversationMode
+            ? html`
+                <sl-icon-button
+                  class="attach-btn"
+                  name="paperclip"
+                  label="Attach file"
+                  @click=${this.handleAttachClick}
+                  ?disabled=${this.disabled || this.uploading}
+                ></sl-icon-button>
+                <input
+                  type="file"
+                  multiple
+                  accept="image/jpeg,image/png,image/gif,image/webp,application/pdf,text/plain,text/markdown,application/zip"
+                  style="display:none"
+                  @change=${this.handleFileSelected}
+                />
+              `
+            : nothing}
+          <div class="textarea-wrapper">
+            <sl-textarea
+              placeholder="Send a message..."
+              size="small"
+              rows="1"
+              resize="auto"
+              .value=${this.text}
+              @sl-input=${this.handleInput}
+              @keydown=${this.handleKeydown}
+              ?disabled=${this.disabled}
+            ></sl-textarea>
+            <scion-mention-autocomplete
+              .agents=${this.agents}
+              .members=${this.members}
+              @mention-accept=${this.handleMentionAccept}
+            ></scion-mention-autocomplete>
+          </div>
+          <sl-button
+            class="send-btn"
+            size="small"
+            variant="primary"
+            ?disabled=${!canSend}
+            @click=${this.handleSend}
+          >
+            <sl-icon slot="prefix" name="send"></sl-icon>
+            Send
+          </sl-button>
+        </div>
+        <div class="footer-row">
+          <div class="options">
+            <label>
+              <sl-checkbox
+                size="small"
+                ?checked=${this.plain}
+                @sl-change=${this.handlePlainToggle}
+              ></sl-checkbox>
+              Plain
+            </label>
+            <label>
+              <sl-checkbox
+                size="small"
+                ?checked=${this.interrupt}
+                @sl-change=${this.handleInterruptToggle}
+              ></sl-checkbox>
+              Interrupt
+            </label>
+          </div>
+          ${this.runeCount > 0 || isNearLimit
+            ? html`
+                <span class="char-counter ${counterClass}">
+                  ${this.runeCount} / ${MAX_MESSAGE_LENGTH}
+                </span>
+              `
+            : nothing}
+        </div>
+      </div>
+    `;
+  }
+
+  /** Render the destination chip showing where the message will go. */
+  private renderDestinationChip() {
+    if (this.conversationMode === 'dm') {
+      return html`
+        <div class="destination-chip dm">
+          <span class="arrow">&rarr;</span>
+          <span class="agent-name">@${this.peerName}</span>
+        </div>
+      `;
+    }
+
+    // Thread mode with live mention override
+    if (this.liveMentionOverride) {
+      return html`
+        <div class="destination-chip">
+          <span class="arrow">&rarr;</span>
+          <span class="mention-override">@${this.liveMentionOverride}</span>
+          <span class="hint">(mention)</span>
+        </div>
+      `;
+    }
+
+    // Thread mode with default agent
+    if (this.defaultAgent) {
+      return html`
+        <div class="destination-chip">
+          <span class="arrow">&rarr;</span>
+          <sl-icon name="cpu" style="font-size: 0.75rem"></sl-icon>
+          <span class="agent-name">${this.defaultAgent}</span>
+          <span class="hint">(thread default)</span>
+        </div>
+      `;
+    }
+
+    // Thread mode with no default
+    return html`
+      <div class="destination-chip">
+        <span class="arrow">&rarr;</span>
+        <span class="hint">no agent &mdash; visible to space members</span>
+      </div>
+    `;
+  }
+
+  private handleInput(e: Event): void {
+    const target = e.target as HTMLInputElement;
+    this.text = target.value;
+    this.runeCount = countRunes(this.text);
+
+    // Dispatch typing event so the parent can send a typing indicator
+    if (this.text.length > 0) {
+      this.dispatchEvent(new CustomEvent('chat-typing', { bubbles: true, composed: true }));
+    }
+
+    // Update live mention override for destination chip
+    this.updateLiveMentionOverride();
+
+    // Feed the autocomplete component.
+    const autocomplete = this.shadowRoot?.querySelector('scion-mention-autocomplete') as
+      | import('./mention-autocomplete.js').ScionMentionAutocomplete
+      | null;
+    if (autocomplete) {
+      const textarea = this.getTextareaElement();
+      if (textarea) {
+        autocomplete.handleInput(this.text, textarea.selectionStart ?? this.text.length, textarea);
+      }
+    }
+  }
+
+  /** Update live mention override based on @mentions in the text. */
+  private updateLiveMentionOverride(): void {
+    if (!this.conversationMode || this.conversationMode === 'dm') {
+      this.liveMentionOverride = '';
+      return;
+    }
+    // Find the first @mention in the text
+    const mentionMatch = this.text.match(/@(\S+)/);
+    if (mentionMatch) {
+      const slug = mentionMatch[1];
+      // Check if this matches a known agent
+      const matchedAgent = this.agents.find(
+        (a) => (a.slug || a.name || '').toLowerCase() === slug.toLowerCase()
+      );
+      if (matchedAgent) {
+        this.liveMentionOverride = matchedAgent.slug || matchedAgent.name || slug;
+        return;
+      }
+    }
+    this.liveMentionOverride = '';
+  }
+
+  private handleKeydown(e: KeyboardEvent): void {
+    // Let the autocomplete handle keys first.
+    const autocomplete = this.shadowRoot?.querySelector('scion-mention-autocomplete') as
+      | import('./mention-autocomplete.js').ScionMentionAutocomplete
+      | null;
+    if (autocomplete?.handleKeydown(e)) {
+      return; // consumed by autocomplete
+    }
+
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      this.handleSend();
+    }
+  }
+
+  private handleMentionAccept(e: CustomEvent<MentionAcceptDetail>): void {
+    const { slug, triggerStart } = e.detail;
+    const textarea = this.getTextareaElement();
+    if (!textarea) return;
+
+    // Compute what to replace: from @-trigger to current cursor position.
+    const cursorPos = textarea.selectionStart ?? this.text.length;
+    const before = this.text.slice(0, triggerStart);
+    const after = this.text.slice(cursorPos);
+    const insertion = `@${slug} `;
+
+    this.text = before + insertion + after;
+    this.runeCount = countRunes(this.text);
+
+    // Track the accepted mention.
+    this.acceptedMentions.add(slug);
+
+    // Restore cursor position after the inserted text.
+    const newCursorPos = triggerStart + insertion.length;
+    void this.updateComplete.then(() => {
+      const ta = this.getTextareaElement();
+      if (ta) {
+        ta.value = this.text;
+        ta.setSelectionRange(newCursorPos, newCursorPos);
+        ta.focus();
+      }
+    });
+  }
+
+  /** Render the pending uploaded files as previews/chips. */
+  private renderPendingFiles() {
+    return html`
+      <div class="pending-files">
+        ${this.pendingFiles.map(
+          (file, idx) => html`
+            <div class="pending-file">
+              ${file.mime.startsWith('image/')
+                ? html`<img src=${file.url} alt=${file.name} />`
+                : html`<sl-icon name="file-earmark" style="font-size:0.875rem"></sl-icon>`}
+              <span class="file-name" title=${file.name}>${file.name}</span>
+              <button class="remove-btn" @click=${() => this.removePendingFile(idx)}>&times;</button>
+            </div>
+          `
+        )}
+      </div>
+    `;
+  }
+
+  /** Open the hidden file input. */
+  private handleAttachClick(): void {
+    const input = this.shadowRoot?.querySelector('input[type="file"]') as HTMLInputElement | null;
+    if (input) {
+      input.value = '';
+      input.click();
+    }
+  }
+
+  /** Handle file selection from the file picker. */
+  private async handleFileSelected(e: Event): Promise<void> {
+    const input = e.target as HTMLInputElement;
+    const files = input.files;
+    if (!files || files.length === 0) return;
+
+    // Enforce max attachments.
+    if (this.pendingFiles.length + files.length > 10) {
+      this.dispatchEvent(
+        new CustomEvent('composer-error', {
+          detail: { message: 'Maximum 10 attachments per message' },
+          bubbles: true,
+          composed: true,
+        })
+      );
+      return;
+    }
+
+    this.uploading = true;
+    try {
+      const formData = new FormData();
+      formData.append('project_id', this.projectId);
+      for (const file of Array.from(files)) {
+        formData.append('files', file);
+      }
+
+      const { apiFetch } = await import('../../../client/api.js');
+      const res = await apiFetch('/api/v1/chat/attachments', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({ message: 'Upload failed' }));
+        this.dispatchEvent(
+          new CustomEvent('composer-error', {
+            detail: { message: (errData as Record<string, string>).message || 'Upload failed' },
+            bubbles: true,
+            composed: true,
+          })
+        );
+        return;
+      }
+
+      const data = (await res.json()) as {
+        attachments: UploadedAttachment[];
+      };
+      this.pendingFiles = [...this.pendingFiles, ...data.attachments];
+    } catch (err) {
+      this.dispatchEvent(
+        new CustomEvent('composer-error', {
+          detail: { message: err instanceof Error ? err.message : 'Upload failed' },
+          bubbles: true,
+          composed: true,
+        })
+      );
+    } finally {
+      this.uploading = false;
+    }
+  }
+
+  /** Remove a pending file from the list. */
+  private removePendingFile(index: number): void {
+    this.pendingFiles = this.pendingFiles.filter((_, i) => i !== index);
+  }
+
+  private handlePlainToggle(e: Event): void {
+    this.plain = (e.target as HTMLInputElement).checked;
+  }
+
+  private handleInterruptToggle(e: Event): void {
+    this.interrupt = (e.target as HTMLInputElement).checked;
+  }
+
+  private handleSend(): void {
+    const trimmed = this.text.trim();
+    const hasAttachments = this.pendingFiles.length > 0;
+    if ((!trimmed && !hasAttachments) || this.runeCount > MAX_MESSAGE_LENGTH || this.disabled) return;
+
+    // Filter accepted mentions to those still literally present in the text.
+    const mentions = [...this.acceptedMentions].filter((slug) => trimmed.includes(`@${slug}`));
+
+    // W7: Collect attachment IDs from pending uploads.
+    const attachmentIds = this.pendingFiles.map((f) => f.id);
+
+    this.dispatchEvent(
+      new CustomEvent<ChatSendDetail>('chat-send', {
+        detail: {
+          text: trimmed,
+          plain: this.plain,
+          interrupt: this.interrupt,
+          mentions,
+          attachmentIds,
+          onSuccess: () => {
+            this.text = '';
+            this.runeCount = 0;
+            this.acceptedMentions.clear();
+            this.pendingFiles = [];
+          },
+        },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
+
+  /**
+   * Get the underlying HTMLTextAreaElement from the sl-textarea shadow DOM.
+   */
+  private getTextareaElement(): HTMLTextAreaElement | null {
+    const slTextarea = this.shadowRoot?.querySelector('sl-textarea');
+    if (!slTextarea) return null;
+    // Shoelace sl-textarea wraps a native <textarea> inside its shadow root.
+    return (slTextarea.shadowRoot?.querySelector('textarea') as HTMLTextAreaElement) ?? null;
+  }
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    'scion-chat-composer': ScionChatComposer;
+  }
+}

@@ -72,6 +72,11 @@ const (
 	// call so only one standalone instance registers the webhook URL at a time.
 	LockTelegramWebhook AdvisoryLockKey = 0x5C10000D
 
+	// LockA2ABridgeSweep guards the Hub scheduler's recurring A2A bridge
+	// sweep job. The Hub (not the bridge) holds this lock to POST
+	// /internal/sweep to the bridge's external URL at most once per tick.
+	LockA2ABridgeSweep AdvisoryLockKey = 0x5C10000E
+
 	// LockHubSettingsSeed guards first-boot seeding of operational settings
 	// from settings.yaml into the hub_settings table (settings-db §3.9).
 	// Only the replica that acquires this lock performs the seed; others skip.
@@ -81,6 +86,28 @@ const (
 	// that removes stale port registrations for agents that are no longer
 	// running (stopped, deleted, etc.).
 	LockExposedPortsSweep AdvisoryLockKey = 0x5C10000C
+
+	// LockStorageMigration guards MigrateStorageOnFirstBoot so only one
+	// replica copies legacy un-namespaced GCS objects to the hub-scoped
+	// prefix at boot time.
+	LockStorageMigration AdvisoryLockKey = 0x5C10000F
+
+	// LockBundledResources guards BootstrapBundledResources so only one
+	// replica seeds embedded templates/harness-configs/skills into DB+GCS
+	// at boot time.
+	LockBundledResources AdvisoryLockKey = 0x5C100010
+
+	// LockInlineSecretsMigration guards the one-shot migration of inline
+	// plugin secrets from settings.yaml to the secret backend at boot time.
+	LockInlineSecretsMigration AdvisoryLockKey = 0x5C100011
+
+	// LockNonceCacheEviction guards the periodic HMAC nonce cache eviction
+	// that purges expired nonce entries from the database.
+	LockNonceCacheEviction AdvisoryLockKey = 0x5C100012
+
+	// LockChatLinkCodeEviction guards the periodic chat link code cleanup
+	// that deletes expired entries from the chat_link_codes table.
+	LockChatLinkCodeEviction AdvisoryLockKey = 0x5C100013
 
 	// LockWorkspaceProvision is the CLASS ID for per-project workspace
 	// provisioning locks. It is used with the two-int advisory lock form

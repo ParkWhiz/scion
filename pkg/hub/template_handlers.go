@@ -166,6 +166,10 @@ func (s *Server) handleTemplatesV2(w http.ResponseWriter, r *http.Request) {
 
 // listTemplatesV2 lists templates with extended filtering.
 func (s *Server) listTemplatesV2(w http.ResponseWriter, r *http.Request) {
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 	query := r.URL.Query()
 
@@ -387,6 +391,10 @@ func (s *Server) handleTemplateCRUD(w http.ResponseWriter, r *http.Request, id s
 
 // getTemplateV2 retrieves a template with full metadata.
 func (s *Server) getTemplateV2(w http.ResponseWriter, r *http.Request, id string) {
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 	template, err := s.store.GetTemplate(ctx, id)
 	if err != nil {

@@ -40,6 +40,65 @@ import (
 
 var tracer = otel.Tracer("scion-hub")
 
+// msgSANotAvailableInProject is the ONE answer given for both "this service
+// account does not exist" and "it exists but is not reachable from this
+// project", everywhere a caller names a service account by ID.
+//
+// THE WHOLE POINT IS THAT THE TWO CASES ARE INDISTINGUISHABLE. Answering
+// them differently — by message OR by status code — makes the endpoint an
+// existence oracle: a caller who may create agents in their own project can
+// enumerate other projects' service account IDs by watching which ones fail
+// differently. "Does not exist" and "exists but is not yours" are one answer.
+// Both branches must also use the same helper, since the response's `code`
+// field distinguishes ValidationError from BadRequest just as visibly as the
+// message does.
+//
+// The rationale was already written down at the project-settings default-SA
+// path, which has collapsed the two cases since it was written; the agent
+// create and PATCH paths did not follow it. This const exists so the three
+// sites cannot drift back apart: a future edit to one message is now an edit
+// to all three, which is the only version of this that stays true.
+//
+// It is deliberately vaguer than the messages around it. Once the account IS
+// reachable from the caller's project, being specific discloses nothing they
+// could not already read, so the "not verified" message that follows each of
+// these checks stays specific on purpose.
+//
+// ⚠️ THE COST, WHICH IS REAL AND NOT A FREE WIN, AND WHICH LANDS ON WHOEVER
+// VERIFIES THIS NEXT: the response no longer says which branch refused. Scope
+// refusal and nonexistence are one answer to a caller — the point — and they are
+// also one answer to a reviewer, who is not the intended audience but gets the
+// same view.
+//
+// So a test that seeds an unreachable account and asserts "400, this message" is
+// now satisfied by a fixture that never persisted the account at all. Before the
+// collapse that mistake announced itself, because nonexistence answered
+// differently. It is now indistinguishable from success at testing the thing.
+//
+// VERIFICATION THEREFORE HAS TO CONTROL THE FIXTURE, NOT READ THE RESPONSE:
+//   - that the collapse holds — same request, account present-but-unreachable
+//     versus absent, answers identical. requireIndistinguishable in
+//     sa_existence_oracle_test.go, applied to all three sites.
+//   - that the predicate still RUNS — account genuinely present in both arms,
+//     only reachability varied, reachable admitted and unreachable refused.
+//     Named rather than gestured at, because a reader should be able to check
+//     this rather than take it. The tightest pair is PATCH's, both subtests of
+//     TestBypassAgents_UpdateAgentServiceAccountChecks over one fixture:
+//     "service account from another project is rejected" against "verified
+//     in-project service account is still accepted". Create's pair is
+//     TestAgentCreate_HubScopedSA_AssignableByCreatorAndAdmin against
+//     TestAgentCreate_OtherProjectSA_StillRejected, which varies the kind of
+//     scope as well as reachability — weaker, but both arms persist the account,
+//     which is the property that matters here. Without an admitted arm, every
+//     refusal test would still pass over a deleted predicate, for the wrong
+//     reason.
+//
+// The neighbouring distinction — authorization refusal versus scope refusal — is
+// still observable and is pinned by assertDeniedByAuthzNotByScope in
+// handlers_agents_gcp_hubscope_test.go. Only scope-versus-nonexistence went
+// dark, and it went dark on purpose.
+const msgSANotAvailableInProject = "GCP service account not available in this project"
+
 // parseLabelFilters parses label=key=value query parameters into a map and
 // validates the resulting labels against constraint rules.
 func parseLabelFilters(params []string) (map[string]string, error) {
@@ -108,6 +167,10 @@ type CreateAgentRequest struct {
 	// NoAuth indicates the agent should start with zero injected credentials.
 	// When true, the Hub skips secret resolution and the broker skips credential injection.
 	NoAuth bool `json:"noAuth,omitempty"`
+	// AgentRole specifies the requested authorization role for the agent.
+	// Valid values: "none", "readonly", "baseline", "full".
+	// When omitted, defaults to the effective ceiling (project max intersected with caller ceiling).
+	AgentRole string `json:"agentRole,omitempty"`
 	// GCPIdentity specifies the GCP identity assignment for the agent.
 	// Controls metadata server behavior and optional service account binding.
 	GCPIdentity *GCPIdentityAssignment `json:"gcp_identity,omitempty"`
@@ -166,6 +229,10 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 	query := r.URL.Query()
 
@@ -297,6 +364,21 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		ValidationError(w, "projectId is required", nil)
 		return
 	}
+
+	// Resolve project slug to UUID if needed (mirrors listAgents pattern).
+	if gouuid.Validate(req.ProjectID) != nil {
+		project, err := s.store.GetProjectBySlug(ctx, req.ProjectID)
+		if err != nil {
+			if err == store.ErrNotFound {
+				NotFound(w, "Project")
+				return
+			}
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		req.ProjectID = project.ID
+	}
+
 	if req.CleanupMode != "" && req.CleanupMode != "strict" && req.CleanupMode != "force" {
 		ValidationError(w, "cleanupMode must be 'strict' or 'force'", nil)
 		return
@@ -321,27 +403,30 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if req.AgentRole != "" && !ValidAgentRole(AgentRole(req.AgentRole)) {
+		ValidationError(w, fmt.Sprintf("invalid agentRole %q: must be one of none, readonly, baseline, full", req.AgentRole), nil)
+		return
+	}
+
 	if err := labels.Validate(req.Labels); err != nil {
 		ValidationError(w, "Invalid labels: "+err.Error(), nil)
 		return
 	}
 
-	// Check if the caller is an agent (sub-agent creation)
+	// Authorization for every caller kind. The branch this replaced had no else,
+	// so a caller that was neither agent nor user fell through ungated (#591).
+	// Do not wrap this in an identity-kind test.
+	if !s.authorizeAgentCreate(w, r, req.ProjectID) {
+		return
+	}
+
+	// Attribution only (CreatedBy, creator name, ancestry, --notify subscriber).
+	// Authorization is done above; nothing below this point is a gate.
 	var createdBy string
 	var creatorName string
 	var ancestry []string
 	var notifySubscriberType, notifySubscriberID string // For --notify subscription
 	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
-		// Agent callers must have the project:agent:create scope
-		if !agentIdent.HasScope(ScopeAgentCreate) {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Missing required scope: project:agent:create", nil)
-			return
-		}
-		// Enforce project isolation: agents can only create sub-agents in their own project
-		if req.ProjectID != agentIdent.ProjectID() {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Agents can only create sub-agents within their own project", nil)
-			return
-		}
 		createdBy = agentIdent.ID()
 		// Resolve human-readable creator name and ancestry from the calling agent
 		if creatorAgent, err := s.store.GetAgent(ctx, agentIdent.ID()); err == nil {
@@ -359,20 +444,52 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		notifySubscriberID = userIdent.ID()
 		// User-created agents: ancestry is [userID]
 		ancestry = []string{userIdent.ID()}
-		// Enforce policy-based authorization: user must have permission to create agents in this project
-		decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-			Type:       "agent",
-			ParentType: "project",
-			ParentID:   req.ProjectID,
-		}, ActionCreate)
-		if !decision.Allowed {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"You don't have permission to create agents in this project", nil)
-			return
-		}
 	}
 
 	s.createAgentInProject(w, r, req, req.ProjectID, createdBy, creatorName, ancestry, notifySubscriberType, notifySubscriberID)
+}
+
+// validateGCPIdentityRequest performs the field-level validation of a requested
+// GCP identity assignment: the mode must be one of the three known modes, and
+// the service account ID must be present exactly for "assign". It writes a
+// ValidationError and returns false when the request is malformed.
+//
+// It lives here, on the path both create routes funnel through, rather than in
+// each route. It used to be in createAgent only, so POST
+// /api/v1/projects/{id}/agents — the route the CLI actually uses — accepted an
+// unrecognised metadata_mode outright and accepted a service_account_id
+// alongside "block" (#591, design §3.3). Duplicating the block per route would
+// reproduce the drift that caused that; one chokepoint cannot drift, and a
+// future third caller of createAgentInProject is covered by construction.
+//
+// It rejects rather than normalises. An unknown mode is a malformed request and
+// saying so is the signal; coercing it to "block" would hide exactly the
+// cross-layer disagreement documented in design §8.4. (The broker and sidecar
+// correctly fall back to "block" — they only know the value is unusable,
+// whereas here we know the caller's intent is malformed.)
+func validateGCPIdentityRequest(w http.ResponseWriter, cfg *GCPIdentityAssignment) bool {
+	if cfg == nil {
+		return true
+	}
+	switch cfg.MetadataMode {
+	case store.GCPMetadataModeBlock, store.GCPMetadataModePassthrough:
+		if cfg.ServiceAccountID != "" {
+			ValidationError(w, "service_account_id must be empty when metadata_mode is '"+cfg.MetadataMode+"'", nil)
+			return false
+		}
+	case store.GCPMetadataModeAssign:
+		if cfg.ServiceAccountID == "" {
+			ValidationError(w, "service_account_id is required when metadata_mode is 'assign'", nil)
+			return false
+		}
+	default:
+		// Covers the empty mode, i.e. `"gcp_identity": {}`, which previously
+		// fell through the config-building switch below and silently dropped
+		// the project's configured default mode.
+		ValidationError(w, "metadata_mode must be 'block', 'passthrough', or 'assign'", nil)
+		return false
+	}
+	return true
 }
 
 func (s *Server) createAgentInProject(
@@ -396,6 +513,12 @@ func (s *Server) createAgentInProject(
 	)
 	hubCreateStart := time.Now()
 
+	// Field-level GCP identity validation, before any persistence or SA
+	// resolution. Both create routes reach it here.
+	if !validateGCPIdentityRequest(w, req.GCPIdentity) {
+		return
+	}
+
 	// Verify project exists and get its configuration
 	project, err := s.store.GetProject(ctx, projectID)
 	if err != nil {
@@ -414,6 +537,127 @@ func (s *Server) createAgentInProject(
 		return
 	}
 
+	// Resolve effective agent role using the authority lattice.
+	// Computed early (before broker resolution) so that fail-loud 403 on
+	// role over-requests fires before resource-intensive operations.
+	var effectiveRole AgentRole
+	var parentRole AgentRole // empty for user-created agents; set in agent-caller branch
+	requestedRole := AgentRole(req.AgentRole)
+
+	// Read project max agent role from annotations (default: full)
+	projectMax := AgentRoleFull
+	if project != nil && project.Annotations != nil {
+		if maxStr, ok := project.Annotations[projectSettingMaxAgentRole]; ok && maxStr != "" {
+			if ValidAgentRole(AgentRole(maxStr)) {
+				projectMax = AgentRole(maxStr)
+			}
+		}
+	}
+
+	// Read default agent role: project annotation → hub default → full.
+	// Applied only when no explicit role is requested.
+	defaultAgentRole := AgentRoleFull
+	foundProjectDefault := false
+	if project != nil && project.Annotations != nil {
+		if defStr, ok := project.Annotations[projectSettingDefaultAgentRole]; ok && defStr != "" {
+			if ValidAgentRole(AgentRole(defStr)) {
+				defaultAgentRole = AgentRole(defStr)
+				foundProjectDefault = true
+			}
+		}
+	}
+	if !foundProjectDefault {
+		// No project-level default set; fall back to hub-level default
+		if hubDefault := s.hubAgentDefaults().DefaultAgentRole; hubDefault != "" {
+			if ValidAgentRole(AgentRole(hubDefault)) {
+				defaultAgentRole = AgentRole(hubDefault)
+			}
+		}
+	}
+
+	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+		// Agent caller: read parent agent's stored role for no-escalation ceiling.
+		parentRole = AgentRoleFull
+		creatorAgent, err := s.store.GetAgent(ctx, agentIdent.ID())
+		if err != nil {
+			// Fail-closed: default to baseline on lookup failure so that
+			// transient errors do not grant maximum privileges.
+			parentRole = AgentRoleBaseline
+			slog.Warn("Failed to read parent agent for role ceiling",
+				"parent_agent_id", agentIdent.ID(), "error", err)
+		} else if creatorAgent.AppliedConfig != nil && creatorAgent.AppliedConfig.AgentRole != "" {
+			parentRole = AgentRole(creatorAgent.AppliedConfig.AgentRole)
+		}
+
+		// Validate stored parentRole to guard against corrupted data.
+		if !ValidAgentRole(parentRole) {
+			slog.Warn("Parent agent has invalid stored role, defaulting to baseline",
+				"parent_agent_id", agentIdent.ID(), "stored_role", parentRole)
+			parentRole = AgentRoleBaseline
+		}
+
+		// Log the parent role for audit trail
+		slog.Info("Agent creating sub-agent",
+			"parent_agent_id", agentIdent.ID(),
+			"parent_role", parentRole,
+			"requested_role", requestedRole,
+			"project_max", projectMax,
+		)
+
+		if requestedRole == "" {
+			requestedRole = parentRole // default: inherit parent's role
+		}
+
+		// Enforce no-escalation: sub-agent role cannot exceed parent's role.
+		// Fail-loud so template misconfiguration is visible (a template requesting
+		// "full" for a sub-agent under a "baseline" parent is almost certainly wrong).
+		if req.AgentRole != "" && CompareRoles(AgentRole(req.AgentRole), parentRole) > 0 {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				fmt.Sprintf("Cannot grant sub-agent role %q: parent agent role is %q",
+					req.AgentRole, parentRole), nil)
+			return
+		}
+
+		effectiveRole = minRole(requestedRole, parentRole, projectMax)
+	} else if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
+		// User caller: ceiling based on hub role.
+		// The user-ceiling gate is currently a pass-through (all hub roles get
+		// Full); the projectMax gate is the effective limiter.
+		userCeiling := AgentRoleFull
+
+		if requestedRole == "" {
+			requestedRole = defaultAgentRole
+		}
+
+		// Fail-loud: reject explicit over-request against user ceiling or project max.
+		if req.AgentRole != "" && CompareRoles(AgentRole(req.AgentRole), userCeiling) > 0 {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				fmt.Sprintf("Cannot grant agent role %q: user ceiling is %q",
+					req.AgentRole, userCeiling), nil)
+			return
+		}
+		if req.AgentRole != "" && CompareRoles(AgentRole(req.AgentRole), projectMax) > 0 {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				fmt.Sprintf("Cannot grant agent role %q: project maximum is %q",
+					req.AgentRole, projectMax), nil)
+			return
+		}
+
+		// Use minRole directly instead of ResolveEffectiveRole to avoid recomputing ceiling.
+		effectiveRole = minRole(requestedRole, userCeiling, projectMax)
+	} else {
+		// No identity (should not happen in practice) - default to configured default
+		if requestedRole == "" {
+			requestedRole = defaultAgentRole
+		}
+		effectiveRole = requestedRole
+	}
+
+	// Map role=none to NoAuth behavior
+	if effectiveRole == AgentRoleNone {
+		req.NoAuth = true
+	}
+
 	// Resolve the runtime broker
 	runtimeBrokerID, err := s.resolveRuntimeBroker(ctx, w, req.RuntimeBrokerID, project)
 	if err != nil {
@@ -428,20 +672,22 @@ func (s *Server) createAgentInProject(
 		}
 	}
 
-	// Validate GCP passthrough mode: only the broker owner (or admin) may use passthrough,
-	// because it exposes the broker's own GCP identity to the agent container.
+	// Validate GCP passthrough mode. Two independent checks:
+	//  1. Broker-owner/admin restriction.
+	//  2. actAs on the broker host service account (requires the broker to
+	//     have its host SA registered).
+	//
+	// Both are enforced by authorizePassthroughIdentity. The ownership check
+	// is deliberately a hand-rolled comparison rather than policy-based
+	// authorization — see passthrough_gate.go for the reasoning.
 	if req.GCPIdentity != nil && req.GCPIdentity.MetadataMode == store.GCPMetadataModePassthrough && runtimeBrokerID != "" {
-		if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-			broker, err := s.store.GetRuntimeBroker(ctx, runtimeBrokerID)
-			if err != nil {
-				writeErrorFromErr(w, err, "")
-				return
-			}
-			if userIdent.Role() != "admin" && broker.CreatedBy != userIdent.ID() {
-				writeError(w, http.StatusForbidden, ErrCodeForbidden,
-					"GCP identity passthrough requires broker ownership. Only the broker owner can expose the broker's GCP identity to agents.", nil)
-				return
-			}
+		broker, err := s.store.GetRuntimeBroker(ctx, runtimeBrokerID)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		if !s.authorizePassthroughIdentity(w, r, broker, SurfacePassthroughCreate) {
+			return
 		}
 	}
 
@@ -450,15 +696,26 @@ func (s *Server) createAgentInProject(
 	if req.GCPIdentity != nil && req.GCPIdentity.MetadataMode == store.GCPMetadataModeAssign {
 		sa, err := s.store.GetGCPServiceAccount(ctx, req.GCPIdentity.ServiceAccountID)
 		if err != nil {
-			if err == store.ErrNotFound {
-				ValidationError(w, "GCP service account not found", nil)
+			// errors.Is, not ==, and that is load-bearing rather than style. A
+			// wrapped ErrNotFound would miss a == comparison and fall through to
+			// writeErrorFromErr, which answers ErrNotFound with 404 — reopening
+			// the existence oracle this branch exists to close, silently and from
+			// a change in another package. See msgSANotAvailableInProject.
+			if errors.Is(err, store.ErrNotFound) {
+				ValidationError(w, msgSANotAvailableInProject, nil)
 				return
 			}
 			writeErrorFromErr(w, err, "")
 			return
 		}
-		if sa.ScopeID != projectID {
-			ValidationError(w, "GCP service account does not belong to this project", nil)
+		// Scope-aware admissibility (P4 item F). This was `sa.ScopeID != projectID`,
+		// which never read sa.Scope and so was not a scope check at all: it
+		// compared a hub-scoped account's hub instance ID against a project ID and
+		// rejected it. ReachableFromProject keeps project-scoped accounts confined
+		// to their own project and admits hub-scoped ones from anywhere, which is
+		// what makes a hub-wide account assignable.
+		if !sa.ReachableFromProject(projectID) {
+			ValidationError(w, msgSANotAvailableInProject, nil)
 			return
 		}
 		if !sa.Verified {
@@ -466,15 +723,16 @@ func (s *Server) createAgentInProject(
 			return
 		}
 
-		// Authorization: any project member who can see the SA can assign it.
+		// Authorization: ActionAssign in Hub policy, plus iam.serviceAccounts.actAs
+		// on the caller in GCP. "Can see it" is no longer sufficient — reading a
+		// service account and being allowed to run as it are different grants.
 		// SA management (create/mint/delete) is gated on ActionManage elsewhere.
-		if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-			decision := s.authzService.CheckAccess(ctx, userIdent, gcpServiceAccountResource(sa), ActionRead)
-			if !decision.Allowed {
-				writeError(w, http.StatusForbidden, ErrCodeForbidden,
-					"You don't have permission to assign GCP service accounts in this project", nil)
-				return
-			}
+		//
+		// The whole gate lives in authorizeSAAssignment, including the ordering of
+		// the two layers, so the create and PATCH paths cannot drift apart on the
+		// part that matters. Read it there before changing either call.
+		if !s.authorizeSAAssignment(w, r, sa, SurfaceAgentCreate) {
+			return
 		}
 
 		resolvedGCPSA = sa
@@ -678,7 +936,7 @@ func (s *Server) createAgentInProject(
 		}
 	}
 
-	agent.AppliedConfig = s.buildAppliedConfig(req, harnessConfig, creatorName)
+	agent.AppliedConfig = s.buildAppliedConfig(req, harnessConfig, creatorName, effectiveRole)
 
 	// Populate GCP identity in applied config.
 	// Default to "block" mode when no GCP identity is specified, so agents
@@ -701,6 +959,18 @@ func (s *Server) createAgentInProject(
 			agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
 				MetadataMode: store.GCPMetadataModeBlock,
 			}
+		default:
+			// Unreachable: validateGCPIdentityRequest rejects any other mode at
+			// the top of this function. Asserted rather than assumed — before
+			// the hoist this switch had no default arm, and on the project
+			// route that accident was the *only* thing standing between an
+			// unrecognised mode and the agent container (design §8.4). An
+			// unrecognised mode reaching here now means the validation was
+			// removed or bypassed, which is a server bug, not a client one.
+			slog.Error("unreachable: unvalidated GCP metadata mode reached agent config build",
+				"metadata_mode", req.GCPIdentity.MetadataMode, "project_id", projectID)
+			InternalError(w)
+			return
 		}
 	} else {
 		// No explicit GCP identity — check project default, then fall back to block.
@@ -713,18 +983,72 @@ func (s *Server) createAgentInProject(
 		case store.GCPMetadataModeAssign:
 			if projectSettings.DefaultGCPIdentityServiceAccountID != "" {
 				sa, err := s.store.GetGCPServiceAccount(ctx, projectSettings.DefaultGCPIdentityServiceAccountID)
-				if err == nil && sa.ScopeID == projectID && sa.Verified {
-					agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
-						MetadataMode:        store.GCPMetadataModeAssign,
-						ServiceAccountID:    sa.ID,
-						ServiceAccountEmail: sa.Email,
-						ProjectID:           sa.ProjectID,
-					}
-				} else {
-					// SA not found/invalid — fall back to block
-					agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
-						MetadataMode: store.GCPMetadataModeBlock,
-					}
+				// Scope-aware admissibility (P4 item F), same predicate as the two
+				// caller-supplied assign sites. A project may legitimately nominate
+				// a hub-scoped account as its default, and the old ScopeID equality
+				// silently refused one.
+				if err != nil || !sa.ReachableFromProject(projectID) {
+					// SA not found or not reachable — fail agent creation.
+					// P10 changes: a project-default SA that fails checks is an
+					// error, not a silent fallback to block. The operator set the
+					// default; if the SA is unreachable, the operator needs to know.
+					slog.Warn("project-default SA assignment failed: service account not available",
+						"surface", SurfaceProjectDefault,
+						"project_id", projectID,
+						"sa_id", projectSettings.DefaultGCPIdentityServiceAccountID,
+						"err", err)
+					writeError(w, http.StatusBadRequest, ErrCodeValidationError,
+						"project default GCP service account is not available in this project; "+
+							"update the project's default GCP identity setting", nil)
+					return
+				}
+				if !sa.Verified {
+					slog.Warn("project-default SA assignment failed: service account not verified",
+						"surface", SurfaceProjectDefault,
+						"project_id", projectID,
+						"sa_id", sa.ID, "sa_email", sa.Email)
+					writeError(w, http.StatusBadRequest, ErrCodeValidationError,
+						"project default GCP service account is not verified; "+
+							"verify it before it can be assigned to agents", nil)
+					return
+				}
+
+				// P10: Authorization gate for project-default SA assignment.
+				//
+				// Design §4.5 (ruled by ptone): project-default assignment checks
+				// the immediate agent creator. The principal is:
+				//   - for a human-created agent: the human creator;
+				//   - for agent-creates-agent: the creating agent's assigned SA.
+				//
+				// This REPLACES the former "NO authorization check here,
+				// deliberately and by ruling (P4 item F)" comment. P10 changes
+				// the ruling: the project operator selected an available default,
+				// but did not grant every future creator permission to act as it.
+				//
+				// authorizeSAAssignment runs:
+				//   1. Hub-scoped mode coupling (D4) — denies hub-scoped SAs
+				//      when gcpIamCheckMode != enforce.
+				//   2. Hub ActionAssign authorization.
+				//   3. GCP actAs check via callerPrincipal.
+				//   4. Audit record via EvaluateActAs with SurfaceProjectDefault.
+				//
+				// On failure, authorizeSAAssignment writes the HTTP error and
+				// returns false. Agent creation FAILS rather than silently
+				// falling back to block — a failed default is an error, not a
+				// degradation.
+				if !s.authorizeSAAssignment(w, r, sa, SurfaceProjectDefault) {
+					slog.Warn("project-default SA assignment denied by authorization gate",
+						"surface", SurfaceProjectDefault,
+						"project_id", projectID,
+						"sa_id", sa.ID, "sa_email", sa.Email)
+					return
+				}
+
+				agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
+					MetadataMode:        store.GCPMetadataModeAssign,
+					ServiceAccountID:    sa.ID,
+					ServiceAccountEmail: sa.Email,
+					ProjectID:           sa.ProjectID,
 				}
 			} else {
 				agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
@@ -866,8 +1190,12 @@ func (s *Server) createAgentInProject(
 
 	// Managed agent path: bypass broker dispatch entirely and handle directly.
 	if req.Profile == ManagedAgentsProfile {
+		logAttrs := []any{"agent_id", agent.ID, "agent", agent.Name, "elapsed", time.Since(hubCreateStart).String()}
+		if parentRole != "" {
+			logAttrs = append(logAttrs, "parent_agent_role", string(parentRole))
+		}
 		s.agentLifecycleLog.Info("Hub: managed agent create (hub-direct)",
-			"agent_id", agent.ID, "agent", agent.Name, "elapsed", time.Since(hubCreateStart).String())
+			logAttrs...)
 
 		task := ""
 		if agent.AppliedConfig != nil {
@@ -902,8 +1230,12 @@ func (s *Server) createAgentInProject(
 	// Dispatch to runtime broker if available.
 	// Unless provision-only is requested, do a full create+start via DispatchAgentCreate.
 	// Otherwise provision only — set up dirs, worktree, templates without launching the container.
+	preDispatchAttrs := []any{"agent_id", agent.ID, "agent", agent.Name, "elapsed", time.Since(hubCreateStart).String()}
+	if parentRole != "" {
+		preDispatchAttrs = append(preDispatchAttrs, "parent_agent_role", string(parentRole))
+	}
 	s.agentLifecycleLog.Info("Hub: pre-dispatch setup complete",
-		"agent_id", agent.ID, "agent", agent.Name, "elapsed", time.Since(hubCreateStart).String())
+		preDispatchAttrs...)
 	var warnings []string
 	if dispatcher := s.GetDispatcher(); dispatcher != nil {
 		if !req.ProvisionOnly {
@@ -1027,8 +1359,12 @@ func (s *Server) createAgentInProject(
 		}
 	}
 
+	dispatchAttrs := []any{"agent_id", agent.ID, "agent", agent.Name, "totalElapsed", time.Since(hubCreateStart).String()}
+	if parentRole != "" {
+		dispatchAttrs = append(dispatchAttrs, "parent_agent_role", string(parentRole))
+	}
 	s.agentLifecycleLog.Info("Hub: dispatch complete",
-		"agent_id", agent.ID, "agent", agent.Name, "totalElapsed", time.Since(hubCreateStart).String())
+		dispatchAttrs...)
 
 	// Re-read the agent from the database before publishing the "created" event.
 	// A concurrent status update (e.g. sciontool reporting a clone error) may have
@@ -1664,6 +2000,10 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getAgent(w http.ResponseWriter, r *http.Request, id string) {
+	if !checkAgentReadScope(w, r) {
+		return
+	}
+
 	ctx := r.Context()
 	agent, err := s.store.GetAgent(ctx, id)
 	if err != nil {
@@ -1671,19 +2011,20 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	// If the caller is an agent, enforce project isolation
+	// If the caller is an agent, enforce project isolation.
+	//
+	// This check MUST run before s.authorize: cross-project access is answered
+	// with 404 rather than 403 so the response does not disclose that the agent
+	// exists. Authorizing first would turn that 404 into a 403 and leak
+	// existence (design §4.2).
 	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
 		if agent.ProjectID != agentIdent.ProjectID() {
 			NotFound(w, "Agent")
 			return
 		}
 	}
-	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-		decision := s.authzService.CheckAccess(ctx, userIdent, agentResource(agent), ActionRead)
-		if !decision.Allowed {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden, "Access denied", nil)
-			return
-		}
+	if !s.authorize(w, r, agentResource(agent), ActionRead) {
+		return
 	}
 
 	// Enrich agent with project and broker names
@@ -1710,6 +2051,13 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, id string) 
 	agent, err := s.store.GetAgent(ctx, id)
 	if err != nil {
 		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	// This handler had no authorization of any kind before #591: any
+	// authenticated caller could rename, relabel and rewrite the config of any
+	// agent on the hub, including its GCP identity.
+	if !s.authorize(w, r, agentResource(agent), ActionUpdate) {
 		return
 	}
 
@@ -1813,6 +2161,25 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, id string) 
 				MetadataMode: store.GCPMetadataModeBlock,
 			}
 		case store.GCPMetadataModePassthrough:
+			// Passthrough exposes the broker's own GCP identity to the agent
+			// container. The create path (see createAgentInProject) enforces
+			// broker-owner/admin + actAs restriction for passthrough. This
+			// PATCH path must enforce the same restriction — without it,
+			// "create without passthrough, then PATCH it in" bypasses the
+			// create-path gate. Both checks live in
+			// authorizePassthroughIdentity.
+			if agent.RuntimeBrokerID == "" {
+				ValidationError(w, "GCP identity passthrough requires a runtime broker, but this agent has no broker assigned", nil)
+				return
+			}
+			broker, err := s.store.GetRuntimeBroker(ctx, agent.RuntimeBrokerID)
+			if err != nil {
+				writeErrorFromErr(w, err, "")
+				return
+			}
+			if !s.authorizePassthroughIdentity(w, r, broker, SurfacePassthroughPatch) {
+				return
+			}
 			agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
 				MetadataMode: store.GCPMetadataModePassthrough,
 			}
@@ -1823,7 +2190,46 @@ func (s *Server) updateAgent(w http.ResponseWriter, r *http.Request, id string) 
 			}
 			sa, err := s.store.GetGCPServiceAccount(ctx, updates.GCPIdentity.ServiceAccountID)
 			if err != nil {
-				writeErrorFromErr(w, err, "GCP service account not found")
+				// Was writeErrorFromErr(w, err, "GCP service account not found"),
+				// which was wrong twice over. That third parameter is requestID,
+				// not a message, so the string shipped in the response's requestId
+				// field while the message read "Resource not found" — and the
+				// status was 404, against 400 for the not-reachable branch twelve
+				// lines down. Existence and reachability were distinguishable here
+				// by status code even more plainly than by wording.
+				//
+				// errors.Is, not ==: see the create path.
+				if errors.Is(err, store.ErrNotFound) {
+					ValidationError(w, msgSANotAvailableInProject, nil)
+					return
+				}
+				writeErrorFromErr(w, err, "")
+				return
+			}
+			// These two checks mirror the create path (see the assign branch of
+			// createAgentInProject) deliberately, character for character. Without
+			// them, "create with no service account, then PATCH one in" walks
+			// straight around the hardened create path — it needs only update
+			// rights on the agent, which the creator has by definition.
+			//
+			// Kept as a near-duplicate rather than factored into a shared helper on
+			// purpose. That duplication has now paid for itself once: the ScopeID
+			// equality it describes became scope-aware in P4 item F, and the site
+			// was found by grepping for the create path's shape. The property is
+			// worth preserving — keep these greppably identical to the create path.
+			if !sa.ReachableFromProject(agent.ProjectID) {
+				ValidationError(w, msgSANotAvailableInProject, nil)
+				return
+			}
+			if !sa.Verified {
+				ValidationError(w, "GCP service account is not verified; verify it before assigning to agents", nil)
+				return
+			}
+			// Parity with the create path, and now literally the same call.
+			// PATCH is the surface that most needs it: reassigning an existing
+			// agent's identity is the cheapest way to acquire a service account
+			// you could not have been given at create time.
+			if !s.authorizeSAAssignment(w, r, sa, SurfaceAgentPatch) {
 				return
 			}
 			agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
@@ -1896,14 +2302,36 @@ func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agen
 		attribute.String("scion.agent.id", agent.ID),
 	)
 
-	// Enforce policy-based authorization: only the agent's creator (owner) or admins can delete
-	if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-		decision := s.authzService.CheckAccess(ctx, userIdent, agentResource(agent), ActionDelete)
+	// Authorize by caller kind: users by delete policy, agents by lifecycle
+	// scope + same-project isolation (as in handleAgentAction). Fail closed
+	// for a caller that is neither — a user-only check would silently skip
+	// agent callers, which do not satisfy the UserIdentity interface.
+	switch ident := GetIdentityFromContext(ctx).(type) {
+	case UserIdentity:
+		decision := s.authzService.CheckAccess(ctx, ident, agentResource(agent), ActionDelete)
 		if !decision.Allowed {
 			writeError(w, http.StatusForbidden, ErrCodeForbidden,
 				"Only the agent's creator can delete it", nil)
 			return
 		}
+	case AgentIdentity:
+		if !ident.HasScope(ScopeAgentLifecycle) {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"Missing required scope: project:agent:lifecycle", nil)
+			return
+		}
+		// An empty project ID on either side must never authorize: two empty
+		// strings compare equal, so a malformed token or corrupted record would
+		// otherwise slip past the isolation gate.
+		if agent.ProjectID == "" || ident.ProjectID() == "" || agent.ProjectID != ident.ProjectID() {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"Agents can only manage agents within their own project", nil)
+			return
+		}
+	default:
+		writeError(w, http.StatusForbidden, ErrCodeForbidden,
+			"This action requires user or agent authentication", nil)
+		return
 	}
 
 	query := r.URL.Query()
@@ -2257,20 +2685,41 @@ func (s *Server) handleAgentTokenRefresh(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Extract the current token from the request to refresh it
-	token := extractAgentToken(r)
-	if token == "" {
-		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
-			"no agent token found in request", nil)
+	// Look up the agent record to re-derive scopes from the stored role.
+	// This is critical for backward compatibility: legacy agents created
+	// before the role system have tokens with old scope sets (missing
+	// ScopeProjectRead, etc.). Copying old scopes verbatim on refresh
+	// would perpetuate the gap. By re-deriving from the stored role via
+	// agentRoleAndScopes → Server.GenerateAgentToken → ScopesForRole,
+	// the refreshed token always reflects the current role definition.
+	agent, err := s.store.GetAgent(r.Context(), id)
+	if err != nil {
+		slog.Warn("Token refresh: failed to look up agent for role-based scope derivation",
+			"agent_id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"failed to look up agent record", nil)
 		return
 	}
 
-	newToken, expiresAt, err := s.agentTokenService.RefreshAgentToken(token)
+	agentRole, additionalScopes := agentRoleAndScopes(agent)
+	newToken, err := s.GenerateAgentToken(
+		agent.ID, agent.ProjectID, agentIdent.Ancestry(),
+		agentRole, additionalScopes,
+	)
 	if err != nil {
-		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
-			"failed to refresh token: "+err.Error(), nil)
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"failed to generate refreshed token: "+err.Error(), nil)
 		return
 	}
+
+	// Parse the new token to extract the expiry for the response.
+	newClaims, err := s.agentTokenService.ValidateAgentToken(newToken)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"failed to validate refreshed token", nil)
+		return
+	}
+	expiresAt := newClaims.Expiry.Time()
 
 	// Build the generalized tokens[] array.
 	// App tokens are always present; transport tokens are added when

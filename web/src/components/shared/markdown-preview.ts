@@ -23,41 +23,7 @@
 
 import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-
-// ────────────────────────────────────────────────────────────
-// Lazy-loaded markdown rendering
-// ────────────────────────────────────────────────────────────
-
-interface MarkdownRenderer {
-  render(markdown: string): string;
-}
-
-let rendererPromise: Promise<MarkdownRenderer> | null = null;
-
-async function loadRenderer(): Promise<MarkdownRenderer> {
-  if (!rendererPromise) {
-    rendererPromise = (async () => {
-      const [{ marked }, DOMPurify] = await Promise.all([
-        import('marked'),
-        import('dompurify'),
-      ]);
-
-      const purify = DOMPurify.default ?? DOMPurify;
-
-      return {
-        render(markdown: string): string {
-          const rawHtml = marked.parse(markdown, { async: false }) as string;
-          return purify.sanitize(rawHtml);
-        },
-      };
-    })();
-  }
-  return rendererPromise;
-}
-
-// ────────────────────────────────────────────────────────────
-// Component
-// ────────────────────────────────────────────────────────────
+import { getMarkdownRenderer } from '../../utils/markdown.js';
 
 @customElement('scion-markdown-preview')
 export class ScionMarkdownPreview extends LitElement {
@@ -102,10 +68,22 @@ export class ScionMarkdownPreview extends LitElement {
       color: var(--scion-text, #1e293b);
     }
 
-    .preview-container h1 { font-size: 1.75rem; border-bottom: 1px solid var(--scion-border, #e2e8f0); padding-bottom: 0.3em; }
-    .preview-container h2 { font-size: 1.375rem; border-bottom: 1px solid var(--scion-border, #e2e8f0); padding-bottom: 0.3em; }
-    .preview-container h3 { font-size: 1.125rem; }
-    .preview-container h4 { font-size: 1rem; }
+    .preview-container h1 {
+      font-size: 1.75rem;
+      border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      padding-bottom: 0.3em;
+    }
+    .preview-container h2 {
+      font-size: 1.375rem;
+      border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      padding-bottom: 0.3em;
+    }
+    .preview-container h3 {
+      font-size: 1.125rem;
+    }
+    .preview-container h4 {
+      font-size: 1rem;
+    }
 
     .preview-container p {
       margin: 0 0 1em;
@@ -242,7 +220,7 @@ export class ScionMarkdownPreview extends LitElement {
     this.error = null;
 
     try {
-      const renderer = await loadRenderer();
+      const renderer = await getMarkdownRenderer();
       this.renderedHtml = renderer.render(this.content);
     } catch (err) {
       console.error('Failed to render markdown:', err);

@@ -27,6 +27,7 @@ import { customElement, property, state } from 'lit/decorators.js';
 
 import type { PageData } from '../../shared/types.js';
 import '../shared/env-var-list.js';
+import '../shared/gcp-service-account-list.js';
 import '../shared/secret-list.js';
 import '../shared/resource-list.js';
 import '../shared/resource-import.js';
@@ -151,23 +152,29 @@ export class ScionPageSettings extends LitElement {
           <sl-tab slot="nav" panel="env-vars" ?active=${this.activeTab === 'env-vars'}
             >Environment Variables</sl-tab
           >
-          <sl-tab slot="nav" panel="secrets" ?active=${this.activeTab === 'secrets'}>Secrets</sl-tab>
+          <sl-tab slot="nav" panel="secrets" ?active=${this.activeTab === 'secrets'}
+            >Secrets</sl-tab
+          >
           <sl-tab slot="nav" panel="templates" ?active=${this.activeTab === 'templates'}
             >Templates</sl-tab
           >
           <sl-tab slot="nav" panel="harness-configs" ?active=${this.activeTab === 'harness-configs'}
             >Harness Configs</sl-tab
           >
-          <sl-tab
-            slot="nav"
-            panel="pre-start-hooks"
-            ?active=${this.activeTab === 'pre-start-hooks'}
+          <sl-tab slot="nav" panel="pre-start-hooks" ?active=${this.activeTab === 'pre-start-hooks'}
             >Pre-Start Hooks</sl-tab
           >
-          <sl-tab slot="nav" panel="skills" ?active=${this.activeTab === 'skills'}
-            >Skills</sl-tab
+          <sl-tab
+            slot="nav"
+            panel="service-accounts"
+            ?active=${this.activeTab === 'service-accounts'}
+            >Service Accounts</sl-tab
           >
-          <sl-tab slot="nav" panel="project-templates" ?active=${this.activeTab === 'project-templates'}
+          <sl-tab slot="nav" panel="skills" ?active=${this.activeTab === 'skills'}>Skills</sl-tab>
+          <sl-tab
+            slot="nav"
+            panel="project-templates"
+            ?active=${this.activeTab === 'project-templates'}
             >Project Templates</sl-tab
           >
 
@@ -230,20 +237,42 @@ export class ScionPageSettings extends LitElement {
             ></scion-pre-start-hook-list>
           </sl-tab-panel>
 
+          <!--
+            THE COPY HERE STATES WHAT IS TRUE TODAY, NOT WHAT THE SCOPE IMPLIES.
+            An earlier draft said these accounts "are usable from every project".
+            The Hub does accept a hub-scoped account at agent creation, but no
+            agent-creation picker offers one yet, so that sentence promised a
+            capability a user cannot reach and would have read as a bug rather
+            than as unfinished work. Both gaps below are part of step 5's
+            definition of done; when the picker lands, this paragraph shrinks.
+          -->
+          <sl-tab-panel name="service-accounts">
+            <p class="tab-intro">
+              GCP service accounts registered at hub scope. They belong to the hub rather than to
+              any one project, which is why they are managed here.
+            </p>
+            <p class="tab-intro">
+              Two things are not available yet. Registering a hub-scoped account — use a project's
+              settings to register an account for that project. And selecting a hub-scoped account
+              when creating an agent, so an account listed here is not yet offered on any project's
+              agent form.
+            </p>
+            <scion-gcp-service-account-list scope="hub"></scion-gcp-service-account-list>
+          </sl-tab-panel>
+
           <sl-tab-panel name="skills">
             <p class="tab-intro">
-              Skills automatically injected into all agents on this hub. System entries are
-              seeded from built-in platform skills and are read-only. User-defined entries
-              can be added and removed by hub admins.
+              Skills automatically injected into all agents on this hub. System entries are seeded
+              from built-in platform skills and are read-only. User-defined entries can be added and
+              removed by hub admins.
             </p>
             <scion-injected-skills-panel scope="hub"></scion-injected-skills-panel>
           </sl-tab-panel>
 
           <sl-tab-panel name="project-templates">
             <p class="tab-intro">
-              Project templates for quick project setup. Create a template from any
-              existing project, then use it to create new projects with pre-configured
-              settings.
+              Project templates for quick project setup. Create a template from any existing
+              project, then use it to create new projects with pre-configured settings.
             </p>
             <scion-project-template-list></scion-project-template-list>
           </sl-tab-panel>

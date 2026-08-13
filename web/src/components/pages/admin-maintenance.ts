@@ -127,13 +127,25 @@ export class ScionPageAdminMaintenance extends LitElement {
   @state()
   private viewingRun: MaintenanceRun | null = null;
 
+  /** Whether the restart hub confirmation dialog is open. */
+  @state()
+  private restartDialogOpen = false;
+
+  /** Whether a restart request is in-flight. */
+  @state()
+  private restartLoading = false;
+
   /** Whether the bulk reset-auth request is in-flight. */
   @state()
   private resetAuthAllLoading = false;
 
   /** Result of the last bulk reset-auth request. */
   @state()
-  private resetAuthAllResult: { succeeded: { id: string; name: string }[]; failed: { id: string; name: string; error: string }[]; total: number } | null = null;
+  private resetAuthAllResult: {
+    succeeded: { id: string; name: string }[];
+    failed: { id: string; name: string; error: string }[];
+    total: number;
+  } | null = null;
 
   /** Update check state for rebuild-server. */
   @state()
@@ -612,7 +624,9 @@ export class ScionPageAdminMaintenance extends LitElement {
     try {
       const response = await apiFetch('/api/v1/admin/maintenance/operations');
       if (!response.ok) {
-        throw new Error(await extractApiError(response, `HTTP ${response.status}: ${response.statusText}`));
+        throw new Error(
+          await extractApiError(response, `HTTP ${response.status}: ${response.statusText}`)
+        );
       }
 
       const data = (await response.json()) as MaintenanceResponse;
@@ -780,7 +794,7 @@ export class ScionPageAdminMaintenance extends LitElement {
               dryRun: this.runDialogDryRun,
             },
           }),
-        },
+        }
       );
 
       if (!response.ok) {
@@ -815,7 +829,7 @@ export class ScionPageAdminMaintenance extends LitElement {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ params: {} }),
-        },
+        }
       );
 
       if (!response.ok) {
@@ -857,9 +871,7 @@ export class ScionPageAdminMaintenance extends LitElement {
 
   private async loadRunHistory(key: string): Promise<void> {
     try {
-      const response = await apiFetch(
-        `/api/v1/admin/maintenance/operations/${key}/runs?limit=20`,
-      );
+      const response = await apiFetch(`/api/v1/admin/maintenance/operations/${key}/runs?limit=20`);
       if (!response.ok) return;
 
       const data = (await response.json()) as { runs: MaintenanceRun[] | null };
@@ -881,9 +893,7 @@ export class ScionPageAdminMaintenance extends LitElement {
     // Otherwise fetch the full run detail.
     try {
       const key = run.operationKey ?? '';
-      const response = await apiFetch(
-        `/api/v1/admin/maintenance/operations/${key}/runs/${run.id}`,
-      );
+      const response = await apiFetch(`/api/v1/admin/maintenance/operations/${key}/runs/${run.id}`);
       if (response.ok) {
         const detail = (await response.json()) as MaintenanceRun;
         this.viewingRun = detail;
@@ -899,7 +909,9 @@ export class ScionPageAdminMaintenance extends LitElement {
     this.viewingRun = null;
   }
 
-  private parseMigrationResult(resultStr: string | undefined): { log?: string; error?: string; dryRun?: boolean } | null {
+  private parseMigrationResult(
+    resultStr: string | undefined
+  ): { log?: string; error?: string; dryRun?: boolean } | null {
     if (!resultStr) return null;
     try {
       return JSON.parse(resultStr) as { log?: string; error?: string; dryRun?: boolean };
@@ -922,9 +934,7 @@ export class ScionPageAdminMaintenance extends LitElement {
         : this.error
           ? this.renderError()
           : this.renderContent()}
-
-      ${this.renderRunDialog()}
-      ${this.renderRunDetailDialog()}
+      ${this.renderRunDialog()} ${this.renderRunDetailDialog()} ${this.renderRestartDialog()}
     `;
   }
 
@@ -954,9 +964,7 @@ export class ScionPageAdminMaintenance extends LitElement {
 
   private renderContent() {
     return html`
-      ${this.renderMaintenanceMode()}
-      ${this.renderQuickActions()}
-      ${this.renderMigrations()}
+      ${this.renderMaintenanceMode()} ${this.renderQuickActions()} ${this.renderMigrations()}
       ${this.renderOperations()}
     `;
   }
@@ -965,10 +973,31 @@ export class ScionPageAdminMaintenance extends LitElement {
     return html`
       <div class="section">
         <h2 class="section-title">Quick Actions</h2>
-        <p class="section-description">
-          One-off administrative actions across all agents.
-        </p>
+        <p class="section-description">One-off administrative actions across all agents.</p>
         <div class="card-list">
+          <div class="card">
+            <div class="card-header">
+              <sl-icon name="arrow-clockwise" class="pending"></sl-icon>
+              <span class="card-title">Restart Hub</span>
+              ${this.restartLoading
+                ? html`<sl-button size="small" disabled loading>Restarting...</sl-button>`
+                : html`
+                    <sl-button
+                      variant="warning"
+                      size="small"
+                      @click=${() => this.openRestartDialog()}
+                    >
+                      <sl-icon slot="prefix" name="arrow-clockwise"></sl-icon>
+                      Restart
+                    </sl-button>
+                  `}
+            </div>
+            <div class="card-description">
+              Restart the hub service via systemd. This will briefly drop all active connections
+              (including WebSockets) while the process restarts. Use this after changing settings
+              that require a restart to take effect.
+            </div>
+          </div>
           <div class="card">
             <div class="card-header">
               <sl-icon name="key" class="pending"></sl-icon>
@@ -987,23 +1016,25 @@ export class ScionPageAdminMaintenance extends LitElement {
                   `}
             </div>
             <div class="card-description">
-              Inject a fresh auth token into every running agent without restarting them.
-              The token refresh loop in each agent will pick up the new credentials automatically.
+              Inject a fresh auth token into every running agent without restarting them. The token
+              refresh loop in each agent will pick up the new credentials automatically.
             </div>
             ${this.resetAuthAllResult
               ? html`
                   <div class="card-meta">
                     <span>
-                      Total: ${this.resetAuthAllResult.total} &middot;
-                      Succeeded: ${this.resetAuthAllResult.succeeded?.length ?? 0} &middot;
-                      Failed: ${this.resetAuthAllResult.failed?.length ?? 0}
+                      Total: ${this.resetAuthAllResult.total} &middot; Succeeded:
+                      ${this.resetAuthAllResult.succeeded?.length ?? 0} &middot; Failed:
+                      ${this.resetAuthAllResult.failed?.length ?? 0}
                     </span>
                   </div>
                   ${(this.resetAuthAllResult.failed?.length ?? 0) > 0
                     ? html`
-                        <div class="result-log result-error">${this.resetAuthAllResult.failed
+                        <div class="result-log result-error">
+                          ${this.resetAuthAllResult.failed
                             .map((f) => `${f.name || f.id}: ${f.error}`)
-                            .join('\n')}</div>
+                            .join('\n')}
+                        </div>
                       `
                     : nothing}
                 `
@@ -1033,26 +1064,57 @@ export class ScionPageAdminMaintenance extends LitElement {
     }
   }
 
+  private openRestartDialog(): void {
+    this.restartDialogOpen = true;
+  }
+
+  private closeRestartDialog(): void {
+    if (!this.restartLoading) {
+      this.restartDialogOpen = false;
+    }
+  }
+
+  private async handleRestartHub(): Promise<void> {
+    this.restartLoading = true;
+    try {
+      const response = await apiFetch('/api/v1/admin/maintenance/restart', {
+        method: 'POST',
+      });
+      if (!response.ok) {
+        const errMsg = await extractApiError(response, `HTTP ${response.status}`);
+        throw new Error(errMsg);
+      }
+      this.restartDialogOpen = false;
+      showToast('Hub is restarting... The page will reconnect shortly.', 'primary', {
+        icon: 'info-circle',
+        duration: 10000,
+      });
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to restart hub');
+    } finally {
+      this.restartLoading = false;
+    }
+  }
+
   private renderMaintenanceMode() {
     return html`
       <div class="section">
         <h2 class="section-title">Maintenance Mode</h2>
         <p class="section-description">
-          When maintenance mode is enabled, only administrators can log in.
-          All other users will be temporarily blocked until maintenance mode is
-          disabled.
+          When maintenance mode is enabled, only administrators can log in. All other users will be
+          temporarily blocked until maintenance mode is disabled.
         </p>
         <div class="maintenance-mode-toggle">
           <button
             class="toggle-track ${this.maintenanceEnabled ? 'active' : ''}"
-            @click=${() => { this.toggleMaintenance(); }}
+            @click=${() => {
+              this.toggleMaintenance();
+            }}
             aria-label="Toggle maintenance mode"
           >
             <span class="toggle-knob"></span>
           </button>
-          <span class="toggle-label">
-            ${this.maintenanceEnabled ? 'Enabled' : 'Disabled'}
-          </span>
+          <span class="toggle-label"> ${this.maintenanceEnabled ? 'Enabled' : 'Disabled'} </span>
         </div>
       </div>
     `;
@@ -1063,8 +1125,8 @@ export class ScionPageAdminMaintenance extends LitElement {
       <div class="section">
         <h2 class="section-title">Migrations</h2>
         <p class="section-description">
-          One-time data migrations that transition the system between states.
-          Completed migrations cannot be re-run from the UI.
+          One-time data migrations that transition the system between states. Completed migrations
+          cannot be re-run from the UI.
         </p>
         ${this.migrations.length === 0
           ? html`<div class="empty-inline">No migrations registered.</div>`
@@ -1087,10 +1149,7 @@ export class ScionPageAdminMaintenance extends LitElement {
         <div class="card-header">
           ${isRunning
             ? html`<sl-spinner style="font-size: 1.25rem;"></sl-spinner>`
-            : html`<sl-icon
-                name="${this.statusIcon(m.status)}"
-                class="${m.status}"
-              ></sl-icon>`}
+            : html`<sl-icon name="${this.statusIcon(m.status)}" class="${m.status}"></sl-icon>`}
           <span class="card-title">${m.title}</span>
           <span class="status-badge ${m.status}">${m.status}</span>
         </div>
@@ -1100,9 +1159,7 @@ export class ScionPageAdminMaintenance extends LitElement {
           ${m.completedAt
             ? html`<span>Completed: ${this.formatDate(m.completedAt)}</span>`
             : nothing}
-          ${m.startedBy
-            ? html`<span>By: ${m.startedBy}</span>`
-            : nothing}
+          ${m.startedBy ? html`<span>By: ${m.startedBy}</span>` : nothing}
         </div>
         ${result?.log
           ? html`<div class="result-log ${result.error ? 'result-error' : ''}">${result.log}</div>`
@@ -1125,11 +1182,7 @@ export class ScionPageAdminMaintenance extends LitElement {
                         ${m.status === 'failed' ? 'Retry' : 'Run'}
                       </sl-button>
                     `
-                  : html`
-                      <sl-button size="small" disabled loading>
-                        Running...
-                      </sl-button>
-                    `}
+                  : html` <sl-button size="small" disabled loading> Running... </sl-button> `}
               </div>
             `
           : nothing}
@@ -1201,16 +1254,14 @@ export class ScionPageAdminMaintenance extends LitElement {
           ? html`
               <div class="card-meta">
                 <span>
-                  Last run: ${this.formatRelativeTime(op.lastRun.startedAt)}
-                  (<span class="status-badge ${op.lastRun.status}">${op.lastRun.status}</span>)
+                  Last run: ${this.formatRelativeTime(op.lastRun.startedAt)} (<span
+                    class="status-badge ${op.lastRun.status}"
+                    >${op.lastRun.status}</span
+                  >)
                 </span>
-                ${op.lastRun.startedBy
-                  ? html`<span>by ${op.lastRun.startedBy}</span>`
-                  : nothing}
+                ${op.lastRun.startedBy ? html`<span>by ${op.lastRun.startedBy}</span>` : nothing}
               </div>
-              ${op.lastRun.status === 'failed'
-                ? this.renderLastRunError(op.lastRun)
-                : nothing}
+              ${op.lastRun.status === 'failed' ? this.renderLastRunError(op.lastRun) : nothing}
             `
           : html`
               <div class="card-meta">
@@ -1260,7 +1311,7 @@ export class ScionPageAdminMaintenance extends LitElement {
                 <td><span class="status-badge ${run.status}">${run.status}</span></td>
                 <td>${run.startedBy ?? '--'}</td>
               </tr>
-            `,
+            `
           )}
         </tbody>
       </table>
@@ -1281,11 +1332,7 @@ export class ScionPageAdminMaintenance extends LitElement {
     if (!migration) return nothing;
 
     return html`
-      <sl-dialog
-        label="Run Migration"
-        open
-        @sl-request-close=${() => this.closeRunDialog()}
-      >
+      <sl-dialog label="Run Migration" open @sl-request-close=${() => this.closeRunDialog()}>
         <div class="dialog-body">
           <p><strong>${migration.title}</strong></p>
           <p>${migration.description}</p>
@@ -1303,7 +1350,8 @@ export class ScionPageAdminMaintenance extends LitElement {
           variant="default"
           @click=${() => this.closeRunDialog()}
           ?disabled=${this.runInProgress}
-        >Cancel</sl-button>
+          >Cancel</sl-button
+        >
         <sl-button
           slot="footer"
           variant="primary"
@@ -1324,11 +1372,7 @@ export class ScionPageAdminMaintenance extends LitElement {
     const isDestructive = this.runDialogKey === 'rebuild-server';
 
     return html`
-      <sl-dialog
-        label="Run Operation"
-        open
-        @sl-request-close=${() => this.closeRunDialog()}
-      >
+      <sl-dialog label="Run Operation" open @sl-request-close=${() => this.closeRunDialog()}>
         <div class="dialog-body">
           <p><strong>${operation.title}</strong></p>
           <p>${operation.description}</p>
@@ -1343,7 +1387,8 @@ export class ScionPageAdminMaintenance extends LitElement {
           variant="default"
           @click=${() => this.closeRunDialog()}
           ?disabled=${this.runInProgress}
-        >Cancel</sl-button>
+          >Cancel</sl-button
+        >
         <sl-button
           slot="footer"
           variant="${isDestructive ? 'warning' : 'primary'}"
@@ -1385,11 +1430,41 @@ export class ScionPageAdminMaintenance extends LitElement {
             ? html`<div class="result-log">${run.log}</div>`
             : html`<div class="empty-inline">No log output captured.</div>`}
         </div>
+        <sl-button slot="footer" variant="default" @click=${() => this.closeRunDetail()}
+          >Close</sl-button
+        >
+      </sl-dialog>
+    `;
+  }
+
+  private renderRestartDialog() {
+    if (!this.restartDialogOpen) return nothing;
+
+    return html`
+      <sl-dialog label="Restart Hub" open @sl-request-close=${() => this.closeRestartDialog()}>
+        <div class="dialog-body">
+          <p>Are you sure you want to restart the hub service?</p>
+          <p style="color: var(--sl-color-warning-700, #a16207); font-weight: 500;">
+            This will briefly disconnect all users and drop active WebSocket connections. The hub
+            will be back online within a few seconds.
+          </p>
+        </div>
         <sl-button
           slot="footer"
           variant="default"
-          @click=${() => this.closeRunDetail()}
-        >Close</sl-button>
+          @click=${() => this.closeRestartDialog()}
+          ?disabled=${this.restartLoading}
+          >Cancel</sl-button
+        >
+        <sl-button
+          slot="footer"
+          variant="warning"
+          ?loading=${this.restartLoading}
+          @click=${() => this.handleRestartHub()}
+        >
+          <sl-icon slot="prefix" name="arrow-clockwise"></sl-icon>
+          Restart Hub
+        </sl-button>
       </sl-dialog>
     `;
   }
@@ -1423,9 +1498,10 @@ export class ScionPageAdminMaintenance extends LitElement {
     const r = this.updateCheckResult;
     if (!r) return nothing;
 
-    const branchLabel = r.current_branch && r.current_branch !== 'main'
-      ? html` on <code>${r.current_branch}</code>`
-      : nothing;
+    const branchLabel =
+      r.current_branch && r.current_branch !== 'main'
+        ? html` on <code>${r.current_branch}</code>`
+        : nothing;
 
     if (!r.update_available) {
       return html`
@@ -1449,11 +1525,7 @@ export class ScionPageAdminMaintenance extends LitElement {
           ? html`
               <div class="update-check-commits">
                 ${r.new_commits.map(
-                  (c) => html`
-                    <div>
-                      <span class="commit-hash">${c.hash}</span>${c.subject}
-                    </div>
-                  `,
+                  (c) => html` <div><span class="commit-hash">${c.hash}</span>${c.subject}</div> `
                 )}
               </div>
             `

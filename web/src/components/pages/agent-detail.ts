@@ -56,6 +56,9 @@ import '../shared/agent-log-viewer.js';
 import type { ScionAgentLogViewer } from '../shared/agent-log-viewer.js';
 import '../shared/agent-message-viewer.js';
 import type { ScionAgentMessageViewer } from '../shared/agent-message-viewer.js';
+import '../shared/chat/chat-thread.js';
+import type { ScionChatThread } from '../shared/chat/chat-thread.js';
+import { isFeatureEnabled } from '../../utils/feature-flags.js';
 import '../shared/hash-display.js';
 import '../shared/quick-message-dialog.js';
 import { showToast } from '../../utils/toast.js';
@@ -142,6 +145,15 @@ export class ScionPageAgentDetail extends LitElement {
 
   @state()
   private quickMessageOpen = false;
+
+  /** Whether the Chat|Log toggle is in "chat" mode (vs "log" mode). */
+  @state()
+  private chatViewActive = true;
+
+  /** Whether the native chat feature flag is enabled. */
+  private get nativeChatEnabled(): boolean {
+    return isFeatureEnabled('web.native_chat');
+  }
 
   @state()
   private metricsSummary: AgentMetricsSummary | null = null;
@@ -581,7 +593,6 @@ export class ScionPageAgentDetail extends LitElement {
       background: var(--scion-bg-subtle, #f1f5f9);
       color: var(--scion-text-muted, #64748b);
     }
-
   `;
 
   private boundOnAgentsUpdated = this.onAgentsUpdated.bind(this);
@@ -607,7 +618,10 @@ export class ScionPageAgentDetail extends LitElement {
   override disconnectedCallback(): void {
     super.disconnectedCallback();
     stateManager.removeEventListener('agents-updated', this.boundOnAgentsUpdated as EventListener);
-    stateManager.removeEventListener('projects-updated', this.boundOnProjectsUpdated as EventListener);
+    stateManager.removeEventListener(
+      'projects-updated',
+      this.boundOnProjectsUpdated as EventListener
+    );
     if (this.relativeTimeInterval) {
       clearInterval(this.relativeTimeInterval);
       this.relativeTimeInterval = null;
@@ -643,7 +657,12 @@ export class ScionPageAgentDetail extends LitElement {
         const agentResponse = await apiFetch(`/api/v1/agents/${this.agentId}`);
 
         if (!agentResponse.ok) {
-          throw new Error(await extractApiError(agentResponse, `HTTP ${agentResponse.status}: ${agentResponse.statusText}`));
+          throw new Error(
+            await extractApiError(
+              agentResponse,
+              `HTTP ${agentResponse.status}: ${agentResponse.statusText}`
+            )
+          );
         }
 
         this.agent = (await agentResponse.json()) as Agent;
@@ -695,8 +714,12 @@ export class ScionPageAgentDetail extends LitElement {
           apiFetch(`/api/v1/notifications/subscriptions?agentId=${this.agentId}`)
             .then(async (subRes) => {
               if (subRes.ok) {
-                const data = (await subRes.json()) as Subscription[] | { subscriptions?: Subscription[] };
-                const subs = Array.isArray(data) ? data : (data as { subscriptions?: Subscription[] }).subscriptions || [];
+                const data = (await subRes.json()) as
+                  | Subscription[]
+                  | { subscriptions?: Subscription[] };
+                const subs = Array.isArray(data)
+                  ? data
+                  : (data as { subscriptions?: Subscription[] }).subscriptions || [];
                 const match = subs.find((s) => s.scope === 'agent' && s.agentId === this.agentId);
                 if (match) {
                   this.subscribed = true;
@@ -823,14 +846,11 @@ export class ScionPageAgentDetail extends LitElement {
     if (action === 'reset-auth') {
       this.actionLoading = { ...this.actionLoading, 'reset-auth': true };
       try {
-        const response = await apiFetch(
-          `/api/v1/agents/${this.agentId}/reset-auth`,
-          { method: 'POST' }
-        );
+        const response = await apiFetch(`/api/v1/agents/${this.agentId}/reset-auth`, {
+          method: 'POST',
+        });
         if (!response.ok) {
-          throw new Error(
-            await extractApiError(response, 'Failed to reset auth')
-          );
+          throw new Error(await extractApiError(response, 'Failed to reset auth'));
         }
         this.backgroundRefresh();
       } catch (err) {
@@ -935,10 +955,37 @@ export class ScionPageAgentDetail extends LitElement {
       viewer?.loadLogs();
     }
     if (e.detail.name === 'messages') {
-      const viewer = this.shadowRoot?.querySelector(
-        'scion-agent-message-viewer'
-      ) as ScionAgentMessageViewer | null;
-      viewer?.loadMessages();
+      if (this.nativeChatEnabled && this.chatViewActive) {
+        const chatThread = this.shadowRoot?.querySelector(
+          'scion-chat-thread'
+        ) as ScionChatThread | null;
+        chatThread?.loadHistory();
+      } else {
+        const viewer = this.shadowRoot?.querySelector(
+          'scion-agent-message-viewer'
+        ) as ScionAgentMessageViewer | null;
+        viewer?.loadMessages();
+      }
+    }
+  }
+
+  private handleMessageViewToggle(mode: 'chat' | 'log'): void {
+    this.chatViewActive = mode === 'chat';
+    // Trigger load for the newly active view
+    if (this.chatViewActive) {
+      this.updateComplete.then(() => {
+        const chatThread = this.shadowRoot?.querySelector(
+          'scion-chat-thread'
+        ) as ScionChatThread | null;
+        chatThread?.loadHistory();
+      });
+    } else {
+      this.updateComplete.then(() => {
+        const viewer = this.shadowRoot?.querySelector(
+          'scion-agent-message-viewer'
+        ) as ScionAgentMessageViewer | null;
+        viewer?.loadMessages();
+      });
     }
   }
 
@@ -995,14 +1042,7 @@ export class ScionPageAgentDetail extends LitElement {
               : {}}
           ></scion-agent-log-viewer>
         </sl-tab-panel>
-        <sl-tab-panel name="messages">
-          <scion-agent-message-viewer
-            agentId=${this.agentId}
-            agentName=${this.agent.name || ''}
-            ?canSend=${can(this.agent._capabilities, 'message')}
-            ?cloudLogging=${this.agent.cloudLogging || false}
-          ></scion-agent-message-viewer>
-        </sl-tab-panel>
+        <sl-tab-panel name="messages"> ${this.renderMessagesPanel()} </sl-tab-panel>
         <sl-tab-panel name="configuration">${this.renderConfigurationTab()}</sl-tab-panel>
       </sl-tab-group>
 
@@ -1010,8 +1050,68 @@ export class ScionPageAgentDetail extends LitElement {
         agentId=${this.agentId}
         agentName=${this.agent.name || ''}
         ?open=${this.quickMessageOpen}
-        @sl-request-close=${() => { this.quickMessageOpen = false; }}
+        @sl-request-close=${() => {
+          this.quickMessageOpen = false;
+        }}
       ></scion-quick-message-dialog>
+    `;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Messages Panel (Chat | Log toggle)
+  // ---------------------------------------------------------------------------
+
+  private renderMessagesPanel() {
+    const agent = this.agent!;
+
+    // When the feature flag is off, render exactly the existing message viewer
+    // (AC9 — byte-for-byte current Messages tab behaviour).
+    if (!this.nativeChatEnabled) {
+      return html`
+        <scion-agent-message-viewer
+          agentId=${this.agentId}
+          agentName=${agent.name || ''}
+          ?canSend=${can(agent._capabilities, 'message')}
+          ?cloudLogging=${agent.cloudLogging || false}
+        ></scion-agent-message-viewer>
+      `;
+    }
+
+    // Feature flag ON: show Chat|Log toggle, default to Chat
+    return html`
+      <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem;">
+        <sl-radio-group
+          value=${this.chatViewActive ? 'chat' : 'log'}
+          size="small"
+          @sl-change=${(e: Event) => {
+            const value = (e.target as HTMLInputElement).value as 'chat' | 'log';
+            this.handleMessageViewToggle(value);
+          }}
+        >
+          <sl-radio-button value="chat">
+            <sl-icon slot="prefix" name="chat-dots" style="font-size: 0.875rem"></sl-icon>
+            Chat
+          </sl-radio-button>
+          <sl-radio-button value="log">
+            <sl-icon slot="prefix" name="list-ul" style="font-size: 0.875rem"></sl-icon>
+            Log
+          </sl-radio-button>
+        </sl-radio-group>
+      </div>
+      <scion-chat-thread
+        agentId=${this.agentId}
+        agentName=${agent.name || ''}
+        ?canSend=${can(agent._capabilities, 'message')}
+        ?showVisibilityToggle=${true}
+        style="display: ${this.chatViewActive ? '' : 'none'}"
+      ></scion-chat-thread>
+      <scion-agent-message-viewer
+        agentId=${this.agentId}
+        agentName=${agent.name || ''}
+        ?canSend=${can(agent._capabilities, 'message')}
+        ?cloudLogging=${agent.cloudLogging || false}
+        style="display: ${this.chatViewActive ? 'none' : ''}"
+      ></scion-agent-message-viewer>
     `;
   }
 
@@ -1062,7 +1162,9 @@ export class ScionPageAgentDetail extends LitElement {
                   variant="default"
                   size="small"
                   outline
-                  @click=${() => { this.quickMessageOpen = true; }}
+                  @click=${() => {
+                    this.quickMessageOpen = true;
+                  }}
                 >
                   <sl-icon slot="prefix" name="chat-dots"></sl-icon>
                   Message
@@ -1173,7 +1275,10 @@ export class ScionPageAgentDetail extends LitElement {
               `
             : nothing}
           <sl-tooltip content="See this agent in graph">
-            <a href="/agents/graph?project=${agent.projectId}&focus=${this.agentId}" style="text-decoration: none;">
+            <a
+              href="/agents/graph?project=${agent.projectId}&focus=${this.agentId}"
+              style="text-decoration: none;"
+            >
               <sl-button variant="default" size="small">
                 <sl-icon slot="prefix" name="diagram-3"></sl-icon>
               </sl-button>
@@ -1206,8 +1311,7 @@ export class ScionPageAgentDetail extends LitElement {
     return html`
       ${this.renderCurrentStateCard(agent)} ${this.renderCurrentTaskCard(agent)}
       ${this.renderLimitsUsageCard(agent)} ${this.renderConnectivityCard(agent)}
-      ${this.renderExposedPortsCard(agent)}
-      ${this.renderNotificationsCard()}
+      ${this.renderExposedPortsCard(agent)} ${this.renderNotificationsCard()}
     `;
   }
 
@@ -1218,7 +1322,11 @@ export class ScionPageAgentDetail extends LitElement {
           <h3 class="card-title">Current State</h3>
           ${this.pageData?.user
             ? html`
-                <sl-tooltip content=${this.subscribed ? 'Unsubscribe from notifications' : 'Subscribe to notifications'}>
+                <sl-tooltip
+                  content=${this.subscribed
+                    ? 'Unsubscribe from notifications'
+                    : 'Subscribe to notifications'}
+                >
                   <sl-button
                     size="small"
                     variant=${this.subscribed ? 'primary' : 'default'}
@@ -1250,12 +1358,22 @@ export class ScionPageAgentDetail extends LitElement {
             <span class="info-value">
               ${agent.activity
                 ? html`<scion-status-badge
-                    status=${agent.activity as StatusType}
-                    label=${agent.activity}
-                    size="small"
-                  ></scion-status-badge>${((agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)) || agent.updated || agent.updatedAt)
-                    ? html`<span style="color: var(--scion-text-muted, #64748b); font-size: 0.85em; margin-left: 0.5em;">${this.formatRelativeTime(((agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)) ? agent.lastActivityEvent : (agent.updated || agent.updatedAt))!)}</span>`
-                    : ''}`
+                      status=${agent.activity as StatusType}
+                      label=${agent.activity}
+                      size="small"
+                    ></scion-status-badge
+                    >${(agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)) ||
+                    agent.updated ||
+                    agent.updatedAt
+                      ? html`<span
+                          style="color: var(--scion-text-muted, #64748b); font-size: 0.85em; margin-left: 0.5em;"
+                          >${this.formatRelativeTime(
+                            (agent.lastActivityEvent && !this.isZeroDate(agent.lastActivityEvent)
+                              ? agent.lastActivityEvent
+                              : agent.updated || agent.updatedAt)!
+                          )}</span
+                        >`
+                      : ''}`
                 : html`<span style="color: var(--scion-text-muted, #64748b);">—</span>`}
             </span>
           </div>
@@ -1406,9 +1524,7 @@ export class ScionPageAgentDetail extends LitElement {
           ${ports.map(
             (p) => html`
               <div class="info-item">
-                <span class="info-label">
-                  :${p.port}${p.label ? ` (${p.label})` : ''}
-                </span>
+                <span class="info-label"> :${p.port}${p.label ? ` (${p.label})` : ''} </span>
                 <span class="info-value">
                   <a
                     href="/api/v1/agents/${agent.id}/ports/${p.port}/proxy/"
@@ -1499,7 +1615,9 @@ export class ScionPageAgentDetail extends LitElement {
                       <span class="info-value">
                         ${t.calls} calls
                         ${t.error > 0
-                          ? html`<span style="color: var(--scion-danger-500, #ef4444)"> (${t.error} errors)</span>`
+                          ? html`<span style="color: var(--scion-danger-500, #ef4444)">
+                              (${t.error} errors)</span
+                            >`
                           : nothing}
                       </span>
                     </div>
@@ -1550,14 +1668,14 @@ export class ScionPageAgentDetail extends LitElement {
     const inline = cfg?.inlineConfig;
 
     return html`
-      ${this.renderIdentityCard(agent, cfg?.gcpIdentity)} ${this.renderLabelsCard(agent)}
+      ${this.renderIdentityCard(agent)} ${this.renderLabelsCard(agent)}
       ${this.renderHarnessModelCard(agent, cfg, inline)} ${this.renderRuntimeCard(agent, inline)}
       ${this.renderGCPIdentityCard(cfg?.gcpIdentity)} ${this.renderConfigLimitsCard(inline)}
       ${this.renderTelemetryCard(inline?.telemetry)} ${this.renderInitialTaskCard(cfg)}
     `;
   }
 
-  private renderIdentityCard(agent: Agent, gcpIdentity?: GCPIdentityConfig) {
+  private renderIdentityCard(agent: Agent) {
     return html`
       <div class="card">
         <h3 class="card-title">Identity</h3>
@@ -1592,7 +1710,30 @@ export class ScionPageAgentDetail extends LitElement {
             ? html`
                 <div class="info-item">
                   <span class="info-label">Auth Method</span>
-                  <span class="info-value">${agent.harnessAuth || agent.appliedConfig?.harnessAuth}</span>
+                  <span class="info-value"
+                    >${agent.harnessAuth || agent.appliedConfig?.harnessAuth}</span
+                  >
+                </div>
+              `
+            : ''}
+          ${agent.appliedConfig?.agentRole
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Authorization Role</span>
+                  <span class="info-value">
+                    <sl-badge
+                      variant=${agent.appliedConfig.agentRole === 'full'
+                        ? 'success'
+                        : agent.appliedConfig.agentRole === 'baseline'
+                          ? 'primary'
+                          : agent.appliedConfig.agentRole === 'readonly'
+                            ? 'neutral'
+                            : agent.appliedConfig.agentRole === 'none'
+                              ? 'warning'
+                              : 'neutral'}
+                      >${agent.appliedConfig.agentRole}</sl-badge
+                    >
+                  </span>
                 </div>
               `
             : ''}
@@ -1603,22 +1744,6 @@ export class ScionPageAgentDetail extends LitElement {
                   <span class="info-value">
                     <span class="visibility-badge">${agent.visibility}</span>
                   </span>
-                </div>
-              `
-            : ''}
-          ${gcpIdentity?.metadataMode === 'assign' && gcpIdentity.serviceAccountEmail
-            ? html`
-                <div class="info-item">
-                  <span class="info-label">GCP Service Account</span>
-                  <span class="info-value mono">${gcpIdentity.serviceAccountEmail}</span>
-                </div>
-              `
-            : ''}
-          ${gcpIdentity?.metadataMode === 'assign' && gcpIdentity.projectId
-            ? html`
-                <div class="info-item">
-                  <span class="info-label">GCP Project</span>
-                  <span class="info-value mono">${gcpIdentity.projectId}</span>
                 </div>
               `
             : ''}
@@ -1671,7 +1796,10 @@ export class ScionPageAgentDetail extends LitElement {
                 <div class="info-item">
                   <span class="info-label">Template Hash</span>
                   <span class="info-value mono">
-                    <scion-hash-display .hash=${cfg.templateHash} max-width="14ch"></scion-hash-display>
+                    <scion-hash-display
+                      .hash=${cfg.templateHash}
+                      max-width="14ch"
+                    ></scion-hash-display>
                   </span>
                 </div>
               `
@@ -1787,6 +1915,22 @@ export class ScionPageAgentDetail extends LitElement {
               <sl-badge variant=${modeVariant}>${gcpIdentity.metadataMode}</sl-badge>
             </span>
           </div>
+          ${gcpIdentity.serviceAccountEmail
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">Service Account</span>
+                  <span class="info-value mono">${gcpIdentity.serviceAccountEmail}</span>
+                </div>
+              `
+            : ''}
+          ${gcpIdentity.projectId
+            ? html`
+                <div class="info-item">
+                  <span class="info-label">GCP Project</span>
+                  <span class="info-value mono">${gcpIdentity.projectId}</span>
+                </div>
+              `
+            : ''}
         </div>
       </div>
     `;

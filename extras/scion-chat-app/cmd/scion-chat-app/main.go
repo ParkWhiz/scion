@@ -219,15 +219,22 @@ func main() {
 				CommandIDMap:        cfg.Platforms.GoogleChat.CommandIDMap,
 				ListenAddress:       cfg.Platforms.GoogleChat.ListenAddress,
 				Credentials:         cfg.Platforms.GoogleChat.Credentials,
+				IngressMode:         cfg.Platforms.GoogleChat.IngressMode,
+				PubSubSubscription:  cfg.Platforms.GoogleChat.PubSubSubscription,
 			},
 			cmdRouter.HandleEvent,
 			chatClient,
 			gcLog,
 		)
 		messenger = gcAdapter
+		ingressMode := cfg.Platforms.GoogleChat.IngressMode
+		if ingressMode == "" {
+			ingressMode = "http"
+		}
 		log.Info("google chat adapter initialized",
 			"project_id", cfg.Platforms.GoogleChat.ProjectID,
 			"external_url", cfg.Platforms.GoogleChat.ExternalURL,
+			"ingress_mode", ingressMode,
 		)
 	}
 
@@ -236,6 +243,23 @@ func main() {
 
 	// Create notification relay and wire it as the broker's message handler.
 	relay := chatapp.NewNotificationRelay(store, messenger, log.With("component", "notifications"))
+
+	// Create send queue to rate-limit outbound messages per space.
+	if messenger != nil {
+		sendQueue := chatapp.NewSendQueue(
+			messenger,
+			log.With("component", "sendqueue"),
+			cfg.Platforms.GoogleChat.SendQueueSize,
+			cfg.Platforms.GoogleChat.SendMinDelay.Duration,
+		)
+		relay.SetSendQueue(sendQueue)
+		defer sendQueue.Close()
+		log.Info("send queue initialized",
+			"queue_size", cfg.Platforms.GoogleChat.SendQueueSize,
+			"min_delay", cfg.Platforms.GoogleChat.SendMinDelay.Duration,
+		)
+	}
+
 	broker.SetHandler(relay.HandleBrokerMessage)
 
 	// Load existing space-project links and request broker subscriptions.

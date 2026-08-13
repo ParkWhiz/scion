@@ -28,6 +28,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/knadh/koanf/v2"
 )
 
@@ -89,6 +90,9 @@ type Layer1Snapshot struct {
 	// Auto-expose ports
 	AutoExposePortsEnabled *bool
 
+	// Project defaults
+	DefaultScratchpad *bool
+
 	// Agent defaults
 	DefaultTemplate      string
 	DefaultHarnessConfig string
@@ -113,6 +117,18 @@ type Layer1Snapshot struct {
 
 	// Notifications
 	NotificationChannels []config.V1NotificationChannelConfig
+
+	// Federation
+	FederationConfig *config.FederationConfig // nil when federation section not present
+
+	// Runtimes — map of named runtime configs (DB > bootstrap fallback)
+	Runtimes map[string]config.V1RuntimeConfig
+
+	// Profiles — map of named profile configs (DB > bootstrap fallback)
+	Profiles map[string]config.V1ProfileConfig
+
+	// HarnessConfigs — map of named harness configurations (DB > bootstrap fallback)
+	HarnessConfigs map[string]config.HarnessConfigEntry
 
 	// EnvOverrides lists Layer-1 koanf keys that are overridden by env vars
 	// on this node — used for drift warnings.
@@ -275,6 +291,13 @@ func (o *OperationalSettings) Snapshot() Layer1Snapshot {
 
 	snap := buildSnapshotFromKoanf(merged)
 
+	// Map-of-objects sections (runtimes, profiles, harness_configs): extract
+	// directly from DB docs or bootstrap koanf rather than going through the
+	// merged koanf. The koanf round-trip loses empty-map semantics ({} → no
+	// keys → nil), which would cause an admin-cleared section to silently
+	// fall back to file values instead of returning the empty map.
+	o.populateMapSections(&snap, dbSections)
+
 	// Populate env overrides list.
 	overrides := make([]string, 0, len(o.envOverrides))
 	for key := range o.envOverrides {
@@ -290,6 +313,123 @@ func (o *OperationalSettings) Snapshot() Layer1Snapshot {
 	}
 
 	return snap
+}
+
+// populateMapSections fills the Runtimes, Profiles, and HarnessConfigs
+// snapshot fields. When a DB row exists for the section, the doc is
+// deserialized directly (preserving empty maps). When no DB row exists,
+// the bootstrap koanf is used as the file-based fallback.
+func (o *OperationalSettings) populateMapSections(snap *Layer1Snapshot, dbSections map[string]json.RawMessage) {
+	// Runtimes
+	if doc, ok := dbSections["runtimes"]; ok {
+		var v map[string]config.V1RuntimeConfig
+		if err := json.Unmarshal(doc, &v); err != nil {
+			slog.Warn("runtimes: failed to unmarshal DB doc for snapshot", "error", err)
+		} else {
+			if v == nil {
+				v = map[string]config.V1RuntimeConfig{}
+			}
+			snap.Runtimes = v
+		}
+	} else {
+		snap.Runtimes = extractRuntimesFromKoanf(o.bootstrapKoanf)
+	}
+
+	// Profiles
+	if doc, ok := dbSections["profiles"]; ok {
+		var v map[string]config.V1ProfileConfig
+		if err := json.Unmarshal(doc, &v); err != nil {
+			slog.Warn("profiles: failed to unmarshal DB doc for snapshot", "error", err)
+		} else {
+			if v == nil {
+				v = map[string]config.V1ProfileConfig{}
+			}
+			snap.Profiles = v
+		}
+	} else {
+		snap.Profiles = extractProfilesFromKoanf(o.bootstrapKoanf)
+	}
+
+	// HarnessConfigs
+	if doc, ok := dbSections["harness_configs"]; ok {
+		var v map[string]config.HarnessConfigEntry
+		if err := json.Unmarshal(doc, &v); err != nil {
+			slog.Warn("harness_configs: failed to unmarshal DB doc for snapshot", "error", err)
+		} else {
+			if v == nil {
+				v = map[string]config.HarnessConfigEntry{}
+			}
+			snap.HarnessConfigs = v
+		}
+	} else {
+		snap.HarnessConfigs = extractHarnessConfigsFromKoanf(o.bootstrapKoanf)
+	}
+}
+
+// extractRuntimesFromKoanf extracts runtimes from a koanf instance (file fallback).
+func extractRuntimesFromKoanf(k *koanf.Koanf) map[string]config.V1RuntimeConfig {
+	if k == nil || !k.Exists("runtimes") {
+		return nil
+	}
+	sub := k.Cut("runtimes")
+	if sub == nil || len(sub.Keys()) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(sub.Raw())
+	if err != nil {
+		slog.Warn("runtimes: failed to marshal from bootstrap koanf", "error", err)
+		return nil
+	}
+	var v map[string]config.V1RuntimeConfig
+	if err := json.Unmarshal(data, &v); err != nil {
+		slog.Warn("runtimes: failed to unmarshal from bootstrap koanf", "error", err)
+		return nil
+	}
+	return v
+}
+
+// extractProfilesFromKoanf extracts profiles from a koanf instance (file fallback).
+func extractProfilesFromKoanf(k *koanf.Koanf) map[string]config.V1ProfileConfig {
+	if k == nil || !k.Exists("profiles") {
+		return nil
+	}
+	sub := k.Cut("profiles")
+	if sub == nil || len(sub.Keys()) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(sub.Raw())
+	if err != nil {
+		slog.Warn("profiles: failed to marshal from bootstrap koanf", "error", err)
+		return nil
+	}
+	var v map[string]config.V1ProfileConfig
+	if err := json.Unmarshal(data, &v); err != nil {
+		slog.Warn("profiles: failed to unmarshal from bootstrap koanf", "error", err)
+		return nil
+	}
+	return v
+}
+
+// extractHarnessConfigsFromKoanf extracts harness_configs from a koanf instance (file fallback).
+func extractHarnessConfigsFromKoanf(k *koanf.Koanf) map[string]config.HarnessConfigEntry {
+	if k == nil || !k.Exists("harness_configs") {
+		return nil
+	}
+	sub := k.Cut("harness_configs")
+	if sub == nil || len(sub.Keys()) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(sub.Raw())
+	if err != nil {
+		slog.Warn("harness_configs: failed to marshal from bootstrap koanf", "error", err)
+		return nil
+	}
+	var v map[string]config.HarnessConfigEntry
+	if err := json.Unmarshal(data, &v); err != nil {
+		slog.Warn("harness_configs: failed to unmarshal from bootstrap koanf", "error", err)
+		return nil
+	}
+	return v
 }
 
 // maintenanceFromCache extracts maintenance settings from the DB section
@@ -578,6 +718,12 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 		v := k.Bool("auto_expose_ports.enabled")
 		snap.AutoExposePortsEnabled = &v
 	}
+
+	// Project defaults
+	if k.Exists("project_defaults.default_scratchpad") {
+		v := k.Bool("project_defaults.default_scratchpad")
+		snap.DefaultScratchpad = &v
+	}
 	teleSub := k.Cut("telemetry")
 	if teleSub != nil && len(teleSub.Keys()) > 0 {
 		data, err := json.Marshal(teleSub.Raw())
@@ -634,6 +780,42 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 		}
 	}
 
+	// Federation
+	if k.Exists("server.federation.enabled") || k.Exists("server.federation.trusted_issuers") {
+		fedCfg := config.FederationConfig{
+			Enabled: k.Bool("server.federation.enabled"),
+		}
+		// TrustedIssuers: unmarshal from the koanf slice
+		if raw := k.Get("server.federation.trusted_issuers"); raw != nil {
+			data, err := json.Marshal(raw)
+			if err != nil {
+				slog.Warn("federation: failed to marshal trusted_issuers from koanf", "error", err)
+			} else if err := json.Unmarshal(data, &fedCfg.TrustedIssuers); err != nil {
+				slog.Warn("federation: failed to unmarshal trusted_issuers", "error", err)
+			}
+		}
+		if algs := k.Strings("server.federation.algorithms"); len(algs) > 0 {
+			fedCfg.Algorithms = algs
+		}
+		if ri := k.String("server.federation.refresh_interval"); ri != "" {
+			if d, err := time.ParseDuration(ri); err == nil {
+				fedCfg.Cache.RefreshInterval = d
+			}
+		}
+		if di := k.String("server.federation.debounce_interval"); di != "" {
+			if d, err := time.ParseDuration(di); err == nil {
+				fedCfg.Cache.DebounceInterval = d
+			}
+		}
+		snap.FederationConfig = &fedCfg
+	}
+
+	// NOTE: Runtimes, profiles, and harness_configs are NOT extracted from
+	// koanf here. Map-of-objects sections lose empty-map semantics in the
+	// koanf round-trip ({} → no keys → nil), so they are extracted directly
+	// from the DB docs (or bootstrap koanf) in Snapshot(). See the
+	// populateMapSections call in Snapshot().
+
 	return snap
 }
 
@@ -669,6 +851,14 @@ func BuildLayer1SnapshotFromFile(gc *config.GlobalConfig) Layer1Snapshot {
 	snap.GitHubInstallationURL = gc.GitHubApp.InstallationURL
 	snap.GitHubPrivateKeyPath = gc.GitHubApp.PrivateKeyPath
 
+	// Project defaults — read from settings.yaml project_defaults section
+	snap.DefaultScratchpad = gc.DefaultScratchpad
+
+	// Federation — read from GlobalConfig
+	if gc.Federation.Enabled || len(gc.Federation.TrustedIssuers) > 0 {
+		snap.FederationConfig = &gc.Federation
+	}
+
 	return snap
 }
 
@@ -703,6 +893,15 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		s.config.AutoExposePortsDefault = snap.AutoExposePortsEnabled
 		if oldVal == nil || *oldVal != *snap.AutoExposePortsEnabled {
 			applied = append(applied, "auto_expose_ports_default")
+		}
+	}
+
+	// Project defaults
+	if snap.DefaultScratchpad != nil {
+		oldVal := s.config.DefaultScratchpad
+		s.config.DefaultScratchpad = snap.DefaultScratchpad
+		if oldVal == nil || *oldVal != *snap.DefaultScratchpad {
+			applied = append(applied, "default_scratchpad")
 		}
 	}
 
@@ -765,6 +964,16 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		applied = append(applied, "hub_name")
 	}
 
+	// Image registry (#985) — wire DB value to the consumption path.
+	// resolveImageRegistry() reads s.config.MaintenanceConfig.ImageRegistry.
+	if snap.ImageRegistry != "" {
+		old := s.config.MaintenanceConfig.ImageRegistry
+		s.config.MaintenanceConfig.ImageRegistry = snap.ImageRegistry
+		if old != snap.ImageRegistry {
+			applied = append(applied, "image_registry")
+		}
+	}
+
 	// Agent defaults (hub operational agent_defaults section).
 	//
 	// Written unconditionally from the snapshot rather than only-if-non-empty,
@@ -810,11 +1019,88 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		}
 	}
 
+	// Runtimes, profiles, and harness configs: update the global settings
+	// overlay so that the co-located broker (which reads via
+	// config.LoadEffectiveSettings on every dispatch) sees DB-backed values.
+	// The overlay is installed at hub startup in co-located mode (see
+	// cmd/server_foreground.go). For standalone brokers the overlay is nil
+	// and they continue reading from disk only.
+	if snap.Runtimes != nil || snap.Profiles != nil || snap.HarnessConfigs != nil {
+		if overlay := config.GetGlobalSettingsOverlay(); overlay != nil {
+			overlay.Update(snap.Runtimes, snap.Profiles, snap.HarnessConfigs, snap.ImageRegistry)
+			if snap.Runtimes != nil {
+				applied = append(applied, "runtimes")
+			}
+			if snap.Profiles != nil {
+				applied = append(applied, "profiles")
+			}
+			if snap.HarnessConfigs != nil {
+				applied = append(applied, "harness_configs")
+			}
+			slog.Info("Settings overlay updated with DB-backed runtimes/profiles/harness_configs",
+				"runtimes", len(snap.Runtimes),
+				"profiles", len(snap.Profiles),
+				"harness_configs", len(snap.HarnessConfigs),
+			)
+		}
+	}
+
 	// NOTE: Maintenance state is deliberately NOT applied here.
 	// Maintenance is runtime/API-owned state. In file mode, reloadSettings
 	// must never touch MaintenanceState (restoring pre-refactor behavior).
 	// In postgres mode, the caller uses ApplyMaintenanceFromSnapshot
 	// separately, which respects env > DB precedence (§3.4/§3.8).
+
+	// Federation (outside mutex — atomic.Pointer swap is lock-free,
+	// and NewFederationAuthenticator may do network I/O)
+	//
+	// When federation is disabled (nil config or Enabled=false), clear the
+	// authenticator so the middleware returns 401. This ensures disabling
+	// federation at runtime actually takes effect.
+	if snap.FederationConfig == nil || !snap.FederationConfig.Enabled {
+		s.federationAuth.Store(nil)
+		if snap.FederationConfig != nil {
+			slog.Info("Federation disabled via config, authenticator cleared")
+		}
+		applied = append(applied, "federation")
+	} else {
+		if errs := snap.FederationConfig.Validate(); len(errs) > 0 {
+			slog.Error("Federation config validation failed during apply, keeping old config",
+				"errors", fmt.Sprintf("%v", errs))
+		} else {
+			// Derive federation mode using the same pattern as New().
+			federationMode := s.config.Mode
+			if federationMode == "" {
+				if s.config.Workstation {
+					federationMode = "workstation"
+				} else {
+					federationMode = "hosted"
+				}
+			}
+			// Use the OIDC issuer URL as the default expected audience.
+			federationAudience := s.oidcIssuerURL
+			if federationAudience == "" {
+				federationAudience = s.config.OIDCConfig.IssuerURL
+			}
+			newAuth, err := NewFederationAuthenticator(
+				*snap.FederationConfig,
+				federationAudience,
+				s.federationClient,
+				federationMode,
+				logging.Subsystem("hub.federation"),
+			)
+			if err != nil {
+				slog.Error("Federation authenticator rebuild failed, keeping old config",
+					"error", err)
+			} else {
+				s.federationAuth.Store(newAuth)
+				slog.Info("Federation authenticator hot-reloaded",
+					"trusted_issuers", len(snap.FederationConfig.TrustedIssuers),
+					"enabled", snap.FederationConfig.Enabled)
+				applied = append(applied, "federation")
+			}
+		}
+	}
 
 	// Settings that require restart
 	needsRestart := []string{

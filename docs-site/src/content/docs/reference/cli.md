@@ -18,6 +18,14 @@ These flags are available on all commands:
 - `--non-interactive`: Full non-interactive mode (implies `--yes`, errors on ambiguous prompts).
 - `--debug`: Enable verbose debug output.
 
+:::tip[Decluttered CLI Help]
+To keep subcommand help output clean and readable, global flags are hidden from default subcommand help outputs. You can view the full list of global flags anytime by running:
+
+```bash
+scion help global-flags
+```
+:::
+
 ## Agent Lifecycle
 
 ### `scion start` (or `run`)
@@ -120,7 +128,7 @@ Sends a message to a running agent's harness by enqueuing it into its input stre
     - `--at <time>`: Schedule message delivery at an absolute time (ISO 8601, e.g., `2026-02-28T14:00:00Z`). *(Requires Hub mode)*
     - `--plain`: Mark for plain-text delivery (the message still flows as structured JSON internally).
     - `--raw`: Send literal bytes via tmux send-keys with no trailing Enter (supports control keys like arrows and Escape). Cannot be combined with `--attach`.
-    - `--channel <channel>`: Target a specific message channel (e.g., `telegram`, `gchat`, `web`).
+    - `--channel <channel>`: Target a specific message channel (e.g., `telegram`, `gchat`, `teams`, `web`).
     - `--thread-id <id>`: Target a specific thread ID within the channel.
 
 ### `scion messages` (aliases: `msgs`, `inbox`)
@@ -225,6 +233,20 @@ Manages per-user Hub settings.
     - `add <uri>`: Add a skill URI to your personal auto-injected list.
         - Flags: `--as <alias>` (alias under which to mount the skill), `--optional` (continue provisioning if resolution fails), `--from-directory <url>` (discover and batch-add all skills from a GitHub repository directory).
     - `remove <id|uri>` (aliases `rm`, `delete`): Remove an auto-injected skill entry from your personal list by its ID or full URI.
+
+### `scion secret`
+
+Manages project-scoped secrets from the host or within an agent container. This command mirrors the `sciontool secret` commands used in agent containers, using the `hubclient` Secrets service to operate on the active project.
+
+Unlike `scion hub secret` (which supports managing secrets at any scope: user, hub, project, or broker), `scion secret` is streamlined for project-level secrets within your current project context.
+
+- `scion secret set KEY VALUE`: Store a project-scoped secret in the Hub.
+    - If `VALUE` starts with `@`, the remainder is treated as a file path. The file contents are read and base64-encoded, and `--type` defaults to `file`.
+    - Flags:
+        - `--type <string>`: Secret type: `environment` (default), `variable`, or `file`.
+        - `--target <string>`: Injection target path (defaults to key for env, required for file-type secrets).
+- `scion secret get KEY`: Retrieve the metadata of a project-scoped secret. Secret values are never returned to protect security.
+- `scion secret list`: List metadata (key, type, version, updated time) for all project-scoped secrets. Secret values are never returned.
 
 ### `scion clean`
 

@@ -110,10 +110,10 @@ An agent whose lifecycle is managed directly by the Hub via a cloud provider API
 A named bundle of runtime broker settings selected as a unit — a runtime plus its execution settings (env, volumes, resources), default harness-config and template, image registry, secrets, and harness overrides. A runtime-broker-scoped concept; long form **Runtime Broker Profile**.
 
 ### Message Broker
-The pluggable system that brokers messages between Scion actors (agents and users) and messaging surfaces — built-in brokers such as the web UI Messages view, and broker plugins to external systems like Telegram, Discord, Slack, and Google Chat. Backs the `scion message` command. Distinct from the Runtime Broker despite the shared word.
+The pluggable system that brokers messages between Scion actors (agents and users) and messaging surfaces — built-in brokers such as the web UI Messages view, and broker plugins to external systems like Telegram, Discord, Slack, Google Chat, and Microsoft Teams. Backs the `scion message` command. Distinct from the Runtime Broker despite the shared word.
 
 ### Broker plugin
-A Message Broker implementation for a specific external messaging system (e.g. Telegram, Google Chat), loaded through the broker plugin interface (`PluginTypeBroker`).
+A Message Broker implementation for a specific external messaging system (e.g. Telegram, Discord, Google Chat, Microsoft Teams), loaded through the broker plugin interface (`PluginTypeBroker`).
 
 ### Built-in broker
 A Message Broker implementation shipped with Scion rather than loaded as a plugin — for example the broker that surfaces messages in the web UI's Messages view.
@@ -160,6 +160,9 @@ A named collection of Hub users (and nested groups) used by the Hub permissions 
 A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT is scoped to a single project and carries a specific list of action permissions (scopes). Formerly known as a *Personal Access Token (PAT)*.
 
 ## Messaging
+
+### Native Web Chat
+The built-in interactive messaging interface in the Web Dashboard (enabled via the `web.native_chat` feature flag) that promotes chat to a top-level fourth ShellType (alongside standalone, profile, and app). It features a dedicated thread rail, unread indicators, three-state visibility filtering (Conversation/Verbose/Full), @-mention autocomplete, and cross-channel reply coherence.
 
 ### Message Group
 A set of recipients addressed by a single send, correlated by a shared `group_id`, as opposed to a direct message to one recipient or a broadcast to all agents in a project. Distinct from **Group** (Hub users).
@@ -254,3 +257,14 @@ The in-container OTLP receiver and forwarding pipeline (`pkg/sciontool/telemetry
 
 ### Session metrics
 Database-backed summaries and aggregations computed on agent session-end (aggregated by `sciontool` and delivered as a `MetricsPayload` in the StatusUpdate protocol) and stored in the Hub's `agent_session_metrics` SQL table. They provide an IDOR-safe structural view of token usage (input, output, cached, reasoning), tool execution counts, session duration, and model usage, queried via dedicated summary API endpoints and displayed in the Web Dashboard. Contrast with raw OpenTelemetry time-series metrics.
+
+## Users & Access
+
+### Agent Authorization Role
+A named authority tier (one of `none`, `readonly`, `baseline`, or `full`) assigned to an agent that governs the API scopes granted in its Hub-issued JWT. Resolves via a two-gate authority lattice matching requested role, user ceiling, and project maximums.
+
+### Group
+A named collection of Hub users (and nested groups) used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion.
+
+### User Access Token (UAT)
+A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT is scoped to a single project and carries a specific list of action permissions (scopes).

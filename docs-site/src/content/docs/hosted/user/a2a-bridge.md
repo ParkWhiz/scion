@@ -41,11 +41,25 @@ The `scion-a2a-bridge` process runs two concurrent RPC servers:
 1. **A2A HTTP Server (Default: Port 8443)**: Serves external A2A clients. Handles agent discovery requests (`/.well-known/agent-card.json`), JSON-RPC message exchanges, operational health checks (`/healthz`, `/readyz`), and Prometheus metrics (`/metrics`).
 2. **Broker Plugin RPC Server (Default: Port 9090)**: A `go-plugin` RPC interface. The Scion Hub connects to this port to push real-time agent-emitted messages, events, and status changes back to the bridge.
 
+### High Availability (HA) & Cloud Run Deployment
+
+To support robust, load-balanced hosted environments, the A2A Bridge includes advanced production capabilities:
+
+#### Leaderless HA Architecture
+The A2A Bridge supports High Availability (HA) natively through a **leaderless architecture**. Every replica is identical and interchangeable — there is no leader election, coordination overhead, or instance-identity requirement. Behind a load balancer, any replica can handle any incoming A2A request or receive broker plugin events, enabling seamless horizontal scaling.
+
+HA mode requires **standalone mode** (`--standalone` flag or `A2A_STANDALONE=true`) with a shared **PostgreSQL** backend (`DATABASE_URL`). This replaces the default local SQLite store so that all replicas share webhook subscriptions, task state, and admin configuration. Without a shared database, per-replica local state (SQLite) would drift across replicas and be lost on restart — making SQLite unsuitable for multi-replica or ephemeral deployments like Cloud Run.
+
+#### Single-Port h2c Multiplexing (Cloud Run)
+Google Cloud Run enforces a strict single-port limitation for incoming traffic. To run both the A2A HTTP server and the Broker Plugin RPC gRPC server on a single container port, the bridge implements **h2c port multiplexing**:
+- **Auto-Detection**: The bridge automatically detects when it is running on Cloud Run by checking for the presence of the `K_SERVICE` environment variable.
+- **Traffic Routing**: When detected, the bridge binds to the designated `$PORT` and multiplexes incoming HTTP/1.1 (standard A2A protocol JSON-RPC, health checks, and metrics) and HTTP/2 (gRPC broker traffic) over that single port. This eliminates the need for separate external ports or complex sidecar routing proxies.
+
 ### Interaction Modes
 The bridge supports three distinct A2A communication mechanics:
 * **Synchronous Blocking (SendMessage)**: The client POSTs a message and holds the HTTP connection open (up to `timeouts.send_message`, default 120s) until the agent produces its final response.
-* **Server-Sent Events (SSE) Streaming (SendStreamingMessage)**: The client opens an SSE connection (`message/stream`) to receive real-time, token-by-token streaming updates as the agent executes.
-* **Asynchronous Webhooks (Push Notifications)**: Clients register a callback URL (`tasks/pushNotification/set`). The bridge stores this subscription in its SQLite database and POSTs state-change alerts (running, completed, input-required, error) to the webhook as they occur.
+* **Server-Sent Events (SSE) Streaming (SendStreamingMessage)**: The client initiates streaming to receive real-time, token-by-token streaming updates as the agent executes.
+* **Asynchronous Webhooks (Push Notifications)**: Clients register a callback URL (via the `CreateTaskPushNotificationConfig` method). The bridge stores this subscription in its state database (SQLite in default mode, PostgreSQL in standalone/HA mode) and POSTs state-change alerts (running, completed, input-required, error) to the webhook as they occur.
 
 ---
 
@@ -71,9 +85,9 @@ From your Scion repository root, compile the Go binary:
 # Using the project Makefile
 make build-a2a-bridge
 
-# Or compiling manually
+# Or compiling manually (requires the -tags no_embed_web flag to skip embedding frontend assets)
 cd extras/scion-a2a-bridge
-go build -o scion-a2a-bridge ./cmd/scion-a2a-bridge/
+go build -tags no_embed_web -o scion-a2a-bridge ./cmd/scion-a2a-bridge/
 ```
 
 Verify the binary is available:
@@ -282,7 +296,7 @@ curl -X POST https://a2a.example.com/projects/my-coding-project/agents/code-help
   -d '{
     "jsonrpc": "2.0",
     "id": "desktop-test-1",
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "role": "user",
@@ -298,9 +312,9 @@ curl -X POST https://a2a.example.com/projects/my-coding-project/agents/code-help
 
 When the A2A bridge is configured with per-user authentication, callers present their own individual credentials instead of a shared static API key. This activates **CallerIdentity context propagation** and granular task isolation.
 
-### The Two Per-User Schemes
+### Per-User & Federation Schemes
 
-The A2A bridge supports two per-user authentication schemes, specified via `auth.scheme` in the bridge configuration:
+The A2A bridge supports three authentication schemes for granular access control, specified via `auth.scheme` in the bridge configuration:
 
 #### 1. `hubUAT` (Recommended for Desktop App Federation)
 * **How it works**: Callers present a Scion User Access Token (`Authorization: Bearer scion_pat_...`) created via the CLI.
@@ -312,10 +326,24 @@ The A2A bridge supports two per-user authentication schemes, specified via `auth
 * **How it works**: Callers present a Scion-signed User JWT.
 * **Local Validation**: The bridge validates the JWT signature locally using the HS256 `hub.signing_key` secret shared with the Hub. Since this happens entirely locally, it requires no active API calls to the Hub, making it extremely fast.
 
+#### 3. `oidcFederation` (For Federated Access)
+* **How it works**: Callers present an OIDC ID token issued by a trusted federation provider.
+* **Token Verification & Bookkeeping**: The bridge decodes the OIDC token and performs local bookkeeping. It fully supports RFC 7519 `aud` (audience) claim validation, accepting the claim in either string or array-of-strings format.
+* **Transport Auth Wiring**: Integrated with Google Cloud Identity-Aware Proxy (IAP) transport auth wiring to automatically resolve and bypass platform-level guards when accessing protected backends.
+* **OIDC & JWKS Discovery Proxying**: Behind IAP, third-party federation callers cannot access the Scion Hub's OIDC discovery and JWKS public keys because they lack IAP credentials. The bridge resolves this by proxying `/.well-known/openid-configuration` and `/.well-known/jwks.json`:
+  - It uses its own internal **bridge transport auth** (IAP credentials) to fetch these documents from the Hub.
+  - It rewrites the returned `jwks_uri` inside the OIDC config to point back to the bridge's own `/.well-known/jwks.json` endpoint.
+  - It serves these endpoints publicly and caches them for **5 minutes** to ensure high performance and reduce Hub load.
+  - For air-gapped or manual distribution, administrators can also use the **Download JWKS** button on the federation admin page in the Web Dashboard to download public keys out-of-band.
+
 ### Per-User Isolation Benefits
 
 * **Task Ownership & Visibility**: Users can only see, query, and cancel/interrupt tasks they created. One user cannot view or modify the active tasks of another user. This is enforced at the SQLite level using a `ScopedTaskStore`.
 * **Audit Trails & Attribution**: All downstream Hub API calls made by the bridge (such as sending messages or interrupting containers) propagate the user's actual `CallerIdentity`. The Hub's audit logs will show the real user's identity as the initiator rather than the bridge admin's service account.
+* **Extended Identity Context**: The propagated `CallerIdentity` carries critical security metadata, including:
+  - **`CallerKey`**: Resolves the exact key/token credentials used to authenticate the request.
+  - **`IsAgent`**: Identifies whether the calling entity is a federated agent or a human user.
+  - **`SenderLabel`**: A human-readable attribution tag attached to transaction and delivery logs.
 
 ---
 
@@ -328,6 +356,8 @@ The bridge exposes the following HTTP endpoints:
 | Endpoint | Method | Authentication | Description |
 | :--- | :--- | :--- | :--- |
 | `/.well-known/agent-card.json` | GET | None | Base bridge registry agent card. |
+| `/.well-known/openid-configuration` | GET | None | OIDC discovery proxy document for deployments behind IAP. Uses bridge transport auth to fetch from the Hub and rewrites the `jwks_uri` to point back to the bridge. Cached for 5 minutes. |
+| `/.well-known/jwks.json` | GET | None | JSON Web Key Set (JWKS) proxy endpoint. Serves Hub public keys with a 5-minute cache. |
 | `/projects/{projectSlug}/agents/{agentSlug}/.well-known/agent-card.json` | GET | Configured Scheme | Per-agent capabilities card. |
 | `/projects/{projectSlug}/agents/{agentSlug}/jsonrpc` | POST | Configured Scheme | Primary A2A JSON-RPC 2.0 communication endpoint. |
 | `/healthz` | GET | None | Liveness check (returns HTTP 200). |
@@ -346,15 +376,15 @@ Standard A2A JSON-RPC methods supported at the `/jsonrpc` endpoint:
 
 | JSON-RPC Method | Description |
 | :--- | :--- |
-| `message/send` | Send a message to the agent. Supports standard and blocking modes. Returns the agent's completed response. |
-| `message/stream` | Send a message and establish an SSE streaming connection. Real-time token updates are pushed over the stream. |
-| `tasks/get` | Retrieve detailed status and execution state of a specific task by its unique task ID. |
-| `tasks/list` | List all tasks associated with a particular `contextId` (conversation). |
-| `tasks/cancel` | Cancel an in-progress agent execution task. |
-| `tasks/resubscribe` | Re-attach an active SSE streaming connection to an ongoing task (useful on connection drops). |
-| `tasks/pushNotification/set` | Register a webhook callback URL to receive real-time POST alerts on task state changes. |
-| `tasks/pushNotification/get` | Retrieve registered webhooks for a specific task. |
-| `tasks/pushNotification/delete` | Remove a webhook callback subscription. |
+| `SendMessage` | Send a message to the agent. Supports standard and blocking modes. Returns the agent's completed response. |
+| `SendStreamingMessage` | Send a message and establish an SSE streaming connection. Real-time token updates are pushed over the stream. |
+| `GetTask` | Retrieve detailed status and execution state of a specific task by its unique task ID. |
+| `ListTasks` | List all tasks associated with a particular `contextId` (conversation). |
+| `CancelTask` | Cancel an in-progress agent execution task. |
+| `SubscribeToTask` | Re-attach an active SSE streaming connection to an ongoing task (useful on connection drops). |
+| `CreateTaskPushNotificationConfig` | Register a webhook callback URL to receive real-time POST alerts on task state changes. |
+| `GetTaskPushNotificationConfig` | Retrieve registered webhooks for a specific task. |
+| `DeleteTaskPushNotificationConfig` | Remove a webhook callback subscription. |
 
 ---
 

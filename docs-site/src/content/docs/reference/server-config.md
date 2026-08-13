@@ -55,6 +55,8 @@ Controls the central Hub API server.
 | `host` | string | `"0.0.0.0"` | Network interface to bind to. |
 | `public_url` | string | | The externally accessible URL of the Hub (used for callbacks). |
 | `gcp_project_id` | string | | GCP project ID used for minting GCP Service Accounts. Auto-detected if running on GCE/Cloud Run. |
+| `gcp_iam_check_mode` | string | `"off"` | Controls whether IAM `actAs` permission is checked when binding a GCP service account to an agent. Supported values: `"off"` (no check; default) or `"enforce"` (uses Policy Troubleshooter to enforce `iam.serviceAccounts.actAs`). See the security/permissions reference for details on roles and caches. |
+| `gcp_iam_deny_unknown_policy` | string | `"fail-open"` | Behavior when Policy Troubleshooter cannot evaluate deny policies (e.g. if the Hub lacks org-level reviewer roles). Supported values: `"fail-open"` (allow if no explicit deny is found; default) or `"fail-closed"` (treat as indeterminate and deny). |
 | `read_timeout` | duration | `"30s"` | HTTP read timeout. |
 | `write_timeout` | duration | `"60s"` | HTTP write timeout. |
 | `admin_emails` | list | `[]` | List of emails granted super-admin access. |
@@ -195,6 +197,33 @@ Backend for managing encrypted secrets. The `local` backend is read-only and rej
 | `gcp_project_id` | string | | GCP Project ID for Secret Manager. Required when `backend` is `gcpsm`. |
 | `gcp_credentials` | string | | Path to GCP service account JSON or the JSON content itself. Optional if using Application Default Credentials. |
 
+### Workspace Storage (`server.workspace_storage`)
+
+Configures the backend and mount settings for storing and managing agent workspaces. This is a critical setting for high-availability deployments where multiple Hub and Broker replicas need shared, durable access to project workspaces.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `backend` | string | `"local"` | Storage backend pivot: `"local"` (node-local directories), `"nfs"` (Network File System mounts), `"cloudrun-volume"` (Cloud Run platform-managed volume mounts), or `"gke-shared-volume"` (GKE shared CSI-backed PVC mounts). |
+| `nfs.mount_root` | string | | The host base directory under which NFS exports are mounted. |
+| `nfs.mount_options` | string | `"vers=3,hard,nconnect=4,_netdev"` | Standard mount options passed to the `mount.nfs` utility. |
+| `nfs.uid` | integer | `1000` | Node-independent owner UID for NFS-backed workspace trees to ensure consistent container write permissions. |
+| `nfs.gid` | integer | `1000` | Node-independent owner GID for NFS-backed workspace trees. |
+| `nfs.storage_class` | string | | The Kubernetes StorageClass name used to dynamically allocate volumes on GKE. |
+| `nfs.subpath_root` | string | `"projects"` | The default base folder name within the share for project workspaces. |
+| `nfs.shares` | list of objects | `[]` | List of NFS share objects. Each share requires: `id` (stable ID), `server` (IP address or hostname), `export` (exported path, e.g., `/scion-workspaces`), and optional `pv_name` (for GKE). |
+| `cloudrun_volume.volume_name` | string | | The name of the platform volume declared in the Cloud Run service specification. |
+| `cloudrun_volume.subpath_root` | string | `"projects"` | Sub-directory prefix within the Cloud Run volume. |
+| `gke_shared_volume.volume_name` | string | | The K8s volume name referencing the persistent volume claim (PVC). |
+| `gke_shared_volume.pv_claim_name` | string | | The name of the GKE-managed PVC bound to the shared storage backend (e.g. Filestore). |
+| `gke_shared_volume.subpath_root` | string | `"projects"` | Sub-directory prefix within the GKE volume. |
+
+#### Ephemeral Storage & 503 Safety Gate
+
+To protect deployments from silent data loss, the Hub implements a strict **503 Safety Gate**:
+* If the Hub is deployed on serverless environments like Google Cloud Run with the `local` backend selected, its local workspace paths map to ephemeral, non-durable container storage.
+* The Hub detects this non-durable state and automatically intercepts all file write and modification endpoints (including WebDAV, inline file editing, and git cloning).
+* Affected endpoints will return `503 Service Unavailable` with a descriptive message rather than allowing writes to persist ephemerally on the container's scratch space, enforcing the transition to a durable backend (`nfs`, `cloudrun-volume`, or `gke-shared-volume`) for production.
+
 ### Scheduler (`server.scheduler`)
 
 Controls the background task scheduler in the Hub. This regulates the tick interval and concurrency of recurring maintenance tasks (such as telemetry aggregation, session cleanups, and heartbeats) to match database capacity.
@@ -208,6 +237,70 @@ Controls the background task scheduler in the Hub. This regulates the tick inter
 Configuring a modest concurrency limit (such as the default `2`) is highly recommended for small or single-node database instances to prevent sudden spikes in database connection usage.
 :::
 
+### OIDC Identity Provider (`server.oidc`)
+
+Configuration for the Hub's built-in OIDC Identity Provider feature.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | bool | `false` | Enable the OIDC Identity Provider endpoints. |
+| `issuer_url` | string | | The public issuer URL of this Hub. If empty, the hub public URL is used. |
+| `token_lifetime` | duration | `"15m"` | Validity duration for minted OIDC identity tokens (e.g. `"15m"`, `"1h"`). |
+
+### OIDC Federation (`server.federation`)
+
+Configuration for inbound OIDC-based federation authentication.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | bool | `false` | Enable OIDC federation authentication. |
+| `trusted_issuers` | list of objects | `[]` | List of trusted OIDC issuers (see below). |
+| `algorithms` | list of strings | `["RS256"]` | Supported cryptographic signing algorithms. |
+| `cache.refresh_interval` | duration | `"1h"` | How often to refresh cached issuer public keys (JWKS). |
+| `cache.debounce_interval` | duration | `"1s"` | Min interval between JWKS reload attempts to prevent DDOS. |
+
+#### Trusted Issuer Settings (`server.federation.trusted_issuers[]`)
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `issuer_url` | string | | **MANDATORY.** The exact OIDC issuer URL (matching token `iss` claim). |
+| `jwks_url` | string | | The URL to fetch signing public keys. Discovered via OIDC discovery if empty. |
+| `expected_audience` | string | | The expected audience `aud` claim in tokens. |
+| `allowed_projects` | list of strings | | If set, restricts tokens to specific project UUIDs. |
+| `allowed_root_users` | list of strings | | If set, restricts tokens to specific root user emails. |
+| `default_scopes` | list of strings | | Default JWT scopes granted to federated agents. |
+| `issuer_type` | string | `"hub"` | Type of issuer: `"hub"`, `"service_account"`, or `"user"`. |
+| `default_role` | string | `"viewer"` | Default role for federated users (`issuer_type: user`). |
+| `allowed_emails` | list of strings | | Restrict user tokens to specific email claims (supports wildcards e.g. `*@example.com`). |
+
+### OIDC Login (`server.oidc_login`)
+
+Configuration for an external OIDC provider used for Web UI user login.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `enabled` | bool | `false` | Enable the external OIDC login provider. |
+| `display_name` | string | | The human-readable label shown on the login button (e.g. `"Corporate SSO"`). |
+| `issuer_url` | string | | The exact OIDC issuer URL. Used to perform discovery via `{issuer_url}/.well-known/openid-configuration`. |
+| `client_id` | string | | The OAuth2/OIDC Client ID. |
+| `client_secret` | string | | The OAuth2/OIDC Client Secret (can be empty for public OIDC clients). |
+| `scopes` | list of strings | `["openid", "email", "profile"]` | Overrides the default scopes requested during login. |
+
+### Project Defaults (`project_defaults`)
+
+Configuration for project-level default behaviors across the Hub. Unlike most other server configurations, `project_defaults` is declared as a **top-level section** in `settings.yaml` (outside of the `server:` block).
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `default_scratchpad` | bool | `true` | If enabled, automatically provisions a default `scratchpad` shared directory when a new project is created. |
+
+**Example:**
+```yaml
+# Declared at the top level of settings.yaml
+project_defaults:
+  default_scratchpad: true
+```
+
 ## Environment Variables
 
 :::tip[Database Mode]
@@ -219,6 +312,8 @@ All server settings can be overridden via environment variables using the `SCION
 **Examples:**
 - `server.hub.port` -> `SCION_SERVER_HUB_PORT`
 - `server.hub.gcp_project_id` -> `SCION_SERVER_HUB_GCPPROJECTID`
+- `server.hub.gcp_iam_check_mode` -> `SCION_SERVER_HUB_GCPIAMCHECKMODE`
+- `server.hub.gcp_iam_deny_unknown_policy` -> `SCION_SERVER_HUB_GCPIAMDENYUNKNOWNPOLICY`
 - `server.broker.enabled` -> `SCION_SERVER_BROKER_ENABLED`
 - `server.broker.container_hub_endpoint` -> `SCION_SERVER_BROKER_CONTAINERHUBENDPOINT`
 - `server.database.url` -> `SCION_SERVER_DATABASE_URL`
@@ -428,7 +523,7 @@ Settings required before the database connection exists, or that are restart-bou
 | :--- | :--- |
 | Database | `database.*` |
 | Listeners | `hub.port`, `hub.host`, `hub.read_timeout`, `hub.write_timeout`, `broker.*` |
-| Auth stack | `auth.mode`, `auth.dev_mode`, `auth.dev_token`, `auth.dev_token_file`, `auth.proxy.*`, `auth.transport.*`, `oauth.*` |
+| Auth stack | `auth.mode`, `auth.dev_mode`, `auth.dev_token`, `auth.dev_token_file`, `auth.proxy.*`, `auth.transport.*`, `oauth.*`, `oidc_login.*` |
 | Secrets/storage | `secrets.*`, `storage.*`, `workspace_storage.*` |
 | Identity/mode | `mode`, `env`, `hub.hub_id`, `hub.gcp_project_id` |
 | Logging | `log_level`, `log_format` |
@@ -437,7 +532,7 @@ Settings required before the database connection exists, or that are restart-bou
 
 ### Layer 1 — Operational (Postgres `hub_settings` table)
 
-Settings that can be changed at runtime and are shared across all replicas. Stored as section-per-row in the `hub_settings` table. In SQLite/workstation mode, these fall back to `settings.yaml` (unchanged behavior).
+Settings that can be changed at runtime and are shared across all replicas. Stored as section-per-row in the `hub_settings` table. In SQLite/workstation mode, these fall back to `settings.yaml` (unchanged behavior), except for the `maintenance` section which is runtime/API-only and has no `settings.yaml` representation (ephemeral in file/SQLite mode).
 
 | Section | Contents |
 | :--- | :--- |
@@ -445,7 +540,8 @@ Settings that can be changed at runtime and are shared across all replicas. Stor
 | `lifecycle` | `auto_suspend_stalled`, `soft_delete_retention`, `soft_delete_retain_files` |
 | `maintenance` | `admin_mode`, `maintenance_message` (durable + cluster-wide) |
 | `telemetry` | Full `telemetry.*` subtree (enabled, cloud, hub, local, filter, resource) |
-| `agent_defaults` | `default_template`, `default_harness_config`, `default_max_turns`, `default_max_model_calls`, `default_max_duration`, `default_resources`, `default_model`, `default_thinking_level` |
+| `agent_defaults` | `default_template`, `default_harness_config`, `default_max_turns`, `default_max_model_calls`, `default_max_duration`, `default_resources`, `default_model`, `default_thinking_level`, `default_max_agent_role`, `default_agent_role` |
+| `federation` | `enabled`, `trusted_issuers[]`, `algorithms`, `refresh_interval`, `debounce_interval` |
 | `endpoints` | `hub.public_url`, `image_registry` |
 | `github_app` | `app_id`, `api_base_url`, `webhooks_enabled`, `installation_url`, `private_key_path` |
 | `notifications` | `notification_channels[]` |
@@ -478,13 +574,13 @@ Because env overrides on Layer-1 keys reintroduce per-node drift, the system war
 
 ### Admin API Behavior Notes
 
-**PUT partitioning**: The request body is partitioned by the section registry. Layer-1 fields are written to DB sections. Layer-0 fields trigger a `422` rejection. Unclassified fields (e.g. `runtimes`, `profiles`) are ignored and reported in `ignored_keys`.
+**PUT partitioning**: The request body is partitioned by the section registry. Layer-1 fields (including `runtimes`, `profiles`, and `harness_configs`) are written to DB sections in the `hub_settings` table as whole-map JSONB documents. Layer-0 fields trigger a `422` rejection. Unclassified fields (non-registered settings) are ignored and reported in `ignored_keys`.
 
 **Revision CAS**: The request body may include `expected_revisions` — a map of section name to expected revision number. On mismatch, the response is `409 Conflict` with the conflicting sections and their current revisions. Omitted sections use last-writer-wins semantics. Sections are written in alphabetical order for deterministic partial-apply behavior.
 
 **Presence-aware clearing**: The PUT handler distinguishes **omitted** fields (preserve current DB value) from **explicitly-sent empty values** (`""`, `[]`, `null`) which **clear** the field. This enables clearing admin_emails, user_access_mode, authorized_domains, notification_channels, and public_url without sending every field.
 
-**Maintenance durability**: `PUT /api/v1/admin/maintenance` writes to the `maintenance` section in DB, making admin/maintenance mode durable across restarts and propagated to all replicas. `SCION_SERVER_ADMINMODE` env var still force-enables per node for break-glass access.
+**Maintenance durability**: `PUT /api/v1/admin/maintenance` writes to the `maintenance` section in DB, making admin/maintenance mode durable across restarts and propagated to all replicas. `SCION_SERVER_ADMINMODE` env var still force-enables per node for break-glass access. In file/SQLite mode, maintenance changes are ephemeral (in-memory only, lost on restart). Use `SCION_SERVER_ADMINMODE=true` env var for persistent control.
 
 **Schema endpoint**: `GET /api/v1/admin/server-config/schema` returns JSON-schema fragments and koanf key paths per section for UI form generation and CLI validation.
 
@@ -496,3 +592,78 @@ Due to Go's `omitempty` JSON behavior, boolean `false` is indistinguishable from
 
 When these fields are explicitly set to `false` in the DB, they are correctly applied via the snapshot. However, the raw JSON representation may omit them. The admin API handles this correctly via the presence-aware clearing mechanism.
 :::
+
+## GCP IAM Check Mode
+
+The `gcp_iam_check_mode` setting controls whether the Hub verifies that a caller holds the `iam.serviceAccounts.actAs` IAM permission on a GCP service account before allowing it to be assigned to an agent. This uses the [GCP Policy Troubleshooter v3 API](https://cloud.google.com/policy-intelligence/docs/troubleshoot-access).
+
+### Values
+
+| Value | Behaviour |
+| :--- | :--- |
+| `"off"` (default) | No IAM check. Any member who can see a service account can assign it. Assignment is gated by Hub policy only. |
+| `"enforce"` | The Hub calls Policy Troubleshooter to verify the caller has `actAs`. Denials are enforced. |
+
+### Configuration
+
+```yaml
+# settings.yaml
+server:
+  hub:
+    gcp_iam_check_mode: "off"   # or "enforce"
+```
+
+Or via environment variable:
+
+```bash
+export SCION_SERVER_HUB_GCPIAMCHECKMODE=enforce
+```
+
+### Enablement Checklist
+
+Before setting `gcp_iam_check_mode: enforce`:
+
+1. **Enable the Policy Troubleshooter API** on the Hub's GCP project:
+   ```bash
+   gcloud services enable policytroubleshooter.googleapis.com
+   ```
+
+2. **Grant the Hub SA `roles/iam.securityReviewer`**:
+   - On the Hub's own GCP project (minimum; covers Hub-minted SAs).
+   - On each org or project containing BYOSA service accounts, if applicable.
+
+3. **(Recommended)** Grant `roles/iam.denyReviewer` and `roles/browser` at the org level for full deny-policy and resource hierarchy evaluation.
+
+4. **(Optional)** Configure domain-wide delegation with Workspace `groups.read` for group-binding resolution. Without this, group-granted `serviceAccountUser` bindings produce an indeterminate result (denied by default).
+
+5. **Test with a known-good SA assignment** before enabling in production.
+
+### Group-Binding Limitation
+
+When `roles/iam.serviceAccountUser` is granted to a Google Workspace **group**, the Hub SA must have domain-wide delegation with the `groups.read` privilege to resolve the membership. Without it, Policy Troubleshooter returns `MEMBERSHIP_UNKNOWN_INFO`, which under fail-closed rules is treated as a denial.
+
+This denies legitimately authorized users whose `actAs` grant arrives via a group binding, even when the PT API is fully available and functioning correctly.
+
+| Mitigation | Cost | Resolves groups? |
+| :--- | :--- | :--- |
+| Grant Hub SA domain-wide delegation + `groups.read` | High (org-admin consent per Workspace) | Yes |
+| Grant `actAs` directly to users, not via groups | Low (per-SA IAM binding) | Avoided |
+| Leave `gcp_iam_check_mode: "off"` | Zero | N/A (check disabled) |
+
+### BYOSA Cross-Org Access
+
+For BYOSA service accounts (accounts in a customer's org, not the Hub's), the Hub SA needs `roles/iam.securityReviewer` in the customer's organisation or at minimum on the project containing the SA. Some customers may refuse this grant. Their options are:
+
+1. Leave `gcp_iam_check_mode: "off"` (the default).
+2. Grant `securityReviewer` on the specific project (not org-wide).
+3. Accept that BYOSA assignments will fail closed until the grant is made.
+
+### Required IAM Permissions Summary
+
+| Role / Permission | Scope | Purpose | Required? |
+| :--- | :--- | :--- | :--- |
+| `roles/iam.securityReviewer` | Org or project containing the target SA | Read allow policies, role bindings, and role definitions | **Yes** |
+| `roles/iam.denyReviewer` | Org or folder | Read IAM Deny policies | Recommended |
+| `roles/browser` | Org | Read project/folder hierarchy for policy inheritance | Recommended |
+| Workspace Admin `groups.read` (via domain-wide delegation) | Google Workspace domain | Resolve group memberships in IAM bindings | Only if group-granted actAs must be resolved |
+| PT API enabled on Hub's GCP project | Hub's GCP project | `policytroubleshooter.googleapis.com` | **Yes** |

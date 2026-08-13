@@ -108,6 +108,16 @@ var koanfPathToJSONField = map[string]map[string]string{
 	"auto_expose_ports": {
 		"auto_expose_ports.enabled": "enabled",
 	},
+	"project_defaults": {
+		"project_defaults.default_scratchpad": "default_scratchpad",
+	},
+	"federation": {
+		"server.federation.enabled":           "enabled",
+		"server.federation.trusted_issuers":   "trusted_issuers",
+		"server.federation.algorithms":        "algorithms",
+		"server.federation.refresh_interval":  "refresh_interval",
+		"server.federation.debounce_interval": "debounce_interval",
+	},
 }
 
 // jsonFieldToKoanfPaths maps section name → json field → koanf path for the
@@ -138,6 +148,16 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 	"auto_expose_ports": {
 		"enabled": "auto_expose_ports.enabled",
 	},
+	"project_defaults": {
+		"default_scratchpad": "project_defaults.default_scratchpad",
+	},
+	"federation": {
+		"enabled":           "server.federation.enabled",
+		"trusted_issuers":   "server.federation.trusted_issuers",
+		"algorithms":        "server.federation.algorithms",
+		"refresh_interval":  "server.federation.refresh_interval",
+		"debounce_interval": "server.federation.debounce_interval",
+	},
 }
 
 // ExtractSectionFromKoanf extracts a section's JSON document from a koanf
@@ -156,6 +176,12 @@ func ExtractSectionFromKoanf(k *koanf.Koanf, sectionName string) (json.RawMessag
 	switch sectionName {
 	case "telemetry":
 		return extractSubtree(k, "telemetry")
+	case "runtimes":
+		return extractSubtree(k, "runtimes")
+	case "profiles":
+		return extractSubtree(k, "profiles")
+	case "harness_configs":
+		return extractSubtree(k, "harness_configs")
 	case "agent_defaults":
 		return extractAgentDefaults(k)
 	case "github_app":
@@ -247,6 +273,12 @@ func loadSectionIntoKoanf(k *koanf.Koanf, sectionName string, doc json.RawMessag
 	switch sectionName {
 	case "telemetry":
 		return loadPrefixed(k, "telemetry", raw)
+	case "runtimes":
+		return loadPrefixed(k, "runtimes", raw)
+	case "profiles":
+		return loadPrefixed(k, "profiles", raw)
+	case "harness_configs":
+		return loadPrefixed(k, "harness_configs", raw)
 	case "agent_defaults":
 		return k.Load(confmap.Provider(raw, "."), nil)
 	case "github_app":

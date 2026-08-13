@@ -29,6 +29,7 @@ import '../shared/header.js';
 import '../shared/debug-panel.js';
 
 import type { User } from '../../shared/types.js';
+import { performLogout } from '../../utils/auth.js';
 import { setDocumentTitle } from '../../client/page-title.js';
 
 const PROFILE_TITLES: Record<string, string> = {
@@ -166,7 +167,11 @@ export class ScionProfileShell extends LitElement {
         placement="start"
         @sl-hide=${(): void => this.handleDrawerClose()}
       >
-        <scion-profile-nav .user=${this.user} .currentPath=${this.currentPath} .hideCollapse=${true}></scion-profile-nav>
+        <scion-profile-nav
+          .user=${this.user}
+          .currentPath=${this.currentPath}
+          .hideCollapse=${true}
+        ></scion-profile-nav>
       </sl-drawer>
 
       <main class="main">
@@ -211,17 +216,12 @@ export class ScionProfileShell extends LitElement {
     this._drawerOpen = false;
   }
 
+  /**
+   * Handle logout action.
+   * Delegates to shared performLogout() utility (design doc Section 4.1).
+   */
   private handleLogout(): void {
-    fetch('/auth/logout', {
-      method: 'POST',
-      credentials: 'include',
-    })
-      .then(() => {
-        window.location.href = '/auth/login';
-      })
-      .catch((error) => {
-        console.error('Logout failed:', error);
-      });
+    performLogout();
   }
 }
 

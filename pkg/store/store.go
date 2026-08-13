@@ -150,6 +150,11 @@ type AgentStore interface {
 	// Returns ErrNotFound if the agent doesn't exist.
 	GetAgentBySlug(ctx context.Context, projectID, slug string) (*Agent, error)
 
+	// GetAgentsByIDs retrieves agents by a list of IDs.
+	// Returns only agents that exist; missing IDs are silently skipped.
+	// The returned map is keyed by agent ID.
+	GetAgentsByIDs(ctx context.Context, ids []string) (map[string]*Agent, error)
+
 	// UpdateAgent updates an existing agent.
 	// Uses optimistic locking via StateVersion.
 	// Returns ErrNotFound if agent doesn't exist.
@@ -1166,6 +1171,28 @@ type GCPServiceAccountFilter struct {
 	ScopeID string // Filter by scope ID
 	Email   string // Filter by SA email
 	Managed *bool  // Filter by managed status (nil = no filter)
+
+	// IncludeHubScoped widens the Scope/ScopeID terms from AND to OR against
+	// hub scope: the result is everything the scope terms select, plus every
+	// hub-scoped account. Other terms (Email, Managed) still apply to the whole
+	// result. It is a no-op when no scope terms are set, since an unscoped list
+	// already returns hub-scoped accounts.
+	//
+	// This exists so that "this project's accounts, plus the hub-wide ones it
+	// may use" is a single query. The obvious alternative — list the project,
+	// list the hub, concatenate — is wrong in ways that only show up later: the
+	// two halves are read at different times, and any pagination or ordering
+	// applied afterwards is applied to a set the database never saw as one.
+	// Expressing it as one predicate makes the invariant structural rather than
+	// a rule each caller has to remember.
+	//
+	// The hub arm matches on Scope alone and never on ScopeID. That is a
+	// project-wide invariant, not a local shortcut: on a hub-scoped record
+	// ScopeID is provenance -- which hub instance registered it -- and is never
+	// a predicate. The hub ID is derived from config or a hostname hash, so
+	// filtering on it would orphan every hub-scoped record the first time a
+	// hostname changed, silently, as an empty result.
+	IncludeHubScoped bool
 }
 
 // =============================================================================
@@ -1218,6 +1245,11 @@ type MessageStore interface {
 	// GetMessage returns a single message by ID.
 	// Returns ErrNotFound if the message doesn't exist.
 	GetMessage(ctx context.Context, id string) (*Message, error)
+
+	// GetMessagesByIDs retrieves messages by a list of IDs.
+	// Returns only messages that exist; missing IDs are silently skipped.
+	// The returned map is keyed by message ID.
+	GetMessagesByIDs(ctx context.Context, ids []string) (map[string]*Message, error)
 
 	// ListMessages returns messages matching the given filter.
 	// Results are ordered by created_at DESC.

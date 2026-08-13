@@ -20,6 +20,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerdispatch"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerjointoken"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokersecret"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
@@ -36,6 +37,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperationrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/message"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/noncecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notificationsubscription"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
@@ -78,6 +80,7 @@ const (
 	TypeBrokerDispatch           = "BrokerDispatch"
 	TypeBrokerJoinToken          = "BrokerJoinToken"
 	TypeBrokerSecret             = "BrokerSecret"
+	TypeChatLinkCode             = "ChatLinkCode"
 	TypeEnvVar                   = "EnvVar"
 	TypeGCPServiceAccount        = "GCPServiceAccount"
 	TypeGitHubResolutionCache    = "GitHubResolutionCache"
@@ -94,6 +97,7 @@ const (
 	TypeMaintenanceOperation     = "MaintenanceOperation"
 	TypeMaintenanceOperationRun  = "MaintenanceOperationRun"
 	TypeMessage                  = "Message"
+	TypeNonceCache               = "NonceCache"
 	TypeNotification             = "Notification"
 	TypeNotificationSubscription = "NotificationSubscription"
 	TypePolicyBinding            = "PolicyBinding"
@@ -9843,6 +9847,757 @@ func (m *BrokerSecretMutation) ResetEdge(name string) error {
 	return fmt.Errorf("unknown BrokerSecret edge %s", name)
 }
 
+// ChatLinkCodeMutation represents an operation that mutates the ChatLinkCode nodes in the graph.
+type ChatLinkCodeMutation struct {
+	config
+	op              Op
+	typ             string
+	id              *uuid.UUID
+	code_hash       *string
+	user_identifier *string
+	provider        *chatlinkcode.Provider
+	status          *chatlinkcode.Status
+	user_id         *string
+	user_email      *string
+	expires_at      *time.Time
+	created_at      *time.Time
+	clearedFields   map[string]struct{}
+	done            bool
+	oldValue        func(context.Context) (*ChatLinkCode, error)
+	predicates      []predicate.ChatLinkCode
+}
+
+var _ ent.Mutation = (*ChatLinkCodeMutation)(nil)
+
+// chatlinkcodeOption allows management of the mutation configuration using functional options.
+type chatlinkcodeOption func(*ChatLinkCodeMutation)
+
+// newChatLinkCodeMutation creates new mutation for the ChatLinkCode entity.
+func newChatLinkCodeMutation(c config, op Op, opts ...chatlinkcodeOption) *ChatLinkCodeMutation {
+	m := &ChatLinkCodeMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeChatLinkCode,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// withChatLinkCodeID sets the ID field of the mutation.
+func withChatLinkCodeID(id uuid.UUID) chatlinkcodeOption {
+	return func(m *ChatLinkCodeMutation) {
+		var (
+			err   error
+			once  sync.Once
+			value *ChatLinkCode
+		)
+		m.oldValue = func(ctx context.Context) (*ChatLinkCode, error) {
+			once.Do(func() {
+				if m.done {
+					err = errors.New("querying old values post mutation is not allowed")
+				} else {
+					value, err = m.Client().ChatLinkCode.Get(ctx, id)
+				}
+			})
+			return value, err
+		}
+		m.id = &id
+	}
+}
+
+// withChatLinkCode sets the old ChatLinkCode of the mutation.
+func withChatLinkCode(node *ChatLinkCode) chatlinkcodeOption {
+	return func(m *ChatLinkCodeMutation) {
+		m.oldValue = func(context.Context) (*ChatLinkCode, error) {
+			return node, nil
+		}
+		m.id = &node.ID
+	}
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m ChatLinkCodeMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m ChatLinkCodeMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// SetID sets the value of the id field. Note that this
+// operation is only accepted on creation of ChatLinkCode entities.
+func (m *ChatLinkCodeMutation) SetID(id uuid.UUID) {
+	m.id = &id
+}
+
+// ID returns the ID value in the mutation. Note that the ID is only available
+// if it was provided to the builder or after it was returned from the database.
+func (m *ChatLinkCodeMutation) ID() (id uuid.UUID, exists bool) {
+	if m.id == nil {
+		return
+	}
+	return *m.id, true
+}
+
+// IDs queries the database and returns the entity ids that match the mutation's predicate.
+// That means, if the mutation is applied within a transaction with an isolation level such
+// as sql.LevelSerializable, the returned ids match the ids of the rows that will be updated
+// or updated by the mutation.
+func (m *ChatLinkCodeMutation) IDs(ctx context.Context) ([]uuid.UUID, error) {
+	switch {
+	case m.op.Is(OpUpdateOne | OpDeleteOne):
+		id, exists := m.ID()
+		if exists {
+			return []uuid.UUID{id}, nil
+		}
+		fallthrough
+	case m.op.Is(OpUpdate | OpDelete):
+		return m.Client().ChatLinkCode.Query().Where(m.predicates...).IDs(ctx)
+	default:
+		return nil, fmt.Errorf("IDs is not allowed on %s operations", m.op)
+	}
+}
+
+// SetCodeHash sets the "code_hash" field.
+func (m *ChatLinkCodeMutation) SetCodeHash(s string) {
+	m.code_hash = &s
+}
+
+// CodeHash returns the value of the "code_hash" field in the mutation.
+func (m *ChatLinkCodeMutation) CodeHash() (r string, exists bool) {
+	v := m.code_hash
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldCodeHash returns the old "code_hash" field's value of the ChatLinkCode entity.
+// If the ChatLinkCode object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChatLinkCodeMutation) OldCodeHash(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldCodeHash is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldCodeHash requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldCodeHash: %w", err)
+	}
+	return oldValue.CodeHash, nil
+}
+
+// ResetCodeHash resets all changes to the "code_hash" field.
+func (m *ChatLinkCodeMutation) ResetCodeHash() {
+	m.code_hash = nil
+}
+
+// SetUserIdentifier sets the "user_identifier" field.
+func (m *ChatLinkCodeMutation) SetUserIdentifier(s string) {
+	m.user_identifier = &s
+}
+
+// UserIdentifier returns the value of the "user_identifier" field in the mutation.
+func (m *ChatLinkCodeMutation) UserIdentifier() (r string, exists bool) {
+	v := m.user_identifier
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUserIdentifier returns the old "user_identifier" field's value of the ChatLinkCode entity.
+// If the ChatLinkCode object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChatLinkCodeMutation) OldUserIdentifier(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUserIdentifier is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUserIdentifier requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUserIdentifier: %w", err)
+	}
+	return oldValue.UserIdentifier, nil
+}
+
+// ResetUserIdentifier resets all changes to the "user_identifier" field.
+func (m *ChatLinkCodeMutation) ResetUserIdentifier() {
+	m.user_identifier = nil
+}
+
+// SetProvider sets the "provider" field.
+func (m *ChatLinkCodeMutation) SetProvider(c chatlinkcode.Provider) {
+	m.provider = &c
+}
+
+// Provider returns the value of the "provider" field in the mutation.
+func (m *ChatLinkCodeMutation) Provider() (r chatlinkcode.Provider, exists bool) {
+	v := m.provider
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldProvider returns the old "provider" field's value of the ChatLinkCode entity.
+// If the ChatLinkCode object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChatLinkCodeMutation) OldProvider(ctx context.Context) (v chatlinkcode.Provider, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldProvider is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldProvider requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldProvider: %w", err)
+	}
+	return oldValue.Provider, nil
+}
+
+// ResetProvider resets all changes to the "provider" field.
+func (m *ChatLinkCodeMutation) ResetProvider() {
+	m.provider = nil
+}
+
+// SetStatus sets the "status" field.
+func (m *ChatLinkCodeMutation) SetStatus(c chatlinkcode.Status) {
+	m.status = &c
+}
+
+// Status returns the value of the "status" field in the mutation.
+func (m *ChatLinkCodeMutation) Status() (r chatlinkcode.Status, exists bool) {
+	v := m.status
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldStatus returns the old "status" field's value of the ChatLinkCode entity.
+// If the ChatLinkCode object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChatLinkCodeMutation) OldStatus(ctx context.Context) (v chatlinkcode.Status, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldStatus is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldStatus requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldStatus: %w", err)
+	}
+	return oldValue.Status, nil
+}
+
+// ResetStatus resets all changes to the "status" field.
+func (m *ChatLinkCodeMutation) ResetStatus() {
+	m.status = nil
+}
+
+// SetUserID sets the "user_id" field.
+func (m *ChatLinkCodeMutation) SetUserID(s string) {
+	m.user_id = &s
+}
+
+// UserID returns the value of the "user_id" field in the mutation.
+func (m *ChatLinkCodeMutation) UserID() (r string, exists bool) {
+	v := m.user_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUserID returns the old "user_id" field's value of the ChatLinkCode entity.
+// If the ChatLinkCode object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChatLinkCodeMutation) OldUserID(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUserID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUserID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUserID: %w", err)
+	}
+	return oldValue.UserID, nil
+}
+
+// ClearUserID clears the value of the "user_id" field.
+func (m *ChatLinkCodeMutation) ClearUserID() {
+	m.user_id = nil
+	m.clearedFields[chatlinkcode.FieldUserID] = struct{}{}
+}
+
+// UserIDCleared returns if the "user_id" field was cleared in this mutation.
+func (m *ChatLinkCodeMutation) UserIDCleared() bool {
+	_, ok := m.clearedFields[chatlinkcode.FieldUserID]
+	return ok
+}
+
+// ResetUserID resets all changes to the "user_id" field.
+func (m *ChatLinkCodeMutation) ResetUserID() {
+	m.user_id = nil
+	delete(m.clearedFields, chatlinkcode.FieldUserID)
+}
+
+// SetUserEmail sets the "user_email" field.
+func (m *ChatLinkCodeMutation) SetUserEmail(s string) {
+	m.user_email = &s
+}
+
+// UserEmail returns the value of the "user_email" field in the mutation.
+func (m *ChatLinkCodeMutation) UserEmail() (r string, exists bool) {
+	v := m.user_email
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUserEmail returns the old "user_email" field's value of the ChatLinkCode entity.
+// If the ChatLinkCode object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChatLinkCodeMutation) OldUserEmail(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUserEmail is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUserEmail requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUserEmail: %w", err)
+	}
+	return oldValue.UserEmail, nil
+}
+
+// ClearUserEmail clears the value of the "user_email" field.
+func (m *ChatLinkCodeMutation) ClearUserEmail() {
+	m.user_email = nil
+	m.clearedFields[chatlinkcode.FieldUserEmail] = struct{}{}
+}
+
+// UserEmailCleared returns if the "user_email" field was cleared in this mutation.
+func (m *ChatLinkCodeMutation) UserEmailCleared() bool {
+	_, ok := m.clearedFields[chatlinkcode.FieldUserEmail]
+	return ok
+}
+
+// ResetUserEmail resets all changes to the "user_email" field.
+func (m *ChatLinkCodeMutation) ResetUserEmail() {
+	m.user_email = nil
+	delete(m.clearedFields, chatlinkcode.FieldUserEmail)
+}
+
+// SetExpiresAt sets the "expires_at" field.
+func (m *ChatLinkCodeMutation) SetExpiresAt(t time.Time) {
+	m.expires_at = &t
+}
+
+// ExpiresAt returns the value of the "expires_at" field in the mutation.
+func (m *ChatLinkCodeMutation) ExpiresAt() (r time.Time, exists bool) {
+	v := m.expires_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldExpiresAt returns the old "expires_at" field's value of the ChatLinkCode entity.
+// If the ChatLinkCode object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChatLinkCodeMutation) OldExpiresAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldExpiresAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldExpiresAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldExpiresAt: %w", err)
+	}
+	return oldValue.ExpiresAt, nil
+}
+
+// ResetExpiresAt resets all changes to the "expires_at" field.
+func (m *ChatLinkCodeMutation) ResetExpiresAt() {
+	m.expires_at = nil
+}
+
+// SetCreatedAt sets the "created_at" field.
+func (m *ChatLinkCodeMutation) SetCreatedAt(t time.Time) {
+	m.created_at = &t
+}
+
+// CreatedAt returns the value of the "created_at" field in the mutation.
+func (m *ChatLinkCodeMutation) CreatedAt() (r time.Time, exists bool) {
+	v := m.created_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldCreatedAt returns the old "created_at" field's value of the ChatLinkCode entity.
+// If the ChatLinkCode object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ChatLinkCodeMutation) OldCreatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldCreatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldCreatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldCreatedAt: %w", err)
+	}
+	return oldValue.CreatedAt, nil
+}
+
+// ResetCreatedAt resets all changes to the "created_at" field.
+func (m *ChatLinkCodeMutation) ResetCreatedAt() {
+	m.created_at = nil
+}
+
+// Where appends a list predicates to the ChatLinkCodeMutation builder.
+func (m *ChatLinkCodeMutation) Where(ps ...predicate.ChatLinkCode) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the ChatLinkCodeMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *ChatLinkCodeMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.ChatLinkCode, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *ChatLinkCodeMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *ChatLinkCodeMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (ChatLinkCode).
+func (m *ChatLinkCodeMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *ChatLinkCodeMutation) Fields() []string {
+	fields := make([]string, 0, 8)
+	if m.code_hash != nil {
+		fields = append(fields, chatlinkcode.FieldCodeHash)
+	}
+	if m.user_identifier != nil {
+		fields = append(fields, chatlinkcode.FieldUserIdentifier)
+	}
+	if m.provider != nil {
+		fields = append(fields, chatlinkcode.FieldProvider)
+	}
+	if m.status != nil {
+		fields = append(fields, chatlinkcode.FieldStatus)
+	}
+	if m.user_id != nil {
+		fields = append(fields, chatlinkcode.FieldUserID)
+	}
+	if m.user_email != nil {
+		fields = append(fields, chatlinkcode.FieldUserEmail)
+	}
+	if m.expires_at != nil {
+		fields = append(fields, chatlinkcode.FieldExpiresAt)
+	}
+	if m.created_at != nil {
+		fields = append(fields, chatlinkcode.FieldCreatedAt)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *ChatLinkCodeMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case chatlinkcode.FieldCodeHash:
+		return m.CodeHash()
+	case chatlinkcode.FieldUserIdentifier:
+		return m.UserIdentifier()
+	case chatlinkcode.FieldProvider:
+		return m.Provider()
+	case chatlinkcode.FieldStatus:
+		return m.Status()
+	case chatlinkcode.FieldUserID:
+		return m.UserID()
+	case chatlinkcode.FieldUserEmail:
+		return m.UserEmail()
+	case chatlinkcode.FieldExpiresAt:
+		return m.ExpiresAt()
+	case chatlinkcode.FieldCreatedAt:
+		return m.CreatedAt()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *ChatLinkCodeMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	switch name {
+	case chatlinkcode.FieldCodeHash:
+		return m.OldCodeHash(ctx)
+	case chatlinkcode.FieldUserIdentifier:
+		return m.OldUserIdentifier(ctx)
+	case chatlinkcode.FieldProvider:
+		return m.OldProvider(ctx)
+	case chatlinkcode.FieldStatus:
+		return m.OldStatus(ctx)
+	case chatlinkcode.FieldUserID:
+		return m.OldUserID(ctx)
+	case chatlinkcode.FieldUserEmail:
+		return m.OldUserEmail(ctx)
+	case chatlinkcode.FieldExpiresAt:
+		return m.OldExpiresAt(ctx)
+	case chatlinkcode.FieldCreatedAt:
+		return m.OldCreatedAt(ctx)
+	}
+	return nil, fmt.Errorf("unknown ChatLinkCode field %s", name)
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *ChatLinkCodeMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case chatlinkcode.FieldCodeHash:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetCodeHash(v)
+		return nil
+	case chatlinkcode.FieldUserIdentifier:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUserIdentifier(v)
+		return nil
+	case chatlinkcode.FieldProvider:
+		v, ok := value.(chatlinkcode.Provider)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetProvider(v)
+		return nil
+	case chatlinkcode.FieldStatus:
+		v, ok := value.(chatlinkcode.Status)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetStatus(v)
+		return nil
+	case chatlinkcode.FieldUserID:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUserID(v)
+		return nil
+	case chatlinkcode.FieldUserEmail:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUserEmail(v)
+		return nil
+	case chatlinkcode.FieldExpiresAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetExpiresAt(v)
+		return nil
+	case chatlinkcode.FieldCreatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetCreatedAt(v)
+		return nil
+	}
+	return fmt.Errorf("unknown ChatLinkCode field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *ChatLinkCodeMutation) AddedFields() []string {
+	return nil
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *ChatLinkCodeMutation) AddedField(name string) (ent.Value, bool) {
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *ChatLinkCodeMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	}
+	return fmt.Errorf("unknown ChatLinkCode numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *ChatLinkCodeMutation) ClearedFields() []string {
+	var fields []string
+	if m.FieldCleared(chatlinkcode.FieldUserID) {
+		fields = append(fields, chatlinkcode.FieldUserID)
+	}
+	if m.FieldCleared(chatlinkcode.FieldUserEmail) {
+		fields = append(fields, chatlinkcode.FieldUserEmail)
+	}
+	return fields
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *ChatLinkCodeMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *ChatLinkCodeMutation) ClearField(name string) error {
+	switch name {
+	case chatlinkcode.FieldUserID:
+		m.ClearUserID()
+		return nil
+	case chatlinkcode.FieldUserEmail:
+		m.ClearUserEmail()
+		return nil
+	}
+	return fmt.Errorf("unknown ChatLinkCode nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *ChatLinkCodeMutation) ResetField(name string) error {
+	switch name {
+	case chatlinkcode.FieldCodeHash:
+		m.ResetCodeHash()
+		return nil
+	case chatlinkcode.FieldUserIdentifier:
+		m.ResetUserIdentifier()
+		return nil
+	case chatlinkcode.FieldProvider:
+		m.ResetProvider()
+		return nil
+	case chatlinkcode.FieldStatus:
+		m.ResetStatus()
+		return nil
+	case chatlinkcode.FieldUserID:
+		m.ResetUserID()
+		return nil
+	case chatlinkcode.FieldUserEmail:
+		m.ResetUserEmail()
+		return nil
+	case chatlinkcode.FieldExpiresAt:
+		m.ResetExpiresAt()
+		return nil
+	case chatlinkcode.FieldCreatedAt:
+		m.ResetCreatedAt()
+		return nil
+	}
+	return fmt.Errorf("unknown ChatLinkCode field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *ChatLinkCodeMutation) AddedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *ChatLinkCodeMutation) AddedIDs(name string) []ent.Value {
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *ChatLinkCodeMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *ChatLinkCodeMutation) RemovedIDs(name string) []ent.Value {
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *ChatLinkCodeMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *ChatLinkCodeMutation) EdgeCleared(name string) bool {
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *ChatLinkCodeMutation) ClearEdge(name string) error {
+	return fmt.Errorf("unknown ChatLinkCode unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *ChatLinkCodeMutation) ResetEdge(name string) error {
+	return fmt.Errorf("unknown ChatLinkCode edge %s", name)
+}
+
 // EnvVarMutation represents an operation that mutates the EnvVar nodes in the graph.
 type EnvVarMutation struct {
 	config
@@ -10759,25 +11514,27 @@ func (m *EnvVarMutation) ResetEdge(name string) error {
 // GCPServiceAccountMutation represents an operation that mutates the GCPServiceAccount nodes in the graph.
 type GCPServiceAccountMutation struct {
 	config
-	op             Op
-	typ            string
-	id             *uuid.UUID
-	scope          *string
-	scope_id       *string
-	email          *string
-	project_id     *string
-	display_name   *string
-	default_scopes *string
-	verified       *bool
-	verified_at    *time.Time
-	created_by     *string
-	managed        *bool
-	managed_by     *string
-	created        *time.Time
-	clearedFields  map[string]struct{}
-	done           bool
-	oldValue       func(context.Context) (*GCPServiceAccount, error)
-	predicates     []predicate.GCPServiceAccount
+	op                  Op
+	typ                 string
+	id                  *uuid.UUID
+	scope               *string
+	scope_id            *string
+	email               *string
+	project_id          *string
+	display_name        *string
+	default_scopes      *string
+	verified            *bool
+	verified_at         *time.Time
+	verification_status *string
+	verification_error  *string
+	created_by          *string
+	managed             *bool
+	managed_by          *string
+	created             *time.Time
+	clearedFields       map[string]struct{}
+	done                bool
+	oldValue            func(context.Context) (*GCPServiceAccount, error)
+	predicates          []predicate.GCPServiceAccount
 }
 
 var _ ent.Mutation = (*GCPServiceAccountMutation)(nil)
@@ -11185,6 +11942,78 @@ func (m *GCPServiceAccountMutation) ResetVerifiedAt() {
 	delete(m.clearedFields, gcpserviceaccount.FieldVerifiedAt)
 }
 
+// SetVerificationStatus sets the "verification_status" field.
+func (m *GCPServiceAccountMutation) SetVerificationStatus(s string) {
+	m.verification_status = &s
+}
+
+// VerificationStatus returns the value of the "verification_status" field in the mutation.
+func (m *GCPServiceAccountMutation) VerificationStatus() (r string, exists bool) {
+	v := m.verification_status
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldVerificationStatus returns the old "verification_status" field's value of the GCPServiceAccount entity.
+// If the GCPServiceAccount object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GCPServiceAccountMutation) OldVerificationStatus(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldVerificationStatus is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldVerificationStatus requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldVerificationStatus: %w", err)
+	}
+	return oldValue.VerificationStatus, nil
+}
+
+// ResetVerificationStatus resets all changes to the "verification_status" field.
+func (m *GCPServiceAccountMutation) ResetVerificationStatus() {
+	m.verification_status = nil
+}
+
+// SetVerificationError sets the "verification_error" field.
+func (m *GCPServiceAccountMutation) SetVerificationError(s string) {
+	m.verification_error = &s
+}
+
+// VerificationError returns the value of the "verification_error" field in the mutation.
+func (m *GCPServiceAccountMutation) VerificationError() (r string, exists bool) {
+	v := m.verification_error
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldVerificationError returns the old "verification_error" field's value of the GCPServiceAccount entity.
+// If the GCPServiceAccount object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *GCPServiceAccountMutation) OldVerificationError(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldVerificationError is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldVerificationError requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldVerificationError: %w", err)
+	}
+	return oldValue.VerificationError, nil
+}
+
+// ResetVerificationError resets all changes to the "verification_error" field.
+func (m *GCPServiceAccountMutation) ResetVerificationError() {
+	m.verification_error = nil
+}
+
 // SetCreatedBy sets the "created_by" field.
 func (m *GCPServiceAccountMutation) SetCreatedBy(s string) {
 	m.created_by = &s
@@ -11363,7 +12192,7 @@ func (m *GCPServiceAccountMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *GCPServiceAccountMutation) Fields() []string {
-	fields := make([]string, 0, 12)
+	fields := make([]string, 0, 14)
 	if m.scope != nil {
 		fields = append(fields, gcpserviceaccount.FieldScope)
 	}
@@ -11387,6 +12216,12 @@ func (m *GCPServiceAccountMutation) Fields() []string {
 	}
 	if m.verified_at != nil {
 		fields = append(fields, gcpserviceaccount.FieldVerifiedAt)
+	}
+	if m.verification_status != nil {
+		fields = append(fields, gcpserviceaccount.FieldVerificationStatus)
+	}
+	if m.verification_error != nil {
+		fields = append(fields, gcpserviceaccount.FieldVerificationError)
 	}
 	if m.created_by != nil {
 		fields = append(fields, gcpserviceaccount.FieldCreatedBy)
@@ -11424,6 +12259,10 @@ func (m *GCPServiceAccountMutation) Field(name string) (ent.Value, bool) {
 		return m.Verified()
 	case gcpserviceaccount.FieldVerifiedAt:
 		return m.VerifiedAt()
+	case gcpserviceaccount.FieldVerificationStatus:
+		return m.VerificationStatus()
+	case gcpserviceaccount.FieldVerificationError:
+		return m.VerificationError()
 	case gcpserviceaccount.FieldCreatedBy:
 		return m.CreatedBy()
 	case gcpserviceaccount.FieldManaged:
@@ -11457,6 +12296,10 @@ func (m *GCPServiceAccountMutation) OldField(ctx context.Context, name string) (
 		return m.OldVerified(ctx)
 	case gcpserviceaccount.FieldVerifiedAt:
 		return m.OldVerifiedAt(ctx)
+	case gcpserviceaccount.FieldVerificationStatus:
+		return m.OldVerificationStatus(ctx)
+	case gcpserviceaccount.FieldVerificationError:
+		return m.OldVerificationError(ctx)
 	case gcpserviceaccount.FieldCreatedBy:
 		return m.OldCreatedBy(ctx)
 	case gcpserviceaccount.FieldManaged:
@@ -11529,6 +12372,20 @@ func (m *GCPServiceAccountMutation) SetField(name string, value ent.Value) error
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetVerifiedAt(v)
+		return nil
+	case gcpserviceaccount.FieldVerificationStatus:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetVerificationStatus(v)
+		return nil
+	case gcpserviceaccount.FieldVerificationError:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetVerificationError(v)
 		return nil
 	case gcpserviceaccount.FieldCreatedBy:
 		v, ok := value.(string)
@@ -11639,6 +12496,12 @@ func (m *GCPServiceAccountMutation) ResetField(name string) error {
 		return nil
 	case gcpserviceaccount.FieldVerifiedAt:
 		m.ResetVerifiedAt()
+		return nil
+	case gcpserviceaccount.FieldVerificationStatus:
+		m.ResetVerificationStatus()
+		return nil
+	case gcpserviceaccount.FieldVerificationError:
+		m.ResetVerificationError()
 		return nil
 	case gcpserviceaccount.FieldCreatedBy:
 		m.ResetCreatedBy()
@@ -23181,6 +24044,9 @@ type MessageMutation struct {
 	dispatch_state          *string
 	dispatch_failure_reason *string
 	dispatched_at           *time.Time
+	channel                 *string
+	thread_id               *string
+	visibility              *string
 	created                 *time.Time
 	clearedFields           map[string]struct{}
 	done                    bool
@@ -23910,6 +24776,153 @@ func (m *MessageMutation) ResetDispatchedAt() {
 	delete(m.clearedFields, message.FieldDispatchedAt)
 }
 
+// SetChannel sets the "channel" field.
+func (m *MessageMutation) SetChannel(s string) {
+	m.channel = &s
+}
+
+// Channel returns the value of the "channel" field in the mutation.
+func (m *MessageMutation) Channel() (r string, exists bool) {
+	v := m.channel
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldChannel returns the old "channel" field's value of the Message entity.
+// If the Message object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *MessageMutation) OldChannel(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldChannel is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldChannel requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldChannel: %w", err)
+	}
+	return oldValue.Channel, nil
+}
+
+// ClearChannel clears the value of the "channel" field.
+func (m *MessageMutation) ClearChannel() {
+	m.channel = nil
+	m.clearedFields[message.FieldChannel] = struct{}{}
+}
+
+// ChannelCleared returns if the "channel" field was cleared in this mutation.
+func (m *MessageMutation) ChannelCleared() bool {
+	_, ok := m.clearedFields[message.FieldChannel]
+	return ok
+}
+
+// ResetChannel resets all changes to the "channel" field.
+func (m *MessageMutation) ResetChannel() {
+	m.channel = nil
+	delete(m.clearedFields, message.FieldChannel)
+}
+
+// SetThreadID sets the "thread_id" field.
+func (m *MessageMutation) SetThreadID(s string) {
+	m.thread_id = &s
+}
+
+// ThreadID returns the value of the "thread_id" field in the mutation.
+func (m *MessageMutation) ThreadID() (r string, exists bool) {
+	v := m.thread_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldThreadID returns the old "thread_id" field's value of the Message entity.
+// If the Message object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *MessageMutation) OldThreadID(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldThreadID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldThreadID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldThreadID: %w", err)
+	}
+	return oldValue.ThreadID, nil
+}
+
+// ClearThreadID clears the value of the "thread_id" field.
+func (m *MessageMutation) ClearThreadID() {
+	m.thread_id = nil
+	m.clearedFields[message.FieldThreadID] = struct{}{}
+}
+
+// ThreadIDCleared returns if the "thread_id" field was cleared in this mutation.
+func (m *MessageMutation) ThreadIDCleared() bool {
+	_, ok := m.clearedFields[message.FieldThreadID]
+	return ok
+}
+
+// ResetThreadID resets all changes to the "thread_id" field.
+func (m *MessageMutation) ResetThreadID() {
+	m.thread_id = nil
+	delete(m.clearedFields, message.FieldThreadID)
+}
+
+// SetVisibility sets the "visibility" field.
+func (m *MessageMutation) SetVisibility(s string) {
+	m.visibility = &s
+}
+
+// Visibility returns the value of the "visibility" field in the mutation.
+func (m *MessageMutation) Visibility() (r string, exists bool) {
+	v := m.visibility
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldVisibility returns the old "visibility" field's value of the Message entity.
+// If the Message object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *MessageMutation) OldVisibility(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldVisibility is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldVisibility requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldVisibility: %w", err)
+	}
+	return oldValue.Visibility, nil
+}
+
+// ClearVisibility clears the value of the "visibility" field.
+func (m *MessageMutation) ClearVisibility() {
+	m.visibility = nil
+	m.clearedFields[message.FieldVisibility] = struct{}{}
+}
+
+// VisibilityCleared returns if the "visibility" field was cleared in this mutation.
+func (m *MessageMutation) VisibilityCleared() bool {
+	_, ok := m.clearedFields[message.FieldVisibility]
+	return ok
+}
+
+// ResetVisibility resets all changes to the "visibility" field.
+func (m *MessageMutation) ResetVisibility() {
+	m.visibility = nil
+	delete(m.clearedFields, message.FieldVisibility)
+}
+
 // SetCreated sets the "created" field.
 func (m *MessageMutation) SetCreated(t time.Time) {
 	m.created = &t
@@ -23980,7 +24993,7 @@ func (m *MessageMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *MessageMutation) Fields() []string {
-	fields := make([]string, 0, 16)
+	fields := make([]string, 0, 19)
 	if m.project_id != nil {
 		fields = append(fields, message.FieldProjectID)
 	}
@@ -24026,6 +25039,15 @@ func (m *MessageMutation) Fields() []string {
 	if m.dispatched_at != nil {
 		fields = append(fields, message.FieldDispatchedAt)
 	}
+	if m.channel != nil {
+		fields = append(fields, message.FieldChannel)
+	}
+	if m.thread_id != nil {
+		fields = append(fields, message.FieldThreadID)
+	}
+	if m.visibility != nil {
+		fields = append(fields, message.FieldVisibility)
+	}
 	if m.created != nil {
 		fields = append(fields, message.FieldCreated)
 	}
@@ -24067,6 +25089,12 @@ func (m *MessageMutation) Field(name string) (ent.Value, bool) {
 		return m.DispatchFailureReason()
 	case message.FieldDispatchedAt:
 		return m.DispatchedAt()
+	case message.FieldChannel:
+		return m.Channel()
+	case message.FieldThreadID:
+		return m.ThreadID()
+	case message.FieldVisibility:
+		return m.Visibility()
 	case message.FieldCreated:
 		return m.Created()
 	}
@@ -24108,6 +25136,12 @@ func (m *MessageMutation) OldField(ctx context.Context, name string) (ent.Value,
 		return m.OldDispatchFailureReason(ctx)
 	case message.FieldDispatchedAt:
 		return m.OldDispatchedAt(ctx)
+	case message.FieldChannel:
+		return m.OldChannel(ctx)
+	case message.FieldThreadID:
+		return m.OldThreadID(ctx)
+	case message.FieldVisibility:
+		return m.OldVisibility(ctx)
 	case message.FieldCreated:
 		return m.OldCreated(ctx)
 	}
@@ -24224,6 +25258,27 @@ func (m *MessageMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetDispatchedAt(v)
 		return nil
+	case message.FieldChannel:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetChannel(v)
+		return nil
+	case message.FieldThreadID:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetThreadID(v)
+		return nil
+	case message.FieldVisibility:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetVisibility(v)
+		return nil
 	case message.FieldCreated:
 		v, ok := value.(time.Time)
 		if !ok {
@@ -24279,6 +25334,15 @@ func (m *MessageMutation) ClearedFields() []string {
 	if m.FieldCleared(message.FieldDispatchedAt) {
 		fields = append(fields, message.FieldDispatchedAt)
 	}
+	if m.FieldCleared(message.FieldChannel) {
+		fields = append(fields, message.FieldChannel)
+	}
+	if m.FieldCleared(message.FieldThreadID) {
+		fields = append(fields, message.FieldThreadID)
+	}
+	if m.FieldCleared(message.FieldVisibility) {
+		fields = append(fields, message.FieldVisibility)
+	}
 	return fields
 }
 
@@ -24310,6 +25374,15 @@ func (m *MessageMutation) ClearField(name string) error {
 		return nil
 	case message.FieldDispatchedAt:
 		m.ClearDispatchedAt()
+		return nil
+	case message.FieldChannel:
+		m.ClearChannel()
+		return nil
+	case message.FieldThreadID:
+		m.ClearThreadID()
+		return nil
+	case message.FieldVisibility:
+		m.ClearVisibility()
 		return nil
 	}
 	return fmt.Errorf("unknown Message nullable field %s", name)
@@ -24364,6 +25437,15 @@ func (m *MessageMutation) ResetField(name string) error {
 	case message.FieldDispatchedAt:
 		m.ResetDispatchedAt()
 		return nil
+	case message.FieldChannel:
+		m.ResetChannel()
+		return nil
+	case message.FieldThreadID:
+		m.ResetThreadID()
+		return nil
+	case message.FieldVisibility:
+		m.ResetVisibility()
+		return nil
 	case message.FieldCreated:
 		m.ResetCreated()
 		return nil
@@ -24417,6 +25499,446 @@ func (m *MessageMutation) ClearEdge(name string) error {
 // It returns an error if the edge is not defined in the schema.
 func (m *MessageMutation) ResetEdge(name string) error {
 	return fmt.Errorf("unknown Message edge %s", name)
+}
+
+// NonceCacheMutation represents an operation that mutates the NonceCache nodes in the graph.
+type NonceCacheMutation struct {
+	config
+	op            Op
+	typ           string
+	id            *uuid.UUID
+	nonce         *string
+	expires_at    *time.Time
+	created_at    *time.Time
+	clearedFields map[string]struct{}
+	done          bool
+	oldValue      func(context.Context) (*NonceCache, error)
+	predicates    []predicate.NonceCache
+}
+
+var _ ent.Mutation = (*NonceCacheMutation)(nil)
+
+// noncecacheOption allows management of the mutation configuration using functional options.
+type noncecacheOption func(*NonceCacheMutation)
+
+// newNonceCacheMutation creates new mutation for the NonceCache entity.
+func newNonceCacheMutation(c config, op Op, opts ...noncecacheOption) *NonceCacheMutation {
+	m := &NonceCacheMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeNonceCache,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// withNonceCacheID sets the ID field of the mutation.
+func withNonceCacheID(id uuid.UUID) noncecacheOption {
+	return func(m *NonceCacheMutation) {
+		var (
+			err   error
+			once  sync.Once
+			value *NonceCache
+		)
+		m.oldValue = func(ctx context.Context) (*NonceCache, error) {
+			once.Do(func() {
+				if m.done {
+					err = errors.New("querying old values post mutation is not allowed")
+				} else {
+					value, err = m.Client().NonceCache.Get(ctx, id)
+				}
+			})
+			return value, err
+		}
+		m.id = &id
+	}
+}
+
+// withNonceCache sets the old NonceCache of the mutation.
+func withNonceCache(node *NonceCache) noncecacheOption {
+	return func(m *NonceCacheMutation) {
+		m.oldValue = func(context.Context) (*NonceCache, error) {
+			return node, nil
+		}
+		m.id = &node.ID
+	}
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m NonceCacheMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m NonceCacheMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// SetID sets the value of the id field. Note that this
+// operation is only accepted on creation of NonceCache entities.
+func (m *NonceCacheMutation) SetID(id uuid.UUID) {
+	m.id = &id
+}
+
+// ID returns the ID value in the mutation. Note that the ID is only available
+// if it was provided to the builder or after it was returned from the database.
+func (m *NonceCacheMutation) ID() (id uuid.UUID, exists bool) {
+	if m.id == nil {
+		return
+	}
+	return *m.id, true
+}
+
+// IDs queries the database and returns the entity ids that match the mutation's predicate.
+// That means, if the mutation is applied within a transaction with an isolation level such
+// as sql.LevelSerializable, the returned ids match the ids of the rows that will be updated
+// or updated by the mutation.
+func (m *NonceCacheMutation) IDs(ctx context.Context) ([]uuid.UUID, error) {
+	switch {
+	case m.op.Is(OpUpdateOne | OpDeleteOne):
+		id, exists := m.ID()
+		if exists {
+			return []uuid.UUID{id}, nil
+		}
+		fallthrough
+	case m.op.Is(OpUpdate | OpDelete):
+		return m.Client().NonceCache.Query().Where(m.predicates...).IDs(ctx)
+	default:
+		return nil, fmt.Errorf("IDs is not allowed on %s operations", m.op)
+	}
+}
+
+// SetNonce sets the "nonce" field.
+func (m *NonceCacheMutation) SetNonce(s string) {
+	m.nonce = &s
+}
+
+// Nonce returns the value of the "nonce" field in the mutation.
+func (m *NonceCacheMutation) Nonce() (r string, exists bool) {
+	v := m.nonce
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldNonce returns the old "nonce" field's value of the NonceCache entity.
+// If the NonceCache object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *NonceCacheMutation) OldNonce(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldNonce is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldNonce requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldNonce: %w", err)
+	}
+	return oldValue.Nonce, nil
+}
+
+// ResetNonce resets all changes to the "nonce" field.
+func (m *NonceCacheMutation) ResetNonce() {
+	m.nonce = nil
+}
+
+// SetExpiresAt sets the "expires_at" field.
+func (m *NonceCacheMutation) SetExpiresAt(t time.Time) {
+	m.expires_at = &t
+}
+
+// ExpiresAt returns the value of the "expires_at" field in the mutation.
+func (m *NonceCacheMutation) ExpiresAt() (r time.Time, exists bool) {
+	v := m.expires_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldExpiresAt returns the old "expires_at" field's value of the NonceCache entity.
+// If the NonceCache object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *NonceCacheMutation) OldExpiresAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldExpiresAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldExpiresAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldExpiresAt: %w", err)
+	}
+	return oldValue.ExpiresAt, nil
+}
+
+// ResetExpiresAt resets all changes to the "expires_at" field.
+func (m *NonceCacheMutation) ResetExpiresAt() {
+	m.expires_at = nil
+}
+
+// SetCreatedAt sets the "created_at" field.
+func (m *NonceCacheMutation) SetCreatedAt(t time.Time) {
+	m.created_at = &t
+}
+
+// CreatedAt returns the value of the "created_at" field in the mutation.
+func (m *NonceCacheMutation) CreatedAt() (r time.Time, exists bool) {
+	v := m.created_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldCreatedAt returns the old "created_at" field's value of the NonceCache entity.
+// If the NonceCache object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *NonceCacheMutation) OldCreatedAt(ctx context.Context) (v time.Time, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldCreatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldCreatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldCreatedAt: %w", err)
+	}
+	return oldValue.CreatedAt, nil
+}
+
+// ResetCreatedAt resets all changes to the "created_at" field.
+func (m *NonceCacheMutation) ResetCreatedAt() {
+	m.created_at = nil
+}
+
+// Where appends a list predicates to the NonceCacheMutation builder.
+func (m *NonceCacheMutation) Where(ps ...predicate.NonceCache) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the NonceCacheMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *NonceCacheMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.NonceCache, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *NonceCacheMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *NonceCacheMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (NonceCache).
+func (m *NonceCacheMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *NonceCacheMutation) Fields() []string {
+	fields := make([]string, 0, 3)
+	if m.nonce != nil {
+		fields = append(fields, noncecache.FieldNonce)
+	}
+	if m.expires_at != nil {
+		fields = append(fields, noncecache.FieldExpiresAt)
+	}
+	if m.created_at != nil {
+		fields = append(fields, noncecache.FieldCreatedAt)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *NonceCacheMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case noncecache.FieldNonce:
+		return m.Nonce()
+	case noncecache.FieldExpiresAt:
+		return m.ExpiresAt()
+	case noncecache.FieldCreatedAt:
+		return m.CreatedAt()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *NonceCacheMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	switch name {
+	case noncecache.FieldNonce:
+		return m.OldNonce(ctx)
+	case noncecache.FieldExpiresAt:
+		return m.OldExpiresAt(ctx)
+	case noncecache.FieldCreatedAt:
+		return m.OldCreatedAt(ctx)
+	}
+	return nil, fmt.Errorf("unknown NonceCache field %s", name)
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *NonceCacheMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case noncecache.FieldNonce:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetNonce(v)
+		return nil
+	case noncecache.FieldExpiresAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetExpiresAt(v)
+		return nil
+	case noncecache.FieldCreatedAt:
+		v, ok := value.(time.Time)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetCreatedAt(v)
+		return nil
+	}
+	return fmt.Errorf("unknown NonceCache field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *NonceCacheMutation) AddedFields() []string {
+	return nil
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *NonceCacheMutation) AddedField(name string) (ent.Value, bool) {
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *NonceCacheMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	}
+	return fmt.Errorf("unknown NonceCache numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *NonceCacheMutation) ClearedFields() []string {
+	return nil
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *NonceCacheMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *NonceCacheMutation) ClearField(name string) error {
+	return fmt.Errorf("unknown NonceCache nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *NonceCacheMutation) ResetField(name string) error {
+	switch name {
+	case noncecache.FieldNonce:
+		m.ResetNonce()
+		return nil
+	case noncecache.FieldExpiresAt:
+		m.ResetExpiresAt()
+		return nil
+	case noncecache.FieldCreatedAt:
+		m.ResetCreatedAt()
+		return nil
+	}
+	return fmt.Errorf("unknown NonceCache field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *NonceCacheMutation) AddedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *NonceCacheMutation) AddedIDs(name string) []ent.Value {
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *NonceCacheMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *NonceCacheMutation) RemovedIDs(name string) []ent.Value {
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *NonceCacheMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *NonceCacheMutation) EdgeCleared(name string) bool {
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *NonceCacheMutation) ClearEdge(name string) error {
+	return fmt.Errorf("unknown NonceCache unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *NonceCacheMutation) ResetEdge(name string) error {
+	return fmt.Errorf("unknown NonceCache edge %s", name)
 }
 
 // NotificationMutation represents an operation that mutates the Notification nodes in the graph.
@@ -30981,36 +32503,38 @@ func (m *ProjectSyncStateMutation) ResetEdge(name string) error {
 // RuntimeBrokerMutation represents an operation that mutates the RuntimeBroker nodes in the graph.
 type RuntimeBrokerMutation struct {
 	config
-	op                   Op
-	typ                  string
-	id                   *uuid.UUID
-	name                 *string
-	slug                 *string
-	mode                 *string
-	version              *string
-	lock_version         *int64
-	addlock_version      *int64
-	status               *string
-	connection_state     *string
-	last_heartbeat       *time.Time
-	capabilities         *string
-	supported_harnesses  *string
-	resources            *string
-	runtimes             *string
-	labels               *string
-	annotations          *string
-	endpoint             *string
-	created_by           *string
-	auto_provide         *bool
-	connected_hub_id     *string
-	connected_session_id *string
-	connected_at         *time.Time
-	created              *time.Time
-	updated              *time.Time
-	clearedFields        map[string]struct{}
-	done                 bool
-	oldValue             func(context.Context) (*RuntimeBroker, error)
-	predicates           []predicate.RuntimeBroker
+	op                             Op
+	typ                            string
+	id                             *uuid.UUID
+	name                           *string
+	slug                           *string
+	mode                           *string
+	version                        *string
+	lock_version                   *int64
+	addlock_version                *int64
+	status                         *string
+	connection_state               *string
+	last_heartbeat                 *time.Time
+	capabilities                   *string
+	supported_harnesses            *string
+	resources                      *string
+	runtimes                       *string
+	labels                         *string
+	annotations                    *string
+	endpoint                       *string
+	created_by                     *string
+	auto_provide                   *bool
+	gcp_host_service_account_email *string
+	gcp_host_project_id            *string
+	connected_hub_id               *string
+	connected_session_id           *string
+	connected_at                   *time.Time
+	created                        *time.Time
+	updated                        *time.Time
+	clearedFields                  map[string]struct{}
+	done                           bool
+	oldValue                       func(context.Context) (*RuntimeBroker, error)
+	predicates                     []predicate.RuntimeBroker
 }
 
 var _ ent.Mutation = (*RuntimeBrokerMutation)(nil)
@@ -31879,6 +33403,104 @@ func (m *RuntimeBrokerMutation) ResetAutoProvide() {
 	m.auto_provide = nil
 }
 
+// SetGcpHostServiceAccountEmail sets the "gcp_host_service_account_email" field.
+func (m *RuntimeBrokerMutation) SetGcpHostServiceAccountEmail(s string) {
+	m.gcp_host_service_account_email = &s
+}
+
+// GcpHostServiceAccountEmail returns the value of the "gcp_host_service_account_email" field in the mutation.
+func (m *RuntimeBrokerMutation) GcpHostServiceAccountEmail() (r string, exists bool) {
+	v := m.gcp_host_service_account_email
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldGcpHostServiceAccountEmail returns the old "gcp_host_service_account_email" field's value of the RuntimeBroker entity.
+// If the RuntimeBroker object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *RuntimeBrokerMutation) OldGcpHostServiceAccountEmail(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldGcpHostServiceAccountEmail is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldGcpHostServiceAccountEmail requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldGcpHostServiceAccountEmail: %w", err)
+	}
+	return oldValue.GcpHostServiceAccountEmail, nil
+}
+
+// ClearGcpHostServiceAccountEmail clears the value of the "gcp_host_service_account_email" field.
+func (m *RuntimeBrokerMutation) ClearGcpHostServiceAccountEmail() {
+	m.gcp_host_service_account_email = nil
+	m.clearedFields[runtimebroker.FieldGcpHostServiceAccountEmail] = struct{}{}
+}
+
+// GcpHostServiceAccountEmailCleared returns if the "gcp_host_service_account_email" field was cleared in this mutation.
+func (m *RuntimeBrokerMutation) GcpHostServiceAccountEmailCleared() bool {
+	_, ok := m.clearedFields[runtimebroker.FieldGcpHostServiceAccountEmail]
+	return ok
+}
+
+// ResetGcpHostServiceAccountEmail resets all changes to the "gcp_host_service_account_email" field.
+func (m *RuntimeBrokerMutation) ResetGcpHostServiceAccountEmail() {
+	m.gcp_host_service_account_email = nil
+	delete(m.clearedFields, runtimebroker.FieldGcpHostServiceAccountEmail)
+}
+
+// SetGcpHostProjectID sets the "gcp_host_project_id" field.
+func (m *RuntimeBrokerMutation) SetGcpHostProjectID(s string) {
+	m.gcp_host_project_id = &s
+}
+
+// GcpHostProjectID returns the value of the "gcp_host_project_id" field in the mutation.
+func (m *RuntimeBrokerMutation) GcpHostProjectID() (r string, exists bool) {
+	v := m.gcp_host_project_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldGcpHostProjectID returns the old "gcp_host_project_id" field's value of the RuntimeBroker entity.
+// If the RuntimeBroker object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *RuntimeBrokerMutation) OldGcpHostProjectID(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldGcpHostProjectID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldGcpHostProjectID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldGcpHostProjectID: %w", err)
+	}
+	return oldValue.GcpHostProjectID, nil
+}
+
+// ClearGcpHostProjectID clears the value of the "gcp_host_project_id" field.
+func (m *RuntimeBrokerMutation) ClearGcpHostProjectID() {
+	m.gcp_host_project_id = nil
+	m.clearedFields[runtimebroker.FieldGcpHostProjectID] = struct{}{}
+}
+
+// GcpHostProjectIDCleared returns if the "gcp_host_project_id" field was cleared in this mutation.
+func (m *RuntimeBrokerMutation) GcpHostProjectIDCleared() bool {
+	_, ok := m.clearedFields[runtimebroker.FieldGcpHostProjectID]
+	return ok
+}
+
+// ResetGcpHostProjectID resets all changes to the "gcp_host_project_id" field.
+func (m *RuntimeBrokerMutation) ResetGcpHostProjectID() {
+	m.gcp_host_project_id = nil
+	delete(m.clearedFields, runtimebroker.FieldGcpHostProjectID)
+}
+
 // SetConnectedHubID sets the "connected_hub_id" field.
 func (m *RuntimeBrokerMutation) SetConnectedHubID(s string) {
 	m.connected_hub_id = &s
@@ -32132,7 +33754,7 @@ func (m *RuntimeBrokerMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *RuntimeBrokerMutation) Fields() []string {
-	fields := make([]string, 0, 22)
+	fields := make([]string, 0, 24)
 	if m.name != nil {
 		fields = append(fields, runtimebroker.FieldName)
 	}
@@ -32183,6 +33805,12 @@ func (m *RuntimeBrokerMutation) Fields() []string {
 	}
 	if m.auto_provide != nil {
 		fields = append(fields, runtimebroker.FieldAutoProvide)
+	}
+	if m.gcp_host_service_account_email != nil {
+		fields = append(fields, runtimebroker.FieldGcpHostServiceAccountEmail)
+	}
+	if m.gcp_host_project_id != nil {
+		fields = append(fields, runtimebroker.FieldGcpHostProjectID)
 	}
 	if m.connected_hub_id != nil {
 		fields = append(fields, runtimebroker.FieldConnectedHubID)
@@ -32241,6 +33869,10 @@ func (m *RuntimeBrokerMutation) Field(name string) (ent.Value, bool) {
 		return m.CreatedBy()
 	case runtimebroker.FieldAutoProvide:
 		return m.AutoProvide()
+	case runtimebroker.FieldGcpHostServiceAccountEmail:
+		return m.GcpHostServiceAccountEmail()
+	case runtimebroker.FieldGcpHostProjectID:
+		return m.GcpHostProjectID()
 	case runtimebroker.FieldConnectedHubID:
 		return m.ConnectedHubID()
 	case runtimebroker.FieldConnectedSessionID:
@@ -32294,6 +33926,10 @@ func (m *RuntimeBrokerMutation) OldField(ctx context.Context, name string) (ent.
 		return m.OldCreatedBy(ctx)
 	case runtimebroker.FieldAutoProvide:
 		return m.OldAutoProvide(ctx)
+	case runtimebroker.FieldGcpHostServiceAccountEmail:
+		return m.OldGcpHostServiceAccountEmail(ctx)
+	case runtimebroker.FieldGcpHostProjectID:
+		return m.OldGcpHostProjectID(ctx)
 	case runtimebroker.FieldConnectedHubID:
 		return m.OldConnectedHubID(ctx)
 	case runtimebroker.FieldConnectedSessionID:
@@ -32432,6 +34068,20 @@ func (m *RuntimeBrokerMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetAutoProvide(v)
 		return nil
+	case runtimebroker.FieldGcpHostServiceAccountEmail:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetGcpHostServiceAccountEmail(v)
+		return nil
+	case runtimebroker.FieldGcpHostProjectID:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetGcpHostProjectID(v)
+		return nil
 	case runtimebroker.FieldConnectedHubID:
 		v, ok := value.(string)
 		if !ok {
@@ -32542,6 +34192,12 @@ func (m *RuntimeBrokerMutation) ClearedFields() []string {
 	if m.FieldCleared(runtimebroker.FieldCreatedBy) {
 		fields = append(fields, runtimebroker.FieldCreatedBy)
 	}
+	if m.FieldCleared(runtimebroker.FieldGcpHostServiceAccountEmail) {
+		fields = append(fields, runtimebroker.FieldGcpHostServiceAccountEmail)
+	}
+	if m.FieldCleared(runtimebroker.FieldGcpHostProjectID) {
+		fields = append(fields, runtimebroker.FieldGcpHostProjectID)
+	}
 	if m.FieldCleared(runtimebroker.FieldConnectedHubID) {
 		fields = append(fields, runtimebroker.FieldConnectedHubID)
 	}
@@ -32594,6 +34250,12 @@ func (m *RuntimeBrokerMutation) ClearField(name string) error {
 		return nil
 	case runtimebroker.FieldCreatedBy:
 		m.ClearCreatedBy()
+		return nil
+	case runtimebroker.FieldGcpHostServiceAccountEmail:
+		m.ClearGcpHostServiceAccountEmail()
+		return nil
+	case runtimebroker.FieldGcpHostProjectID:
+		m.ClearGcpHostProjectID()
 		return nil
 	case runtimebroker.FieldConnectedHubID:
 		m.ClearConnectedHubID()
@@ -32662,6 +34324,12 @@ func (m *RuntimeBrokerMutation) ResetField(name string) error {
 		return nil
 	case runtimebroker.FieldAutoProvide:
 		m.ResetAutoProvide()
+		return nil
+	case runtimebroker.FieldGcpHostServiceAccountEmail:
+		m.ResetGcpHostServiceAccountEmail()
+		return nil
+	case runtimebroker.FieldGcpHostProjectID:
+		m.ResetGcpHostProjectID()
 		return nil
 	case runtimebroker.FieldConnectedHubID:
 		m.ResetConnectedHubID()

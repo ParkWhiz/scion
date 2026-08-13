@@ -46,6 +46,10 @@ type EventPublisher interface {
 	// broker.dispatch.<dispatchID>.done so the originator's subscription wakes
 	// and reads the result from the dispatch row (design §6.3).
 	PublishDispatchDone(ctx context.Context, dispatchID string)
+	// PublishChatTopicEvent publishes a topic lifecycle event (created, updated,
+	// deleted) on project.<projectID>.chat.topic so SSE subscribers can
+	// update the space rail in real time.
+	PublishChatTopicEvent(ctx context.Context, projectID string, action string, topic WebChatTopic)
 	// Subscribe returns a channel that receives events matching the given
 	// subject patterns, along with an unsubscribe function. Patterns use
 	// NATS-style wildcards: '*' matches a single token, '>' matches the
@@ -75,8 +79,10 @@ func (noopEventPublisher) PublishAgentPorts(_ context.Context, _ *store.Agent)  
 func (noopEventPublisher) PublishAllowListChanged(_ context.Context, _, _ string)            {}
 func (noopEventPublisher) PublishInviteChanged(_ context.Context, _, _, _ string)            {}
 func (noopEventPublisher) PublishDispatchDone(_ context.Context, _ string)                   {}
-func (noopEventPublisher) PublishRaw(_ string, _ interface{})                                {}
-func (noopEventPublisher) Close()                                                            {}
+func (noopEventPublisher) PublishChatTopicEvent(_ context.Context, _ string, _ string, _ WebChatTopic) {
+}
+func (noopEventPublisher) PublishRaw(_ string, _ interface{}) {}
+func (noopEventPublisher) Close()                             {}
 
 // Subscribe on the no-op publisher returns a nil channel (which blocks forever
 // on receive) and a no-op unsubscribe. Callers that need real subscriptions
@@ -193,19 +199,27 @@ type BrokerStatusEvent struct {
 // UserMessageEvent is published when a message involving a human user is
 // persisted — either an agent→user reply or a user→agent instruction.
 type UserMessageEvent struct {
-	ID          string `json:"id"`
-	ProjectID   string `json:"projectId"`
-	GroveID     string `json:"groveId"`
-	Sender      string `json:"sender"`
-	SenderID    string `json:"senderId"`
-	Recipient   string `json:"recipient"`
-	RecipientID string `json:"recipientId"`
-	Msg         string `json:"msg"`
-	Type        string `json:"type"`
-	Urgent      bool   `json:"urgent,omitempty"`
-	Broadcasted bool   `json:"broadcasted,omitempty"`
-	AgentID     string `json:"agentId"`
-	CreatedAt   string `json:"createdAt"`
+	ID            string `json:"id"`
+	ProjectID     string `json:"projectId"`
+	GroveID       string `json:"groveId"`
+	Sender        string `json:"sender"`
+	SenderID      string `json:"senderId"`
+	Recipient     string `json:"recipient"`
+	RecipientID   string `json:"recipientId"`
+	Msg           string `json:"msg"`
+	Type          string `json:"type"`
+	Urgent        bool   `json:"urgent,omitempty"`
+	Broadcasted   bool   `json:"broadcasted,omitempty"`
+	AgentID       string `json:"agentId"`
+	CreatedAt     string `json:"createdAt"`
+	Channel       string `json:"channel,omitempty"`
+	ThreadID      string `json:"threadId,omitempty"`
+	Visibility    string `json:"visibility,omitempty"`
+	GroupID       string `json:"groupId,omitempty"`
+	Read          bool   `json:"read"`
+	DispatchState string `json:"dispatchState,omitempty"`
+	// Metadata on the SSE event is deferred to a later phase when metadata
+	// persistence is added to store.Message (F4 deliverable).
 }
 
 // NotificationCreatedEvent is published when a user notification is created.
@@ -596,19 +610,25 @@ func (p *eventBuilder) PublishInviteChanged(_ context.Context, action, inviteID,
 //     directions; subscribers filter by user participation themselves)
 func (p *eventBuilder) PublishUserMessage(_ context.Context, msg *store.Message) {
 	evt := UserMessageEvent{
-		ID:          msg.ID,
-		ProjectID:   msg.ProjectID,
-		GroveID:     msg.ProjectID,
-		Sender:      msg.Sender,
-		SenderID:    msg.SenderID,
-		Recipient:   msg.Recipient,
-		RecipientID: msg.RecipientID,
-		Msg:         msg.Msg,
-		Type:        msg.Type,
-		Urgent:      msg.Urgent,
-		Broadcasted: msg.Broadcasted,
-		AgentID:     msg.AgentID,
-		CreatedAt:   msg.CreatedAt.Format("2006-01-02T15:04:05.000Z"),
+		ID:            msg.ID,
+		ProjectID:     msg.ProjectID,
+		GroveID:       msg.ProjectID,
+		Sender:        msg.Sender,
+		SenderID:      msg.SenderID,
+		Recipient:     msg.Recipient,
+		RecipientID:   msg.RecipientID,
+		Msg:           msg.Msg,
+		Type:          msg.Type,
+		Urgent:        msg.Urgent,
+		Broadcasted:   msg.Broadcasted,
+		AgentID:       msg.AgentID,
+		CreatedAt:     msg.CreatedAt.Format("2006-01-02T15:04:05.000Z"),
+		Channel:       msg.Channel,
+		ThreadID:      msg.ThreadID,
+		Visibility:    msg.Visibility,
+		GroupID:       msg.GroupID,
+		Read:          msg.Read,
+		DispatchState: msg.DispatchState,
 	}
 	// Only fan out to user-inbox and project-level subjects when the
 	// recipient is actually a human user. For user→agent messages the
@@ -626,6 +646,43 @@ func (p *eventBuilder) PublishUserMessage(_ context.Context, msg *store.Message)
 	if msg.AgentID != "" {
 		p.sink("agent."+msg.AgentID+".message", evt)
 	}
+	// Fan out to project-scoped chat subject for web-channel messages with
+	// topic thread_ids (UUID, not dm: prefixed). This enables shared-space
+	// SSE: all project members see the message, not just the direct
+	// recipient. Wave-2 §4.4.
+	if msg.Channel == "web" && msg.ProjectID != "" && msg.ThreadID != "" &&
+		!strings.HasPrefix(msg.ThreadID, "dm:") &&
+		!strings.HasPrefix(msg.ThreadID, "agent:") {
+		p.sink("project."+msg.ProjectID+".chat.message", evt)
+	}
+	// Fan out DM messages to user.<id>.chat.dm for both participants so the
+	// v2 frontend (which subscribes to user.<self>.chat.>) receives real-time
+	// DM updates. The wave-1 user.<id>.message subject above is kept for
+	// backward compat. Wave-2 §4.4.
+	if msg.Channel == "web" && msg.ThreadID != "" && strings.HasPrefix(msg.ThreadID, "dm:") {
+		// Publish to both participants extracted from the DM key.
+		dmParts := strings.Split(msg.ThreadID, ":")
+		if len(dmParts) >= 5 {
+			id1, id2 := dmParts[2], dmParts[4]
+			p.sink("user."+id1+".chat.dm", evt)
+			if id2 != id1 {
+				p.sink("user."+id2+".chat.dm", evt)
+			}
+		}
+	}
+}
+
+// PublishChatTopicEvent publishes a topic lifecycle event on
+// project.<projectID>.chat.topic.
+func (p *eventBuilder) PublishChatTopicEvent(_ context.Context, projectID string, action string, topic WebChatTopic) {
+	if projectID == "" {
+		return
+	}
+	evt := TopicEvent{
+		Action: action,
+		Topic:  topic,
+	}
+	p.sink("project."+projectID+".chat.topic", evt)
 }
 
 // PublishDispatchDone emits a slim completion event when a broker_dispatch row

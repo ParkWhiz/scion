@@ -24,9 +24,14 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/knadh/koanf/providers/confmap"
+	"github.com/knadh/koanf/providers/file"
+	"github.com/knadh/koanf/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
+
+	yamlparser "github.com/knadh/koanf/parsers/yaml"
 )
 
 // --- Struct round-trip tests ---
@@ -1427,6 +1432,168 @@ func TestResolveRuntime_RuntimeNotFound(t *testing.T) {
 	_, _, err := vs.ResolveRuntime("")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "missing-runtime")
+}
+
+// --- CloudRunInstances koanf unmarshal tests ---
+
+func TestCloudRunInstancesConfig_KoanfUnmarshalFromYAML(t *testing.T) {
+	// Verify that the CloudRunInstances nested struct is correctly populated
+	// when loading from a YAML file via koanf. This was the failing path
+	// described in issue #984: the nested struct fields (especially ProjectID)
+	// were silently dropped.
+	tmpDir := t.TempDir()
+	settingsYAML := `
+schema_version: "1"
+active_profile: cr-prod
+runtimes:
+  cr:
+    type: cloudrun-instances
+    cloudrun_instances:
+      project_id: my-gcp-project
+      region: us-central1
+profiles:
+  cr-prod:
+    runtime: cr
+`
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "settings.yaml"), []byte(settingsYAML), 0644))
+
+	k := koanf.New(".")
+	require.NoError(t, k.Load(file.Provider(filepath.Join(tmpDir, "settings.yaml")), yamlparser.Parser()))
+
+	settings := &VersionedSettings{
+		Runtimes: make(map[string]V1RuntimeConfig),
+		Profiles: make(map[string]V1ProfileConfig),
+	}
+	require.NoError(t, k.Unmarshal("", settings))
+
+	rt, ok := settings.Runtimes["cr"]
+	require.True(t, ok, "runtime 'cr' should exist")
+	assert.Equal(t, "cloudrun-instances", rt.Type)
+	require.NotNil(t, rt.CloudRunInstances, "CloudRunInstances should not be nil")
+	assert.Equal(t, "my-gcp-project", rt.CloudRunInstances.ProjectID)
+	assert.Equal(t, "us-central1", rt.CloudRunInstances.Region)
+}
+
+func TestCloudRunInstancesConfig_KoanfUnmarshalFromConfmap(t *testing.T) {
+	// Verify that flat koanf keys (as used by confmap.Provider or env vars)
+	// correctly populate the CloudRunInstances nested struct.
+	k := koanf.New(".")
+	require.NoError(t, k.Load(confmap.Provider(map[string]interface{}{
+		"runtimes.cr.type":                          "cloudrun-instances",
+		"runtimes.cr.cloudrun_instances.project_id": "my-gcp-project",
+		"runtimes.cr.cloudrun_instances.region":     "us-central1",
+		"runtimes.docker.type":                      "docker",
+	}, "."), nil))
+
+	settings := &VersionedSettings{
+		Runtimes: make(map[string]V1RuntimeConfig),
+	}
+	require.NoError(t, k.Unmarshal("", settings))
+
+	rt, ok := settings.Runtimes["cr"]
+	require.True(t, ok, "runtime 'cr' should exist")
+	assert.Equal(t, "cloudrun-instances", rt.Type)
+	require.NotNil(t, rt.CloudRunInstances, "CloudRunInstances should not be nil")
+	assert.Equal(t, "my-gcp-project", rt.CloudRunInstances.ProjectID)
+	assert.Equal(t, "us-central1", rt.CloudRunInstances.Region)
+
+	// Docker runtime should not have CloudRunInstances
+	docker, ok := settings.Runtimes["docker"]
+	require.True(t, ok)
+	assert.Nil(t, docker.CloudRunInstances)
+}
+
+func TestCloudRunInstancesConfig_JSONRoundTrip(t *testing.T) {
+	// Verify that JSON marshal/unmarshal of V1RuntimeConfig preserves
+	// the CloudRunInstances nested struct. This exercises the DB storage
+	// path in operational settings (populateMapSections).
+	original := map[string]V1RuntimeConfig{
+		"cr": {
+			Type: "cloudrun-instances",
+			CloudRunInstances: &V1CloudRunInstancesConfig{
+				ProjectID: "my-gcp-project",
+				Region:    "us-central1",
+			},
+		},
+		"docker": {
+			Type: "docker",
+		},
+	}
+
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+
+	var restored map[string]V1RuntimeConfig
+	require.NoError(t, json.Unmarshal(data, &restored))
+
+	rt := restored["cr"]
+	assert.Equal(t, "cloudrun-instances", rt.Type)
+	require.NotNil(t, rt.CloudRunInstances)
+	assert.Equal(t, "my-gcp-project", rt.CloudRunInstances.ProjectID)
+	assert.Equal(t, "us-central1", rt.CloudRunInstances.Region)
+	assert.Nil(t, rt.CloudRun, "CloudRun should be nil for cloudrun-instances type")
+}
+
+func TestCloudRunInstancesConfig_ResolveRuntime(t *testing.T) {
+	// Verify that ResolveRuntime correctly returns the CloudRunInstances
+	// config when the active profile references a cloudrun-instances runtime.
+	vs := &VersionedSettings{
+		ActiveProfile: "cr-prod",
+		Runtimes: map[string]V1RuntimeConfig{
+			"cr": {
+				Type: "cloudrun-instances",
+				CloudRunInstances: &V1CloudRunInstancesConfig{
+					ProjectID: "my-gcp-project",
+					Region:    "us-central1",
+				},
+			},
+		},
+		Profiles: map[string]V1ProfileConfig{
+			"cr-prod": {Runtime: "cr"},
+		},
+	}
+
+	rtConfig, runtimeType, err := vs.ResolveRuntime("")
+	require.NoError(t, err)
+	assert.Equal(t, "cloudrun-instances", runtimeType)
+	require.NotNil(t, rtConfig.CloudRunInstances)
+	assert.Equal(t, "my-gcp-project", rtConfig.CloudRunInstances.ProjectID)
+	assert.Equal(t, "us-central1", rtConfig.CloudRunInstances.Region)
+}
+
+func TestCloudRunInstancesConfig_CoexistsWithCloudRun(t *testing.T) {
+	// Verify that both CloudRun and CloudRunInstances can be configured
+	// as separate runtime entries without interference.
+	k := koanf.New(".")
+	require.NoError(t, k.Load(confmap.Provider(map[string]interface{}{
+		"runtimes.cr-service.type":                            "cloudrun",
+		"runtimes.cr-service.cloudrun.project":                "service-project",
+		"runtimes.cr-service.cloudrun.region":                 "us-east1",
+		"runtimes.cr-instances.type":                          "cloudrun-instances",
+		"runtimes.cr-instances.cloudrun_instances.project_id": "instances-project",
+		"runtimes.cr-instances.cloudrun_instances.region":     "us-west1",
+	}, "."), nil))
+
+	settings := &VersionedSettings{
+		Runtimes: make(map[string]V1RuntimeConfig),
+	}
+	require.NoError(t, k.Unmarshal("", settings))
+
+	// Check cloudrun service entry
+	svc := settings.Runtimes["cr-service"]
+	assert.Equal(t, "cloudrun", svc.Type)
+	require.NotNil(t, svc.CloudRun)
+	assert.Equal(t, "service-project", svc.CloudRun.Project)
+	assert.Equal(t, "us-east1", svc.CloudRun.Region)
+	assert.Nil(t, svc.CloudRunInstances)
+
+	// Check cloudrun-instances entry
+	inst := settings.Runtimes["cr-instances"]
+	assert.Equal(t, "cloudrun-instances", inst.Type)
+	require.NotNil(t, inst.CloudRunInstances)
+	assert.Equal(t, "instances-project", inst.CloudRunInstances.ProjectID)
+	assert.Equal(t, "us-west1", inst.CloudRunInstances.Region)
+	assert.Nil(t, inst.CloudRun)
 }
 
 // --- Hub helper method tests ---
@@ -4213,6 +4380,235 @@ func TestConvertV1ServerToGlobalConfig_StalledThresholdInvalidIgnored(t *testing
 	gc := ConvertV1ServerToGlobalConfig(v1)
 	// Invalid duration string should be ignored; StalledThreshold stays at zero value.
 	assert.Equal(t, time.Duration(0), gc.Hub.StalledThreshold)
+}
+
+// --- Federation conversion tests ---
+
+func TestConvertV1FederationConfig_RoundTrip(t *testing.T) {
+	enabled := true
+	v1 := &V1ServerConfig{
+		Federation: &V1FederationConfig{
+			Enabled: &enabled,
+			TrustedIssuers: []V1TrustedIssuerConfig{
+				{
+					IssuerURL:        "https://hub-a.example.com",
+					JWKSURL:          "https://hub-a.example.com/.well-known/jwks.json",
+					ExpectedAudience: "https://hub-b.example.com",
+					AllowedProjects:  []string{"proj1", "proj2"},
+					AllowedRootUsers: []string{"user@example.com"},
+					DefaultScopes:    []string{"agent:status:update", "agent:message:send"},
+					IssuerType:       "hub",
+					DefaultRole:      "",
+					AllowedEmails:    nil,
+				},
+				{
+					IssuerURL:        "https://accounts.google.com",
+					JWKSURL:          "",
+					ExpectedAudience: "https://hub-b.example.com",
+					AllowedProjects:  nil,
+					AllowedRootUsers: nil,
+					DefaultScopes:    []string{"agent:status:update"},
+					IssuerType:       "service_account",
+					DefaultRole:      "",
+					AllowedEmails:    []string{"sa@proj.iam.gserviceaccount.com"},
+				},
+			},
+			Algorithms:       []string{"RS256", "ES256"},
+			RefreshInterval:  "1h",
+			DebounceInterval: "5s",
+		},
+	}
+
+	// V1 -> GlobalConfig
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.True(t, gc.Federation.Enabled)
+	require.Len(t, gc.Federation.TrustedIssuers, 2)
+
+	ti0 := gc.Federation.TrustedIssuers[0]
+	assert.Equal(t, "https://hub-a.example.com", ti0.IssuerURL)
+	assert.Equal(t, "https://hub-a.example.com/.well-known/jwks.json", ti0.JWKSURL)
+	assert.Equal(t, "https://hub-b.example.com", ti0.ExpectedAudience)
+	assert.Equal(t, []string{"proj1", "proj2"}, ti0.AllowedProjects)
+	assert.Equal(t, []string{"user@example.com"}, ti0.AllowedRootUsers)
+	assert.Equal(t, []string{"agent:status:update", "agent:message:send"}, ti0.DefaultScopes)
+	assert.Equal(t, "hub", ti0.IssuerType)
+
+	ti1 := gc.Federation.TrustedIssuers[1]
+	assert.Equal(t, "https://accounts.google.com", ti1.IssuerURL)
+	assert.Equal(t, "service_account", ti1.IssuerType)
+	assert.Equal(t, []string{"sa@proj.iam.gserviceaccount.com"}, ti1.AllowedEmails)
+
+	assert.Equal(t, []string{"RS256", "ES256"}, gc.Federation.Algorithms)
+	assert.Equal(t, time.Hour, gc.Federation.Cache.RefreshInterval)
+	assert.Equal(t, 5*time.Second, gc.Federation.Cache.DebounceInterval)
+
+	// GlobalConfig -> V1 (round-trip back)
+	v1Back := ConvertGlobalToV1ServerConfig(gc)
+	require.NotNil(t, v1Back.Federation)
+	assert.Equal(t, &enabled, v1Back.Federation.Enabled)
+	assert.Equal(t, []string{"RS256", "ES256"}, v1Back.Federation.Algorithms)
+	assert.Equal(t, "1h0m0s", v1Back.Federation.RefreshInterval)
+	assert.Equal(t, "5s", v1Back.Federation.DebounceInterval)
+
+	require.Len(t, v1Back.Federation.TrustedIssuers, 2)
+	vi0 := v1Back.Federation.TrustedIssuers[0]
+	assert.Equal(t, "https://hub-a.example.com", vi0.IssuerURL)
+	assert.Equal(t, "https://hub-a.example.com/.well-known/jwks.json", vi0.JWKSURL)
+	assert.Equal(t, "https://hub-b.example.com", vi0.ExpectedAudience)
+	assert.Equal(t, []string{"proj1", "proj2"}, vi0.AllowedProjects)
+	assert.Equal(t, []string{"user@example.com"}, vi0.AllowedRootUsers)
+	assert.Equal(t, []string{"agent:status:update", "agent:message:send"}, vi0.DefaultScopes)
+	assert.Equal(t, "hub", vi0.IssuerType)
+
+	vi1 := v1Back.Federation.TrustedIssuers[1]
+	assert.Equal(t, "https://accounts.google.com", vi1.IssuerURL)
+	assert.Equal(t, "service_account", vi1.IssuerType)
+	assert.Equal(t, []string{"sa@proj.iam.gserviceaccount.com"}, vi1.AllowedEmails)
+}
+
+func TestConvertV1FederationConfig_NilFederation(t *testing.T) {
+	v1 := &V1ServerConfig{}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.False(t, gc.Federation.Enabled)
+	assert.Empty(t, gc.Federation.TrustedIssuers)
+}
+
+func TestConvertGlobalToV1_FederationDisabledNoIssuers(t *testing.T) {
+	gc := DefaultGlobalConfig()
+	gc.Federation.Enabled = false
+	gc.Federation.TrustedIssuers = nil
+	v1 := ConvertGlobalToV1ServerConfig(&gc)
+	// When federation is disabled with no issuers, Federation should be nil in V1
+	assert.Nil(t, v1.Federation)
+}
+
+func TestConvertV1FederationConfig_EnabledNilDereference(t *testing.T) {
+	// Test that nil Enabled is handled safely (defaults to false)
+	v1 := &V1ServerConfig{
+		Federation: &V1FederationConfig{
+			Enabled: nil,
+			TrustedIssuers: []V1TrustedIssuerConfig{
+				{
+					IssuerURL: "https://hub-a.example.com",
+				},
+			},
+		},
+	}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.False(t, gc.Federation.Enabled)
+	require.Len(t, gc.Federation.TrustedIssuers, 1)
+	assert.Equal(t, "https://hub-a.example.com", gc.Federation.TrustedIssuers[0].IssuerURL)
+}
+
+// --- OIDC Login Config Tests ---
+
+func TestConvertV1ServerToGlobalConfig_OIDCLogin(t *testing.T) {
+	enabled := true
+	v1 := &V1ServerConfig{
+		OIDCLogin: &V1OIDCLoginConfig{
+			Enabled:      &enabled,
+			DisplayName:  "Corporate SSO",
+			IssuerURL:    "https://sso.example.com/auth/realms/main",
+			ClientID:     "scion-client",
+			ClientSecret: "secret-value",
+			Scopes:       []string{"openid", "email", "custom-scope"},
+		},
+	}
+
+	gc := ConvertV1ServerToGlobalConfig(v1)
+
+	assert.True(t, gc.OIDCLogin.Enabled)
+	assert.Equal(t, "Corporate SSO", gc.OIDCLogin.DisplayName)
+	assert.Equal(t, "https://sso.example.com/auth/realms/main", gc.OIDCLogin.IssuerURL)
+	assert.Equal(t, "scion-client", gc.OIDCLogin.ClientID)
+	assert.Equal(t, "secret-value", gc.OIDCLogin.ClientSecret)
+	assert.Equal(t, []string{"openid", "email", "custom-scope"}, gc.OIDCLogin.Scopes)
+}
+
+func TestConvertV1ServerToGlobalConfig_OIDCLoginNil(t *testing.T) {
+	v1 := &V1ServerConfig{}
+	gc := ConvertV1ServerToGlobalConfig(v1)
+
+	assert.False(t, gc.OIDCLogin.Enabled)
+	assert.Empty(t, gc.OIDCLogin.DisplayName)
+	assert.Empty(t, gc.OIDCLogin.IssuerURL)
+	assert.Empty(t, gc.OIDCLogin.ClientID)
+	assert.Empty(t, gc.OIDCLogin.ClientSecret)
+	assert.Nil(t, gc.OIDCLogin.Scopes)
+}
+
+func TestConvertV1ServerToGlobalConfig_OIDCLoginDefaultScopes(t *testing.T) {
+	enabled := true
+	v1 := &V1ServerConfig{
+		OIDCLogin: &V1OIDCLoginConfig{
+			Enabled:   &enabled,
+			IssuerURL: "https://sso.example.com",
+			ClientID:  "client-id",
+			// Scopes not set — should remain nil (defaults applied at usage time)
+		},
+	}
+
+	gc := ConvertV1ServerToGlobalConfig(v1)
+	assert.True(t, gc.OIDCLogin.Enabled)
+	assert.Nil(t, gc.OIDCLogin.Scopes)
+}
+
+func TestConvertGlobalToV1ServerConfig_OIDCLogin(t *testing.T) {
+	gc := &GlobalConfig{
+		OIDCLogin: OIDCLoginConfig{
+			Enabled:      true,
+			DisplayName:  "JB Hunt SSO",
+			IssuerURL:    "https://sso.example.com/auth/realms/security360",
+			ClientID:     "scion-test",
+			ClientSecret: "test-secret",
+			Scopes:       []string{"openid", "email"},
+		},
+	}
+
+	v1 := ConvertGlobalToV1ServerConfig(gc)
+
+	require.NotNil(t, v1.OIDCLogin)
+	assert.Equal(t, boolPtr(true), v1.OIDCLogin.Enabled)
+	assert.Equal(t, "JB Hunt SSO", v1.OIDCLogin.DisplayName)
+	assert.Equal(t, "https://sso.example.com/auth/realms/security360", v1.OIDCLogin.IssuerURL)
+	assert.Equal(t, "scion-test", v1.OIDCLogin.ClientID)
+	assert.Equal(t, "test-secret", v1.OIDCLogin.ClientSecret)
+	assert.Equal(t, []string{"openid", "email"}, v1.OIDCLogin.Scopes)
+}
+
+func TestConvertGlobalToV1ServerConfig_OIDCLoginDisabledOmitted(t *testing.T) {
+	gc := &GlobalConfig{
+		OIDCLogin: OIDCLoginConfig{
+			Enabled: false,
+			// IssuerURL is empty too, so it should be omitted
+		},
+	}
+
+	v1 := ConvertGlobalToV1ServerConfig(gc)
+	assert.Nil(t, v1.OIDCLogin)
+}
+
+func TestConvertV1OIDCLoginConfig_RoundTrip(t *testing.T) {
+	original := &GlobalConfig{
+		OIDCLogin: OIDCLoginConfig{
+			Enabled:      true,
+			DisplayName:  "Test SSO",
+			IssuerURL:    "https://idp.example.com",
+			ClientID:     "client-123",
+			ClientSecret: "secret-456",
+			Scopes:       []string{"openid", "email", "profile"},
+		},
+	}
+
+	v1 := ConvertGlobalToV1ServerConfig(original)
+	roundTripped := ConvertV1ServerToGlobalConfig(v1)
+
+	assert.Equal(t, original.OIDCLogin.Enabled, roundTripped.OIDCLogin.Enabled)
+	assert.Equal(t, original.OIDCLogin.DisplayName, roundTripped.OIDCLogin.DisplayName)
+	assert.Equal(t, original.OIDCLogin.IssuerURL, roundTripped.OIDCLogin.IssuerURL)
+	assert.Equal(t, original.OIDCLogin.ClientID, roundTripped.OIDCLogin.ClientID)
+	assert.Equal(t, original.OIDCLogin.ClientSecret, roundTripped.OIDCLogin.ClientSecret)
+	assert.Equal(t, original.OIDCLogin.Scopes, roundTripped.OIDCLogin.Scopes)
 }
 
 // --- Helper ---

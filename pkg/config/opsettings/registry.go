@@ -95,6 +95,7 @@ func init() {
 				"default_max_turns", "default_max_model_calls",
 				"default_max_duration", "default_resources",
 				"default_model", "default_thinking_level",
+				"default_max_agent_role", "default_agent_role",
 			},
 			New: func() any { return &AgentDefaultsSettings{} },
 		},
@@ -118,13 +119,46 @@ func init() {
 			New:        func() any { return &NotificationsSettings{} },
 		},
 		{
-			// project_defaults is durable via DB but has no settings.yaml
-			// representation. It controls hub-level defaults applied at
+			// project_defaults controls hub-level defaults applied at
 			// project creation time (e.g. default scratchpad shared dir).
 			// Absent DB row = compiled defaults (default_scratchpad=true).
-			Name:       "project_defaults",
-			KoanfPaths: nil,
-			New:        func() any { return &ProjectDefaultsSettings{} },
+			Name: "project_defaults",
+			KoanfPaths: []string{
+				"project_defaults.default_scratchpad",
+			},
+			New: func() any { return &ProjectDefaultsSettings{} },
+		},
+		{
+			Name: "federation",
+			KoanfPaths: []string{
+				"server.federation.enabled",
+				"server.federation.trusted_issuers",
+				"server.federation.algorithms",
+				"server.federation.refresh_interval",
+				"server.federation.debounce_interval",
+			},
+			New: func() any { return &FederationSettings{} },
+		},
+		{
+			// runtimes is a map-of-objects section: one hub_settings row stores
+			// the entire map as JSONB. Prefix-only KoanfPath ("runtimes") means
+			// OwningSection walks up from any nested key (e.g. "runtimes.docker.type")
+			// and hits this entry.
+			Name:       "runtimes",
+			KoanfPaths: []string{"runtimes"},
+			New:        func() any { m := make(RuntimesSettings); return &m },
+		},
+		{
+			// profiles is a map-of-objects section, same pattern as runtimes.
+			Name:       "profiles",
+			KoanfPaths: []string{"profiles"},
+			New:        func() any { m := make(ProfilesSettings); return &m },
+		},
+		{
+			// harness_configs is a map-of-objects section, same pattern as runtimes.
+			Name:       "harness_configs",
+			KoanfPaths: []string{"harness_configs"},
+			New:        func() any { m := make(HarnessConfigsSettings); return &m },
 		},
 	}
 
@@ -291,6 +325,8 @@ func compileSchemas() {
 				"default_resources":       getSchemaProperty(root, "default_resources"),
 				"default_model":           map[string]interface{}{"type": "string"},
 				"default_thinking_level":  map[string]interface{}{"type": "integer"},
+				"default_max_agent_role":  getSchemaProperty(root, "default_max_agent_role"),
+				"default_agent_role":      getSchemaProperty(root, "default_agent_role"),
 			},
 			"additionalProperties": false,
 		},
@@ -323,6 +359,101 @@ func compileSchemas() {
 			"type": "object",
 			"properties": map[string]interface{}{
 				"default_scratchpad": map[string]interface{}{"type": "boolean"},
+			},
+			"additionalProperties": false,
+		},
+		// runtimes: map-of-objects — keys are runtime names, values are
+		// runtime config objects. additionalProperties validates each entry.
+		"runtimes": {
+			"type": "object",
+			"additionalProperties": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"type":                map[string]interface{}{"type": "string"},
+					"host":                map[string]interface{}{"type": "string"},
+					"context":             map[string]interface{}{"type": "string"},
+					"namespace":           map[string]interface{}{"type": "string"},
+					"env":                 map[string]interface{}{"type": "object", "additionalProperties": map[string]interface{}{"type": "string"}},
+					"sync":                map[string]interface{}{"type": "string"},
+					"gke":                 map[string]interface{}{"type": "boolean"},
+					"list_all_namespaces": map[string]interface{}{"type": "boolean"},
+					"cloudrun":            map[string]interface{}{"type": "object"},
+				},
+			},
+		},
+		// profiles: map-of-objects — keys are profile names, values are
+		// profile config objects.
+		"profiles": {
+			"type": "object",
+			"additionalProperties": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"runtime":                map[string]interface{}{"type": "string"},
+					"default_template":       map[string]interface{}{"type": "string"},
+					"default_harness_config": map[string]interface{}{"type": "string"},
+					"image_registry":         map[string]interface{}{"type": "string"},
+					"env":                    map[string]interface{}{"type": "object", "additionalProperties": map[string]interface{}{"type": "string"}},
+					"volumes":                map[string]interface{}{"type": "array"},
+					"resources":              map[string]interface{}{"type": "object"},
+					"harness_overrides":      map[string]interface{}{"type": "object"},
+					"secrets":                map[string]interface{}{"type": "array"},
+				},
+			},
+		},
+		// harness_configs: map-of-objects — keys are harness config names,
+		// values are harness config entry objects.
+		"harness_configs": {
+			"type": "object",
+			"additionalProperties": map[string]interface{}{
+				"type":     "object",
+				"required": []string{"harness"},
+				"properties": map[string]interface{}{
+					"name":               map[string]interface{}{"type": "string"},
+					"harness":            map[string]interface{}{"type": "string"},
+					"image":              map[string]interface{}{"type": "string"},
+					"user":               map[string]interface{}{"type": "string"},
+					"model":              map[string]interface{}{"type": "string"},
+					"task_flag":          map[string]interface{}{"type": "string"},
+					"args":               map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+					"env":                map[string]interface{}{"type": "object", "additionalProperties": map[string]interface{}{"type": "string"}},
+					"volumes":            map[string]interface{}{"type": "array"},
+					"auth_selected_type": map[string]interface{}{"type": "string"},
+					"secrets":            map[string]interface{}{"type": "array"},
+					"model_aliases":      map[string]interface{}{"type": "object", "additionalProperties": map[string]interface{}{"type": "string"}},
+				},
+			},
+		},
+		// federation schema is hand-written — federation config has no $defs
+		// in settings-v1.schema.json because it is a new Layer-1 section.
+		"federation": {
+			"type": "object",
+			"properties": map[string]interface{}{
+				"enabled": map[string]interface{}{"type": "boolean"},
+				"trusted_issuers": map[string]interface{}{
+					"type": "array",
+					"items": map[string]interface{}{
+						"type":     "object",
+						"required": []string{"issuer_url"},
+						"properties": map[string]interface{}{
+							"issuer_url":         map[string]interface{}{"type": "string", "minLength": 1},
+							"jwks_url":           map[string]interface{}{"type": "string"},
+							"expected_audience":  map[string]interface{}{"type": "string"},
+							"allowed_projects":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"allowed_root_users": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"default_scopes":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"issuer_type":        map[string]interface{}{"type": "string", "enum": []string{"hub", "service_account", "user"}},
+							"default_role":       map[string]interface{}{"type": "string"},
+							"allowed_emails":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						},
+						"additionalProperties": false,
+					},
+				},
+				"algorithms": map[string]interface{}{
+					"type":  "array",
+					"items": map[string]interface{}{"type": "string", "enum": []string{"RS256", "ES256"}},
+				},
+				"refresh_interval":  map[string]interface{}{"type": "string"},
+				"debounce_interval": map[string]interface{}{"type": "string"},
 			},
 			"additionalProperties": false,
 		},

@@ -24,7 +24,14 @@
 export { ScionApp } from './app-shell.js';
 
 // Shared components
-export { ScionNav, ScionHeader, ScionBreadcrumb, ScionStatusBadge, ScionViewToggle, ScionPreStartHookList } from './shared/index.js';
+export {
+  ScionNav,
+  ScionHeader,
+  ScionBreadcrumb,
+  ScionStatusBadge,
+  ScionViewToggle,
+  ScionPreStartHookList,
+} from './shared/index.js';
 export type { StatusType } from './shared/index.js';
 export type { ViewMode } from './shared/index.js';
 
@@ -43,6 +50,7 @@ export { ScionPageAdminUsers } from './pages/admin-users.js';
 export { ScionPageAdminGroups } from './pages/admin-groups.js';
 export { ScionPageProfileEnvVars } from './pages/profile-env-vars.js';
 export { ScionPageProfileSecrets } from './pages/profile-secrets.js';
+export { ScionPageProfileTeams } from './pages/profile-teams.js';
 export { ScionPageSettings } from './pages/settings.js';
 export { ScionPage404 } from './pages/not-found.js';
 export { ScionLoginPage } from './pages/login.js';

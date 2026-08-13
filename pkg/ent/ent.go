@@ -20,6 +20,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerdispatch"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerjointoken"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokersecret"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
@@ -36,6 +37,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperationrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/message"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/noncecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notificationsubscription"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
@@ -123,6 +125,7 @@ func checkColumn(t, c string) error {
 			brokerdispatch.Table:           brokerdispatch.ValidColumn,
 			brokerjointoken.Table:          brokerjointoken.ValidColumn,
 			brokersecret.Table:             brokersecret.ValidColumn,
+			chatlinkcode.Table:             chatlinkcode.ValidColumn,
 			envvar.Table:                   envvar.ValidColumn,
 			gcpserviceaccount.Table:        gcpserviceaccount.ValidColumn,
 			githubresolutioncache.Table:    githubresolutioncache.ValidColumn,
@@ -139,6 +142,7 @@ func checkColumn(t, c string) error {
 			maintenanceoperation.Table:     maintenanceoperation.ValidColumn,
 			maintenanceoperationrun.Table:  maintenanceoperationrun.ValidColumn,
 			message.Table:                  message.ValidColumn,
+			noncecache.Table:               noncecache.ValidColumn,
 			notification.Table:             notification.ValidColumn,
 			notificationsubscription.Table: notificationsubscription.ValidColumn,
 			policybinding.Table:            policybinding.ValidColumn,

@@ -48,16 +48,10 @@ export class ScionLoginPage extends LitElement {
   returnTo = '/';
 
   /**
-   * Whether Google OAuth is configured (fetched from server)
+   * Available OAuth providers (fetched from server)
    */
   @state()
-  private googleEnabled = false;
-
-  /**
-   * Whether GitHub OAuth is configured (fetched from server)
-   */
-  @state()
-  private githubEnabled = false;
+  private _providers: OAuthProvider[] = [];
 
   /**
    * Whether the server is in proxy auth mode (e.g., behind IAP)
@@ -332,13 +326,36 @@ export class ScionLoginPage extends LitElement {
     try {
       const resp = await fetch('/auth/providers');
       if (resp.ok) {
-        const data = (await resp.json()) as Record<string, unknown>;
-        this.googleEnabled = !!data.google;
-        this.githubEnabled = !!data.github;
+        const data = (await resp.json()) as {
+          providers?: { id: string; name: string; enabled: boolean }[];
+          authMode?: string;
+          google?: boolean;
+          github?: boolean;
+        };
+
+        if (data.providers) {
+          // New-style response with provider list
+          this._providers = data.providers.map((p) => ({
+            id: p.id,
+            name: p.name,
+            icon: p.id,
+            available: p.enabled,
+          }));
+        } else {
+          // Legacy fallback (defensive — should not occur after deploy)
+          this._providers = [];
+          if (data.google) {
+            this._providers.push({ id: 'google', name: 'Google', icon: 'google', available: true });
+          }
+          if (data.github) {
+            this._providers.push({ id: 'github', name: 'GitHub', icon: 'github', available: true });
+          }
+        }
+
         this._proxyMode = data.authMode === 'proxy';
       }
     } catch {
-      // If the fetch fails, leave providers disabled
+      // If the fetch fails, leave providers empty
     } finally {
       this._providersLoading = false;
     }
@@ -387,7 +404,10 @@ export class ScionLoginPage extends LitElement {
             ? html`
                 <div class="no-providers">
                   <p>Authentication is handled by your organization's identity provider.</p>
-                  <p>If you continue to see this page, the authenticating proxy may not be configured correctly.</p>
+                  <p>
+                    If you continue to see this page, the authenticating proxy may not be configured
+                    correctly.
+                  </p>
                 </div>
               `
             : hasProviders
@@ -416,33 +436,16 @@ export class ScionLoginPage extends LitElement {
         'You have been signed out because the server security credentials were updated. Please sign in again.',
       session_error:
         'Your session could not be saved. Please contact an administrator if this persists.',
-      state_mismatch:
-        'Login verification failed. Please try signing in again.',
-      exchange_failed:
-        'Could not complete sign-in with the provider. Please try again.',
-      unauthorized_domain:
-        'Your email domain is not authorized to access this application.',
-      user_create_failed:
-        'Could not create your account. Please contact an administrator.',
+      state_mismatch: 'Login verification failed. Please try signing in again.',
+      exchange_failed: 'Could not complete sign-in with the provider. Please try again.',
+      unauthorized_domain: 'Your email domain is not authorized to access this application.',
+      user_create_failed: 'Could not create your account. Please contact an administrator.',
     };
     return messages[this.error] ?? this.error;
   }
 
   private getProviders(): OAuthProvider[] {
-    return [
-      {
-        id: 'google',
-        name: 'Google',
-        icon: 'google',
-        available: this.googleEnabled,
-      },
-      {
-        id: 'github',
-        name: 'GitHub',
-        icon: 'github',
-        available: this.githubEnabled,
-      },
-    ];
+    return this._providers;
   }
 
   private renderProvider(provider: OAuthProvider) {

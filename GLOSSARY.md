@@ -152,12 +152,12 @@ _Avoid_: environment, runtime config, preset, runtime profile
 _See also_: Runtime Broker, Runtime
 
 **Message Broker**:
-The pluggable system that brokers messages between Scion actors (agents and users) and messaging surfaces — built-in brokers such as the web UI Messages view, and broker plugins to external systems like Telegram, Discord, Slack, and Google Chat. Backs the `scion message` command. Always write in full; "broker" alone is forbidden because it collides with Runtime Broker.
+The pluggable system that brokers messages between Scion actors (agents and users) and messaging surfaces — built-in brokers such as the web UI Messages view, and broker plugins to external systems like Telegram, Discord, Slack, Google Chat, and Microsoft Teams. Backs the `scion message` command. Always write in full; "broker" alone is forbidden because it collides with Runtime Broker.
 _Avoid_: broker, message bus, queue, pub/sub
 _See also_: Broker plugin, Built-in broker, Plugin, Event Bus (distinct), Runtime Broker (distinct, same word)
 
 **Broker plugin**:
-A Message Broker implementation for a specific external messaging system (e.g. Telegram, Google Chat), loaded through the broker plugin interface (`PluginTypeBroker`).
+A Message Broker implementation for a specific external messaging system (e.g. Telegram, Discord, Google Chat, Microsoft Teams), loaded through the broker plugin interface (`PluginTypeBroker`).
 _Avoid_: connector, bridge, adapter
 _See also_: Message Broker, Built-in broker, Plugin
 
@@ -224,6 +224,11 @@ _See also_: A2A Protocol, Hub
 
 ## Users & Access
 
+**Agent Authorization Role**:
+A named authority tier (one of `none`, `readonly`, `baseline`, or `full`) assigned to an agent that governs the API scopes granted in its Hub-issued JWT. Resolves via a two-gate authority lattice matching requested role, user ceiling, and project maximums.
+_Avoid_: raw template scopes, agent scopes
+_See also_: User Access Token (UAT)
+
 **Group**:
 A named collection of Hub users (and nested groups) used by the Hub permissions system to assign access. This is the primary meaning of "group" in Scion.
 _Avoid_: team, org, role
@@ -235,6 +240,10 @@ _Avoid_: personal access token (PAT), API key, secret token
 _See also_: Hub
 
 ## Messaging
+
+**Native Web Chat**:
+The built-in interactive messaging interface in the Web Dashboard (enabled via the `web.native_chat` feature flag) that promotes chat to a top-level fourth ShellType (alongside standalone, profile, and app). It features a dedicated thread rail, unread indicators, three-state visibility filtering (Conversation/Verbose/Full), @-mention autocomplete, and cross-channel reply coherence.
+_Avoid_: chat plugin, external chat, messages tab (only for the old tab)
 
 **Message Group**:
 A set of recipients addressed by a single send, correlated by a shared `group_id`, as opposed to a direct message to one recipient or a broadcast to all agents in a project.

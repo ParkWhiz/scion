@@ -28,6 +28,8 @@ type Tx struct {
 	BrokerJoinToken *BrokerJoinTokenClient
 	// BrokerSecret is the client for interacting with the BrokerSecret builders.
 	BrokerSecret *BrokerSecretClient
+	// ChatLinkCode is the client for interacting with the ChatLinkCode builders.
+	ChatLinkCode *ChatLinkCodeClient
 	// EnvVar is the client for interacting with the EnvVar builders.
 	EnvVar *EnvVarClient
 	// GCPServiceAccount is the client for interacting with the GCPServiceAccount builders.
@@ -60,6 +62,8 @@ type Tx struct {
 	MaintenanceOperationRun *MaintenanceOperationRunClient
 	// Message is the client for interacting with the Message builders.
 	Message *MessageClient
+	// NonceCache is the client for interacting with the NonceCache builders.
+	NonceCache *NonceCacheClient
 	// Notification is the client for interacting with the Notification builders.
 	Notification *NotificationClient
 	// NotificationSubscription is the client for interacting with the NotificationSubscription builders.
@@ -237,6 +241,7 @@ func (tx *Tx) init() {
 	tx.BrokerDispatch = NewBrokerDispatchClient(tx.config)
 	tx.BrokerJoinToken = NewBrokerJoinTokenClient(tx.config)
 	tx.BrokerSecret = NewBrokerSecretClient(tx.config)
+	tx.ChatLinkCode = NewChatLinkCodeClient(tx.config)
 	tx.EnvVar = NewEnvVarClient(tx.config)
 	tx.GCPServiceAccount = NewGCPServiceAccountClient(tx.config)
 	tx.GitHubResolutionCache = NewGitHubResolutionCacheClient(tx.config)
@@ -253,6 +258,7 @@ func (tx *Tx) init() {
 	tx.MaintenanceOperation = NewMaintenanceOperationClient(tx.config)
 	tx.MaintenanceOperationRun = NewMaintenanceOperationRunClient(tx.config)
 	tx.Message = NewMessageClient(tx.config)
+	tx.NonceCache = NewNonceCacheClient(tx.config)
 	tx.Notification = NewNotificationClient(tx.config)
 	tx.NotificationSubscription = NewNotificationSubscriptionClient(tx.config)
 	tx.PolicyBinding = NewPolicyBindingClient(tx.config)

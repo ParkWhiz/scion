@@ -65,6 +65,8 @@ type AgentDefaultsSettings struct {
 	DefaultResources     *api.ResourceSpec `json:"default_resources,omitempty"`
 	DefaultModel         string            `json:"default_model,omitempty"`
 	DefaultThinkingLevel *int              `json:"default_thinking_level,omitempty"`
+	DefaultMaxAgentRole  string            `json:"default_max_agent_role,omitempty"`
+	DefaultAgentRole     string            `json:"default_agent_role,omitempty"`
 }
 
 // EndpointsSettings holds Layer-1 endpoint configuration.
@@ -89,6 +91,15 @@ type NotificationsSettings struct {
 	NotificationChannels []config.V1NotificationChannelConfig `json:"notification_channels,omitempty"`
 }
 
+// FederationSettings is the opsettings section struct for federation config.
+type FederationSettings struct {
+	Enabled          *bool                          `json:"enabled,omitempty"`
+	TrustedIssuers   []config.V1TrustedIssuerConfig `json:"trusted_issuers,omitempty"`
+	Algorithms       []string                       `json:"algorithms,omitempty"`
+	RefreshInterval  string                         `json:"refresh_interval,omitempty"`
+	DebounceInterval string                         `json:"debounce_interval,omitempty"`
+}
+
 // ProjectDefaultsSettings holds Layer-1 project creation defaults.
 type ProjectDefaultsSettings struct {
 	// DefaultScratchpad controls whether new projects automatically get a
@@ -96,3 +107,15 @@ type ProjectDefaultsSettings struct {
 	// the compiled default is true (ON).
 	DefaultScratchpad *bool `json:"default_scratchpad,omitempty"`
 }
+
+// RuntimesSettings holds the Layer-1 runtimes map (map of named runtime configs).
+// The entire map is stored as a single JSONB document in hub_settings.
+type RuntimesSettings = map[string]config.V1RuntimeConfig
+
+// ProfilesSettings holds the Layer-1 profiles map (map of named profile configs).
+// The entire map is stored as a single JSONB document in hub_settings.
+type ProfilesSettings = map[string]config.V1ProfileConfig
+
+// HarnessConfigsSettings holds the Layer-1 harness_configs map.
+// The entire map is stored as a single JSONB document in hub_settings.
+type HarnessConfigsSettings = map[string]config.HarnessConfigEntry

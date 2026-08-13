@@ -18,6 +18,14 @@ The dashboard features an integrated notification framework with real-time SSE d
 - **Notification Tray**: Provides agent-scoped filtering for status events, accessible directly from the top navigation.
 - **Browser Push Notifications**: Opt-in native browser push notifications ensure you receive alerts even when the dashboard is in the background. Default triggers include `stalled` and `error` states, as well as requests for user input.
 
+### Native Web Chat
+When enabled via the `web.native_chat` feature flag, the dashboard includes a top-level **Native Web Chat** workspace (a fourth ShellType in the SPA). It offers a rich interface for direct communication and coordination with your running agents.
+- **Thread Rail & Unread dots**: Access all active agent conversations from a persistent left-hand sidebar, complete with unread dots indicating new activity.
+- **Chat/Log Switcher**: Instantly toggle between standard conversational chat with the agent and a real-time stream of the agent's raw execution logs inside the same view.
+- **@-Mentions & Autocomplete**: Call other agents into the thread by typing `@` to trigger a fuzzy-matching, keyboard-navigable agent dropdown. Protected by code-fence guards to prevent triggering inside Markdown code snippets.
+- **Visibility Density Filters**: Choose from three filter levels—**Conversation** (pure dialogue), **Verbose** (adds mentions/CCs), or **Full** (adds state updates and background processes)—with preferences saved individually per agent.
+- **Coherence Sync**: Real-time sync ensures actions taken on external channels (e.g. Discord or Teams) propagate instantly to the Web UI, with delivery state tooltips indicating whether messages succeeded.
+
 ### Projects
 View and manage your registered projects.
 - **Create/Register Project**: Create a Hub-Managed workspace directly on the Hub, or connect a new remote Git repository. Includes a confirmation dialog when creating a project for an existing git repository.
@@ -33,7 +41,15 @@ View and manage your registered projects.
 
 ### Agents
 Detailed view for individual agents, featuring a high-density tabbed layout and improved breadcrumb navigation with a dedicated back button.
-- **Advanced Agent Creation**: A comprehensive form for Just-In-Time (JIT) configuration, allowing granular control over models, resource limits (`max_turns`, `max_duration`), and harness settings at creation time. It features a native **Runtime Profile Selector** that dynamically populates available profiles based on the selected broker, and **Custom Branch Targeting**, which allows users to direct agents to clone and check out specific git branches immediately upon creation. To keep the primary creation form simpler and cleaner, the **auto-expose ports** checkbox resides exclusively on this configure-only (advanced) form.
+- **Unified Agent Creation**: A unified single-page interface for creating and configuring agents that merges the previous two-phase create/configure flow into a single step (removing the `editingAgentId` round-trip flow).
+  - **Primary Fields**: The default visible section features fields for **Name**, **Project**, **Template**, **Harness** (Type), **Broker**, **Profile** (with a native Runtime Profile Selector that dynamically populates available profiles based on the selected broker), **Task**, and **Notify** settings.
+  - **Collapsible Advanced Settings**: A collapsible advanced configuration area structured into 5 dedicated tabs:
+    - **General**: Advanced execution settings, including the **auto-expose ports** checkbox and **Custom Branch Targeting** (which lets users direct agents to clone and check out specific git branches immediately upon creation).
+    - **Auth & Security**: Late-binding authorization and role selections.
+    - **Environment & Labels**: Key-value pairs for environment variables and metadata labels.
+    - **Limits & Resources**: Granular control over maximum turns (`max_turns`), duration (`max_duration`), and other resource limits.
+    - **Prompts**: Custom prompt overrides and initial system instruction settings.
+- **Agent Identity & Roles**: The agent detail page includes an expanded GCP Identity card that displays the service account email and target Google Cloud project for all identity modes. This card also displays a color-coded role badge representing the agent's active authorization tier (`full`, `baseline`, `readonly`, or `none`).
 - **Quick-Message Button**: Found on agent details, list, and graph cards. Instantly open an interactive modal dialog to chat with an agent (use `Enter` to send, `Shift+Enter` for a newline), gated by your existing message permissions.
 - **Graph Card Terminal Shortcut**: Connect straight to an agent's interactive terminal directly from its card in the graph view via a dedicated, icon-only shortcut button. Gated by attach capability and disabled when the agent is offline.
 - **Status Tab**: Real-time view of agent lifecycle (Starting, Thinking, Waiting, etc.), including the `suspended` and `error` phases. Includes **stalled agent detection** to flag agents that are alive but hung (activity `stalled`) and offline detection for agents whose heartbeat has gone silent (activity `offline`). A crashed agent (non-zero exit) is shown in the `error` phase with a message such as `Agent crashed with exit code N`, and can be restarted from the UI.
