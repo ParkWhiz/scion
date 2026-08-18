@@ -1525,6 +1525,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			notifySubscriberID := ""
 			ancestry := []string{"system:github-webhook"}
 
+			webhookUser := NewAuthenticatedUser(createdBy, "webhook@system.scion", creatorName, "admin", "webhook")
+			r = r.WithContext(contextWithIdentity(r.Context(), webhookUser))
+
 			s.createAgentInProject(w, r, req, proj.ID, createdBy, creatorName, ancestry, notifySubscriberType, notifySubscriberID)
 
 			if w.Code >= 400 {
