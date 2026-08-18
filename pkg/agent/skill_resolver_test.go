@@ -955,6 +955,53 @@ func TestDownloadSkillFile_TokenNotSentToNonGitHubHost(t *testing.T) {
 	}
 }
 
+func TestDownloadSkillFile_UnauthenticatedFallbackOn404(t *testing.T) {
+	isGitHubHostOverride = func(host string) bool { return true }
+	t.Cleanup(func() { isGitHubHostOverride = nil })
+
+	var requestCount int
+	var authHeaders []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		auth := r.Header.Get("Authorization")
+		authHeaders = append(authHeaders, auth)
+		if auth != "" {
+			// Simulate 404 for an unauthorized/scoped token on raw.githubusercontent.com
+			http.NotFound(w, r)
+			return
+		}
+		// Succeeded unauthenticated
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("public skill content"))
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "test.txt")
+	err := downloadSkillFile(context.Background(), srv.URL+"/file", dest, defaultMaxFileSize, "scoped-token")
+	if err != nil {
+		t.Fatalf("expected download to succeed with unauthenticated fallback, got error: %v", err)
+	}
+
+	if requestCount != 2 {
+		t.Fatalf("expected 2 requests (authenticated followed by unauthenticated), got %d", requestCount)
+	}
+	if authHeaders[0] != "Bearer scoped-token" {
+		t.Errorf("first request should carry Bearer token, got %q", authHeaders[0])
+	}
+	if authHeaders[1] != "" {
+		t.Errorf("second request should be unauthenticated, got %q", authHeaders[1])
+	}
+
+	content, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("failed to read downloaded file: %v", err)
+	}
+	if string(content) != "public skill content" {
+		t.Errorf("downloaded content = %q, want %q", string(content), "public skill content")
+	}
+}
+
 func TestGitHubTokenFromContext(t *testing.T) {
 	if got := GitHubTokenFromContext(context.Background()); got != "" {
 		t.Errorf("expected no token on a bare context, got %q", got)

@@ -1684,6 +1684,83 @@ func TestTokenForRef_CLILocalMode(t *testing.T) {
 	}
 }
 
+// TestGitHubSkillResolver_UnauthenticatedFallbackOn404 tests that when a default
+// token (such as a GitHub App installation token from another organization) receives 404
+// from GitHub endpoints, the resolver falls back to unauthenticated requests so that
+// public repositories succeed.
+func TestGitHubSkillResolver_UnauthenticatedFallbackOn404(t *testing.T) {
+	skillContent := "# Public Skill\nPublic content."
+	readmeContent := "# README\nPublic README."
+
+	server, mux := newTestGitHubServer(t)
+
+	// Commits endpoint: return 404 if Authorization is present (simulating scoped token),
+	// but succeed if unauthenticated.
+	mux.HandleFunc("/repos/other-org/public-repo/commits/main", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Accept") != "application/vnd.github.v3.sha" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(testCommitSHA))
+	})
+
+	// Contents endpoint: return 404 if Authorization is present, but succeed unauthenticated.
+	mux.HandleFunc("/repos/other-org/public-repo/contents/skills/public-skill", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]githubContentEntry{
+			{Name: "SKILL.md", Path: "skills/public-skill/SKILL.md", Type: "file", Size: len(skillContent)},
+			{Name: "README.md", Path: "skills/public-skill/README.md", Type: "file", Size: len(readmeContent)},
+		})
+	})
+
+	// Raw content: return 404 if Authorization is present, but succeed unauthenticated.
+	mux.HandleFunc("/raw/other-org/public-repo/"+testCommitSHA+"/skills/public-skill/SKILL.md", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(skillContent))
+	})
+	mux.HandleFunc("/raw/other-org/public-repo/"+testCommitSHA+"/skills/public-skill/README.md", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(readmeContent))
+	})
+
+	resolver := newTestGitHubResolver(server)
+	// Set default token (e.g. from GitHub App)
+	resolver.token = "installation-token-other-org"
+
+	result, err := resolver.Resolve(context.Background(), []api.SkillReference{
+		{URI: "gh://other-org/public-repo/public-skill@main"},
+	}, ResolveOpts{})
+
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if len(result.Errors) != 0 {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+	if len(result.Resolved) != 1 {
+		t.Fatalf("expected 1 resolved skill, got %d", len(result.Resolved))
+	}
+	if result.Resolved[0].Name != "public-skill" {
+		t.Errorf("expected skill name 'public-skill', got %q", result.Resolved[0].Name)
+	}
+	if len(result.Resolved[0].Files) != 2 {
+		t.Errorf("expected 2 files, got %d", len(result.Resolved[0].Files))
+	}
+}
+
 type stubSkillResolver struct {
 	result *ResolveResult
 }

@@ -697,9 +697,14 @@ func validateFilePath(path string) error {
 	return nil
 }
 
+var isGitHubHostOverride func(host string) bool
+
 // isGitHubHost reports whether host belongs to GitHub, and is therefore a
 // permitted recipient of a GitHub token.
 func isGitHubHost(host string) bool {
+	if isGitHubHostOverride != nil {
+		return isGitHubHostOverride(host)
+	}
 	host = strings.ToLower(host)
 	return host == "github.com" ||
 		strings.HasSuffix(host, ".github.com") ||
@@ -753,6 +758,22 @@ func downloadSkillFile(ctx context.Context, fileURL, destPath string, maxSize in
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
+	}
+
+	// If an authenticated request to a GitHub host returned 404, 401, or 403,
+	// the provided token may be a scoped or installation token that lacks access
+	// to this repository, but the repo may be public. Retry without authentication.
+	if ghToken != "" && isGitHubHost(parsed.Hostname()) &&
+		(resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		_ = resp.Body.Close()
+		reqUnauth, errUnauth := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+		if errUnauth == nil {
+			if respUnauth, errDo := client.Do(reqUnauth); errDo == nil {
+				resp = respUnauth
+			} else {
+				return fmt.Errorf("download failed: %w", errDo)
+			}
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 

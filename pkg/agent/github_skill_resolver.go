@@ -383,6 +383,19 @@ func (r *GitHubSkillResolver) resolveCommitSHA(ctx context.Context, ghRef *GitHu
 	if err != nil {
 		return "", fmt.Errorf("GitHub API request failed: %w", err)
 	}
+
+	if token != "" && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		_ = resp.Body.Close()
+		reqUnauth, errUnauth := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if errUnauth == nil {
+			reqUnauth.Header.Set("Accept", "application/vnd.github.v3.sha")
+			if respUnauth, errDo := r.doWithRetry(ctx, reqUnauth); errDo == nil {
+				resp = respUnauth
+			} else {
+				return "", fmt.Errorf("GitHub API request failed: %w", errDo)
+			}
+		}
+	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
@@ -419,6 +432,19 @@ func (r *GitHubSkillResolver) listContents(ctx context.Context, ghRef *GitHubSki
 	if err != nil {
 		return nil, fmt.Errorf("GitHub API request failed: %w", err)
 	}
+
+	if token != "" && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		_ = resp.Body.Close()
+		reqUnauth, errUnauth := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if errUnauth == nil {
+			reqUnauth.Header.Set("Accept", "application/vnd.github.v3+json")
+			if respUnauth, errDo := r.doWithRetry(ctx, reqUnauth); errDo == nil {
+				resp = respUnauth
+			} else {
+				return nil, fmt.Errorf("GitHub API request failed: %w", errDo)
+			}
+		}
+	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
@@ -449,6 +475,18 @@ func (r *GitHubSkillResolver) downloadRawFile(ctx context.Context, ghRef *GitHub
 	resp, err := r.doWithRetry(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("download failed: %w", err)
+	}
+
+	if token != "" && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		_ = resp.Body.Close()
+		reqUnauth, errUnauth := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if errUnauth == nil {
+			if respUnauth, errDo := r.doWithRetry(ctx, reqUnauth); errDo == nil {
+				resp = respUnauth
+			} else {
+				return nil, fmt.Errorf("download failed: %w", errDo)
+			}
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
