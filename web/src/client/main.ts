@@ -28,7 +28,10 @@ import type { PageData, User } from '../shared/types.js';
 import { stateManager } from './state.js';
 import { debugLog } from './debug-log.js';
 import { setDocumentTitle } from './page-title.js';
-import { isFeatureEnabled } from '../utils/feature-flags.js';
+import { CHAT_DM_ROUTE, CHAT_SPACE_ROUTE, CHAT_THREAD_ROUTE } from './chat-routes.js';
+import { chatNotifications } from './chat-notifications.js';
+import { chatUnread } from './chat-unread.js';
+import { isFeatureEnabled, setFeatureFlag } from '../utils/feature-flags.js';
 
 /**
  * Strip the Vite base path prefix from a URL pathname so the client-side
@@ -94,6 +97,7 @@ import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
 import '@shoelace-style/shoelace/dist/components/alert/alert.js';
 import '@shoelace-style/shoelace/dist/components/radio-group/radio-group.js';
 import '@shoelace-style/shoelace/dist/components/radio-button/radio-button.js';
+import '@shoelace-style/shoelace/dist/components/radio/radio.js';
 import '@shoelace-style/shoelace/dist/components/range/range.js';
 import '@shoelace-style/shoelace/dist/components/switch/switch.js';
 import '@shoelace-style/shoelace/dist/components/details/details.js';
@@ -139,6 +143,29 @@ async function fetchCurrentUser(): Promise<User | null> {
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Apply server-published public settings to the client feature-flag layer.
+ *
+ * The hub owns the native chat toggle (server.native_chat.enabled); when it is
+ * off the chat API endpoints are not even registered, so the UI must not offer
+ * chat. Resolving this before the first render keeps the /chat route gate in
+ * renderRoute() honest. Failures leave the compiled defaults in place — a
+ * transient settings fetch error should not hide a working feature.
+ */
+async function applyServerFeatureFlags(): Promise<void> {
+  try {
+    const res = await fetch('/api/v1/settings/public', { credentials: 'include' });
+    if (!res.ok) return;
+    const settings = (await res.json()) as { nativeChatEnabled?: boolean };
+    if (settings.nativeChatEnabled === false) {
+      setFeatureFlag('web.native_chat', false);
+      setFeatureFlag('web.native_chat_v2', false);
+    }
+  } catch {
+    // Public settings unavailable — keep the compiled defaults.
   }
 }
 
@@ -438,21 +465,27 @@ const ROUTES: RouteConfig[] = [
   },
   // Wave-2 v2 chat routes: space, thread, and DM navigation
   {
-    pattern: /^\/chat\/space\/[^/]+\/thread\/[^/]+$/,
+    pattern: CHAT_THREAD_ROUTE,
     tag: 'scion-page-chat',
     load: () => import('../components/pages/chat.js'),
   },
   {
-    pattern: /^\/chat\/space\/[^/]+$/,
+    pattern: CHAT_SPACE_ROUTE,
     tag: 'scion-page-chat',
     load: () => import('../components/pages/chat.js'),
   },
   {
-    pattern: /^\/chat\/dm\/[^/]+$/,
+    pattern: CHAT_DM_ROUTE,
     tag: 'scion-page-chat',
     load: () => import('../components/pages/chat.js'),
   },
-  // Wave-1 agent-based route (preserved for v1 flag compat)
+  // Readable deep-link: /chat/<project-slug>/<thread-id>
+  {
+    pattern: /^\/chat\/[^/]+\/[^/]+$/,
+    tag: 'scion-page-chat',
+    load: () => import('../components/pages/chat.js'),
+  },
+  // Wave-1 agent-based route OR project-slug space link (resolved in chat.ts)
   {
     pattern: /^\/chat\/[^/]+$/,
     tag: 'scion-page-chat',
@@ -554,9 +587,22 @@ async function init(): Promise<void> {
   // Attach debug logger to state manager to capture all SSE events
   debugLog.attach(stateManager);
 
+  // Start the feature-flag fetch now so it overlaps the auth and component
+  // work below; it is awaited before the first render, which needs the flags.
+  const featureFlagsReady = applyServerFeatureFlags();
+
   // Fetch current user from session if not provided by SSR
   if (!currentUser) {
     currentUser = await fetchCurrentUser();
+  }
+
+  // Chat notifications are published on user.<id>.notification, so the state
+  // manager must know who we are before it opens the first SSE connection.
+  if (currentUser?.id) {
+    stateManager.setCurrentUserId(currentUser.id);
+    // Mention/DM popups are driven off those events. Started here rather than
+    // from the chat page because a mention has to reach you on any page.
+    chatNotifications.start(currentUser.id);
   }
 
   // Wait for core shell components to be defined (page components are lazy-loaded)
@@ -588,7 +634,20 @@ async function init(): Promise<void> {
     }
   }
 
-  // Render the initial page based on current URL (strip proxy prefix for route matching)
+  // Render the initial page based on current URL (strip proxy prefix for route
+  // matching). Feature flags must be settled first — renderRoute gates /chat on
+  // them, and rendering early would flash a page the server has disabled.
+  await featureFlagsReady;
+
+  // The tab-title unread badge is unread state, not notification state: it
+  // runs for every signed-in user regardless of the push preference, and on
+  // every page, because an unread mention is worth seeing from the dashboard.
+  // After the flags settle — with chat disabled the endpoints it reads are
+  // not even registered.
+  if (currentUser && isFeatureEnabled('web.native_chat')) {
+    chatUnread.start();
+  }
+
   await renderRoute(stripBasePath(window.location.pathname));
 
   // Setup client-side router for navigation

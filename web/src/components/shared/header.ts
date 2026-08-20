@@ -24,11 +24,48 @@ import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import type { User } from '../../shared/types.js';
+import { isFeatureEnabled } from '../../utils/feature-flags.js';
+import { apiFetch } from '../../client/api.js';
 import './notification-tray.js';
 import './inbox-tray.js';
 
+// ---------------------------------------------------------------------------
+// Project-context helpers for the dashboard ↔ chat mode switch.
+//
+// These are pure functions exported for testing — they map URL paths to
+// the project identifier that should carry across the view toggle.
+// ---------------------------------------------------------------------------
+
+/** Extract a project ID from a dashboard-style path (`/projects/:id/…`). */
+export function projectIdFromDashboardPath(path: string): string | null {
+  const m = path.match(/^\/projects\/([^/?#]+)/);
+  // `/projects/new` is the creation form, not a project-scoped page.
+  return m && m[1] !== 'new' ? m[1] : null;
+}
+
+/** Extract a project ID from a legacy chat space path (`/chat/space/:id/…`). */
+export function projectIdFromChatSpacePath(path: string): string | null {
+  const m = path.match(/^\/chat\/space\/([^/?#]+)/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Extract a project slug from a readable chat path (`/chat/:slug` or
+ * `/chat/:slug/:threadId`). Returns null for space, dm, and bare `/chat`
+ * paths — those are handled by dedicated helpers or have no project context.
+ */
+export function slugFromChatPath(path: string): string | null {
+  if (/^\/chat\/space\//.test(path)) return null;
+  if (/^\/chat\/dm\//.test(path)) return null;
+  const m = path.match(/^\/chat\/([^/?#]+)/);
+  return m ? m[1] : null;
+}
+
 /** URL for the Scion documentation site, opened by the Help button. */
 const DOCS_URL = 'https://googlecloudplatform.github.io/scion/overview/';
+
+/** Feature flag gating the chat mode (and therefore the mode switch). */
+const NATIVE_CHAT_FLAG = 'web.native_chat';
 
 @customElement('scion-header')
 export class ScionHeader extends LitElement {
@@ -103,6 +140,28 @@ export class ScionHeader extends LitElement {
       margin: 0;
     }
 
+    /*
+     * On the chat view the logo stands in for the page title, so it is sized
+     * to sit inline within the 60px header rather than as a sidebar block.
+     */
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .logo-icon {
+      font-size: 1.5rem;
+      line-height: 1;
+    }
+
+    .logo-text h1 {
+      margin: 0;
+      font-size: 1.125rem;
+      font-weight: 700;
+      color: var(--scion-text, #1e293b);
+    }
+
     .header-right {
       display: flex;
       align-items: center;
@@ -113,6 +172,27 @@ export class ScionHeader extends LitElement {
       display: flex;
       align-items: center;
       gap: 0.5rem;
+    }
+
+    /* Chat ↔ dashboard mode switch */
+    .mode-switch {
+      display: flex;
+      align-items: center;
+      gap: 0.125rem;
+      padding: 0.125rem;
+      border: 1px solid var(--scion-border, #e2e8f0);
+      border-radius: 0.5rem;
+    }
+
+    .mode-switch sl-icon-button::part(base) {
+      padding: 0.25rem 0.5rem;
+      color: var(--scion-text-muted, #64748b);
+    }
+
+    .mode-switch sl-icon-button.active::part(base) {
+      background: var(--scion-primary, #3b82f6);
+      color: white;
+      border-radius: 0.375rem;
     }
 
     @media (max-width: 640px) {
@@ -264,10 +344,20 @@ export class ScionHeader extends LitElement {
               </button>
             `
           : ''}
-        <h1 class="page-title">${this.pageTitle}</h1>
+        ${this.isChatView()
+          ? html`
+              <div class="logo">
+                <div class="logo-icon">🌱</div>
+                <div class="logo-text">
+                  <h1>Scion Chat</h1>
+                </div>
+              </div>
+            `
+          : html`<h1 class="page-title">${this.pageTitle}</h1>`}
       </div>
 
       <div class="header-right">
+        ${this.renderModeSwitch()}
         <div class="header-actions">
           <scion-inbox-tray .user=${this.user}></scion-inbox-tray>
           <scion-notification-tray .user=${this.user}></scion-notification-tray>
@@ -296,6 +386,122 @@ export class ScionHeader extends LitElement {
         <div class="user-section">${this.renderUserSection()}</div>
       </div>
     `;
+  }
+
+  /**
+   * Whether the header is rendering above the chat view. The chat view has no
+   * sidebar of its own, so the header carries the Scion logo there in place of
+   * the page title.
+   */
+  private isChatView(): boolean {
+    const path = this.currentPath || window.location.pathname;
+    return path.startsWith('/chat');
+  }
+
+  /**
+   * Toggle between the dashboard and chat views. Chat is a peer view of the
+   * dashboard, so the switch lives in the header rather than in either
+   * sidebar — it is the one control present in both shells.
+   */
+  private renderModeSwitch() {
+    if (!isFeatureEnabled(NATIVE_CHAT_FLAG)) return '';
+
+    const isChat = this.isChatView();
+
+    return html`
+      <div class="mode-switch" role="group" aria-label="Switch view">
+        <sl-tooltip content="Dashboard">
+          <sl-icon-button
+            name="house"
+            label="Dashboard"
+            class=${isChat ? '' : 'active'}
+            @click=${() => { this.handleModeSwitch('/'); }}
+          ></sl-icon-button>
+        </sl-tooltip>
+        <sl-tooltip content="Chat">
+          <sl-icon-button
+            name="chat-dots"
+            label="Chat"
+            class=${isChat ? 'active' : ''}
+            @click=${() => { this.handleModeSwitch('/chat'); }}
+          ></sl-icon-button>
+        </sl-tooltip>
+      </div>
+    `;
+  }
+
+  /**
+   * Navigate to the given mode, preserving project context when possible.
+   *
+   * Dashboard → Chat:  /projects/:id/… → /chat/space/:id
+   * Chat → Dashboard:  /chat/space/:id/… → /projects/:id
+   *                     /chat/:slug/…     → (resolve slug) → /projects/:id
+   *                     /chat/dm/…        → / (no project context)
+   *
+   * Uses the same nav-click event as the sidebar so the router handles it
+   * identically in both the app and chat shells.
+   */
+  private async handleModeSwitch(targetBase: string): Promise<void> {
+    const currentPath = this.currentPath || window.location.pathname;
+    let target: string;
+
+    if (targetBase === '/chat') {
+      // Dashboard → Chat: carry the project ID into a space URL.
+      const projectId = projectIdFromDashboardPath(currentPath);
+      target = projectId
+        ? `/chat/space/${encodeURIComponent(projectId)}`
+        : '/chat';
+    } else {
+      // Chat → Dashboard: resolve project ID from the chat URL.
+      const projectId = projectIdFromChatSpacePath(currentPath);
+      if (projectId) {
+        target = `/projects/${encodeURIComponent(projectId)}`;
+      } else {
+        const slug = slugFromChatPath(currentPath);
+        if (slug) {
+          const resolvedId = await this.resolveProjectIdBySlug(slug);
+          target = resolvedId
+            ? `/projects/${encodeURIComponent(resolvedId)}`
+            : '/';
+        } else {
+          target = '/';
+        }
+      }
+    }
+
+    // Guard: component may have disconnected during async slug resolution.
+    if (!this.isConnected) return;
+
+    this.dispatchEvent(
+      new CustomEvent('nav-click', {
+        detail: { path: target },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
+
+  /**
+   * Look up a project by slug via the projects API, returning the project ID
+   * or an empty string when the slug cannot be resolved.
+   */
+  private async resolveProjectIdBySlug(slug: string): Promise<string> {
+    try {
+      const res = await apiFetch(
+        `/api/v1/projects?slug=${encodeURIComponent(slug)}&limit=1`
+      );
+      if (res.ok) {
+        const data = (await res.json()) as {
+          items?: Array<{ id: string; slug: string }>;
+        };
+        if (data.items && data.items.length > 0) {
+          return data.items[0].id;
+        }
+      }
+    } catch {
+      // Slug resolution is best-effort; fall back to the top-level view.
+    }
+    return '';
   }
 
   private renderUserSection() {

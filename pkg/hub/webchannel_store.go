@@ -181,6 +181,29 @@ type WebChatStore interface {
 
 	// LinkAttachmentToMessage associates an attachment with a message.
 	LinkAttachmentToMessage(ctx context.Context, messageID, attachmentID string) error
+
+	// --- Phase-3 Message extension methods ---
+
+	// SetMessageReplyTo records that messageID is a reply to replyToID.
+	SetMessageReplyTo(ctx context.Context, messageID, replyToID string) error
+
+	// GetMessageExt returns the extension row for a single message.
+	// Returns nil if no row exists.
+	GetMessageExt(ctx context.Context, messageID string) (*WebChatMessageExt, error)
+
+	// GetMessageExts returns extension rows for multiple messages in a
+	// single query, keyed by message ID. Missing rows are omitted.
+	GetMessageExts(ctx context.Context, messageIDs []string) (map[string]*WebChatMessageExt, error)
+
+	// SetMessageEdited marks a message as edited at the given time.
+	SetMessageEdited(ctx context.Context, messageID string, editedAt time.Time) error
+
+	// SetMessageDeleted marks a message as soft-deleted at the given time.
+	SetMessageDeleted(ctx context.Context, messageID string, deletedAt time.Time) error
+
+	// UpdateMessageContent updates the content of a message in the Ent
+	// messages table. This is used for edit operations.
+	UpdateMessageContent(ctx context.Context, messageID, content string) error
 }
 
 // ThreadPrefs holds per-thread display preferences from webchat_thread_prefs.
@@ -195,6 +218,19 @@ type WebChatThread struct {
 	LastMessageID  string
 	LastActivityAt time.Time
 	LastReadAt     *time.Time // nil if never read
+}
+
+// ---------------------------------------------------------------------------
+// Phase-3 types (new table: webchat_message_ext)
+// ---------------------------------------------------------------------------
+
+// WebChatMessageExt holds per-message extension data stored outside the Ent
+// messages table. Used for reply-to, edit, and soft-delete metadata.
+type WebChatMessageExt struct {
+	MessageID string     `json:"messageId"`
+	ReplyToID string     `json:"replyToId,omitempty"`
+	EditedAt  *time.Time `json:"editedAt,omitempty"`
+	DeletedAt *time.Time `json:"deletedAt,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -237,11 +273,14 @@ type WebChatReadState struct {
 }
 
 // WebChatUserPrefs holds per-user rail preferences.
+// The json tags mirror the field names PUT /api/v1/chat/user-prefs accepts, so
+// a client can read back what it wrote instead of translating between a
+// camelCase request and a PascalCase response.
 type WebChatUserPrefs struct {
-	UserID         string
-	SpaceSortMode  string // "activity", "alpha", "custom"
-	SpaceOrder     string // JSON array of project UUIDs
-	ThreadSortMode string // "activity", "alpha"
+	UserID         string `json:"userId"`
+	SpaceSortMode  string `json:"spaceSortMode"`  // "activity", "alpha", "custom"
+	SpaceOrder     string `json:"spaceOrder"`     // JSON array of project UUIDs
+	ThreadSortMode string `json:"threadSortMode"` // "activity", "alpha"
 }
 
 // WebChatDM represents one side of a DM conversation.
@@ -410,6 +449,14 @@ CREATE TABLE IF NOT EXISTS webchat_message_attachment (
 
 CREATE INDEX IF NOT EXISTS idx_webchat_message_attachment_message
     ON webchat_message_attachment (message_id);
+
+-- Phase-3: message extension data (reply-to, edit, delete)
+CREATE TABLE IF NOT EXISTS webchat_message_ext (
+    message_id TEXT PRIMARY KEY,
+    reply_to_id TEXT,
+    edited_at TEXT,
+    deleted_at TEXT
+);
 `
 	_, err := s.db.Exec(ddl)
 	if err != nil {
@@ -989,6 +1036,11 @@ DO UPDATE SET
 // ---------------------------------------------------------------------------
 
 // UpsertDM upserts a participant row for a DM conversation.
+//
+// An empty LastMessageID means "unknown", not "clear it": registration
+// callers (ensureDMRegistered) never carry a message ID, and overwriting the
+// stored watermark with NULL would break the unread indicator, which compares
+// last_message_id against the reader's watermark.
 func (s *sqliteWebChatStore) UpsertDM(ctx context.Context, dm WebChatDM) error {
 	const query = `
 INSERT INTO webchat_dm (conversation_key, participant_id, peer_id, peer_kind, last_message_id, last_activity_at)
@@ -997,8 +1049,8 @@ ON CONFLICT (participant_id, conversation_key)
 DO UPDATE SET
     peer_id = excluded.peer_id,
     peer_kind = excluded.peer_kind,
-    last_message_id = excluded.last_message_id,
-    last_activity_at = excluded.last_activity_at
+    last_message_id = COALESCE(excluded.last_message_id, webchat_dm.last_message_id),
+    last_activity_at = COALESCE(excluded.last_activity_at, webchat_dm.last_activity_at)
 `
 	activityAt := ""
 	if !dm.LastActivityAt.IsZero() {
@@ -1553,6 +1605,134 @@ func generateSnippet(content, query string, contextLen int) string {
 	}
 
 	return sb.String()
+}
+
+// ---------------------------------------------------------------------------
+// Phase-3: message extension methods (SQLite)
+// ---------------------------------------------------------------------------
+
+// SetMessageReplyTo upserts the reply_to_id for a message.
+func (s *sqliteWebChatStore) SetMessageReplyTo(ctx context.Context, messageID, replyToID string) error {
+	const query = `
+INSERT INTO webchat_message_ext (message_id, reply_to_id)
+VALUES (?, ?)
+ON CONFLICT (message_id)
+DO UPDATE SET reply_to_id = excluded.reply_to_id
+`
+	_, err := s.db.ExecContext(ctx, query, messageID, replyToID)
+	if err != nil {
+		return fmt.Errorf("webchat store: set message reply_to: %w", err)
+	}
+	return nil
+}
+
+// GetMessageExt returns the extension row for a single message.
+func (s *sqliteWebChatStore) GetMessageExt(ctx context.Context, messageID string) (*WebChatMessageExt, error) {
+	const query = `SELECT message_id, reply_to_id, edited_at, deleted_at FROM webchat_message_ext WHERE message_id = ?`
+	var ext WebChatMessageExt
+	var replyToID, editedAt, deletedAt sql.NullString
+	err := s.db.QueryRowContext(ctx, query, messageID).Scan(&ext.MessageID, &replyToID, &editedAt, &deletedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("webchat store: get message ext: %w", err)
+	}
+	ext.ReplyToID = replyToID.String
+	if editedAt.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, editedAt.String)
+		ext.EditedAt = &t
+	}
+	if deletedAt.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, deletedAt.String)
+		ext.DeletedAt = &t
+	}
+	return &ext, nil
+}
+
+// GetMessageExts returns extension rows for multiple messages in a single query.
+func (s *sqliteWebChatStore) GetMessageExts(ctx context.Context, messageIDs []string) (map[string]*WebChatMessageExt, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(messageIDs))
+	args := make([]interface{}, len(messageIDs))
+	for i, id := range messageIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := `SELECT message_id, reply_to_id, edited_at, deleted_at FROM webchat_message_ext WHERE message_id IN (` + strings.Join(placeholders, ",") + `)`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("webchat store: get message exts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	result := make(map[string]*WebChatMessageExt, len(messageIDs))
+	for rows.Next() {
+		var ext WebChatMessageExt
+		var replyToID, editedAt, deletedAt sql.NullString
+		if err := rows.Scan(&ext.MessageID, &replyToID, &editedAt, &deletedAt); err != nil {
+			return nil, fmt.Errorf("webchat store: scan message ext: %w", err)
+		}
+		ext.ReplyToID = replyToID.String
+		if editedAt.Valid {
+			t, _ := time.Parse(time.RFC3339Nano, editedAt.String)
+			ext.EditedAt = &t
+		}
+		if deletedAt.Valid {
+			t, _ := time.Parse(time.RFC3339Nano, deletedAt.String)
+			ext.DeletedAt = &t
+		}
+		result[ext.MessageID] = &ext
+	}
+	return result, rows.Err()
+}
+
+// SetMessageEdited marks a message as edited at the given time.
+func (s *sqliteWebChatStore) SetMessageEdited(ctx context.Context, messageID string, editedAt time.Time) error {
+	const query = `
+INSERT INTO webchat_message_ext (message_id, edited_at)
+VALUES (?, ?)
+ON CONFLICT (message_id)
+DO UPDATE SET edited_at = excluded.edited_at
+`
+	_, err := s.db.ExecContext(ctx, query, messageID, editedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("webchat store: set message edited: %w", err)
+	}
+	return nil
+}
+
+// SetMessageDeleted marks a message as soft-deleted at the given time.
+func (s *sqliteWebChatStore) SetMessageDeleted(ctx context.Context, messageID string, deletedAt time.Time) error {
+	const query = `
+INSERT INTO webchat_message_ext (message_id, deleted_at)
+VALUES (?, ?)
+ON CONFLICT (message_id)
+DO UPDATE SET deleted_at = excluded.deleted_at
+`
+	_, err := s.db.ExecContext(ctx, query, messageID, deletedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("webchat store: set message deleted: %w", err)
+	}
+	return nil
+}
+
+// UpdateMessageContent updates the content (msg column) of a message in the
+// Ent messages table using raw SQL. This bypasses the Ent ORM intentionally
+// because the webchat layer must not import the ent package.
+func (s *sqliteWebChatStore) UpdateMessageContent(ctx context.Context, messageID, content string) error {
+	const query = `UPDATE messages SET msg = ? WHERE id = ?`
+	res, err := s.db.ExecContext(ctx, query, content, messageID)
+	if err != nil {
+		return fmt.Errorf("webchat store: update message content: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("webchat store: message %s not found", messageID)
+	}
+	return nil
 }
 
 // truncateSnippet truncates content to maxLen runes for display.

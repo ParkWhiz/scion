@@ -35,6 +35,7 @@ const hostedUserGuide = {
 		{ label: 'Scheduling & Events', slug: 'hosted/user/scheduling' },
 		{ label: 'External Channels', slug: 'hosted/user/external-channels' },
 		{ label: 'A2A Protocol Bridge', slug: 'hosted/user/a2a-bridge' },
+		{ label: 'AWS Federation', slug: 'hosted/user/aws-federation' },
 	],
 };
 
@@ -96,6 +97,7 @@ export default defineConfig({
 							label: 'Release Notes',
 							items: [
 								{ label: 'Overview', slug: 'release-notes' },
+								{ label: 'Aug 10 -- 16', slug: 'release-notes/2026-08-10' },
 								{ label: 'Aug 3 -- 9', slug: 'release-notes/2026-08-03' },
 								{ label: 'Jul 27 -- Aug 2', slug: 'release-notes/2026-07-27' },
 								{ label: 'Jul 19 -- 25', slug: 'release-notes/2026-07-19' },
@@ -168,6 +170,7 @@ export default defineConfig({
 							items: [
 								{ label: 'HA Overview', slug: 'hosted/ha/overview' },
 								{ label: 'Deploy on GCP (Cloud Run + GKE)', slug: 'hosted/ha/setup-gcp' },
+								{ label: 'Deploy via Helm (GKE)', slug: 'hosted/ha/helm' },
 								{ label: 'Kubernetes Runtime', slug: 'hosted/ha/kubernetes' },
 								{ label: 'Runtime Brokers & Profiles', slug: 'hosted/ha/runtime-broker' },
 								{ label: 'Managed Agents', slug: 'hosted/single-node/managed-agents' },

@@ -130,6 +130,7 @@ Sends a message to a running agent's harness by enqueuing it into its input stre
     - `--raw`: Send literal bytes via tmux send-keys with no trailing Enter (supports control keys like arrows and Escape). Cannot be combined with `--attach`.
     - `--channel <channel>`: Target a specific message channel (e.g., `telegram`, `gchat`, `teams`, `web`).
     - `--thread-id <id>`: Target a specific thread ID within the channel.
+    - `--cc <agents>`: Carbon copy additional agents. This flag is **repeatable** and also accepts a **comma-separated list** of agent names (e.g., `--cc dev-agent,qa-agent --cc test-agent`). Strict empty-value validation is enforced.
 
 ### `scion messages` (aliases: `msgs`, `inbox`)
 
@@ -382,12 +383,17 @@ Manages connection to and interaction with a Scion Hub. Authentication lives und
     - `login`: Authenticate with Hub server (opens a browser; supports `--no-browser` for device flow and `--provider github`).
     - `logout`: Clear stored credentials.
 - `scion hub token`: Manage user access tokens (scoped, revocable bearer tokens for CI/CD and automation).
-    - `create`: Create a new token. Flags: `--project`, `--name`, `--scopes`, `--expires`.
+    - `create`: Create a new token.
+        - Flags:
+            - `--project <string>`: Project ID or name to scope the token to (required).
+            - `--name <string>`: Token name/label (required).
+            - `--scopes <scopes>`: Scopes to grant (required). This flag is **repeatable** and also accepts a **comma-separated list** of scopes (e.g., `--scopes agent:read,agent:create --scopes agent:start`). Strict empty-value validation is enforced.
+            - `--expires <duration>`: Expiry duration (e.g., 30d, 90d, 1y, default: 90d).
     - `list`: List your access tokens.
     - `revoke <token-id>`: Revoke a token (remains visible in listings as revoked).
     - `delete <token-id>`: Permanently delete a token.
 - `scion hub status`: Show the current Hub connection status.
-- `scion hub notifications`: Retrieve a list of recent system notifications and agent alerts.
+- `scion hub notifications`: **Deprecated**. This command has been moved to the top-level `scion notifications` command group.
 - `scion hub link`: Link the current local project to the Hub.
 - `scion hub unlink`: Unlink the current project from the Hub locally.
 - `scion hub projects`: List all projects registered on the Hub.
@@ -412,6 +418,29 @@ Manages connection to and interaction with a Scion Hub. Authentication lives und
     - `activate <id-or-slug>`: Mark an archived hook as active (archives any currently active hub-scoped hook).
     - `delete <id-or-slug>` (alias `rm`, `remove`): Delete an archived hook. Active hooks cannot be deleted.
 
+## Notification Management
+
+### `scion notifications`
+
+Manages notifications and notification subscriptions. Requires Hub mode.
+
+- `scion notifications`: List your recent unacknowledged notifications.
+    - Flags: `--all` (include acknowledged notifications), `--json` (format output as JSON).
+- `scion notifications ack [id]`: Acknowledge one or all notifications.
+    - Flags: `--all` (acknowledge all unacknowledged notifications).
+- `scion notifications subscribe`: Subscribe to notifications for a specific agent or all agents in a project.
+    - Flags:
+        - `--agent <name-or-id>`: Subscribe to specific agent.
+        - `--project <name>`: Specify project (inferred from context if omitted).
+        - `--triggers <triggers>`: Trigger activities to subscribe to. This flag is **repeatable** and also accepts a **comma-separated list** of triggers (e.g., `--triggers COMPLETED,WAITING_FOR_INPUT --triggers LIMITS_EXCEEDED`). Default: `COMPLETED,WAITING_FOR_INPUT,LIMITS_EXCEEDED`. Strict empty-value validation is enforced.
+- `scion notifications unsubscribe <id>`: Remove a subscription.
+    - Flags: `--all` (remove all subscriptions in the project), `--project <name>`.
+- `scion notifications update <id>`: Update a subscription's trigger activities.
+    - Flags:
+        - `--triggers <triggers>`: Trigger activities to update (required). This flag is **repeatable** and also accepts a **comma-separated list** of triggers (e.g., `--triggers COMPLETED,WAITING_FOR_INPUT --triggers LIMITS_EXCEEDED`). Strict empty-value validation is enforced.
+- `scion notifications subscriptions`: List your active notification subscriptions.
+    - Flags: `--project <name>` (filter by project), `--json` (format output as JSON).
+
 ## Infrastructure
 
 ### `scion broker`
@@ -431,7 +460,13 @@ Manages the local host as a Runtime Broker.
 Manages Scion server components (Hub and Broker).
 
 - `scion server start`: Start one or more server components.
-    - Flags: `--enable-hub`, `--enable-runtime-broker`, `--port`, `--db`, `--dev-auth`.
+    - Flags:
+        - `--enable-hub`: Enable the Hub server component.
+        - `--enable-runtime-broker`: Enable the Runtime Broker component.
+        - `--port <int>`: Port to listen on.
+        - `--db <string>`: Database driver/connection.
+        - `--dev-auth`: Enable dev-auth authentication.
+        - `--admin-emails <emails>`: Email addresses to auto-promote to the administrator role. This flag is **repeatable** and also accepts a **comma-separated list** (e.g. `--admin-emails admin1@example.com,admin2@example.com --admin-emails admin3@example.com`). Strict empty-value validation is enforced.
 
 ## Miscellaneous
 

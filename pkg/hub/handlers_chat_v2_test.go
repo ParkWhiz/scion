@@ -20,7 +20,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +54,32 @@ func TestIsDMParticipant(t *testing.T) {
 	for _, tt := range tests {
 		if got := isDMParticipant(tt.key, tt.userID); got != tt.want {
 			t.Errorf("isDMParticipant(%q, %q) = %v, want %v", tt.key, tt.userID, got, tt.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// dmUserParticipants tests
+// ---------------------------------------------------------------------------
+
+// Typing events for human-to-human DMs have no project to publish on, so they
+// fan out to each user participant's own subject. The agent side of an agent DM
+// has no user subject and must be skipped.
+func TestDMUserParticipants(t *testing.T) {
+	tests := []struct {
+		key  string
+		want []string
+	}{
+		{"dm:user:u1:user:u2", []string{"u1", "u2"}},
+		{"dm:agent:a1:user:u1", []string{"u1"}},
+		{"dm:user:u1:user:u1", []string{"u1"}},
+		{"dm:user:u1", nil},
+		{"topic-uuid", nil},
+	}
+	for _, tt := range tests {
+		got := dmUserParticipants(tt.key)
+		if !slices.Equal(got, tt.want) {
+			t.Errorf("dmUserParticipants(%q) = %v, want %v", tt.key, got, tt.want)
 		}
 	}
 }
@@ -992,6 +1022,98 @@ func TestChatV2_Members(t *testing.T) {
 	}
 }
 
+// The members sidebar tooltip shows the agent's status detail and the time of
+// its last state change, so both have to survive the trip through this
+// endpoint — the heartbeat in lastSeen is not a substitute for either.
+func TestChatV2_Members_AgentDetailAndActivityTime(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	proj := &store.Project{ID: tid("members-detail"), Name: "members-detail", Slug: "members-detail", Created: time.Now(), Updated: time.Now()}
+	if err := s.CreateProject(ctx, proj); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	activityAt := time.Now().Add(-30 * time.Minute).UTC().Truncate(time.Second)
+	agent := &store.Agent{
+		ID:                tid("members-detail-agent"),
+		ProjectID:         proj.ID,
+		Name:              "Helper Bot",
+		Slug:              "helper-bot",
+		Phase:             "running",
+		Activity:          "blocked",
+		Message:           "Waiting for user decision on c34",
+		LastSeen:          time.Now().UTC(),
+		LastActivityEvent: activityAt,
+		OwnerID:           DevUserID,
+		CreatedBy:         DevUserID,
+	}
+	if err := s.CreateAgent(ctx, agent); err != nil {
+		t.Fatalf("CreateAgent: %v", err)
+	}
+
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/chat/spaces/"+proj.ID+"/members", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatMembersResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(resp.Agents))
+	}
+	got := resp.Agents[0]
+	if got.Message != "Waiting for user decision on c34" {
+		t.Errorf("message = %q, want the agent's status detail", got.Message)
+	}
+	if want := activityAt.Format(time.RFC3339); got.LastActivityEvent != want {
+		t.Errorf("lastActivityEvent = %q, want %q", got.LastActivityEvent, want)
+	}
+}
+
+// An agent that has never reported an activity event still needs an updated
+// time, otherwise the tooltip loses its second line entirely.
+func TestChatV2_Members_LastActivityEventFallsBackToUpdated(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	proj := &store.Project{ID: tid("members-fallback"), Name: "members-fallback", Slug: "members-fallback", Created: time.Now(), Updated: time.Now()}
+	if err := s.CreateProject(ctx, proj); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	agent := &store.Agent{
+		ID:        tid("members-fallback-agent"),
+		ProjectID: proj.ID,
+		Name:      "Fresh Bot",
+		Slug:      "fresh-bot",
+		Phase:     "created",
+		OwnerID:   DevUserID,
+		CreatedBy: DevUserID,
+	}
+	if err := s.CreateAgent(ctx, agent); err != nil {
+		t.Fatalf("CreateAgent: %v", err)
+	}
+
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/chat/spaces/"+proj.ID+"/members", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatMembersResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(resp.Agents))
+	}
+	if resp.Agents[0].LastActivityEvent == "" {
+		t.Error("lastActivityEvent should fall back to the agent's updated time")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // DM key validation tests
 // ---------------------------------------------------------------------------
@@ -1169,9 +1291,9 @@ func TestChatV2_Send_Mention_AgentReceives(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// With a resolved mention, message should be type "instruction" (agent-routed).
-	if resp.Type != messages.TypeInstruction {
-		t.Errorf("expected type %q (mention-routed), got %q", messages.TypeInstruction, resp.Type)
+	// With a resolved @mention, message should be type "mention" (not "instruction").
+	if resp.Type != messages.TypeMention {
+		t.Errorf("expected type %q (mention-routed), got %q", messages.TypeMention, resp.Type)
 	}
 	// Mentions should be populated.
 	if len(resp.Mentions) == 0 {
@@ -1409,9 +1531,9 @@ func TestChatV2_Send_AgentDM_MentionTakesPrecedence(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// Should be type:instruction (agent-routed via mention).
-	if resp.Type != messages.TypeInstruction {
-		t.Errorf("mention-takes-precedence: expected type %q, got %q", messages.TypeInstruction, resp.Type)
+	// Should be type:mention (agent-routed via @mention).
+	if resp.Type != messages.TypeMention {
+		t.Errorf("mention-takes-precedence: expected type %q, got %q", messages.TypeMention, resp.Type)
 	}
 	// Mentions should include the mentioned agent.
 	if len(resp.Mentions) == 0 {
@@ -1873,5 +1995,815 @@ func TestChatSearch_MethodNotAllowed(t *testing.T) {
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/chat/search?q=hello", nil)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405 for POST, got %d", rec.Code)
+	}
+}
+
+// R17: GET .../read reports the DM peer's watermark so the sender can render
+// the "Seen" receipt on load rather than waiting for the next SSE event.
+func TestChatV2_ConversationReadState_ReportsPeerWatermark(t *testing.T) {
+	srv, _ := testServer(t)
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	wcs := NewWebChatStore(db, "sqlite3")
+	if err := wcs.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	srv.SetWebChatStore(wcs)
+
+	peerID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	key := "dm:user:" + peerID + ":user:" + DevUserID
+
+	if err := wcs.SetReadState(ctx, peerID, key, "msg-9"); err != nil {
+		t.Fatalf("SetReadState(peer): %v", err)
+	}
+	if err := wcs.SetReadState(ctx, DevUserID, key, "msg-11"); err != nil {
+		t.Fatalf("SetReadState(self): %v", err)
+	}
+
+	rec := doRequest(t, srv, http.MethodGet,
+		"/api/v1/chat/conversations/"+url.PathEscape(key)+"/read", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatReadStateResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.PeerLastReadMessageID != "msg-9" {
+		t.Errorf("expected peerLastReadMessageId msg-9, got %q", resp.PeerLastReadMessageID)
+	}
+	if resp.LastReadMessageID != "msg-11" {
+		t.Errorf("expected lastReadMessageId msg-11, got %q", resp.LastReadMessageID)
+	}
+	if resp.PeerLastReadAt == "" {
+		t.Error("expected peerLastReadAt to be populated")
+	}
+}
+
+// A topic has no "peer" watermark to report — only the caller's own.
+func TestChatV2_ConversationReadState_TopicHasNoPeer(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	proj := &store.Project{ID: tid("read-state"), Name: "read-state", Slug: "read-state", Created: time.Now(), Updated: time.Now()}
+	if err := s.CreateProject(ctx, proj); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	wcs := NewWebChatStore(db, "sqlite3")
+	if err := wcs.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	srv.SetWebChatStore(wcs)
+
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID:        "topic-read-state",
+		ProjectID: proj.ID,
+		Name:      "readable",
+		CreatedBy: "dev",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+	if err := wcs.SetReadState(ctx, DevUserID, "topic-read-state", "msg-3"); err != nil {
+		t.Fatalf("SetReadState: %v", err)
+	}
+
+	rec := doRequest(t, srv, http.MethodGet,
+		"/api/v1/chat/conversations/topic-read-state/read", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatReadStateResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.LastReadMessageID != "msg-3" {
+		t.Errorf("expected lastReadMessageId msg-3, got %q", resp.LastReadMessageID)
+	}
+	if resp.PeerLastReadMessageID != "" {
+		t.Errorf("topic should have no peer watermark, got %q", resp.PeerLastReadMessageID)
+	}
+}
+
+// R17: a deleted agent must not linger as a thread's default — new messages
+// would be routed at an agent that no longer exists.
+func TestChatV2_ClearTopicDefaultAgent(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	proj := &store.Project{ID: tid("clear-default"), Name: "clear-default", Slug: "clear-default", Created: time.Now(), Updated: time.Now()}
+	if err := s.CreateProject(ctx, proj); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	wcs := NewWebChatStore(db, "sqlite3")
+	if err := wcs.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	srv.SetWebChatStore(wcs)
+
+	agentID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	topics := []struct {
+		id           string
+		defaultAgent string
+	}{
+		{"topic-by-slug", "coder"},
+		{"topic-by-id", agentID},
+		{"topic-other", "reviewer"},
+	}
+	for _, tc := range topics {
+		if err := wcs.CreateTopic(ctx, WebChatTopic{
+			ID:           tc.id,
+			ProjectID:    proj.ID,
+			Name:         tc.id,
+			DefaultAgent: tc.defaultAgent,
+			CreatedBy:    "dev",
+			CreatedAt:    time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("CreateTopic(%s): %v", tc.id, err)
+		}
+	}
+
+	srv.ClearTopicDefaultAgent(ctx, agentID, "coder", proj.ID)
+
+	for _, id := range []string{"topic-by-slug", "topic-by-id"} {
+		got, err := wcs.GetTopic(ctx, id)
+		if err != nil || got == nil {
+			t.Fatalf("GetTopic(%s): %v", id, err)
+		}
+		if got.DefaultAgent != "" {
+			t.Errorf("%s: expected default agent cleared, got %q", id, got.DefaultAgent)
+		}
+	}
+
+	other, err := wcs.GetTopic(ctx, "topic-other")
+	if err != nil || other == nil {
+		t.Fatalf("GetTopic(topic-other): %v", err)
+	}
+	if other.DefaultAgent != "reviewer" {
+		t.Errorf("unrelated topic default changed: got %q", other.DefaultAgent)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// History pagination (#1027)
+// ---------------------------------------------------------------------------
+
+// seedHistoryMessages inserts n web-channel messages into the given thread,
+// one second apart so the keyset ordering (created DESC, id DESC) is stable.
+// It returns the message contents in chronological order (oldest first).
+func seedHistoryMessages(t *testing.T, s store.Store, projectID, threadID string, n int) []string {
+	t.Helper()
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Duration(n) * time.Second)
+	contents := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		content := fmt.Sprintf("message-%03d", i)
+		msg := &store.Message{
+			ID:        tid(threadID + "-msg-" + content),
+			ProjectID: projectID,
+			Sender:    "user:dev",
+			SenderID:  DevUserID,
+			Recipient: "thread:" + threadID,
+			Msg:       content,
+			Type:      messages.TypeChat,
+			Channel:   "web",
+			ThreadID:  threadID,
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
+		}
+		if err := s.CreateMessage(ctx, msg); err != nil {
+			t.Fatalf("CreateMessage(%s): %v", content, err)
+		}
+		contents = append(contents, content)
+	}
+	return contents
+}
+
+// The client sends the pagination cursor as ?cursor= (chat-thread.ts
+// fetchHistoryV2). When the handler read a different parameter the cursor was
+// silently dropped and every page returned the same newest window, so
+// scrollback never advanced past the first page (#1027). Paginating twice is
+// the only way to catch that: a single-page assertion passes either way.
+func TestChatV2_History_CursorPaginatesToOlderMessages(t *testing.T) {
+	srv, s, wcs, proj := setupSendTest(t)
+	ctx := context.Background()
+
+	topicID := tid("topic-history-paginate")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID:        topicID,
+		ProjectID: proj.ID,
+		Name:      "history-paginate",
+		CreatedBy: "dev",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// More than one default page (50) so a second page must exist.
+	const total = 120
+	seedHistoryMessages(t, s, proj.ID, topicID, total)
+
+	fetch := func(cursor string) chatHistoryResponse {
+		t.Helper()
+		path := "/api/v1/chat/conversations/" + topicID + "/messages?limit=50"
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		rec := doRequest(t, srv, http.MethodGet, path, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s: expected 200, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+		var resp chatHistoryResponse
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp
+	}
+
+	first := fetch("")
+	if len(first.Messages) != 50 {
+		t.Fatalf("first page: got %d messages, want 50", len(first.Messages))
+	}
+	if first.NextCursor == "" {
+		t.Fatalf("first page: expected a nextCursor with %d messages seeded", total)
+	}
+	// Newest first: the last seeded message heads the first page.
+	if got, want := first.Messages[0].Msg, fmt.Sprintf("message-%03d", total-1); got != want {
+		t.Errorf("first page head = %q, want %q", got, want)
+	}
+
+	second := fetch(first.NextCursor)
+	if len(second.Messages) != 50 {
+		t.Fatalf("second page: got %d messages, want 50", len(second.Messages))
+	}
+
+	// The second page must be disjoint from the first...
+	firstIDs := make(map[string]bool, len(first.Messages))
+	for _, m := range first.Messages {
+		firstIDs[m.ID] = true
+	}
+	for _, m := range second.Messages {
+		if firstIDs[m.ID] {
+			t.Fatalf("second page repeats message %q from the first page — cursor was ignored", m.Msg)
+		}
+	}
+
+	// ...and strictly older than it.
+	oldestOnFirst := first.Messages[len(first.Messages)-1].CreatedAt
+	newestOnSecond := second.Messages[0].CreatedAt
+	if !newestOnSecond.Before(oldestOnFirst) {
+		t.Errorf("second page is not older: newest=%s, oldest on first page=%s", newestOnSecond, oldestOnFirst)
+	}
+	if got, want := second.Messages[0].Msg, fmt.Sprintf("message-%03d", total-51); got != want {
+		t.Errorf("second page head = %q, want %q", got, want)
+	}
+
+	// A third page walks the tail: 120 seeded, 100 consumed, 20 left.
+	third := fetch(second.NextCursor)
+	if len(third.Messages) != 20 {
+		t.Fatalf("third page: got %d messages, want 20", len(third.Messages))
+	}
+	if got, want := third.Messages[len(third.Messages)-1].Msg, "message-000"; got != want {
+		t.Errorf("third page tail = %q, want %q (oldest message unreachable)", got, want)
+	}
+	if third.NextCursor != "" {
+		t.Errorf("third page: expected no nextCursor, got %q", third.NextCursor)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase-3: Edit/Delete endpoint tests
+// ---------------------------------------------------------------------------
+
+// setupEditDeleteTest creates a project, topic, webchat store, and a user
+// message for edit/delete testing. It wires the webchat store to the same
+// underlying database as the ent store so that UpdateMessageContent (raw SQL)
+// can see messages created through the ent store — matching production wiring.
+// Returns the server, store, webchat store, topic ID, message ID, and project ID.
+func setupEditDeleteTest(t *testing.T) (*Server, store.Store, WebChatStore, string, string, string) {
+	t.Helper()
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	proj := &store.Project{ID: tid("send-test"), Name: "send-test", Slug: "send-test", Created: time.Now(), Updated: time.Now()}
+	if err := s.CreateProject(ctx, proj); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	// Use the ent store's underlying DB so UpdateMessageContent can reach
+	// messages created via s.CreateMessage — same wiring as production.
+	dbProvider, ok := s.(interface{ DB() *sql.DB })
+	if !ok {
+		t.Fatal("store does not expose DB()")
+	}
+	rawDB := dbProvider.DB()
+	if rawDB == nil {
+		t.Fatal("store DB() returned nil")
+	}
+	wcs := NewWebChatStore(rawDB, "sqlite3")
+	if err := wcs.Init(); err != nil {
+		t.Fatalf("Init webchat store: %v", err)
+	}
+	srv.SetWebChatStore(wcs)
+
+	topicID := tid("topic-editdel")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID:        topicID,
+		ProjectID: proj.ID,
+		Name:      "edit-delete-test",
+		CreatedBy: "dev",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// Create a message owned by the dev user.
+	now := time.Now().UTC()
+	msgID := tid("msg-editdel")
+	storeMsg := &store.Message{
+		ID:        msgID,
+		ProjectID: proj.ID,
+		Sender:    "user:dev@localhost",
+		SenderID:  DevUserID,
+		Recipient: "thread:" + topicID,
+		Msg:       "original content",
+		Type:      "chat",
+		Channel:   "web",
+		ThreadID:  topicID,
+		CreatedAt: now,
+	}
+	if err := s.CreateMessage(ctx, storeMsg); err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+
+	return srv, s, wcs, topicID, msgID, proj.ID
+}
+
+func TestChatV2_Edit_HappyPath(t *testing.T) {
+	srv, s, wcs, topicID, msgID, _ := setupEditDeleteTest(t)
+	ctx := context.Background()
+
+	body := map[string]string{"content": "updated content"}
+	rec := doRequest(t, srv, http.MethodPut,
+		"/api/v1/chat/conversations/"+topicID+"/messages/"+msgID, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["messageId"] != msgID {
+		t.Errorf("messageId = %v, want %v", resp["messageId"], msgID)
+	}
+	if resp["content"] != "updated content" {
+		t.Errorf("content = %v, want %q", resp["content"], "updated content")
+	}
+	if resp["editedAt"] == nil {
+		t.Error("editedAt should be set")
+	}
+
+	// Verify the message content was actually updated in the store.
+	msg, err := s.GetMessage(ctx, msgID)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if msg.Msg != "updated content" {
+		t.Errorf("persisted content = %q, want %q", msg.Msg, "updated content")
+	}
+
+	// Verify edited_at was recorded in extensions.
+	exts, err := wcs.GetMessageExts(ctx, []string{msgID})
+	if err != nil {
+		t.Fatalf("GetMessageExts: %v", err)
+	}
+	ext, ok := exts[msgID]
+	if !ok {
+		t.Fatal("expected extension for message")
+	}
+	if ext.EditedAt == nil {
+		t.Error("expected editedAt to be set in extensions")
+	}
+}
+
+func TestChatV2_Edit_NonOwner_Forbidden(t *testing.T) {
+	srv, s, _, topicID, _, projID := setupEditDeleteTest(t)
+	ctx := context.Background()
+
+	// Create a message from a different user.
+	otherUserID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	otherMsgID := tid("msg-other-edit")
+	otherMsg := &store.Message{
+		ID:        otherMsgID,
+		ProjectID: projID,
+		Sender:    "user:other@localhost",
+		SenderID:  otherUserID,
+		Recipient: "thread:" + topicID,
+		Msg:       "other user message",
+		Type:      "chat",
+		Channel:   "web",
+		ThreadID:  topicID,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.CreateMessage(ctx, otherMsg); err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+
+	// DevUser tries to edit another user's message — should get 403.
+	body := map[string]string{"content": "hacked content"}
+	rec := doRequest(t, srv, http.MethodPut,
+		"/api/v1/chat/conversations/"+topicID+"/messages/"+otherMsgID, body)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-owner edit, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatV2_Edit_AgentReplied_Conflict(t *testing.T) {
+	srv, s, _, topicID, msgID, projID := setupEditDeleteTest(t)
+	ctx := context.Background()
+
+	// Create an agent reply after the user's message.
+	agentMsgID := tid("msg-agent-reply")
+	agentMsg := &store.Message{
+		ID:        agentMsgID,
+		ProjectID: projID,
+		Sender:    "agent:helper-bot",
+		SenderID:  tid("agent-helper"),
+		Recipient: "user:dev@localhost",
+		Msg:       "I can help with that",
+		Type:      "assistant-reply",
+		Channel:   "web",
+		ThreadID:  topicID,
+		CreatedAt: time.Now().UTC().Add(1 * time.Second),
+	}
+	if err := s.CreateMessage(ctx, agentMsg); err != nil {
+		t.Fatalf("CreateMessage (agent reply): %v", err)
+	}
+
+	// Attempt to edit — should get 409 because an agent has replied.
+	body := map[string]string{"content": "too late to edit"}
+	rec := doRequest(t, srv, http.MethodPut,
+		"/api/v1/chat/conversations/"+topicID+"/messages/"+msgID, body)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("expected 409 when agent has replied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatV2_Edit_ConversationKeyMismatch(t *testing.T) {
+	srv, _, _, _, msgID, _ := setupEditDeleteTest(t)
+
+	// Try to edit the message using a wrong conversation key.
+	body := map[string]string{"content": "wrong conversation"}
+	rec := doRequest(t, srv, http.MethodPut,
+		"/api/v1/chat/conversations/wrong-topic-id/messages/"+msgID, body)
+	// Should be rejected — message does not belong to this conversation.
+	if rec.Code != http.StatusBadRequest && rec.Code != http.StatusNotFound {
+		t.Errorf("expected 400 or 404 for conversation key mismatch, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatV2_Delete_HappyPath(t *testing.T) {
+	srv, _, wcs, topicID, msgID, _ := setupEditDeleteTest(t)
+	ctx := context.Background()
+
+	rec := doRequest(t, srv, http.MethodDelete,
+		"/api/v1/chat/conversations/"+topicID+"/messages/"+msgID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["messageId"] != msgID {
+		t.Errorf("messageId = %v, want %v", resp["messageId"], msgID)
+	}
+	if resp["deletedAt"] == nil {
+		t.Error("deletedAt should be set")
+	}
+
+	// Verify the extension has deletedAt set.
+	exts, err := wcs.GetMessageExts(ctx, []string{msgID})
+	if err != nil {
+		t.Fatalf("GetMessageExts: %v", err)
+	}
+	ext, ok := exts[msgID]
+	if !ok {
+		t.Fatal("expected extension for message")
+	}
+	if ext.DeletedAt == nil {
+		t.Error("expected deletedAt to be set in extensions")
+	}
+}
+
+func TestChatV2_Delete_NonOwner_Forbidden(t *testing.T) {
+	srv, s, _, topicID, _, projID := setupEditDeleteTest(t)
+	ctx := context.Background()
+
+	// Create a message from a different user.
+	otherUserID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	otherMsgID := tid("msg-other-del")
+	otherMsg := &store.Message{
+		ID:        otherMsgID,
+		ProjectID: projID,
+		Sender:    "user:other@localhost",
+		SenderID:  otherUserID,
+		Recipient: "thread:" + topicID,
+		Msg:       "other user message",
+		Type:      "chat",
+		Channel:   "web",
+		ThreadID:  topicID,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.CreateMessage(ctx, otherMsg); err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+
+	// DevUser tries to delete another user's message — should get 403.
+	rec := doRequest(t, srv, http.MethodDelete,
+		"/api/v1/chat/conversations/"+topicID+"/messages/"+otherMsgID, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-owner delete, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatV2_Delete_AgentReplied_Conflict(t *testing.T) {
+	srv, s, _, topicID, msgID, projID := setupEditDeleteTest(t)
+	ctx := context.Background()
+
+	// Create an agent reply after the user's message.
+	agentMsgID := tid("msg-agent-reply-del")
+	agentMsg := &store.Message{
+		ID:        agentMsgID,
+		ProjectID: projID,
+		Sender:    "agent:helper-bot",
+		SenderID:  tid("agent-helper-del"),
+		Recipient: "user:dev@localhost",
+		Msg:       "I responded already",
+		Type:      "assistant-reply",
+		Channel:   "web",
+		ThreadID:  topicID,
+		CreatedAt: time.Now().UTC().Add(1 * time.Second),
+	}
+	if err := s.CreateMessage(ctx, agentMsg); err != nil {
+		t.Fatalf("CreateMessage (agent reply): %v", err)
+	}
+
+	// Attempt to delete — should get 409.
+	rec := doRequest(t, srv, http.MethodDelete,
+		"/api/v1/chat/conversations/"+topicID+"/messages/"+msgID, nil)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("expected 409 when agent has replied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatV2_Delete_ContentBlankedInHistory(t *testing.T) {
+	srv, _, wcs, topicID, msgID, _ := setupEditDeleteTest(t)
+	ctx := context.Background()
+
+	// Soft-delete the message.
+	now := time.Now().UTC()
+	if err := wcs.SetMessageDeleted(ctx, msgID, now); err != nil {
+		t.Fatalf("SetMessageDeleted: %v", err)
+	}
+
+	// Fetch history.
+	rec := doRequest(t, srv, http.MethodGet,
+		"/api/v1/chat/conversations/"+topicID+"/messages", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatHistoryResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Find the deleted message in the response.
+	var found bool
+	for _, m := range resp.Messages {
+		if m.ID == msgID {
+			found = true
+			if m.Msg != "" {
+				t.Errorf("deleted message content should be blank, got %q", m.Msg)
+			}
+		}
+	}
+	if !found {
+		t.Error("deleted message not found in history response")
+	}
+
+	// Verify the extension has deletedAt.
+	if ext, ok := resp.MessageExtensions[msgID]; !ok || ext.DeletedAt == nil {
+		t.Error("expected deletedAt in message extensions for deleted message")
+	}
+}
+
+// A human sender that floods a thread is cut off with a retryable 429 rather
+// than being allowed to fill the conversation, and the cut-off lifts as soon
+// as tokens refill (#1054).
+func TestChatV2_Send_RateLimitsFloodingHuman(t *testing.T) {
+	srv, _, wcs, proj := setupSendTest(t)
+	ctx := context.Background()
+
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID:        tid("topic-ratelimit"),
+		ProjectID: proj.ID,
+		Name:      "flooded",
+		CreatedBy: "dev",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	// Production limits, test clock: the real 30/min ceiling without a real
+	// minute of waiting.
+	clock := newTestClock()
+	srv.chatSendLimiter = newChatSendLimiterWithClock(clock.Now)
+
+	path := "/api/v1/chat/conversations/" + tid("topic-ratelimit") + "/messages"
+	for i := range chatSendHumanRatePerMinute {
+		rec := doRequest(t, srv, http.MethodPost, path, map[string]string{"content": "flood"})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("send %d: expected 201, got %d: %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, path, map[string]string{"content": "one too many"})
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("send %d: expected 429, got %d: %s",
+			chatSendHumanRatePerMinute+1, rec.Code, rec.Body.String())
+	}
+	retryAfter := rec.Header().Get("Retry-After")
+	if retryAfter == "" {
+		t.Error("a rate-limited send must say when to retry (Retry-After header missing)")
+	} else if secs, err := strconv.Atoi(retryAfter); err != nil || secs < 1 {
+		t.Errorf("Retry-After = %q, want a positive number of seconds", retryAfter)
+	}
+	if !strings.Contains(rec.Body.String(), ErrCodeRateLimited) {
+		t.Errorf("expected a %q error code in the body, got %s", ErrCodeRateLimited, rec.Body.String())
+	}
+	// The delay belongs in the body as well as the header: no current client
+	// reads Retry-After, so the message text is the signal that gets seen.
+	if want := "retry in " + retryAfter + "s"; !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("expected the body to carry the retry delay %q, got %s", want, rec.Body.String())
+	}
+
+	// The refusal is transient: at 30/min a token accrues every 2 seconds.
+	clock.Advance(2 * time.Second)
+	rec = doRequest(t, srv, http.MethodPost, path, map[string]string{"content": "after backoff"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected the send to succeed after backing off, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1055: Idempotency key on send
+// ---------------------------------------------------------------------------
+
+func TestChatV2_Send_IdempotencyKey_DeduplicatesSend(t *testing.T) {
+	srv, _, wcs, proj := setupSendTest(t)
+	ctx := context.Background()
+
+	// Create a topic.
+	topicID := tid("topic-idem-1")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID:        topicID,
+		ProjectID: proj.ID,
+		Name:      "idempotency-test",
+		CreatedBy: "dev",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	path := "/api/v1/chat/conversations/" + topicID + "/messages"
+	idemKey := "test-idempotency-key-123"
+
+	// First send — should create the message (201).
+	body1 := map[string]string{"content": "idempotent message", "idempotency_key": idemKey}
+	rec1 := doRequest(t, srv, http.MethodPost, path, body1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("first send: expected 201, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	var resp1 chatMessageResponse
+	if err := json.NewDecoder(rec1.Body).Decode(&resp1); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if resp1.ID == "" {
+		t.Fatal("first send: expected non-empty message ID")
+	}
+
+	// Second send with the same idempotency key — should return 200 with the same ID.
+	body2 := map[string]string{"content": "idempotent message", "idempotency_key": idemKey}
+	rec2 := doRequest(t, srv, http.MethodPost, path, body2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second send: expected 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+
+	var resp2 chatMessageResponse
+	if err := json.NewDecoder(rec2.Body).Decode(&resp2); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if resp2.ID != resp1.ID {
+		t.Errorf("expected same message ID %q on duplicate, got %q", resp1.ID, resp2.ID)
+	}
+}
+
+func TestChatV2_Send_DifferentIdempotencyKeys_CreateSeparateMessages(t *testing.T) {
+	srv, _, wcs, proj := setupSendTest(t)
+	ctx := context.Background()
+
+	topicID := tid("topic-idem-2")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID:        topicID,
+		ProjectID: proj.ID,
+		Name:      "idempotency-diff",
+		CreatedBy: "dev",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	path := "/api/v1/chat/conversations/" + topicID + "/messages"
+
+	// Two sends with different keys should create two distinct messages.
+	body1 := map[string]string{"content": "first message", "idempotency_key": "key-a"}
+	rec1 := doRequest(t, srv, http.MethodPost, path, body1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("first send: expected 201, got %d", rec1.Code)
+	}
+	var resp1 chatMessageResponse
+	_ = json.NewDecoder(rec1.Body).Decode(&resp1)
+
+	body2 := map[string]string{"content": "second message", "idempotency_key": "key-b"}
+	rec2 := doRequest(t, srv, http.MethodPost, path, body2)
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("second send: expected 201, got %d", rec2.Code)
+	}
+	var resp2 chatMessageResponse
+	_ = json.NewDecoder(rec2.Body).Decode(&resp2)
+
+	if resp1.ID == resp2.ID {
+		t.Errorf("different idempotency keys should produce different message IDs, both got %q", resp1.ID)
+	}
+}
+
+func TestChatV2_Send_NoIdempotencyKey_AlwaysCreates(t *testing.T) {
+	srv, _, wcs, proj := setupSendTest(t)
+	ctx := context.Background()
+
+	topicID := tid("topic-idem-3")
+	if err := wcs.CreateTopic(ctx, WebChatTopic{
+		ID:        topicID,
+		ProjectID: proj.ID,
+		Name:      "no-idem-key",
+		CreatedBy: "dev",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
+	}
+
+	path := "/api/v1/chat/conversations/" + topicID + "/messages"
+
+	// Without an idempotency key, each send creates a new message.
+	body := map[string]string{"content": "same content, no key"}
+	rec1 := doRequest(t, srv, http.MethodPost, path, body)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("first send: expected 201, got %d", rec1.Code)
+	}
+	var resp1 chatMessageResponse
+	_ = json.NewDecoder(rec1.Body).Decode(&resp1)
+
+	rec2 := doRequest(t, srv, http.MethodPost, path, body)
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("second send: expected 201, got %d", rec2.Code)
+	}
+	var resp2 chatMessageResponse
+	_ = json.NewDecoder(rec2.Body).Decode(&resp2)
+
+	if resp1.ID == resp2.ID {
+		t.Errorf("sends without idempotency key should create distinct messages, both got %q", resp1.ID)
 	}
 }

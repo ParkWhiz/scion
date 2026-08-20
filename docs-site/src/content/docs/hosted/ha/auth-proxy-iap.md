@@ -94,8 +94,13 @@ During startup in Hosted HA mode, Scion performs strict preflight checks to vali
    - For **Cloud Run** audiences, Scion can automatically derive the Hub's public URL format from the audience.
    - For **GCLB/GKE** backend-service audiences, Scion *cannot* automatically derive the public endpoint URL because a backend service ID does not contain regional or routing information. You **must explicitly configure the public URL** using the `SCION_SERVER_BASE_URL` environment variable (or `server.hub.public_url` / `SCION_SERVER_HUB_PUBLIC_URL`). If missing, Scion will log a warning at startup and fall back to `localhost`, which is likely unreachable from dispatched agents:
      ```
-     Warning: GKE/GCLB IAP audience detected but SCION_SERVER_BASE_URL not set; hub endpoint will fall back to localhost which is likely unreachable from dispatched agents
+     Warning: hosted HA deployment has no explicit hub base URL; falling back to http://localhost:8080, which is unreachable from dispatched agents. Set SCION_SERVER_BASE_URL or server.hub.public_url.
      ```
+4. **Synthetic Bootstrap Placeholders (GKE Two-Step Flow)**: During automated deployment sequences (such as GKE two-step bootstrap flow), you may need to spin up the Hub config before your GKE backend service (and its real IAP audience) is fully provisioned. If the Hub detects that the `audience` looks like a synthetic bootstrap placeholder (containing the word `placeholder`), it will emit a startup warning rather than failing-closed:
+   ```
+   Warning: IAP audience "/projects/1234/global/backendServices/placeholder" looks like a synthetic bootstrap placeholder. This is supported to facilitate GKE bootstrap, but you must update this configuration with your live IAP audience once provisioned.
+   ```
+   This allows the Hub to start up, register with local databases/brokers, and complete initial bootstrap before the final GCLB resource is available.
 :::
 
 #### Issuer and JWKS overrides
@@ -116,9 +121,9 @@ Provisioning in proxy mode works identically to OAuth — lazy, allow-list-gated
 - **`open`**: any verified email is allowed.
 - **`domain_restricted`**: email domain must be in `authorized_domains`.
 - **`invite_only`**: email must be pre-registered (via admin invite-code flow).
-- Emails in `admin_emails` are always allowed and auto-promoted to admin role.
-- If not permitted, the request returns **403**.
-- Suspended users are rejected even though IAP authenticates them upstream.
+- **Additive-Only `admin_emails` Floor**: Emails in the `admin_emails` configuration are granted the `admin` role automatically. This setting is strictly additive (acts as a floor, not a ceiling): it never overwrites or demotes roles that have been explicitly promoted or changed via the Admin UI/API, which are stored in the database and preserved verbatim across logins/refreshes.
+- If not permitted, the request returns **403**. Deleted users are rejected with **401** or **403**, and suspended users are rejected with **403** (even though upstream IAP may authenticate them).
+- **Database-Backed Token Refresh**: The token refresh endpoint reads the user's active role directly from the database rather than relying on stale session cache, ensuring UI-based role promotions take effect immediately.
 
 A **60-second resolution cache** (keyed by verified email) avoids a database lookup on every request. The JWT signature is verified on every request — only the provisioning/store lookup is cached.
 

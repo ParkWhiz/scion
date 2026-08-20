@@ -69,6 +69,32 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
 		BadRequest(w, "Invalid request body: "+err.Error())
 		return
 	}
+
+	if req.Type == "" {
+		req.Type = "input-needed"
+	}
+
+	// Per-sender send limit (#1054). This is the path a looping agent floods a
+	// thread through, so the limit has to live here and not only on the
+	// browser send path. The response is an explicit 429 with Retry-After
+	// rather than a silent drop, so a caller can back off and resend.
+	//
+	// The traffic class is derived from the (now defaulted) message type so the
+	// automatic assistant-reply transcript mirror — posted by the agent hook,
+	// not written by the agent — cannot spend the whole allowance the agent
+	// needs for a completion report or an escalation. The class only ever
+	// selects a reservation inside the agent's single aggregate ceiling, so a
+	// caller cannot buy extra allowance by relabelling its traffic. A type
+	// this build does not recognise is classified as ordinary agent traffic
+	// and still accepted, exactly as before: tightening the type contract on
+	// the wire is a compatibility change and is tracked separately.
+	//
+	// Charged before the payload is validated: a flood of malformed sends is
+	// still a flood.
+	if !s.allowChatSend(w, agentIdent.ID(), chatSenderClassForMessageType(req.Type)) {
+		return
+	}
+
 	if req.Msg == "" {
 		ValidationError(w, "msg is required", nil)
 		return
@@ -76,9 +102,6 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
 	if msgLen := utf8.RuneCountInString(req.Msg); msgLen > messages.MaxMessageLength {
 		ValidationError(w, fmt.Sprintf("message exceeds %d character limit (current: %d chars). Consider splitting into multiple messages using multiple scion message invocations", messages.MaxMessageLength, msgLen), nil)
 		return
-	}
-	if req.Type == "" {
-		req.Type = "input-needed"
 	}
 
 	// Validate and default visibility.
@@ -233,6 +256,18 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	// W7: Record the attached files as chat attachments so they render in web
+	// chat. The refs ride along in the message metadata because the linkage row
+	// needs a message ID, which only exists once the message is persisted —
+	// below on the direct path, or in the broker's deliverToUser.
+	attachmentRefs := s.ingestAgentAttachments(ctx, agent.ProjectID, agent.ID, req.Attachments)
+	if encoded, ok := attachmentRefsMetadata(attachmentRefs); ok {
+		if structuredMsg.Metadata == nil {
+			structuredMsg.Metadata = make(map[string]string, 1)
+		}
+		structuredMsg.Metadata[attachmentsMetadataKey] = encoded
+	}
+
 	// Route through broker when available; otherwise persist and publish
 	// directly. The broker's deliverToUser callback handles persistence
 	// and SSE, so doing both here would create duplicate messages.
@@ -253,6 +288,12 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
 				"Failed to persist message", nil)
 			return
 		}
+		// W7: Link before publishing so a client that refetches on the SSE
+		// event already sees the attachments.
+		s.mu.RLock()
+		wcs := s.webChatStore
+		s.mu.RUnlock()
+		linkAttachmentRefs(ctx, wcs, storeMsg.ID, attachmentRefs, s.messageLog)
 		s.events.PublishUserMessage(ctx, storeMsg)
 		if s.channelRegistry != nil && s.channelRegistry.Len() > 0 {
 			s.channelRegistry.Dispatch(ctx, structuredMsg)
@@ -267,7 +308,13 @@ func (s *Server) handleAgentOutboundMessage(w http.ResponseWriter, r *http.Reque
 			if senderName == "" {
 				senderName = agent.Slug
 			}
-			go cn.NotifyDMReceived(context.Background(), recipientID, senderName, req.ThreadID, req.Msg, agent.ProjectID)
+			go cn.NotifyDMReceived(context.Background(), recipientID, ChatMessageContext{
+				SenderID:        agent.ID,
+				SenderName:      senderName,
+				ConversationKey: req.ThreadID,
+				Preview:         req.Msg,
+				ProjectID:       agent.ProjectID,
+			})
 		}
 	}
 
@@ -458,6 +505,17 @@ func (s *Server) handleAgentMessage(w http.ResponseWriter, r *http.Request, id s
 			} else if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
 				structuredMsg.SenderID = agentIdent.ID()
 				structuredMsg.Sender = "agent:" + agentIdent.ID()
+			}
+		}
+		// Backfill SenderID from auth context when the client set Sender
+		// but omitted SenderID (e.g. CLI-originated agent-to-agent messages).
+		// Without this, inter-agent message queries by ParticipantID miss
+		// messages where the agent was the sender.
+		if structuredMsg.SenderID == "" {
+			if user := GetUserIdentityFromContext(ctx); user != nil {
+				structuredMsg.SenderID = user.ID()
+			} else if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+				structuredMsg.SenderID = agentIdent.ID()
 			}
 		}
 		// Default version, timestamp and type when the client omits them

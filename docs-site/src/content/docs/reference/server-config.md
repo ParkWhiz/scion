@@ -59,7 +59,7 @@ Controls the central Hub API server.
 | `gcp_iam_deny_unknown_policy` | string | `"fail-open"` | Behavior when Policy Troubleshooter cannot evaluate deny policies (e.g. if the Hub lacks org-level reviewer roles). Supported values: `"fail-open"` (allow if no explicit deny is found; default) or `"fail-closed"` (treat as indeterminate and deny). |
 | `read_timeout` | duration | `"30s"` | HTTP read timeout. |
 | `write_timeout` | duration | `"60s"` | HTTP write timeout. |
-| `admin_emails` | list | `[]` | List of emails granted super-admin access. |
+| `admin_emails` | list | `[]` | List of emails granted super-admin access. Additive only: listed users are promoted to admin on login, but the list never demotes or rewrites a role already stored in the database (e.g. `admin` or `viewer` set from the admin UI). Changing a role is an explicit admin action. |
 | `soft_delete_retention` | duration | | Duration to retain soft-deleted agents (e.g., `"72h"`). |
 | `soft_delete_retain_files` | bool | `false` | Preserve workspace files during the soft-delete period. |
 | `cors` | object | | CORS configuration (see below). |
@@ -211,9 +211,9 @@ Configures the backend and mount settings for storing and managing agent workspa
 | `nfs.storage_class` | string | | The Kubernetes StorageClass name used to dynamically allocate volumes on GKE. |
 | `nfs.subpath_root` | string | `"projects"` | The default base folder name within the share for project workspaces. |
 | `nfs.shares` | list of objects | `[]` | List of NFS share objects. Each share requires: `id` (stable ID), `server` (IP address or hostname), `export` (exported path, e.g., `/scion-workspaces`), and optional `pv_name` (for GKE). |
-| `cloudrun_volume.volume_name` | string | | The name of the platform volume declared in the Cloud Run service specification. |
+| `cloudrun_volume.volume_name` | string | | The name of the platform volume declared in the Cloud Run service specification. The Hub resolves workspaces under `/mnt/<volume_name>`, which is where Cloud Run mounts a declared volume. |
 | `cloudrun_volume.subpath_root` | string | `"projects"` | Sub-directory prefix within the Cloud Run volume. |
-| `gke_shared_volume.volume_name` | string | | The K8s volume name referencing the persistent volume claim (PVC). |
+| `gke_shared_volume.volume_name` | string | | The K8s volume name referencing the persistent volume claim (PVC). **The pod spec must mount that volume at `/mnt/<volume_name>`**: the Hub derives every workspace path from it, and a pod that mounts the PVC elsewhere fails readiness (`GET /readyz` returns `503`) rather than writing workspaces to ephemeral container storage. |
 | `gke_shared_volume.pv_claim_name` | string | | The name of the GKE-managed PVC bound to the shared storage backend (e.g. Filestore). |
 | `gke_shared_volume.subpath_root` | string | `"projects"` | Sub-directory prefix within the GKE volume. |
 
@@ -339,6 +339,23 @@ These environment variables control server-side logging behavior. They are not p
 | `SCION_SERVER_REQUEST_LOG_PATH` | Write HTTP request logs to a file at this path. Each line is a JSON object in `HttpRequest` format. When not set, request logs follow the default routing (stdout in background mode, suppressed in foreground mode, Cloud Logging when enabled). | (disabled) |
 
 See the [Local Development Logging guide](/scion/contributing/logging/) for details on log formats, request log fields, and Cloud Logging integration.
+
+### Boolean Environment Variable Parsing (`parseBoolEnv`)
+
+For server and infrastructure configurations, Scion parses several boolean environment variables using a robust, operator-friendly `parseBoolEnv` parser:
+
+- **Supported Truthy Values:** `true`, `1`, `t`, `yes`, `y`, `on` (case-insensitive, whitespace-trimmed).
+- **Supported Falsy Values:** `false`, `0`, `f`, `no`, `n`, `off` (case-insensitive, whitespace-trimmed).
+- **Safety Warnings:** Unset, empty, or unparseable values default to `false`. However, to prevent configuration typos from silently disabling critical features, any **unrecognized non-empty value** (e.g., `SCION_LOG_GCP=trur`) will trigger an explicit **warning at startup** and default to `false`.
+
+#### Tracked Boolean Variables:
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `SCION_SERVER_ADMIN_MODE` | Forces the server into emergency maintenance mode (break-glass removal). | `false` |
+| `SCION_TRACING_ENABLED` | Enables OpenTelemetry tracing when a GCP Project ID is configured. | `false` |
+| `SCION_LOG_GCP` | Enables Google Cloud Logging JSON format on standard output. | `false` |
+| `SCION_REQUIRE_STABLE_SIGNING_KEY` | Demands a persistent session/JWT signing key. When enabled, startup aborts (fail-closed) if no stable key/secret can be resolved in hosted mode, preventing JWT signature mismatches across replica restarts. | `false` |
 
 ### Hub Endpoint Resolution
 

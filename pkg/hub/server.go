@@ -263,11 +263,19 @@ type ServerConfig struct {
 	Mode string
 
 	// WorkspaceStorageConfig selects the workspace storage backend for
-	// hub-managed project workspaces. When Backend is "nfs" or
-	// "cloudrun-volume", hubManagedProjectPath returns a path on the
-	// configured durable mount instead of the node-local home directory.
+	// hub-managed project workspaces. When Backend is "nfs",
+	// "cloudrun-volume" or "gke-shared-volume", hubManagedProjectPath returns
+	// a path on the configured durable mount instead of the node-local home
+	// directory.
 	// Nil or Backend=="" / "local" preserves the legacy ephemeral behavior.
 	WorkspaceStorageConfig *config.V1WorkspaceStorageConfig
+
+	// NativeChatEnabled controls whether the built-in chat feature is active:
+	// the /api/v1/chat/* routes are registered and the web UI is told to show
+	// the chat interface. Nil means enabled — chat shipped default-on, so an
+	// operator must opt out explicitly via server.native_chat.enabled.
+	// Read through Server.nativeChatEnabled(), never directly.
+	NativeChatEnabled *bool
 }
 
 // MaintenanceConfig holds configuration for routine maintenance operation executors.
@@ -750,6 +758,14 @@ type Server struct {
 	// Single-node only; see design §4.5 HA limitation.
 	presenceManager *PresenceManager
 
+	// Per-sender token-bucket limiter for the chat send paths (#1054).
+	// Set once in New and read without the lock; nil-safe.
+	chatSendLimiter *chatSendLimiter
+
+	// In-memory idempotency cache for chat message sends (#1055).
+	// Keyed by senderID:idempotencyKey with a 5-minute TTL.
+	chatIdempotency *ChatIdempotencyCache
+
 	// Channel registry for external notification delivery (nil = disabled)
 	channelRegistry *ChannelRegistry
 
@@ -883,6 +899,11 @@ type Server struct {
 	// chatLinkStore is the DB-backed chat link code store (nil when entClient is nil).
 	// When non-nil, Telegram/Discord/Teams link services delegate to it.
 	chatLinkStore *ChatLinkStore
+
+	// warnedEphemeralProjects holds the project slugs already reported as being
+	// served from ephemeral local storage, keeping that warning to one line per
+	// slug on a request path. See warnEphemeralProjectPath.
+	warnedEphemeralProjects sync.Map
 }
 
 // groupsLogger returns the groups subsystem logger, falling back to
@@ -986,6 +1007,10 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 
 	// Initialize GCP token metrics
 	srv.gcpTokenMetrics = NewGCPTokenMetrics()
+
+	// Per-sender chat send rate limiter (#1054).
+	srv.chatSendLimiter = newChatSendLimiter()
+	srv.chatIdempotency = NewChatIdempotencyCache()
 
 	ctx := context.Background()
 
@@ -1885,11 +1910,15 @@ func (s *Server) GetMessageBrokerProxy() *MessageBrokerProxy {
 func (s *Server) SetWebChatStore(wcs WebChatStore) {
 	s.mu.Lock()
 	s.webChatStore = wcs
-	// Initialize ChatNotifier with the store; presence checker is nil (W5 stub).
-	s.chatNotifier = NewChatNotifier(s.store, s.events, wcs, nil, s.messageLog)
+	// Initialize ChatNotifier with the store. Presence is resolved lazily
+	// through the server (see serverPresenceChecker): the presence manager is
+	// created by InitPresenceManager, which runs after this on the current
+	// startup path, and a snapshot taken here would pin a nil checker.
+	s.chatNotifier = NewChatNotifier(s.store, s.events, wcs, serverPresenceChecker{s}, s.messageLog)
 	// Wire into existing broker proxy if already started (startup order varies).
 	if s.messageBrokerProxy != nil {
 		s.messageBrokerProxy.chatNotifier = s.chatNotifier
+		s.messageBrokerProxy.webChatStore = wcs
 	}
 	s.mu.Unlock()
 }
@@ -1906,6 +1935,28 @@ func (s *Server) getChatNotifier() *ChatNotifier {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.chatNotifier
+}
+
+// serverPresenceChecker adapts the server's presence manager to the
+// PresenceChecker interface, resolving it at call time rather than at
+// construction time. Startup wires the webchat store (and with it the
+// ChatNotifier) before InitPresenceManager runs, so a checker captured up
+// front would be permanently absent-reporting — the defect this replaces.
+type serverPresenceChecker struct {
+	srv *Server
+}
+
+// IsUserActive reports whether the user is currently present, or false while
+// no presence manager exists (before InitPresenceManager, or in deployments
+// that never start one).
+func (c serverPresenceChecker) IsUserActive(userID string) bool {
+	if c.srv == nil {
+		return false
+	}
+	c.srv.mu.RLock()
+	pm := c.srv.presenceManager
+	c.srv.mu.RUnlock()
+	return pm.IsUserActive(userID)
 }
 
 // InitPresenceManager creates and starts the presence manager for real-time
@@ -2354,6 +2405,7 @@ func (s *Server) StartMessageBroker(b eventbus.EventBus) {
 	proxy := NewMessageBrokerProxy(b, s.store, s.events, s.GetDispatcher, logging.Subsystem("hub.broker"))
 	proxy.messageLog = s.dedicatedMessageLog
 	proxy.chatNotifier = s.chatNotifier // W6: wire DM notification trigger
+	proxy.webChatStore = s.webChatStore // DM watermark stamping after persist
 	s.messageBrokerProxy = proxy
 	proxy.Start()
 
@@ -3507,24 +3559,30 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/messages/", s.handleMessageRoutes)
 	s.mux.HandleFunc("/api/v1/message-channels", s.handleMessageChannels)
 
-	// Chat thread prefs (Phase 3 — visibility mode persistence)
-	s.mux.HandleFunc("/api/v1/chat/prefs", s.handleChatPrefs)
+	// Native chat endpoints. Registration is gated on server.native_chat.enabled,
+	// so disabling the feature makes every /api/v1/chat/* path 404 rather than
+	// leaving a live API behind a hidden UI. This is a startup-time gate:
+	// flipping the toggle requires a hub restart (same as the message broker).
+	if s.nativeChatEnabled() {
+		// Chat thread prefs (Phase 3 — visibility mode persistence)
+		s.mux.HandleFunc("/api/v1/chat/prefs", s.handleChatPrefs)
 
-	// Chat thread endpoints (Phase 5 — thread rail, legacy)
-	s.mux.HandleFunc("/api/v1/chat/threads", s.handleChatThreads)
-	s.mux.HandleFunc("/api/v1/chat/threads/", s.handleChatThreadRoutes)
+		// Chat thread endpoints (Phase 5 — thread rail, legacy)
+		s.mux.HandleFunc("/api/v1/chat/threads", s.handleChatThreads)
+		s.mux.HandleFunc("/api/v1/chat/threads/", s.handleChatThreadRoutes)
 
-	// Wave-2 chat endpoints (conversation REST API)
-	s.mux.HandleFunc("/api/v1/chat/spaces", s.handleChatSpaces)
-	s.mux.HandleFunc("/api/v1/chat/spaces/", s.handleChatSpaceRoutes)
-	s.mux.HandleFunc("/api/v1/chat/conversations/", s.handleChatConversationRoutes)
-	s.mux.HandleFunc("/api/v1/chat/topics/", s.handleChatTopicRoutes)
-	s.mux.HandleFunc("/api/v1/chat/dms", s.handleChatDMs)
-	s.mux.HandleFunc("/api/v1/chat/user-prefs", s.handleChatUserPrefs)
-	s.mux.HandleFunc("/api/v1/chat/presence", s.handleChatPresence)
-	s.mux.HandleFunc("/api/v1/chat/search", s.handleChatSearch)
-	s.mux.HandleFunc("/api/v1/chat/attachments", s.handleChatAttachments)
-	s.mux.HandleFunc("/api/v1/chat/attachments/", s.handleChatAttachmentByID)
+		// Wave-2 chat endpoints (conversation REST API)
+		s.mux.HandleFunc("/api/v1/chat/spaces", s.handleChatSpaces)
+		s.mux.HandleFunc("/api/v1/chat/spaces/", s.handleChatSpaceRoutes)
+		s.mux.HandleFunc("/api/v1/chat/conversations/", s.handleChatConversationRoutes)
+		s.mux.HandleFunc("/api/v1/chat/topics/", s.handleChatTopicRoutes)
+		s.mux.HandleFunc("/api/v1/chat/dms", s.handleChatDMs)
+		s.mux.HandleFunc("/api/v1/chat/user-prefs", s.handleChatUserPrefs)
+		s.mux.HandleFunc("/api/v1/chat/presence", s.handleChatPresence)
+		s.mux.HandleFunc("/api/v1/chat/search", s.handleChatSearch)
+		s.mux.HandleFunc("/api/v1/chat/attachments", s.handleChatAttachments)
+		s.mux.HandleFunc("/api/v1/chat/attachments/", s.handleChatAttachmentByID)
+	}
 
 	// WebSocket control channel endpoint for Runtime Brokers
 	s.mux.HandleFunc("/api/v1/runtime-brokers/connect", s.handleRuntimeBrokerConnect)

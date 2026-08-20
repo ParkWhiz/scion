@@ -72,6 +72,10 @@ The "Reset to bootstrap" feature requires a backend endpoint that is not yet ava
 
 ## Environment Variable Namespaces
 
+:::tip[Boolean Environments]
+Operational boolean settings configured via environment variables (such as `SCION_SEED_*` and `SCION_SERVER_*`) are processed using the standard `parseBoolEnv` logic. They support case-insensitive spellings for `yes`/`y`/`on` and `no`/`n`/`off`, and issue startup warnings on unrecognized non-empty inputs to help administrators catch configuration typos.
+:::
+
 ### `SCION_SEED_*` (New)
 
 Use `SCION_SEED_*` to provide initial/default values for operational settings. Seeds are overridable — admins can change them in the UI, and the database value takes precedence.
@@ -181,6 +185,8 @@ To support complete infrastructure configuration directly from the Web Dashboard
 - **Harness Configs Editor**: Features a rich JSON textarea for writing and editing raw harness properties directly, making it easy to tune model parameters or customize env environments.
 
 In highly available (HA) Postgres deployments, all configurations edited through this tab are stored in the database's `hub_settings` table as whole-map JSONB documents. This ensures edits propagate immediately to all replicas, support optimistic locking (CAS), and are never silently dropped or ignored on server PUT actions.
+
+Furthermore, these database-backed settings are wired directly into the runtime broker consumption path. During agent dispatch, both the Scion Hub and the Runtime Broker resolve runtime execution environments and resource profiles dynamically from these persisted database settings. This eliminates the need to distribute or maintain on-disk configuration files (such as local `settings.yaml` files) on individual broker nodes, ensuring a centralized, real-time control plane.
 
 #### Navigation Updates
 
