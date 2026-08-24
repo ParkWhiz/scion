@@ -50,6 +50,9 @@ import './chat-visibility-toggle.js';
 import './chat-interagent-marker.js';
 import './send-to-agent-picker.js';
 import type { AgentSelectedDetail } from './send-to-agent-picker.js';
+import { getLanguageFromPath } from '../code-editor.js';
+import '../code-editor.js';
+import '../markdown-preview.js';
 
 /** Result from server-side mention fan-out. */
 interface MentionResult {
@@ -90,6 +93,113 @@ const SEEN_VISIBLE_MS = 5 * 60 * 1000;
 
 /** Typing send throttle in ms. */
 const TYPING_SEND_THROTTLE_MS = 4000;
+
+// ---------------------------------------------------------------------------
+// Path-link utilities (#1148) — parse container paths into API parameters.
+// ---------------------------------------------------------------------------
+
+/** Encode each segment of a file path for use in API URLs. */
+function encodeFilePath(filePath: string): string {
+  return filePath
+    .split('/')
+    .map((seg) => encodeURIComponent(seg))
+    .join('/');
+}
+
+interface PathLinkTarget {
+  kind: 'workspace' | 'shared-dir';
+  /** Shared-directory name (only for kind === 'shared-dir'). */
+  dirName?: string;
+  /** File path within the workspace or shared directory. */
+  filePath: string;
+}
+
+/**
+ * Parse a container path into the API type and parameters.
+ *
+ * Supported patterns:
+ *   /scion-volumes/{dirName}/{filePath}       -> shared-dir
+ *   /workspace/.scion-volumes/{dirName}/{fp}   -> shared-dir (in-workspace mount)
+ *   /workspace/{filePath}                      -> workspace
+ */
+function parseContainerPath(containerPath: string): PathLinkTarget | null {
+  // /scion-volumes/{dirName}/...
+  const sharedDirMatch = containerPath.match(/^\/scion-volumes\/([^/]+)(?:\/(.+))?$/);
+  if (sharedDirMatch) {
+    return {
+      kind: 'shared-dir',
+      dirName: sharedDirMatch[1],
+      filePath: sharedDirMatch[2] || '',
+    };
+  }
+
+  // /workspace/.scion-volumes/{dirName}/...
+  const inWorkspaceMatch = containerPath.match(
+    /^\/workspace\/\.scion-volumes\/([^/]+)(?:\/(.+))?$/
+  );
+  if (inWorkspaceMatch) {
+    return {
+      kind: 'shared-dir',
+      dirName: inWorkspaceMatch[1],
+      filePath: inWorkspaceMatch[2] || '',
+    };
+  }
+
+  // /workspace/...
+  const workspaceMatch = containerPath.match(/^\/workspace\/(.+)$/);
+  if (workspaceMatch) {
+    return {
+      kind: 'workspace',
+      filePath: workspaceMatch[1],
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Build the API URL for a parsed path-link target.
+ */
+function buildFileApiUrl(projectId: string, target: PathLinkTarget): string {
+  if (target.kind === 'shared-dir') {
+    return `/api/v1/projects/${encodeURIComponent(projectId)}/shared-dirs/${encodeURIComponent(target.dirName!)}/files/${encodeFilePath(target.filePath)}`;
+  }
+  return `/api/v1/projects/${encodeURIComponent(projectId)}/workspace/files/${encodeFilePath(target.filePath)}`;
+}
+
+/** Known image extensions for path-link preview. */
+const PATH_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.ico']);
+
+/** Known markdown extensions for path-link preview. */
+const PATH_MD_EXTS = new Set(['.md', '.markdown']);
+
+/** Maximum file size for inline text preview (512 KB). */
+const PATH_PREVIEW_MAX = 512 * 1024;
+
+/** State for the file-path viewer dialog. */
+interface FilePreviewState {
+  /** The raw container path from the link. */
+  containerPath: string;
+  /** Resolved filename for display. */
+  fileName: string;
+  /** Loading / ready / error state. */
+  status: 'loading' | 'ready' | 'error';
+  /** File content (text) when ready. */
+  content?: string;
+  /** Error message when status is 'error'. */
+  error?: string;
+  /** Whether this is an image file. */
+  isImage?: boolean;
+  /** Whether this is a markdown file. */
+  isMarkdown?: boolean;
+  /** Whether this is a binary/unknown file (download-only). */
+  isBinary?: boolean;
+  /** API URL for download. */
+  downloadUrl?: string;
+}
+
+// Export the parse function for testing.
+export { parseContainerPath, buildFileApiUrl, type PathLinkTarget };
 
 @customElement('scion-chat-thread')
 export class ScionChatThread extends LitElement {
@@ -225,6 +335,11 @@ export class ScionChatThread extends LitElement {
   /** Temporarily stored message for send-to-agent flow. */
   private _pendingSendToAgentMessage: Message | null = null;
 
+  // ---- Path-link file preview state (#1148) ----
+
+  /** Current file preview dialog state, or null when closed. */
+  @state() private filePreview: FilePreviewState | null = null;
+
   /** Message extensions keyed by message ID. */
   private v2MessageExtMap = new Map<
     string,
@@ -251,6 +366,25 @@ export class ScionChatThread extends LitElement {
 
   /** Bound listener for v2 SSE chat-message events via stateManager. */
   private _v2MessageHandler = this.handleV2ChatMessage.bind(this);
+
+  /** True once an SSE connection has been observed while this thread listens. */
+  private _sawSseConnect = false;
+
+  /**
+   * The hub keeps no event history, so anything sent while the stream was down
+   * was never delivered; a reconnection refetches the latest page to fill the
+   * gap. mergeMessages dedupes, so overlap with what is already shown is safe.
+   */
+  private _sseReconnectHandler = (): void => {
+    if (!this._sawSseConnect) {
+      this._sawSseConnect = true;
+      return;
+    }
+    if (!this.loaded) return;
+    void this.fetchHistoryV2().catch((err) => {
+      console.warn('[chat-thread] catch-up fetch after reconnect failed:', err);
+    });
+  };
 
   /** Bound listener for v2 SSE typing events via stateManager. */
   private _v2TypingHandler = this.handleV2TypingEvent.bind(this);
@@ -632,6 +766,42 @@ export class ScionChatThread extends LitElement {
       color: var(--scion-text-muted, #64748b);
     }
 
+    /* Path-link file preview dialog (#1148) */
+    .file-preview-dialog::part(panel) {
+      width: min(90vw, 800px);
+      max-height: 85vh;
+    }
+
+    .file-preview-dialog::part(body) {
+      padding: 0;
+      overflow: auto;
+    }
+
+    .file-preview-placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 3rem 2rem;
+      color: var(--scion-text-muted, #64748b);
+      font-size: 0.875rem;
+    }
+
+    .file-preview-placeholder.error {
+      color: var(--scion-danger-600, #dc2626);
+    }
+
+    .file-preview-image {
+      max-width: 100%;
+      max-height: 70vh;
+      display: block;
+      margin: 0 auto;
+    }
+
+    .file-preview-dialog scion-code-editor {
+      --editor-max-height: 70vh;
+    }
+
     /* Phase-5: Slash command system message */
     .system-info-message {
       padding: 0.5rem 1rem;
@@ -672,6 +842,7 @@ export class ScionChatThread extends LitElement {
   /** Tear down v2 state so a fresh load can happen. */
   private resetV2State(): void {
     // Stop any active SSE listener
+    stateManager.removeEventListener('connected', this._sseReconnectHandler);
     stateManager.removeEventListener('chat-message-received', this._v2MessageHandler);
     stateManager.removeEventListener('chat-typing-received', this._v2TypingHandler);
     stateManager.removeEventListener('chat-read-state-updated', this._v2ReadStateHandler);
@@ -722,6 +893,7 @@ export class ScionChatThread extends LitElement {
     super.disconnectedCallback();
     this.stopStream();
     // Clean up v2 SSE listeners
+    stateManager.removeEventListener('connected', this._sseReconnectHandler);
     stateManager.removeEventListener('chat-message-received', this._v2MessageHandler);
     stateManager.removeEventListener('chat-typing-received', this._v2TypingHandler);
     stateManager.removeEventListener('chat-read-state-updated', this._v2ReadStateHandler);
@@ -1175,6 +1347,8 @@ export class ScionChatThread extends LitElement {
 
   /** Start listening for v2 messages via stateManager instead of per-thread EventSource. */
   private startStreamV2(): void {
+    this._sawSseConnect = stateManager.isConnected;
+    stateManager.addEventListener('connected', this._sseReconnectHandler);
     stateManager.addEventListener('chat-message-received', this._v2MessageHandler);
     stateManager.addEventListener('chat-typing-received', this._v2TypingHandler);
     stateManager.addEventListener('chat-read-state-updated', this._v2ReadStateHandler);
@@ -2173,6 +2347,158 @@ export class ScionChatThread extends LitElement {
   }
 
   // ---------------------------------------------------------------------------
+  // Path-link file preview (#1148)
+  // ---------------------------------------------------------------------------
+
+  /** Handle path-link-click event from a chat message. */
+  private async handlePathLinkClick(
+    e: CustomEvent<{ path: string }>
+  ): Promise<void> {
+    const containerPath = e.detail.path;
+
+    if (!this.projectId) {
+      this.sendError = 'Cannot open file: no project context';
+      setTimeout(() => {
+        if (this.sendError === 'Cannot open file: no project context') {
+          this.sendError = null;
+        }
+      }, 4000);
+      return;
+    }
+
+    const target = parseContainerPath(containerPath);
+    if (!target) {
+      this.sendError = 'Cannot open file: unrecognized path format';
+      setTimeout(() => {
+        if (this.sendError === 'Cannot open file: unrecognized path format') {
+          this.sendError = null;
+        }
+      }, 4000);
+      return;
+    }
+
+    const fileName = containerPath.split('/').pop() || containerPath;
+    const ext = fileName.includes('.') ? '.' + fileName.split('.').pop()!.toLowerCase() : '';
+    const isImage = PATH_IMAGE_EXTS.has(ext);
+    const isMarkdown = PATH_MD_EXTS.has(ext);
+    const downloadUrl = buildFileApiUrl(this.projectId, target);
+
+    this.filePreview = {
+      containerPath,
+      fileName,
+      status: 'loading',
+      isImage,
+      isMarkdown,
+      downloadUrl,
+    };
+
+    if (isImage) {
+      // Images are loaded directly by the browser via URL.
+      this.filePreview = { ...this.filePreview, status: 'ready' };
+      return;
+    }
+
+    try {
+      const res = await apiFetch(`${downloadUrl}?format=json`);
+      // Staleness guard: user closed dialog or clicked a different file link.
+      if (this.filePreview?.containerPath !== containerPath) return;
+      if (!res.ok) {
+        const errMsg = await extractApiError(res, `HTTP ${res.status}`);
+        this.filePreview = { ...this.filePreview, status: 'error', error: errMsg };
+        return;
+      }
+      const data = (await res.json()) as { content: string; size: number };
+      // Staleness guard: user navigated away while parsing response.
+      if (this.filePreview?.containerPath !== containerPath) return;
+      if (data.size > PATH_PREVIEW_MAX) {
+        // Too large for inline preview, show download-only.
+        this.filePreview = {
+          ...this.filePreview,
+          status: 'ready',
+          isBinary: true,
+        };
+        return;
+      }
+      this.filePreview = {
+        ...this.filePreview,
+        status: 'ready',
+        content: data.content,
+      };
+    } catch (err) {
+      // Staleness guard: user navigated away while request was in-flight.
+      if (this.filePreview?.containerPath !== containerPath) return;
+      this.filePreview = {
+        ...this.filePreview,
+        status: 'error',
+        error: err instanceof Error ? err.message : 'Failed to load file',
+      };
+    }
+  }
+
+  /** Close the file preview dialog. */
+  private closeFilePreview(): void {
+    this.filePreview = null;
+  }
+
+  /** Render the file preview overlay dialog. */
+  private renderFilePreview() {
+    const fp = this.filePreview;
+    if (!fp) return nothing;
+
+    let body;
+    if (fp.status === 'loading') {
+      body = html`
+        <div class="file-preview-placeholder">
+          <sl-spinner></sl-spinner>
+          Loading file…
+        </div>
+      `;
+    } else if (fp.status === 'error') {
+      body = html`<div class="file-preview-placeholder error">${fp.error}</div>`;
+    } else if (fp.isImage) {
+      body = html`<img class="file-preview-image" src="${fp.downloadUrl}?view=true" alt=${fp.fileName} />`;
+    } else if (fp.isBinary) {
+      body = html`
+        <div class="file-preview-placeholder">
+          This file is too large to preview inline. Use the Download button.
+        </div>
+      `;
+    } else if (fp.isMarkdown) {
+      body = html`<scion-markdown-preview .content=${fp.content ?? ''}></scion-markdown-preview>`;
+    } else {
+      body = html`
+        <scion-code-editor
+          .content=${fp.content ?? ''}
+          language=${getLanguageFromPath(fp.fileName)}
+          readonly
+        ></scion-code-editor>
+      `;
+    }
+
+    return html`
+      <sl-dialog
+        class="file-preview-dialog"
+        open
+        label=${fp.fileName}
+        @sl-after-hide=${(e: Event) => {
+          if (e.target === e.currentTarget) this.closeFilePreview();
+        }}
+      >
+        ${body}
+        <div slot="footer" style="display:flex;gap:0.5rem;align-items:center">
+          <span style="flex:1;font-size:0.75rem;color:var(--scion-text-muted,#64748b);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=${fp.containerPath}>
+            ${fp.containerPath}
+          </span>
+          <sl-button href="${fp.downloadUrl}" download=${fp.fileName} size="small">
+            <sl-icon slot="prefix" name="download"></sl-icon>
+            Download
+          </sl-button>
+        </div>
+      </sl-dialog>
+    `;
+  }
+
+  // ---------------------------------------------------------------------------
   // Phase-5: Slash command handling
   // ---------------------------------------------------------------------------
 
@@ -2444,6 +2770,7 @@ export class ScionChatThread extends LitElement {
               ></scion-chat-composer>
             `
           : nothing}
+        ${this.renderFilePreview()}
       </div>
     `;
   }
@@ -2473,6 +2800,7 @@ export class ScionChatThread extends LitElement {
           @chat-slash-command=${this.handleSlashCommand}
         ></scion-chat-composer>
         ${this.renderContextMenu()}
+        ${this.renderFilePreview()}
         <scion-send-to-agent-picker
           .agents=${this.agents}
           ?open=${this.showAgentPicker}
@@ -2798,6 +3126,7 @@ export class ScionChatThread extends LitElement {
           @message-delete=${this.handleMessageDeleteRequest}
           @message-copy-link=${this.handleCopyLink}
           @scroll-to-message=${this.handleScrollToMessage}
+          @path-link-click=${this.handlePathLinkClick}
         ></scion-chat-message>
       `);
 
