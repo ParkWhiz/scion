@@ -1131,7 +1131,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				owner, repo := parts[0], parts[1]
 				var errMsg string
 				if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
-					errMsg = fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the PR's target branch), or\n2. A **public project with isolated agents** available for this repository.", cmd)
+					errMsg = fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the PR's target branch), or\n2. A **project with isolated workspaces** available for this repository.", cmd)
 				} else {
 					errMsg = "No matching project or grove was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
 				}
@@ -1162,7 +1162,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 
 	// For /review, /validate, and /fix, ensure we have an appropriate project.
 	// An appropriate project is either branch-specific (has agents matching prBranch)
-	// or is a public project with isolated agents.
+	// or is a project with isolated workspaces.
 	if cmd == "/review" || cmd == "/validate" || cmd == "/fix" {
 		hasAppropriateProject := false
 
@@ -1184,9 +1184,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 		}
 
-		// 2. Check for public project with isolated agents
+		// 2. Check for project with isolated workspaces
 		if !hasAppropriateProject {
-			if s.selectByPublicAndIsolated(projects) != nil {
+			if s.selectByIsolatedWorkspace(projects) != nil {
 				hasAppropriateProject = true
 			}
 		}
@@ -1199,7 +1199,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 					parts := strings.SplitN(repoFullName, "/", 2)
 					if len(parts) == 2 {
 						owner, repo := parts[0], parts[1]
-						guidanceMsg := fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the branch `%s`), or\n2. A **public project with isolated agents** available for this repository.", cmd, prBranch)
+						guidanceMsg := fmt.Sprintf("No appropriate Scion project/grove could be found to execute your `%s` command.\n\nTo run this command, you must have either:\n1. A **branch-specific project** (a project that is currently serving the branch `%s`), or\n2. A **project with isolated workspaces** available for this repository.", cmd, prBranch)
 						if err := s.postPRCommentWithFallback(ctx, client, installationID, owner, repo, prNumber, guidanceMsg); err != nil {
 							slog.Error("Failed to post project fallback guidance comment to GitHub", "repo", repoFullName, "pr", prNumber, "error", err.Error())
 						} else {
@@ -1599,8 +1599,8 @@ func (s *Server) resolveBestProjectForPR(ctx context.Context, projects []store.P
 			if s.config.Debug {
 				slog.Debug("resolveBestProjectForPR: found branch match candidates", "branch", prBranch, "count", len(branchMatchCandidates))
 			}
-			// Prefer public + isolated within branch match candidates if there are multiple, otherwise fall back to the first.
-			best := s.selectByPublicAndIsolated(branchMatchCandidates)
+			// Prefer isolated workspaces within branch match candidates if there are multiple, otherwise fall back to the first.
+			best := s.selectByIsolatedWorkspace(branchMatchCandidates)
 			if best != nil {
 				return *best
 			}
@@ -1608,11 +1608,11 @@ func (s *Server) resolveBestProjectForPR(ctx context.Context, projects []store.P
 		}
 	}
 
-	// Priority 2: Public & Isolated Workspaces (Tier 2)
-	best := s.selectByPublicAndIsolated(projects)
+	// Priority 2: Isolated Workspaces (Tier 2)
+	best := s.selectByIsolatedWorkspace(projects)
 	if best != nil {
 		if s.config.Debug {
-			slog.Debug("resolveBestProjectForPR: selected project by public and isolated workspace", "project_id", best.ID, "name", best.Name)
+			slog.Debug("resolveBestProjectForPR: selected project by isolated workspace", "project_id", best.ID, "name", best.Name)
 		}
 		return *best
 	}
@@ -1624,10 +1624,10 @@ func (s *Server) resolveBestProjectForPR(ctx context.Context, projects []store.P
 	return projects[0]
 }
 
-func (s *Server) selectByPublicAndIsolated(projects []store.Project) *store.Project {
-	for _, p := range projects {
-		if p.Visibility == store.VisibilityPublic && !p.IsSharedWorkspace() {
-			return &p
+func (s *Server) selectByIsolatedWorkspace(projects []store.Project) *store.Project {
+	for i := range projects {
+		if !projects[i].IsSharedWorkspace() {
+			return &projects[i]
 		}
 	}
 	return nil

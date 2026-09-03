@@ -1416,7 +1416,6 @@ func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
 		Name:                   "Proj Review Fallback 1",
 		Slug:                   "proj-review-fallback-1",
 		GitRemote:              "https://github.com/acme/widgets.git",
-		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -1748,7 +1747,6 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 		Name:                   "Proj Validate Fallback 1",
 		Slug:                   "proj-validate-fallback-1",
 		GitRemote:              "https://github.com/acme/widgets.git",
-		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -1916,7 +1914,6 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 		Name:                   "Proj Tpl 1",
 		Slug:                   "proj-tpl-1",
 		GitRemote:              "https://github.com/acme/widgets.git",
-		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2155,7 +2152,6 @@ profiles:
 		Name:                   "Proj SrvTpl 1",
 		Slug:                   "proj-srvtpl-1",
 		GitRemote:              "https://github.com/acme/widgets.git",
-		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2324,7 +2320,6 @@ func TestHandleGitHubWebhook_TemplateResolution_Database(t *testing.T) {
 		Name:                   "Proj SrvTpl 2",
 		Slug:                   "proj-srvtpl-2",
 		GitRemote:              "https://github.com/acme/widgets.git",
-		Visibility:             store.VisibilityPublic,
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2473,24 +2468,25 @@ func TestResolveBestProject_PublicIsolatedFallback(t *testing.T) {
 	srv, s := webhookTestServer(t)
 	ctx := context.Background()
 
-	// pA is private
+	// pA has a shared workspace (IsSharedWorkspace() is true)
 	pA := &store.Project{
-		ID:         tid("project-a"),
-		Name:       "Project A",
-		Slug:       "project-a",
-		GitRemote:  "https://github.com/acme/widgets.git",
-		Visibility: "private",
-		Created:    time.Now(),
-		Updated:    time.Now(),
+		ID:        tid("project-a"),
+		Name:      "Project A",
+		Slug:      "project-a",
+		GitRemote: "https://github.com/acme/widgets.git",
+		Labels: map[string]string{
+			store.LabelWorkspaceMode: store.WorkspaceModeShared,
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
 	}
 
-	// pB is public and has isolated workspaces enabled (!IsSharedWorkspace() i.e. not shared)
+	// pB has isolated workspaces enabled (!IsSharedWorkspace() i.e. not shared)
 	pB := &store.Project{
-		ID:         tid("project-b"),
-		Name:       "Project B",
-		Slug:       "project-b",
-		GitRemote:  "https://github.com/acme/widgets.git",
-		Visibility: store.VisibilityPublic,
+		ID:        tid("project-b"),
+		Name:      "Project B",
+		Slug:      "project-b",
+		GitRemote: "https://github.com/acme/widgets.git",
 		Labels: map[string]string{
 			store.LabelWorkspaceMode: store.WorkspaceModePerAgent,
 		},
@@ -2498,13 +2494,12 @@ func TestResolveBestProject_PublicIsolatedFallback(t *testing.T) {
 		Updated: time.Now(),
 	}
 
-	// pC is public but has a shared workspace (IsSharedWorkspace() is true)
+	// pC has a shared workspace (IsSharedWorkspace() is true)
 	pC := &store.Project{
-		ID:         tid("project-c"),
-		Name:       "Project C",
-		Slug:       "project-c",
-		GitRemote:  "https://github.com/acme/widgets.git",
-		Visibility: store.VisibilityPublic,
+		ID:        tid("project-c"),
+		Name:      "Project C",
+		Slug:      "project-c",
+		GitRemote: "https://github.com/acme/widgets.git",
 		Labels: map[string]string{
 			store.LabelWorkspaceMode: store.WorkspaceModeShared,
 		},
@@ -2526,7 +2521,7 @@ func TestResolveBestProject_PublicIsolatedFallback(t *testing.T) {
 	best := srv.resolveBestProjectForPR(ctx, projects, "feature-xyz")
 
 	if best.ID != pB.ID {
-		t.Errorf("expected best project to be %s (public + isolated), got %s", pB.ID, best.ID)
+		t.Errorf("expected best project to be %s (isolated), got %s", pB.ID, best.ID)
 	}
 }
 
@@ -2552,7 +2547,6 @@ func TestHandleGitHubWebhook_FixAndSpawnBypass(t *testing.T) {
 		Name:                 "Project Fix 1",
 		Slug:                 "project-fix-1",
 		GitRemote:            "https://github.com/acme/widgets.git",
-		Visibility:           store.VisibilityPublic,
 		GitHubInstallationID: &inst.InstallationID,
 		Created:              time.Now(),
 		Updated:              time.Now(),
@@ -2668,7 +2662,6 @@ func TestHandleGitHubWebhook_FixAndSpawnBypass_Mismatch(t *testing.T) {
 		Name:                 "Project Fix 2",
 		Slug:                 "project-fix-2",
 		GitRemote:            "https://github.com/acme/widgets.git",
-		Visibility:           store.VisibilityPublic,
 		GitHubInstallationID: &inst.InstallationID,
 		Created:              time.Now(),
 		Updated:              time.Now(),
@@ -2838,13 +2831,15 @@ func TestHandleGitHubWebhook_NoAppropriateProjectCommentBack(t *testing.T) {
 		t.Fatalf("failed to create installation: %v", err)
 	}
 
-	// Create a private project with no active agents matching the branch (so it's inappropriate)
+	// Create a shared workspace project with no active agents matching the branch (so it's inappropriate)
 	project := &store.Project{
-		ID:                     tid("proj-inappropriate-1"),
-		Name:                   "Proj Inappropriate 1",
-		Slug:                   "proj-inappropriate-1",
-		GitRemote:              "https://github.com/acme/widgets.git",
-		Visibility:             "private",
+		ID:        tid("proj-inappropriate-1"),
+		Name:      "Proj Inappropriate 1",
+		Slug:      "proj-inappropriate-1",
+		GitRemote: "https://github.com/acme/widgets.git",
+		Labels: map[string]string{
+			store.LabelWorkspaceMode: store.WorkspaceModeShared,
+		},
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2992,13 +2987,15 @@ func TestHandleGitHubWebhook_FallbackToPRReviewComment(t *testing.T) {
 		t.Fatalf("failed to create installation: %v", err)
 	}
 
-	// Create a private project with no active agents matching the branch (so it's inappropriate)
+	// Create a shared workspace project with no active agents matching the branch (so it's inappropriate)
 	project := &store.Project{
-		ID:                     tid("proj-inappropriate-1"),
-		Name:                   "Proj Inappropriate 1",
-		Slug:                   "proj-inappropriate-1",
-		GitRemote:              "https://github.com/acme/widgets.git",
-		Visibility:             "private",
+		ID:        tid("proj-inappropriate-1"),
+		Name:      "Proj Inappropriate 1",
+		Slug:      "proj-inappropriate-1",
+		GitRemote: "https://github.com/acme/widgets.git",
+		Labels: map[string]string{
+			store.LabelWorkspaceMode: store.WorkspaceModeShared,
+		},
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -3110,7 +3107,6 @@ func TestHandleGitHubWebhook_PlanCommand(t *testing.T) {
 		Name:                   "Proj Plan 1",
 		Slug:                   "proj-plan-1",
 		GitRemote:              "https://github.com/acme/plan-widgets.git",
-		Visibility:             "public",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -3247,7 +3243,6 @@ func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
 		Name:                   "Proj Implement 1",
 		Slug:                   "proj-implement-1",
 		GitRemote:              "https://github.com/acme/implement-widgets.git",
-		Visibility:             "public",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -3382,7 +3377,6 @@ func TestHandleGitHubWebhook_PlanCommand_ActiveAgent(t *testing.T) {
 		Name:                   "Proj Plan Active 1",
 		Slug:                   "proj-plan-active-1",
 		GitRemote:              "https://github.com/acme/plan-widgets.git",
-		Visibility:             "public",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
