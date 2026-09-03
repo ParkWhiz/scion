@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
@@ -606,6 +608,70 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// AdminStatusResponse is the response for GET /api/v1/auth/admin-status.
+type AdminStatusResponse struct {
+	IsAdmin      bool     `json:"isAdmin"`
+	IsSuperAdmin bool     `json:"isSuperAdmin"`
+	Permissions  []string `json:"permissions"`
+}
+
+// handleAuthAdminStatus handles GET /api/v1/auth/admin-status.
+// Returns whether the current user has hub-admin or super-admin capabilities,
+// along with their effective system-scoped permission IDs.
+// This is used by the frontend to decide whether to show admin navigation,
+// which admin sections are visible, and to allow access to admin routes.
+func (s *Server) handleAuthAdminStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		MethodNotAllowed(w)
+		return
+	}
+
+	user := GetUserIdentityFromContext(r.Context())
+	if user == nil {
+		Unauthorized(w)
+		return
+	}
+
+	isSuperAdmin := IsUnscopedLocalPlatformAdmin(user)
+
+	var perms []string
+	if isSuperAdmin {
+		// Super-admin has all permissions — populate from registry so the
+		// frontend shows all UI elements without a separate code path.
+		perms = allPermissionIDs()
+	} else if s.authzService != nil {
+		// Resolve effective permissions from all system-scoped role bindings
+		// for this user. This handles both the built-in hub-admin role and
+		// any custom roles with partial permissions.
+		effective, err := s.authzService.getEffectivePermissions(
+			r.Context(),
+			store.RoleBindingPrincipalUser, user.ID(),
+			store.RoleScopeSystem, "",
+		)
+		if err != nil {
+			slog.Error("failed to resolve effective permissions for admin-status",
+				"user_id", user.ID(), "error", err)
+			InternalError(w)
+			return
+		}
+		perms = effective
+	}
+
+	// Ensure JSON serializes as [] rather than null when there are no permissions.
+	if perms == nil {
+		perms = []string{}
+	} else {
+		sort.Strings(perms)
+	}
+
+	writeJSON(w, http.StatusOK, AdminStatusResponse{
+		IsAdmin:      isSuperAdmin || len(perms) > 0,
+		IsSuperAdmin: isSuperAdmin,
+		Permissions:  perms,
+	})
+}
+
 // handleTokens routes user access token requests.
 func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -750,6 +816,12 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request, id st
 		NotFound(w, "access token")
 		return
 	}
+
+	s.emitMutationAudit(r.Context(), &store.MutationAuditRecord{
+		MutationType: "credential_revoke",
+		TargetType:   "user_access_token",
+		TargetID:     id,
+	})
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1235,7 +1307,7 @@ func (s *Server) provisionUser(ctx context.Context, info *ExternalUserInfo) (*st
 	// Authorization check
 	if !s.isUserAuthorized(ctx, info.Email) {
 		reason := "not_on_allow_list"
-		if s.config.UserAccessMode != "invite_only" {
+		if s.UserAccessMode() != "invite_only" {
 			reason = "domain_not_authorized"
 		}
 		LogInviteAuditFailure(ctx, s.auditLogger, InviteAuditLoginDenied, info.Email, reason)
@@ -1277,7 +1349,11 @@ func (s *Server) provisionUser(ctx context.Context, info *ExternalUserInfo) (*st
 				user.AvatarURL = info.AvatarURL
 			}
 			user.LastLogin = time.Now()
+			oldRole := user.Role
 			user.Role = s.getUserRole(info.Email, user.Role)
+			if oldRole == "admin" && user.Role != "admin" {
+				s.deleteSuperAdminBinding(ctx, user.ID)
+			}
 			LogInviteAudit(ctx, s.auditLogger, InviteAuditUserActivated, info.Email, "", user.ID, info.Email, nil)
 		} else {
 			// Update last login and backfill profile
@@ -1288,10 +1364,19 @@ func (s *Server) provisionUser(ctx context.Context, info *ExternalUserInfo) (*st
 			if info.DisplayName != "" && user.DisplayName == "" {
 				user.DisplayName = info.DisplayName
 			}
-			// Re-evaluate admin status on every login
+			// Re-evaluate admin status on every login.
+			// D11-fix2: when demotion actually happens (admin → non-admin),
+			// also delete the super-admin binding so IsSystemAdmin immediately
+			// agrees with IsUnscopedLocalPlatformAdmin. The empty-list guard
+			// is inherited: determineUserRole refuses to demote when AdminEmails
+			// is nil/empty, so oldRole == newRole and this branch is skipped.
 			if newRole := s.getUserRole(info.Email, user.Role); user.Role != newRole {
-				slog.Info("User role changed on login", "email", info.Email, "old_role", user.Role, "new_role", newRole)
+				oldRole := user.Role
+				slog.Info("User role changed on login", "email", info.Email, "old_role", oldRole, "new_role", newRole)
 				user.Role = newRole
+				if oldRole == "admin" {
+					s.deleteSuperAdminBinding(ctx, user.ID)
+				}
 			}
 		}
 		if err := s.store.UpdateUser(ctx, user); err != nil {
@@ -1314,7 +1399,7 @@ func generateID() string {
 // isUserAuthorized checks whether a user is permitted to log in based on
 // admin_emails, authorized_domains, and user_access_mode (allow list).
 func (s *Server) isUserAuthorized(ctx context.Context, email string) bool {
-	return checkUserAuthorized(ctx, email, s.config.AuthorizedDomains, s.config.AdminEmails, s.config.UserAccessMode, s.store)
+	return checkUserAuthorized(ctx, email, s.AuthorizedDomains(), s.AdminEmails(), s.UserAccessMode(), s.store)
 }
 
 // checkUserAuthorized is a package-level authorization check used by both
@@ -1430,21 +1515,46 @@ func isEmailAuthorized(email string, authorizedDomains []string, adminEmails []s
 // determineUserRole returns the role for a user based on their email and the
 // role they currently hold.
 //
-// The adminEmails config list is additive-only: it acts as a floor, not a
-// ceiling. A user is "admin" if their email is in adminEmails, so config always
-// promotes. Otherwise any role the user already holds is preserved verbatim —
-// including "viewer" and any role added in future — so config never demotes or
-// rewrites a role set through the admin UI/API. Only a user with no stored role
-// (that is, one that does not exist yet) defaults to "member".
+// The adminEmails config list is the sole authority for the "admin" role:
+//   - Present in adminEmails → always "admin" (promotion).
+//   - Absent from adminEmails AND currentRole is "admin" → demoted to "member"
+//     (D11: removal from AdminEmails is no longer a no-op).
+//   - Absent from adminEmails AND currentRole is anything else → preserved
+//     verbatim (including "viewer" and any role added in future).
+//   - No stored role (new user) → "member".
+//
+// This function intentionally does NOT demote non-admin roles: a "viewer" set
+// through the admin UI stays "viewer". Only the "admin" role is owned by
+// config; all other roles are owned by the database.
+//
+// demotionSafe gates whether demotion is permitted: it is set to true by the
+// startup reconciler only when the intended admin set is non-empty. When false
+// (reconciler refused demotions, never ran, or errored), login-time demotion
+// is blocked to prevent one-at-a-time admin loss through the interactive path.
 //
 // currentRole is the user's role as stored in the database; pass "" for a user
 // that does not exist yet.
-func determineUserRole(email string, adminEmails []string, currentRole string) string {
+func determineUserRole(email string, adminEmails []string, currentRole string, demotionSafe bool) string {
 	emailLower := strings.ToLower(email)
 	for _, adminEmail := range adminEmails {
 		if strings.ToLower(adminEmail) == emailLower {
 			return "admin"
 		}
+	}
+	// D11: if the user currently holds "admin" but is no longer in adminEmails,
+	// demote to "member". The admin role is owned by config, not by the store.
+	//
+	// Empty-list safety: when adminEmails is nil or empty, do NOT demote.
+	// An empty list is almost always a config load failure, not an instruction
+	// to remove every administrator. The reconciliation function has its own
+	// empty-list guard, but login-time evaluation must be equally safe.
+	//
+	// Reconciler guard: when demotionSafe is false (reconciler refused batch
+	// demotions because the intended admin set was empty, or reconciler never
+	// ran), refuse login-time demotion too — the same condition that prevents
+	// mass demotion at startup must prevent one-at-a-time demotion at login.
+	if currentRole == "admin" && len(adminEmails) > 0 && demotionSafe {
+		return "member"
 	}
 	if currentRole != "" {
 		return currentRole
@@ -1453,8 +1563,12 @@ func determineUserRole(email string, adminEmails []string, currentRole string) s
 }
 
 // (s *Server) getUserRole is a convenience method to determine role using server config.
+// It consults the process-level demotionSafe flag set by the startup reconciler:
+// when the reconciler refused demotions (zero intended admins, empty config, or
+// reconciler never ran), demotionSafe is false and login-time demotion is blocked
+// to prevent one-at-a-time admin loss through the interactive path.
 func (s *Server) getUserRole(email, currentRole string) string {
-	return determineUserRole(email, s.config.AdminEmails, currentRole)
+	return determineUserRole(email, s.AdminEmails(), currentRole, s.demotionSafe.Load())
 }
 
 // handleInviteRedeem handles POST /api/v1/auth/invite/redeem.
@@ -1489,8 +1603,9 @@ func (s *Server) handleInviteRedeem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check authorized domains before allowing redemption
-	if len(s.config.AuthorizedDomains) > 0 {
-		if !isEmailInDomains(strings.ToLower(user.Email()), s.config.AuthorizedDomains) {
+	authorizedDomains := s.AuthorizedDomains()
+	if len(authorizedDomains) > 0 {
+		if !isEmailInDomains(strings.ToLower(user.Email()), authorizedDomains) {
 			writeError(w, http.StatusForbidden, "unauthorized_domain",
 				"your email domain is not authorized to join this hub", nil)
 			return
@@ -1529,4 +1644,97 @@ func (s *Server) handleInviteRedeem(w http.ResponseWriter, r *http.Request) {
 			"email": user.Email(),
 		},
 	})
+}
+
+// AuthScopeEntry is a single UAT scope in the scopes endpoint response.
+type AuthScopeEntry struct {
+	ID          string `json:"id"`
+	Resource    string `json:"resource"`
+	Action      string `json:"action"`
+	Description string `json:"description"`
+}
+
+// AuthScopeAlias is a convenience alias that expands to multiple scopes.
+type AuthScopeAlias struct {
+	ID          string   `json:"id"`
+	Description string   `json:"description"`
+	ExpandsTo   []string `json:"expands_to"`
+}
+
+// AuthScopesResponse is the response for GET /api/v1/auth/scopes.
+type AuthScopesResponse struct {
+	Scopes  []AuthScopeEntry `json:"scopes"`
+	Aliases []AuthScopeAlias `json:"aliases"`
+}
+
+// handleAuthScopes handles GET /api/v1/auth/scopes.
+// Returns all valid UAT scopes from the permissions registry.
+func (s *Server) handleAuthScopes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		MethodNotAllowed(w)
+		return
+	}
+
+	options := permissions.UATScopeOptions(false)
+	scopes := make([]AuthScopeEntry, 0, len(options))
+	for _, opt := range options {
+		scopes = append(scopes, AuthScopeEntry{
+			ID:          opt.UATScope,
+			Resource:    opt.Resource,
+			Action:      opt.Action,
+			Description: opt.Description,
+		})
+	}
+
+	// Build aliases dynamically from the manage alias registry.
+	aliasKeys := make([]string, 0, len(permissions.UATManageAliases))
+	for alias := range permissions.UATManageAliases {
+		aliasKeys = append(aliasKeys, alias)
+	}
+	sort.Strings(aliasKeys)
+	aliases := make([]AuthScopeAlias, 0, len(aliasKeys))
+	for _, alias := range aliasKeys {
+		resource := permissions.UATManageAliases[alias]
+		aliases = append(aliases, AuthScopeAlias{
+			ID:          alias,
+			Description: fmt.Sprintf("All %s management operations", resource),
+			ExpandsTo:   permissions.UATManageScopesFor(resource),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, AuthScopesResponse{
+		Scopes:  scopes,
+		Aliases: aliases,
+	})
+}
+
+// deleteSuperAdminBinding removes the system-scoped super-admin role binding for
+// a user, if one exists. Called at login time when demotion actually happened
+// (D11-fix2, Finding 3) so that IsSystemAdmin immediately agrees with
+// IsUnscopedLocalPlatformAdmin. Best-effort: errors are logged but do not fail
+// the login — the next startup reconciliation will clean up.
+func (s *Server) deleteSuperAdminBinding(ctx context.Context, userID string) {
+	rd, err := s.store.GetRoleDefinitionByName(ctx, store.SystemRoleSuperAdmin, store.RoleScopeSystem)
+	if err != nil {
+		slog.Warn("deleteSuperAdminBinding: super-admin role definition not found", "user_id", userID, "error", err)
+		return
+	}
+
+	bindings, err := s.store.ListRoleBindingsForPrincipal(ctx, store.RoleBindingPrincipalUser, userID)
+	if err != nil {
+		slog.Warn("deleteSuperAdminBinding: failed to list bindings", "user_id", userID, "error", err)
+		return
+	}
+
+	for _, b := range bindings {
+		if b.ScopeType == store.RoleScopeSystem && b.RoleDefinitionID == rd.ID {
+			if err := s.store.DeleteRoleBinding(ctx, b.ID); err != nil {
+				slog.Warn("deleteSuperAdminBinding: failed to delete binding",
+					"user_id", userID, "binding_id", b.ID, "error", err)
+			} else {
+				slog.Info("deleted super-admin binding at login-time demotion",
+					"user_id", userID, "binding_id", b.ID)
+			}
+		}
+	}
 }

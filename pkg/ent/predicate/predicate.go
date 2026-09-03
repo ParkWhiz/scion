@@ -6,11 +6,17 @@ import (
 	"entgo.io/ent/dialect/sql"
 )
 
+// AccessConstraint is the predicate function for accessconstraint builders.
+type AccessConstraint func(*sql.Selector)
+
 // AccessPolicy is the predicate function for accesspolicy builders.
 type AccessPolicy func(*sql.Selector)
 
 // Agent is the predicate function for agent builders.
 type Agent func(*sql.Selector)
+
+// AgentCredential is the predicate function for agentcredential builders.
+type AgentCredential func(*sql.Selector)
 
 // AgentSessionMetrics is the predicate function for agentsessionmetrics builders.
 type AgentSessionMetrics func(*sql.Selector)
@@ -32,6 +38,21 @@ type BrokerSecret func(*sql.Selector)
 
 // ChatLinkCode is the predicate function for chatlinkcode builders.
 type ChatLinkCode func(*sql.Selector)
+
+// Conversation is the predicate function for conversation builders.
+type Conversation func(*sql.Selector)
+
+// ConversationParticipant is the predicate function for conversationparticipant builders.
+type ConversationParticipant func(*sql.Selector)
+
+// DecisionAudit is the predicate function for decisionaudit builders.
+type DecisionAudit func(*sql.Selector)
+
+// DelegationEdge is the predicate function for delegationedge builders.
+type DelegationEdge func(*sql.Selector)
+
+// EntitlementBinding is the predicate function for entitlementbinding builders.
+type EntitlementBinding func(*sql.Selector)
 
 // EnvVar is the predicate function for envvar builders.
 type EnvVar func(*sql.Selector)
@@ -72,6 +93,9 @@ type LifecycleHook func(*sql.Selector)
 // LifecycleHookAgentPhase is the predicate function for lifecyclehookagentphase builders.
 type LifecycleHookAgentPhase func(*sql.Selector)
 
+// LimitDefinition is the predicate function for limitdefinition builders.
+type LimitDefinition func(*sql.Selector)
+
 // MaintenanceOperation is the predicate function for maintenanceoperation builders.
 type MaintenanceOperation func(*sql.Selector)
 
@@ -80,6 +104,12 @@ type MaintenanceOperationRun func(*sql.Selector)
 
 // Message is the predicate function for message builders.
 type Message func(*sql.Selector)
+
+// MessageAddressee is the predicate function for messageaddressee builders.
+type MessageAddressee func(*sql.Selector)
+
+// MutationAudit is the predicate function for mutationaudit builders.
+type MutationAudit func(*sql.Selector)
 
 // NonceCache is the predicate function for noncecache builders.
 type NonceCache func(*sql.Selector)
@@ -104,6 +134,12 @@ type ProjectPreStartHook func(*sql.Selector)
 
 // ProjectSyncState is the predicate function for projectsyncstate builders.
 type ProjectSyncState func(*sql.Selector)
+
+// RoleBinding is the predicate function for rolebinding builders.
+type RoleBinding func(*sql.Selector)
+
+// RoleDefinition is the predicate function for roledefinition builders.
+type RoleDefinition func(*sql.Selector)
 
 // RuntimeBroker is the predicate function for runtimebroker builders.
 type RuntimeBroker func(*sql.Selector)
@@ -134,6 +170,9 @@ type SubscriptionTemplate func(*sql.Selector)
 
 // Template is the predicate function for template builders.
 type Template func(*sql.Selector)
+
+// UsageReservation is the predicate function for usagereservation builders.
+type UsageReservation func(*sql.Selector)
 
 // User is the predicate function for user builders.
 type User func(*sql.Selector)

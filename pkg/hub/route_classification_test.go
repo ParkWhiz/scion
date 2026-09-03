@@ -25,6 +25,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 )
 
 var routePermissionClassifications = map[string]string{
@@ -35,10 +37,12 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/auth/token":                        "public:auth",
 	"/api/v1/auth/refresh":                      "public:auth",
 	"/api/v1/auth/validate":                     "public:auth",
+	"/api/v1/auth/admin-status":                 "authenticated:user",
 	"/api/v1/auth/logout":                       "authenticated:user",
 	"/api/v1/auth/me":                           "authenticated:user",
 	"/api/v1/auth/tokens":                       "authenticated:user-token",
 	"/api/v1/auth/tokens/":                      "authenticated:user-token",
+	"/api/v1/auth/scopes":                       "authenticated:user-token",
 	"/api/v1/auth/providers":                    "public:auth",
 	"/api/v1/auth/invite/redeem":                "public:invite",
 	"/api/v1/auth/cli/authorize":                "public:cli-oauth",
@@ -61,8 +65,8 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/gcp-service-accounts/":             "policy:gcp-service-account",
 	"/api/v1/skills":                            "policy:skill",
 	"/api/v1/skills/":                           "policy:skill",
-	"/api/v1/skill-registries":                  "policy:skill-registry",
-	"/api/v1/skill-registries/":                 "policy:skill-registry",
+	"/api/v1/skill-registries":                  "hub-admin:skill-registry",
+	"/api/v1/skill-registries/":                 "hub-admin:skill-registry",
 	"/api/v1/harness-configs":                   "policy:harness-config",
 	"/api/v1/harness-configs/":                  "policy:harness-config",
 	"/api/v1/pre-start-hooks":                   "policy:pre-start-hook",
@@ -76,15 +80,15 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/metrics/session/":                  "authenticated:session-metrics",
 	"/api/v1/groups":                            "policy:group",
 	"/api/v1/groups/":                           "policy:group",
-	"/api/v1/policies":                          "hub-admin:policy",
-	"/api/v1/policies/":                         "hub-admin:policy",
+	"/api/v1/policies":                          "authenticated:policy-gone",
+	"/api/v1/policies/":                         "authenticated:policy-gone",
 	"/api/v1/users/me/groups":                   "authenticated:principal",
 	"/api/v1/principals/":                       "authenticated:principal",
 	"/api/v1/users/me/injected-skills":          "authenticated:injected-skills",
 	"/api/v1/users/me/injected-skills/":         "authenticated:injected-skills",
 	"/api/v1/users/me/templates":                "authenticated:user-templates",
 	"/api/v1/users/me/templates/":               "authenticated:user-templates",
-	"/api/v1/hub/settings/injected-skills":      "hub-admin:injected-skills",
+	"/api/v1/hub/settings/injected-skills":      "authenticated:injected-skills",
 	"/api/v1/brokers":                           "broker-hmac:registration",
 	"/api/v1/brokers/join":                      "broker-hmac:registration",
 	"/api/v1/brokers/":                          "broker-hmac:broker",
@@ -118,6 +122,7 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/admin/diagnostics/logs/stream":     "hub-admin:diagnostics",
 	"/api/v1/admin/diagnostics/logs":            "hub-admin:diagnostics",
 	"/api/v1/admin/health/summary":              "hub-admin:health",
+	"/api/v1/admin/messaging/divergence":        "hub-admin:diagnostics",
 	"/api/v1/metrics/":                          "hub-admin:metrics-dashboard",
 	"/api/v1/admin/metrics-dashboard":           "hub-admin:metrics-dashboard",
 	"/api/v1/notifications":                     "authenticated:notifications",
@@ -177,6 +182,27 @@ var routePermissionClassifications = map[string]string{
 	"/api/v1/system/fs/list":                    "workstation:filesystem",
 	"/api/v1/system/fs/mkdir":                   "workstation:filesystem",
 	"/api/v1/system/fs/validate-path":           "workstation:filesystem",
+	"/api/v1/authz/explain":                     "authenticated:authz-explain",
+	"/api/v1/admin/limits":                      "hub-admin:quota",
+	"/api/v1/admin/limits/":                     "hub-admin:quota",
+	"/api/v1/admin/entitlements/":               "hub-admin:quota",
+	"/api/v1/admin/usage":                       "hub-admin:quota",
+	"/api/v1/admin/usage/":                      "hub-admin:quota",
+	"/api/v1/usage/me":                          "authenticated:quota-usage",
+	// Role management (PR-C1)
+	"/api/v1/admin/roles":          "hub-admin:role",
+	"/api/v1/admin/roles/":         "hub-admin:role",
+	"/api/v1/admin/role-bindings":  "hub-admin:role_binding",
+	"/api/v1/admin/role-bindings/": "hub-admin:role_binding",
+	"/api/v1/admin/permissions":    "hub-admin:role",
+
+	// Access Constraints (AC1)
+	"/api/v1/admin/access-constraints":  "hub-admin:access_constraint",
+	"/api/v1/admin/access-constraints/": "hub-admin:access_constraint",
+
+	// Access Constraint Previews (B7)
+	"/api/v1/admin/access-constraint-previews":  "hub-admin:access_constraint",
+	"/api/v1/admin/access-constraint-previews/": "hub-admin:access_constraint",
 }
 
 func TestRegisteredRoutesHavePermissionClassification(t *testing.T) {
@@ -219,13 +245,159 @@ func TestRegisteredRoutesHavePermissionClassification(t *testing.T) {
 	}
 }
 
-func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
+func TestRegisteredRoutesHaveRouteMetadata(t *testing.T) {
+	source, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatalf("read server.go: %v", err)
+	}
+
+	re := regexp.MustCompile(`s\.mux\.Handle(?:Func)?\("([^"]+)"`)
+	matches := re.FindAllStringSubmatch(string(source), -1)
+	if len(matches) == 0 {
+		t.Fatal("no registered routes found in server.go")
+	}
+
+	registered := make(map[string]bool, len(matches))
+	for _, match := range matches {
+		registered[match[1]] = true
+	}
+
+	var missing []string
+	for route := range registered {
+		meta, ok := routeMetadataTable[route]
+		if !ok {
+			missing = append(missing, route)
+			continue
+		}
+		if meta.Classification == "" {
+			missing = append(missing, route+" (empty classification)")
+		}
+		if meta.RouteID == "" {
+			missing = append(missing, route+" (empty routeID)")
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("registered routes missing route metadata: %v", missing)
+	}
+
+	var stale []string
+	for route := range routeMetadataTable {
+		if !registered[route] {
+			stale = append(stale, route)
+		}
+	}
+	sort.Strings(stale)
+	if len(stale) > 0 {
+		t.Fatalf("route metadata for unregistered routes: %v", stale)
+	}
+}
+
+func TestRouteMetadataPermissionsAreValid(t *testing.T) {
+	// Build set of valid permission IDs from the registry.
+	validPermissions := make(map[string]bool)
+	for _, perm := range permissions.Registry {
+		validPermissions[perm.ID] = true
+	}
+
+	var invalid []string
+	for pattern, meta := range routeMetadataTable {
+		if meta.Classification != RoutePolicy {
+			continue
+		}
+		if meta.Permission == "" {
+			invalid = append(invalid, pattern+": empty permission")
+			continue
+		}
+		if !validPermissions[meta.Permission] {
+			invalid = append(invalid, pattern+": unknown permission "+meta.Permission)
+		}
+		if meta.Resource == "" {
+			invalid = append(invalid, pattern+": empty resource")
+		}
+		if meta.Action == "" {
+			invalid = append(invalid, pattern+": empty action")
+		}
+	}
+	sort.Strings(invalid)
+	if len(invalid) > 0 {
+		t.Fatalf("invalid route metadata permissions:\n%s", strings.Join(invalid, "\n"))
+	}
+}
+
+func TestRouteGuardsDenyUnauthorized(t *testing.T) {
 	srv := &Server{config: DefaultServerConfig(), mux: http.NewServeMux()}
 	srv.registerRoutes()
 
-	admin := NewAuthenticatedUser("admin-uat", "admin-uat@example.com", "Admin UAT", "admin", "api")
-	scopedAdmin := NewScopedUserIdentity(admin, "project-1", []string{"agent:create", "project:read", "policy:manage"})
+	// Test representative routes from each classification.
+	tests := []struct {
+		name           string
+		route          string
+		classification RouteClassification
+		identity       Identity
+		wantStatus     int
+	}{
+		// RouteAuthenticated: no identity → 401
+		{
+			name:           "authenticated route denies unauthenticated",
+			route:          "/api/v1/auth/logout",
+			classification: RouteAuthenticated,
+			identity:       nil,
+			wantStatus:     http.StatusUnauthorized,
+		},
+		// RouteHubAdmin: non-admin user → 403
+		// Uses a route without Permission (requireAdmin fallback) so this test
+		// works without an authzService. Permission-based routes are tested in
+		// TestRouteGuardOpsPermissions with a full server.
+		{
+			name:           "hub-admin route denies non-admin",
+			route:          "/api/v1/admin/allow-list",
+			classification: RouteHubAdmin,
+			identity:       NewAuthenticatedUser("user-1", "user@example.com", "User", "member", "api"),
+			wantStatus:     http.StatusForbidden,
+		},
+		// RouteHubAdmin: no identity → 401
+		{
+			name:           "hub-admin route denies unauthenticated",
+			route:          "/api/v1/admin/allow-list",
+			classification: RouteHubAdmin,
+			identity:       nil,
+			wantStatus:     http.StatusUnauthorized,
+		},
+		// RouteAgentToken: no identity → 401
+		{
+			name:           "agent-token route denies unauthenticated",
+			route:          "/api/v1/agent/gcp-token",
+			classification: RouteAgentToken,
+			identity:       nil,
+			wantStatus:     http.StatusUnauthorized,
+		},
+	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tt.identity != nil {
+				ctx = contextWithIdentity(ctx, tt.identity)
+			}
+			ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer cancel()
+
+			req := httptest.NewRequest(http.MethodGet, tt.route, nil)
+			req = req.WithContext(ctx)
+			rr := httptest.NewRecorder()
+
+			srv.mux.ServeHTTP(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("route %s returned %d, want %d: %s", tt.route, rr.Code, tt.wantStatus, rr.Body.String())
+			}
+		})
+	}
+}
+
+// allHubAdminRoutes returns all routes classified as hub-admin, sorted.
+func allHubAdminRoutes() []string {
 	routes := make([]string, 0)
 	for route, classification := range routePermissionClassifications {
 		if strings.HasPrefix(classification, "hub-admin:") {
@@ -233,9 +405,28 @@ func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
 		}
 	}
 	sort.Strings(routes)
+	return routes
+}
+
+func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
+	srv := &Server{config: DefaultServerConfig(), mux: http.NewServeMux(), authzService: NewAuthzService(nil, nil)}
+	srv.registerRoutes()
+
+	admin := NewAuthenticatedUser("admin-uat", "admin-uat@example.com", "Admin UAT", "admin", "api")
+	scopedAdmin := NewScopedUserIdentity(admin, "project-1", []string{"agent:create", "project:read", "policy:manage"})
+
+	routes := allHubAdminRoutes()
 
 	for _, route := range routes {
 		t.Run(route, func(t *testing.T) {
+			// Skip routes that have Permission set — they require an authzService
+			// to exercise the Decide path. These are tested in
+			// TestRouteGuardOpsPermissions with a full server.
+			if meta, ok := routeMetadataTable[route]; ok && meta.Permission != "" {
+				t.Skipf("skipping permission-based route %s (tested in TestRouteGuardOpsPermissions)", route)
+				return
+			}
+
 			method, path, body := scopedAdminUATRouteRequest(route)
 			ctx, cancel := context.WithTimeout(contextWithIdentity(context.Background(), scopedAdmin), 200*time.Millisecond)
 			defer cancel()

@@ -23,14 +23,8 @@ import (
 // handleAdminValidateResources validates storage consistency for all global
 // resources (templates and harness-configs). Requires admin role.
 func (s *Server) handleAdminValidateResources(w http.ResponseWriter, r *http.Request) {
-	user := GetUserIdentityFromContext(r.Context())
-	if user == nil || user.Role() != "admin" {
-		Forbidden(w)
-		return
-	}
-
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 

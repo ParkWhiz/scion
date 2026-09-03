@@ -278,6 +278,11 @@ type CreateAgentRequest struct {
 	// taking precedence over ResolvedEnv.
 	ResolvedEnv map[string]string `json:"resolvedEnv,omitempty"`
 
+	// EnvClassifications records the classification (plain, secret-fetchable,
+	// secret-injected) for each key in ResolvedEnv (#127, P3a). See
+	// api.EnvKind for three-state semantics (present, absent, nil).
+	EnvClassifications map[string]api.EnvKind `json:"envClassifications,omitempty"`
+
 	// ResolvedSecrets contains type-aware secrets resolved by the Hub.
 	// These are projected into the agent container based on their type
 	// (environment variable, file, or variable).
@@ -582,7 +587,9 @@ func AgentInfoToResponse(info api.AgentInfo) AgentResponse {
 		phase = info.Phase
 		status = info.Phase
 	} else {
-		// Legacy fallback: derive phase and status from container status
+		// Legacy fallback: derive phase from ContainerStatus for runtimes
+		// that don't populate Phase directly. All current runtimes populate
+		// Phase as of #1257, but this remains for backward compatibility.
 		switch {
 		case info.ContainerStatus == "":
 			phase = string(state.PhaseCreated)
@@ -639,7 +646,8 @@ func AgentInfoToResponse(info api.AgentInfo) AgentResponse {
 	return resp
 }
 
-// containsAny checks if s contains any of the substrings (case-insensitive).
+// containsAny is used by the legacy ContainerStatus-to-Phase fallback.
+// It checks if s contains any of the substrings (case-insensitive).
 func containsAny(s string, substrs ...string) bool {
 	s = strings.ToLower(s)
 	for _, sub := range substrs {

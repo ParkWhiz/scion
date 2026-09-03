@@ -97,6 +97,8 @@ export default defineConfig({
 							label: 'Release Notes',
 							items: [
 								{ label: 'Overview', slug: 'release-notes' },
+								{ label: 'Aug 24 -- 30', slug: 'release-notes/2026-08-24' },
+								{ label: 'Aug 17 -- 23', slug: 'release-notes/2026-08-17' },
 								{ label: 'Aug 10 -- 16', slug: 'release-notes/2026-08-10' },
 								{ label: 'Aug 3 -- 9', slug: 'release-notes/2026-08-03' },
 								{ label: 'Jul 27 -- Aug 2', slug: 'release-notes/2026-07-27' },
@@ -149,11 +151,12 @@ export default defineConfig({
 						{
 							label: 'Admin Guide',
 							items: [
-								{ label: 'Single-node Overview', slug: 'hosted/single-node/overview' },
-								{ label: 'Hub Setup', slug: 'hosted/single-node/hub-server' },
-								{ label: 'Deploy on a VM (GCE)', slug: 'hosted/single-node/hub-setup-gce' },
-								{ label: 'Auth & Tenancy', slug: 'hosted/single-node/auth' },
-								{ label: 'Managed Agents', slug: 'hosted/single-node/managed-agents' },
+							        { label: 'Single-node Overview', slug: 'hosted/single-node/overview' },
+							        { label: 'Hub Setup', slug: 'hosted/single-node/hub-server' },
+							        { label: 'Deploy on a VM (GCE)', slug: 'hosted/single-node/hub-setup-gce' },
+							        { label: 'Deploy on Cloud Run (Sandbox)', slug: 'hosted/single-node/hub-setup-cloudrun' },
+							        { label: 'Auth & Tenancy', slug: 'hosted/single-node/auth' },
+							        { label: 'Managed Agents', slug: 'hosted/single-node/managed-agents' },
 								{ label: 'Skill Registry & Federation', slug: 'hosted/single-node/skill-registry' },
 								{ label: 'Observability', slug: 'hosted/single-node/observability' },
 								{ label: 'Metrics', slug: 'hosted/single-node/metrics' },

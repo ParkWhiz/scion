@@ -12,10 +12,14 @@ import (
 // Tx is a transactional client that is created by calling Client.Tx().
 type Tx struct {
 	config
+	// AccessConstraint is the client for interacting with the AccessConstraint builders.
+	AccessConstraint *AccessConstraintClient
 	// AccessPolicy is the client for interacting with the AccessPolicy builders.
 	AccessPolicy *AccessPolicyClient
 	// Agent is the client for interacting with the Agent builders.
 	Agent *AgentClient
+	// AgentCredential is the client for interacting with the AgentCredential builders.
+	AgentCredential *AgentCredentialClient
 	// AgentSessionMetrics is the client for interacting with the AgentSessionMetrics builders.
 	AgentSessionMetrics *AgentSessionMetricsClient
 	// AllowListEntry is the client for interacting with the AllowListEntry builders.
@@ -30,6 +34,16 @@ type Tx struct {
 	BrokerSecret *BrokerSecretClient
 	// ChatLinkCode is the client for interacting with the ChatLinkCode builders.
 	ChatLinkCode *ChatLinkCodeClient
+	// Conversation is the client for interacting with the Conversation builders.
+	Conversation *ConversationClient
+	// ConversationParticipant is the client for interacting with the ConversationParticipant builders.
+	ConversationParticipant *ConversationParticipantClient
+	// DecisionAudit is the client for interacting with the DecisionAudit builders.
+	DecisionAudit *DecisionAuditClient
+	// DelegationEdge is the client for interacting with the DelegationEdge builders.
+	DelegationEdge *DelegationEdgeClient
+	// EntitlementBinding is the client for interacting with the EntitlementBinding builders.
+	EntitlementBinding *EntitlementBindingClient
 	// EnvVar is the client for interacting with the EnvVar builders.
 	EnvVar *EnvVarClient
 	// GCPServiceAccount is the client for interacting with the GCPServiceAccount builders.
@@ -56,12 +70,18 @@ type Tx struct {
 	LifecycleHook *LifecycleHookClient
 	// LifecycleHookAgentPhase is the client for interacting with the LifecycleHookAgentPhase builders.
 	LifecycleHookAgentPhase *LifecycleHookAgentPhaseClient
+	// LimitDefinition is the client for interacting with the LimitDefinition builders.
+	LimitDefinition *LimitDefinitionClient
 	// MaintenanceOperation is the client for interacting with the MaintenanceOperation builders.
 	MaintenanceOperation *MaintenanceOperationClient
 	// MaintenanceOperationRun is the client for interacting with the MaintenanceOperationRun builders.
 	MaintenanceOperationRun *MaintenanceOperationRunClient
 	// Message is the client for interacting with the Message builders.
 	Message *MessageClient
+	// MessageAddressee is the client for interacting with the MessageAddressee builders.
+	MessageAddressee *MessageAddresseeClient
+	// MutationAudit is the client for interacting with the MutationAudit builders.
+	MutationAudit *MutationAuditClient
 	// NonceCache is the client for interacting with the NonceCache builders.
 	NonceCache *NonceCacheClient
 	// Notification is the client for interacting with the Notification builders.
@@ -78,6 +98,10 @@ type Tx struct {
 	ProjectPreStartHook *ProjectPreStartHookClient
 	// ProjectSyncState is the client for interacting with the ProjectSyncState builders.
 	ProjectSyncState *ProjectSyncStateClient
+	// RoleBinding is the client for interacting with the RoleBinding builders.
+	RoleBinding *RoleBindingClient
+	// RoleDefinition is the client for interacting with the RoleDefinition builders.
+	RoleDefinition *RoleDefinitionClient
 	// RuntimeBroker is the client for interacting with the RuntimeBroker builders.
 	RuntimeBroker *RuntimeBrokerClient
 	// Schedule is the client for interacting with the Schedule builders.
@@ -98,6 +122,8 @@ type Tx struct {
 	SubscriptionTemplate *SubscriptionTemplateClient
 	// Template is the client for interacting with the Template builders.
 	Template *TemplateClient
+	// UsageReservation is the client for interacting with the UsageReservation builders.
+	UsageReservation *UsageReservationClient
 	// User is the client for interacting with the User builders.
 	User *UserClient
 	// UserAccessToken is the client for interacting with the UserAccessToken builders.
@@ -233,8 +259,10 @@ func (tx *Tx) Client() *Client {
 }
 
 func (tx *Tx) init() {
+	tx.AccessConstraint = NewAccessConstraintClient(tx.config)
 	tx.AccessPolicy = NewAccessPolicyClient(tx.config)
 	tx.Agent = NewAgentClient(tx.config)
+	tx.AgentCredential = NewAgentCredentialClient(tx.config)
 	tx.AgentSessionMetrics = NewAgentSessionMetricsClient(tx.config)
 	tx.AllowListEntry = NewAllowListEntryClient(tx.config)
 	tx.ApiKey = NewApiKeyClient(tx.config)
@@ -242,6 +270,11 @@ func (tx *Tx) init() {
 	tx.BrokerJoinToken = NewBrokerJoinTokenClient(tx.config)
 	tx.BrokerSecret = NewBrokerSecretClient(tx.config)
 	tx.ChatLinkCode = NewChatLinkCodeClient(tx.config)
+	tx.Conversation = NewConversationClient(tx.config)
+	tx.ConversationParticipant = NewConversationParticipantClient(tx.config)
+	tx.DecisionAudit = NewDecisionAuditClient(tx.config)
+	tx.DelegationEdge = NewDelegationEdgeClient(tx.config)
+	tx.EntitlementBinding = NewEntitlementBindingClient(tx.config)
 	tx.EnvVar = NewEnvVarClient(tx.config)
 	tx.GCPServiceAccount = NewGCPServiceAccountClient(tx.config)
 	tx.GitHubResolutionCache = NewGitHubResolutionCacheClient(tx.config)
@@ -255,9 +288,12 @@ func (tx *Tx) init() {
 	tx.InviteCode = NewInviteCodeClient(tx.config)
 	tx.LifecycleHook = NewLifecycleHookClient(tx.config)
 	tx.LifecycleHookAgentPhase = NewLifecycleHookAgentPhaseClient(tx.config)
+	tx.LimitDefinition = NewLimitDefinitionClient(tx.config)
 	tx.MaintenanceOperation = NewMaintenanceOperationClient(tx.config)
 	tx.MaintenanceOperationRun = NewMaintenanceOperationRunClient(tx.config)
 	tx.Message = NewMessageClient(tx.config)
+	tx.MessageAddressee = NewMessageAddresseeClient(tx.config)
+	tx.MutationAudit = NewMutationAuditClient(tx.config)
 	tx.NonceCache = NewNonceCacheClient(tx.config)
 	tx.Notification = NewNotificationClient(tx.config)
 	tx.NotificationSubscription = NewNotificationSubscriptionClient(tx.config)
@@ -266,6 +302,8 @@ func (tx *Tx) init() {
 	tx.ProjectContributor = NewProjectContributorClient(tx.config)
 	tx.ProjectPreStartHook = NewProjectPreStartHookClient(tx.config)
 	tx.ProjectSyncState = NewProjectSyncStateClient(tx.config)
+	tx.RoleBinding = NewRoleBindingClient(tx.config)
+	tx.RoleDefinition = NewRoleDefinitionClient(tx.config)
 	tx.RuntimeBroker = NewRuntimeBrokerClient(tx.config)
 	tx.Schedule = NewScheduleClient(tx.config)
 	tx.ScheduledEvent = NewScheduledEventClient(tx.config)
@@ -276,6 +314,7 @@ func (tx *Tx) init() {
 	tx.SkillVersion = NewSkillVersionClient(tx.config)
 	tx.SubscriptionTemplate = NewSubscriptionTemplateClient(tx.config)
 	tx.Template = NewTemplateClient(tx.config)
+	tx.UsageReservation = NewUsageReservationClient(tx.config)
 	tx.User = NewUserClient(tx.config)
 	tx.UserAccessToken = NewUserAccessTokenClient(tx.config)
 }
@@ -287,7 +326,7 @@ func (tx *Tx) init() {
 // of them in order to commit or rollback the transaction.
 //
 // If a closed transaction is embedded in one of the generated entities, and the entity
-// applies a query, for example: AccessPolicy.QueryXXX(), the query will be executed
+// applies a query, for example: AccessConstraint.QueryXXX(), the query will be executed
 // through the driver which created this transaction.
 //
 // Note that txDriver is not goroutine safe.

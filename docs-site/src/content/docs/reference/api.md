@@ -48,7 +48,7 @@ Agent state uses a layered model:
 - `GET /:id`: Get broker status and capacity.
 
 #### Chat Attachments (`/api/v1/chat/attachments`)
-- `POST /`: Upload one or more files (`multipart/form-data`, field `files`, optional `project_id`). Max 10 files, 10 MB each.
+- `POST /`: Upload one or more files (`multipart/form-data`, field `files`, optional `project_id`). Max 10 files, 10 MB each. Text files containing unusual control characters (e.g., vertical tab `0x0B`) are supported and correctly identified as text.
 - `GET /:id`: Download a stored attachment. Responses carry `X-Content-Type-Options: nosniff`, and `Content-Disposition: inline` only for image types — everything else is served as an `attachment`.
 
 Uploads are accepted or refused **per file**, and the response reports both outcomes:
@@ -73,8 +73,24 @@ Status codes:
 The stored MIME type is derived from the file's content plus its extension; the `Content-Type` a client declares on the part is ignored. Executable extensions (`.exe`, `.sh`, `.js`, `.ps1`, and their peers) and markup extensions (`.html`, `.svg`, and their peers) are refused whatever the content is.
 
 #### Templates (`/api/v1/templates`)
-- `GET /`: List available agent templates.
+- `GET /`: List available agent templates. The authorized list validator caps list requests at a maximum limit of **100** templates per page (default is 50). Requests specifying a `limit` query parameter greater than 100 will fail with HTTP 400 Bad Request.
 - `POST /`: Upload a new template or version.
+
+#### Auth (`/api/v1/auth`)
+- `GET /scopes`: Dynamically discover all available User Access Token (UAT) scopes and their descriptions.
+
+#### Admin (`/api/v1/admin`)
+- `GET /roles`: List Role Definitions.
+- `POST /roles`, `PUT /roles/:id`, `DELETE /roles/:id`: Manage Role Definitions (requires appropriate administrative capabilities). Note that `updateRoleDefinition` includes a `CanDelegate` check to prevent privilege escalation.
+- `GET /role-bindings`: List Role Bindings (paginated).
+- `POST /role-bindings`, `PUT /role-bindings/:id`, `DELETE /role-bindings/:id`: Manage Role Bindings.
+- `GET /limits`: List Limit Definitions.
+- `GET /limits/:id`, `PUT /limits/:id`: Inspect or update a Limit Definition.
+- `GET /entitlements/:id`: Inspect an Entitlement Binding.
+- `GET /gcp-quota`: View GCP quota status.
+- `GET /messaging/divergence`: View a read-only snapshot of migration divergence counters and metadata for the conversation model transition (requires `hub.diagnostics.read` permission).
+
+The Quota System API enforces fail-closed limits. Route guards strictly separate read and write permissions, preventing arbitrary modification of system limits.
 
 ## Runtime Broker API
 

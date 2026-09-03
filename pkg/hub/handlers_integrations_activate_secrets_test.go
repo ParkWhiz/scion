@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !no_sqlite
+
 package hub
 
 import (
@@ -65,6 +67,10 @@ func (m *migrationSecretBackend) GetMeta(_ context.Context, name, _, _ string) (
 		return nil, store.ErrNotFound
 	}
 	return &secret.SecretMeta{Name: name}, nil
+}
+
+func (m *migrationSecretBackend) UpdateMeta(_ context.Context, _ *secret.UpdateMetaInput) (*secret.SecretMeta, error) {
+	return nil, nil
 }
 
 func (m *migrationSecretBackend) Resolve(context.Context, string, string, string, *secret.ResolveOpts) ([]secret.SecretWithValue, error) {

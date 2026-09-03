@@ -39,6 +39,8 @@ type Agent struct {
 	DelegationEnabled bool `json:"delegation_enabled,omitempty"`
 	// Visibility holds the value of the "visibility" field.
 	Visibility string `json:"visibility,omitempty"`
+	// MessageMode holds the value of the "message_mode" field.
+	MessageMode agent.MessageMode `json:"message_mode,omitempty"`
 	// Labels holds the value of the "labels" field.
 	Labels map[string]string `json:"labels,omitempty"`
 	// Annotations holds the value of the "annotations" field.
@@ -53,6 +55,10 @@ type Agent struct {
 	ConnectionState string `json:"connection_state,omitempty"`
 	// ContainerStatus holds the value of the "container_status" field.
 	ContainerStatus string `json:"container_status,omitempty"`
+	// ExitCode holds the value of the "exit_code" field.
+	ExitCode *int `json:"exit_code,omitempty"`
+	// ExitReason holds the value of the "exit_reason" field.
+	ExitReason string `json:"exit_reason,omitempty"`
 	// RuntimeState holds the value of the "runtime_state" field.
 	RuntimeState string `json:"runtime_state,omitempty"`
 	// StalledFromActivity holds the value of the "stalled_from_activity" field.
@@ -154,9 +160,9 @@ func (*Agent) scanValues(columns []string) ([]any, error) {
 			values[i] = new([]byte)
 		case agent.FieldDelegationEnabled, agent.FieldDetached, agent.FieldWebPtyEnabled:
 			values[i] = new(sql.NullBool)
-		case agent.FieldCurrentTurns, agent.FieldCurrentModelCalls, agent.FieldStateVersion:
+		case agent.FieldExitCode, agent.FieldCurrentTurns, agent.FieldCurrentModelCalls, agent.FieldStateVersion:
 			values[i] = new(sql.NullInt64)
-		case agent.FieldSlug, agent.FieldName, agent.FieldTemplate, agent.FieldStatus, agent.FieldVisibility, agent.FieldPhase, agent.FieldActivity, agent.FieldToolName, agent.FieldConnectionState, agent.FieldContainerStatus, agent.FieldRuntimeState, agent.FieldStalledFromActivity, agent.FieldImage, agent.FieldRuntime, agent.FieldRuntimeBrokerID, agent.FieldTaskSummary, agent.FieldMessage, agent.FieldAppliedConfig:
+		case agent.FieldSlug, agent.FieldName, agent.FieldTemplate, agent.FieldStatus, agent.FieldVisibility, agent.FieldMessageMode, agent.FieldPhase, agent.FieldActivity, agent.FieldToolName, agent.FieldConnectionState, agent.FieldContainerStatus, agent.FieldExitReason, agent.FieldRuntimeState, agent.FieldStalledFromActivity, agent.FieldImage, agent.FieldRuntime, agent.FieldRuntimeBrokerID, agent.FieldTaskSummary, agent.FieldMessage, agent.FieldAppliedConfig:
 			values[i] = new(sql.NullString)
 		case agent.FieldCreated, agent.FieldUpdated, agent.FieldLastSeen, agent.FieldLastActivityEvent, agent.FieldStartedAt, agent.FieldDeletedAt:
 			values[i] = new(sql.NullTime)
@@ -239,6 +245,12 @@ func (_m *Agent) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.Visibility = value.String
 			}
+		case agent.FieldMessageMode:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field message_mode", values[i])
+			} else if value.Valid {
+				_m.MessageMode = agent.MessageMode(value.String)
+			}
 		case agent.FieldLabels:
 			if value, ok := values[i].(*[]byte); !ok {
 				return fmt.Errorf("unexpected type %T for field labels", values[i])
@@ -284,6 +296,19 @@ func (_m *Agent) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field container_status", values[i])
 			} else if value.Valid {
 				_m.ContainerStatus = value.String
+			}
+		case agent.FieldExitCode:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field exit_code", values[i])
+			} else if value.Valid {
+				_m.ExitCode = new(int)
+				*_m.ExitCode = int(value.Int64)
+			}
+		case agent.FieldExitReason:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field exit_reason", values[i])
+			} else if value.Valid {
+				_m.ExitReason = value.String
 			}
 		case agent.FieldRuntimeState:
 			if value, ok := values[i].(*sql.NullString); !ok {
@@ -501,6 +526,9 @@ func (_m *Agent) String() string {
 	builder.WriteString("visibility=")
 	builder.WriteString(_m.Visibility)
 	builder.WriteString(", ")
+	builder.WriteString("message_mode=")
+	builder.WriteString(fmt.Sprintf("%v", _m.MessageMode))
+	builder.WriteString(", ")
 	builder.WriteString("labels=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Labels))
 	builder.WriteString(", ")
@@ -521,6 +549,14 @@ func (_m *Agent) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("container_status=")
 	builder.WriteString(_m.ContainerStatus)
+	builder.WriteString(", ")
+	if v := _m.ExitCode; v != nil {
+		builder.WriteString("exit_code=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
+	builder.WriteString("exit_reason=")
+	builder.WriteString(_m.ExitReason)
 	builder.WriteString(", ")
 	builder.WriteString("runtime_state=")
 	builder.WriteString(_m.RuntimeState)

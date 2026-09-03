@@ -10,6 +10,7 @@ import (
 // handleAdminResetAuthAll handles POST /api/v1/admin/agents/reset-auth-all.
 // It lists all running agents and dispatches an auth reset for each one,
 // returning a summary of successes and failures.
+// Authorization: enforced by routeGuard via hub.auth_reset.execute permission.
 func (s *Server) handleAdminResetAuthAll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		MethodNotAllowed(w)
@@ -17,14 +18,11 @@ func (s *Server) handleAdminResetAuthAll(w http.ResponseWriter, r *http.Request)
 	}
 
 	user := GetUserIdentityFromContext(r.Context())
-	if user == nil || user.Role() != "admin" {
-		Forbidden(w)
-		return
-	}
 
 	ctx := r.Context()
 
-	if s.dispatcher == nil {
+	disp := s.GetDispatcher()
+	if disp == nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"agent dispatcher not configured", nil)
 		return
@@ -56,7 +54,7 @@ func (s *Server) handleAdminResetAuthAll(w http.ResponseWriter, r *http.Request)
 			defer func() { <-sem }()
 
 			res := agentResult{ID: a.ID, Name: a.Name}
-			if err := s.dispatcher.DispatchAgentResetAuth(ctx, &a); err != nil {
+			if err := disp.DispatchAgentResetAuth(ctx, &a); err != nil {
 				slog.Error("Bulk reset-auth failed for agent", "agent_id", a.ID, "error", err)
 				res.Error = err.Error()
 			}

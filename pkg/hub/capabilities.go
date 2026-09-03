@@ -16,8 +16,8 @@ package hub
 
 import (
 	"context"
-	"errors"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -27,30 +27,20 @@ type Capabilities struct {
 }
 
 // ResourceActions maps resource types to the actions applicable to individual resources.
-var ResourceActions = map[string][]Action{
-	"agent":               {ActionRead, ActionUpdate, ActionDelete, ActionStart, ActionStop, ActionMessage, ActionAttach},
-	"project":             {ActionRead, ActionUpdate, ActionDelete, ActionManage, ActionRegister},
-	"skill":               {ActionRead, ActionUpdate, ActionDelete},
-	"template":            {ActionRead, ActionUpdate, ActionDelete},
-	"harness_config":      {ActionRead, ActionUpdate, ActionDelete},
-	"group":               {ActionRead, ActionUpdate, ActionDelete, ActionAddMember, ActionRemoveMember},
-	"user":                {ActionRead, ActionUpdate},
-	"policy":              {ActionRead, ActionUpdate, ActionDelete},
-	"broker":              {ActionRead, ActionUpdate, ActionDelete, ActionDispatch},
-	"gcp_service_account": {ActionRead, ActionDelete, ActionVerify, ActionAssign},
-}
+var ResourceActions = actionMapFromRegistry(permissions.ResourceActions())
 
 // ScopeActions maps resource types to scope-level actions (e.g., create, list).
-var ScopeActions = map[string][]Action{
-	"agent":               {ActionCreate, ActionList, ActionStopAll},
-	"project":             {ActionCreate, ActionList},
-	"skill":               {ActionCreate, ActionList},
-	"template":            {ActionCreate, ActionList},
-	"harness_config":      {ActionCreate, ActionList},
-	"group":               {ActionCreate, ActionList},
-	"policy":              {ActionCreate, ActionList},
-	"broker":              {ActionCreate, ActionList},
-	"gcp_service_account": {ActionCreate, ActionList, ActionMint},
+var ScopeActions = actionMapFromRegistry(permissions.ScopeActions())
+
+func actionMapFromRegistry(in map[string][]string) map[string][]Action {
+	out := make(map[string][]Action, len(in))
+	for resource, actions := range in {
+		out[resource] = make([]Action, len(actions))
+		for i, action := range actions {
+			out[resource][i] = Action(action)
+		}
+	}
+	return out
 }
 
 // agentResource constructs a Resource from a store.Agent for capability computation.
@@ -147,21 +137,6 @@ func userResource(u *store.User) Resource {
 	}
 }
 
-// policyResource constructs a Resource from a store.Policy for capability computation.
-func policyResource(p *store.Policy) Resource {
-	r := Resource{
-		Type:   "policy",
-		ID:     p.ID,
-		Labels: p.Labels,
-	}
-	// Project-scoped policies are children of the project for authz purposes.
-	if p.ScopeType == "project" && p.ScopeID != "" {
-		r.ParentType = "project"
-		r.ParentID = p.ScopeID
-	}
-	return r
-}
-
 // brokerResource constructs a Resource from a store.RuntimeBroker for capability computation.
 func brokerResource(b *store.RuntimeBroker) Resource {
 	return Resource{
@@ -200,14 +175,15 @@ func (a *AuthzService) ComputeCapabilities(ctx context.Context, identity Identit
 		return &Capabilities{Actions: []string{}}
 	}
 
-	// Admin short-circuit: return all actions
-	if user, ok := identity.(UserIdentity); ok && user.Role() == "admin" {
-		return allActions(actions)
+	// Super-admins get all actions via CheckAccess/Decide step-1 bypass.
+	// Hub-admins get correct capabilities from their role bindings.
+	if IsScopedUserIdentity(identity) {
+		return a.computeCapabilitiesWithContext(ctx, identity, resource, actions)
 	}
 
 	// Project owner/admin short-circuit: full access on project and project-scoped
-	// resources. Mirrors the bypass in checkAccessForUser so capability lists
-	// match what the user can actually do.
+	// resources. Mirrors the kernel evaluation so capability lists match what
+	// the user can actually do.
 	if user, ok := identity.(UserIdentity); ok {
 		if projectID := projectIDForResource(resource); projectID != "" {
 			if a.isProjectOwnerOrAdmin(ctx, user.ID(), projectID) {
@@ -236,15 +212,16 @@ func (a *AuthzService) ComputeScopeCapabilities(ctx context.Context, identity Id
 		return &Capabilities{Actions: []string{}}
 	}
 
-	// Admin short-circuit
-	if user, ok := identity.(UserIdentity); ok && user.Role() == "admin" {
-		return allActions(actions)
-	}
+	// Super-admins get all actions via CheckAccess/Decide step-1 bypass.
+	// Hub-admins get correct capabilities from their role bindings.
 
 	resource := Resource{
 		Type:       resourceType,
 		ParentType: scopeType,
 		ParentID:   scopeID,
+	}
+	if IsScopedUserIdentity(identity) {
+		return a.computeCapabilitiesWithContext(ctx, identity, resource, actions)
 	}
 
 	// Project owner/admin short-circuit at scope level (e.g. agent:create
@@ -280,18 +257,15 @@ func (a *AuthzService) ComputeCapabilitiesBatch(ctx context.Context, identity Id
 		return caps
 	}
 
-	// Admin short-circuit: return all actions for all resources
-	if user, ok := identity.(UserIdentity); ok && user.Role() == "admin" {
-		allCap := allActions(actions)
+	// Super-admins get all actions via CheckAccess/Decide step-1 bypass.
+	// Hub-admins get correct capabilities from their role bindings.
+	if IsScopedUserIdentity(identity) {
 		caps := make([]*Capabilities, len(resources))
-		for i := range caps {
-			caps[i] = allCap
+		for i, resource := range resources {
+			caps[i] = a.computeCapabilitiesWithContext(ctx, identity, resource, actions)
 		}
 		return caps
 	}
-
-	// Pre-fetch principals and policies once for the identity
-	principals, policies := a.precomputeForIdentity(ctx, identity)
 
 	// Per-batch project ownership cache. Most batches list resources from a
 	// single project, so this collapses to one lookup per project.
@@ -314,16 +288,6 @@ func (a *AuthzService) ComputeCapabilitiesBatch(ctx context.Context, identity Id
 
 	caps := make([]*Capabilities, len(resources))
 	for i, resource := range resources {
-		// Owner short-circuit
-		if resource.OwnerID != "" && resource.OwnerID == identity.ID() {
-			caps[i] = allActions(actions)
-			continue
-		}
-		// Ancestry short-circuit: ancestors get full access
-		if canAccessAsAncestor(identity.ID(), resource) {
-			caps[i] = allActions(actions)
-			continue
-		}
 		// Project owner/admin short-circuit
 		if isProjectOwner(projectIDForResource(resource)) {
 			caps[i] = allActions(actions)
@@ -332,7 +296,7 @@ func (a *AuthzService) ComputeCapabilitiesBatch(ctx context.Context, identity Id
 
 		var allowed []string
 		for _, action := range actions {
-			decision := a.checkAccessPrecomputed(identity, principals, policies, resource, action)
+			decision := a.checkAccessPrecomputed(ctx, identity, resource, action)
 			if decision.Allowed {
 				allowed = append(allowed, string(action))
 			}
@@ -345,54 +309,27 @@ func (a *AuthzService) ComputeCapabilitiesBatch(ctx context.Context, identity Id
 	return caps
 }
 
-// precomputeForIdentity fetches group memberships and policies once for an identity.
-func (a *AuthzService) precomputeForIdentity(ctx context.Context, identity Identity) ([]store.PrincipalRef, []store.Policy) {
-	var principals []store.PrincipalRef
-
-	switch identity.Type() {
-	case "user", "dev":
-		principals = append(principals, store.PrincipalRef{Type: "user", ID: identity.ID()})
-		groupIDs, err := a.store.GetEffectiveGroups(ctx, identity.ID())
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			a.logger.Warn("failed to get effective groups for user", "userID", identity.ID(), "error", err.Error())
-		}
-		for _, gid := range groupIDs {
-			principals = append(principals, store.PrincipalRef{Type: "group", ID: gid})
-		}
-	case "agent":
-		principals = append(principals, store.PrincipalRef{Type: "agent", ID: identity.ID()})
-		groupIDs, err := a.store.GetEffectiveGroupsForAgent(ctx, identity.ID())
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			a.logger.Warn("failed to get effective groups for agent", "agent_id", identity.ID(), "error", err.Error())
-		}
-		for _, gid := range groupIDs {
-			principals = append(principals, store.PrincipalRef{Type: "group", ID: gid})
+// computeCapabilitiesWithContext evaluates every action through the canonical
+// request path so credential caveats (notably UAT project and scope limits)
+// cannot be bypassed by capability projections.
+func (a *AuthzService) computeCapabilitiesWithContext(ctx context.Context, identity Identity, resource Resource, actions []Action) *Capabilities {
+	if GetIdentityFromContext(ctx) != identity {
+		ctx = contextWithIdentity(ctx, identity)
+	}
+	allowed := make([]string, 0, len(actions))
+	for _, action := range actions {
+		if a.DecideFromContext(ctx, resource, action).Allowed {
+			allowed = append(allowed, string(action))
 		}
 	}
-
-	policies, err := a.store.GetPoliciesForPrincipals(ctx, principals)
-	if err != nil {
-		a.logger.Warn("failed to get policies for principals", "error", err)
-	}
-
-	return principals, policies
+	return &Capabilities{Actions: allowed}
 }
 
-// checkAccessPrecomputed evaluates access using pre-fetched principals and policies.
-func (a *AuthzService) checkAccessPrecomputed(identity Identity, _ []store.PrincipalRef, policies []store.Policy, resource Resource, action Action) Decision {
-	// Owner bypass (already handled in batch caller, but kept for single-resource calls)
-	if user, ok := identity.(UserIdentity); ok {
-		if resource.OwnerID != "" && resource.OwnerID == user.ID() {
-			return Decision{Allowed: true, Reason: "resource owner"}
-		}
-	}
-
-	// Ancestry bypass (already handled in batch caller, but kept for single-resource calls)
-	if canAccessAsAncestor(identity.ID(), resource) {
-		return Decision{Allowed: true, Reason: "ancestor access"}
-	}
-
-	return a.evaluatePolicies(policies, resource, action)
+// checkAccessPrecomputed evaluates access using CheckAccess through the
+// standard kernel pipeline. The pre-computed parameters are no longer used
+// — all decisions route through the AK1 kernel.
+func (a *AuthzService) checkAccessPrecomputed(ctx context.Context, identity Identity, resource Resource, action Action) Decision {
+	return a.CheckAccess(ctx, identity, resource, action)
 }
 
 // allActions returns a Capabilities with all provided actions.

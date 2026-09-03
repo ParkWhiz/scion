@@ -294,36 +294,83 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result, err := s.store.ListAgents(ctx, filter, store.ListOptions{
-		Limit:  limit,
-		Cursor: query.Get("cursor"),
-	})
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
+	identity, cursor := GetIdentityFromContext(ctx), query.Get("cursor")
+	cursorBinding := authorizedListCursorBinding("agents", filter)
+	if cursor != "" {
+		if err := validateAuthorizedListCursor(cursor, cursorBinding); err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
+	}
+
+	var items []store.Agent
+	var nextCursor string
+	var totalCount int
+
+	// Scope-aware list authorization: resolve the caller's authorized project
+	// set from role bindings instead of using a binary admin-view check on a
+	// synthetic hub resource.
+	if identity == nil {
+		// Unauthenticated: return empty list.
+		items = []store.Agent{}
+	} else {
+		scopes := s.authzService.ResolveListScopes(ctx, identity, "agent.list")
+		if !scopes.IsNone() {
+			// All or explicit scope set: push authorized IDs into the store
+			// query so pagination and totals reflect only the visible set.
+			// For All, AuthorizedProjectIDs remains nil (no filter applied).
+			if !scopes.IsAll() {
+				filter.AuthorizedProjectIDs = scopes.ProjectIDs()
+			}
+			result, err := s.store.ListAgents(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, CursorBinding: cursorBinding})
+			if err != nil {
+				writeErrorFromErr(w, err, "")
+				return
+			}
+			items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+		} else {
+			// No role bindings resolved. Fall back to per-item policy filtering
+			// for backward compatibility during the transition period before
+			// CO1 cutover completes. After cutover, all principals will have
+			// role bindings and this path will not be reached.
+			result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.Agent], error) {
+				page, err := s.store.ListAgents(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
+				if err != nil {
+					return authorizedCandidatePage[store.Agent]{}, err
+				}
+				return authorizedCandidatePage[store.Agent]{Items: page.Items, NextCursor: page.NextCursor}, nil
+			}, agentResource, func(a *store.Agent) string { return authorizedListCursor(a.Created, a.ID, cursorBinding) }, s.authzService.AuthorizeReadBatch)
+			if err != nil {
+				writeAuthorizedListError(w, err)
+				return
+			}
+			items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+		}
 	}
 
 	// Enrich agents with project and broker names
-	s.enrichAgents(ctx, result.Items)
+	s.enrichAgents(ctx, items)
 
-	// Compute per-item and scope capabilities
-	identity := GetIdentityFromContext(ctx)
-	agents := make([]AgentWithCapabilities, 0, len(result.Items))
-	if identity != nil {
-		resources := make([]Resource, len(result.Items))
-		for i := range result.Items {
-			resources[i] = agentResource(&result.Items[i])
-		}
-		caps := s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "agent")
-		for i := range result.Items {
-			if !capabilityAllows(caps[i], ActionRead) {
-				continue
-			}
-			agents = append(agents, AgentWithCapabilities{Agent: result.Items[i], Cap: caps[i]})
+	// Compute per-item and scope capabilities for authorized items
+	agents := make([]AgentWithCapabilities, 0, len(items))
+	if identity == nil {
+		for i := range items {
+			agents = append(agents, AgentWithCapabilities{Agent: items[i]})
 		}
 	} else {
-		for i := range result.Items {
-			agents = append(agents, AgentWithCapabilities{Agent: result.Items[i]})
+		resources := make([]Resource, len(items))
+		for i := range items {
+			resources[i] = agentResource(&items[i])
+		}
+		for i, cap := range s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "agent") {
+			agents = append(agents, AgentWithCapabilities{Agent: items[i], Cap: cap})
+		}
+	}
+
+	// Compute messageability for each agent relative to the viewer.
+	if identity != nil {
+		for i := range agents {
+			agents[i].Messageability = s.ComputeMessageability(ctx, identity, &agents[i].Agent)
 		}
 	}
 
@@ -332,14 +379,9 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 		scopeCap = s.authzService.ComputeScopeCapabilities(ctx, identity, "", "", "agent")
 	}
 
-	totalCount := result.TotalCount
-	if identity != nil {
-		totalCount = len(agents)
-	}
-
 	writeJSON(w, http.StatusOK, ListAgentsResponse{
 		Agents:       agents,
-		NextCursor:   result.NextCursor,
+		NextCursor:   nextCursor,
 		TotalCount:   totalCount,
 		ServerTime:   time.Now().UTC(),
 		Capabilities: scopeCap,
@@ -541,7 +583,8 @@ func (s *Server) createAgentInProject(
 	// Computed early (before broker resolution) so that fail-loud 403 on
 	// role over-requests fires before resource-intensive operations.
 	var effectiveRole AgentRole
-	var parentRole AgentRole // empty for user-created agents; set in agent-caller branch
+	var parentRole AgentRole     // empty for user-created agents; set in agent-caller branch
+	var parentMessageMode string // parent's message_mode for inheritance (D10)
 	requestedRole := AgentRole(req.AgentRole)
 
 	// Read project max agent role from annotations (default: full)
@@ -586,6 +629,7 @@ func (s *Server) createAgentInProject(
 				"parent_agent_id", agentIdent.ID(), "error", err)
 		} else {
 			parentRole, _ = agentRoleAndScopes(creatorAgent)
+			parentMessageMode = creatorAgent.MessageMode
 		}
 
 		// Validate stored parentRole to guard against corrupted data.
@@ -619,22 +663,14 @@ func (s *Server) createAgentInProject(
 
 		effectiveRole = minRole(requestedRole, parentRole, projectMax)
 	} else if userIdent := GetUserIdentityFromContext(ctx); userIdent != nil {
-		// User caller: ceiling based on hub role.
-		// The user-ceiling gate is currently a pass-through (all hub roles get
-		// Full); the projectMax gate is the effective limiter.
-		userCeiling := AgentRoleFull
-
+		// User caller: project max is the creation-time limiter.
+		// The live delegation ceiling (Phase 1G) handles user authority bounding
+		// at decision time rather than at role resolution time.
 		if requestedRole == "" {
 			requestedRole = defaultAgentRole
 		}
 
-		// Fail-loud: reject explicit over-request against user ceiling or project max.
-		if req.AgentRole != "" && CompareRoles(AgentRole(req.AgentRole), userCeiling) > 0 {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				fmt.Sprintf("Cannot grant agent role %q: user ceiling is %q",
-					req.AgentRole, userCeiling), nil)
-			return
-		}
+		// Fail-loud: reject explicit over-request against project max.
 		if req.AgentRole != "" && CompareRoles(AgentRole(req.AgentRole), projectMax) > 0 {
 			writeError(w, http.StatusForbidden, ErrCodeForbidden,
 				fmt.Sprintf("Cannot grant agent role %q: project maximum is %q",
@@ -642,14 +678,43 @@ func (s *Server) createAgentInProject(
 			return
 		}
 
-		// Use minRole directly instead of ResolveEffectiveRole to avoid recomputing ceiling.
-		effectiveRole = minRole(requestedRole, userCeiling, projectMax)
+		effectiveRole = minRole(requestedRole, projectMax)
 	} else {
 		// No identity (should not happen in practice) - default to configured default
 		if requestedRole == "" {
 			requestedRole = defaultAgentRole
 		}
 		effectiveRole = requestedRole
+	}
+
+	// CanDelegate check (Phase 1F): ensure the actor has sufficient authority
+	// to delegate the effective agent role and scopes.
+	var delegateDecision Decision
+	if s.authzService != nil {
+		actorIdentity := GetIdentityFromContext(ctx)
+		if actorIdentity != nil {
+			// Resolve additional scopes from the template (if any).
+			var additionalScopes []AgentTokenScope
+			// The effective role determines the scopes the agent will get.
+			grantDesc := GrantDescriptor{
+				Type:        GrantTypeAgentDelegation,
+				AgentRole:   string(effectiveRole),
+				AgentScopes: additionalScopes,
+				ProjectID:   projectID,
+				ScopeType:   store.RoleScopeProject,
+				ScopeID:     projectID,
+			}
+			delegateDecision = s.authzService.CanDelegate(ctx, actorIdentity, grantDesc)
+			if !delegateDecision.Allowed {
+				logAuthzDenial(r, actorIdentity, Resource{
+					Type:       "agent",
+					ParentType: "project",
+					ParentID:   projectID,
+				}, ActionCreate, "CanDelegate denied: "+delegateDecision.Reason)
+				writeForbidden(w, "Cannot delegate agent authority you do not hold: "+delegateDecision.Reason)
+				return
+			}
+		}
 	}
 
 	// Map role=none to NoAuth behavior
@@ -784,6 +849,18 @@ func (s *Server) createAgentInProject(
 		}
 	}
 
+	// Global fallback: when no template name arrived from the request, the
+	// project annotation, or the hub operational defaults, try resolving a
+	// template named "default". This ensures a fresh hosted hub with no
+	// agent_defaults configured can still resolve its built-in template.
+	// Like templateFromHubDefault, a missing "default" template degrades
+	// (warn + continue with no template) rather than failing the create.
+	templateFromImplicitDefault := false
+	if req.Template == "" {
+		req.Template = "default"
+		templateFromImplicitDefault = true
+	}
+
 	// Resolve template if specified - the client may pass either a template ID or name
 	//
 	// DEGRADATION RULE (design §3.2.2) — when, and only when, the name came
@@ -859,6 +936,13 @@ func (s *Server) createAgentInProject(
 			case templateFromHubDefault:
 				s.warnHubDefaultTemplateUnusable(ctx, req.Template, projectID, "not found")
 				req.Template = ""
+			case templateFromImplicitDefault:
+				// The implicit "default" fallback template doesn't exist — this
+				// is normal on hubs that haven't created one. Continue with no
+				// template. No warning: unlike a hub default (which is operator-
+				// configured and should resolve), the implicit fallback is
+				// speculative.
+				req.Template = ""
 			default:
 				NotFound(w, "Template")
 				return
@@ -872,7 +956,7 @@ func (s *Server) createAgentInProject(
 			if name == "" {
 				name = resolvedTemplate.Name
 			}
-			if !templateFromHubDefault {
+			if !templateFromHubDefault && !templateFromImplicitDefault {
 				ValidationError(w, "template "+name+" has no files — sync template files first with: scion template sync "+name, nil)
 				return
 			}
@@ -936,6 +1020,22 @@ func (s *Server) createAgentInProject(
 	}
 
 	agent.AppliedConfig = s.buildAppliedConfig(req, harnessConfig, creatorName, effectiveRole)
+
+	// Resolve message_mode (D10 spawn defaults):
+	//   1. Template specifies message_mode → use it.
+	//   2. Parent agent exists → inherit parent's message_mode.
+	//   3. Otherwise → default to "project" (handled by Ent schema default).
+	if resolvedTemplate != nil && resolvedTemplate.Config != nil && resolvedTemplate.Config.MessageMode != "" {
+		if !store.IsValidMessageMode(resolvedTemplate.Config.MessageMode) {
+			ValidationError(w, "invalid template message mode: "+resolvedTemplate.Config.MessageMode, nil)
+			return
+		}
+		agent.MessageMode = resolvedTemplate.Config.MessageMode
+	} else if parentMessageMode != "" {
+		agent.MessageMode = parentMessageMode
+	} else {
+		agent.MessageMode = store.MessageModeProject
+	}
 
 	// Populate GCP identity in applied config.
 	// Default to "block" mode when no GCP identity is specified, so agents
@@ -1085,10 +1185,46 @@ func (s *Server) createAgentInProject(
 
 	s.populateAgentConfig(ctx, agent, project, resolvedTemplate)
 
+	// Quota enforcement: check agent-per-project limit before creation.
+	if s.quotaService != nil {
+		if err := s.quotaService.CheckAndReserve(ctx, "max_agents_per_project", createdBy, "project", projectID, agent.ID); err != nil {
+			if errors.Is(err, store.ErrQuotaExceeded) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota exceeded: max_agents_per_project", nil)
+				return
+			}
+			if errors.Is(err, ErrQuotaLockContention) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota check temporarily unavailable, please retry", nil)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "quota check failed", nil)
+			return
+		}
+	}
+
 	if err := s.store.CreateAgent(ctx, agent); err != nil {
+		if s.quotaService != nil {
+			s.quotaService.Release(ctx, "max_agents_per_project", agent.ID)
+		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
+
+	if delegateDecision.Allowed {
+		s.emitMutationAudit(ctx, &store.MutationAuditRecord{
+			MutationType:      "agent_delegation",
+			TargetType:        "agent",
+			TargetID:          agent.ID,
+			CanDelegateResult: "allow",
+			CanDelegateReason: delegateDecision.Reason,
+		})
+	}
+
+	// Record delegation edge (Phase 1G): track who delegated authority to this agent.
+	// Best-effort: log errors but do not fail the creation. The live delegation
+	// ceiling falls back to a safe default when no edge is found.
+	s.recordDelegationEdge(ctx, agent.ID, projectID, string(effectiveRole), createdBy)
 
 	// Create notification subscription if requested
 	if req.Notify {
@@ -2039,6 +2175,14 @@ func (s *Server) getAgent(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	if identity := GetIdentityFromContext(ctx); identity != nil {
 		resp.Cap = s.authzService.ComputeCapabilities(ctx, identity, agentResource(agent))
+
+		// Compute detailed messageability with reachable counts for the detail endpoint.
+		projectAgentsResult, err := s.store.ListAgents(ctx, store.AgentFilter{ProjectID: agent.ProjectID}, store.ListOptions{})
+		if err == nil {
+			resp.Messageability = s.ComputeMessageabilityDetail(ctx, identity, agent, projectAgentsResult.Items)
+		} else {
+			resp.Messageability = s.ComputeMessageability(ctx, identity, agent)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -2392,6 +2536,17 @@ func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agen
 		}
 	}
 
+	// Revoke all credentials for the deleted agent (best-effort, Phase 1H)
+	if _, err := s.store.RevokeAgentCredentialsByAgent(ctx, agent.ID, "system", "agent_deleted"); err != nil {
+		slog.Warn("Failed to revoke agent credentials on delete", "agent_id", agent.ID, "error", err)
+	}
+
+	s.emitMutationAudit(ctx, &store.MutationAuditRecord{
+		MutationType: "agent_credential_revoke",
+		TargetType:   "agent_credential",
+		TargetID:     agent.ID,
+	})
+
 	// Cancel pending scheduled events targeting this agent
 	s.cancelScheduledEventsForAgent(ctx, agent)
 
@@ -2413,6 +2568,11 @@ func (s *Server) performAgentDelete(w http.ResponseWriter, r *http.Request, agen
 			writeErrorFromErr(w, err, "")
 			return
 		}
+	}
+
+	// Release quota reservation for the deleted agent (best-effort).
+	if s.quotaService != nil {
+		s.quotaService.Release(ctx, "max_agents_per_project", agent.ID)
 	}
 
 	// A deleted agent must not remain a thread's default — the binding would
@@ -2504,15 +2664,52 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, a
 		action == api.AgentActionRefreshToken ||
 		action == api.AgentActionOutboundMessage
 
-	// Self-message: allow an agent to deliver a message to itself using its
-	// own token, without requiring the ScopeAgentLifecycle scope. This mirrors
-	// the outbound-message self-access pattern and is used by sciontool to
-	// send system notifications (e.g. port auto-expose) to the agent's own
-	// harness input.
+	// --- set_message_mode action: own permission model (D7) ---
+	// Mode changes are human-only and use agent.set_message_mode permission,
+	// not lifecycle authorization. Must be routed before the generic authz block.
+	if action == api.AgentActionSetMessageMode {
+		s.handleSetMessageMode(w, r, id)
+		return
+	}
+
+	// --- Message action: routed through authorizeAgentMessage (D1) ---
+	// Messaging is a first-class axis, split from lifecycle/attach. The choke
+	// point handles user senders, agent senders, mode checks, and piercing.
 	if action == api.AgentActionMessage {
-		if claims := GetAgentFromContext(r.Context()); claims != nil && claims.Subject == id {
-			selfAccess = true
+		identity := GetIdentityFromContext(r.Context())
+		if identity == nil {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "This action requires user or agent authentication", nil)
+			return
 		}
+
+		// Self-message is handled inside authorizeAgentMessage as a
+		// self-access exemption, separate from system-plane (D8).
+		isSystemPlane := false
+
+		targetAgent, err := s.store.GetAgent(r.Context(), id)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+
+		allowed, reason := s.authorizeAgentMessage(r.Context(), identity, targetAgent, isSystemPlane)
+		if !allowed {
+			slog.Warn("message authorization denied",
+				"sender_type", identity.Type(),
+				"sender_id", identity.ID(),
+				"target_agent", id,
+				"reason", reason,
+			)
+			writeError(w, http.StatusForbidden, ErrCodeMessageDenied,
+				"Message delivery denied", map[string]interface{}{
+					"reason":        mapReasonToCode(reason),
+					"senderMode":    s.getSenderMode(r.Context(), identity),
+					"recipientMode": targetAgent.MessageMode,
+				})
+			return
+		}
+		// Authorization passed — fall through to action dispatch below.
+		goto actionDispatch
 	}
 
 	if !selfAccess {
@@ -2554,6 +2751,8 @@ func (s *Server) handleAgentAction(w http.ResponseWriter, r *http.Request, id, a
 			}
 		}
 	}
+
+actionDispatch:
 
 	switch action {
 	case api.AgentActionStatus:
@@ -2688,6 +2887,22 @@ func (s *Server) handleAgentTokenRefresh(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	// Phase 1H: Check credential state before allowing refresh.
+	// Look up the current token's credential by JTI hash.
+	oldCredentialID := GetAgentCredentialIDFromContext(r.Context())
+	isLegacy := IsLegacyTokenFromContext(r.Context())
+
+	if oldCredentialID != "" {
+		// Credential found — check if it's been revoked
+		cred, credErr := s.store.GetAgentCredentialByJTIHash(r.Context(),
+			hashJTI(agentIdent.TokenID()))
+		if credErr == nil && cred.RevokedAt != nil {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"token has been revoked", nil)
+			return
+		}
+	}
+
 	// Look up the agent record to re-derive scopes from the stored role.
 	// This is critical for backward compatibility: legacy agents created
 	// before the role system have tokens with old scope sets (missing
@@ -2704,6 +2919,20 @@ func (s *Server) handleAgentTokenRefresh(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	// For legacy tokens, verify the agent is still authorized
+	if isLegacy {
+		if !agent.DeletedAt.IsZero() {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"agent has been deleted", nil)
+			return
+		}
+		if agent.Phase == "suspended" {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"agent is suspended", nil)
+			return
+		}
+	}
+
 	agentRole, additionalScopes := agentRoleAndScopes(agent)
 	newToken, err := s.GenerateAgentToken(
 		agent.ID, agent.ProjectID, agentIdent.Ancestry(),
@@ -2713,6 +2942,14 @@ func (s *Server) handleAgentTokenRefresh(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"failed to generate refreshed token: "+err.Error(), nil)
 		return
+	}
+
+	// Revoke the old credential now that a new token has been issued (best-effort)
+	if oldCredentialID != "" {
+		if err := s.store.RevokeAgentCredential(r.Context(), oldCredentialID, "system", "refreshed"); err != nil {
+			slog.Warn("Failed to revoke old credential after refresh",
+				"agent_id", id, "credential_id", oldCredentialID, "error", err)
+		}
 	}
 
 	// Parse the new token to extract the expiry for the response.
@@ -2777,13 +3014,14 @@ func (s *Server) handleAgentResetAuth(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	if s.dispatcher == nil {
+	disp := s.GetDispatcher()
+	if disp == nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"agent dispatcher not configured", nil)
 		return
 	}
 
-	if err := s.dispatcher.DispatchAgentResetAuth(ctx, agent); err != nil {
+	if err := disp.DispatchAgentResetAuth(ctx, agent); err != nil {
 		slog.Error("Failed to reset agent auth", "agent_id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"auth reset failed: "+err.Error(), nil)
@@ -2803,4 +3041,51 @@ func isContainerNameConflict(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return (strings.Contains(msg, "container name") && strings.Contains(msg, "already in use")) ||
 		strings.Contains(msg, "is already in use by container")
+}
+
+// recordDelegationEdge creates a delegation edge from the creator to the new
+// agent. The creator may be a user or an agent. Best-effort: errors are logged
+// but do not fail the operation, because the edge is supplementary — the live
+// delegation ceiling falls back to a safe default when no edge is found.
+//
+// When called from the HTTP agent-create path, the context identity determines
+// the delegator type. When called from the scheduler dispatch path (where the
+// context has no authenticated identity), the caller resolves the creator type
+// before calling recordDelegationEdgeWithType.
+func (s *Server) recordDelegationEdge(ctx context.Context, agentID, projectID, role, createdBy string) {
+	var delegatorType string
+
+	// Determine if creator is an agent or user from context identity.
+	if agentIdent := GetAgentIdentityFromContext(ctx); agentIdent != nil {
+		delegatorType = store.DelegationPrincipalAgent
+	} else {
+		delegatorType = store.DelegationPrincipalUser
+	}
+
+	s.recordDelegationEdgeWithType(ctx, agentID, projectID, role, delegatorType, createdBy)
+}
+
+// recordDelegationEdgeWithType creates a delegation edge with an explicitly
+// specified delegator type. Used when the delegator type is already known
+// (e.g., from the scheduled dispatch authorization path).
+func (s *Server) recordDelegationEdgeWithType(ctx context.Context, agentID, projectID, role, delegatorType, delegatorID string) {
+	edge := &store.DelegationEdge{
+		DelegatorType: delegatorType,
+		DelegatorID:   delegatorID,
+		DelegateType:  store.DelegationPrincipalAgent,
+		DelegateID:    agentID,
+		ScopeType:     store.RoleScopeProject,
+		ScopeID:       projectID,
+		Role:          role,
+		Active:        true,
+		Grandfathered: false,
+	}
+	if err := s.store.CreateDelegationEdge(ctx, edge); err != nil {
+		slog.Warn("Failed to record delegation edge (best-effort)",
+			"agent_id", agentID,
+			"delegator_type", delegatorType,
+			"delegator_id", delegatorID,
+			"project_id", projectID,
+			"error", err)
+	}
 }

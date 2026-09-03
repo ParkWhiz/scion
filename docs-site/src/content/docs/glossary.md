@@ -22,7 +22,7 @@ An agent spawned by another agent; "sub" only from the orchestrating user's view
 A namespace and collection of agents and configuration, represented by a `.scion` directory and usually one-to-one with a git repository. Not the same as a **Group**.
 
 ### Template
-A harness-agnostic folder resource defining a generic agent — its system prompt, agent instructions, skills, services, and more — containing nothing specific to any one harness. Templates can live locally (project or global scope) or be managed as fully fledged Hub-level resources with CRUD, CLI, SDK, and Web UI support. The harness-agnostic counterpart to a **Harness-config**.
+A harness-agnostic folder resource defining a generic agent — its system prompt, agent instructions, skills, services, and more — containing nothing specific to any one harness. Templates can live locally (project or global scope) or be managed as fully fledged Hub-level resources (user, project, and global scopes) with CRUD, CLI, SDK, and Web UI support. The harness-agnostic counterpart to a **Harness-config**.
 
 ### Harness
 The external, vendor-supplied agent software that Scion drives, such as Claude Code, Gemini CLI, Codex, or OpenCode. Provided outside Scion; Scion only configures and runs it. A harness is **not** a plugin.
@@ -60,7 +60,7 @@ The helper utility injected into every agent container for status reporting, met
 A feature that allows exposing local HTTP ports running inside an agent container through the Hub as authenticated, reverse-proxied URLs. Built on an outbound WebSocket reverse tunnel.
 
 ### Runtime
-The container technology that executes an agent's container: Docker, Podman, Apple Container, or Kubernetes.
+The container technology that executes an agent's container: Docker, Podman, Apple Container, Kubernetes, or Cloud Run Instances.
 
 ### Workspace
 The working directory mounted into a single agent's container at `/workspace`. How it is provisioned across a project's agents is set by the project's **workspace sharing mode**.
@@ -159,16 +159,44 @@ A named collection of Hub users (and nested groups) used by the Hub permissions 
 ### User Access Token (UAT)
 A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT is scoped to a single project and carries a specific list of action permissions (scopes). Formerly known as a *Personal Access Token (PAT)*.
 
+### Quota System
+An advisory-lock-based enforcement system that governs resource consumption at agent and project creation. It uses fail-closed semantics and prevents reservation leaks, operating on schemas including LimitDefinition, EntitlementBinding, and UsageReservation.
+_Avoid_: rate limits, usage caps
+
+### LimitDefinition
+A seeded system or custom limit configuration that defines a quota boundary within the Quota System.
+
 ## Messaging
+
+### Branch mode (message mode)
+A message mode that permits messaging from ancestry users (like lineage) plus the agent's direct parent and child agents. Project owners can pierce branch mode.
+
+### Lineage mode (message mode)
+A message mode that restricts messaging to users in the agent's ancestry chain — the creating user and their ancestors. No agent-to-agent messaging is permitted for lineage-mode agents. Project owners can pierce lineage mode.
+
+### Message Mode
+A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of four values: `none`, `lineage`, `branch`, or `project` (the default). Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
+
+### Messageability
+A server-computed assessment of whether a specific viewer can message a specific agent, considering the agent's message mode, the viewer's identity, ancestry relationship, and permissions. Exposed in API responses as `_messageability` with `canMessage` and `canReachViewer` booleans. Used by the UI to gate message buttons and show reachability indicators.
 
 ### Native Web Chat
 The built-in interactive messaging interface in the Web Dashboard (enabled via the `web.native_chat` feature flag) that promotes chat to a top-level fourth ShellType (alongside standalone, profile, and app). It features a dedicated thread rail, unread indicators, three-state visibility filtering (Conversation/Verbose/Full), @-mention autocomplete, and cross-channel reply coherence.
+
+### None mode (message mode)
+A message mode that seals the agent from all messaging except system-plane notices and super-admin piercing. No users and no agents can message a none-mode agent through normal paths.
+
+### Piercing (message authorization)
+The ability of a privileged user to bypass an agent's message mode restrictions. Super-admins pierce all modes including none. Project owners pierce lineage and branch modes. Piercing applies only to user identities — it is never inherited by an owner's agents.
+
+### Project mode (message mode)
+The default message mode. Any user with the `agent:message` permission in the project scope can message the agent, and any same-project agent in project or branch mode can message it. The most permissive mode.
 
 ### Message Group
 A set of recipients addressed by a single send, correlated by a shared `group_id`, as opposed to a direct message to one recipient or a broadcast to all agents in a project. Distinct from **Group** (Hub users).
 
 ### Notification
-An event delivered when an agent reaches a tracked trigger activity (e.g. `completed`, `waiting_for_input`, `limits_exceeded`). Recipients register a **Subscription** — scoped to a single agent or to a whole project, naming which trigger activities fire it and whether an agent or a user receives it. Backs `scion notifications` and the `--notify` flag on `scion message`.
+An event delivered when an agent reaches a tracked trigger activity (e.g. `completed`, `waiting_for_input`, `limits_exceeded`). Recipients register a **Subscription** — scoped to a single agent or to a whole project, naming which trigger activities fire it and whether an agent or a user receives it. Backs `scion notifications` and the `--notify` flag on `scion start`.
 
 ## Identity & State
 
@@ -240,7 +268,7 @@ Connecting an interactive terminal to a running agent's tmux session for human-i
 The Hub handing an agent lifecycle command to the appropriate runtime broker for execution.
 
 ### Schedule
-A time-based trigger that fires an action — sending a message or dispatching (starting) an agent from a template — either once (a one-shot *scheduled event*, via `--at <time>` or `--in <duration>`) or repeatedly (a recurring *schedule* on a 5-field cron expression). Backs `scion schedule` and the `--at`/`--in` flags on `scion message`.
+A time-based trigger that fires an action — sending a message or dispatching (starting) an agent from a template — either once (a one-shot *scheduled event*, via `--at <time>` or `--in <duration>`) or repeatedly (a recurring *schedule* on a 5-field cron expression). Backs `scion schedule`.
 
 ## Observability
 
@@ -268,3 +296,6 @@ A named collection of Hub users (and nested groups) used by the Hub permissions 
 
 ### User Access Token (UAT)
 A scoped, revocable bearer token (prefixed with `scion_pat_`) linked to a user account and used for non-interactive Hub authentication (e.g., CLI, CI/CD pipelines, desktop app integration). Every UAT is scoped to a single project and carries a specific list of action permissions (scopes).
+
+### Owner-Based Access Control
+An authorization model where certain resources (such as scheduled events, recurring schedules, and individual agents) are strictly restricted so they can only be viewed, updated, deleted, or managed by their respective creator (the "owner") or system-wide administrators. Enforced via owner-ID validation at the API layer.

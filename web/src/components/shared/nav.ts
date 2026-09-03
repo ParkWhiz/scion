@@ -21,9 +21,15 @@
  */
 
 import { LitElement, html, css } from 'lit';
-import { customElement, property } from 'lit/decorators.js';
+import { customElement, property, state } from 'lit/decorators.js';
 
 import type { User } from '../../shared/types.js';
+import { apiFetch } from '../../client/api.js';
+import {
+  type AdminStatus,
+  hasAnyPermission,
+  NAV_PERMISSION_MAP,
+} from '../../lib/admin-permissions.js';
 
 interface NavItem {
   path: string;
@@ -57,24 +63,33 @@ const NAV_SECTIONS: NavSection[] = [
 ];
 
 /**
- * Admin-only navigation section, shown at the bottom of the sidebar
+ * Admin nav items visible to both hub-admin and super-admin users.
+ * These cover scopeable resources that hub-admins can manage.
  */
-const ADMIN_SECTION: NavSection = {
-  title: 'Admin',
-  items: [
-    { path: '/settings', label: 'Hub Resources', icon: 'gear' },
-    { path: '/admin/server-config', label: 'Server Config', icon: 'sliders' },
-    { path: '/admin/federation', label: 'Federation', icon: 'globe' },
-    { path: '/admin/integrations', label: 'Integrations', icon: 'plug' },
-    { path: '/admin/scheduler', label: 'Scheduler', icon: 'clock' },
-    { path: '/admin/users', label: 'Users', icon: 'people' },
-    { path: '/admin/groups', label: 'Groups', icon: 'diagram-3' },
-    { path: '/admin/diagnostics', label: 'Diagnostics', icon: 'journal-text' },
-    { path: '/health', label: 'Health', icon: 'heart-pulse' },
-    { path: '/admin/maintenance', label: 'Maintenance', icon: 'wrench-adjustable' },
-    { path: '/admin/skill-registries', label: 'Skill Registries', icon: 'cloud-arrow-down' },
-  ],
-};
+const ADMIN_SCOPEABLE_ITEMS: NavItem[] = [
+  { path: '/settings', label: 'Hub Resources', icon: 'gear' },
+  { path: '/admin/server-config', label: 'Server Config', icon: 'sliders' },
+  { path: '/admin/federation', label: 'Federation', icon: 'globe' },
+  { path: '/admin/integrations', label: 'Integrations', icon: 'plug' },
+  { path: '/admin/scheduler', label: 'Scheduler', icon: 'clock' },
+  { path: '/admin/users', label: 'Users', icon: 'people' },
+  { path: '/admin/groups', label: 'Groups', icon: 'diagram-3' },
+  { path: '/admin/roles', label: 'Roles', icon: 'shield-lock' },
+  { path: '/admin/role-bindings', label: 'Role Bindings', icon: 'link-45deg' },
+  { path: '/admin/access-boundaries', label: 'Access Boundaries', icon: 'shield-check' },
+  { path: '/admin/quotas', label: 'Quotas', icon: 'speedometer2' },
+  { path: '/health', label: 'Health', icon: 'heart-pulse' },
+  { path: '/admin/skill-registries', label: 'Skill Registries', icon: 'cloud-arrow-down' },
+];
+
+/**
+ * Admin nav items visible ONLY to super-admin users.
+ * These cover system-level operations that require full admin privileges.
+ */
+const ADMIN_SUPERADMIN_ITEMS: NavItem[] = [
+  { path: '/admin/diagnostics', label: 'Diagnostics', icon: 'journal-text' },
+  { path: '/admin/maintenance', label: 'Maintenance', icon: 'wrench-adjustable' },
+];
 
 @customElement('scion-nav')
 export class ScionNav extends LitElement {
@@ -101,6 +116,80 @@ export class ScionNav extends LitElement {
    */
   @property({ type: Boolean })
   hideCollapse = false;
+
+  /**
+   * The current user's admin status including per-resource permissions.
+   * null when the user is not an admin or status has not been checked yet.
+   * The nav uses this to show only the admin items the user has permissions for.
+   */
+  @state()
+  private adminStatus: AdminStatus | null = null;
+
+  /** Tracks the user ID for which admin capabilities were last checked. */
+  private adminCheckUserId: string | null = null;
+
+  override updated(changedProperties: Map<PropertyKey, unknown>): void {
+    if (changedProperties.has('user')) {
+      void this.checkAdminCapabilities();
+    }
+  }
+
+  /**
+   * Detect whether the current user has admin capabilities by calling
+   * the dedicated admin-status endpoint, which returns explicit boolean
+   * flags for hub-admin and super-admin status plus a permissions array.
+   *
+   * Super-admin users are detected directly via `user.role === 'admin'`
+   * and skip the API call. For hub-admin and custom-role users, the
+   * endpoint determines which nav items are visible.
+   */
+  private async checkAdminCapabilities(): Promise<void> {
+    const userId = this.user?.id ?? null;
+
+    // Skip if we already checked for this user
+    if (userId === this.adminCheckUserId) return;
+    this.adminCheckUserId = userId;
+
+    // Super-admins always have admin capabilities — create an AdminStatus
+    // with isSuperAdmin: true so hasAnyPermission() short-circuits.
+    if (this.user?.role === 'admin') {
+      this.adminStatus = { isAdmin: true, isSuperAdmin: true, permissions: [] };
+      return;
+    }
+
+    // No user = no admin access
+    if (!this.user) {
+      this.adminStatus = null;
+      return;
+    }
+
+    // Call the dedicated admin-status endpoint to detect admin status
+    // and retrieve per-resource permissions.
+    try {
+      const res = await apiFetch('/api/v1/auth/admin-status');
+      // Only apply result if user hasn't changed during the fetch
+      if (this.adminCheckUserId === userId) {
+        if (res.ok) {
+          const data = await res.json();
+          if (data.isAdmin === true) {
+            this.adminStatus = {
+              isAdmin: true,
+              isSuperAdmin: data.isSuperAdmin === true,
+              permissions: Array.isArray(data.permissions) ? data.permissions : [],
+            };
+          } else {
+            this.adminStatus = null;
+          }
+        } else {
+          this.adminStatus = null;
+        }
+      }
+    } catch {
+      if (this.adminCheckUserId === userId) {
+        this.adminStatus = null;
+      }
+    }
+  }
 
   static override styles = css`
     :host {
@@ -331,7 +420,7 @@ export class ScionNav extends LitElement {
   `;
 
   override render() {
-    const isAdmin = this.user?.role === 'admin';
+    const isSuperAdmin = this.user?.role === 'admin';
 
     return html`
       <div class="logo">
@@ -366,12 +455,22 @@ export class ScionNav extends LitElement {
             </div>
           `
         )}
-        ${isAdmin
+        ${this.adminStatus?.isAdmin &&
+        (isSuperAdmin ||
+          ADMIN_SCOPEABLE_ITEMS.some(
+            (item) =>
+              NAV_PERMISSION_MAP[item.path] &&
+              hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
+          ))
           ? html`
               <div class="nav-section admin-section">
-                <div class="nav-section-title">${ADMIN_SECTION.title}</div>
+                <div class="nav-section-title">Admin</div>
                 <ul class="nav-list">
-                  ${ADMIN_SECTION.items.map(
+                  ${ADMIN_SCOPEABLE_ITEMS.filter(
+                    (item) =>
+                      NAV_PERMISSION_MAP[item.path] &&
+                      hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
+                  ).map(
                     (item) => html`
                       <li class="nav-item">
                         <a
@@ -385,6 +484,22 @@ export class ScionNav extends LitElement {
                       </li>
                     `
                   )}
+                  ${isSuperAdmin
+                    ? ADMIN_SUPERADMIN_ITEMS.map(
+                        (item) => html`
+                          <li class="nav-item">
+                            <a
+                              href="${item.path}"
+                              class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
+                              @click=${(e: Event) => this.handleNavClick(e, item.path)}
+                            >
+                              <sl-icon name="${item.icon}"></sl-icon>
+                              <span class="nav-link-text">${item.label}</span>
+                            </a>
+                          </li>
+                        `
+                      )
+                    : ''}
                 </ul>
               </div>
             `

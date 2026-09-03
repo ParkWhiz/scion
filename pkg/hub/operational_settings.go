@@ -905,9 +905,10 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		}
 	}
 
-	// Admin emails
+	// Admin emails — sanitize (TrimSpace + ToLower, drop empties) to match
+	// the normalization the user store applies (D11-fix).
 	if len(snap.AdminEmails) > 0 {
-		s.config.AdminEmails = snap.AdminEmails
+		s.config.AdminEmails = config.SanitizeEmailList(snap.AdminEmails)
 		applied = append(applied, "admin_emails")
 	}
 
@@ -1162,6 +1163,29 @@ func (o *OperationalSettings) ProjectDefaultScratchpad() bool {
 		return *pd.DefaultScratchpad
 	}
 	return true // field omitted in doc → compiled default
+}
+
+// ConversationReadSwitch returns whether the Phase 8 conversation read-switch
+// is enabled. Returns false (compiled default) when the messaging section is
+// absent from the DB. Hot-reloadable: reads from the DB-backed cache.
+func (o *OperationalSettings) ConversationReadSwitch() bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	state, ok := o.cache["messaging"]
+	if !ok {
+		return false // compiled default: OFF
+	}
+
+	var ms opsettings.MessagingSettings
+	if err := json.Unmarshal(state.Value, &ms); err != nil {
+		return false // parse error → fall back to compiled default
+	}
+
+	if ms.ConversationReadSwitch != nil {
+		return *ms.ConversationReadSwitch
+	}
+	return false // field omitted in doc → compiled default
 }
 
 // applySnapshotLogLevel applies the log-level portion of the snapshot.

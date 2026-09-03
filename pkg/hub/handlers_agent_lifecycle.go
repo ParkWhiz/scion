@@ -54,6 +54,13 @@ func (s *Server) updateAgentStatus(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
+	// Validate ExitReason before passing to the store: only terminal
+	// activities are valid exit reasons. Silently drop invalid values
+	// rather than rejecting the entire status update.
+	if status.ExitReason != "" && !isValidExitReason(status.ExitReason) {
+		status.ExitReason = "" // silently drop invalid values
+	}
+
 	// Guard against phase regressions and auto-correct phase from activity.
 	if status.Phase != "" || status.Activity != "" {
 		agent, err := s.store.GetAgent(ctx, id)
@@ -174,6 +181,17 @@ func (s *Server) suspendAgent(ctx context.Context, agent *store.Agent) error {
 			return err
 		}
 	}
+
+	// Revoke all credentials for the suspended agent (best-effort, Phase 1H)
+	if _, err := s.store.RevokeAgentCredentialsByAgent(ctx, agent.ID, "system", "agent_suspended"); err != nil {
+		slog.Warn("Failed to revoke agent credentials on suspend", "agent_id", agent.ID, "error", err)
+	}
+
+	s.emitMutationAudit(ctx, &store.MutationAuditRecord{
+		MutationType: "agent_credential_revoke",
+		TargetType:   "agent_credential",
+		TargetID:     agent.ID,
+	})
 
 	newPhase := string(state.PhaseSuspended)
 	if err := s.store.UpdateAgentStatus(ctx, agent.ID, store.AgentStatusUpdate{
@@ -301,6 +319,8 @@ func (s *Server) handleAgentLifecycle(w http.ResponseWriter, r *http.Request, id
 	if action == api.AgentActionStop {
 		statusUpdate.ContainerStatus = "stopped"
 		statusUpdate.Activity = ""
+		zero := 0
+		statusUpdate.ExitCode = &zero
 	}
 	// When starting or restarting, propagate container status from broker response
 	if (action == api.AgentActionStart || action == api.AgentActionRestart) && agent.ContainerStatus != "" {
@@ -359,16 +379,22 @@ func (s *Server) handleStopAllAgents(w http.ResponseWriter, r *http.Request, pro
 		Phase:     string(state.PhaseRunning),
 	}
 
+	isAdmin := s.authzService.Decide(ctx, AuthzRequest{
+		Principal:  principalContextForIdentity(userIdent),
+		Credential: credentialContextForIdentity(userIdent),
+		Resource:   Resource{Type: "agent", ID: "hub"},
+		Action:     Action("stop_all"),
+		Permission: "agent.stop_all",
+	}).Allowed
 	if projectID == "" {
-		// Global stop-all: platform admin only
-		if userIdent.Role() != "admin" {
+		// Global stop-all: requires agent.stop_all permission
+		if !isAdmin {
 			writeError(w, http.StatusForbidden, ErrCodeForbidden,
 				"Only admins can stop all agents", nil)
 			return
 		}
 	} else {
 		// Project-scoped stop-all: any project member allowed
-		isAdmin := userIdent.Role() == "admin"
 		if !isAdmin {
 			projectRole := s.resolveUserProjectRole(ctx, projectID, userIdent.ID())
 			if projectRole == "" {
@@ -436,10 +462,12 @@ func (s *Server) handleStopAllAgents(w http.ResponseWriter, r *http.Request, pro
 					"agent_id", agent.ID, "error", dispatchErr)
 			} else {
 				// Update agent status in store
+				zero := 0
 				statusUpdate := store.AgentStatusUpdate{
 					Phase:           string(state.PhaseStopped),
 					ContainerStatus: "stopped",
 					Activity:        "",
+					ExitCode:        &zero,
 				}
 				if updateErr := s.store.UpdateAgentStatus(ctx, agent.ID, statusUpdate); updateErr != nil {
 					res.Status = "error"

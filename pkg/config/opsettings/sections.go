@@ -59,6 +59,7 @@ type AutoExposePortsSettings struct {
 type AgentDefaultsSettings struct {
 	DefaultTemplate      string            `json:"default_template,omitempty"`
 	DefaultHarnessConfig string            `json:"default_harness_config,omitempty"`
+	DefaultHarnessAuth   string            `json:"default_harness_auth,omitempty"`
 	DefaultMaxTurns      int               `json:"default_max_turns,omitempty"`
 	DefaultMaxModelCalls int               `json:"default_max_model_calls,omitempty"`
 	DefaultMaxDuration   string            `json:"default_max_duration,omitempty"`
@@ -119,3 +120,10 @@ type ProfilesSettings = map[string]config.V1ProfileConfig
 // HarnessConfigsSettings holds the Layer-1 harness_configs map.
 // The entire map is stored as a single JSONB document in hub_settings.
 type HarnessConfigsSettings = map[string]config.HarnessConfigEntry
+
+// MessagingSettings holds Layer-1 messaging configuration.
+// DB-only (runtime state), no settings.yaml representation.
+// The ConversationReadSwitch flag gates the Phase 8 read-switch migration.
+type MessagingSettings struct {
+	ConversationReadSwitch *bool `json:"conversation_read_switch,omitempty"`
+}

@@ -130,6 +130,20 @@ func (_c *AgentCreate) SetNillableVisibility(v *string) *AgentCreate {
 	return _c
 }
 
+// SetMessageMode sets the "message_mode" field.
+func (_c *AgentCreate) SetMessageMode(v agent.MessageMode) *AgentCreate {
+	_c.mutation.SetMessageMode(v)
+	return _c
+}
+
+// SetNillableMessageMode sets the "message_mode" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableMessageMode(v *agent.MessageMode) *AgentCreate {
+	if v != nil {
+		_c.SetMessageMode(*v)
+	}
+	return _c
+}
+
 // SetLabels sets the "labels" field.
 func (_c *AgentCreate) SetLabels(v map[string]string) *AgentCreate {
 	_c.mutation.SetLabels(v)
@@ -208,6 +222,34 @@ func (_c *AgentCreate) SetContainerStatus(v string) *AgentCreate {
 func (_c *AgentCreate) SetNillableContainerStatus(v *string) *AgentCreate {
 	if v != nil {
 		_c.SetContainerStatus(*v)
+	}
+	return _c
+}
+
+// SetExitCode sets the "exit_code" field.
+func (_c *AgentCreate) SetExitCode(v int) *AgentCreate {
+	_c.mutation.SetExitCode(v)
+	return _c
+}
+
+// SetNillableExitCode sets the "exit_code" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableExitCode(v *int) *AgentCreate {
+	if v != nil {
+		_c.SetExitCode(*v)
+	}
+	return _c
+}
+
+// SetExitReason sets the "exit_reason" field.
+func (_c *AgentCreate) SetExitReason(v string) *AgentCreate {
+	_c.mutation.SetExitReason(v)
+	return _c
+}
+
+// SetNillableExitReason sets the "exit_reason" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableExitReason(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetExitReason(*v)
 	}
 	return _c
 }
@@ -586,6 +628,10 @@ func (_c *AgentCreate) defaults() {
 		v := agent.DefaultVisibility
 		_c.mutation.SetVisibility(v)
 	}
+	if _, ok := _c.mutation.MessageMode(); !ok {
+		v := agent.DefaultMessageMode
+		_c.mutation.SetMessageMode(v)
+	}
 	if _, ok := _c.mutation.CurrentTurns(); !ok {
 		v := agent.DefaultCurrentTurns
 		_c.mutation.SetCurrentTurns(v)
@@ -654,6 +700,14 @@ func (_c *AgentCreate) check() error {
 	}
 	if _, ok := _c.mutation.Visibility(); !ok {
 		return &ValidationError{Name: "visibility", err: errors.New(`ent: missing required field "Agent.visibility"`)}
+	}
+	if _, ok := _c.mutation.MessageMode(); !ok {
+		return &ValidationError{Name: "message_mode", err: errors.New(`ent: missing required field "Agent.message_mode"`)}
+	}
+	if v, ok := _c.mutation.MessageMode(); ok {
+		if err := agent.MessageModeValidator(v); err != nil {
+			return &ValidationError{Name: "message_mode", err: fmt.Errorf(`ent: validator failed for field "Agent.message_mode": %w`, err)}
+		}
 	}
 	if _, ok := _c.mutation.CurrentTurns(); !ok {
 		return &ValidationError{Name: "current_turns", err: errors.New(`ent: missing required field "Agent.current_turns"`)}
@@ -747,6 +801,10 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 		_spec.SetField(agent.FieldVisibility, field.TypeString, value)
 		_node.Visibility = value
 	}
+	if value, ok := _c.mutation.MessageMode(); ok {
+		_spec.SetField(agent.FieldMessageMode, field.TypeEnum, value)
+		_node.MessageMode = value
+	}
 	if value, ok := _c.mutation.Labels(); ok {
 		_spec.SetField(agent.FieldLabels, field.TypeJSON, value)
 		_node.Labels = value
@@ -774,6 +832,14 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.ContainerStatus(); ok {
 		_spec.SetField(agent.FieldContainerStatus, field.TypeString, value)
 		_node.ContainerStatus = value
+	}
+	if value, ok := _c.mutation.ExitCode(); ok {
+		_spec.SetField(agent.FieldExitCode, field.TypeInt, value)
+		_node.ExitCode = &value
+	}
+	if value, ok := _c.mutation.ExitReason(); ok {
+		_spec.SetField(agent.FieldExitReason, field.TypeString, value)
+		_node.ExitReason = value
 	}
 	if value, ok := _c.mutation.RuntimeState(); ok {
 		_spec.SetField(agent.FieldRuntimeState, field.TypeString, value)
@@ -1086,6 +1152,18 @@ func (u *AgentUpsert) UpdateVisibility() *AgentUpsert {
 	return u
 }
 
+// SetMessageMode sets the "message_mode" field.
+func (u *AgentUpsert) SetMessageMode(v agent.MessageMode) *AgentUpsert {
+	u.Set(agent.FieldMessageMode, v)
+	return u
+}
+
+// UpdateMessageMode sets the "message_mode" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateMessageMode() *AgentUpsert {
+	u.SetExcluded(agent.FieldMessageMode)
+	return u
+}
+
 // SetLabels sets the "labels" field.
 func (u *AgentUpsert) SetLabels(v map[string]string) *AgentUpsert {
 	u.Set(agent.FieldLabels, v)
@@ -1209,6 +1287,48 @@ func (u *AgentUpsert) UpdateContainerStatus() *AgentUpsert {
 // ClearContainerStatus clears the value of the "container_status" field.
 func (u *AgentUpsert) ClearContainerStatus() *AgentUpsert {
 	u.SetNull(agent.FieldContainerStatus)
+	return u
+}
+
+// SetExitCode sets the "exit_code" field.
+func (u *AgentUpsert) SetExitCode(v int) *AgentUpsert {
+	u.Set(agent.FieldExitCode, v)
+	return u
+}
+
+// UpdateExitCode sets the "exit_code" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateExitCode() *AgentUpsert {
+	u.SetExcluded(agent.FieldExitCode)
+	return u
+}
+
+// AddExitCode adds v to the "exit_code" field.
+func (u *AgentUpsert) AddExitCode(v int) *AgentUpsert {
+	u.Add(agent.FieldExitCode, v)
+	return u
+}
+
+// ClearExitCode clears the value of the "exit_code" field.
+func (u *AgentUpsert) ClearExitCode() *AgentUpsert {
+	u.SetNull(agent.FieldExitCode)
+	return u
+}
+
+// SetExitReason sets the "exit_reason" field.
+func (u *AgentUpsert) SetExitReason(v string) *AgentUpsert {
+	u.Set(agent.FieldExitReason, v)
+	return u
+}
+
+// UpdateExitReason sets the "exit_reason" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateExitReason() *AgentUpsert {
+	u.SetExcluded(agent.FieldExitReason)
+	return u
+}
+
+// ClearExitReason clears the value of the "exit_reason" field.
+func (u *AgentUpsert) ClearExitReason() *AgentUpsert {
+	u.SetNull(agent.FieldExitReason)
 	return u
 }
 
@@ -1752,6 +1872,20 @@ func (u *AgentUpsertOne) UpdateVisibility() *AgentUpsertOne {
 	})
 }
 
+// SetMessageMode sets the "message_mode" field.
+func (u *AgentUpsertOne) SetMessageMode(v agent.MessageMode) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetMessageMode(v)
+	})
+}
+
+// UpdateMessageMode sets the "message_mode" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateMessageMode() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateMessageMode()
+	})
+}
+
 // SetLabels sets the "labels" field.
 func (u *AgentUpsertOne) SetLabels(v map[string]string) *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
@@ -1896,6 +2030,55 @@ func (u *AgentUpsertOne) UpdateContainerStatus() *AgentUpsertOne {
 func (u *AgentUpsertOne) ClearContainerStatus() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearContainerStatus()
+	})
+}
+
+// SetExitCode sets the "exit_code" field.
+func (u *AgentUpsertOne) SetExitCode(v int) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetExitCode(v)
+	})
+}
+
+// AddExitCode adds v to the "exit_code" field.
+func (u *AgentUpsertOne) AddExitCode(v int) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.AddExitCode(v)
+	})
+}
+
+// UpdateExitCode sets the "exit_code" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateExitCode() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateExitCode()
+	})
+}
+
+// ClearExitCode clears the value of the "exit_code" field.
+func (u *AgentUpsertOne) ClearExitCode() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearExitCode()
+	})
+}
+
+// SetExitReason sets the "exit_reason" field.
+func (u *AgentUpsertOne) SetExitReason(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetExitReason(v)
+	})
+}
+
+// UpdateExitReason sets the "exit_reason" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateExitReason() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateExitReason()
+	})
+}
+
+// ClearExitReason clears the value of the "exit_reason" field.
+func (u *AgentUpsertOne) ClearExitReason() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearExitReason()
 	})
 }
 
@@ -2663,6 +2846,20 @@ func (u *AgentUpsertBulk) UpdateVisibility() *AgentUpsertBulk {
 	})
 }
 
+// SetMessageMode sets the "message_mode" field.
+func (u *AgentUpsertBulk) SetMessageMode(v agent.MessageMode) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetMessageMode(v)
+	})
+}
+
+// UpdateMessageMode sets the "message_mode" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateMessageMode() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateMessageMode()
+	})
+}
+
 // SetLabels sets the "labels" field.
 func (u *AgentUpsertBulk) SetLabels(v map[string]string) *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
@@ -2807,6 +3004,55 @@ func (u *AgentUpsertBulk) UpdateContainerStatus() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearContainerStatus() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearContainerStatus()
+	})
+}
+
+// SetExitCode sets the "exit_code" field.
+func (u *AgentUpsertBulk) SetExitCode(v int) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetExitCode(v)
+	})
+}
+
+// AddExitCode adds v to the "exit_code" field.
+func (u *AgentUpsertBulk) AddExitCode(v int) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.AddExitCode(v)
+	})
+}
+
+// UpdateExitCode sets the "exit_code" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateExitCode() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateExitCode()
+	})
+}
+
+// ClearExitCode clears the value of the "exit_code" field.
+func (u *AgentUpsertBulk) ClearExitCode() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearExitCode()
+	})
+}
+
+// SetExitReason sets the "exit_reason" field.
+func (u *AgentUpsertBulk) SetExitReason(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetExitReason(v)
+	})
+}
+
+// UpdateExitReason sets the "exit_reason" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateExitReason() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateExitReason()
+	})
+}
+
+// ClearExitReason clears the value of the "exit_reason" field.
+func (u *AgentUpsertBulk) ClearExitReason() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearExitReason()
 	})
 }
 

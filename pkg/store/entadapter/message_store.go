@@ -79,6 +79,11 @@ func entMessageToStore(e *ent.Message) *store.Message {
 		}
 	}
 
+	var conversationID string
+	if e.ConversationID != nil {
+		conversationID = e.ConversationID.String()
+	}
+
 	return &store.Message{
 		ID:                    e.ID.String(),
 		ProjectID:             e.ProjectID.String(),
@@ -95,6 +100,7 @@ func entMessageToStore(e *ent.Message) *store.Message {
 		GroupID:               e.GroupID,
 		Channel:               e.Channel,
 		ThreadID:              e.ThreadID,
+		ConversationID:        conversationID,
 		Visibility:            vis,
 		CreatedAt:             e.Created,
 		DispatchState:         e.DispatchState,
@@ -137,6 +143,13 @@ func (s *MessageStore) CreateMessage(ctx context.Context, msg *store.Message) er
 	}
 	if msg.ThreadID != "" {
 		create.SetThreadID(msg.ThreadID)
+	}
+	if msg.ConversationID != "" {
+		cid, err := parseUUID(msg.ConversationID)
+		if err != nil {
+			return err
+		}
+		create.SetConversationID(cid)
 	}
 	if msg.Visibility != "" {
 		create.SetVisibility(msg.Visibility)
@@ -250,6 +263,37 @@ func decodeCursor(cursor string) (time.Time, uuid.UUID, error) {
 	return ts, id, nil
 }
 
+// encodeListCursor extends the ordinary keyset cursor with an optional binding.
+// A binding is supplied by endpoint callers that must reject cursors reused
+// across different resources or filters.
+func encodeListCursor(created time.Time, id, binding string) string {
+	raw := created.Format(time.RFC3339Nano) + "," + id
+	if binding != "" {
+		raw += "," + binding
+	}
+	return base64.URLEncoding.EncodeToString([]byte(raw))
+}
+
+func decodeListCursor(cursor, binding string) (time.Time, uuid.UUID, error) {
+	raw, err := base64.URLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("base64 decode: %w", err)
+	}
+	parts := strings.SplitN(string(raw), ",", 3)
+	if len(parts) < 2 || (binding == "" && len(parts) != 2) || (binding != "" && (len(parts) != 3 || parts[2] != binding)) {
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("cursor does not match this list")
+	}
+	ts, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("parse timestamp: %w", err)
+	}
+	id, err := uuid.Parse(parts[1])
+	if err != nil {
+		return time.Time{}, uuid.UUID{}, fmt.Errorf("parse id: %w", err)
+	}
+	return ts, id, nil
+}
+
 // ListMessages returns messages matching the given filter, ordered by
 // created_at DESC.
 func (s *MessageStore) ListMessages(ctx context.Context, filter store.MessageFilter, opts store.ListOptions) (*store.ListResult[store.Message], error) {
@@ -291,6 +335,13 @@ func (s *MessageStore) ListMessages(ctx context.Context, filter store.MessageFil
 	}
 	if filter.ThreadID != "" {
 		query.Where(message.ThreadIDEQ(filter.ThreadID))
+	}
+	if filter.ConversationID != "" {
+		cid, err := parseUUID(filter.ConversationID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid conversation_id filter: %w", err)
+		}
+		query.Where(message.ConversationIDEQ(cid))
 	}
 	// Visibility filter with NULL backfill awareness (review R1 fix):
 	// Old rows have NULL visibility. The read-time backfill in entMessageToStore
@@ -428,4 +479,47 @@ func (s *MessageStore) PurgeOldMessages(ctx context.Context, readCutoff time.Tim
 		return 0, err
 	}
 	return n, nil
+}
+
+// SetMessageConversationID updates the conversation_id on an existing message.
+// Used by Phase 4 backfill to link legacy messages to Conversation records.
+func (s *MessageStore) SetMessageConversationID(ctx context.Context, messageID, conversationID string) error {
+	mid, err := parseUUID(messageID)
+	if err != nil {
+		return err
+	}
+	cid, err := parseUUID(conversationID)
+	if err != nil {
+		return err
+	}
+	n, err := s.client.Message.Update().
+		Where(message.IDEQ(mid)).
+		SetConversationID(cid).
+		Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// CountUnbackfilledMessages returns the number of messages with a NULL
+// conversation_id. When projectID is non-empty the count is scoped to that
+// project; otherwise it counts across all projects.
+func (s *MessageStore) CountUnbackfilledMessages(ctx context.Context, projectID string) (int, error) {
+	query := s.client.Message.Query().Where(message.ConversationIDIsNil())
+	if projectID != "" {
+		pid, err := parseUUID(projectID)
+		if err != nil {
+			return 0, err
+		}
+		query.Where(message.ProjectIDEQ(pid))
+	}
+	count, err := query.Count(ctx)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return count, nil
 }

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 )
 
 // Agent represents an agent record in the Hub database.
@@ -46,6 +47,8 @@ type Agent struct {
 	ConnectionState string `json:"connectionState,omitempty"` // connected, disconnected, unknown
 	ContainerStatus string `json:"containerStatus,omitempty"` // Container-level status
 	RuntimeState    string `json:"runtimeState,omitempty"`    // Low-level runtime state
+	ExitCode        *int   `json:"exitCode,omitempty"`        // Structured exit code from runtime (nil = unknown)
+	ExitReason      string `json:"exitReason,omitempty"`      // Terminal reason: "crashed" or "limits_exceeded"
 
 	// Limits tracking (updated by sciontool status reports)
 	CurrentTurns      int       `json:"currentTurns,omitempty"`
@@ -82,9 +85,10 @@ type Agent struct {
 	DeletedAt         time.Time `json:"deletedAt,omitempty"`
 
 	// Ownership
-	CreatedBy  string `json:"createdBy,omitempty"`
-	OwnerID    string `json:"ownerId,omitempty"`
-	Visibility string `json:"visibility"` // private, team, public
+	CreatedBy   string `json:"createdBy,omitempty"`
+	OwnerID     string `json:"ownerId,omitempty"`
+	Visibility  string `json:"visibility"`  // private, team, public
+	MessageMode string `json:"messageMode"` // none, lineage, branch, project
 
 	// Ancestry chain for transitive access control.
 	// Ordered list of ancestor IDs: [root, ..., parent].
@@ -172,6 +176,14 @@ type AgentAppliedConfig struct {
 	// AgentRole is the effective authorization role resolved at creation time.
 	// Determines which JWT scopes the agent receives. Immutable after creation.
 	AgentRole string `json:"agentRole,omitempty"`
+
+	// AgentRoleGrandfathered records that AgentRole was assigned by the
+	// pre-role backfill, not by an explicit grant. It is provenance only.
+	// No decision path may read this field to grant, widen, or exempt
+	// anything. If the sponsor later authorizes an exemption policy, that
+	// logic must read this at one named, tested gate — not as an ambient
+	// check inside evaluation.
+	AgentRoleGrandfathered bool `json:"agentRoleGrandfathered,omitempty"`
 
 	// WorkspaceStoragePath is the GCS storage path for bootstrapped workspaces.
 	// Set during workspace bootstrap for non-git projects.
@@ -294,9 +306,8 @@ type Project struct {
 	Updated time.Time `json:"updated"`
 
 	// Ownership
-	CreatedBy  string `json:"createdBy,omitempty"`
-	OwnerID    string `json:"ownerId,omitempty"`
-	Visibility string `json:"visibility"` // private, team, public
+	CreatedBy string `json:"createdBy,omitempty"`
+	OwnerID   string `json:"ownerId,omitempty"`
 
 	// Configuration (stored as JSON)
 	SharedDirs []api.SharedDir `json:"sharedDirs,omitempty"`
@@ -688,6 +699,7 @@ type TemplateConfig struct {
 	HubAccess   *HubAccessConfig     `json:"hubAccess,omitempty"`
 	Secrets     []api.RequiredSecret `json:"secrets,omitempty"`
 	Telemetry   *api.TelemetryConfig `json:"telemetry,omitempty"`
+	MessageMode string               `json:"messageMode,omitempty"` // none, lineage, branch, project
 }
 
 // HubAccessConfig defines what Hub API scopes an agent created from this template receives.
@@ -760,6 +772,30 @@ const (
 	VisibilityTeam    = api.VisibilityTeam
 	VisibilityPublic  = api.VisibilityPublic
 )
+
+// MessageMode constants define the per-agent message mode that controls who
+// can deliver messages to the agent. The mode is orthogonal to agent role
+// (D5) and is read live from the agent record at delivery time (D10).
+//
+// See docs/messaging-authorization.md for the full decision table and
+// piercing rules. See pkg/hub/authorize_message.go for the enforcement
+// choke point.
+const (
+	MessageModeNone    = "none"    // Sealed: no message-plane delivery except super-admin (D6)
+	MessageModeLineage = "lineage" // Ancestry users + project owners only; zero agent-to-agent edges (D4)
+	MessageModeBranch  = "branch"  // Ancestry users + project owners + direct parent/child agents (both must be branch mode)
+	MessageModeProject = "project" // Bidirectional with all agents and users in project (default; matches pre-mode behavior)
+)
+
+// IsValidMessageMode returns true if mode is one of the four valid message modes.
+func IsValidMessageMode(mode string) bool {
+	switch mode {
+	case MessageModeNone, MessageModeLineage, MessageModeBranch, MessageModeProject:
+		return true
+	default:
+		return false
+	}
+}
 
 // =============================================================================
 // Allow List (User Access Control)
@@ -1074,11 +1110,17 @@ func (n *Notification) UnmarshalJSON(data []byte) error {
 
 // ListOptions provides pagination and filtering for list operations.
 type ListOptions struct {
-	Limit   int               // Maximum results
-	Cursor  string            // Pagination cursor (opaque string)
-	Labels  map[string]string // Label selectors
-	SortBy  string            // Sort field (interpretation is store-specific)
-	SortDir string            // Sort direction: "asc" or "desc" (default depends on field)
+	Limit  int    // Maximum results
+	Cursor string // Pagination cursor (opaque string)
+	// SkipTotalCount avoids a full matching COUNT query when the caller only
+	// needs a bounded page scan.
+	SkipTotalCount bool
+	// CursorBinding binds cursors to a caller-defined endpoint and filter.
+	// Stores reject a cursor whose binding does not match.
+	CursorBinding string
+	Labels        map[string]string // Label selectors
+	SortBy        string            // Sort field (interpretation is store-specific)
+	SortDir       string            // Sort direction: "asc" or "desc" (default depends on field)
 }
 
 // ListResult is a generic result container for list operations.
@@ -1151,6 +1193,17 @@ type Secret struct {
 	// Ownership
 	CreatedBy string `json:"createdBy,omitempty"`
 	UpdatedBy string `json:"updatedBy,omitempty"`
+}
+
+// SecretMetaUpdate contains fields for a metadata-only secret update.
+// Only non-zero fields are applied. The encrypted value is never modified.
+type SecretMetaUpdate struct {
+	Description   *string // pointer: nil = no change, "" = clear
+	InjectionMode string  // "" = no change
+	SecretType    string  // "" = no change
+	Target        string  // "" = no change
+	AllowProgeny  *bool   // pointer: nil = no change
+	UpdatedBy     string
 }
 
 // SecretType constants define how a secret is projected into the agent container.
@@ -1287,11 +1340,21 @@ type Policy struct {
 	// Origin tracks how the policy was created.
 	// "" (empty) = user-created (default), "seeded" = created by startup seeder.
 	Origin string `json:"origin,omitempty"`
+
+	// PolicyKind distinguishes user-created explicit policies from seeded defaults.
+	// "explicit" = user-created policy (default), "default" = seeded system default.
+	PolicyKind string `json:"policyKind,omitempty"`
 }
 
 // PolicyOrigin constants
 const (
 	PolicyOriginSeeded = "seeded"
+)
+
+// PolicyKind constants
+const (
+	PolicyKindExplicit = "explicit"
+	PolicyKindDefault  = "default"
 )
 
 // DelegatedFromCondition specifies a delegation source for policy matching.
@@ -1492,51 +1555,34 @@ func (t *UserAccessToken) UnmarshalJSON(data []byte) error {
 // UATPrefix is the token prefix that distinguishes UATs from other token types.
 const UATPrefix = "scion_pat_"
 
-// UAT scope constants define the allowed capability scopes.
+// UAT scope constants define the allowed capability scopes. Stale legacy
+// constants are retained for old stored-token metadata, but UATValidScopes below
+// is registry-derived and controls newly-created tokens.
 const (
-	UATScopeProjectRead     = "project:read"
-	UATScopeProjectUpdate   = "project:update"
-	UATScopeAgentCreate     = "agent:create"
-	UATScopeAgentRead       = "agent:read"
-	UATScopeAgentList       = "agent:list"
-	UATScopeAgentStart      = "agent:start"
-	UATScopeAgentStop       = "agent:stop"
-	UATScopeAgentDelete     = "agent:delete"
-	UATScopeAgentMessage    = "agent:message"
-	UATScopeAgentAttach     = "agent:attach"
-	UATScopeAgentPortAccess = "agent:port_access"
-	UATScopeAgentDispatch   = "agent:dispatch"
-	UATScopeAgentManage     = "agent:manage" // Convenience alias
+	UATScopeProjectRead         = permissions.ResourceProject + ":" + permissions.ActionRead
+	UATScopeProjectUpdate       = permissions.ResourceProject + ":" + permissions.ActionUpdate
+	UATScopeAgentCreate         = permissions.ResourceAgent + ":" + permissions.ActionCreate
+	UATScopeAgentRead           = permissions.ResourceAgent + ":" + permissions.ActionRead
+	UATScopeAgentList           = permissions.ResourceAgent + ":" + permissions.ActionList
+	UATScopeAgentStart          = "agent:start"    // legacy stale scope; not valid for new tokens
+	UATScopeAgentStop           = "agent:stop"     // legacy stale scope; not valid for new tokens
+	UATScopeAgentMessage        = "agent:message"  // registry-backed scope (D2); valid for new tokens
+	UATScopeAgentDispatch       = "agent:dispatch" // legacy stale scope; not valid for new tokens
+	UATScopeAgentDelete         = permissions.ResourceAgent + ":" + permissions.ActionDelete
+	UATScopeAgentAttach         = permissions.ResourceAgent + ":" + permissions.ActionAttach
+	UATScopeAgentPortAccess     = permissions.ResourceAgent + ":" + permissions.ActionPortAccess
+	UATScopeAgentManage         = permissions.UATScopeAgentManage         // Convenience alias
+	UATScopeSkillManage         = permissions.UATScopeSkillManage         // Convenience alias
+	UATScopeTemplateManage      = permissions.UATScopeTemplateManage      // Convenience alias
+	UATScopeHarnessConfigManage = permissions.UATScopeHarnessConfigManage // Convenience alias
+	UATScopeGroupManage         = permissions.UATScopeGroupManage         // Convenience alias
 )
 
 // UATValidScopes is the set of all valid UAT scope strings.
-var UATValidScopes = map[string]bool{
-	UATScopeProjectRead:     true,
-	UATScopeProjectUpdate:   true,
-	UATScopeAgentCreate:     true,
-	UATScopeAgentRead:       true,
-	UATScopeAgentList:       true,
-	UATScopeAgentStart:      true,
-	UATScopeAgentStop:       true,
-	UATScopeAgentDelete:     true,
-	UATScopeAgentMessage:    true,
-	UATScopeAgentAttach:     true,
-	UATScopeAgentPortAccess: true,
-	UATScopeAgentDispatch:   true,
-	UATScopeAgentManage:     true,
-}
+var UATValidScopes = permissions.UATValidScopes()
 
 // UATManageScopes are the scopes expanded from the agent:manage alias.
-var UATManageScopes = []string{
-	UATScopeAgentCreate,
-	UATScopeAgentRead,
-	UATScopeAgentList,
-	UATScopeAgentStart,
-	UATScopeAgentStop,
-	UATScopeAgentDelete,
-	UATScopeAgentPortAccess,
-	UATScopeAgentDispatch,
-}
+var UATManageScopes = permissions.UATManageScopes()
 
 // UATScopeToAction maps a UAT scope to its resource type and action.
 func UATScopeToAction(scope string) (resourceType string, action string) {
@@ -1669,23 +1715,24 @@ const (
 
 // Message represents a persisted structured message between agents and humans.
 type Message struct {
-	ID          string    `json:"id"`
-	ProjectID   string    `json:"projectId"`
-	Sender      string    `json:"sender"`    // "user:alice", "agent:code-reviewer"
-	SenderID    string    `json:"senderId"`  // UUID or identity key
-	Recipient   string    `json:"recipient"` // "user:alice", "agent:code-reviewer"
-	RecipientID string    `json:"recipientId"`
-	Msg         string    `json:"msg"`
-	Type        string    `json:"type"` // "instruction", "input-needed", "state-change"
-	Urgent      bool      `json:"urgent,omitempty"`
-	Broadcasted bool      `json:"broadcasted,omitempty"`
-	Read        bool      `json:"read"`    // Whether recipient has read/acknowledged
-	AgentID     string    `json:"agentId"` // The agent involved (sender or recipient)
-	GroupID     string    `json:"groupId,omitempty"`
-	Channel     string    `json:"channel,omitempty"`
-	ThreadID    string    `json:"threadId,omitempty"`
-	Visibility  string    `json:"visibility,omitempty"`
-	CreatedAt   time.Time `json:"createdAt"`
+	ID             string    `json:"id"`
+	ProjectID      string    `json:"projectId"`
+	Sender         string    `json:"sender"`    // "user:alice", "agent:code-reviewer"
+	SenderID       string    `json:"senderId"`  // UUID or identity key
+	Recipient      string    `json:"recipient"` // "user:alice", "agent:code-reviewer"
+	RecipientID    string    `json:"recipientId"`
+	Msg            string    `json:"msg"`
+	Type           string    `json:"type"` // "instruction", "input-needed", "state-change"
+	Urgent         bool      `json:"urgent,omitempty"`
+	Broadcasted    bool      `json:"broadcasted,omitempty"`
+	Read           bool      `json:"read"`    // Whether recipient has read/acknowledged
+	AgentID        string    `json:"agentId"` // The agent involved (sender or recipient)
+	GroupID        string    `json:"groupId,omitempty"`
+	Channel        string    `json:"channel,omitempty"`
+	ThreadID       string    `json:"threadId,omitempty"`
+	ConversationID string    `json:"conversationId,omitempty"`
+	Visibility     string    `json:"visibility,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
 	// DispatchState tracks cross-node delivery of the message to the broker:
 	// pending|dispatched|failed. The message row is its own durable dispatch
 	// intent (design §5.2/§6.1).
@@ -1743,14 +1790,69 @@ type MessageFilter struct {
 	// the sender_id UUID column), this matches the human-readable
 	// sender label. Useful for finding messages from agents that were
 	// persisted before SenderID was reliably populated.
-	Sender     string
-	OnlyUnread bool      // Only unread messages
-	Type       string    // Filter by message type
-	Channel    string    // Filter by channel (e.g. "web", "discord")
-	ThreadID   string    // Filter by thread_id (wave-2 conversation key)
-	Visibility []string  // Filter to listed visibility levels
-	Before     time.Time // Upper bound for created_at (exclusive)
-	After      time.Time // Lower bound for created_at (exclusive)
+	Sender         string
+	OnlyUnread     bool      // Only unread messages
+	Type           string    // Filter by message type
+	Channel        string    // Filter by channel (e.g. "web", "discord")
+	ThreadID       string    // Filter by thread_id (wave-2 conversation key)
+	ConversationID string    // Filter by conversation_id (S4 conversation model)
+	Visibility     []string  // Filter to listed visibility levels
+	Before         time.Time // Upper bound for created_at (exclusive)
+	After          time.Time // Lower bound for created_at (exclusive)
+}
+
+// =============================================================================
+// Conversations (Multi-Party Messaging)
+// =============================================================================
+
+// Conversation represents a conversation container for a thread of messages.
+// It may be a direct (1:1) or group conversation, and may originate from a
+// native or external surface (Discord, Slack, etc.).
+type Conversation struct {
+	ID             string     `json:"id"`
+	ProjectID      *string    `json:"projectId,omitempty"` // nil for direct conversations
+	Kind           string     `json:"kind"`                // direct | group
+	Surface        string     `json:"surface"`             // native | discord | slack | telegram | gchat | teams
+	ExternalRef    string     `json:"externalRef,omitempty"`
+	ParentRef      string     `json:"parentRef,omitempty"`
+	DisplayName    string     `json:"displayName,omitempty"`
+	DefaultAgentID *string    `json:"defaultAgentId,omitempty"` // MUST be a valid UUID; slugs rejected
+	DriftState     string     `json:"driftState"`               // active | orphaned | unresolvable
+	LastActivityAt time.Time  `json:"lastActivityAt"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	ArchivedAt     *time.Time `json:"archivedAt,omitempty"`
+	DeletedAt      *time.Time `json:"deletedAt,omitempty"`
+}
+
+// ConversationParticipant links a principal (user or agent) to a conversation.
+type ConversationParticipant struct {
+	ID             string     `json:"id"`
+	ConversationID string     `json:"conversationId"`
+	PrincipalKind  string     `json:"principalKind"` // user | agent
+	PrincipalID    string     `json:"principalId"`
+	Role           string     `json:"role"` // member | observer
+	JoinedAt       time.Time  `json:"joinedAt"`
+	LeftAt         *time.Time `json:"leftAt,omitempty"`
+}
+
+// MessageAddressee records one principal that a message is addressed to,
+// how the addressing was resolved, and the current delivery state.
+type MessageAddressee struct {
+	ID            string  `json:"id"`
+	MessageID     string  `json:"messageId"`
+	PrincipalKind string  `json:"principalKind"` // user | agent
+	PrincipalID   string  `json:"principalId"`
+	Via           string  `json:"via"`           // explicit | body-mention | default-agent | direct
+	DeliveryState string  `json:"deliveryState"` // pending | delivered | failed
+	FailureReason *string `json:"failureReason,omitempty"`
+}
+
+// ConversationFilter defines query parameters for listing conversations.
+type ConversationFilter struct {
+	ProjectID  string
+	Kind       string
+	Surface    string
+	DriftState string
 }
 
 // =============================================================================
@@ -1914,6 +2016,8 @@ func (a *Agent) ToAPI() *api.AgentInfo {
 		Activity:        a.Activity,
 		ContainerStatus: a.ContainerStatus,
 		RuntimeState:    a.RuntimeState,
+		ExitCode:        a.ExitCode,
+		ExitReason:      a.ExitReason,
 
 		// Runtime configuration
 		Image:           a.Image,
@@ -1976,9 +2080,8 @@ func (g *Project) ToAPI() *api.ProjectInfo {
 		Updated: g.Updated,
 
 		// Ownership
-		CreatedBy:  g.CreatedBy,
-		OwnerID:    g.OwnerID,
-		Visibility: g.Visibility,
+		CreatedBy: g.CreatedBy,
+		OwnerID:   g.OwnerID,
 
 		// Metadata
 		Labels:      g.Labels,
@@ -2317,6 +2420,128 @@ type AgentSessionMetricsAggregates struct {
 	SumTurnCount    int64 `json:"sumTurnCount"`
 }
 
+// =============================================================================
+// Role Definitions and Bindings (Permissions Foundation Phase 1E)
+// =============================================================================
+
+// RoleDefinition represents a named collection of permissions.
+type RoleDefinition struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"` // e.g. "super-admin", "hub-member", "project-owner"
+	Description string    `json:"description"`
+	ScopeType   string    `json:"scopeType"`   // "system", "project"
+	Permissions []string  `json:"permissions"` // permission IDs from registry
+	System      bool      `json:"system"`      // true = seeded, not user-modifiable
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+// RoleBinding connects a principal to a role definition, optionally scoped.
+type RoleBinding struct {
+	ID               string     `json:"id"`
+	RoleDefinitionID string     `json:"roleDefinitionId"`
+	PrincipalType    string     `json:"principalType"` // "user", "agent", "group"
+	PrincipalID      string     `json:"principalId"`
+	ScopeType        string     `json:"scopeType"` // "system", "project"
+	ScopeID          string     `json:"scopeId"`   // "" for system, project ID for project
+	NotBefore        *time.Time `json:"notBefore"` // Binding is inactive before this time (kernel evaluates)
+	ExpiresAt        *time.Time `json:"expiresAt"` // Binding is inactive after this time (kernel evaluates)
+	CreatedBy        string     `json:"createdBy"`
+	CreatedAt        time.Time  `json:"createdAt"`
+}
+
+// ProjectMembership is a convenience view of role bindings scoped to a project.
+// It is NOT a separate table -- project membership IS role bindings with scope_type="project".
+// This type is used only for query results and API compatibility.
+type ProjectMembership struct {
+	ProjectID     string `json:"projectId"`
+	UserID        string `json:"userId"`
+	Role          string `json:"role"` // "project-owner", "project-admin", "project-member"
+	RoleBindingID string `json:"roleBindingId"`
+}
+
+// RoleDefinition scope types
+const (
+	RoleScopeSystem  = "system"
+	RoleScopeProject = "project"
+)
+
+// System role names
+const (
+	SystemRoleSuperAdmin = "super-admin"
+	SystemRoleHubAdmin   = "hub-admin"
+	SystemRoleHubMember  = "hub-member"
+	SystemRoleHubViewer  = "hub-viewer"
+)
+
+// Project role names
+const (
+	ProjectRoleOwner  = "project-owner"
+	ProjectRoleAdmin  = "project-admin"
+	ProjectRoleMember = "project-member"
+)
+
+// Agent role definition names (matching existing AgentRole constants)
+const (
+	AgentRoleDefNone     = "agent-role-none"
+	AgentRoleDefReadonly = "agent-role-readonly"
+	AgentRoleDefBaseline = "agent-role-baseline"
+	AgentRoleDefFull     = "agent-role-full"
+)
+
+// RoleBinding principal types
+const (
+	RoleBindingPrincipalUser  = "user"
+	RoleBindingPrincipalAgent = "agent"
+	RoleBindingPrincipalGroup = "group"
+)
+
+// =============================================================================
+// Delegation Edges (Permissions Foundation Phase 1G)
+// =============================================================================
+
+// DelegationEdge represents an authority-delegating relationship between principals.
+// Used by the live delegation ceiling to verify that every ancestor in an
+// agent's delegation chain still holds the permissions being exercised.
+type DelegationEdge struct {
+	ID            string    `json:"id"`
+	DelegatorType string    `json:"delegatorType"`
+	DelegatorID   string    `json:"delegatorId"`
+	DelegateType  string    `json:"delegateType"`
+	DelegateID    string    `json:"delegateId"`
+	ScopeType     string    `json:"scopeType"`
+	ScopeID       string    `json:"scopeId"`
+	Role          string    `json:"role"`
+	Active        bool      `json:"active"`
+	Grandfathered bool      `json:"grandfathered"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+// Delegation edge principal types
+const (
+	DelegationPrincipalUser  = "user"
+	DelegationPrincipalAgent = "agent"
+)
+
+// =============================================================================
+// Agent Credentials (Permissions Foundation Phase 1H)
+// =============================================================================
+
+// AgentCredential represents a tracked agent JWT token credential.
+type AgentCredential struct {
+	ID           string     `json:"id"`
+	AgentID      string     `json:"agent_id"`
+	ProjectID    string     `json:"project_id"`
+	TokenJTIHash string     `json:"token_jti_hash"`
+	IssuedAt     time.Time  `json:"issued_at"`
+	ExpiresAt    time.Time  `json:"expires_at"`
+	RevokedAt    *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy    *string    `json:"revoked_by,omitempty"`
+	RevokeReason *string    `json:"revoke_reason,omitempty"`
+	LastSeenAt   *time.Time `json:"last_seen_at,omitempty"`
+}
+
 // MarshalJSON implements custom marshaling to support legacy groveId field.
 func (m AgentSessionMetrics) MarshalJSON() ([]byte, error) {
 	type Alias AgentSessionMetrics
@@ -2346,3 +2571,204 @@ func (m *AgentSessionMetrics) UnmarshalJSON(data []byte) error {
 	}
 	return nil
 }
+
+// =============================================================================
+// Decision Audit (Authorization Decision Audit Phase 1I)
+// =============================================================================
+
+// DecisionAuditRecord represents an authorization decision audit record.
+type DecisionAuditRecord struct {
+	ID             string
+	Timestamp      time.Time
+	PrincipalKind  string
+	PrincipalID    string
+	CredentialID   string
+	CredentialType string
+	Route          string
+	ResourceType   string
+	ResourceID     string
+	Permission     string
+	Result         string
+	Reason         string
+	MatchedPolicy  string
+	MatchedGrant   string
+	PolicyID       string
+	CorrelationID  string
+	Sampled        bool
+}
+
+// DecisionAuditFilter defines query parameters for listing decision audit records.
+type DecisionAuditFilter struct {
+	PrincipalID   string
+	PrincipalKind string
+	CredentialID  string
+	Route         string
+	ResourceType  string
+	ResourceID    string
+	Result        string // "allow" or "deny"
+	Since         time.Time
+	Until         time.Time
+	CorrelationID string
+	Limit         int
+	Offset        int
+}
+
+// =============================================================================
+// Mutation Audit (Authorization Mutation Audit Phase 1I)
+// =============================================================================
+
+// MutationAuditRecord represents an authorization mutation audit record.
+type MutationAuditRecord struct {
+	ID                  string
+	Timestamp           time.Time
+	MutationType        string
+	ActorPrincipalKind  string
+	ActorPrincipalID    string
+	ActorCredentialID   string
+	ActorCredentialType string
+	TargetType          string
+	TargetID            string
+	BeforeSummary       string
+	AfterSummary        string
+	CanDelegateResult   string
+	CanDelegateReason   string
+}
+
+// MutationAuditFilter defines query parameters for listing mutation audit records.
+type MutationAuditFilter struct {
+	MutationType       string
+	ActorPrincipalID   string
+	ActorPrincipalKind string
+	ActorCredentialID  string
+	TargetType         string
+	TargetID           string
+	Since              time.Time
+	Until              time.Time
+	Limit              int
+	Offset             int
+}
+
+// =============================================================================
+// Limit Definitions and Quota Bindings (Permissions Phase 2B)
+// =============================================================================
+
+// LimitDefinition represents a configurable resource limit.
+type LimitDefinition struct {
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`         // e.g. "max_agents_per_project"
+	ResourceType string    `json:"resourceType"` // e.g. "agent", "project", "group"
+	Unit         string    `json:"unit"`         // e.g. "count"
+	Description  string    `json:"description"`
+	DefaultValue int64     `json:"defaultValue"` // 0 = unlimited
+	System       bool      `json:"system"`       // true = seeded, not user-modifiable
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+// EntitlementBinding associates a limit with a subject (user, group, or system default).
+type EntitlementBinding struct {
+	ID                string    `json:"id"`
+	LimitDefinitionID string    `json:"limitDefinitionId"`
+	SubjectType       string    `json:"subjectType"` // "user", "group", "system_default"
+	SubjectID         string    `json:"subjectId"`
+	ScopeType         string    `json:"scopeType"` // "system" or "project"
+	ScopeID           string    `json:"scopeId"`   // "" for system, project ID for project
+	Value             int64     `json:"value"`
+	CreatedBy         string    `json:"createdBy"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
+// UsageReservation tracks a single unit of quota consumption.
+type UsageReservation struct {
+	ID                string     `json:"id"`
+	LimitDefinitionID string     `json:"limitDefinitionId"`
+	SubjectID         string     `json:"subjectId"`
+	ScopeType         string     `json:"scopeType"` // "system" or "project"
+	ScopeID           string     `json:"scopeId"`
+	ResourceID        string     `json:"resourceId"`
+	Reserved          int64      `json:"reserved"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	ReleasedAt        *time.Time `json:"releasedAt,omitempty"`
+}
+
+// Entitlement binding subject types
+const (
+	EntitlementSubjectUser          = "user"
+	EntitlementSubjectGroup         = "group"
+	EntitlementSubjectSystemDefault = "system_default"
+)
+
+// Quota scope types
+const (
+	QuotaScopeSystem  = "system"
+	QuotaScopeProject = "project"
+)
+
+// System limit definition names
+const (
+	LimitMaxAgentsPerProject = "max_agents_per_project"
+	LimitMaxProjectsPerUser  = "max_projects_per_user"
+	LimitMaxMembersPerGroup  = "max_members_per_group"
+)
+
+// =============================================================================
+// Access Constraints (AC1 — Operator Access Constraint Backend)
+// =============================================================================
+
+// AccessConstraint is a named maximum-permissions boundary. It can only
+// reduce otherwise granted authority — it cannot create authority.
+type AccessConstraint struct {
+	ID                   string     `json:"id"`
+	Name                 string     `json:"name"`
+	SubjectKind          string     `json:"subjectKind"`          // "principal", "group_closure", "all_principals"
+	SubjectPrincipalType *string    `json:"subjectPrincipalType"` // "user", "agent", "group" (when subjectKind=principal)
+	SubjectPrincipalID   *string    `json:"subjectPrincipalId"`   // Principal ID (when subjectKind=principal)
+	SubjectGroupID       *string    `json:"subjectGroupId"`       // Group ID (when subjectKind=group_closure)
+	ScopeType            string     `json:"scopeType"`            // "system" or "project"
+	ScopeID              string     `json:"scopeId"`              // "" for system, project ID for project
+	MaximumPermissions   []string   `json:"maximumPermissions"`   // Allowlist of permission IDs
+	NotBefore            *time.Time `json:"notBefore"`            // Constraint inactive before this time
+	ExpiresAt            *time.Time `json:"expiresAt"`            // Constraint inactive after this time
+	Disabled             bool       `json:"disabled"`             // True when deactivated by offline recovery
+	Revision             int64      `json:"revision"`             // Monotonic revision counter for optimistic concurrency
+	Purpose              string     `json:"purpose"`              // Human-readable description of why this constraint exists
+	UpdatedBy            string     `json:"updatedBy,omitempty"`  // Principal who last modified
+	CreatedBy            string     `json:"createdBy"`
+	CreatedAt            time.Time  `json:"createdAt"`
+	UpdatedAt            time.Time  `json:"updatedAt"`
+}
+
+// AccessConstraintListOptions defines filtering, sorting, and cursor-based
+// pagination for ListAccessConstraintsFiltered.
+type AccessConstraintListOptions struct {
+	// Cursor-based pagination
+	PageSize  int
+	PageToken string // opaque cursor
+
+	// Filters
+	SubjectKind          string // "principal", "group_closure", "all_principals"
+	SubjectPrincipalType string // "user", "agent", "group"
+	ScopeType            string // "system", "project"
+	ScopeID              string
+	Status               string // derived: "active", "scheduled", "expired", "recovery_disabled"
+	NameContains         string // case-insensitive search
+
+	// Sort
+	SortBy    string // "name", "created", "updated"
+	SortOrder string // "asc", "desc"
+}
+
+// AccessConstraint subject kinds
+const (
+	ConstraintSubjectPrincipal     = "principal"
+	ConstraintSubjectGroupClosure  = "group_closure"
+	ConstraintSubjectAllPrincipals = "all_principals"
+)
+
+// AccessConstraint subject principal types
+const (
+	ConstraintPrincipalTypeUser  = "user"
+	ConstraintPrincipalTypeAgent = "agent"
+	ConstraintPrincipalTypeGroup = "group"
+)

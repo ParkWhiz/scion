@@ -73,7 +73,7 @@ Enabling progeny propagation dynamically registers implicit access policies (e.g
 
 ## Managing Environment Variables
 
-Use the `scion hub env` command suite to manage non-sensitive configuration.
+Use the `scion hub env` command suite to manage non-sensitive configuration. Each agent environment variable carries **provenance metadata** (hub-injected, user-defined, or runtime-derived) to help you audit and debug the origin of specific values.
 
 ### Setting Variables
 ```bash
@@ -134,6 +134,17 @@ Secrets can be projected into the agent container in three ways:
 1.  **Environment** (Default): Injected as a standard environment variable.
 2.  **File**: Written to a specific path on the agent's filesystem.
 3.  **Variable**: Added to a JSON file at `~/.scion/secrets.json` for programmatic access by the harness.
+
+### Updating Secret Metadata
+
+You can update a secret's configuration metadata (like its `type`, `target` path, or injection mode) without needing to re-enter its sensitive value or create a new version in the backend. This is supported via the Web UI "Edit Settings" dialog and the CLI:
+
+```bash
+# Change an existing secret's type to file and specify a target path
+scion hub secret update MY_SECRET --type file --target ~/.my-secret
+```
+
+This metadata-only update (PATCH) guarantees that path traversal protections and scope validations are applied correctly without re-writing the encrypted payload.
 
 ### Mounting Files as Secrets
 You can use the `@` prefix to read a secret's value from a local file. This is particularly useful for SSH keys or service account JSONs.
@@ -306,12 +317,12 @@ This feature was introduced in [`GoogleCloudPlatform/scion` PR #919](https://git
 
 To use secrets in production, the Hub must be configured with a production-grade secrets backend.
 
-### Secrets Backend (Required)
+### Secrets Backend
 
-Scion requires a secrets backend to store secret values. The recommended backend is **GCP Secret Manager**.
+Scion uses a secrets backend to store secret values securely. The recommended backend for production is **GCP Secret Manager**, while the default `local` backend stores values directly in the Hub database using AES-256-GCM encryption at rest (derived from the hub signing secret).
 
-:::caution[No Plaintext Storage]
-The Hub does not store secret values in its database. Attempting to create or update secrets without a configured backend (e.g., using the default `local` backend) will return an error. You must configure GCP Secret Manager to use secret management features.
+:::note[Encryption at Rest]
+Secret values are never stored in plaintext. If using the default `local` backend, values are encrypted before being written to the database. Legacy plaintext values are transparently re-encrypted on their next write.
 :::
 
 #### Configuring GCP Secret Manager

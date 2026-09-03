@@ -211,3 +211,374 @@ exist outside a cluster.
       `touch` a file under the mounted path as the hub's uid) and confirm
       `ls -n` on the share shows the new files owned by the numeric `nfs.uid` /
       `nfs.gid` configured in `values.yaml` -- not `0:0`, and not `root:root`.
+
+### Configuration intake (`settings.yaml`)
+
+The rendered content is fully covered by `hack/verify.sh` and `golden/` — the
+file shape, the preflight keys in both auth modes, the deep merge, the absent
+environment variables — and none of that needs a cluster. What needs a cluster
+is everything about *delivery*: whether the mount lands, whether the hub can
+read it, and what the hub does when it tries to write it.
+
+#### 1. The hub can read the mounted settings file
+
+The single most likely delivery failure, and the one that does not announce
+itself. A Secret volume is projected `root:root` regardless of the pod's
+`securityContext`, and the hub runs as a non-root uid — so the file's mode is
+load-bearing. The chart projects `0444`.
+
+    kubectl exec <hub-pod> -- ls -l /home/scion/.scion/settings.yaml
+    kubectl exec <hub-pod> -- head -5 /home/scion/.scion/settings.yaml
+
+Pass: the mode is `-r--r--r--`, and the hub's own logs show it loaded the
+configuration — the hub ID it reports matches `hub.hubId`, and the database
+driver it reports matches `database.driver`.
+
+**Fail looks like a configuration error, not a permissions error.** An unreadable
+settings file does not produce "permission denied" anywhere the operator will
+look. The hub starts on its defaults and then fails the hosted preflight naming
+a missing key — sending you to a settings file that is, in fact, correct. If you
+are debugging a preflight failure that names a key you can see in the Secret,
+check the mode first.
+
+Do not fix a permissions problem here by adding `fsGroup`. It is pod-wide, so it
+grants the group to every sidecar as well, and it makes the kubelet apply
+recursive ownership changes to mounted volumes — which becomes a startup hazard
+once the workspace share is an NFS mount.
+
+#### 2. `$HOME/.scion` is writable and the settings file is not
+
+    kubectl exec <hub-pod> -- touch /home/scion/.scion/probe && echo dir-writable
+    kubectl exec <hub-pod> -- sh -c '>> /home/scion/.scion/settings.yaml' ; echo $?
+    kubectl exec <hub-pod> -- ls -a /home/scion/.scion
+
+Pass: the directory accepts a write and the append to `settings.yaml` fails. The
+directory is the hub's whole state directory — `storage/`, `scion-token` and
+anything else it needs at runtime are created in it — so a read-only directory
+breaks the hub for reasons unrelated to configuration. Only the one file is
+read-only.
+
+**Expect a `cache/` tree and nothing else, and compare full paths rather than
+directory names.** Both halves of that will otherwise send somebody hunting, and
+the second half will send them to the wrong conclusion rather than to no
+conclusion.
+
+Neither `agents/` nor `harness-configs/` will exist directly under
+`/home/scion/.scion`, and that is correct. Two mechanisms combine, and they are
+independent — losing one does not restore the directories.
+`cmd/server_foreground.go:1771` bootstraps templates and harness configs from
+local `~/.scion` directories only in the `else` arm of an explicit
+`if hostedMode`; the hosted arm uses `BootstrapBundledResources` instead, "so
+every replica converges on the same DB + storage state". And
+`config.InitGlobal`, at `cmd/server_foreground.go:104`, which *does* run in
+hosted mode and *would* create both directories, is reached only
+`if os.Stat(globalDir)` reports the directory missing — and the chart mounts an
+`emptyDir` at exactly that path, so it never fires.
+
+That second mechanism is the chart changing which startup branch the hub takes,
+which is why it is written down rather than assumed.
+
+Nothing in the hub needs either directory in this deployment, and that is an
+enumeration of the source rather than an inference from one comment. For
+`harness-configs/` the three non-CLI readers are `cmd/server_foreground.go:1777`
+(the `else` arm above) and `pkg/hub/system_handlers.go:348` and `:538`, both
+registered behind `requireWorkstation` (`pkg/hub/server.go:3591`, `:3594`),
+which returns 404 whenever `Workstation` is false — and
+`cmd/server_foreground.go:1496` sets `Workstation: !hostedMode`. For `agents/`
+the reachable readers are `pkg/agent/provision.go:88` and
+`pkg/agent/list.go:201`; both *are* reachable here, because the chart enables
+the runtime broker, and both treat a missing directory as "no agents"
+(`provision.go:172-176` stats each candidate and `continue`s; `list.go:207-210`
+reads and `continue`s on error). No reader returns an error, warns, or fails a
+startup step.
+
+Those two results are not equally durable, and the difference is worth carrying.
+`agents/` is safe because of what its readers do, which survives any later phase
+switching a feature on. `harness-configs/` is safe because of which features are
+off, which does not. **If a later phase makes workstation mode or the onboarding
+endpoints reachable**, `handleSystemInit` (`pkg/hub/system_handlers.go:446`)
+becomes an HTTP endpoint that calls `config.InitMachine` and `os.RemoveAll`
+inside the tree this chart mounts a read-only settings file over. Neither gate
+holding it shut is visible from the chart's side.
+
+**What you should see instead** is `cache/templates`, `cache/harness-configs`
+and `cache/skills`, created at broker startup by `templatecache.New`
+(`pkg/templatecache/cache.go:85`) from `pkg/runtimebroker/server.go:396`, `:413`
+and `:422`. Note the collision: `cache/harness-configs` is **not**
+`harness-configs`. A check that greps for the name, or runs
+`find /home/scion/.scion -name harness-configs`, finds one and concludes the
+bootstrap ran — the opposite of the truth.
+
+That tree is also the positive twin for the write test above. The `touch` probe
+proves the directory is writable by the shell you exec'd as; the `cache/` tree
+proves it was writable by the hub's own uid at startup, which is the principal
+the question is actually about.
+
+**Record what is actually in the directory** — none of this has been observed.
+Two things would be findings rather than local fixes: any hub log line about a
+missing `agents/` or `harness-configs/` directory, or about templates it could
+not find; and the **absence** of the `cache/` tree, which would mean the state
+directory is not writable. That failure is silent — `templatecache.New` failing
+is handled with `slog.Warn` and the broker continues without a template cache
+(`pkg/runtimebroker/server.go:337`) — so it degrades rather than crashing, and
+nothing else will tell you.
+
+#### 3. What silently does not persist, until ptone/scion#1091
+
+The mount stops the hub from rewriting `settings.yaml`, which is the point: those
+writes are pod-local, and `syncHubSettings` re-seeds shared database state from
+the pod-local file on every boot, so a replica that can write this file can
+promote its own divergence into shared truth. Refusing the write prevents that.
+
+The cost is that several operations now do nothing, and mostly say so quietly.
+Confirm each, and record what the operator actually sees:
+
+- **The GitHub App configuration `PUT` returns HTTP 200 and does not persist.**
+  Verify it: configure a GitHub App through the API, get the 200, then read the
+  configuration back and restart the pod. Expected: the setting is not there.
+  This is the worst of the set because the success response is unqualified.
+- **Integration settings writes log a warning and swallow the error.** One of
+  these paths returns HTTP 500 to the caller while the server continues. Find
+  which, and record the message.
+- **The startup write logs a warning and continues.** Confirm the pod still
+  reaches ready.
+
+Pass: every one of these is soft. Nothing crashloops, nothing panics, nothing is
+corrupted, and no two replicas end up disagreeing. **Fail** — and this is the
+outcome that would reopen the mount decision — is any of them terminating the
+process, or any two replicas reporting different configuration.
+
+This is a behaviour change and in one respect it reads as a regression: with a
+writable file these writes succeeded, appeared to work, and were silently lost at
+the next pod replacement. They now never take effect. That is the better failure
+— consistent beats intermittent, and nothing can diverge — but only if operators
+are told, which is what this section and the corresponding `NOTES.txt` section
+are for. Both carry the issue number so this reads as temporary, which it is.
+
+#### 4. `helm upgrade` with a changed configuration actually takes effect
+
+A `subPath` mount is bound when the container starts and is frozen for the
+container's lifetime; the kubelet's periodic refresh of Secret volumes does not
+reach through one. The chart therefore annotates the pod with a checksum of the
+rendered Secret so that a configuration change rolls the pods.
+
+Change something visible in `config.extra` — `server.log_level`, say — and run
+`helm upgrade`.
+
+Pass: the pods are replaced and the new value is in effect.
+
+**Fail is the quiet one:** the upgrade reports success, the Secret is updated,
+and the running hub keeps the old configuration indefinitely, until some
+unrelated event restarts the pods and the change takes effect at a time nobody
+chose. If you see that, the checksum annotation is missing or is being computed
+over something that did not change.
+
+Under `config.existingSecret` the chart deliberately renders no such annotation —
+it does not own the file and cannot checksum it. Editing that Secret is expected
+*not* to roll the pods; restart them yourself.
+
+#### 5. `schema_version` and the migration rename
+
+Not runnable as a positive test — the point is that nothing happens. Worth
+knowing while you are in here: the hub auto-migrates a settings file whose format
+it cannot detect, the detector keys on `schema_version`, and the migration
+replaces the file with `os.Rename`, which returns `EBUSY` against a bind mount.
+The chart always renders `schema_version: "1"`, and `hack/verify.sh` enforces it
+under the name `migration-rename-hazard` across every values permutation.
+
+If you supply your own file through `config.existingSecret`, it must carry
+`schema_version`. If a hub ever fails with a rename or `EBUSY` error on the
+settings path, this is why.
+
+### Cloud SQL
+
+Five items, and **every one of them is UNRUN rather than pending.** The
+distinction is the point of this section, so it is stated once here and not
+softened below: *pending* describes work that is scheduled, and reads as a
+queue that will drain on its own. **Nothing here is scheduled.** No cluster and
+no Cloud SQL instance were reachable from the environment this phase was built
+in, the access needed to reach them was not held, and no request for it was
+outstanding at the time of writing. An item marked UNRUN stays UNRUN until
+somebody runs it and edits this file.
+
+#### 7.1 The connection budget's `S` has never been observed
+
+`NOTES.txt` prints the budget as `TOTAL = R * (M + S)` and requires the operator
+to supply `S` — every connection a replica holds that is not in the ent pool.
+**The chart does not default `S`, does not estimate it, and no one on this phase
+measured it.** The value shipped is an operator input for exactly that reason.
+
+`NOTES.txt` also prints a **structural maximum**, `S_max = 2 * max(4, NumCPU) + 2`,
+derived by reading pgx v5.9.2 (`pgxpool/pool.go:383`, `defaultMaxConns = 4`,
+raised to `runtime.NumCPU()` when larger) against the hub's two pool
+constructions. **That is a ceiling read out of source, not an overhead observed
+in a process**, and the two must not be confused: a ceiling tells you what the
+code cannot exceed, not what it typically holds. Sizing a Cloud SQL instance
+from `S_max` will over-provision; sizing it from an unmeasured guess will
+under-provision at the worst moment.
+
+**To run it**, once a hub is serving against Cloud SQL under representative
+load:
+
+```sql
+SELECT count(*) FROM pg_stat_activity WHERE datname = '<database.name>' AND usename = '<role>';
+```
+
+Subtract `database.maxOpenConns` and divide by `replicaCount`. Record the number
+and the load it was taken under — a value with no load beside it is not
+reusable.
+
+#### 7.2 The IAM verification: UNRUN, with the refusals that stopped it
+
+The design for this phase called for verifying, against the real project,
+whether Cloud SQL IAM database authentication is usable — and made the result
+of that verification the thing that would set `database.auth`'s default.
+
+**The verification could not be performed. It is UNRUN.** Measured
+`2026-08-17T10:24:24Z`, principal
+`scion-my-grove@deploy-demo-test.iam.gserviceaccount.com`:
+
+```
+$ kubectl config get-contexts
+CURRENT   NAME   CLUSTER   AUTHINFO   NAMESPACE
+                                                    <- header row only; zero contexts
+
+$ gcloud container clusters list
+ERROR: (gcloud.container.clusters.list) ResponseError: code=403, message=Required
+"container.clusters.list" permission(s) for "projects/deploy-demo-test". This command
+is authenticated as scion-my-grove@deploy-demo-test.iam.gserviceaccount.com which is
+the active account specified by the [core/account] property.
+
+$ gcloud sql instances list
+ERROR: (gcloud.sql.instances.list) [scion-my-grove@deploy-demo-test.iam.gserviceaccount.com]
+does not have permission to access projects instance [deploy-demo-test] (or it may not
+exist): The client is not authorized to make this request. This command is authenticated
+as scion-my-grove@deploy-demo-test.iam.gserviceaccount.com which is the active account
+specified by the [core/account] property.
+```
+
+`docker` is also absent, so there was no local Postgres fallback either.
+
+**What the chart did instead of guessing.** `database.auth` is **required and
+has no default.** It is the only value in this phase treated the way
+`image.repository` and `hub.hubId` are treated: the operator must state it. A
+default here would have been a parameter nobody chose, presented as one somebody
+did — and the two failure directions are not symmetric. Defaulting to `iam` on a
+project without IAM DB auth enabled produces an authentication failure at the
+first query, after a successful install. Defaulting to `password` silently
+selects the weaker credential path for operators who never read this file.
+Withholding the default costs one line in every values file and is the only one
+of the three that is reversible once somebody measures.
+
+**Do not restore a default to this key on the strength of this section being
+read.** The condition for adding one is a measurement, recorded here.
+
+**The `gcloud` commands `NOTES.txt` prints are derived from documentation and
+are themselves unrun.** They were checked against Google's Cloud SQL IAM
+documentation — including the detail that `gcloud sql users create` and the
+login role both take the service account **with `.gserviceaccount.com`
+stripped**, which was verified against the docs rather than assumed, an
+assumption having been drafted and caught first. Documentation-derived is not
+executed. No command in that section has been run against a real instance.
+
+**To run it**, with a project where the 403s above do not occur:
+
+1. Confirm the instance has IAM authentication on:
+   `gcloud sql instances describe <INSTANCE> --format='value(settings.databaseFlags)'`
+   and look for `cloudsql.iam_authentication=on`.
+2. Run the numbered commands from `helm install`'s `NOTES.txt` output in order.
+3. Install with `database.auth: iam`, then check `/readyz` (see 7.3).
+4. **Then edit this section**: replace it with what happened, whichever way it
+   went. A verification that failed is a result and belongs here; only an
+   unrun one belongs under this heading.
+
+> **This section moving off UNRUN is a registered trigger obligation.** See
+> `hack/trigger-entry-c.sh`, which is the executable form of the paragraph
+> above, and read its header before assuming CI is watching this for you. **It
+> is not.** The predicate is the state of a Google Cloud project, which no check
+> in this repository can observe.
+
+#### 7.3 The manual smoke test: UNRUN
+
+Three claims, none of them exercised, all of which the static checks are
+structurally unable to reach:
+
+1. **The hub reaches Postgres through the proxy.** The chart renders
+   `server.database.url` with the host fixed at `127.0.0.1` and the port shared
+   with the proxy's `--port` from one value. That they agree is asserted
+   statically. That a connection is established over the loopback the proxy
+   binds is not.
+2. **`AutoMigrate` completes.** The native sidecar's startup probe is what is
+   supposed to hold the hub container until the tunnel is up, so migration does
+   not race the proxy. **The ordering is a property of the kubelet, and no
+   kubelet has run this pod.**
+3. **`/readyz` returns 200.** The readiness path is `/readyz`; the chart
+   contains no occurrence of the deprecated liveness path Phase 0 banned. The
+   banned literal is deliberately NOT written out in this file: VALIDATION.md
+   is not in `.helmignore`, so it ships inside the chart, and a tree-wide sweep
+   for that literal would otherwise find its own documentation and go red on
+   the sentence claiming the absence. It did exactly that once - see the note
+   below. That absence is asserted statically. A 200
+   from a live hub is not.
+
+**To run it:** install against a real cluster and instance, then
+`kubectl exec` into the hub container and `curl -s -o /dev/null -w '%{http_code}' localhost:<port>/readyz`.
+Record all three outcomes, not just the last — a 200 tells you nothing about
+whether migration raced the tunnel on the way there.
+
+#### 7.4 The proxy container's runtime identity: UNVERIFIED
+
+Two properties of the rendered proxy container are asserted by the manifest and
+have never been observed in a running pod:
+
+- **The proxy runs as uid 1000, not 65532.** The upstream image declares
+  `USER 65532`, but this pod sets `runAsUser` at pod level from
+  `hub.securityContext.runAsUser`, and a pod-level `runAsUser` is inherited by
+  every container — it can be overridden, not unset. So the rendered spec puts
+  the proxy on the hub's uid. This is **expected** to be harmless: the proxy
+  writes nothing, opens no uid-owned files, and needs a socket and the metadata
+  server. It is **not verified**, and it is the sort of thing that is obvious in
+  hindsight either way.
+- **`readOnlyRootFilesystem: true` is survivable for the proxy.** It is set on
+  the proxy container and deliberately not on the hub container, which writes
+  its state directory. Whether the proxy genuinely writes nothing to its root
+  filesystem — under every code path, including error paths and credential
+  refresh — has been reasoned about and not observed.
+
+**To run it:** `kubectl get pod <pod> -o jsonpath='{.spec.initContainers[?(@.name=="cloud-sql-proxy")].securityContext}'`
+for what was admitted, then `kubectl exec -c cloud-sql-proxy <pod> -- id` for
+what is actually running. If the proxy crash-loops with a write error, this
+section is why.
+
+#### 7.5 The sub-1.29 plain-sidecar path: UNRUN, and newly reachable
+
+Until this phase's round-1 review, `Chart.yaml` declared `kubeVersion: ">=1.29.0-0"`,
+so **no cluster below 1.29 could install this chart at all** — including the ones
+`cloudsql.nativeSidecar: false` exists to serve, which `values.yaml` and
+`NOTES.txt` both told operators to use. That contradiction is fixed: the version
+requirement now belongs to the native-sidecar branch alone
+(`scion-hub.assertNativeSidecarSupported`), and below 1.29 with the flag false
+the chart renders the proxy as an ordinary sidecar.
+
+**That path has never been run on a cluster, and it is the only path this phase
+made newly reachable.** What is asserted about it is asserted from rendered YAML
+only: that the proxy appears as an ordinary container, that no `initContainers`
+block is emitted, and that `NOTES.txt` prints the crash-loop warning. The
+behavioural claim behind those — that the hub loses the startup race to the
+tunnel some number of times, logs `connection refused`, and then **recovers on
+its own** — is reasoning about a race, not an observation of one. Nobody here has
+seen it converge, and "self-healing" is precisely the kind of claim that is
+indistinguishable from "broken" for the first several minutes of watching it.
+
+**To run it**, on a cluster below 1.29 (or any cluster, with the flag forced):
+
+```
+helm install <release> . --set cloudsql.nativeSidecar=false ...
+kubectl get pod <pod> -w                     # count the restarts before Ready
+kubectl logs <pod> -c hub --previous         # expect 'connection refused' on the crashes
+```
+
+Record **how many restarts** it took to converge and how long that was. If it
+does not converge, the flag's documentation is wrong and `NOTES.txt` is
+under-warning; if it converges in one or two, the warning can say so instead of
+leaving the operator to guess.

@@ -837,3 +837,266 @@ func TestAgentStore_AppliedConfigValidatedOnRead(t *testing.T) {
 		}
 	})
 }
+
+// TestAgentStore_ExitCodeExitReason_Persistence verifies that ExitCode and
+// ExitReason survive a round-trip through UpdateAgentStatus and are readable
+// via GetAgent.
+func TestAgentStore_ExitCodeExitReason_Persistence(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("UpdateAgentStatus sets ExitCode and ExitReason", func(t *testing.T) {
+		s, projectID := newTestAgentStore(t)
+		a := makeAgent(projectID, "exit-fields")
+		require.NoError(t, s.CreateAgent(ctx, a))
+
+		ec := 137
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Phase:      "error",
+			Activity:   "crashed",
+			ExitCode:   &ec,
+			ExitReason: "crashed",
+		}))
+
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.ExitCode, "ExitCode should be set")
+		assert.Equal(t, 137, *got.ExitCode)
+		assert.Equal(t, "crashed", got.ExitReason)
+	})
+
+	t.Run("ExitCode zero is persisted (clean exit)", func(t *testing.T) {
+		s, projectID := newTestAgentStore(t)
+		a := makeAgent(projectID, "exit-zero")
+		require.NoError(t, s.CreateAgent(ctx, a))
+
+		ec := 0
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Phase:    "stopped",
+			ExitCode: &ec,
+		}))
+
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.ExitCode, "ExitCode 0 should be persisted, not dropped")
+		assert.Equal(t, 0, *got.ExitCode)
+	})
+
+	t.Run("ExitCode nil leaves field unchanged", func(t *testing.T) {
+		s, projectID := newTestAgentStore(t)
+		a := makeAgent(projectID, "exit-nil")
+		require.NoError(t, s.CreateAgent(ctx, a))
+
+		// First set an exit code
+		ec := 1
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			ExitCode: &ec,
+		}))
+
+		// Then update without ExitCode — should not clear
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Activity: "working",
+		}))
+
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.ExitCode, "nil ExitCode in status update must not clear existing value")
+		assert.Equal(t, 1, *got.ExitCode)
+	})
+
+	t.Run("ExitReason empty leaves field unchanged", func(t *testing.T) {
+		s, projectID := newTestAgentStore(t)
+		a := makeAgent(projectID, "reason-empty")
+		require.NoError(t, s.CreateAgent(ctx, a))
+
+		ec := 1
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			ExitCode:   &ec,
+			ExitReason: "crashed",
+		}))
+
+		// Update with empty ExitReason — should not clear
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Activity: "working",
+		}))
+
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "crashed", got.ExitReason, "empty ExitReason in status update must not clear existing value")
+	})
+
+	t.Run("UpdateAgent round-trips ExitCode and ExitReason", func(t *testing.T) {
+		s, projectID := newTestAgentStore(t)
+		a := makeAgent(projectID, "exit-update")
+		require.NoError(t, s.CreateAgent(ctx, a))
+
+		ec := 42
+		a.ExitCode = &ec
+		a.ExitReason = "limits_exceeded"
+		require.NoError(t, s.UpdateAgent(ctx, a))
+
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.ExitCode)
+		assert.Equal(t, 42, *got.ExitCode)
+		assert.Equal(t, "limits_exceeded", got.ExitReason)
+	})
+
+	t.Run("restart clears ExitCode and ExitReason", func(t *testing.T) {
+		s, projectID := newTestAgentStore(t)
+		a := makeAgent(projectID, "exit-restart")
+		a.Phase = "running"
+		require.NoError(t, s.CreateAgent(ctx, a))
+
+		// Set ExitCode=137 and ExitReason="crashed" via UpdateAgentStatus
+		ec := 137
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Phase:      "error",
+			Activity:   "crashed",
+			ExitCode:   &ec,
+			ExitReason: "crashed",
+		}))
+
+		// Verify they were set
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.ExitCode)
+		assert.Equal(t, 137, *got.ExitCode)
+		assert.Equal(t, "crashed", got.ExitReason)
+
+		// Simulate restart: transition from error to running
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Phase:    "running",
+			Activity: "working",
+		}))
+
+		// Verify ExitCode is nil and ExitReason is "" after restart
+		got, err = s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		assert.Nil(t, got.ExitCode, "ExitCode must be cleared on restart")
+		assert.Equal(t, "", got.ExitReason, "ExitReason must be cleared on restart")
+	})
+
+	t.Run("UpdateAgent clears nil ExitCode", func(t *testing.T) {
+		s, projectID := newTestAgentStore(t)
+		a := makeAgent(projectID, "exit-clear")
+		require.NoError(t, s.CreateAgent(ctx, a))
+
+		// Set an exit code via UpdateAgent
+		ec := 42
+		a.ExitCode = &ec
+		a.ExitReason = "crashed"
+		require.NoError(t, s.UpdateAgent(ctx, a))
+
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.ExitCode)
+		assert.Equal(t, 42, *got.ExitCode)
+
+		// Clear ExitCode by setting it to nil via UpdateAgent
+		got.ExitCode = nil
+		got.ExitReason = ""
+		require.NoError(t, s.UpdateAgent(ctx, got))
+
+		got2, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		assert.Nil(t, got2.ExitCode, "nil ExitCode via UpdateAgent must clear the field")
+		assert.Equal(t, "", got2.ExitReason, "empty ExitReason via UpdateAgent must clear the field")
+	})
+}
+
+// =============================================================================
+// AuthorizedProjectIDs fail-closed filter (R1 — LS1 review)
+// =============================================================================
+
+// TestAgentStore_AuthorizedProjectIDs verifies that the AuthorizedProjectIDs
+// store filter fails closed: empty sets, invalid UUIDs, and nil each behave as
+// documented, ensuring scope-aware authorization cannot leak agents.
+func TestAgentStore_AuthorizedProjectIDs(t *testing.T) {
+	ctx := context.Background()
+
+	// Seed two projects and one agent per project so we can observe filtering.
+	setup := func(t *testing.T) (*AgentStore, string, string) {
+		t.Helper()
+		client := enttest.NewClient(t)
+
+		projAUID := uuid.MustParse("a0000000-0000-0000-0000-000000000001")
+		projBUID := uuid.MustParse("b0000000-0000-0000-0000-000000000002")
+
+		_, err := client.Project.Create().
+			SetID(projAUID).SetName("proj-a").SetSlug("proj-a").
+			Save(ctx)
+		require.NoError(t, err)
+		_, err = client.Project.Create().
+			SetID(projBUID).SetName("proj-b").SetSlug("proj-b").
+			Save(ctx)
+		require.NoError(t, err)
+
+		s := NewAgentStore(client)
+		aA := makeAgent(projAUID.String(), "agent-a")
+		require.NoError(t, s.CreateAgent(ctx, aA))
+		aB := makeAgent(projBUID.String(), "agent-b")
+		require.NoError(t, s.CreateAgent(ctx, aB))
+
+		return s, projAUID.String(), projBUID.String()
+	}
+
+	t.Run("nil applies no filter (all agents returned)", func(t *testing.T) {
+		s, _, _ := setup(t)
+		result, err := s.ListAgents(ctx, store.AgentFilter{
+			AuthorizedProjectIDs: nil,
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 2, result.TotalCount, "nil AuthorizedProjectIDs must not filter")
+	})
+
+	t.Run("empty non-nil returns zero results", func(t *testing.T) {
+		s, _, _ := setup(t)
+		result, err := s.ListAgents(ctx, store.AgentFilter{
+			AuthorizedProjectIDs: []string{},
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 0, result.TotalCount, "empty AuthorizedProjectIDs must return zero agents")
+		assert.Empty(t, result.Items)
+	})
+
+	t.Run("valid UUID returns only matching agents", func(t *testing.T) {
+		s, projA, _ := setup(t)
+		result, err := s.ListAgents(ctx, store.AgentFilter{
+			AuthorizedProjectIDs: []string{projA},
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 1, result.TotalCount, "should return only the agent in proj-a")
+		require.Len(t, result.Items, 1)
+		assert.Equal(t, projA, result.Items[0].ProjectID)
+	})
+
+	t.Run("invalid UUID returns zero results (fail closed)", func(t *testing.T) {
+		s, _, _ := setup(t)
+		result, err := s.ListAgents(ctx, store.AgentFilter{
+			AuthorizedProjectIDs: []string{"not-a-uuid"},
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 0, result.TotalCount, "invalid UUID must fail closed — no agents visible")
+		assert.Empty(t, result.Items)
+	})
+
+	t.Run("mix of valid and invalid UUIDs returns only valid matches", func(t *testing.T) {
+		s, projA, _ := setup(t)
+		result, err := s.ListAgents(ctx, store.AgentFilter{
+			AuthorizedProjectIDs: []string{projA, "garbage"},
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 1, result.TotalCount, "only the valid UUID should match")
+		require.Len(t, result.Items, 1)
+		assert.Equal(t, projA, result.Items[0].ProjectID)
+	})
+
+	t.Run("multiple valid UUIDs returns agents from both projects", func(t *testing.T) {
+		s, projA, projB := setup(t)
+		result, err := s.ListAgents(ctx, store.AgentFilter{
+			AuthorizedProjectIDs: []string{projA, projB},
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 2, result.TotalCount, "both projects' agents should be returned")
+	})
+}

@@ -178,6 +178,20 @@ func (_u *AgentUpdate) SetNillableVisibility(v *string) *AgentUpdate {
 	return _u
 }
 
+// SetMessageMode sets the "message_mode" field.
+func (_u *AgentUpdate) SetMessageMode(v agent.MessageMode) *AgentUpdate {
+	_u.mutation.SetMessageMode(v)
+	return _u
+}
+
+// SetNillableMessageMode sets the "message_mode" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableMessageMode(v *agent.MessageMode) *AgentUpdate {
+	if v != nil {
+		_u.SetMessageMode(*v)
+	}
+	return _u
+}
+
 // SetLabels sets the "labels" field.
 func (_u *AgentUpdate) SetLabels(v map[string]string) *AgentUpdate {
 	_u.mutation.SetLabels(v)
@@ -299,6 +313,53 @@ func (_u *AgentUpdate) SetNillableContainerStatus(v *string) *AgentUpdate {
 // ClearContainerStatus clears the value of the "container_status" field.
 func (_u *AgentUpdate) ClearContainerStatus() *AgentUpdate {
 	_u.mutation.ClearContainerStatus()
+	return _u
+}
+
+// SetExitCode sets the "exit_code" field.
+func (_u *AgentUpdate) SetExitCode(v int) *AgentUpdate {
+	_u.mutation.ResetExitCode()
+	_u.mutation.SetExitCode(v)
+	return _u
+}
+
+// SetNillableExitCode sets the "exit_code" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableExitCode(v *int) *AgentUpdate {
+	if v != nil {
+		_u.SetExitCode(*v)
+	}
+	return _u
+}
+
+// AddExitCode adds value to the "exit_code" field.
+func (_u *AgentUpdate) AddExitCode(v int) *AgentUpdate {
+	_u.mutation.AddExitCode(v)
+	return _u
+}
+
+// ClearExitCode clears the value of the "exit_code" field.
+func (_u *AgentUpdate) ClearExitCode() *AgentUpdate {
+	_u.mutation.ClearExitCode()
+	return _u
+}
+
+// SetExitReason sets the "exit_reason" field.
+func (_u *AgentUpdate) SetExitReason(v string) *AgentUpdate {
+	_u.mutation.SetExitReason(v)
+	return _u
+}
+
+// SetNillableExitReason sets the "exit_reason" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableExitReason(v *string) *AgentUpdate {
+	if v != nil {
+		_u.SetExitReason(*v)
+	}
+	return _u
+}
+
+// ClearExitReason clears the value of the "exit_reason" field.
+func (_u *AgentUpdate) ClearExitReason() *AgentUpdate {
+	_u.mutation.ClearExitReason()
 	return _u
 }
 
@@ -816,6 +877,11 @@ func (_u *AgentUpdate) check() error {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Agent.status": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.MessageMode(); ok {
+		if err := agent.MessageModeValidator(v); err != nil {
+			return &ValidationError{Name: "message_mode", err: fmt.Errorf(`ent: validator failed for field "Agent.message_mode": %w`, err)}
+		}
+	}
 	if _u.mutation.ProjectCleared() && len(_u.mutation.ProjectIDs()) > 0 {
 		return errors.New(`ent: clearing a required unique edge "Agent.project"`)
 	}
@@ -867,6 +933,9 @@ func (_u *AgentUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.Visibility(); ok {
 		_spec.SetField(agent.FieldVisibility, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.MessageMode(); ok {
+		_spec.SetField(agent.FieldMessageMode, field.TypeEnum, value)
+	}
 	if value, ok := _u.mutation.Labels(); ok {
 		_spec.SetField(agent.FieldLabels, field.TypeJSON, value)
 	}
@@ -908,6 +977,21 @@ func (_u *AgentUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.ContainerStatusCleared() {
 		_spec.ClearField(agent.FieldContainerStatus, field.TypeString)
+	}
+	if value, ok := _u.mutation.ExitCode(); ok {
+		_spec.SetField(agent.FieldExitCode, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedExitCode(); ok {
+		_spec.AddField(agent.FieldExitCode, field.TypeInt, value)
+	}
+	if _u.mutation.ExitCodeCleared() {
+		_spec.ClearField(agent.FieldExitCode, field.TypeInt)
+	}
+	if value, ok := _u.mutation.ExitReason(); ok {
+		_spec.SetField(agent.FieldExitReason, field.TypeString, value)
+	}
+	if _u.mutation.ExitReasonCleared() {
+		_spec.ClearField(agent.FieldExitReason, field.TypeString)
 	}
 	if value, ok := _u.mutation.RuntimeState(); ok {
 		_spec.SetField(agent.FieldRuntimeState, field.TypeString, value)
@@ -1313,6 +1397,20 @@ func (_u *AgentUpdateOne) SetNillableVisibility(v *string) *AgentUpdateOne {
 	return _u
 }
 
+// SetMessageMode sets the "message_mode" field.
+func (_u *AgentUpdateOne) SetMessageMode(v agent.MessageMode) *AgentUpdateOne {
+	_u.mutation.SetMessageMode(v)
+	return _u
+}
+
+// SetNillableMessageMode sets the "message_mode" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableMessageMode(v *agent.MessageMode) *AgentUpdateOne {
+	if v != nil {
+		_u.SetMessageMode(*v)
+	}
+	return _u
+}
+
 // SetLabels sets the "labels" field.
 func (_u *AgentUpdateOne) SetLabels(v map[string]string) *AgentUpdateOne {
 	_u.mutation.SetLabels(v)
@@ -1434,6 +1532,53 @@ func (_u *AgentUpdateOne) SetNillableContainerStatus(v *string) *AgentUpdateOne 
 // ClearContainerStatus clears the value of the "container_status" field.
 func (_u *AgentUpdateOne) ClearContainerStatus() *AgentUpdateOne {
 	_u.mutation.ClearContainerStatus()
+	return _u
+}
+
+// SetExitCode sets the "exit_code" field.
+func (_u *AgentUpdateOne) SetExitCode(v int) *AgentUpdateOne {
+	_u.mutation.ResetExitCode()
+	_u.mutation.SetExitCode(v)
+	return _u
+}
+
+// SetNillableExitCode sets the "exit_code" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableExitCode(v *int) *AgentUpdateOne {
+	if v != nil {
+		_u.SetExitCode(*v)
+	}
+	return _u
+}
+
+// AddExitCode adds value to the "exit_code" field.
+func (_u *AgentUpdateOne) AddExitCode(v int) *AgentUpdateOne {
+	_u.mutation.AddExitCode(v)
+	return _u
+}
+
+// ClearExitCode clears the value of the "exit_code" field.
+func (_u *AgentUpdateOne) ClearExitCode() *AgentUpdateOne {
+	_u.mutation.ClearExitCode()
+	return _u
+}
+
+// SetExitReason sets the "exit_reason" field.
+func (_u *AgentUpdateOne) SetExitReason(v string) *AgentUpdateOne {
+	_u.mutation.SetExitReason(v)
+	return _u
+}
+
+// SetNillableExitReason sets the "exit_reason" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableExitReason(v *string) *AgentUpdateOne {
+	if v != nil {
+		_u.SetExitReason(*v)
+	}
+	return _u
+}
+
+// ClearExitReason clears the value of the "exit_reason" field.
+func (_u *AgentUpdateOne) ClearExitReason() *AgentUpdateOne {
+	_u.mutation.ClearExitReason()
 	return _u
 }
 
@@ -1964,6 +2109,11 @@ func (_u *AgentUpdateOne) check() error {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Agent.status": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.MessageMode(); ok {
+		if err := agent.MessageModeValidator(v); err != nil {
+			return &ValidationError{Name: "message_mode", err: fmt.Errorf(`ent: validator failed for field "Agent.message_mode": %w`, err)}
+		}
+	}
 	if _u.mutation.ProjectCleared() && len(_u.mutation.ProjectIDs()) > 0 {
 		return errors.New(`ent: clearing a required unique edge "Agent.project"`)
 	}
@@ -2032,6 +2182,9 @@ func (_u *AgentUpdateOne) sqlSave(ctx context.Context) (_node *Agent, err error)
 	if value, ok := _u.mutation.Visibility(); ok {
 		_spec.SetField(agent.FieldVisibility, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.MessageMode(); ok {
+		_spec.SetField(agent.FieldMessageMode, field.TypeEnum, value)
+	}
 	if value, ok := _u.mutation.Labels(); ok {
 		_spec.SetField(agent.FieldLabels, field.TypeJSON, value)
 	}
@@ -2073,6 +2226,21 @@ func (_u *AgentUpdateOne) sqlSave(ctx context.Context) (_node *Agent, err error)
 	}
 	if _u.mutation.ContainerStatusCleared() {
 		_spec.ClearField(agent.FieldContainerStatus, field.TypeString)
+	}
+	if value, ok := _u.mutation.ExitCode(); ok {
+		_spec.SetField(agent.FieldExitCode, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedExitCode(); ok {
+		_spec.AddField(agent.FieldExitCode, field.TypeInt, value)
+	}
+	if _u.mutation.ExitCodeCleared() {
+		_spec.ClearField(agent.FieldExitCode, field.TypeInt)
+	}
+	if value, ok := _u.mutation.ExitReason(); ok {
+		_spec.SetField(agent.FieldExitReason, field.TypeString, value)
+	}
+	if _u.mutation.ExitReasonCleared() {
+		_spec.ClearField(agent.FieldExitReason, field.TypeString)
 	}
 	if value, ok := _u.mutation.RuntimeState(); ok {
 		_spec.SetField(agent.FieldRuntimeState, field.TypeString, value)

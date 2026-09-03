@@ -51,7 +51,7 @@ Agents running inside containers must report status back to the Hub without poss
 Runtime Brokers represent high-trust infrastructure. They use HMAC-based request signing for bidirectional authentication with the Hub.
 
 - **Shared Secret**: Established during initial registration via a short-lived `joinToken`.
-- **Signing**: Every request includes headers for `X-Scion-Broker-ID`, `X-Scion-Timestamp`, `X-Scion-Nonce`, and `X-Scion-Signature`.
+- **Signing & Verification**: Every request includes headers for `X-Scion-Broker-ID`, `X-Scion-Timestamp`, `X-Scion-Nonce`, and `X-Scion-Signature`. The Hub strictly verifies that the authenticated caller identity matches any target broker paths to prevent cross-tenant escalation.
 - **Replay Protection**: Nonce-based tracking and timestamp validation (5-minute clock skew tolerance) prevent replay attacks.
 - **NAT Traversal**: Brokers establish a persistent WebSocket control channel. The initial upgrade request is HMAC-authenticated, establishing a trusted session for subsequent commands.
 
@@ -120,14 +120,14 @@ The Hub uses a pluggable **SecretBackend** interface for secret storage:
 | Backend | Value Storage | Write Operations | Read Operations |
 |---------|--------------|-----------------|-----------------|
 | **`gcpsm`** (GCP Secret Manager) | Encrypted in GCP SM | Supported | Supported |
-| **`local`** (default) | N/A | **Rejected** (returns 501) | Read-only (existing data) |
+| **`local`** (default) | Encrypted at rest (AES-256-GCM) in Hub DB | Supported | Supported |
 
 When `gcpsm` is configured, a hybrid model is used:
 - **Metadata** (name, type, scope, version) is stored in the Hub database.
 - **Secret values** are stored in GCP Secret Manager with automatic versioning.
 - GCP SM secret names follow the pattern: `scion-{scope}-{sha256(scopeID)[:12]}-{name}`.
 
-The `local` backend rejects all write operations to prevent plaintext secret storage. It supports read and delete operations only for migration of pre-existing data.
+The `local` backend now encrypts secret values at rest using AES-256-GCM, with domain-separated key derivation from the hub signing secret. Legacy plaintext values are transparently readable and will be automatically re-encrypted upon the next write operation.
 
 ### 4.2 Secret Scopes and Resolution
 
@@ -182,5 +182,5 @@ These are infrastructure-level secrets established during broker registration an
 
 To facilitate local development, Scion provides a **Development Authentication** mode.
 - **Developer Token**: A persistent token starting with `scion_dev_` stored in `~/.scion/dev-token`.
-- **Constraints**: Dev mode is disabled by default and requires `localhost` binding if TLS is not used.
+- **Constraints & Safeguards**: Dev mode is disabled by default. Startup validation strictly prohibits binding the `devAuthMiddleware` to non-loopback interfaces (e.g., `0.0.0.0`). Because this middleware automatically logs in every cookieless request as an admin, refusing it on public interfaces prevents the accidental exposure of an unauthenticated admin UI.
 - **Warning**: The server logs clear warnings when operating in Dev Mode.

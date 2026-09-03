@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -51,7 +52,6 @@ type CreateProjectRequest struct {
 	Name          string            `json:"name"`
 	GitRemote     string            `json:"gitRemote,omitempty"`
 	WorkspaceMode string            `json:"workspaceMode,omitempty"` // "shared", "worktree-per-agent", or "per-agent" (default); only meaningful when gitRemote is set
-	Visibility    string            `json:"visibility,omitempty"`
 	Labels        map[string]string `json:"labels,omitempty"`
 	GitHubToken   string            `json:"githubToken,omitempty"`
 }
@@ -137,12 +137,11 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 
 	filter := store.ProjectFilter{
-		OwnerID:    query.Get("ownerId"),
-		Visibility: query.Get("visibility"),
-		GitRemote:  util.NormalizeGitRemote(query.Get("gitRemote")),
-		BrokerID:   query.Get("brokerId"),
-		Name:       query.Get("name"),
-		Slug:       query.Get("slug"),
+		OwnerID:   query.Get("ownerId"),
+		GitRemote: util.NormalizeGitRemote(query.Get("gitRemote")),
+		BrokerID:  query.Get("brokerId"),
+		Name:      query.Get("name"),
+		Slug:      query.Get("slug"),
 	}
 
 	// Template filtering: default to excluding template projects.
@@ -197,36 +196,76 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result, err := s.store.ListProjects(ctx, filter, store.ListOptions{
-		Limit:  limit,
-		Cursor: query.Get("cursor"),
-	})
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
+	identity, cursor := GetIdentityFromContext(ctx), query.Get("cursor")
+	cursorBinding := authorizedListCursorBinding("projects", filter)
+	if cursor != "" {
+		if err := validateAuthorizedListCursor(cursor, cursorBinding); err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
+	}
+
+	var items []store.Project
+	var nextCursor string
+	var totalCount int
+
+	// Scope-aware list authorization: resolve the caller's authorized project
+	// set from role bindings instead of using a binary admin-view check on a
+	// synthetic hub resource.
+	if identity == nil {
+		// Unauthenticated: return empty list.
+		items = []store.Project{}
+	} else {
+		scopes := s.authzService.ResolveListScopes(ctx, identity, "project.list")
+		if !scopes.IsNone() {
+			// All or explicit scope set: push authorized IDs into the store
+			// query so pagination and totals reflect only the visible set.
+			// For All, AuthorizedProjectIDs remains nil (no filter applied).
+			if !scopes.IsAll() {
+				filter.AuthorizedProjectIDs = scopes.ProjectIDs()
+			}
+			result, err := s.store.ListProjects(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, CursorBinding: cursorBinding})
+			if err != nil {
+				writeErrorFromErr(w, err, "")
+				return
+			}
+			items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+		} else {
+			// No role bindings resolved. Fall back to per-item policy filtering
+			// for backward compatibility during the transition period before
+			// CO1 cutover completes. After cutover, all principals will have
+			// role bindings and this path will not be reached.
+			result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.Project], error) {
+				page, err := s.store.ListProjects(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
+				if err != nil {
+					return authorizedCandidatePage[store.Project]{}, err
+				}
+				return authorizedCandidatePage[store.Project]{Items: page.Items, NextCursor: page.NextCursor}, nil
+			}, projectResource, func(p *store.Project) string { return authorizedListCursor(p.Created, p.ID, cursorBinding) }, s.authzService.AuthorizeReadBatch)
+			if err != nil {
+				writeAuthorizedListError(w, err)
+				return
+			}
+			items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+		}
 	}
 
 	// Enrich owner display names
-	s.enrichProjectOwnerNames(ctx, result.Items)
+	s.enrichProjectOwnerNames(ctx, items)
 
-	// Compute per-item and scope capabilities
-	identity := GetIdentityFromContext(ctx)
-	projects := make([]ProjectWithCapabilities, 0, len(result.Items))
-	if identity != nil {
-		resources := make([]Resource, len(result.Items))
-		for i := range result.Items {
-			resources[i] = projectResource(&result.Items[i])
-		}
-		caps := s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "project")
-		for i := range result.Items {
-			if !capabilityAllows(caps[i], ActionRead) {
-				continue
-			}
-			projects = append(projects, ProjectWithCapabilities{Project: result.Items[i], Cap: caps[i]})
+	// Compute per-item and scope capabilities for authorized items
+	projects := make([]ProjectWithCapabilities, 0, len(items))
+	if identity == nil {
+		for i := range items {
+			projects = append(projects, ProjectWithCapabilities{Project: items[i]})
 		}
 	} else {
-		for i := range result.Items {
-			projects = append(projects, ProjectWithCapabilities{Project: result.Items[i]})
+		resources := make([]Resource, len(items))
+		for i := range items {
+			resources[i] = projectResource(&items[i])
+		}
+		for i, cap := range s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "project") {
+			projects = append(projects, ProjectWithCapabilities{Project: items[i], Cap: cap})
 		}
 	}
 
@@ -235,15 +274,10 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 		scopeCap = s.authzService.ComputeScopeCapabilities(ctx, identity, "", "", "project")
 	}
 
-	totalCount := result.TotalCount
-	if identity != nil {
-		totalCount = len(projects)
-	}
-
 	writeJSON(w, http.StatusOK, ListProjectsResponse{
 		Projects:     projects,
 		LegacyGroves: projects,
-		NextCursor:   result.NextCursor,
+		NextCursor:   nextCursor,
 		TotalCount:   totalCount,
 		Capabilities: scopeCap,
 	})
@@ -289,7 +323,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 				callerID = user.ID()
 			}
 			s.createProjectGroup(ctx, existing)
-			s.createProjectMembersGroupAndPolicy(ctx, existing, callerID)
+			s.createProjectMembersGroup(ctx, existing, callerID)
 			writeJSON(w, http.StatusOK, existing)
 			return
 		}
@@ -324,7 +358,7 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	// Apply workspace mode label for git projects with explicit workspace mode.
 	if normalizedRemote != "" {
 		switch req.WorkspaceMode {
-		case store.WorkspaceModeShared, store.WorkspaceModeWorktreePerAgent:
+		case store.WorkspaceModeShared, store.WorkspaceModePerAgent, store.WorkspaceModeWorktreePerAgent:
 			if req.Labels == nil {
 				req.Labels = make(map[string]string)
 			}
@@ -333,16 +367,11 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	project := &store.Project{
-		ID:         projectID,
-		Name:       displayName,
-		Slug:       slug,
-		GitRemote:  normalizedRemote,
-		Labels:     req.Labels,
-		Visibility: req.Visibility,
-	}
-
-	if project.Visibility == "" {
-		project.Visibility = store.VisibilityPrivate
+		ID:        projectID,
+		Name:      displayName,
+		Slug:      slug,
+		GitRemote: normalizedRemote,
+		Labels:    req.Labels,
 	}
 
 	// Set ownership from authenticated user
@@ -377,16 +406,60 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Quota enforcement: check projects-per-user limit before creation.
+	if s.quotaService != nil && project.CreatedBy != "" {
+		if err := s.quotaService.CheckAndReserve(ctx, "max_projects_per_user", project.CreatedBy, "system", "system", project.ID); err != nil {
+			if errors.Is(err, store.ErrQuotaExceeded) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota exceeded: max_projects_per_user", nil)
+				return
+			}
+			if errors.Is(err, ErrQuotaLockContention) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota check temporarily unavailable, please retry", nil)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "quota check failed", nil)
+			return
+		}
+	}
+
 	if err := s.store.CreateProject(ctx, project); err != nil {
+		if s.quotaService != nil && project.CreatedBy != "" {
+			s.quotaService.Release(ctx, "max_projects_per_user", project.ID)
+		}
 		writeErrorFromErr(w, err, "")
 		return
+	}
+
+	// Create canonical project membership as role binding (PM1).
+	// The creator gets the project-owner role binding, which is the sole
+	// source of truth for project membership. A project without an owner
+	// binding is unusable, so failure rolls back the project creation.
+	if project.CreatedBy != "" {
+		if rbErr := s.createProjectOwnerRoleBinding(ctx, project.ID, project.CreatedBy); rbErr != nil {
+			s.projectsLogger().Error("CRITICAL: failed to create project owner role binding — rolling back project",
+				"project_id", project.ID, "user_id", project.CreatedBy, "error", rbErr)
+			if delErr := s.store.DeleteProject(ctx, project.ID); delErr != nil {
+				s.projectsLogger().Warn("failed to roll back project after owner binding failure",
+					"project_id", project.ID, "error", delErr)
+			}
+			if s.quotaService != nil && project.CreatedBy != "" {
+				s.quotaService.Release(ctx, "max_projects_per_user", project.ID)
+			}
+			writeError(w, http.StatusInternalServerError, "ROLE_BINDING_FAILED",
+				"Failed to create project owner binding; project creation rolled back", nil)
+			return
+		}
 	}
 
 	// Create the associated project_agents group (best-effort)
 	s.createProjectGroup(ctx, project)
 
-	// Create project members group and policy (best-effort)
-	s.createProjectMembersGroupAndPolicy(ctx, project)
+	// Create project members group and policy (best-effort).
+	// This continues to create the group for collaboration and policy bindings.
+	// The role binding above is now the canonical membership source.
+	s.createProjectMembersGroup(ctx, project)
 
 	// Ensure the #general chat topic exists for this project (best-effort).
 	s.ensureProjectGeneralTopic(ctx, project)
@@ -418,6 +491,12 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		if _, _, err := s.secretBackend.Set(ctx, tokenInput); err != nil {
 			s.projectsLogger().Error("failed to save GitHub token as project secret",
 				"project_id", project.ID, "error", err)
+			// Cascade-delete role bindings before the project row to avoid
+			// orphaned bindings referencing a deleted project (R1 review fix).
+			if _, rbErr := s.store.DeleteRoleBindingsForScope(ctx, store.RoleScopeProject, project.ID); rbErr != nil {
+				s.projectsLogger().Warn("failed to clean up role bindings after secret save failure",
+					"project_id", project.ID, "error", rbErr)
+			}
 			if delErr := s.store.DeleteProject(ctx, project.ID); delErr != nil {
 				s.projectsLogger().Warn("failed to clean up project record after secret save failure",
 					"project_id", project.ID, "error", delErr)
@@ -440,6 +519,12 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 					s.projectsLogger().Warn("failed to clean up project secret after clone failure",
 						"project_id", project.ID, "error", delErr)
 				}
+			}
+			// Cascade-delete role bindings before the project row to avoid
+			// orphaned bindings referencing a deleted project (R1 review fix).
+			if _, rbErr := s.store.DeleteRoleBindingsForScope(ctx, store.RoleScopeProject, project.ID); rbErr != nil {
+				s.projectsLogger().Warn("failed to clean up role bindings after clone failure",
+					"project_id", project.ID, "error", rbErr)
 			}
 			if delErr := s.store.DeleteProject(ctx, project.ID); delErr != nil {
 				s.projectsLogger().Warn("failed to clean up project record after clone failure",
@@ -493,25 +578,33 @@ func (s *Server) createProjectGroup(ctx context.Context, project *store.Project)
 		GroupType: store.GroupTypeProjectAgents,
 		ProjectID: project.ID,
 		CreatedBy: project.CreatedBy,
+		Annotations: map[string]string{
+			systemProjectAgentsGroupAnnotation: "true",
+		},
 	}
 	if err := s.store.CreateGroup(ctx, projectGroup); err != nil {
 		if !errors.Is(err, store.ErrAlreadyExists) {
 			s.projectsLogger().Warn("failed to create project group", "project_id", project.ID, "error", err.Error())
 			return
 		}
-		// Slug conflict — look it up and ensure project_id is current
+		// Slug conflict — look it up and validate before adopting.
 		existing, lookupErr := s.store.GetGroupBySlug(ctx, agentsSlug)
 		if lookupErr != nil {
 			s.projectsLogger().Warn("failed to look up existing project agents group by slug",
 				"project_id", project.ID, "slug", agentsSlug, "error", lookupErr.Error())
 			return
 		}
-		if existing.ProjectID != project.ID {
-			existing.ProjectID = project.ID
-			if updateErr := s.store.UpdateGroup(ctx, existing); updateErr != nil {
-				s.projectsLogger().Warn("failed to update existing project agents group",
-					"project_id", project.ID, "slug", agentsSlug, "error", updateErr.Error())
-			}
+		if !isSystemProjectAgentsGroup(existing, project.ID) {
+			s.projectsLogger().Warn("refusing to adopt colliding project agents group",
+				"project_id", project.ID, "slug", agentsSlug, "group", existing.ID,
+				"group_type", existing.GroupType, "existing_project_id", existing.ProjectID)
+			return
+		}
+		if existing.GroupType != store.GroupTypeProjectAgents {
+			s.projectsLogger().Warn("refusing to adopt project agents group with wrong group type",
+				"project_id", project.ID, "slug", agentsSlug, "group", existing.ID,
+				"expected_type", store.GroupTypeProjectAgents, "actual_type", existing.GroupType)
+			return
 		}
 	}
 }
@@ -520,14 +613,18 @@ func (s *Server) createProjectGroup(ctx context.Context, project *store.Project)
 // the webchat store is configured. Best-effort: failures are logged but do not
 // block project creation.
 func (s *Server) ensureProjectGeneralTopic(ctx context.Context, project *store.Project) {
-	if s.webChatStore == nil {
+	s.mu.RLock()
+	wcs := s.webChatStore
+	s.mu.RUnlock()
+
+	if wcs == nil {
 		return
 	}
 	createdBy := project.CreatedBy
 	if createdBy == "" {
 		createdBy = "system"
 	}
-	topicID, created, err := s.webChatStore.EnsureGeneralTopic(ctx, project.ID, createdBy)
+	topicID, created, err := wcs.EnsureGeneralTopic(ctx, project.ID, createdBy)
 	if err != nil {
 		s.projectsLogger().Warn("failed to create #general topic for project",
 			"project_id", project.ID, "error", err)
@@ -540,14 +637,123 @@ func (s *Server) ensureProjectGeneralTopic(ctx context.Context, project *store.P
 	if !created {
 		return
 	}
-	topic, err := s.webChatStore.GetTopic(ctx, topicID)
+	topic, err := wcs.GetTopic(ctx, topicID)
 	if err != nil || topic == nil {
 		return
 	}
 	s.events.PublishChatTopicEvent(ctx, project.ID, "created", *topic)
 }
 
+// createProjectOwnerRoleBinding creates a project-owner role binding for the
+// given user in the given project. This is the canonical project membership
+// source (Phase 1E). The role binding is scoped to the project ID, not the
+// project slug, so it survives project renames.
+func (s *Server) createProjectOwnerRoleBinding(ctx context.Context, projectID, userID string) error {
+	ownerRoleDef, err := s.store.GetRoleDefinitionByName(ctx, store.ProjectRoleOwner, store.RoleScopeProject)
+	if err != nil {
+		return fmt.Errorf("lookup project-owner role definition: %w", err)
+	}
+	_, err = s.store.CreateRoleBinding(ctx, &store.RoleBinding{
+		RoleDefinitionID: ownerRoleDef.ID,
+		PrincipalType:    store.RoleBindingPrincipalUser,
+		PrincipalID:      userID,
+		ScopeType:        store.RoleScopeProject,
+		ScopeID:          projectID,
+		CreatedBy:        userID,
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return nil // idempotent
+		}
+		return fmt.Errorf("create project-owner role binding: %w", err)
+	}
+
+	s.emitMutationAudit(ctx, &store.MutationAuditRecord{
+		MutationType: "project_member_add",
+		TargetType:   "project_membership",
+		TargetID:     projectID,
+		AfterSummary: `{"userId":"` + userID + `","role":"owner"}`,
+	})
+
+	return nil
+}
+
+// createProjectRoleBinding creates a project-scoped role binding for any
+// principal (user, agent, or group). This is the canonical way to grant
+// project membership. Returns nil on duplicate (idempotent).
+func (s *Server) createProjectRoleBinding(ctx context.Context, projectID, principalType, principalID, roleName, createdBy string) error {
+	roleDef, err := s.store.GetRoleDefinitionByName(ctx, roleName, store.RoleScopeProject)
+	if err != nil {
+		return fmt.Errorf("lookup %s role definition: %w", roleName, err)
+	}
+	_, err = s.store.CreateRoleBinding(ctx, &store.RoleBinding{
+		RoleDefinitionID: roleDef.ID,
+		PrincipalType:    principalType,
+		PrincipalID:      principalID,
+		ScopeType:        store.RoleScopeProject,
+		ScopeID:          projectID,
+		CreatedBy:        createdBy,
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return nil // idempotent
+		}
+		return fmt.Errorf("create %s role binding: %w", roleName, err)
+	}
+	return nil
+}
+
+// ensureHubMembersProjectVisibility creates a project-member RoleBinding for
+// the hub-members group, making the project visible to all hub members.
+// This replaces the old pattern of adding hub-members as a nested group member
+// of the project's members group. Best-effort; failures are logged.
+//
+// TODO(PM1): Wire into handleCreateProject. The legacy
+// ensureProjectMemberReadPolicy bridge has been removed (CO1 cutover);
+// this function provides the RoleBinding-based replacement.
+func (s *Server) ensureHubMembersProjectVisibility(ctx context.Context, project *store.Project) {
+	group, err := s.store.GetGroupBySlug(ctx, "hub-members")
+	if err != nil {
+		s.projectsLogger().Debug("hub-members group not found, skipping project visibility binding",
+			"project_id", project.ID, "error", err)
+		return
+	}
+	if err := s.createProjectRoleBinding(ctx, project.ID, store.RoleBindingPrincipalGroup,
+		group.ID, store.ProjectRoleMember, "system"); err != nil {
+		s.projectsLogger().Warn("failed to create hub-members project visibility binding",
+			"project_id", project.ID, "error", err)
+	}
+}
+
+// countDirectOwnerBindings returns the number of direct-user project-owner
+// role bindings for a project.
+//
+// Known limitation (O3): This count includes all matching bindings regardless
+// of activation conditions (NotBefore, ExpiresAt). An expired or not-yet-active
+// binding still counts toward the minimum owner threshold. Currently moot
+// because owner bindings are created unconditionally without time bounds, but
+// this will need to filter by activation state if time-bounded ownership
+// bindings are introduced.
+func (s *Server) countDirectOwnerBindings(ctx context.Context, projectID string) (int, error) {
+	bindings, err := s.store.ListRoleBindingsForScope(ctx, store.RoleScopeProject, projectID)
+	if err != nil {
+		return 0, err
+	}
+	ownerRoleDef, err := s.store.GetRoleDefinitionByName(ctx, store.ProjectRoleOwner, store.RoleScopeProject)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, b := range bindings {
+		if b.PrincipalType == store.RoleBindingPrincipalUser && b.RoleDefinitionID == ownerRoleDef.ID {
+			count++
+		}
+	}
+	return count, nil
+}
+
 const systemProjectMembersGroupAnnotation = "scion.io/project-members-group"
+const systemProjectAgentsGroupAnnotation = "scion.io/project-agents-group"
 
 func projectMembersGroupSlug(projectSlug string) string {
 	return "project:" + projectSlug + ":members"
@@ -560,20 +766,34 @@ func isSystemProjectMembersGroup(group *store.Group, projectID string) bool {
 		group.Annotations[systemProjectMembersGroupAnnotation] == "true"
 }
 
-// createProjectMembersGroupAndPolicy creates an explicit members group for a project
-// and a policy allowing members to create agents. Best-effort; failures are logged.
-// If the group already exists (e.g., project was deleted and recreated with the same
-// slug), the existing group is reused and the creator is still added as a member.
-// callerUserID, when non-empty, is also added as an owner of the members group
+func isSystemProjectAgentsGroup(group *store.Group, projectID string) bool {
+	return group != nil &&
+		group.ProjectID == projectID &&
+		group.Annotations != nil &&
+		group.Annotations[systemProjectAgentsGroupAnnotation] == "true"
+}
+
+// createProjectMembersGroup creates the project's collaboration
+// members group and ensures project membership via RoleBindings. The group
+// exists for collaboration (chat, agent co-ownership) but carries NO
+// authorization meaning — all authorization flows through project-scoped
+// RoleBindings.
+//
+// PM1 contract: project membership IS the set of project-scoped role bindings.
+// The special project:<slug>:members group no longer has authorization meaning.
+//
+// callerUserID, when non-empty, also receives a project-owner RoleBinding
 // (e.g. the user who linked the project). It is safe to pass the same value as
-// project.CreatedBy — duplicate additions are handled gracefully.
-func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project *store.Project, callerUserID ...string) {
+// project.CreatedBy — duplicate bindings are handled gracefully.
+func (s *Server) createProjectMembersGroup(ctx context.Context, project *store.Project, callerUserID ...string) {
 	membersSlug := projectMembersGroupSlug(project.Slug)
 
 	s.projectsLogger().Debug("ensuring project members group",
 		"project_id", project.ID, "slug", project.Slug, "membersSlug", membersSlug)
 
-	// Create project members group, or look up the existing one
+	// Create project members group, or look up the existing one.
+	// The group exists for collaboration purposes (chat, agent management)
+	// but has no authorization meaning — membership is defined by RoleBindings.
 	membersGroup := &store.Group{
 		ID:        api.NewUUID(),
 		Name:      project.Name + " Members",
@@ -588,10 +808,8 @@ func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project
 	}
 	createErr := s.store.CreateGroup(ctx, membersGroup)
 	if createErr != nil && errors.Is(createErr, store.ErrInvalidInput) && membersGroup.OwnerID != "" {
-		// FK violation: the owner user does not exist in the store. This can occur
-		// when authentication uses proxy headers without provisioning a DB user record
-		// (e.g. legacy trusted-proxy auth on a fresh Postgres deployment). Retry
-		// without OwnerID so the group and its associated policy are still created.
+		// FK violation: the owner user does not exist in the store. Retry
+		// without OwnerID so the group is still created for collaboration.
 		s.projectsLogger().Warn("project members group owner not found, retrying without owner",
 			"project_id", project.ID, "owner_id", membersGroup.OwnerID, "error", createErr.Error())
 		membersGroup.OwnerID = ""
@@ -600,32 +818,33 @@ func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project
 	if createErr != nil {
 		if !errors.Is(createErr, store.ErrAlreadyExists) {
 			s.projectsLogger().Warn("failed to create project members group", "project_id", project.ID, "error", createErr.Error())
+			// Group creation failed with a non-duplicate error. The group was
+			// never persisted, so its UUID is a phantom — skip all downstream
+			// operations that reference the group ID to avoid creating dangling
+			// group memberships or legacy policy bindings (R2 review fix).
 			return
 		}
-		// Slug conflict — look up existing group
-		existing, lookupErr := s.store.GetGroupBySlug(ctx, membersSlug)
-		if lookupErr != nil {
-			s.projectsLogger().Warn("failed to look up existing project members group by slug",
-				"project_id", project.ID, "slug", membersSlug, "error", lookupErr.Error())
-			return
-		}
-		if !isSystemProjectMembersGroup(existing, project.ID) {
-			s.projectsLogger().Warn("refusing to adopt colliding project members group",
-				"project_id", project.ID, "slug", membersSlug, "group", existing.ID)
-			return
-		}
-		membersGroup = existing
-		// Update the project ID association or owner in case they changed (recreated project
-		// or backfill for groups created before OwnerID was set).
-		needsUpdate := false
-		if membersGroup.OwnerID == "" && project.OwnerID != "" {
-			membersGroup.OwnerID = project.OwnerID
-			needsUpdate = true
-		}
-		if needsUpdate {
-			if updateErr := s.store.UpdateGroup(ctx, membersGroup); updateErr != nil {
-				s.projectsLogger().Warn("failed to update existing project members group",
-					"project_id", project.ID, "slug", membersSlug, "error", updateErr.Error())
+		if errors.Is(createErr, store.ErrAlreadyExists) {
+			// Slug conflict — look up existing group
+			existing, lookupErr := s.store.GetGroupBySlug(ctx, membersSlug)
+			if lookupErr != nil {
+				s.projectsLogger().Warn("failed to look up existing project members group by slug",
+					"project_id", project.ID, "slug", membersSlug, "error", lookupErr.Error())
+				return
+			} else if !isSystemProjectMembersGroup(existing, project.ID) {
+				s.projectsLogger().Warn("refusing to adopt colliding project members group",
+					"project_id", project.ID, "slug", membersSlug, "group", existing.ID)
+				return
+			} else {
+				membersGroup = existing
+				// Update the owner in case it changed.
+				if membersGroup.OwnerID == "" && project.OwnerID != "" {
+					membersGroup.OwnerID = project.OwnerID
+					if updateErr := s.store.UpdateGroup(ctx, membersGroup); updateErr != nil {
+						s.projectsLogger().Warn("failed to update existing project members group",
+							"project_id", project.ID, "slug", membersSlug, "error", updateErr.Error())
+					}
+				}
 			}
 		}
 	} else {
@@ -633,7 +852,7 @@ func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project
 			"project_id", project.ID, "group", membersGroup.ID, "slug", membersSlug)
 	}
 
-	// Add the creating user as an owner of the project members group
+	// Add the creating user to the collaboration group (best-effort).
 	if project.CreatedBy != "" {
 		if err := s.store.AddGroupMember(ctx, &store.GroupMember{
 			GroupID:    membersGroup.ID,
@@ -641,8 +860,18 @@ func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project
 			MemberID:   project.CreatedBy,
 			Role:       store.GroupMemberRoleOwner,
 		}); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-			s.projectsLogger().Warn("failed to add creator as owner of project members group",
+			s.projectsLogger().Warn("failed to add creator to project members group",
 				"project_id", project.ID, "user", project.CreatedBy, "error", err.Error())
+		}
+
+		// Ensure a project-owner role binding exists for the creator. In
+		// production, the createProject handler creates this via
+		// createProjectOwnerRoleBinding BEFORE calling us. But this function
+		// is also called from backfill and sync paths where the role binding
+		// may not exist. Best-effort; errors logged.
+		if rbErr := s.createProjectOwnerRoleBinding(ctx, project.ID, project.CreatedBy); rbErr != nil {
+			s.projectsLogger().Debug("project owner role binding already exists or failed",
+				"project_id", project.ID, "user", project.CreatedBy, "error", rbErr.Error())
 		}
 	}
 
@@ -655,95 +884,20 @@ func (s *Server) createProjectMembersGroupAndPolicy(ctx context.Context, project
 			MemberID:   callerUserID[0],
 			Role:       store.GroupMemberRoleOwner,
 		}); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-			s.projectsLogger().Warn("failed to add caller as owner of project members group",
+			s.projectsLogger().Warn("failed to add caller to project members group",
 				"project_id", project.ID, "user", callerUserID[0], "error", err.Error())
 		}
-	}
 
-	// Backfill: if the group has exactly one member and no owners, promote
-	// that member to owner. This handles projects created before ownership
-	// enforcement was added, where the creator was added as "member".
-	ownerCount, err := s.store.CountGroupMembersByRole(ctx, membersGroup.ID, store.GroupMemberRoleOwner)
-	if err == nil && ownerCount == 0 {
-		members, err := s.store.GetGroupMembers(ctx, membersGroup.ID)
-		if err == nil && len(members) == 1 && members[0].MemberType == store.GroupMemberTypeUser {
-			if promoteErr := s.store.UpdateGroupMemberRole(ctx, membersGroup.ID,
-				members[0].MemberType, members[0].MemberID, store.GroupMemberRoleOwner); promoteErr != nil {
-				s.projectsLogger().Warn("failed to promote sole member to owner",
-					"project_id", project.ID, "group", membersGroup.ID, "user", members[0].MemberID, "error", promoteErr.Error())
-			} else {
-				s.projectsLogger().Info("promoted sole project member to owner",
-					"project_id", project.ID, "group", membersGroup.ID, "user", members[0].MemberID)
-			}
+		// Ensure role binding for caller too.
+		if rbErr := s.createProjectOwnerRoleBinding(ctx, project.ID, callerUserID[0]); rbErr != nil {
+			s.projectsLogger().Debug("caller project owner role binding already exists or failed",
+				"project_id", project.ID, "user", callerUserID[0], "error", rbErr.Error())
 		}
 	}
 
-	// Create project-level policy for member agent creation and stop-all
-	policyName := "project:" + project.Slug + ":member-create-agents"
-	policy := &store.Policy{
-		ID:           api.NewUUID(),
-		Name:         policyName,
-		Description:  "Allow project members to create and stop agents",
-		ScopeType:    "project",
-		ScopeID:      project.ID,
-		ResourceType: "agent",
-		Actions:      []string{"create", "stop_all"},
-		Effect:       "allow",
-	}
-	if err := s.store.CreatePolicy(ctx, policy); err != nil {
-		if !errors.Is(err, store.ErrAlreadyExists) {
-			s.projectsLogger().Warn("failed to create project member policy",
-				"project_id", project.ID, "policy", policyName, "error", err.Error())
-			return
-		}
-		// Policy already exists — look it up and update its scope ID in case the
-		// project was recreated. Also ensure the binding to the current members group.
-		existing, lookupErr := s.store.ListPolicies(ctx, store.PolicyFilter{Name: policyName}, store.ListOptions{Limit: 1})
-		if lookupErr != nil || len(existing.Items) == 0 {
-			s.projectsLogger().Warn("failed to look up existing project member policy",
-				"project_id", project.ID, "policy", policyName, "error", lookupErr)
-			return
-		}
-		policy = &existing.Items[0]
-		needsUpdate := false
-		if policy.ScopeID != project.ID {
-			policy.ScopeID = project.ID
-			needsUpdate = true
-		}
-		// Backfill: ensure stop_all action is present for existing projects
-		hasStopAll := false
-		for _, a := range policy.Actions {
-			if a == "stop_all" {
-				hasStopAll = true
-				break
-			}
-		}
-		if !hasStopAll {
-			policy.Actions = append(policy.Actions, "stop_all")
-			needsUpdate = true
-		}
-		if needsUpdate {
-			if updateErr := s.store.UpdatePolicy(ctx, policy); updateErr != nil {
-				s.projectsLogger().Warn("failed to update existing project member policy",
-					"project_id", project.ID, "policy", policyName, "error", updateErr.Error())
-			}
-		}
-	}
-
-	// Bind policy to the members group
-	if err := s.store.AddPolicyBinding(ctx, &store.PolicyBinding{
-		PolicyID:      policy.ID,
-		PrincipalType: "group",
-		PrincipalID:   membersGroup.ID,
-	}); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-		s.projectsLogger().Warn("failed to bind project member policy",
-			"project_id", project.ID, "policy", policyName, "error", err.Error())
-	}
-
-	// Create the project-level service-account assign policy alongside it.
-	// See projectAssignPolicyName in seed.go for why it is project-scoped and
-	// what reach it preserves.
-	ensureProjectAssignPolicy(ctx, s.store, project, membersGroup.ID)
+	// ── Legacy policy bridge (pre-CO1) ──────────────────────────────────
+	// CO1 cutover: legacy project policies are no longer needed.
+	// All authorization routes through AK1 kernel using RoleBindings.
 }
 
 // hubManagedProjectPath returns the filesystem path for a hub-managed project workspace.
@@ -1224,12 +1378,11 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 		}
 
 		project = &store.Project{
-			ID:         projectID,
-			Name:       displayName,
-			Slug:       slug,
-			GitRemote:  normalizedRemote,
-			Labels:     req.Labels,
-			Visibility: store.VisibilityPrivate,
+			ID:        projectID,
+			Name:      displayName,
+			Slug:      slug,
+			GitRemote: normalizedRemote,
+			Labels:    req.Labels,
 		}
 
 		// Set ownership from authenticated user
@@ -1260,17 +1413,56 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Quota enforcement: check projects-per-user limit before creation.
+		if s.quotaService != nil && project.CreatedBy != "" {
+			if err := s.quotaService.CheckAndReserve(ctx, "max_projects_per_user", project.CreatedBy, "system", "system", project.ID); err != nil {
+				if errors.Is(err, store.ErrQuotaExceeded) {
+					writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+						"quota exceeded: max_projects_per_user", nil)
+					return
+				}
+				if errors.Is(err, ErrQuotaLockContention) {
+					writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+						"quota check temporarily unavailable, please retry", nil)
+					return
+				}
+				writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "quota check failed", nil)
+				return
+			}
+		}
+
 		if err := s.store.CreateProject(ctx, project); err != nil {
+			if s.quotaService != nil && project.CreatedBy != "" {
+				s.quotaService.Release(ctx, "max_projects_per_user", project.ID)
+			}
 			writeErrorFromErr(w, err, "")
 			return
 		}
 		created = true
 
+		// Create owner role binding (PM1: atomic with project creation).
+		if project.CreatedBy != "" {
+			if rbErr := s.createProjectOwnerRoleBinding(ctx, project.ID, project.CreatedBy); rbErr != nil {
+				s.projectsLogger().Error("CRITICAL: failed to create project owner role binding during register — rolling back",
+					"project_id", project.ID, "user_id", project.CreatedBy, "error", rbErr)
+				if delErr := s.store.DeleteProject(ctx, project.ID); delErr != nil {
+					s.projectsLogger().Warn("failed to roll back project after owner binding failure",
+						"project_id", project.ID, "error", delErr)
+				}
+				if s.quotaService != nil {
+					s.quotaService.Release(ctx, "max_projects_per_user", project.ID)
+				}
+				writeError(w, http.StatusInternalServerError, "ROLE_BINDING_FAILED",
+					"Failed to create project owner binding; project creation rolled back", nil)
+				return
+			}
+		}
+
 		// Create the associated project_agents group (best-effort)
 		s.createProjectGroup(ctx, project)
 
-		// Create project members group and policy (best-effort)
-		s.createProjectMembersGroupAndPolicy(ctx, project)
+		// Create project members group (best-effort, for collaboration)
+		s.createProjectMembersGroup(ctx, project)
 
 		// Ensure the #general chat topic exists for this project (best-effort).
 		s.ensureProjectGeneralTopic(ctx, project)
@@ -1289,7 +1481,7 @@ func (s *Server) handleProjectRegister(w http.ResponseWriter, r *http.Request) {
 		s.projectsLogger().Debug("ensuring groups for existing project during register",
 			"project_id", project.ID, "slug", project.Slug, "caller", callerID)
 		s.createProjectGroup(ctx, project)
-		s.createProjectMembersGroupAndPolicy(ctx, project, callerID)
+		s.createProjectMembersGroup(ctx, project, callerID)
 	}
 
 	// Handle broker linking - two paths:
@@ -2240,11 +2432,43 @@ func (s *Server) handleProjectAgentAction(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// set_message_mode action: own permission model (D7).
+	if action == api.AgentActionSetMessageMode {
+		s.handleSetMessageMode(w, r, agent.ID)
+		return
+	}
+
+	// Message action: route through authorizeAgentMessage (D1/D8).
+	if action == api.AgentActionMessage {
+		identity := GetIdentityFromContext(r.Context())
+		if identity == nil {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"This action requires user or agent authentication", nil)
+			return
+		}
+		isSystemPlane := false
+		allowed, reason := s.authorizeAgentMessage(r.Context(), identity, agent, isSystemPlane)
+		if !allowed {
+			slog.Warn("message authorization denied",
+				"sender_type", identity.Type(),
+				"sender_id", identity.ID(),
+				"target_agent", agent.ID,
+				"reason", reason,
+			)
+			writeError(w, http.StatusForbidden, ErrCodeForbidden,
+				"Message delivery denied", nil)
+			return
+		}
+		// Skip lifecycle authorization for messages — dispatch directly.
+		s.handleAgentMessage(w, r, agent.ID)
+		return
+	}
+
 	// For interactive actions, enforce lifecycle authorization for every caller
 	// kind: users via policy, agents via ScopeAgentLifecycle within their own
 	// project, everything else denied. authorizeAgentLifecycle logs the denial.
 	switch action {
-	case api.AgentActionStart, api.AgentActionStop, api.AgentActionSuspend, api.AgentActionRestart, api.AgentActionMessage, api.AgentActionExec:
+	case api.AgentActionStart, api.AgentActionStop, api.AgentActionSuspend, api.AgentActionRestart, api.AgentActionExec:
 		if !s.authorizeAgentLifecycle(w, r, agent) {
 			return
 		}
@@ -2255,8 +2479,6 @@ func (s *Server) handleProjectAgentAction(w http.ResponseWriter, r *http.Request
 		s.updateAgentStatus(w, r, agent.ID)
 	case api.AgentActionStart, api.AgentActionStop, api.AgentActionSuspend, api.AgentActionRestart:
 		s.handleAgentLifecycle(w, r, agent.ID, action)
-	case api.AgentActionMessage:
-		s.handleAgentMessage(w, r, agent.ID)
 	case api.AgentActionExec:
 		s.handleAgentExec(w, r, agent.ID)
 	case api.AgentActionEnv:
@@ -2324,7 +2546,18 @@ func (s *Server) getProject(w http.ResponseWriter, r *http.Request, id string) {
 	// Ensure associated groups exist (backfill for projects created before
 	// group support was added). These calls are idempotent.
 	s.createProjectGroup(ctx, project)
-	s.createProjectMembersGroupAndPolicy(ctx, project)
+
+	// SECURITY-GATE: CheckAccess — verify read access to individual project
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		NotFound(w, "Project")
+		return
+	}
+	if decision := s.authzService.CheckAccess(ctx, identity, projectResource(project), ActionRead); !decision.Allowed {
+		NotFound(w, "Project")
+		return
+	}
+	s.createProjectMembersGroup(ctx, project)
 
 	// Enrich owner display name
 	if project.OwnerID != "" {
@@ -2362,7 +2595,6 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request, id string
 		Name                   string            `json:"name,omitempty"`
 		Slug                   string            `json:"slug,omitempty"`
 		Labels                 map[string]string `json:"labels,omitempty"`
-		Visibility             string            `json:"visibility,omitempty"`
 		DefaultRuntimeBrokerID string            `json:"defaultRuntimeBrokerId,omitempty"`
 	}
 
@@ -2398,9 +2630,6 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request, id string
 	}
 	if updates.Labels != nil {
 		project.Labels = updates.Labels
-	}
-	if updates.Visibility != "" {
-		project.Visibility = updates.Visibility
 	}
 	if updates.DefaultRuntimeBrokerID != "" {
 		project.DefaultRuntimeBrokerID = updates.DefaultRuntimeBrokerID
@@ -2456,20 +2685,9 @@ func (s *Server) migrateProjectSlug(ctx context.Context, project *store.Project,
 			"project_id", project.ID, "old_slug", oldMembersSlug, "error", err)
 	}
 
-	// Migrate the project member policy name.
-	oldPolicyName := "project:" + oldSlug + ":member-create-agents"
-	newPolicyName := "project:" + newSlug + ":member-create-agents"
-	if policies, err := s.store.ListPolicies(ctx, store.PolicyFilter{Name: oldPolicyName}, store.ListOptions{Limit: 1}); err == nil && len(policies.Items) > 0 {
-		policy := &policies.Items[0]
-		policy.Name = newPolicyName
-		if err := s.store.UpdatePolicy(ctx, policy); err != nil {
-			s.projectsLogger().Warn("failed to migrate project member policy name",
-				"project_id", project.ID, "old_policy", oldPolicyName, "new_policy", newPolicyName, "error", err)
-		}
-	} else if err != nil {
-		s.projectsLogger().Warn("failed to retrieve project member policy for migration",
-			"project_id", project.ID, "old_policy", oldPolicyName, "error", err)
-	}
+	// CO1: Legacy policy migration removed. Policies are no longer the
+	// source of authority; project-scoped RoleBindings are scope-keyed by
+	// project ID (not slug), so no rename is needed.
 
 	// Migrate hub-managed project filesystem paths (best-effort).
 	// Derive newPath from oldPath's parent to preserve the directory type (groves/ vs projects/).
@@ -2554,13 +2772,16 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, id string
 		}
 	}
 
-	// Clean up project-scoped policies (best-effort)
-	if projectPolicies, err := s.store.ListPolicies(ctx, store.PolicyFilter{ScopeType: "project", ScopeID: id}, store.ListOptions{Limit: 100}); err == nil {
-		for _, p := range projectPolicies.Items {
-			if delErr := s.store.DeletePolicy(ctx, p.ID); delErr != nil {
-				s.projectsLogger().Warn("failed to delete project policy", "project_id", id, "policy", p.ID, "name", p.Name, "error", delErr.Error())
-			}
-		}
+	// CO1: Legacy policy cleanup removed. Policies are dead data.
+
+	// Cascade-delete all project-scoped role bindings (XL review R1).
+	// This removes all membership (owner/admin/member) bindings and the
+	// hub-members visibility binding for this project. Must run before
+	// DeleteProject so the scope reference is still valid for audit.
+	if n, err := s.store.DeleteRoleBindingsForScope(ctx, store.RoleScopeProject, id); err != nil {
+		s.projectsLogger().Warn("failed to cascade-delete project role bindings", "project_id", id, "error", err)
+	} else if n > 0 {
+		s.projectsLogger().Info("cascade-deleted project role bindings", "project_id", id, "count", n)
 	}
 
 	// Clean up project-scoped env vars (best-effort).
@@ -2619,6 +2840,11 @@ func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request, id string
 	if err := s.store.DeleteProject(ctx, id); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+
+	// Release quota reservation for the deleted project (best-effort).
+	if s.quotaService != nil {
+		s.quotaService.Release(ctx, "max_projects_per_user", id)
 	}
 
 	// For hub-native and shared-workspace projects, remove the filesystem directory

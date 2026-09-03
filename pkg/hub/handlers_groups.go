@@ -16,8 +16,9 @@ package hub
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
@@ -26,6 +27,13 @@ import (
 
 // ============================================================================
 // Group Endpoints
+//
+// Phase 1E separation: GroupMembership.Role is now used ONLY for group
+// governance (who can add/remove members, who can change group settings).
+// It is NOT used for resource authorization decisions. Project membership
+// and resource authorization are determined by role bindings (RoleBinding
+// with scope_type="project"). See pkg/hub/authz.go:isProjectOwnerOrAdmin
+// for the canonical project authorization check.
 // ============================================================================
 
 // ListGroupsResponse is the response for listing groups.
@@ -96,39 +104,77 @@ func (s *Server) listGroups(w http.ResponseWriter, r *http.Request) {
 		ParentID:  query.Get("parentId"),
 		GroupType: query.Get("groupType"),
 		ProjectID: query.Get("projectId"),
+		Search:    query.Get("search"),
 	}
 
-	limit := 50
-	if l := query.Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
-
-	result, err := s.store.ListGroups(ctx, filter, store.ListOptions{
-		Limit:  limit,
-		Cursor: query.Get("cursor"),
-	})
+	identity := GetIdentityFromContext(ctx)
+	limit, err := parseAuthorizedListLimit(query.Get("limit"))
 	if err != nil {
-		writeErrorFromErr(w, err, "")
+		BadRequest(w, err.Error())
 		return
 	}
-
-	// Compute per-item and scope capabilities
-	identity := GetIdentityFromContext(ctx)
-	groups := make([]GroupWithCapabilities, len(result.Items))
-	if identity != nil {
-		resources := make([]Resource, len(result.Items))
-		for i := range result.Items {
-			resources[i] = groupResource(&result.Items[i])
+	cursor := query.Get("cursor")
+	cursorBinding := authorizedListCursorBinding("groups", filter)
+	if cursor != "" {
+		if err := validateAuthorizedListCursor(cursor, cursorBinding); err != nil {
+			BadRequest(w, err.Error())
+			return
 		}
-		caps := s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "group")
-		for i := range result.Items {
-			groups[i] = GroupWithCapabilities{Group: result.Items[i], Cap: caps[i]}
+	}
+	var groupItems []store.Group
+	var nextCursor string
+	var totalCount int
+	// Check if user has admin-level list visibility via permission.
+	hasAdminView := false
+	if identity != nil {
+		if user, ok := identity.(UserIdentity); ok {
+			hasAdminView = s.authzService.Decide(ctx, AuthzRequest{
+				Principal:  principalContextForIdentity(user),
+				Credential: credentialContextForIdentity(user),
+				Resource:   Resource{Type: "group", ID: "hub"},
+				Action:     Action("list"),
+				Permission: "group.list",
+			}).Allowed
+		}
+	}
+	if hasAdminView {
+		// Admin view: direct store query without authorization filtering.
+		result, err := s.store.ListGroups(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, CursorBinding: cursorBinding})
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		groupItems, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+	} else if identity != nil {
+		// Authenticated non-admin: use authorizedList for policy-enforced filtering.
+		result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.Group], error) {
+			page, err := s.store.ListGroups(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
+			if err != nil {
+				return authorizedCandidatePage[store.Group]{}, err
+			}
+			return authorizedCandidatePage[store.Group]{Items: page.Items, NextCursor: page.NextCursor}, nil
+		}, groupResource, func(g *store.Group) string { return authorizedListCursor(g.Created, g.ID, cursorBinding) }, s.authzService.AuthorizeReadBatch)
+		if err != nil {
+			writeAuthorizedListError(w, err)
+			return
+		}
+		groupItems, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+	} else {
+		// Unauthenticated: return empty list (no identity to authorize against).
+		groupItems = []store.Group{}
+	}
+	groups := make([]GroupWithCapabilities, 0, len(groupItems))
+	if identity == nil {
+		for i := range groupItems {
+			groups = append(groups, GroupWithCapabilities{Group: groupItems[i]})
 		}
 	} else {
-		for i := range result.Items {
-			groups[i] = GroupWithCapabilities{Group: result.Items[i]}
+		resources := make([]Resource, len(groupItems))
+		for i := range groupItems {
+			resources[i] = groupResource(&groupItems[i])
+		}
+		for i, cap := range s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "group") {
+			groups = append(groups, GroupWithCapabilities{Group: groupItems[i], Cap: cap})
 		}
 	}
 
@@ -136,11 +182,10 @@ func (s *Server) listGroups(w http.ResponseWriter, r *http.Request) {
 	if identity != nil {
 		scopeCap = s.authzService.ComputeScopeCapabilities(ctx, identity, "", "", "group")
 	}
-
 	writeJSON(w, http.StatusOK, ListGroupsResponse{
 		Groups:       groups,
-		NextCursor:   result.NextCursor,
-		TotalCount:   result.TotalCount,
+		NextCursor:   nextCursor,
+		TotalCount:   totalCount,
 		Capabilities: scopeCap,
 	})
 }
@@ -392,6 +437,13 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 
+	// Constraint-coverage gate (R5): if this group participates in any
+	// AccessConstraint, deleting it silently removes the constraint's subject.
+	// Require access_constraint.admin permission to proceed.
+	if !s.requireConstraintAdminForGroup(w, r, group.ID) {
+		return
+	}
+
 	if group.GroupType == store.GroupTypeProjectAgents {
 		BadRequest(w, "project_agents groups are system-managed and cannot be deleted via API")
 		return
@@ -540,7 +592,13 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 		}
 	} else {
 		isResourceOwner := group.OwnerID != "" && group.OwnerID == userIdent.ID()
-		isPlatformAdmin := userIdent.Role() == "admin"
+		isPlatformAdmin := s.authzService.Decide(ctx, AuthzRequest{
+			Principal:  principalContextForIdentity(userIdent),
+			Credential: credentialContextForIdentity(userIdent),
+			Resource:   Resource{Type: "group", ID: "hub"},
+			Action:     Action("update"),
+			Permission: "group.update",
+		}).Allowed
 		if !isResourceOwner && !isPlatformAdmin {
 			callerMembership, err := s.store.GetGroupMembership(ctx, groupID, store.GroupMemberTypeUser, userIdent.ID())
 			switch req.Role {
@@ -633,6 +691,35 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 		}
 	}
 
+	// CanDelegate check: ensure the actor has sufficient authority to grant
+	// the membership. Because membership in a role-bearing group confers all
+	// of that group's role-binding authority, the actor must hold every
+	// permission that becomes newly reachable.
+	//
+	// This applies to ALL callers (user AND agent) and ALL member types
+	// (user, group, agent). An agent with group.addMember authority must
+	// pass the same delegation test as a user caller — group governance role
+	// does NOT substitute for resource authority.
+	var canDelegateResult, canDelegateReason string
+	if s.authzService != nil {
+		actorIdentity := GetIdentityFromContext(ctx)
+		if actorIdentity != nil {
+			grantDesc := GrantDescriptor{
+				Type:    GrantTypeGroupMembership,
+				GroupID: groupID,
+			}
+			delegateDecision := s.authzService.CanDelegate(ctx, actorIdentity, grantDesc)
+			canDelegateResult = "allow"
+			canDelegateReason = delegateDecision.Reason
+			if !delegateDecision.Allowed {
+				logAuthzDenial(r, actorIdentity, groupResource(group), ActionAddMember,
+					"CanDelegate denied: "+delegateDecision.Reason)
+				writeForbidden(w, "Cannot grant authority you do not hold: "+delegateDecision.Reason)
+				return
+			}
+		}
+	}
+
 	member := &store.GroupMember{
 		GroupID:    groupID,
 		MemberType: req.MemberType,
@@ -645,7 +732,30 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 		member.AddedBy = identity.ID()
 	}
 
+	// Quota enforcement: check members-per-group limit before addition.
+	if s.quotaService != nil {
+		membershipID := fmt.Sprintf("%s:%s:%s", groupID, member.MemberType, member.MemberID)
+		if err := s.quotaService.CheckAndReserve(ctx, "max_members_per_group", groupID, "group", groupID, membershipID); err != nil {
+			if errors.Is(err, store.ErrQuotaExceeded) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota exceeded: max_members_per_group", nil)
+				return
+			}
+			if errors.Is(err, ErrQuotaLockContention) {
+				writeError(w, http.StatusTooManyRequests, ErrCodeQuotaExceeded,
+					"quota check temporarily unavailable, please retry", nil)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "quota check failed", nil)
+			return
+		}
+	}
+
 	if err := s.store.AddGroupMember(ctx, member); err != nil {
+		if s.quotaService != nil {
+			membershipID := fmt.Sprintf("%s:%s:%s", groupID, member.MemberType, member.MemberID)
+			s.quotaService.Release(ctx, "max_members_per_group", membershipID)
+		}
 		if err == store.ErrAlreadyExists {
 			Conflict(w, "Member already exists in this group")
 			return
@@ -653,6 +763,16 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 		writeErrorFromErr(w, err, "")
 		return
 	}
+
+	auditRecord := &store.MutationAuditRecord{
+		MutationType:      "group_member_add",
+		TargetType:        "group_membership",
+		TargetID:          group.ID,
+		AfterSummary:      `{"groupId":"` + group.ID + `","memberType":"` + member.MemberType + `","memberId":"` + member.MemberID + `","role":"` + member.Role + `"}`,
+		CanDelegateResult: canDelegateResult,
+		CanDelegateReason: canDelegateReason,
+	}
+	s.emitMutationAudit(r.Context(), auditRecord)
 
 	s.groupsLogger().Info("group member added",
 		"group_id", groupID,
@@ -731,6 +851,13 @@ func (s *Server) removeGroupMember(w http.ResponseWriter, r *http.Request, group
 		return
 	}
 
+	// Constraint-coverage gate (R5): if this group participates in any
+	// AccessConstraint, removing a member silently relaxes that constraint.
+	// Require access_constraint.admin permission to proceed.
+	if !s.requireConstraintAdminForGroup(w, r, group.ID) {
+		return
+	}
+
 	// Prevent removing the last owner of a group
 	if memberType == store.GroupMemberTypeUser {
 		membership, err := s.store.GetGroupMembership(ctx, group.ID, memberType, memberID)
@@ -756,10 +883,98 @@ func (s *Server) removeGroupMember(w http.ResponseWriter, r *http.Request, group
 		return
 	}
 
+	// Release quota reservation for the removed member (best-effort).
+	if s.quotaService != nil {
+		membershipID := fmt.Sprintf("%s:%s:%s", group.ID, memberType, memberID)
+		s.quotaService.Release(ctx, "max_members_per_group", membershipID)
+	}
+
+	s.emitMutationAudit(r.Context(), &store.MutationAuditRecord{
+		MutationType:  "group_member_remove",
+		TargetType:    "group_membership",
+		TargetID:      group.ID,
+		BeforeSummary: `{"groupId":"` + group.ID + `","memberType":"` + memberType + `","memberId":"` + memberID + `"}`,
+	})
+
 	s.groupsLogger().Info("group member removed",
 		"group_id", group.ID,
 		"member_type", memberType,
 		"member_id", memberID)
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// isConstraintBearingGroup checks whether the given group ID appears as a
+// subject in any AccessConstraint. A group is constraint-bearing if any
+// constraint targets it via a "principal" subject with type "group" or via
+// a "group_closure" subject. Modifying membership of or deleting a
+// constraint-bearing group requires access_constraint.admin permission.
+func (s *Server) isConstraintBearingGroup(ctx context.Context, groupID string) (bool, error) {
+	// R-1 fix: page through all constraints instead of using (0,0) which
+	// defaults to limit=100, silently missing constraint #101+.
+	const pageSize = 500
+	offset := 0
+	for {
+		constraints, err := s.store.ListAccessConstraints(ctx, pageSize, offset)
+		if err != nil {
+			return false, err
+		}
+		for _, c := range constraints {
+			if c.SubjectKind == store.ConstraintSubjectPrincipal &&
+				c.SubjectPrincipalType != nil && *c.SubjectPrincipalType == "group" &&
+				c.SubjectPrincipalID != nil && *c.SubjectPrincipalID == groupID {
+				return true, nil
+			}
+			if c.SubjectKind == store.ConstraintSubjectGroupClosure &&
+				c.SubjectGroupID != nil && *c.SubjectGroupID == groupID {
+				return true, nil
+			}
+		}
+		if len(constraints) < pageSize {
+			break
+		}
+		offset += len(constraints)
+	}
+	return false, nil
+}
+
+// requireConstraintAdminForGroup checks whether the group is constraint-bearing
+// and, if so, requires the caller to hold access_constraint.admin permission.
+// Returns true if the operation may proceed, false if it was denied (response
+// already written).
+func (s *Server) requireConstraintAdminForGroup(w http.ResponseWriter, r *http.Request, groupID string) bool {
+	ctx := r.Context()
+	isCB, err := s.isConstraintBearingGroup(ctx, groupID)
+	if err != nil {
+		// Fail closed: if we cannot determine constraint status, deny.
+		writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError,
+			"failed to check constraint status for group", nil)
+		return false
+	}
+	if !isCB {
+		return true // not constraint-bearing — no extra check needed
+	}
+
+	// Group is constraint-bearing: require access_constraint.admin.
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
+		return false
+	}
+	if s.authzService == nil {
+		Forbidden(w)
+		return false
+	}
+	decision := s.authzService.Decide(ctx, AuthzRequest{
+		Principal:  principalContextForIdentity(identity),
+		Credential: credentialContextForIdentity(identity),
+		Resource:   Resource{Type: "access_constraint", ID: "hub"},
+		Action:     ActionManage,
+		Permission: PermissionConstraintAdmin,
+	})
+	if !decision.Allowed {
+		writeForbidden(w, "group is referenced by an access constraint; access_constraint.admin permission required")
+		return false
+	}
+	return true
 }

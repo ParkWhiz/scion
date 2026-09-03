@@ -12,8 +12,10 @@ import (
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/accessconstraint"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/accesspolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentcredential"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsessionmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/allowlistentry"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/apikey"
@@ -21,6 +23,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerjointoken"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokersecret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/conversation"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/conversationparticipant"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/decisionaudit"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/delegationedge"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/entitlementbinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/envvar"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/gcpserviceaccount"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/githubinstallation"
@@ -34,9 +41,12 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/invitecode"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/lifecyclehook"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/lifecyclehookagentphase"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/limitdefinition"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/maintenanceoperationrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/message"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/messageaddressee"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/mutationaudit"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/noncecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notificationsubscription"
@@ -45,6 +55,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectcontributor"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectprestarthook"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectsyncstate"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/rolebinding"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/roledefinition"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schedule"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledevent"
@@ -55,6 +67,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/skillversion"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/subscriptiontemplate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/template"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/usagereservation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/user"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/useraccesstoken"
 )
@@ -117,8 +130,10 @@ var (
 func checkColumn(t, c string) error {
 	initCheck.Do(func() {
 		columnCheck = sql.NewColumnCheck(map[string]func(string) bool{
+			accessconstraint.Table:         accessconstraint.ValidColumn,
 			accesspolicy.Table:             accesspolicy.ValidColumn,
 			agent.Table:                    agent.ValidColumn,
+			agentcredential.Table:          agentcredential.ValidColumn,
 			agentsessionmetrics.Table:      agentsessionmetrics.ValidColumn,
 			allowlistentry.Table:           allowlistentry.ValidColumn,
 			apikey.Table:                   apikey.ValidColumn,
@@ -126,6 +141,11 @@ func checkColumn(t, c string) error {
 			brokerjointoken.Table:          brokerjointoken.ValidColumn,
 			brokersecret.Table:             brokersecret.ValidColumn,
 			chatlinkcode.Table:             chatlinkcode.ValidColumn,
+			conversation.Table:             conversation.ValidColumn,
+			conversationparticipant.Table:  conversationparticipant.ValidColumn,
+			decisionaudit.Table:            decisionaudit.ValidColumn,
+			delegationedge.Table:           delegationedge.ValidColumn,
+			entitlementbinding.Table:       entitlementbinding.ValidColumn,
 			envvar.Table:                   envvar.ValidColumn,
 			gcpserviceaccount.Table:        gcpserviceaccount.ValidColumn,
 			githubresolutioncache.Table:    githubresolutioncache.ValidColumn,
@@ -139,9 +159,12 @@ func checkColumn(t, c string) error {
 			invitecode.Table:               invitecode.ValidColumn,
 			lifecyclehook.Table:            lifecyclehook.ValidColumn,
 			lifecyclehookagentphase.Table:  lifecyclehookagentphase.ValidColumn,
+			limitdefinition.Table:          limitdefinition.ValidColumn,
 			maintenanceoperation.Table:     maintenanceoperation.ValidColumn,
 			maintenanceoperationrun.Table:  maintenanceoperationrun.ValidColumn,
 			message.Table:                  message.ValidColumn,
+			messageaddressee.Table:         messageaddressee.ValidColumn,
+			mutationaudit.Table:            mutationaudit.ValidColumn,
 			noncecache.Table:               noncecache.ValidColumn,
 			notification.Table:             notification.ValidColumn,
 			notificationsubscription.Table: notificationsubscription.ValidColumn,
@@ -150,6 +173,8 @@ func checkColumn(t, c string) error {
 			projectcontributor.Table:       projectcontributor.ValidColumn,
 			projectprestarthook.Table:      projectprestarthook.ValidColumn,
 			projectsyncstate.Table:         projectsyncstate.ValidColumn,
+			rolebinding.Table:              rolebinding.ValidColumn,
+			roledefinition.Table:           roledefinition.ValidColumn,
 			runtimebroker.Table:            runtimebroker.ValidColumn,
 			schedule.Table:                 schedule.ValidColumn,
 			scheduledevent.Table:           scheduledevent.ValidColumn,
@@ -160,6 +185,7 @@ func checkColumn(t, c string) error {
 			skillversion.Table:             skillversion.ValidColumn,
 			subscriptiontemplate.Table:     subscriptiontemplate.ValidColumn,
 			template.Table:                 template.ValidColumn,
+			usagereservation.Table:         usagereservation.ValidColumn,
 			user.Table:                     user.ValidColumn,
 			useraccesstoken.Table:          useraccesstoken.ValidColumn,
 		})

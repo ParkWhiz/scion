@@ -354,7 +354,7 @@ func TestBuildStartContext_GitClone(t *testing.T) {
 			GitClone: &api.GitCloneConfig{
 				URL:    "https://github.com/org/repo.git",
 				Branch: "main",
-				Depth:  1,
+				Depth:  intPtr(1),
 			},
 		},
 		HTTPRequest: r,
@@ -873,6 +873,176 @@ func TestBuildStartContext_GCPMetadataPassthroughFromResolvedEnv(t *testing.T) {
 	}
 }
 
+// newTestServerWithRuntime creates a test server like newTestServerForStartContext
+// but with a custom runtime name.
+func newTestServerWithRuntime(t *testing.T, cfg ServerConfig, runtimeName string) *Server {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(origWd)
+	})
+
+	dotScion := filepath.Join(tmpDir, ".scion")
+	if err := os.Mkdir(dotScion, 0755); err != nil {
+		t.Fatal(err)
+	}
+	settingsYAML := `schema_version: "1"
+active_profile: local
+profiles:
+    local:
+        runtime: mock
+runtimes:
+    mock:
+        type: mock
+`
+	if err := os.WriteFile(filepath.Join(dotScion, "settings.yaml"), []byte(settingsYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	templatesDir := filepath.Join(dotScion, "templates")
+	if err := os.MkdirAll(templatesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(templatesDir, "default"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(templatesDir, "claude"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.ForceRuntime = "mock"
+	mgr := &envCapturingManager{}
+	rt := &runtime.MockRuntime{
+		NameFunc: func() string { return runtimeName },
+	}
+	return New(cfg, mgr, rt)
+}
+
+// TestBuildStartContext_CloudrunSandboxHubEndpoint verifies hub endpoint
+// behaviour for the cloudrun-sandbox runtime. In CI (no link-local interface),
+// the start must fail rather than fall back to the public IAP URL — a 302
+// from the IAP edge is exactly the failure that this fix prevents.
+//
+// When a link-local address IS available (real Cloud Run Instance), the
+// endpoint must be http://<link-local>:<port> with the port read from the
+// broker's own hub endpoint config.
+func TestBuildStartContext_CloudrunSandboxHubEndpoint(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.HubListenPort = 8080
+	srv := newTestServerWithRuntime(t, cfg, "cloudrun-sandbox")
+
+	r := httptest.NewRequest("POST", "/api/v1/agents", nil)
+
+	sc, err := srv.buildStartContext(context.Background(), startContextInputs{
+		Name:        "agent-sandbox",
+		HTTPRequest: r,
+	})
+
+	if err != nil {
+		// Expected in CI: no link-local address → start fails.
+		// Verify it is the right error and not some other failure.
+		if !strings.Contains(err.Error(), "hub endpoint") && !strings.Contains(err.Error(), "link-local") {
+			t.Fatalf("expected hub-endpoint/link-local error for cloudrun-sandbox, got: %v", err)
+		}
+		return
+	}
+
+	// If we get here, a link-local address was found (real Instance).
+	ep := sc.Opts.Env["SCION_HUB_ENDPOINT"]
+
+	// Guard: SCION_HUB_ENDPOINT must never contain a run.app URL for
+	// cloudrun-sandbox — that would route through IAP, which the sandbox
+	// cannot authenticate against.
+	if strings.Contains(ep, "run.app") {
+		t.Fatalf("SCION_HUB_ENDPOINT must never be a run.app URL for cloudrun-sandbox, got %q", ep)
+	}
+
+	// Must be http (not https) on the link-local address.
+	if !strings.HasPrefix(ep, "http://169.254.") {
+		t.Fatalf("expected http://169.254.x.x:<port>, got %q", ep)
+	}
+
+	// Port must come from the broker config, not hardcoded.
+	if !strings.HasSuffix(ep, ":8080") {
+		t.Fatalf("expected port 8080 from broker hub endpoint, got %q", ep)
+	}
+
+	// Metadata vars must still be localhost — emulator runs inside sandbox.
+	host := sc.Opts.Env["GCE_METADATA_HOST"]
+	root := sc.Opts.Env["GCE_METADATA_ROOT"]
+	if host != "localhost:18380" {
+		t.Errorf("expected GCE_METADATA_HOST='localhost:18380', got %q", host)
+	}
+	if root != "localhost:18380" {
+		t.Errorf("expected GCE_METADATA_ROOT='localhost:18380', got %q", root)
+	}
+}
+
+// TestBuildStartContext_CloudrunSandboxHubNeverRunApp is a durable guard:
+// assert the negative so the test survives refactoring and catches the
+// shipped defect pattern. If buildStartContext succeeds for cloudrun-sandbox,
+// the hub endpoint must NEVER be a public IAP-fronted URL.
+func TestBuildStartContext_CloudrunSandboxHubNeverRunApp(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.HubListenPort = 8080
+	srv := newTestServerWithRuntime(t, cfg, "cloudrun-sandbox")
+
+	r := httptest.NewRequest("POST", "/api/v1/agents", nil)
+
+	// Simulate a hub-dispatched agent whose resolvedEnv carries the public URL.
+	sc, err := srv.buildStartContext(context.Background(), startContextInputs{
+		Name:        "agent-sandbox-iap",
+		ResolvedEnv: map[string]string{"SCION_HUB_ENDPOINT": "https://my-instance-xyz.run.app"},
+		HTTPRequest: r,
+	})
+	if err != nil {
+		// In CI this fails (no link-local) — that is correct.
+		return
+	}
+	ep := sc.Opts.Env["SCION_HUB_ENDPOINT"]
+	if strings.Contains(ep, "run.app") {
+		t.Fatalf("cloudrun-sandbox SCION_HUB_ENDPOINT must never contain run.app, got %q", ep)
+	}
+}
+
+// TestBuildStartContext_GCPMetadataBothVarsAlwaysMatch guards the invariant
+// that GCE_METADATA_HOST and GCE_METADATA_ROOT are always set to the same
+// value. A mismatch means gcloud (ROOT) and language SDKs (HOST) would talk
+// to different servers. Only tests non-cloudrun-sandbox runtimes since
+// cloudrun-sandbox may fail in CI (no link-local).
+func TestBuildStartContext_GCPMetadataBothVarsAlwaysMatch(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.StateDir = t.TempDir()
+	srv := newTestServerWithRuntime(t, cfg, "mock")
+
+	r := httptest.NewRequest("POST", "/api/v1/agents", nil)
+
+	sc, err := srv.buildStartContext(context.Background(), startContextInputs{
+		Name:        "agent-both-vars",
+		HTTPRequest: r,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	host := sc.Opts.Env["GCE_METADATA_HOST"]
+	root := sc.Opts.Env["GCE_METADATA_ROOT"]
+	if host != root {
+		t.Errorf("GCE_METADATA_HOST=%q GCE_METADATA_ROOT=%q — must match", host, root)
+	}
+}
+
 // --- resolveWorktreeProvision tests ---
 
 func TestResolveWorktreeProvision_Eligible(t *testing.T) {
@@ -883,7 +1053,7 @@ func TestResolveWorktreeProvision_Eligible(t *testing.T) {
 		GitClone: &api.GitCloneConfig{
 			URL:    "https://github.com/org/repo.git",
 			Branch: "main",
-			Depth:  1,
+			Depth:  intPtr(1),
 		},
 		ProjectPath: projectDir,
 		ProjectID:   "proj-1",
@@ -999,7 +1169,7 @@ func TestResolveWorktreeProvision_GitTooOld_Fallback(t *testing.T) {
 		GitClone: &api.GitCloneConfig{
 			URL:    "https://github.com/org/repo.git",
 			Branch: "main",
-			Depth:  1,
+			Depth:  intPtr(1),
 		},
 		ProjectPath: projectDir,
 		ProjectID:   "proj-1",
@@ -1118,7 +1288,7 @@ func TestResolveWorktreeProvision_FullCloneDepth(t *testing.T) {
 	originalGC := &api.GitCloneConfig{
 		URL:    "https://github.com/org/repo.git",
 		Branch: "main",
-		Depth:  1,
+		Depth:  intPtr(1),
 	}
 
 	result := resolveWorktreeProvision(worktreeProvisionInput{
@@ -1134,12 +1304,12 @@ func TestResolveWorktreeProvision_FullCloneDepth(t *testing.T) {
 		t.Fatalf("expected ShouldProvision=true, reason: %s", result.Reason)
 	}
 
-	if result.ProvisionInput.GitClone.Depth != -1 {
-		t.Errorf("expected GitClone.Depth=-1 (full clone), got %d", result.ProvisionInput.GitClone.Depth)
+	if result.ProvisionInput.GitClone.Depth == nil || *result.ProvisionInput.GitClone.Depth != 0 {
+		t.Errorf("expected GitClone.Depth=0 (full clone), got %v", result.ProvisionInput.GitClone.Depth)
 	}
 
-	if originalGC.Depth != 1 {
-		t.Errorf("original GitClone.Depth was mutated: got %d, want 1", originalGC.Depth)
+	if originalGC.Depth == nil || *originalGC.Depth != 1 {
+		t.Errorf("original GitClone.Depth was mutated: got %v, want 1", originalGC.Depth)
 	}
 }
 
@@ -1182,7 +1352,7 @@ func TestTryProvisionWorktree_JoinResolvesSharedPath(t *testing.T) {
 	srv := newTestServerForStartContext(t, cfg)
 
 	bare := initBareRepoWithCommit(t)
-	gc := &api.GitCloneConfig{URL: bare, Branch: "main", Depth: 0}
+	gc := &api.GitCloneConfig{URL: bare, Branch: "main"}
 
 	projectPath := filepath.Join(t.TempDir(), "proj")
 	if err := os.MkdirAll(projectPath, 0o755); err != nil {
@@ -1268,7 +1438,7 @@ func TestWorktreeWorkspace_RepoRootDerivesToBase(t *testing.T) {
 	t.Setenv("SCION_HOST_UID", "")
 
 	bare := initBareRepoWithCommit(t)
-	gc := &api.GitCloneConfig{URL: bare, Branch: "main", Depth: 0}
+	gc := &api.GitCloneConfig{URL: bare, Branch: "main"}
 
 	projectPath := filepath.Join(t.TempDir(), "proj")
 	if err := os.MkdirAll(projectPath, 0o755); err != nil {
@@ -1561,3 +1731,87 @@ func TestBuildStartContext_WorkspaceGit(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildStartContext_EnvClassificationsCarried verifies that the merged
+// env classification map (hub-sent + broker-written keys) survives
+// buildStartContext on the returned startContext. Two cases:
+//
+//  1. Hub sends a non-nil EnvClassifications → the returned field is non-nil,
+//     contains hub keys, AND additionally contains broker-written keys.
+//  2. Hub sends nil (old hub / version skew) → the returned field is nil,
+//     NOT an empty map. This preserves the three-state contract described on
+//     api.EnvKind: nil means "classification unavailable", distinct from
+//     "all classified" (non-nil empty map).
+//
+// Pinning these invariants prevents a regression where buildStartContext
+// computes the classification map but drops it on return, making the
+// broker's ~35 classification sites unrecoverable downstream.
+func TestBuildStartContext_EnvClassificationsCarried(t *testing.T) {
+	t.Run("non-nil hub classifications merged with broker keys", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.StateDir = t.TempDir()
+		srv := newTestServerForStartContext(t, cfg)
+
+		hubCls := map[string]api.EnvKind{
+			"HUB_VAR": api.EnvKindPlain,
+		}
+
+		r := httptest.NewRequest("POST", "/api/v1/agents", nil)
+		sc, err := srv.buildStartContext(context.Background(), startContextInputs{
+			Name:               "agent-cls",
+			EnvClassifications: hubCls,
+			HTTPRequest:        r,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if sc.EnvClassifications == nil {
+			t.Fatal("EnvClassifications is nil; expected non-nil map carrying hub + broker keys")
+		}
+
+		// Hub key must survive.
+		if kind, ok := sc.EnvClassifications["HUB_VAR"]; !ok {
+			t.Error("hub key HUB_VAR missing from EnvClassifications")
+		} else if kind != api.EnvKindPlain {
+			t.Errorf("HUB_VAR: got kind %q, want %q", kind, api.EnvKindPlain)
+		}
+
+		// Broker-written key: SCION_WORKSPACE_MODE is always classified by the
+		// broker (it falls through to the shared-plain default when no
+		// WorkspaceMode is provided). Assert the specific key and kind, not
+		// just len() > 0, so this test cannot pass on the wrong map.
+		if kind, ok := sc.EnvClassifications["SCION_WORKSPACE_MODE"]; !ok {
+			t.Error("broker key SCION_WORKSPACE_MODE missing from EnvClassifications")
+		} else if kind != api.EnvKindPlain {
+			t.Errorf("SCION_WORKSPACE_MODE: got kind %q, want %q", kind, api.EnvKindPlain)
+		}
+	})
+
+	t.Run("nil hub classifications stays nil", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.StateDir = t.TempDir()
+		srv := newTestServerForStartContext(t, cfg)
+
+		r := httptest.NewRequest("POST", "/api/v1/agents", nil)
+		sc, err := srv.buildStartContext(context.Background(), startContextInputs{
+			Name: "agent-nil-cls",
+			// EnvClassifications intentionally nil — simulates an old hub
+			// that does not send classification data.
+			HTTPRequest: r,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Must be nil, NOT an empty non-nil map. assert.Empty would pass
+		// for both; this explicit nil check is the point of this test case.
+		if sc.EnvClassifications != nil {
+			t.Errorf("EnvClassifications: got %v (len %d), want nil — "+
+				"nil hub classifications must propagate as nil to preserve "+
+				"the three-state contract", sc.EnvClassifications, len(sc.EnvClassifications))
+		}
+	})
+}
+
+func intPtr(i int) *int { return &i }

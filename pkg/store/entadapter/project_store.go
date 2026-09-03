@@ -108,7 +108,6 @@ func entProjectToStore(p *ent.Project) *store.Project {
 		Updated:     p.Updated,
 		CreatedBy:   p.CreatedBy,
 		OwnerID:     p.OwnerID,
-		Visibility:  p.Visibility,
 	}
 	if p.GitRemote != nil {
 		sp.GitRemote = *p.GitRemote
@@ -153,9 +152,6 @@ func (s *ProjectStore) CreateProject(ctx context.Context, p *store.Project) erro
 		SetCreatedBy(p.CreatedBy).
 		SetOwnerID(p.OwnerID)
 
-	if p.Visibility != "" {
-		create.SetVisibility(p.Visibility)
-	}
 	if p.GitRemote != "" {
 		create.SetGitRemote(p.GitRemote)
 	}
@@ -191,9 +187,6 @@ func (s *ProjectStore) CreateProject(ctx context.Context, p *store.Project) erro
 
 	p.Created = created.Created
 	p.Updated = created.Updated
-	if p.Visibility == "" {
-		p.Visibility = created.Visibility
-	}
 	return nil
 }
 
@@ -295,8 +288,7 @@ func (s *ProjectStore) UpdateProject(ctx context.Context, p *store.Project) erro
 	update := s.client.Project.UpdateOneID(uid).
 		SetName(p.Name).
 		SetSlug(p.Slug).
-		SetOwnerID(p.OwnerID).
-		SetVisibility(p.Visibility)
+		SetOwnerID(p.OwnerID)
 
 	if p.GitRemote != "" {
 		update.SetGitRemote(p.GitRemote)
@@ -394,9 +386,6 @@ func (s *ProjectStore) ListProjects(ctx context.Context, filter store.ProjectFil
 	if filter.ExcludeOwnerID != "" {
 		query.Where(project.OwnerIDNEQ(filter.ExcludeOwnerID))
 	}
-	if filter.Visibility != "" {
-		query.Where(project.VisibilityEQ(filter.Visibility))
-	}
 	if filter.GitRemote != "" {
 		query.Where(project.GitRemoteEQ(filter.GitRemote))
 	} else if filter.GitRemotePrefix != "" {
@@ -434,9 +423,35 @@ func (s *ProjectStore) ListProjects(ctx context.Context, filter store.ProjectFil
 		}
 	}
 
-	totalCount, err := query.Clone().Count(ctx)
-	if err != nil {
-		return nil, err
+	// AuthorizedProjectIDs: scope-aware authorization filter applied at the SQL
+	// level so pagination and totals reflect only the authorized set.
+	// Fail-closed: if all IDs fail UUID parsing, match nothing rather than
+	// passing an empty set to IDIn (which may produce invalid SQL or no filter).
+	if filter.AuthorizedProjectIDs != nil {
+		if len(filter.AuthorizedProjectIDs) == 0 {
+			// Empty authorized set: no projects visible.
+			query.Where(project.IDEQ(uuid.Nil))
+		} else {
+			ids, err := parseUUIDs(filter.AuthorizedProjectIDs)
+			if err != nil {
+				return nil, err
+			}
+			if len(ids) > 0 {
+				query.Where(project.IDIn(ids...))
+			} else {
+				// All IDs failed UUID parsing: fail closed — no projects visible.
+				query.Where(project.IDEQ(uuid.Nil))
+			}
+		}
+	}
+
+	totalCount := 0
+	if !opts.SkipTotalCount {
+		var err error
+		totalCount, err = query.Clone().Count(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	limit := opts.Limit
@@ -448,11 +463,11 @@ func (s *ProjectStore) ListProjects(ctx context.Context, filter store.ProjectFil
 	}
 
 	if opts.Cursor != "" {
-		pred, err := s.projectCursorPredicate(ctx, opts.Cursor)
+		cursorCreated, cursorID, err := decodeListCursor(opts.Cursor, opts.CursorBinding)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid cursor: %w", err)
 		}
-		query.Where(pred)
+		query.Where(projectBeforeCursor(cursorCreated, cursorID))
 	}
 
 	rows, err := query.
@@ -472,15 +487,20 @@ func (s *ProjectStore) ListProjects(ctx context.Context, filter store.ProjectFil
 		items = append(items, *sp)
 	}
 
-	result := &store.ListResult[store.Project]{
-		Items:      items,
-		TotalCount: totalCount,
-	}
+	result := &store.ListResult[store.Project]{TotalCount: totalCount}
 	if len(items) > limit {
-		result.NextCursor = items[limit-1].ID
 		result.Items = items[:limit]
+		last := result.Items[len(result.Items)-1]
+		result.NextCursor = encodeListCursor(last.Created, last.ID, opts.CursorBinding)
+	} else {
+		result.Items = items
 	}
 	return result, nil
+}
+
+// projectBeforeCursor returns a predicate for keyset pagination after the given cursor.
+func projectBeforeCursor(cursorCreated time.Time, cursorID uuid.UUID) predicate.Project {
+	return keysetBeforeCursor(project.FieldCreated, project.FieldID, cursorCreated, cursorID)
 }
 
 // projectCursorPredicate builds the keyset predicate for paginating after the

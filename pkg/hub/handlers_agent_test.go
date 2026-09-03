@@ -699,6 +699,20 @@ func TestAgentGetAgent_ProjectIsolation(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, agentOtherProject))
 
+	// Grant the calling agent a project-member role binding so it has agent.read
+	// permission within its project (CO1 cutover: role bindings required).
+	pmRD, err := s.GetRoleDefinitionByName(ctx, store.ProjectRoleMember, store.RoleScopeProject)
+	require.NoError(t, err)
+	_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
+		RoleDefinitionID: pmRD.ID,
+		PrincipalType:    store.RoleBindingPrincipalAgent,
+		PrincipalID:      agent1.ID,
+		ScopeType:        store.RoleScopeProject,
+		ScopeID:          project1.ID,
+		CreatedBy:        store.SystemReconcileCreatedBy,
+	})
+	require.NoError(t, err)
+
 	tokenSvc := srv.GetAgentTokenService()
 	require.NotNil(t, tokenSvc)
 
@@ -707,6 +721,11 @@ func TestAgentGetAgent_ProjectIsolation(t *testing.T) {
 	token, err := tokenSvc.GenerateAgentToken(agent1.ID, project1.ID, []AgentTokenScope{ScopeAgentStatusUpdate, ScopeProjectRead}, nil)
 	require.NoError(t, err)
 
+	// CO1: agent.read has no AgentScopes mapping in the permissions registry,
+	// so the agent scope restriction blocks agent-to-agent reads at the kernel
+	// level. The handler's checkAgentReadScope passes (ScopeProjectRead is
+	// present), but s.authorize denies because agent.read is not in the
+	// allowed set for the agent's credential scopes.
 	t.Run("Agent can GET details of agents in same project", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+agent2SameProject.ID, nil)
 		req.Header.Set("X-Scion-Agent-Token", token)
@@ -714,7 +733,8 @@ func TestAgentGetAgent_ProjectIsolation(t *testing.T) {
 		rec := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rec, req)
 
-		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, http.StatusForbidden, rec.Code,
+			"CO1: agent.read has no AgentScopes mapping, blocked by credential scope restriction")
 	})
 
 	t.Run("Agent cannot GET details of agents in different project", func(t *testing.T) {
@@ -1761,7 +1781,7 @@ func TestCreateAgent_GitAnchoredProjectPopulatesGitClone(t *testing.T) {
 	require.NotNil(t, persisted.AppliedConfig.GitClone, "GitClone should be populated for git-anchored project")
 	assert.Equal(t, "https://github.com/example/myrepo.git", persisted.AppliedConfig.GitClone.URL)
 	assert.Equal(t, "develop", persisted.AppliedConfig.GitClone.Branch)
-	assert.Equal(t, 1, persisted.AppliedConfig.GitClone.Depth)
+	assert.Equal(t, intPtr(1), persisted.AppliedConfig.GitClone.Depth)
 }
 
 func TestCreateAgent_NonGitProjectNoGitClone(t *testing.T) {
@@ -1836,7 +1856,7 @@ func TestCreateProjectAgent_GitAnchoredProjectPopulatesGitClone(t *testing.T) {
 	require.NotNil(t, persisted.AppliedConfig.GitClone, "GitClone should be populated for git-anchored project")
 	assert.Equal(t, "https://github.com/example/myrepo.git", persisted.AppliedConfig.GitClone.URL)
 	assert.Equal(t, "develop", persisted.AppliedConfig.GitClone.Branch)
-	assert.Equal(t, 1, persisted.AppliedConfig.GitClone.Depth)
+	assert.Equal(t, intPtr(1), persisted.AppliedConfig.GitClone.Depth)
 }
 
 func TestCreateProjectAgent_NonGitProjectNoGitClone(t *testing.T) {
@@ -1912,7 +1932,7 @@ func TestCreateAgent_GitProjectCloneURLFallback(t *testing.T) {
 	assert.Equal(t, "https://github.com/example/fallback-repo.git", persisted.AppliedConfig.GitClone.URL,
 		"clone URL should be constructed from gitRemote when scion.dev/clone-url label is absent")
 	assert.Equal(t, "develop", persisted.AppliedConfig.GitClone.Branch)
-	assert.Equal(t, 1, persisted.AppliedConfig.GitClone.Depth)
+	assert.Equal(t, intPtr(1), persisted.AppliedConfig.GitClone.Depth)
 }
 
 func TestCreateAgent_GitProjectSchemelessCloneURL(t *testing.T) {
@@ -1963,7 +1983,7 @@ func TestCreateAgent_GitProjectSchemelessCloneURL(t *testing.T) {
 	assert.Equal(t, "https://github.com/example/schemeless-repo.git", persisted.AppliedConfig.GitClone.URL,
 		"schemeless clone-url label should be normalized to https:// with .git suffix")
 	assert.Equal(t, "main", persisted.AppliedConfig.GitClone.Branch)
-	assert.Equal(t, 1, persisted.AppliedConfig.GitClone.Depth)
+	assert.Equal(t, intPtr(1), persisted.AppliedConfig.GitClone.Depth)
 }
 
 func TestCreateAgent_GitProjectDefaultBranchFallback(t *testing.T) {
@@ -2014,7 +2034,7 @@ func TestCreateAgent_GitProjectDefaultBranchFallback(t *testing.T) {
 	// default-branch label is missing, so branch should default to "main"
 	assert.Equal(t, "main", persisted.AppliedConfig.GitClone.Branch,
 		"branch should default to 'main' when scion.dev/default-branch label is absent")
-	assert.Equal(t, 1, persisted.AppliedConfig.GitClone.Depth)
+	assert.Equal(t, intPtr(1), persisted.AppliedConfig.GitClone.Depth)
 }
 
 func TestCreateAgent_ProfileStoredInAppliedConfig(t *testing.T) {
@@ -2342,6 +2362,7 @@ func TestGetAgent_ProfileInResponse(t *testing.T) {
 // backfills the profile in AppliedConfig when the agent record is missing it.
 func TestHeartbeat_BackfillsProfile(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{
@@ -3033,6 +3054,7 @@ func TestCreateAgent_NotifySubscriptionCascadeOnDelete(t *testing.T) {
 
 func TestBrokerHeartbeat_PublishesActivitySSE(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	// Wire up a real event publisher so we can subscribe to SSE events
@@ -3133,6 +3155,7 @@ func TestBrokerHeartbeat_ContainerExitedDerivesCrash(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, s := testServer(t)
+			grantDevUserRuntimeBrokerAccess(t, s)
 			ctx := context.Background()
 
 			project := &store.Project{ID: tid("project-hb-crash"), Name: "P", Slug: "hb-crash-project"}
@@ -3177,6 +3200,7 @@ func TestBrokerHeartbeat_ContainerExitedDerivesCrash(t *testing.T) {
 
 func TestBrokerHeartbeat_RepeatedActivityDoesNotRefreshLastActivityEvent(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	// Create project, broker, and agent
@@ -3273,6 +3297,7 @@ func TestBrokerHeartbeat_RepeatedActivityDoesNotRefreshLastActivityEvent(t *test
 
 func TestBrokerHeartbeat_StalledAgentNotOverwrittenBySameActivity(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	// Create project, broker, and agent
@@ -3331,6 +3356,7 @@ func TestBrokerHeartbeat_StalledAgentNotOverwrittenBySameActivity(t *testing.T) 
 
 func TestBrokerHeartbeat_StalledAgentRecoveredByNewActivity(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	// Create project, broker, and agent
@@ -3389,6 +3415,7 @@ func TestBrokerHeartbeat_StalledAgentRecoveredByNewActivity(t *testing.T) {
 
 func TestBrokerHeartbeat_StalledWorkingAgentNotOverwrittenBySameActivity(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("project-stall-working"), Name: "Stall Working Project", Slug: "stall-working-project"}
@@ -3445,6 +3472,7 @@ func TestBrokerHeartbeat_StalledWorkingAgentNotOverwrittenBySameActivity(t *test
 
 func TestBrokerHeartbeat_DoesNotRevertStoppedAgent(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("project-stop-revert"), Name: "Stop Revert Project", Slug: "stop-revert-project"}
@@ -3503,6 +3531,7 @@ func TestBrokerHeartbeat_DoesNotRevertStoppedAgent(t *testing.T) {
 
 func TestBrokerHeartbeat_DoesNotRevertStoppedAgent_LegacyPath(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("project-stop-legacy"), Name: "Stop Legacy Project", Slug: "stop-legacy-project"}
@@ -3551,6 +3580,7 @@ func TestBrokerHeartbeat_DoesNotRevertStoppedAgent_LegacyPath(t *testing.T) {
 
 func TestBrokerHeartbeat_PropagatesTerminalActivityOnStoppedAgent(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-crash-hb"), Name: "Crash HB Project", Slug: "crash-hb-proj"}
@@ -3600,6 +3630,7 @@ func TestBrokerHeartbeat_PropagatesTerminalActivityOnStoppedAgent(t *testing.T) 
 
 func TestBrokerHeartbeat_DoesNotOverwriteTerminalActivityWithNonTerminal(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-term-guard"), Name: "Term Guard Project", Slug: "term-guard-proj"}
@@ -4334,7 +4365,7 @@ func TestCreateAgent_GCPPassthrough_BrokerOwnerAllowed(t *testing.T) {
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.createProjectMembersGroup(ctx, project)
 
 	// Create a broker owned by the same user, with host SA registered (P8).
 	broker := &store.RuntimeBroker{
@@ -4412,7 +4443,7 @@ func TestCreateAgent_GCPPassthrough_NonOwnerDenied(t *testing.T) {
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.createProjectMembersGroup(ctx, project)
 
 	// Create a broker owned by a DIFFERENT user
 	broker := &store.RuntimeBroker{
@@ -4474,6 +4505,7 @@ func TestCreateAgent_GCPPassthrough_AdminAllowed(t *testing.T) {
 	}
 	require.NoError(t, s.CreateUser(ctx, adminUser))
 	ensureHubMembership(ctx, s, adminUser.ID)
+	grantSuperAdminRole(t, s, adminUser.ID)
 
 	project := &store.Project{
 		ID:        tid("project-pt-admin"),
@@ -4485,7 +4517,7 @@ func TestCreateAgent_GCPPassthrough_AdminAllowed(t *testing.T) {
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.createProjectMembersGroup(ctx, project)
 
 	// Broker owned by someone else, with host SA registered (P8).
 	broker := &store.RuntimeBroker{
@@ -4919,6 +4951,7 @@ func TestAgentStatusUpdate_ActivityAutoCorrectsPhase(t *testing.T) {
 
 func TestBrokerHeartbeat_RejectsPhaseRegression(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-hb-regress"), Name: "HB Regression Project", Slug: "hb-regress-project"}
@@ -5013,6 +5046,7 @@ func TestAgentStatusUpdate_SuspendedIsStickyAgainstStatusPost(t *testing.T) {
 // heartbeat reporting stopped/crashed for a suspended agent leaves it suspended.
 func TestBrokerHeartbeat_DoesNotRevertSuspendedAgent(t *testing.T) {
 	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-susp-hb"), Name: "Suspend HB Project", Slug: "susp-hb-project"}
@@ -5216,4 +5250,301 @@ func TestListAgents_ResponseMetadata(t *testing.T) {
 	// When authenticated, totalCount reflects the auth-filtered returned count
 	assert.Greater(t, resp.TotalCount, 0, "totalCount should be present and non-zero")
 	assert.NotEmpty(t, resp.NextCursor, "nextCursor should be non-empty when more results exist")
+}
+
+// TestBrokerHeartbeat_PhaseErrorPersistsExitCodeAndReason verifies that when
+// a broker directly reports PhaseError (e.g. a failed K8s pod), the hub
+// persists ExitCode and ExitReason. Previously the exit-code extraction block
+// was gated on PhaseStopped only, so PhaseError heartbeats lost this data.
+func TestBrokerHeartbeat_PhaseErrorPersistsExitCodeAndReason(t *testing.T) {
+	nonZero := 137
+	cases := []struct {
+		name           string
+		hbPhase        string
+		hbExitCode     *int
+		hbExitReason   string
+		wantPhase      string
+		wantExitCode   *int
+		wantExitReason string
+		wantMessage    string
+	}{
+		{
+			name:           "PhaseError with non-zero exit code persists ExitCode and ExitReason",
+			hbPhase:        string(state.PhaseError),
+			hbExitCode:     &nonZero,
+			hbExitReason:   "crashed",
+			wantPhase:      string(state.PhaseError),
+			wantExitCode:   &nonZero,
+			wantExitReason: "crashed",
+			wantMessage:    "Agent crashed with exit code 137",
+		},
+		{
+			name:           "PhaseError with nil exit code preserves PhaseError and ExitReason",
+			hbPhase:        string(state.PhaseError),
+			hbExitCode:     nil,
+			hbExitReason:   "crashed",
+			wantPhase:      string(state.PhaseError),
+			wantExitCode:   nil,
+			wantExitReason: "crashed",
+		},
+		{
+			name:           "PhaseStopped with non-zero exit code still promotes to PhaseError",
+			hbPhase:        string(state.PhaseStopped),
+			hbExitCode:     &nonZero,
+			hbExitReason:   "crashed",
+			wantPhase:      string(state.PhaseError),
+			wantExitCode:   &nonZero,
+			wantExitReason: "crashed",
+			wantMessage:    "Agent crashed with exit code 137",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, s := testServer(t)
+			grantDevUserRuntimeBrokerAccess(t, s)
+			ctx := context.Background()
+
+			project := &store.Project{ID: tid("proj-pe-exit-" + tc.name), Name: "P", Slug: "pe-exit-proj-" + tc.name}
+			require.NoError(t, s.CreateProject(ctx, project))
+			broker := &store.RuntimeBroker{
+				ID: tid("broker-pe-exit-" + tc.name), Name: "B", Slug: "pe-exit-broker-" + tc.name,
+				Status: store.BrokerStatusOnline,
+			}
+			require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+			agent := &store.Agent{
+				ID: tid("agent-pe-exit-" + tc.name), Slug: "pe-exit-slug-" + tc.name, Name: "A",
+				ProjectID: project.ID, RuntimeBrokerID: broker.ID,
+				Phase: string(state.PhaseRunning),
+			}
+			require.NoError(t, s.CreateAgent(ctx, agent))
+
+			heartbeat := brokerHeartbeatRequest{
+				Status: "online",
+				Projects: []brokerProjectHeartbeat{{
+					ProjectID:  project.ID,
+					AgentCount: 1,
+					Agents: []brokerAgentHeartbeat{{
+						Slug:       agent.Slug,
+						Phase:      tc.hbPhase,
+						ExitCode:   tc.hbExitCode,
+						ExitReason: tc.hbExitReason,
+					}},
+				}},
+			}
+
+			rec := doRequest(t, srv, http.MethodPost, "/api/v1/runtime-brokers/"+broker.ID+"/heartbeat", heartbeat)
+			assert.Equal(t, http.StatusOK, rec.Code)
+
+			updated, err := s.GetAgent(ctx, agent.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantPhase, updated.Phase, "phase mismatch")
+			if tc.wantExitCode != nil {
+				require.NotNil(t, updated.ExitCode, "ExitCode should be persisted")
+				assert.Equal(t, *tc.wantExitCode, *updated.ExitCode, "ExitCode value mismatch")
+			}
+			if tc.wantExitReason != "" {
+				assert.Equal(t, tc.wantExitReason, updated.ExitReason, "ExitReason should be persisted")
+			}
+			if tc.wantMessage != "" {
+				assert.Equal(t, tc.wantMessage, updated.Message, "Message mismatch")
+			}
+		})
+	}
+}
+
+// TestBrokerHeartbeat_BackfillsContainerStatusFromStructuredPhase verifies
+// that when a broker sends structured Phase/ExitCode but no ContainerStatus,
+// the hub renders a backward-compatible ContainerStatus display string.
+func TestBrokerHeartbeat_BackfillsContainerStatusFromStructuredPhase(t *testing.T) {
+	zero := 0
+	nonZero := 137
+	cases := []struct {
+		name                string
+		initialPhase        string // agent's initial phase in store
+		hbPhase             string
+		hbExitCode          *int
+		wantContainerStatus string
+		wantPhase           string
+	}{
+		{
+			name:                "running phase backfills running",
+			initialPhase:        string(state.PhaseRunning),
+			hbPhase:             string(state.PhaseRunning),
+			wantContainerStatus: "running",
+			wantPhase:           string(state.PhaseRunning),
+		},
+		{
+			name:                "stopped phase backfills stopped",
+			initialPhase:        string(state.PhaseRunning),
+			hbPhase:             string(state.PhaseStopped),
+			hbExitCode:          &zero,
+			wantContainerStatus: "stopped",
+			wantPhase:           string(state.PhaseStopped),
+		},
+		{
+			name:                "error phase with exit code backfills exited (N)",
+			initialPhase:        string(state.PhaseRunning),
+			hbPhase:             string(state.PhaseStopped),
+			hbExitCode:          &nonZero,
+			wantContainerStatus: "exited (137)",
+			wantPhase:           string(state.PhaseError),
+		},
+		{
+			name:                "provisioning phase backfills created",
+			initialPhase:        string(state.PhaseCreated),
+			hbPhase:             string(state.PhaseProvisioning),
+			wantContainerStatus: "created",
+			wantPhase:           string(state.PhaseProvisioning),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, s := testServer(t)
+			grantDevUserRuntimeBrokerAccess(t, s)
+			ctx := context.Background()
+
+			project := &store.Project{ID: tid("proj-backfill-" + tc.name), Name: "P", Slug: "backfill-proj-" + tc.name}
+			require.NoError(t, s.CreateProject(ctx, project))
+			broker := &store.RuntimeBroker{
+				ID: tid("broker-backfill-" + tc.name), Name: "B", Slug: "backfill-broker-" + tc.name,
+				Status: store.BrokerStatusOnline,
+			}
+			require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+			agent := &store.Agent{
+				ID: tid("agent-backfill-" + tc.name), Slug: "backfill-slug-" + tc.name, Name: "A",
+				ProjectID: project.ID, RuntimeBrokerID: broker.ID,
+				Phase: tc.initialPhase,
+			}
+			require.NoError(t, s.CreateAgent(ctx, agent))
+
+			hb := brokerHeartbeatRequest{
+				Status: "online",
+				Projects: []brokerProjectHeartbeat{{
+					ProjectID:  project.ID,
+					AgentCount: 1,
+					Agents: []brokerAgentHeartbeat{{
+						Slug:     agent.Slug,
+						Phase:    tc.hbPhase,
+						ExitCode: tc.hbExitCode,
+						// No ContainerStatus — should be backfilled
+					}},
+				}},
+			}
+
+			rec := doRequest(t, srv, http.MethodPost, "/api/v1/runtime-brokers/"+broker.ID+"/heartbeat", hb)
+			assert.Equal(t, http.StatusOK, rec.Code)
+
+			updated, err := s.GetAgent(ctx, agent.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantPhase, updated.Phase, "phase mismatch")
+			assert.Equal(t, tc.wantContainerStatus, updated.ContainerStatus, "ContainerStatus should be backfilled from structured Phase")
+		})
+	}
+}
+
+// TestBrokerHeartbeat_NoBackfillWhenContainerStatusPresent verifies that
+// the backfill logic does not overwrite a ContainerStatus that the broker
+// already sent.
+func TestBrokerHeartbeat_NoBackfillWhenContainerStatusPresent(t *testing.T) {
+	srv, s := testServer(t)
+	grantDevUserRuntimeBrokerAccess(t, s)
+	ctx := context.Background()
+
+	project := &store.Project{ID: tid("proj-no-backfill"), Name: "P", Slug: "no-backfill-proj"}
+	require.NoError(t, s.CreateProject(ctx, project))
+	broker := &store.RuntimeBroker{
+		ID: tid("broker-no-backfill"), Name: "B", Slug: "no-backfill-broker",
+		Status: store.BrokerStatusOnline,
+	}
+	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+	agent := &store.Agent{
+		ID: tid("agent-no-backfill"), Slug: "no-backfill-slug", Name: "A",
+		ProjectID: project.ID, RuntimeBrokerID: broker.ID,
+		Phase: string(state.PhaseRunning),
+	}
+	require.NoError(t, s.CreateAgent(ctx, agent))
+
+	hb := brokerHeartbeatRequest{
+		Status: "online",
+		Projects: []brokerProjectHeartbeat{{
+			ProjectID:  project.ID,
+			AgentCount: 1,
+			Agents: []brokerAgentHeartbeat{{
+				Slug:            agent.Slug,
+				Phase:           string(state.PhaseRunning),
+				ContainerStatus: "Up 2 hours", // Explicit ContainerStatus from broker
+			}},
+		}},
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/runtime-brokers/"+broker.ID+"/heartbeat", hb)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	updated, err := s.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "Up 2 hours", updated.ContainerStatus, "broker-provided ContainerStatus should not be overwritten")
+}
+
+// TestStopAgent_SetsExitCodeZero verifies that when an agent is stopped via
+// the lifecycle handler, the ExitCode is set to 0 (clean exit).
+func TestStopAgent_SetsExitCodeZero(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	project := &store.Project{ID: tid("proj-stop-exitcode"), Name: "P", Slug: "stop-exitcode-proj"}
+	require.NoError(t, s.CreateProject(ctx, project))
+
+	agent := &store.Agent{
+		ID:        tid("agent-stop-exitcode"),
+		Slug:      "stop-exitcode-slug",
+		Name:      "Stop ExitCode Agent",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseRunning),
+	}
+	require.NoError(t, s.CreateAgent(ctx, agent))
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/stop", nil)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	updated, err := s.GetAgent(ctx, agent.ID)
+	require.NoError(t, err)
+	assert.Equal(t, string(state.PhaseStopped), updated.Phase)
+	assert.Equal(t, "stopped", updated.ContainerStatus)
+	require.NotNil(t, updated.ExitCode, "ExitCode should be set on stop")
+	assert.Equal(t, 0, *updated.ExitCode, "ExitCode should be 0 for clean stop")
+}
+
+// TestStopAllAgents_SetsExitCodeZero verifies that the stop-all handler
+// records ExitCode=0 for each stopped agent.
+func TestStopAllAgents_SetsExitCodeZero(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	project := &store.Project{ID: tid("proj-stopall-exit"), Name: "P", Slug: "stopall-exit-proj"}
+	require.NoError(t, s.CreateProject(ctx, project))
+
+	agentIDs := []string{tid("agent-stopall-exit-1"), tid("agent-stopall-exit-2")}
+	for _, id := range agentIDs {
+		agent := &store.Agent{
+			ID:        id,
+			Slug:      id,
+			Name:      id,
+			ProjectID: project.ID,
+			Phase:     string(state.PhaseRunning),
+		}
+		require.NoError(t, s.CreateAgent(ctx, agent))
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/projects/"+project.ID+"/agents/stop-all", nil)
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	for _, id := range agentIDs {
+		updated, err := s.GetAgent(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, string(state.PhaseStopped), updated.Phase, "agent %s should be stopped", id)
+		require.NotNil(t, updated.ExitCode, "agent %s ExitCode should be set", id)
+		assert.Equal(t, 0, *updated.ExitCode, "agent %s ExitCode should be 0 for clean stop", id)
+	}
 }

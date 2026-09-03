@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -210,7 +211,7 @@ func TestCreateToken(t *testing.T) {
 
 	t.Run("basic creation", func(t *testing.T) {
 		key, token, err := svc.CreateToken(ctx, tid("user-1"), "ci-token", tid("project-1"),
-			[]string{"agent:dispatch", "agent:read"}, nil)
+			[]string{"agent:create", "agent:read"}, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -242,6 +243,36 @@ func TestCreateToken(t *testing.T) {
 		}
 	})
 
+	t.Run("expands template:manage", func(t *testing.T) {
+		_, token, err := svc.CreateToken(ctx, tid("user-1"), "template-manage-token", tid("project-1"),
+			[]string{"template:manage"}, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected := permissions.UATManageScopesFor(permissions.ResourceTemplate)
+		if len(token.Scopes) != len(expected) {
+			t.Errorf("expected %d expanded scopes, got %d: %v", len(expected), len(token.Scopes), token.Scopes)
+		}
+		// Every scope must be a template:* scope
+		for _, sc := range token.Scopes {
+			if !strings.HasPrefix(sc, "template:") {
+				t.Errorf("template:manage expanded to non-template scope %q", sc)
+			}
+		}
+	})
+
+	t.Run("expands group:manage", func(t *testing.T) {
+		_, token, err := svc.CreateToken(ctx, tid("user-1"), "group-manage-token", tid("project-1"),
+			[]string{"group:manage"}, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected := permissions.UATManageScopesFor(permissions.ResourceGroup)
+		if len(token.Scopes) != len(expected) {
+			t.Errorf("expected %d expanded scopes, got %d: %v", len(expected), len(token.Scopes), token.Scopes)
+		}
+	})
+
 	t.Run("accepts project:update", func(t *testing.T) {
 		_, token, err := svc.CreateToken(ctx, tid("user-1"), "proj-update-token", tid("project-1"),
 			[]string{"project:read", "project:update"}, nil)
@@ -262,6 +293,14 @@ func TestCreateToken(t *testing.T) {
 	t.Run("rejects invalid scope", func(t *testing.T) {
 		_, _, err := svc.CreateToken(ctx, tid("user-1"), "bad-token", tid("project-1"),
 			[]string{"invalid:scope"}, nil)
+		if !errors.Is(err, ErrInvalidUATScope) {
+			t.Errorf("expected ErrInvalidUATScope, got %v", err)
+		}
+	})
+
+	t.Run("rejects stale agent dispatch scope", func(t *testing.T) {
+		_, _, err := svc.CreateToken(ctx, tid("user-1"), "stale-token", tid("project-1"),
+			[]string{"agent:dispatch"}, nil)
 		if !errors.Is(err, ErrInvalidUATScope) {
 			t.Errorf("expected ErrInvalidUATScope, got %v", err)
 		}
@@ -297,8 +336,8 @@ func TestValidateToken(t *testing.T) {
 	svc, _, _ := newTestUATService()
 	ctx := context.Background()
 
-	key, _, err := svc.CreateToken(ctx, tid("user-1"), "test-token", tid("project-1"),
-		[]string{"agent:dispatch", "agent:read"}, nil)
+	key, token, err := svc.CreateToken(ctx, tid("user-1"), "test-token", tid("project-1"),
+		[]string{"agent:attach", "agent:read"}, nil)
 	if err != nil {
 		t.Fatalf("failed to create token: %v", err)
 	}
@@ -314,8 +353,11 @@ func TestValidateToken(t *testing.T) {
 		if identity.ScopedProjectID() != tid("project-1") {
 			t.Errorf("expected project 'project-1', got %q", identity.ScopedProjectID())
 		}
-		if !identity.HasScope("agent:dispatch") {
-			t.Error("expected identity to have scope agent:dispatch")
+		if identity.CredentialID() != token.ID {
+			t.Errorf("expected credential ID %q, got %q", token.ID, identity.CredentialID())
+		}
+		if !identity.HasScope("agent:attach") {
+			t.Error("expected identity to have scope agent:attach")
 		}
 		if identity.HasScope("agent:delete") {
 			t.Error("expected identity NOT to have scope agent:delete")
@@ -438,6 +480,11 @@ func TestListTokens(t *testing.T) {
 }
 
 func TestExpandScopes(t *testing.T) {
+	skillManageCount := len(permissions.UATManageScopesFor(permissions.ResourceSkill))
+	templateManageCount := len(permissions.UATManageScopesFor(permissions.ResourceTemplate))
+	harnessConfigManageCount := len(permissions.UATManageScopesFor(permissions.ResourceHarnessConfig))
+	groupManageCount := len(permissions.UATManageScopesFor(permissions.ResourceGroup))
+
 	tests := []struct {
 		name     string
 		input    []string
@@ -448,6 +495,14 @@ func TestExpandScopes(t *testing.T) {
 		{"manage with extra", []string{"agent:manage", "project:read"}, len(store.UATManageScopes) + 1},
 		{"dedup", []string{"agent:read", "agent:read"}, 1},
 		{"manage dedup with explicit", []string{"agent:manage", "agent:read"}, len(store.UATManageScopes)},
+		{"skill:manage alias", []string{"skill:manage"}, skillManageCount},
+		{"template:manage alias", []string{"template:manage"}, templateManageCount},
+		{"harness_config:manage alias", []string{"harness_config:manage"}, harnessConfigManageCount},
+		{"group:manage alias", []string{"group:manage"}, groupManageCount},
+		{"skill:manage with extra", []string{"skill:manage", "agent:read"}, skillManageCount + 1},
+		{"skill:manage dedup with explicit", []string{"skill:manage", "skill:read"}, skillManageCount},
+		{"multiple manage aliases", []string{"agent:manage", "skill:manage"}, len(store.UATManageScopes) + skillManageCount},
+		{"group:manage with extra and dedup", []string{"group:manage", "group:read", "project:read"}, groupManageCount + 1},
 	}
 
 	for _, tc := range tests {
@@ -460,9 +515,27 @@ func TestExpandScopes(t *testing.T) {
 	}
 }
 
+func TestExpandScopes_ManageAliasesExpandToCorrectResource(t *testing.T) {
+	// Verify each manage alias only expands to scopes of its own resource type.
+	for alias, resource := range permissions.UATManageAliases {
+		t.Run(alias, func(t *testing.T) {
+			result := expandScopes([]string{alias})
+			if len(result) == 0 {
+				t.Fatalf("%s expanded to zero scopes", alias)
+			}
+			prefix := resource + ":"
+			for _, scope := range result {
+				if !strings.HasPrefix(scope, prefix) {
+					t.Errorf("%s expanded to non-%s scope %q", alias, resource, scope)
+				}
+			}
+		})
+	}
+}
+
 func TestScopedUserIdentity(t *testing.T) {
 	base := NewAuthenticatedUser(tid("user-1"), "test@example.com", "Test", "member", "api")
-	scoped := NewScopedUserIdentity(base, tid("project-1"), []string{"agent:dispatch", "agent:read"})
+	scoped := NewScopedUserIdentity(base, tid("project-1"), []string{"agent:attach", "agent:read"})
 
 	if scoped.ID() != tid("user-1") {
 		t.Errorf("expected ID 'user-1', got %q", scoped.ID())
@@ -473,8 +546,8 @@ func TestScopedUserIdentity(t *testing.T) {
 	if scoped.ScopedProjectID() != tid("project-1") {
 		t.Errorf("expected project 'project-1', got %q", scoped.ScopedProjectID())
 	}
-	if !scoped.HasScope("agent:dispatch") {
-		t.Error("expected HasScope('agent:dispatch') to be true")
+	if !scoped.HasScope("agent:attach") {
+		t.Error("expected HasScope('agent:attach') to be true")
 	}
 	if scoped.HasScope("agent:delete") {
 		t.Error("expected HasScope('agent:delete') to be false")

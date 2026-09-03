@@ -15,12 +15,12 @@
 package hub
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -169,21 +169,8 @@ func (s *Server) listTemplatesV2(w http.ResponseWriter, r *http.Request) {
 	if !checkAgentReadScope(w, r) {
 		return
 	}
-
-	ctx := r.Context()
-	query := r.URL.Query()
-
-	filter := store.TemplateFilter{
-		Name:      query.Get("name"),
-		Scope:     query.Get("scope"),
-		ScopeID:   query.Get("scopeId"),
-		ProjectID: query.Get("projectId"), // Backwards compat
-		Harness:   query.Get("harness"),
-		Status:    query.Get("status"),
-		Search:    query.Get("search"),
-	}
-
-	// Default to active templates only
+	ctx, query := r.Context(), r.URL.Query()
+	filter := store.TemplateFilter{Name: query.Get("name"), Scope: query.Get("scope"), ScopeID: query.Get("scopeId"), ProjectID: query.Get("projectId"), Harness: query.Get("harness"), Status: query.Get("status"), Search: query.Get("search")}
 	if filter.Status == "" {
 		filter.Status = store.TemplateStatusActive
 	}
@@ -206,51 +193,73 @@ func (s *Server) listTemplatesV2(w http.ResponseWriter, r *http.Request) {
 		filter.ScopeID = userIdent.ID()
 	}
 
-	limit := 50
-	if l := query.Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
-
-	result, err := s.store.ListTemplates(ctx, filter, store.ListOptions{
-		Limit:  limit,
-		Cursor: query.Get("cursor"),
-	})
+	limit, err := parseAuthorizedListLimit(query.Get("limit"))
 	if err != nil {
-		writeErrorFromErr(w, err, "")
+		BadRequest(w, err.Error())
 		return
 	}
-
-	// Compute per-item and scope capabilities
-	identity := GetIdentityFromContext(ctx)
-	templates := make([]TemplateWithCapabilities, len(result.Items))
-	if identity != nil {
-		resources := make([]Resource, len(result.Items))
-		for i := range result.Items {
-			resources[i] = templateResource(&result.Items[i])
-		}
-		caps := s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "template")
-		for i := range result.Items {
-			templates[i] = TemplateWithCapabilities{Template: result.Items[i], Cap: caps[i]}
-		}
-	} else {
-		for i := range result.Items {
-			templates[i] = TemplateWithCapabilities{Template: result.Items[i]}
+	identity, cursor := GetIdentityFromContext(ctx), query.Get("cursor")
+	cursorBinding := authorizedListCursorBinding("templates", filter)
+	if cursor != "" {
+		if err := validateAuthorizedListCursor(cursor, cursorBinding); err != nil {
+			BadRequest(w, err.Error())
+			return
 		}
 	}
-
+	var items []store.Template
+	var nextCursor string
+	var totalCount int
+	// Check if user has admin-level list visibility via permission.
+	hasAdminView := false
+	if user, ok := identity.(UserIdentity); ok {
+		hasAdminView = s.authzService.Decide(ctx, AuthzRequest{
+			Principal:  principalContextForIdentity(user),
+			Credential: credentialContextForIdentity(user),
+			Resource:   Resource{Type: "template", ID: "hub"},
+			Action:     Action("list"),
+			Permission: "template.list",
+		}).Allowed
+	}
+	if identity != nil && !hasAdminView {
+		result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.Template], error) {
+			page, err := s.store.ListTemplates(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
+			if err != nil {
+				return authorizedCandidatePage[store.Template]{}, err
+			}
+			return authorizedCandidatePage[store.Template]{Items: page.Items, NextCursor: page.NextCursor}, nil
+		}, templateResource, func(t *store.Template) string { return authorizedListCursor(t.Created, t.ID, cursorBinding) }, s.authzService.AuthorizeReadBatch)
+		if err != nil {
+			writeAuthorizedListError(w, err)
+			return
+		}
+		items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+	} else {
+		result, err := s.store.ListTemplates(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, CursorBinding: cursorBinding})
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		items, nextCursor, totalCount = result.Items, result.NextCursor, result.TotalCount
+	}
+	templates := make([]TemplateWithCapabilities, 0, len(items))
+	if identity == nil {
+		for i := range items {
+			templates = append(templates, TemplateWithCapabilities{Template: items[i]})
+		}
+	} else {
+		resources := make([]Resource, len(items))
+		for i := range items {
+			resources[i] = templateResource(&items[i])
+		}
+		for i, cap := range s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "template") {
+			templates = append(templates, TemplateWithCapabilities{Template: items[i], Cap: cap})
+		}
+	}
 	var scopeCap *Capabilities
 	if identity != nil {
 		scopeCap = s.authzService.ComputeScopeCapabilities(ctx, identity, "", "", "template")
 	}
-
-	writeJSON(w, http.StatusOK, ListTemplatesResponse{
-		Templates:    templates,
-		NextCursor:   result.NextCursor,
-		TotalCount:   result.TotalCount,
-		Capabilities: scopeCap,
-	})
+	writeJSON(w, http.StatusOK, ListTemplatesResponse{Templates: templates, NextCursor: nextCursor, TotalCount: totalCount, Capabilities: scopeCap})
 }
 
 // createTemplateV2 creates a template with optional file upload URLs.
@@ -286,6 +295,14 @@ func (s *Server) createTemplateV2(w http.ResponseWriter, r *http.Request) {
 	if slug == "" {
 		BadRequest(w, "invalid slug: name cannot be slugified")
 		return
+	}
+
+	// Validate MessageMode in template config if specified.
+	if req.Config != nil && req.Config.MessageMode != "" {
+		if !store.IsValidMessageMode(req.Config.MessageMode) {
+			ValidationError(w, "invalid template message mode: "+req.Config.MessageMode, nil)
+			return
+		}
 	}
 
 	// Create template record
@@ -464,6 +481,14 @@ func (s *Server) updateTemplateV2(w http.ResponseWriter, r *http.Request, id str
 	if err := readJSON(r, &template); err != nil {
 		BadRequest(w, "Invalid request body: "+err.Error())
 		return
+	}
+
+	// Validate MessageMode in template config if specified.
+	if template.Config != nil && template.Config.MessageMode != "" {
+		if !store.IsValidMessageMode(template.Config.MessageMode) {
+			ValidationError(w, "invalid template message mode: "+template.Config.MessageMode, nil)
+			return
+		}
 	}
 
 	// Preserve immutable fields

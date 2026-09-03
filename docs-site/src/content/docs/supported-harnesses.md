@@ -14,8 +14,8 @@ projection, and MCP configuration across all bundles. See
 [Harness-Specific Settings](/scion/reference/harness-settings/) for how bundles are packaged and
 managed.
 
-`antigravity` and `gemini-cli` are installed by default. `opencode`, `codex`, `copilot`, `hermes`, and
-`antigravity` are opt-in bundles you add via a [harness-config](/scion/reference/harness-settings/#managing-harness-configs).
+`antigravity` and `gemini-cli` are installed by default. `opencode`, `codex`, `copilot`, `hermes`,
+and `grok-build` are opt-in bundles you add via a [harness-config](/scion/reference/harness-settings/#managing-harness-configs).
 :::
 
 ## 1. Gemini CLI (`gemini-cli`)
@@ -88,6 +88,7 @@ OpenCode supports two authentication methods (auto-detected in this order):
 - **Config File**: `~/.config/opencode/opencode.json`.
 - **Environment**: Respects standard OpenCode environment variables.
 - **Model Resolution**: Supports model selection via the `SCION_MODEL` environment variable. When `ctx.model_resolution` is empty, the provisioning script automatically falls back to `SCION_MODEL` to resolve and configure the underlying model.
+- **Catalog Pre-fetch**: The provisioner automatically pre-fetches the `models.dev` catalog to ensure fresh model data is available before startup.
 
 ### Known Limitations
 - **Auth File Copy**: The `auth.json` file is copied only when the agent is **created**. If you update your host credentials, you may need to manually update the file in the agent or recreate the agent.
@@ -197,11 +198,11 @@ a containerized workspace agent; choose the managed agent for repo-less, broker-
 :::
 
 ### Authentication
-Antigravity uses **OAuth** (auth type `oauth-token`), with an optional **Vertex AI**
-(`vertex-ai`) mode for enterprise/GCP deployments. It does not use API keys.
+Antigravity supports three authentication methods, evaluated in priority order (`vertex-ai` > `oauth-token` > `api-key`):
 
-- **OAuth token** (`oauth-token`): provide a JSON file secret named `AGY_TOKEN` containing a `refresh_token`. Scion stages it at `~/.gemini/antigravity-cli/antigravity-oauth-token` and injects it into the container's gnome-keyring at launch.
 - **Vertex AI** (`vertex-ai`): Google Cloud's Vertex AI mode using Google Cloud Application Default Credentials (ADC) plus `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` (or `GOOGLE_CLOUD_REGION`). This mode no longer requires `AGY_TOKEN`. It uses the `gcloud-adc` file secret or automatically resolves ADC via the assigned GCP Service Account (Hub-managed GCP Identity). Requires AGY CLI >= 1.1.10.
+- **OAuth token** (`oauth-token`): Provide a JSON file secret named `AGY_TOKEN` containing a `refresh_token`. Scion stages it at `~/.gemini/antigravity-cli/antigravity-oauth-token` and injects it into the container's gnome-keyring at launch.
+- **API Key** (`api-key`): The lowest-priority fallback method. Accepts either the `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment secret. The provisioner will automatically set `modelProvider` to `Gemini` in the agent's `settings.json` and authenticate using this key.
 
 If no token is available, run `agy` interactively to log in, then capture the credential with
 the Antigravity bundle's `capture_auth.py` (which can also extract the token from gnome-keyring).
@@ -222,26 +223,69 @@ the Antigravity bundle's `capture_auth.py` (which can also extract the token fro
 
 ---
 
+## 8. Grok Build (`grok-build`)
+
+A harness for xAI's `grok` CLI (Grok Build). Opt-in bundle.
+
+### Authentication
+Grok Build authenticates with an **xAI API key** (auth type `api-key`). Scion resolves the key
+from the `XAI_API_KEY` environment variable.
+
+Alternatively, a file-based auth method (`auth-file`) is supported using `~/.grok/auth.json`,
+produced by `grok login --device-auth`. Capture the credential with `capture_auth.py` after login.
+
+A **Vertex AI** auth method (`vertex-ai`) routes inference through Google Cloud's Vertex AI
+Model Garden. Set `GOOGLE_CLOUD_PROJECT` and optionally `GOOGLE_CLOUD_REGION` (defaults to the
+global endpoint). The provisioner writes `[auth_provider]` and `[model]` entries to
+`~/.grok/config.toml` using `gcloud auth print-access-token` for on-demand token refresh.
+Application Default Credentials (ADC) are placed automatically when staged.
+
+If no credentials are found, the agent drops to a shell — run `grok login --device-auth`
+interactively, then capture the credential with the container's `capture_auth.py`
+(see [Harness Authentication](/scion/local/agent-credentials/#capturing-credentials-from-a-running-agent)).
+
+| Mode | Credential | Setup |
+|---|---|---|
+| API Key | `XAI_API_KEY` | Set env var with xAI API key |
+| Auth File | `~/.grok/auth.json` | `grok login --device-auth` + capture |
+| Vertex AI | `SCION_METADATA_PROJECT_ID` or `GOOGLE_CLOUD_PROJECT` | Detected from GCP identity or env var |
+
+### Configuration
+- **Config directory**: `~/.grok/` (settings in `config.toml`).
+- **Instructions**: `agent_instructions` are projected into `~/.grok/AGENTS.md`.
+- **System Prompt**: Supported natively via the `--system-prompt-override` flag during launch.
+- **MCP**: `~/.grok/config.toml` under `[mcp_servers.*]` TOML sections (supports `stdio`, `sse`, and `streamable-http` transports). Project-scoped MCP servers are not supported (demoted to global).
+- **Model aliases**: `small` → `grok-3-mini`, `medium` → `grok-3`, `large` → `grok-4`, `extra-large` → `grok-4` (resolved and injected via `GROK_DEFAULT_MODEL`).
+- **Hooks**: 11 Grok lifecycle event hooks are wired to sciontool via `~/.grok/hooks/scion.json` using the `grok-build` dialect.
+- **OpenTelemetry**: When telemetry is enabled, Scion injects `GROK_TELEMETRY_ENABLED`, `GROK_EXTERNAL_OTEL`, and standard `OTEL_*` env vars pointing at sciontool's local OTLP receiver.
+
+### Known Limitations
+- **No max_model_calls** — Grok hooks do not expose model-call start/end events. `max_turns` and `max_duration` are supported.
+- **No project-scoped MCP**.
+- **OAuth**: not supported — Grok uses xAI auth only.
+
+---
+
 ## Feature Capability Matrix
 
 The following table summarizes the capabilities supported by each agent harness within Scion.
 
-| Capability | Gemini | Claude | OpenCode | Codex | Copilot | Hermes | Antigravity |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Resume** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| With Prompt | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
-| Custom Session ID | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Interject** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Interrupt Key | C-c | C-c | Esc / C-c | C-c | C-c | C-c | C-c |
-| **Enqueue** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Hooks** | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Support | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| **OpenTelemetry** | ✅ | ✅  | ❌ | ✅  | ❌ | ❌ | ❌ |
-| **System Prompt Override** | ✅ | ✅ | ❌ | ❌ | ◐ | ◐ | ◐ |
-| **Auth: API Key** | ✅ | ✅ | ✅ | ✅ | ✅¹ | ✅ | ❌ |
-| **Auth: OAuth Token** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Auth: Auth File** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅² |
-| **Auth: Vertex AI** | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Capability | Gemini | Claude | OpenCode | Codex | Copilot | Hermes | Antigravity | Grok Build |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Resume** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| With Prompt | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Custom Session ID | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Interject** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Interrupt Key | C-c | C-c | Esc / C-c | C-c | C-c | C-c | C-c | C-c |
+| **Enqueue** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Hooks** | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Support | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| **OpenTelemetry** | ✅ | ✅  | ❌ | ✅  | ❌ | ❌ | ❌ | ✅ |
+| **System Prompt Override** | ✅ | ✅ | ❌ | ❌ | ◐ | ◐ | ◐ | ✅ |
+| **Auth: API Key** | ✅ | ✅ | ✅ | ✅ | ✅¹ | ✅ | ❌ | ✅ |
+| **Auth: OAuth Token** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Auth: Auth File** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅² | ✅ |
+| **Auth: Vertex AI** | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
 
 * **Resume with Prompt**: Ability to provide a new task/prompt when resuming an existing session.
 * **Interject** (pending feature): Key used to interrupt the agent (e.g., stop generation).

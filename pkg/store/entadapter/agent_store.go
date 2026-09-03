@@ -99,6 +99,8 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 		ToolName:            a.ToolName,
 		ConnectionState:     a.ConnectionState,
 		ContainerStatus:     a.ContainerStatus,
+		ExitCode:            a.ExitCode,
+		ExitReason:          a.ExitReason,
 		RuntimeState:        a.RuntimeState,
 		StalledFromActivity: a.StalledFromActivity,
 		CurrentTurns:        a.CurrentTurns,
@@ -114,6 +116,7 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 		Created:             a.Created,
 		Updated:             a.Updated,
 		Visibility:          a.Visibility,
+		MessageMode:         string(a.MessageMode),
 		Ancestry:            a.Ancestry,
 		StateVersion:        a.StateVersion,
 	}
@@ -240,6 +243,9 @@ func (s *AgentStore) CreateAgent(ctx context.Context, a *store.Agent) error {
 
 	if a.Visibility != "" {
 		create.SetVisibility(a.Visibility)
+	}
+	if a.MessageMode != "" {
+		create.SetMessageMode(agent.MessageMode(a.MessageMode))
 	}
 	if a.Labels != nil {
 		create.SetLabels(a.Labels)
@@ -392,6 +398,17 @@ func (s *AgentStore) UpdateAgent(ctx context.Context, a *store.Agent) error {
 		SetUpdated(now).
 		SetStateVersion(newVersion)
 
+	if a.MessageMode != "" {
+		update.SetMessageMode(agent.MessageMode(a.MessageMode))
+	}
+
+	if a.ExitCode != nil {
+		update.SetExitCode(*a.ExitCode)
+	} else {
+		update.ClearExitCode()
+	}
+	update.SetExitReason(a.ExitReason)
+
 	if a.Labels != nil {
 		update.SetLabels(a.Labels)
 	} else {
@@ -479,9 +496,13 @@ func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, o
 		query.Where(preds...)
 	}
 
-	totalCount, err := query.Clone().Count(ctx)
-	if err != nil {
-		return nil, err
+	totalCount := 0
+	if !opts.SkipTotalCount {
+		var err error
+		totalCount, err = query.Clone().Count(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	limit := opts.Limit
@@ -493,16 +514,16 @@ func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, o
 	}
 
 	if opts.Cursor != "" {
-		pred, err := s.agentCursorPredicate(ctx, opts.Cursor)
+		cursorCreated, cursorID, err := decodeListCursor(opts.Cursor, opts.CursorBinding)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid cursor: %w", err)
 		}
-		query.Where(pred)
+		query.Where(agentBeforeCursor(cursorCreated, cursorID))
 	}
 
 	// Fetch one extra row to detect whether a further page exists.
 	rows, err := query.
-		Order(agent.ByCreated(entsql.OrderDesc())).
+		Order(agent.ByCreated(entsql.OrderDesc()), agent.ByID(entsql.OrderDesc())).
 		Limit(limit + 1).
 		All(ctx)
 	if err != nil {
@@ -514,15 +535,20 @@ func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, o
 		items = append(items, *entAgentToStore(a))
 	}
 
-	result := &store.ListResult[store.Agent]{
-		Items:      items,
-		TotalCount: totalCount,
-	}
+	result := &store.ListResult[store.Agent]{TotalCount: totalCount}
 	if len(items) > limit {
 		result.Items = items[:limit]
-		result.NextCursor = items[limit-1].ID
+		last := result.Items[len(result.Items)-1]
+		result.NextCursor = encodeListCursor(last.Created, last.ID, opts.CursorBinding)
+	} else {
+		result.Items = items
 	}
 	return result, nil
+}
+
+// agentBeforeCursor returns a predicate for keyset pagination after the given cursor.
+func agentBeforeCursor(cursorCreated time.Time, cursorID uuid.UUID) predicate.Agent {
+	return keysetBeforeCursor(agent.FieldCreated, agent.FieldID, cursorCreated, cursorID)
 }
 
 // agentFilterPredicates translates a store.AgentFilter into Ent predicates,
@@ -584,6 +610,25 @@ func agentFilterPredicates(filter store.AgentFilter) ([]predicate.Agent, error) 
 	}
 	for k, v := range filter.Labels {
 		preds = append(preds, labelContains(k, v))
+	}
+
+	// AuthorizedProjectIDs: scope-aware authorization filter applied at the SQL
+	// level so pagination and totals reflect only the authorized set.
+	// Fail-closed: if all IDs fail UUID parsing, match nothing rather than
+	// omitting the predicate (which would return all agents).
+	if filter.AuthorizedProjectIDs != nil {
+		if len(filter.AuthorizedProjectIDs) == 0 {
+			// Empty authorized set: no agents visible.
+			preds = append(preds, agent.ProjectIDEQ(uuid.Nil))
+		} else {
+			projectUIDs := parseUUIDList(filter.AuthorizedProjectIDs)
+			if len(projectUIDs) > 0 {
+				preds = append(preds, agent.ProjectIDIn(projectUIDs...))
+			} else {
+				// All IDs failed UUID parsing: fail closed — no agents visible.
+				preds = append(preds, agent.ProjectIDEQ(uuid.Nil))
+			}
+		}
 	}
 
 	// Exclude soft-deleted agents unless explicitly requested.
@@ -692,6 +737,8 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 			upd.SetMessage("")
 		}
 		upd.SetStalledFromActivity("")
+		upd.ClearExitCode()
+		upd.SetExitReason("")
 	}
 
 	if su.Message != "" {
@@ -702,6 +749,12 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 	}
 	if su.ContainerStatus != "" {
 		upd.SetContainerStatus(su.ContainerStatus)
+	}
+	if su.ExitCode != nil {
+		upd.SetExitCode(*su.ExitCode)
+	}
+	if su.ExitReason != "" {
+		upd.SetExitReason(su.ExitReason)
 	}
 	if su.RuntimeState != "" {
 		upd.SetRuntimeState(su.RuntimeState)

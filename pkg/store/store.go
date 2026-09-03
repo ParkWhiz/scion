@@ -28,7 +28,40 @@ var (
 	ErrVersionConflict  = errors.New("version conflict")
 	ErrInvalidInput     = errors.New("invalid input")
 	ErrRevisionConflict = errors.New("revision conflict")
+	ErrQuotaExceeded    = errors.New("quota exceeded")
+
+	// ErrSuperAdminBindingRestricted is returned when a non-reconciler caller
+	// attempts to create a role binding for the super-admin role definition.
+	// Super-admin authority is conferred exclusively via User.Role (out-of-band)
+	// and the system reconciler; the F1.5 role-binding machinery must not be a
+	// second grant path.
+	ErrSuperAdminBindingRestricted = errors.New("super-admin role bindings can only be created by the system reconciler")
+
+	// ErrDirectUserOnly is returned when a role binding for a direct-user-only
+	// role (super-admin, project-owner) is attempted with a non-user principal.
+	ErrDirectUserOnly = errors.New("this role requires a direct user principal")
+
+	// ErrScopeMismatch is returned when a role binding's scope type does not
+	// match the role definition's scope type.
+	ErrScopeMismatch = errors.New("binding scope type does not match role definition scope type")
 )
+
+// SystemReconcileCreatedBy is the CreatedBy sentinel that identifies the
+// system reconciler as the caller of CreateRoleBinding. Only bindings
+// with this CreatedBy value (or SystemBackfillCreatedBy) may target the
+// super-admin role definition.
+const SystemReconcileCreatedBy = "system-reconcile"
+
+// SystemBackfillCreatedBy is the CreatedBy sentinel for the one-time
+// startup backfill that migrates existing User.Role values into role bindings.
+const SystemBackfillCreatedBy = "system-backfill"
+
+// IsSuperAdminBindingAllowed reports whether the given CreatedBy value is
+// permitted to create a super-admin role binding. Only the system reconciler
+// and the startup backfill are allowed.
+func IsSuperAdminBindingAllowed(createdBy string) bool {
+	return createdBy == SystemReconcileCreatedBy || createdBy == SystemBackfillCreatedBy
+}
 
 // Store defines the interface for Hub data persistence.
 // Implementations may use SQLite, PostgreSQL, Firestore, or other backends.
@@ -74,9 +107,6 @@ type Store interface {
 
 	// Group operations (Hub Permissions System)
 	GroupStore
-
-	// Policy operations (Hub Permissions System)
-	PolicyStore
 
 	// User Access Token operations
 	UserAccessTokenStore
@@ -134,6 +164,30 @@ type Store interface {
 
 	// AgentSessionMetrics operations (Hub Metrics Reporting)
 	AgentSessionMetricsStore
+
+	// Conversation operations (Multi-Party Messaging)
+	ConversationStore
+
+	// Role operations (Permissions Foundation Phase 1E)
+	RoleStore
+
+	// Delegation Edge operations (Permissions Foundation Phase 1G)
+	DelegationEdgeStore
+
+	// Agent Credential operations (Permissions Foundation Phase 1H)
+	AgentCredentialStore
+
+	// Decision Audit operations (Authorization Decision Audit Phase 1I)
+	DecisionAuditStore
+
+	// Mutation Audit operations (Authorization Mutation Audit Phase 1I)
+	MutationAuditStore
+
+	// Quota operations (Permissions Phase 2B — Limits/Quotas)
+	QuotaStore
+
+	// Access Constraint operations (AC1 — Operator Access Constraint Backend)
+	AccessConstraintStore
 }
 
 // AgentStore defines agent-related persistence operations.
@@ -246,6 +300,13 @@ type AgentFilter struct {
 	// Labels, when non-empty, restricts results to agents whose labels
 	// contain all specified key-value pairs (AND semantics).
 	Labels map[string]string
+
+	// AuthorizedProjectIDs, when non-nil, restricts results to agents whose
+	// project_id is in this set. This is used by scope-aware list authorization
+	// to push the resolved ScopeSet into the SQL query so pagination and totals
+	// reflect only the authorized set. A nil value means no authorization
+	// filtering. An empty non-nil slice means no agents are authorized.
+	AuthorizedProjectIDs []string
 }
 
 // AgentHealthAggregate holds pre-computed counts and short lists used by the
@@ -288,7 +349,8 @@ type AgentStatusUpdate struct {
 	StartedAt         string `json:"startedAt,omitempty"`
 
 	// Exit tracking
-	ExitCode *int `json:"exitCode,omitempty"`
+	ExitCode   *int   `json:"exitCode,omitempty"`
+	ExitReason string `json:"exitReason,omitempty"`
 }
 
 // ProjectStore defines project-related persistence operations.
@@ -334,7 +396,6 @@ type ProjectStore interface {
 // ProjectFilter defines criteria for filtering projects.
 type ProjectFilter struct {
 	OwnerID         string
-	Visibility      string
 	GitRemotePrefix string
 	GitRemote       string // Filter by exact git remote (case-sensitive)
 	BrokerID        string // Filter by contributing broker
@@ -360,6 +421,14 @@ type ProjectFilter struct {
 	// (true) or non-template projects (false). Template projects carry the
 	// scion.io/template: "true" label.
 	IsTemplate *bool
+
+	// AuthorizedProjectIDs, when non-nil, restricts results to projects whose
+	// ID is in this set. This is used by scope-aware list authorization to push
+	// the resolved ScopeSet into the SQL query so pagination and totals reflect
+	// only the authorized set. A nil value means no authorization filtering
+	// (caller has admin view or filtering is handled elsewhere). An empty non-nil
+	// slice means no projects are authorized — the query returns zero results.
+	AuthorizedProjectIDs []string
 }
 
 // RuntimeBrokerStore defines runtime broker persistence operations.
@@ -745,6 +814,11 @@ type SecretStore interface {
 	// Returns ErrNotFound if the secret doesn't exist.
 	GetSecretValue(ctx context.Context, key, scope, scopeID string) (encryptedValue string, err error)
 
+	// UpdateSecretMeta updates metadata fields of an existing secret without
+	// modifying the encrypted value. Increments the version automatically.
+	// Returns the updated secret. Returns ErrNotFound if the secret doesn't exist.
+	UpdateSecretMeta(ctx context.Context, key, scope, scopeID string, meta *SecretMetaUpdate) (*Secret, error)
+
 	// ListProgenySecrets returns user-scoped secrets with allowProgeny=true
 	// whose createdBy is in the given set of ancestor IDs.
 	// Note: EncryptedValue is NOT populated in the returned secrets.
@@ -827,10 +901,11 @@ type GroupStore interface {
 	// including the implicit project_agents group and transitive parent groups.
 	GetEffectiveGroupsForAgent(ctx context.Context, agentID string) ([]string, error)
 
-	// CheckDelegatedAccess checks whether an agent's delegation relationship
-	// satisfies the given policy conditions. Returns true if the agent has
-	// delegation enabled, its creator is active, and the conditions match.
-	CheckDelegatedAccess(ctx context.Context, agentID string, conditions *PolicyConditions) (bool, error)
+	// GetParentGroups returns all ancestor groups of the given group —
+	// i.e., groups that transitively contain this group as a child.
+	// Used by delegation checks to compute the full authority inherited
+	// through group membership.
+	GetParentGroups(ctx context.Context, groupID string) ([]string, error)
 
 	// CountGroupMembersByRole counts how many members of a group have the given role.
 	CountGroupMembersByRole(ctx context.Context, groupID, role string) (int, error)
@@ -846,6 +921,7 @@ type GroupFilter struct {
 	ParentID  string // Filter by parent group
 	GroupType string // Filter by group type ("explicit" or "project_agents")
 	ProjectID string // Filter by project ID (for project_agents groups)
+	Search    string // Case-insensitive match on name or slug
 }
 
 // PrincipalRef identifies a principal by type and ID.
@@ -855,54 +931,10 @@ type PrincipalRef struct {
 	ID   string // Principal UUID
 }
 
-// PolicyStore defines policy-related persistence operations.
-type PolicyStore interface {
-	// CreatePolicy creates a new policy record.
-	CreatePolicy(ctx context.Context, policy *Policy) error
-
-	// GetPolicy retrieves a policy by ID.
-	// Returns ErrNotFound if the policy doesn't exist.
-	GetPolicy(ctx context.Context, id string) (*Policy, error)
-
-	// UpdatePolicy updates an existing policy.
-	// Returns ErrNotFound if the policy doesn't exist.
-	UpdatePolicy(ctx context.Context, policy *Policy) error
-
-	// DeletePolicy removes a policy by ID.
-	// Also removes all policy bindings.
-	// Returns ErrNotFound if the policy doesn't exist.
-	DeletePolicy(ctx context.Context, id string) error
-
-	// ListPolicies returns policies matching the filter criteria.
-	ListPolicies(ctx context.Context, filter PolicyFilter, opts ListOptions) (*ListResult[Policy], error)
-
-	// AddPolicyBinding binds a principal (user, group, or agent) to a policy.
-	// Returns ErrAlreadyExists if the binding already exists.
-	AddPolicyBinding(ctx context.Context, binding *PolicyBinding) error
-
-	// RemovePolicyBinding removes a binding from a policy.
-	// Returns ErrNotFound if the binding doesn't exist.
-	RemovePolicyBinding(ctx context.Context, policyID, principalType, principalID string) error
-
-	// GetPolicyBindings returns all bindings for a policy.
-	GetPolicyBindings(ctx context.Context, policyID string) ([]PolicyBinding, error)
-
-	// GetPoliciesForPrincipal returns all policies bound to a specific principal.
-	GetPoliciesForPrincipal(ctx context.Context, principalType, principalID string) ([]Policy, error)
-
-	// GetPoliciesForPrincipals returns all policies bound to any of the given principals.
-	// Results are ordered by scope_type then priority ASC.
-	GetPoliciesForPrincipals(ctx context.Context, principals []PrincipalRef) ([]Policy, error)
-}
-
-// PolicyFilter defines criteria for filtering policies.
-type PolicyFilter struct {
-	Name         string // Filter by policy name
-	ScopeType    string // Filter by scope type (hub, project, resource)
-	ScopeID      string // Filter by scope ID
-	ResourceType string // Filter by resource type
-	Effect       string // Filter by effect (allow, deny)
-}
+// R-5: PolicyStore interface and PolicyFilter removed — CO1 cutover
+// deleted the legacy evaluator and all production Policy reads/writes.
+// Ent schema files (policy.go, policybinding.go) retained for now per
+// brief constraint (schema migration out of scope).
 
 // =============================================================================
 // User Access Tokens (UATs)
@@ -1274,6 +1306,16 @@ type MessageStore interface {
 	// PurgeOldMessages removes read messages older than readCutoff and
 	// unread messages older than unreadCutoff. Returns count removed.
 	PurgeOldMessages(ctx context.Context, readCutoff time.Time, unreadCutoff time.Time) (int, error)
+
+	// SetMessageConversationID updates the conversation_id on an existing
+	// message. Used by the Phase 4 backfill to link legacy messages to
+	// Conversation records. Returns ErrNotFound if the message doesn't exist.
+	SetMessageConversationID(ctx context.Context, messageID, conversationID string) error
+
+	// CountUnbackfilledMessages returns the number of messages with an empty
+	// conversation_id for the given project. When projectID is empty, counts
+	// across all projects.
+	CountUnbackfilledMessages(ctx context.Context, projectID string) (int, error)
 }
 
 // =============================================================================
@@ -1540,4 +1582,398 @@ type AgentSessionMetricsStore interface {
 	// CountDistinctAgentsByProject returns the number of distinct agents with
 	// session metrics in a project.
 	CountDistinctAgentsByProject(ctx context.Context, projectID string) (int, error)
+}
+
+// =============================================================================
+// Conversations (Multi-Party Messaging)
+// =============================================================================
+
+// ConversationStore manages conversation, participant, and addressee persistence.
+type ConversationStore interface {
+	// CreateConversation creates a new conversation.
+	// Returns ErrAlreadyExists if a conversation with the same ID exists.
+	CreateConversation(ctx context.Context, conv *Conversation) error
+
+	// GetConversation retrieves a conversation by ID.
+	// Returns ErrNotFound if the conversation doesn't exist.
+	GetConversation(ctx context.Context, id string) (*Conversation, error)
+
+	// UpdateConversation updates an existing conversation.
+	// Returns ErrNotFound if the conversation doesn't exist.
+	UpdateConversation(ctx context.Context, conv *Conversation) error
+
+	// DeleteConversation soft-deletes a conversation by setting DeletedAt.
+	// Returns ErrNotFound if the conversation doesn't exist.
+	DeleteConversation(ctx context.Context, id string) error
+
+	// ListConversations returns conversations matching the filter.
+	ListConversations(ctx context.Context, filter ConversationFilter, opts ListOptions) (*ListResult[Conversation], error)
+
+	// GetConversationByExternalRef looks up a conversation by (surface, external_ref).
+	// Returns ErrNotFound if no matching active (non-deleted) conversation exists.
+	// This is the read-only counterpart of UpsertConversationByExternalRef.
+	GetConversationByExternalRef(ctx context.Context, surface, externalRef string) (*Conversation, error)
+
+	// UpsertConversationByExternalRef creates or updates a conversation keyed on (surface, external_ref).
+	// This is the idempotent broker-edge operation. Returns the conversation (created or existing).
+	// CRITICAL: this must be safe under concurrent calls — the UNIQUE partial index is the guard.
+	UpsertConversationByExternalRef(ctx context.Context, conv *Conversation) (*Conversation, error)
+
+	// AddParticipant adds a principal to a conversation.
+	// Returns ErrAlreadyExists if the participant already exists.
+	AddParticipant(ctx context.Context, p *ConversationParticipant) error
+
+	// EnsureParticipant ensures a participant row exists. If the participant
+	// already exists (active or soft-removed), the row is left untouched.
+	// Unlike AddParticipant, this does not clear left_at on existing rows.
+	EnsureParticipant(ctx context.Context, p *ConversationParticipant) error
+
+	// RemoveParticipant soft-removes a participant by setting LeftAt.
+	// Returns ErrNotFound if the participant doesn't exist.
+	RemoveParticipant(ctx context.Context, conversationID, principalKind, principalID string) error
+
+	// ListParticipants returns active participants of a conversation (where left_at IS NULL).
+	ListParticipants(ctx context.Context, conversationID string) ([]ConversationParticipant, error)
+
+	// GetConversationsForPrincipal returns conversations a principal participates in (active, left_at IS NULL).
+	GetConversationsForPrincipal(ctx context.Context, principalKind, principalID string) ([]Conversation, error)
+
+	// AddAddressee adds an addressee record to a message.
+	// Returns ErrAlreadyExists if the addressee already exists.
+	AddAddressee(ctx context.Context, a *MessageAddressee) error
+
+	// ListAddressees returns all addressees for a message.
+	ListAddressees(ctx context.Context, messageID string) ([]MessageAddressee, error)
+
+	// UpdateDeliveryState updates the delivery state of an addressee.
+	// Returns ErrNotFound if the addressee doesn't exist.
+	UpdateDeliveryState(ctx context.Context, id string, state string, failureReason *string) error
+}
+
+// =============================================================================
+// Role Definitions and Bindings (Permissions Foundation Phase 1E)
+// =============================================================================
+
+// RoleStore defines role definition and role binding persistence operations.
+type RoleStore interface {
+	// GetRoleDefinition retrieves a role definition by ID.
+	// Returns ErrNotFound if the role definition doesn't exist.
+	GetRoleDefinition(ctx context.Context, id string) (*RoleDefinition, error)
+
+	// GetRoleDefinitionsByIDs retrieves role definitions by a list of IDs.
+	// Missing IDs are silently omitted from the result map.
+	GetRoleDefinitionsByIDs(ctx context.Context, ids []string) (map[string]*RoleDefinition, error)
+
+	// GetRoleDefinitionByName retrieves a role definition by name and scope type.
+	// Returns ErrNotFound if the role definition doesn't exist.
+	GetRoleDefinitionByName(ctx context.Context, name string, scopeType string) (*RoleDefinition, error)
+
+	// ListRoleDefinitions returns all role definitions.
+	ListRoleDefinitions(ctx context.Context) ([]*RoleDefinition, error)
+
+	// CreateRoleDefinition creates a new role definition.
+	// Returns ErrAlreadyExists if a role definition with the same name+scopeType exists.
+	CreateRoleDefinition(ctx context.Context, rd *RoleDefinition) (*RoleDefinition, error)
+
+	// GetRoleBinding retrieves a role binding by ID.
+	// Returns ErrNotFound if the role binding doesn't exist.
+	GetRoleBinding(ctx context.Context, id string) (*RoleBinding, error)
+
+	// ListRoleBindingsForPrincipal returns all role bindings for a given principal.
+	ListRoleBindingsForPrincipal(ctx context.Context, principalType, principalID string) ([]*RoleBinding, error)
+
+	// ListRoleBindingsForPrincipals returns all role bindings matching any of the
+	// given principals, optionally filtered by scope types and scope IDs.
+	// This is the authorization hot-path query: it resolves bindings for the
+	// entire principal closure (direct user + all transitive groups) and applicable
+	// scopes (system + project) in ONE query.
+	//
+	// If scopeTypes is non-empty, only bindings with a matching scope_type are returned.
+	// If scopeIDs is non-empty, only bindings with a matching scope_id are returned.
+	// When scopeIDs is provided, system-scoped bindings (scope_type="system") are
+	// always included regardless of the scope_id values — callers do not need to
+	// pass "" to match system bindings.
+	// Both filters are optional; passing nil/empty returns all scopes.
+	ListRoleBindingsForPrincipals(ctx context.Context, principals []PrincipalRef, scopeTypes []string, scopeIDs []string) ([]*RoleBinding, error)
+
+	// ListRoleBindingsForScope returns all role bindings for a given scope.
+	ListRoleBindingsForScope(ctx context.Context, scopeType, scopeID string) ([]*RoleBinding, error)
+
+	// CreateRoleBinding creates a new role binding.
+	// Returns ErrAlreadyExists if the exact binding already exists.
+	//
+	// Validation enforced:
+	//   - RoleDefinitionID must reference a valid role definition
+	//   - Scope type must match the role definition's scope type
+	//   - PrincipalType must be one of user/agent/group
+	//   - super-admin and project-owner bindings are direct-user-only
+	//   - Duplicate (role, principal, scope) is rejected
+	CreateRoleBinding(ctx context.Context, rb *RoleBinding) (*RoleBinding, error)
+
+	// DeleteRoleBinding deletes a role binding by ID.
+	// Returns ErrNotFound if the role binding doesn't exist.
+	DeleteRoleBinding(ctx context.Context, id string) error
+
+	// DeleteRoleBindingsForPrincipal deletes all role bindings where the given
+	// principal (type + ID) is the bound principal. Used for cascade delete
+	// when a group is deleted — no orphan bindings may remain.
+	DeleteRoleBindingsForPrincipal(ctx context.Context, principalType, principalID string) (int, error)
+
+	// DeleteRoleBindingsForScope deletes all role bindings scoped to the given
+	// scope type and ID. Used for cascade delete when a project is deleted.
+	DeleteRoleBindingsForScope(ctx context.Context, scopeType, scopeID string) (int, error)
+
+	// UpdateRoleDefinition updates an existing role definition.
+	// Returns ErrNotFound if the role definition doesn't exist.
+	UpdateRoleDefinition(ctx context.Context, rd *RoleDefinition) (*RoleDefinition, error)
+
+	// UpdateSystemRoleDefinitionPermissions updates only the permissions list of
+	// a system role definition. Unlike UpdateRoleDefinition, this method allows
+	// modifying system roles and is intended for startup backfill operations.
+	// Returns ErrNotFound if the role definition doesn't exist.
+	UpdateSystemRoleDefinitionPermissions(ctx context.Context, id string, permissions []string) error
+
+	// DeleteRoleDefinition deletes a role definition by ID.
+	// Returns ErrNotFound if the role definition doesn't exist.
+	DeleteRoleDefinition(ctx context.Context, id string) error
+
+	// ListAllRoleBindings returns all role bindings (admin view).
+	// limit and offset control pagination. A limit of 0 defaults to 100.
+	// The maximum allowed limit is 1000.
+	ListAllRoleBindings(ctx context.Context, limit, offset int) ([]*RoleBinding, error)
+
+	// CountAllRoleBindings returns the total number of role bindings.
+	CountAllRoleBindings(ctx context.Context) (int, error)
+
+	// GetProjectMembership returns the project membership for a user in a project.
+	// Returns ErrNotFound if the user is not a member of the project.
+	GetProjectMembership(ctx context.Context, projectID, userID string) (*ProjectMembership, error)
+
+	// ListProjectMembers returns all members of a project via role bindings.
+	ListProjectMembers(ctx context.Context, projectID string) ([]*ProjectMembership, error)
+
+	// IsProjectMember returns true if the user has any project-scoped role binding
+	// for the given project.
+	IsProjectMember(ctx context.Context, projectID, userID string) (bool, error)
+}
+
+// =============================================================================
+// Delegation Edge Store (Permissions Foundation Phase 1G)
+// =============================================================================
+
+// DelegationEdgeStore defines delegation edge persistence operations.
+// Delegation edges record every authority-delegating relationship and are
+// used by the live delegation ceiling to verify ancestor authority at
+// decision time.
+type DelegationEdgeStore interface {
+	// CreateDelegationEdge records a new delegation edge.
+	CreateDelegationEdge(ctx context.Context, edge *DelegationEdge) error
+
+	// GetDelegationEdgesForDelegate returns active delegation edges where
+	// the given principal is the delegate (receiving authority).
+	GetDelegationEdgesForDelegate(ctx context.Context, delegateType, delegateID string) ([]*DelegationEdge, error)
+
+	// GetDelegationEdgesForDelegator returns active delegation edges where
+	// the given principal is the delegator (granting authority).
+	GetDelegationEdgesForDelegator(ctx context.Context, delegatorType, delegatorID string) ([]*DelegationEdge, error)
+
+	// DeactivateDelegationEdge marks an edge as inactive.
+	// Returns ErrNotFound if the edge doesn't exist.
+	DeactivateDelegationEdge(ctx context.Context, edgeID string) error
+}
+
+// =============================================================================
+// Agent Credential Store (Permissions Foundation Phase 1H)
+// =============================================================================
+
+// AgentCredentialStore defines agent credential persistence operations.
+type AgentCredentialStore interface {
+	// CreateAgentCredential records a newly issued agent token.
+	CreateAgentCredential(ctx context.Context, cred *AgentCredential) error
+
+	// GetAgentCredentialByJTIHash looks up a credential by its JTI hash.
+	// Returns ErrNotFound if no credential exists with that hash.
+	GetAgentCredentialByJTIHash(ctx context.Context, jtiHash string) (*AgentCredential, error)
+
+	// RevokeAgentCredential marks a credential as revoked.
+	// Returns ErrNotFound if the credential doesn't exist.
+	RevokeAgentCredential(ctx context.Context, id string, revokedBy string, reason string) error
+
+	// RevokeAgentCredentialsByAgent revokes all active credentials for an agent.
+	// Returns the number of credentials revoked.
+	RevokeAgentCredentialsByAgent(ctx context.Context, agentID string, revokedBy string, reason string) (int, error)
+
+	// UpdateAgentCredentialLastSeen updates the last_seen_at timestamp.
+	UpdateAgentCredentialLastSeen(ctx context.Context, id string, lastSeen time.Time) error
+
+	// PurgeExpiredAgentCredentials removes expired credentials older than cutoff.
+	// Returns the number of credentials purged.
+	PurgeExpiredAgentCredentials(ctx context.Context, cutoff time.Time) (int, error)
+}
+
+// =============================================================================
+// Decision Audit Store (Authorization Decision Audit Phase 1I)
+// =============================================================================
+
+// DecisionAuditStore defines persistence operations for authorization decision audit records.
+type DecisionAuditStore interface {
+	// CreateDecisionAudit stores a new decision audit record.
+	CreateDecisionAudit(ctx context.Context, record *DecisionAuditRecord) error
+
+	// ListDecisionAudits returns decision audit records matching the filter.
+	// Returns (records, total count, error).
+	ListDecisionAudits(ctx context.Context, filter DecisionAuditFilter) ([]*DecisionAuditRecord, int, error)
+
+	// DeleteDecisionAuditsBefore removes decision audit records older than the given time.
+	// Returns the number of records deleted.
+	DeleteDecisionAuditsBefore(ctx context.Context, before time.Time) (int, error)
+}
+
+// =============================================================================
+// Mutation Audit Store (Authorization Mutation Audit Phase 1I)
+// =============================================================================
+
+// MutationAuditStore defines persistence operations for authorization mutation audit records.
+type MutationAuditStore interface {
+	// CreateMutationAudit stores a new mutation audit record.
+	CreateMutationAudit(ctx context.Context, record *MutationAuditRecord) error
+
+	// ListMutationAudits returns mutation audit records matching the filter.
+	// Returns (records, total count, error).
+	ListMutationAudits(ctx context.Context, filter MutationAuditFilter) ([]*MutationAuditRecord, int, error)
+
+	// DeleteMutationAuditsBefore removes mutation audit records older than the given time.
+	// Returns the number of records deleted.
+	DeleteMutationAuditsBefore(ctx context.Context, before time.Time) (int, error)
+}
+
+// =============================================================================
+// Quota Store (Permissions Phase 2B — Limits/Quotas)
+// =============================================================================
+
+// QuotaStore defines limit and quota persistence operations (Permissions Phase 2B).
+type QuotaStore interface {
+	// Limit definitions
+	// CreateLimitDefinition creates a new limit definition.
+	// Returns ErrAlreadyExists if a definition with the same name exists.
+	CreateLimitDefinition(ctx context.Context, def *LimitDefinition) (*LimitDefinition, error)
+
+	// GetLimitDefinition retrieves a limit definition by ID.
+	// Returns ErrNotFound if the definition doesn't exist.
+	GetLimitDefinition(ctx context.Context, id string) (*LimitDefinition, error)
+
+	// GetLimitDefinitionByName retrieves a limit definition by name.
+	// Returns ErrNotFound if the definition doesn't exist.
+	GetLimitDefinitionByName(ctx context.Context, name string) (*LimitDefinition, error)
+
+	// ListLimitDefinitions returns all limit definitions.
+	ListLimitDefinitions(ctx context.Context) ([]*LimitDefinition, error)
+
+	// UpdateLimitDefinition updates an existing limit definition.
+	// Returns ErrNotFound if the definition doesn't exist.
+	UpdateLimitDefinition(ctx context.Context, def *LimitDefinition) (*LimitDefinition, error)
+
+	// DeleteLimitDefinition deletes a limit definition by ID.
+	// Returns ErrNotFound if the definition doesn't exist.
+	DeleteLimitDefinition(ctx context.Context, id string) error
+
+	// Entitlement bindings
+	// CreateEntitlementBinding creates a new entitlement binding.
+	// Returns ErrAlreadyExists if the exact binding already exists.
+	CreateEntitlementBinding(ctx context.Context, binding *EntitlementBinding) (*EntitlementBinding, error)
+
+	// GetEntitlementBinding retrieves an entitlement binding by ID.
+	// Returns ErrNotFound if the binding doesn't exist.
+	GetEntitlementBinding(ctx context.Context, id string) (*EntitlementBinding, error)
+
+	// ListEntitlementBindings returns all entitlement bindings for a limit definition.
+	ListEntitlementBindings(ctx context.Context, limitDefinitionID string) ([]*EntitlementBinding, error)
+
+	// ListEntitlementBindingsForSubject returns all entitlement bindings for a given subject.
+	ListEntitlementBindingsForSubject(ctx context.Context, subjectType, subjectID string) ([]*EntitlementBinding, error)
+
+	// UpdateEntitlementBinding updates an existing entitlement binding.
+	// Returns ErrNotFound if the binding doesn't exist.
+	UpdateEntitlementBinding(ctx context.Context, binding *EntitlementBinding) (*EntitlementBinding, error)
+
+	// DeleteEntitlementBinding deletes an entitlement binding by ID.
+	// Returns ErrNotFound if the binding doesn't exist.
+	DeleteEntitlementBinding(ctx context.Context, id string) error
+
+	// Usage reservations
+	// CreateUsageReservation creates a new usage reservation.
+	CreateUsageReservation(ctx context.Context, reservation *UsageReservation) (*UsageReservation, error)
+
+	// CountActiveReservations counts non-released reservations for a specific
+	// limit, subject, and scope. Only reservations with released_at IS NULL are counted.
+	CountActiveReservations(ctx context.Context, limitDefinitionID, subjectID, scopeType, scopeID string) (int64, error)
+
+	// ReleaseReservation releases a reservation by setting released_at.
+	// The record is retained for auditing. Matches on limit_definition_id and resource_id.
+	ReleaseReservation(ctx context.Context, limitDefinitionID, resourceID string) error
+
+	// ReleaseReservationsByResource releases all reservations for a given resource ID.
+	ReleaseReservationsByResource(ctx context.Context, resourceID string) error
+
+	// ListActiveReservations returns active (non-released) reservations for a limit and scope.
+	ListActiveReservations(ctx context.Context, limitDefinitionID, scopeType, scopeID string) ([]*UsageReservation, error)
+}
+
+// =============================================================================
+// Access Constraint Store (AC1 — Operator Access Constraint Backend)
+// =============================================================================
+
+// AccessConstraintStore defines persistence operations for access constraints.
+type AccessConstraintStore interface {
+	// CreateAccessConstraint creates a new access constraint.
+	// Returns ErrAlreadyExists if a constraint with the same name and scope exists.
+	// Sets revision=1 on insert.
+	CreateAccessConstraint(ctx context.Context, c *AccessConstraint) (*AccessConstraint, error)
+
+	// GetAccessConstraint retrieves an access constraint by ID.
+	// Returns ErrNotFound if the constraint doesn't exist.
+	GetAccessConstraint(ctx context.Context, id string) (*AccessConstraint, error)
+
+	// UpdateAccessConstraint updates an existing access constraint.
+	// Returns ErrNotFound if the constraint doesn't exist.
+	// Increments revision atomically. If expectedRevision > 0, returns
+	// ErrRevisionConflict if the stored revision differs (optimistic concurrency).
+	UpdateAccessConstraint(ctx context.Context, c *AccessConstraint, expectedRevision int64) (*AccessConstraint, error)
+
+	// DeleteAccessConstraint deletes an access constraint by ID.
+	// Returns ErrNotFound if the constraint doesn't exist.
+	DeleteAccessConstraint(ctx context.Context, id string) error
+
+	// ListAccessConstraints returns all access constraints with pagination.
+	// limit of 0 defaults to 100. Maximum allowed limit is 1000.
+	// Kept for callers that page through all constraints (loadAllAccessConstraints).
+	ListAccessConstraints(ctx context.Context, limit, offset int) ([]*AccessConstraint, error)
+
+	// ListAccessConstraintsFiltered returns access constraints with SQL-level
+	// filtering, sorting, and cursor-based pagination.
+	// Returns: items, nextPageToken, totalCount, error.
+	ListAccessConstraintsFiltered(ctx context.Context, opts AccessConstraintListOptions) ([]*AccessConstraint, string, int, error)
+
+	// CountAccessConstraints returns the total number of access constraints.
+	CountAccessConstraints(ctx context.Context) (int, error)
+
+	// ResolveApplicableConstraints returns all constraints that may apply to
+	// the given set of principals and scopes. The caller should further filter
+	// by subject matching and time window evaluation.
+	//
+	// This is a batched lookup: it returns constraints where:
+	// - subject_kind is "all_principals", OR
+	// - subject_kind is "principal" and the principal matches one of the given principals, OR
+	// - subject_kind is "group_closure" and the group matches one of the given principals.
+	//
+	// AND the scope matches one of the given scopes (system matches everything,
+	// project matches the specific project).
+	ResolveApplicableConstraints(ctx context.Context, principals []PrincipalRef, scopeTypes []string, scopeIDs []string) ([]*AccessConstraint, error)
+
+	// ListConstraintsForScope returns all constraints scoped to the given scope.
+	ListConstraintsForScope(ctx context.Context, scopeType, scopeID string) ([]*AccessConstraint, error)
+
+	// DisableAccessConstraint disables a constraint (for offline recovery).
+	// Returns ErrNotFound if the constraint doesn't exist.
+	DisableAccessConstraint(ctx context.Context, id string) error
 }

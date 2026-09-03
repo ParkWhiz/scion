@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -34,6 +35,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/imagecheck"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectcompat"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
@@ -82,7 +84,11 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// Determine the project ID for label-based filtering. In broker/hosted mode
 	// this comes from env injected by the hub dispatcher.
 	projectID := ""
+	agentID := opts.Name
 	if opts.Env != nil {
+		if opts.Env["SCION_AGENT_ID"] != "" {
+			agentID = opts.Env["SCION_AGENT_ID"]
+		}
 		projectID = opts.Env["SCION_PROJECT_ID"]
 		if projectID == "" {
 			projectID = opts.Env["SCION_GROVE_ID"]
@@ -98,8 +104,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			if !matchAgentProject(a, projectName, projectID) {
 				continue
 			}
-			status := strings.ToLower(a.ContainerStatus)
-			isRunning := strings.HasPrefix(status, "up") || status == "running"
+			isRunning := a.Phase == string(state.PhaseRunning)
 			if isRunning {
 				// If a new task is provided, we might want to recreate even if running
 				// but if no task provided, we just return the running one
@@ -134,6 +139,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	}
 	if opts.GitClone != nil {
 		ctx = api.ContextWithGitClone(ctx, opts.GitClone)
+	}
+	if opts.SharedWorkspace {
+		ctx = api.ContextWithSharedWorkspace(ctx)
 	}
 	if opts.HarnessConfigPath != "" {
 		ctx = api.ContextWithHarnessConfigPath(ctx, opts.HarnessConfigPath)
@@ -500,15 +508,34 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			}
 			return nil, fmt.Errorf("auth resolution failed: %w", err)
 		}
+		if resolved == nil {
+			// ResolveAuth returned nil without error — treat as no auth available.
+			if canFallbackToNoAuth() {
+				util.Debugf("auth: resolution returned nil, falling back to no-auth mode")
+				opts.NoAuth = true
+				warnings = append(warnings, "Auth: no credentials found, starting in no-auth mode")
+				goto authDone
+			}
+			return nil, fmt.Errorf("auth resolution returned nil for method %q", auth.SelectedType)
+		}
 		// Keep a copy of the full resolved auth material for secret filtering.
+		// Deep-copy the Files slice so in-place SourcePath clearing below
+		// does not leak into resolvedForSecretFilter.
 		resolvedForSecretFilter := *resolved
+		resolvedForSecretFilter.Files = append([]api.FileMapping(nil), resolved.Files...)
 		if opts.BrokerMode {
-			// File projection is handled by writeFileSecrets() from ResolvedSecrets
-			// at container launch, not by applyResolvedAuth from local paths.
-			resolved.Files = nil
+			// File content projection is handled by writeFileSecrets() from
+			// ResolvedSecrets at container launch (via SCION_STAGED_SECRETS),
+			// not by applyResolvedAuth from local paths. Clear SourcePath so
+			// stageFileSecretFiles won't try to read host files, but preserve
+			// ContainerPath so it can populate file_secret_files in
+			// auth-candidates.json.
+			for i := range resolved.Files {
+				resolved.Files[i].SourcePath = ""
+			}
 		}
 		util.Debugf("auth: resolved — method=%q, envVars=%v, files=%d", resolved.Method, resolved.EnvVars, len(resolved.Files))
-		if err := harness.ValidateAuth(resolved); err != nil {
+		if err := harness.ValidateAuth(resolved, opts.BrokerMode); err != nil {
 			if canFallbackToNoAuth() {
 				util.Debugf("auth: validation failed, falling back to no-auth mode: %v", err)
 				opts.NoAuth = true
@@ -732,22 +759,34 @@ authDone:
 	// rather than relying on an environment variable that goes stale after
 	// token refresh.
 	if token, ok := opts.Env["SCION_AUTH_TOKEN"]; ok && token != "" {
-		scionDir := filepath.Join(agentHome, ".scion")
-		if err := os.MkdirAll(scionDir, 0700); err != nil {
-			util.Debugf("Start: failed to create .scion dir for token file: %v", err)
-		} else {
-			tokenPath := filepath.Join(scionDir, "scion-token")
-			tmp := tokenPath + ".tmp"
-			if err := os.WriteFile(tmp, []byte(token), 0600); err != nil {
-				util.Debugf("Start: failed to write token file: %v", err)
-			} else if err := os.Rename(tmp, tokenPath); err != nil {
-				util.Debugf("Start: failed to rename token file: %v", err)
-				_ = os.Remove(tmp)
-			} else {
-				util.Debugf("Start: wrote agent token to %s", tokenPath)
-			}
-		}
+		// THE DELETE IS FIRST, AND UNCONDITIONAL, ON PURPOSE. #1348.
+		//
+		// opts.Env becomes `--env KEY=VALUE` in the runtime's argv, and that
+		// argv is written to Cloud Logging on every start (#127). The token
+		// must therefore leave opts.Env on EVERY path out of this block,
+		// including the failure paths below -- opts.Env is the caller's map,
+		// and the broker still holds it after Start returns an error.
+		//
+		// Deleting before the write, rather than after it, is what makes that
+		// property structural: there is no path through the rest of this block
+		// that can skip it, so a later edit cannot reintroduce the leak by
+		// adding an early return. Nothing between here and buildAgentEnv reads
+		// the key back -- the only other reference is the resolver at :721,
+		// which is above this block and never runs again in this call.
 		delete(opts.Env, "SCION_AUTH_TOKEN")
+
+		// Refusing to start is deliberate, and it is a choice of an
+		// availability failure over a security one. The tempting fix for a
+		// failed token write is to leave the token in opts.Env as a fallback;
+		// that would put a live credential into the argv above and turn a rare,
+		// loud failure into a silent credential disclosure on a path nobody
+		// watches. All three failure modes mean the agent home is not writable,
+		// which is not a condition an agent can usefully run under anyway: it
+		// would report started and be able to authenticate to nothing, because
+		// NewClient() finds no token in either place and returns nil.
+		if err := writeAgentTokenFile(agentHome, token); err != nil {
+			return nil, fmt.Errorf("cannot start agent %q without a hub credential: %w", opts.Name, err)
+		}
 	}
 
 	// Resolve host networking: when the hub endpoint is localhost or was
@@ -912,20 +951,80 @@ authDone:
 		}
 	}
 
+	workspaceBackendName := ""
+	nfsUID := 0
+	nfsGID := 0
+	nfsPVClaimName := ""
+	nfsSubPath := ""
+	nfsStorageClass := ""
+
+	if settings != nil && settings.Server != nil && settings.Server.WorkspaceStorage != nil {
+		sharingMode := store.SharingModeWorktreePerAgent
+		if opts.SharedWorkspace || opts.GitClone != nil {
+			sharingMode = store.SharingModeSharedPlain
+		}
+		backend := runtime.SelectWorkspaceBackend(settings.Server.WorkspaceStorage, sharingMode)
+		if backend.Name() == "nfs" {
+			sharedDirNames := make([]string, 0, len(effectiveSharedDirs))
+			for _, dir := range effectiveSharedDirs {
+				sharedDirNames = append(sharedDirNames, dir.Name)
+			}
+			resolvedWorkspace, err := backend.Resolve(runtime.ResolveInput{
+				ProjectID:      projectID,
+				AgentID:        agentID,
+				ProjectSlug:    api.Slugify(projectName),
+				Mode:           sharingMode,
+				SharedDirNames: sharedDirNames,
+				ProjectDir:     projectDir,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("resolve workspace backend %q: %w", backend.Name(), err)
+			}
+			mount, err := backend.Realize(runtime.RealizeInput{
+				Resolved:           resolvedWorkspace,
+				ContainerWorkspace: containerWorkspace,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("realize workspace backend %q: %w", backend.Name(), err)
+			}
+
+			workspaceBackendName = backend.Name()
+			if mount.HostPath != "" {
+				effectiveWorkspace = mount.HostPath
+			}
+			if mount.Target != "" {
+				containerWorkspace = mount.Target
+			}
+			nfsPVClaimName = mount.PVClaimName
+			nfsSubPath = mount.SubPath
+			if settings.Server.WorkspaceStorage.NFS != nil {
+				nfsUID = settings.Server.WorkspaceStorage.NFS.UID
+				nfsGID = settings.Server.WorkspaceStorage.NFS.GID
+				nfsStorageClass = settings.Server.WorkspaceStorage.NFS.StorageClass
+			}
+		}
+	}
+
 	runCfg := runtime.RunConfig{
-		Name:               containerName(projectName, opts.Name),
-		Template:           template,
-		UnixUsername:       unixUsername,
-		Image:              resolvedImage,
-		HomeDir:            agentHome,
-		Workspace:          effectiveWorkspace,
-		RepoRoot:           repoRoot,
-		ContainerWorkspace: containerWorkspace,
-		ResolvedAuth:       resolvedAuth,
-		Harness:            h,
-		Project:            projectName,
-		ProjectID:          projectID,
-		TelemetryEnabled:   telemetryEnabled,
+		Name:                 containerName(projectName, opts.Name),
+		Template:             template,
+		UnixUsername:         unixUsername,
+		Image:                resolvedImage,
+		HomeDir:              agentHome,
+		Workspace:            effectiveWorkspace,
+		RepoRoot:             repoRoot,
+		ContainerWorkspace:   containerWorkspace,
+		ResolvedAuth:         resolvedAuth,
+		Harness:              h,
+		Project:              projectName,
+		ProjectID:            projectID,
+		WorkspaceBackendName: workspaceBackendName,
+		NFSUID:               nfsUID,
+		NFSGID:               nfsGID,
+		NFSPVClaimName:       nfsPVClaimName,
+		NFSSubPath:           nfsSubPath,
+		NFSStorageClass:      nfsStorageClass,
+		TelemetryEnabled:     telemetryEnabled,
 		Task: func() string {
 			// When task_flag is set, task is delivered via CommandArgs instead
 			if finalScionCfg != nil && finalScionCfg.TaskFlag != "" {
@@ -1007,6 +1106,7 @@ authDone:
 				"scion.template":       template,
 				"scion.harness_config": harnessConfigName,
 				"scion.harness_auth":   opts.HarnessAuth,
+				"agent_id":             agentID,
 			}
 			for k, v := range projectcompat.ProjectNameLabels(projectName, true) {
 				l[k] = v
@@ -1047,8 +1147,7 @@ authDone:
 		for _, a := range allAgents {
 			if a.ContainerID == id || strings.EqualFold(a.Name, opts.Name) {
 				// Check if the container has already exited
-				containerStatus := strings.ToLower(a.ContainerStatus)
-				if strings.Contains(containerStatus, "exited") || strings.Contains(containerStatus, "dead") {
+				if a.Phase == string(state.PhaseStopped) || a.Phase == string(state.PhaseError) {
 					// Try to get logs for diagnosis
 					logs, _ := m.Runtime.GetLogs(ctx, id)
 					_ = m.Runtime.Delete(ctx, id)
@@ -1079,6 +1178,43 @@ authDone:
 		HarnessAuth:           opts.HarnessAuth,
 		Profile:               profileName,
 	}, nil
+}
+
+// writeAgentTokenFile writes the agent's hub credential to the canonical token
+// file in the agent home, atomically, via a temp file plus rename. Processes
+// inside the container read the file rather than an environment variable, which
+// would go stale after a token refresh.
+//
+// EVERY ERROR NAMES THE OPERATION THAT FAILED AND THE PATH IT FAILED ON, and
+// wraps the underlying *os.PathError. There are three distinct failure modes
+// here with three distinct causes -- an unwritable agent home, a full or
+// read-only filesystem, and a token path occupied by something that is not a
+// regular file -- and a single "failed to prepare agent credentials" would
+// leave an operator with no way to tell them apart. See #1348 and PROTOCOLS.md
+// §5. util.Debugf is deliberately not used for the failures: per #1339, debug
+// output from this subsystem may not emit at all, so a Debugf here is a failure
+// report that can vanish.
+func writeAgentTokenFile(agentHome, token string) error {
+	scionDir := filepath.Join(agentHome, ".scion")
+	if err := os.MkdirAll(scionDir, 0700); err != nil {
+		return fmt.Errorf("create agent token directory %s: %w", scionDir, err)
+	}
+
+	tokenPath := filepath.Join(scionDir, "scion-token")
+	tmp := tokenPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(token), 0600); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("write agent token file %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, tokenPath); err != nil {
+		// Best effort: the temp file holds the credential, so leaving it behind
+		// on a path we are about to abort on is worse than a lost error here.
+		_ = os.Remove(tmp)
+		return fmt.Errorf("install agent token file %s from %s: %w", tokenPath, tmp, err)
+	}
+
+	util.Debugf("Start: wrote agent token to %s", tokenPath)
+	return nil
 }
 
 // detectRepoRoot resolves the git repo root to bind-mount for an agent, or ""

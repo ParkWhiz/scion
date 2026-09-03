@@ -1973,7 +1973,7 @@ func TestHTTPAgentDispatcher_DispatchAgentCreate_PropagatesGitClone(t *testing.T
 			GitClone: &api.GitCloneConfig{
 				URL:    "https://github.com/example/repo.git",
 				Branch: "develop",
-				Depth:  1,
+				Depth:  intPtr(1),
 			},
 		},
 	}
@@ -2000,8 +2000,8 @@ func TestHTTPAgentDispatcher_DispatchAgentCreate_PropagatesGitClone(t *testing.T
 		t.Errorf("expected GitClone Branch 'develop', got '%s'",
 			mockClient.lastCreateReq.Config.GitClone.Branch)
 	}
-	if mockClient.lastCreateReq.Config.GitClone.Depth != 1 {
-		t.Errorf("expected GitClone Depth 1, got %d",
+	if mockClient.lastCreateReq.Config.GitClone.Depth == nil || *mockClient.lastCreateReq.Config.GitClone.Depth != 1 {
+		t.Errorf("expected GitClone Depth 1, got %v",
 			mockClient.lastCreateReq.Config.GitClone.Depth)
 	}
 }
@@ -2267,7 +2267,7 @@ func TestHTTPAgentDispatcher_DispatchAgentCreate_NoProjectSlug_LocalPathProject(
 			GitClone: &api.GitCloneConfig{
 				URL:    "https://github.com/example/local-project.git",
 				Branch: "main",
-				Depth:  1,
+				Depth:  intPtr(1),
 			},
 		},
 	}
@@ -3461,6 +3461,9 @@ func (m *mockSecretBackend) List(ctx context.Context, filter secret.Filter) ([]s
 func (m *mockSecretBackend) GetMeta(ctx context.Context, name, scope, scopeID string) (*secret.SecretMeta, error) {
 	return nil, nil
 }
+func (m *mockSecretBackend) UpdateMeta(ctx context.Context, input *secret.UpdateMetaInput) (*secret.SecretMeta, error) {
+	return nil, nil
+}
 func (m *mockSecretBackend) Resolve(ctx context.Context, userID, projectID, brokerID string, opts *secret.ResolveOpts) ([]secret.SecretWithValue, error) {
 	return m.secrets, nil
 }
@@ -4583,3 +4586,5 @@ func TestDispatchAgentCreate_IncludesHubName(t *testing.T) {
 		t.Errorf("SCION_HUB_NAME = %q, want %q", got, "create-hub")
 	}
 }
+
+func intPtr(i int) *int { return &i }

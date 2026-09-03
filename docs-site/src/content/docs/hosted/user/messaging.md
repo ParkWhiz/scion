@@ -7,6 +7,10 @@ Scion provides a robust messaging system that allows for bidirectional communica
 
 ## The Inbox Tray
 
+:::note[Design Record]
+For an in-depth look at the architecture, semantic contract, and design invariants underlying the Scion messaging system, see the [Conversation Model Design](https://github.com/GoogleCloudPlatform/scion/blob/main/.design/messaging-conversation-model.md) and its companion [Defect Inventory](https://github.com/GoogleCloudPlatform/scion/blob/main/.design/messaging-conversation-model-findings.md) in the project repository.
+:::
+
 In the Web Dashboard, the **Inbox Tray** provides a centralized view of all messages sent by your agents.
 - **Unread Badges:** The top navigation bar displays a badge indicating the number of unread messages across all your agents.
 - **Mark as Read:** You can mark individual messages or all messages as read, helping you keep track of what needs your attention.
@@ -24,6 +28,7 @@ Scion features an interactive, top-level **Native Web Chat** interface in the We
   - **Chat → Dashboard**: Clicking the **Dashboard** icon while in a project chat space (`/chat/space/:id/...` or `/chat/:slug/...`) takes you directly back to that project's detail page (`/projects/:id`).
   - **DMs / General Chat**: If there is no active project context (such as when in Direct Messages or bare `/chat`), the toggle falls back to the top-level dashboard `/`.
 - **Direct Messaging (DMs)**: In addition to collaborative project spaces, the chat interface supports robust 1-on-1 Direct Messages (DMs). This includes both **human-to-human (H2H)** communication between team members and **human-to-agent (H2A)** chats. DMs are structured as a "global pair"—a single, consolidated thread per participant pair.
+  - **DM Promotion to Shared Threads**: When a 1-on-1 Direct Message with an agent develops context useful for the broader team, you can promote the DM conversation into a Shared Space Thread. This atomic operation safely re-keys the messages and streams the transition live to all clients via SSE without a page reload. Use the promotion button located in the DM header.
 - **Members Sidebar, Presence & Typing**: A right-hand members sidebar lists all participants in the active project space or DM. This includes real-time online **presence indicators** (active, away, offline) and live **typing indicators** to show when a team member or agent is actively composing a message.
 - **The Thread Rail & Mobile Swipe Navigation**: A left-hand navigation sidebar lists all active chat spaces, threads, and DMs. On mobile viewports, the rail supports native **swipe gestures** for fluid, app-like drawer navigation.
 - **Chat/Log Toggle**: Located on the main `scion-chat-thread` panel, this toggle lets you switch between a clean, dialogue-focused **Chat** view and a live **Execution Log** stream for that agent.
@@ -128,6 +133,63 @@ scion messages --agent <agent-name>
 scion messages read <message-id>
 ```
 
+### Sending Messages
+
+Use `scion message` to send messages. The preferred addressing form uses `@`:
+
+```bash
+# Send to an agent (preferred form)
+scion message @tech-lead "Please review the auth module."
+
+# Send a global DM to a user by email
+scion message @preston@example.com "Build is green, ready for review."
+
+# Legacy forms (still work but @-form is preferred)
+scion message agent:tech-lead "Please review the auth module."
+
+# Attach a file
+scion message @tech-lead "See the test results." --attach ./results.json
+
+# Set message visibility
+scion message @tech-lead "Debug trace attached." --visibility verbose
+```
+
+### Message Formatting
+
+The `scion message` CLI delivers the body argument **verbatim** — it performs no escape expansion, no markdown rendering, and no character substitution. Whatever bytes you pass are exactly what the recipient sees.
+
+To include newlines, use real newlines inside shell quoted strings or heredocs. Do **not** use JSON-encoded bodies or literal backslash-n (`\n`) sequences — those will appear as literal characters in the delivered message.
+
+**Correct** — real newlines in a quoted string:
+```bash
+scion message --non-interactive @reviewer "PR #42 is ready for review.
+
+Branch: fix/auth-bug
+CI: all green"
+```
+
+**Correct** — heredoc for longer messages:
+```bash
+scion message --non-interactive @reviewer "$(cat <<'EOF'
+PR #42 is ready for review.
+
+Branch: fix/auth-bug
+CI: all green
+EOF
+)"
+```
+
+**Wrong** — JSON-encoded body with literal `\n`:
+```bash
+# BAD: literal \n chars appear in the delivered message
+scion message --non-interactive @reviewer "PR #42 is ready for review.\n\nBranch: fix/auth-bug\nCI: all green"
+```
+
+### Related Commands
+
+- **`scion broadcast`**: Send a message to all agents in the current project, or use `--all` for a global broadcast. This replaces the old `--broadcast` flag on `scion message`.
+- **`scion keys`**: Send raw keystrokes to an agent's tmux terminal (e.g., `scion keys editor "ENTER"`). Useful for unblocking interactive prompts. This replaces the old `--raw` flag on `scion message`.
+
 ## Discord
 
 Scion supports Discord through two separate integration pathways:
@@ -153,6 +215,23 @@ When an agent uses the `ask_user` tool (or similar mechanism depending on the ha
 ## Real-Time Delivery
 
 Messages are delivered in real-time to the Web Dashboard via Server-Sent Events (SSE). The **Messages Tab** on the individual agent detail page provides a real-time stream of all communication with that specific agent.
+
+## Message Authorization & Modes
+
+Every agent is protected by a **Message Mode** that controls which users and other agents can send messages to it. An agent's message mode can be set via the Web Dashboard or via the `set_message_mode` action. The available modes are:
+
+- **Project Mode (Default)**: Any user with the `agent:message` permission in the project can message the agent. Any peer agent in the project (that is not restricted by lineage mode) can also message it. The most permissive mode.
+- **Branch Mode**: Only users in the agent's ancestry chain (its creator and their ancestors), plus the agent's direct parent and child agents, can message it.
+- **Lineage Mode**: Strictly restricts messaging to users in the agent's ancestry chain (its creator and their ancestors). No agent-to-agent messaging is permitted.
+- **None Mode**: Seals the agent from all messaging except system-plane notices. No users and no agents can message a none-mode agent through normal paths.
+
+### Piercing
+Highly privileged users can bypass an agent's message mode restrictions. This is called **piercing**.
+- **Project Owners** can pierce Branch and Lineage modes.
+- **Super-admins** pierce all modes, including None mode.
+Piercing applies only to user identities — it is never inherited by an owner's agents.
+
+The Web Dashboard displays reachability indicators (e.g., whether you can message a specific agent) based on the computed messageability, which takes into account the agent's mode, your ancestry relationship to it, and any piercing privileges.
 
 ---
 
@@ -194,11 +273,24 @@ Write a unit test for the auth package.
 | **`group-set`** | An `@-mention` targeting multiple agents. | Act on it like an `instruction`. |
 | **`system`** | Operational notices generated by the Hub (e.g. `delivery-failed`, `scheduler`, `port-forward`). | Treat as FYI or follow troubleshooting instructions in the notice. |
 
+:::note[Conversation Model Migration]
+The messaging system is transitioning to a conversation-based model where messages carry a `conversation_id` and are addressed to conversations rather than agents directly. During this transition, inbound messages continue to arrive with the `type` fields described above, and agents should continue to discriminate on the `type` field as documented. 
+
+To migrate historical messages that predate the conversation model, administrators can use the `scion server backfill` command.
+
+#### Safe Idempotent Backfilling
+The backfill process is safe and fully idempotent — messages that are already attributed to a conversation are skipped automatically. By default, the backfill runs in a safe **dry-run** mode, allowing operators to preview what would be migrated. The `--execute` flag must be explicitly passed to commit changes to the database.
+
+#### Compound Keyset Resumability (DEF-81)
+If a backfill operation is interrupted, it can be safely resumed from its last page of progress using the `--checkpoint` flag with the cursor printed in the previous run's report.
+The backfill uses a robust **compound keyset cursor** `(created, id)` (rather than a strictly-greater-than timestamp). This eliminates the potential for permanent row loss on resume, ensuring that any messages sharing identical timestamps are correctly processed and never skipped during resumes.
+:::
+
 #### Handling `input-needed` Notifications
 
 When an agent signals `WAITING_FOR_INPUT` (by calling `sciontool status ask_user`), a notification of type `input-needed` is dispatched to all subscribed agents (including its creator).
 
-* **Parent Agent Role**: If you are the parent agent that created the waiting agent, you may be the intended respondent. Use `scion message agent:<name>` to reply with the answer.
+* **Parent Agent Role**: If you are the parent agent that created the waiting agent, you may be the intended respondent. Use `scion message @<name>` to reply with the answer.
 * **Peer Agent Rule**: Unrelated peer agents should **NOT** reply to `input-needed` notifications. Answering a peer's input prompt wastes context tokens, causes false loop signals, and violates project-scoped boundaries. To request a peer's input, always send an explicit `instruction` instead.
 
 :::tip[Project-Scoped Message Isolation]
@@ -215,42 +307,51 @@ When using slug-based query paths or addressing agents via `agent:<name>` (e.g.,
   - **Granular Scopes**: Authorization gates require the agent token to hold the `project:read` scope for reading subscriptions and the `project:agent:notify` scope for writing (creating, updating, or deleting) subscriptions.
   - **Ownership Constraints**: Acknowledging notifications or modifying/deleting existing subscriptions strictly requires ownership validation, meaning an agent can only modify or acknowledge subscriptions that target or belong to itself.
 
-### 4. Sleep Anti-Pattern & Polling
+### 4. Security Controls for Direct Messages & Broadcasts
+
+Scion employs strict, ingress-level security controls and invariants for Direct Messages (DMs) and Broadcasts to prevent spoofing, cross-project injection, and message divergence:
+- **Server-Side Sender Identity & Derivation**: Sender identity is forced server-side based on the authenticated request context, completely ignoring any sender claims in the payload. Furthermore, DM conversation keys are derived dynamically from the authenticated caller rather than trusting the payload, closing spoofed-sender conversation-selection vectors.
+- **Canonical DM Key Enforcement**: Thread IDs (used as DM keys) undergo strict canonicality enforcement. Non-canonical kinds and UUIDs are rejected immediately at derivation without silent normalization, ensuring precise routing.
+- **Participant Guard Consolidation**: A unified participant guard (`CheckDMParticipantKey`) protects all DM ingresses (adding/ensuring participants or merging conversations). This strict invariant guarantees that participant records cannot diverge from their canonical thread keys.
+- **Broadcast Authorization**: Project membership is strictly required and enforced for all broadcast calls.
+- **Publish Gating & Stamping**: Message publishing to real-time streams (SSE) is securely gated on successful database persistence (dual-write conversation stamping). This ensures that a message is never broadcasted to clients without being safely committed to history.
+
+### 5. Sleep Anti-Pattern & Polling
 
 :::danger[Avoid Sleep]
 **Never use the shell `sleep` command to wait for external processes.** Running a blocking `sleep` loop keeps your agent alive but inactive, triggering the Hub's stall detector and leading to an automatic suspend.
 :::
 
-Instead, pair `sciontool status blocked` with a scheduled self-callback using the relative `--in` delay flag:
+Instead, pair `sciontool status blocked` with a scheduled self-callback using `scion schedule create`:
 
 ```bash
 # Correct way to wait 5 minutes for a build to finish:
-scion message --in 5m agent:$(scion whoami --non-interactive --format json | jq -r .name) "Check build status"
+scion schedule create --in 5m --message "Check build status" --agent "$(scion whoami --non-interactive --format json | jq -r .name)"
 sciontool status blocked "Waiting for build job 103"
 ```
 The scheduled message delivers the wake-up poke; `status blocked` tells the platform that your silence is intentional, keeping you from being suspended.
 
-### 5. @mention Parsing & Multi-Recipient CC Fan-Out
+### 6. @mention Parsing & Conversation Addressing
 
-When a human or an agent sends a message, Scion automatically scans for recipient targeting to fan-out notifications. This enables multi-agent notification and collaboration through two distinct mechanisms:
+`@<agent-name>` is now the **preferred addressing form** for sending messages to agents via the CLI (e.g., `scion message @tech-lead "..."`). This form addresses the agent's conversation directly.
+
+When a human or an agent sends a message, Scion automatically scans for recipient targeting to fan-out notifications:
 
 #### Body @mentions
 Any name starting with `@` in the message body (e.g., `@dev-lead`) is automatically parsed. If the name matches an active agent within the same project, Scion generates a secondary message of type `mention` and delivers it to that agent.
 
-#### Comma-Separated Carbon Copy (`--cc`)
-When sending a message via the CLI, you can explicitly designate additional recipients using the `--cc` flag. This flag is **repeatable** and also accepts a **comma-separated list** (with strict empty-value validation):
+#### Multi-Recipient Addressing
+To send to multiple recipients at once, use the `group[...]` addressing form:
 ```bash
-scion message agent:tech-lead "Let's review the deployment strategy" --cc dev-agent,qa-agent --cc another-agent
+scion message "group[tech-lead, dev-agent, qa-agent]" "Let's review the deployment strategy"
 ```
-For each recipient listed in the `--cc` flag, Scion resolves their name against the active project's agents list and dispatches a dedicated notification of type `mention`.
+
+:::caution[Deprecated Flag]
+The `--cc` flag on `scion message` is deprecated and will be removed in a future release. It still works but triggers a deprecation warning. Use `group[...]` addressing or body `@mentions` for multi-recipient delivery instead.
+:::
 
 #### Validation & Integration Rules
-1. **Deduplication**: If an agent is both `@mentioned` inside the body of a message and explicitly named in the `--cc` flag, Scion automatically deduplicates the list so they only receive a single `mention` message.
-2. **Project Scope Restriction**: Mentions are restricted to the parent project boundary. Both body-mentions and `--cc` names can only be resolved and delivered to agents that belong to the *same* project. Unresolved names will result in a warning printed to stderr, but will not fail delivery of the primary message.
-3. **CLI Flag Constraints**:
-   - The `--cc` flag cannot be combined with `--broadcast` or `--all`.
-   - It cannot be combined with `--raw` (raw messaging mode).
-   - It cannot be combined with `--in` or `--at` (delayed/scheduled messaging).
-   - It cannot be used with user recipients (only agent-to-agent mentions are supported).
-   - It requires Hub mode to resolve and fan-out (use `scion hub enable` first if running locally).
+1. **Deduplication**: If an agent is both `@mentioned` inside the body of a message and explicitly addressed as a recipient, Scion automatically deduplicates the list so they only receive a single `mention` message.
+2. **Project Scope Restriction**: Mentions are restricted to the parent project boundary. Body-mentions can only be resolved and delivered to agents that belong to the *same* project. Unresolved names will result in a warning printed to stderr, but will not fail delivery of the primary message.
+3. **Fan-Out Restrictions**: A single message is fanned out to a maximum of **10 recipients** per `@-mention` broadcast.
 

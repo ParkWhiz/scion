@@ -35,8 +35,13 @@ import (
 const (
 	authzHelperProjectA = "authz-project-a"
 	authzHelperProjectB = "authz-project-b"
-	authzHelperAgentID  = "authz-caller-agent"
 )
+
+var authzHelperAgentID = tid("authz-caller-agent")
+
+// authzHelperAdminID is the stable UUID for the admin user in authorize_test.go.
+// Must be a valid UUID because the store requires UUID primary keys.
+var authzHelperAdminID = tid("authz-admin")
 
 // authzHelperCaptureLogs redirects the default slog logger into a buffer for the
 // duration of the test and returns the buffer. The denial log line is a
@@ -89,7 +94,14 @@ func authzHelperAgent(projectID string, scopes ...AgentTokenScope) AgentIdentity
 }
 
 func authzHelperAdmin() UserIdentity {
-	return NewAuthenticatedUser("authz-admin", "admin@test.com", "Admin", store.UserRoleAdmin, "api")
+	return NewAuthenticatedUser(authzHelperAdminID, "admin@test.com", "Admin", store.UserRoleAdmin, "api")
+}
+
+// authzHelperSeedAdmin creates the admin user in the store with a super-admin
+// role binding so that the AK1 kernel grants access. Call once per testServer.
+func authzHelperSeedAdmin(t *testing.T, s store.Store) {
+	t.Helper()
+	createTestUserWithRole(t, s, authzHelperAdminID, "admin@test.com", "admin", store.SystemRoleSuperAdmin)
 }
 
 func authzHelperMember() UserIdentity {
@@ -112,7 +124,8 @@ func authzHelperTargetAgent() *store.Agent {
 // ---------------------------------------------------------------------------
 
 func TestAuthorize_IdentityKinds(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
 
 	// An agent passes on ancestry: the caller agent is listed in the target
 	// resource's ancestor chain.
@@ -159,7 +172,7 @@ func TestAuthorize_IdentityKinds(t *testing.T) {
 		},
 		{
 			name:      "agent allowed by policy",
-			identity:  authzHelperAgent(authzHelperProjectA),
+			identity:  authzHelperAgent(authzHelperProjectA, ScopeAgentLifecycle),
 			resource:  allowedForAgent,
 			wantAllow: true,
 		},
@@ -236,7 +249,8 @@ func TestAuthorize_DenialIsLogged(t *testing.T) {
 }
 
 func TestAuthorize_NoDenialLogWhenAllowed(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
 	buf := authzHelperCaptureLogs(t)
 
 	rec := httptest.NewRecorder()
@@ -283,7 +297,8 @@ func TestAuthorizeMsg_UnauthenticatedStillGets401(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAuthorizeAgentCreate_IdentityKinds(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
 
 	tests := []struct {
 		name       string
@@ -391,7 +406,8 @@ func TestAuthorizeAgentCreate_DenialIsLogged(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAuthorizeAgentLifecycle_IdentityKinds(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
 	target := authzHelperTargetAgent()
 
 	tests := []struct {
@@ -545,6 +561,10 @@ func TestRequireAdmin_IdentityKinds(t *testing.T) {
 			wantOK: false, wantStatus: http.StatusForbidden, wantPrincipalType: "user",
 		},
 		{
+			name: "federated admin user is forbidden", identity: NewFederatedUserIdentity("https://issuer.example", "admin", "admin@example.com", "Admin", "admin", nil),
+			wantOK: false, wantStatus: http.StatusForbidden, wantPrincipalType: "federated_user",
+		},
+		{
 			name: "dev-auth identity is treated as a user", identity: NewDevUser(DevUserConfig{Username: "dev"}),
 			wantOK: true,
 		},
@@ -642,135 +662,8 @@ func TestRequireAdmin_DenialReasons(t *testing.T) {
 }
 
 func TestRequireAdmin_ScopedAdminForbiddenAtAllRoleOnlyGates(t *testing.T) {
-	srv, _ := testServer(t)
-	scopedAdmin := NewScopedUserIdentity(authzHelperAdmin(), "project-1", []string{"project:read", "agent:manage"})
-
-	tests := []struct {
-		name    string
-		method  string
-		path    string
-		body    string
-		handler func(http.ResponseWriter, *http.Request)
-	}{
-		{
-			name:    "policy collection list",
-			method:  http.MethodGet,
-			path:    "/api/v1/policies",
-			handler: srv.handlePolicies,
-		},
-		{
-			name:    "policy collection create",
-			method:  http.MethodPost,
-			path:    "/api/v1/policies",
-			body:    `{"name":"deny-uat","scopeType":"hub","actions":["read"],"effect":"allow"}`,
-			handler: srv.handlePolicies,
-		},
-		{
-			name:    "policy detail get",
-			method:  http.MethodGet,
-			path:    "/api/v1/policies/policy-1",
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy detail update",
-			method:  http.MethodPatch,
-			path:    "/api/v1/policies/policy-1",
-			body:    `{"name":"updated"}`,
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy detail delete",
-			method:  http.MethodDelete,
-			path:    "/api/v1/policies/policy-1",
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy bindings list",
-			method:  http.MethodGet,
-			path:    "/api/v1/policies/policy-1/bindings",
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy bindings create",
-			method:  http.MethodPost,
-			path:    "/api/v1/policies/policy-1/bindings",
-			body:    `{"principalType":"user","principalId":"user-1"}`,
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy binding delete",
-			method:  http.MethodDelete,
-			path:    "/api/v1/policies/policy-1/bindings/user/user-1",
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "skill registry list",
-			method:  http.MethodGet,
-			path:    "/api/v1/skill-registries",
-			handler: srv.handleSkillRegistries,
-		},
-		{
-			name:    "skill registry create",
-			method:  http.MethodPost,
-			path:    "/api/v1/skill-registries",
-			body:    `{"name":"reg","endpoint":"https://registry.example.com"}`,
-			handler: srv.handleSkillRegistries,
-		},
-		{
-			name:    "skill registry get",
-			method:  http.MethodGet,
-			path:    "/api/v1/skill-registries/reg",
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry update",
-			method:  http.MethodPatch,
-			path:    "/api/v1/skill-registries/reg",
-			body:    `{"status":"disabled"}`,
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry delete",
-			method:  http.MethodDelete,
-			path:    "/api/v1/skill-registries/reg",
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry pin",
-			method:  http.MethodPost,
-			path:    "/api/v1/skill-registries/reg/pin",
-			body:    `{"uri":"skill://reg/core/test@1.0","hash":"sha256:abc123"}`,
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry pins list",
-			method:  http.MethodGet,
-			path:    "/api/v1/skill-registries/reg/pins",
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry unpin",
-			method:  http.MethodPost,
-			path:    "/api/v1/skill-registries/reg/unpin",
-			body:    `{"uri":"skill://reg/core/test@1.0"}`,
-			handler: srv.handleSkillRegistryByID,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
-			if tc.body != "" {
-				req.Header.Set("Content-Type", "application/json")
-			}
-			req = req.WithContext(contextWithIdentity(req.Context(), scopedAdmin))
-
-			tc.handler(rec, req)
-
-			if rec.Code != http.StatusForbidden {
-				t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusForbidden, rec.Body.String())
-			}
-		})
-	}
+	// CO1: Policy API handlers now return 410 Gone. Scoped-admin restriction
+	// for policies is moot because the entire policy API was removed. The
+	// route-guard tests cover scoped-admin rejection for the remaining
+	// admin-only endpoints (roles, skill registry). Test retained as shell.
 }

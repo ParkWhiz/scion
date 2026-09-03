@@ -138,6 +138,7 @@ This is the simplest method, relying on standard environment variables to provid
 **Required Sources:**
 - **Claude**: `ANTHROPIC_API_KEY`
 - **Gemini**: `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+- **Antigravity**: `GEMINI_API_KEY` or `GOOGLE_API_KEY` (lowest-priority fallback method)
 - **OpenCode**: `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` (Anthropic preferred)
 - **Codex**: `CODEX_API_KEY` or `OPENAI_API_KEY` (Codex-specific key preferred)
 - **Hermes**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY` (in that order)
@@ -231,6 +232,10 @@ For the Claude harness, Scion automatically translates `GOOGLE_CLOUD_PROJECT` to
 For the Antigravity harness, `vertex-ai` authentication is powered entirely by Google Cloud Application Default Credentials (ADC) plus the Google Cloud project (`GOOGLE_CLOUD_PROJECT`) and location/region (`GOOGLE_CLOUD_LOCATION` or `GOOGLE_CLOUD_REGION`) environment variables, and no longer requires `AGY_TOKEN`. At runtime, Scion sets the `AGY_ADC_AUTH` environment variable to `true` and maps `gcloud-adc` (if uploaded) to `GOOGLE_APPLICATION_CREDENTIALS`. This mode requires AGY CLI >= 1.1.10.
 :::
 
+:::tip[Antigravity API Key Fallback]
+In addition to Vertex AI and OAuth refresh tokens, the Antigravity harness supports direct API Key authentication. Evaluation priority is `vertex-ai` > `oauth-token` > `api-key`. If either `GEMINI_API_KEY` or `GOOGLE_API_KEY` is set and no higher-priority auth is resolved, the provisioner automatically configures `modelProvider: "Gemini"` inside the agent's `settings.json` and authenticates using this key.
+:::
+
 :::caution[Defensive Auth Protection]
 To prevent auth state corruption across container restarts, Scion implements a strict defensive guard rejecting known harness implementation names (e.g., `container-script`) from being stored or written as authentication types into `opts.HarnessAuth` or `scion-agent.json`. This ensures that previous backfill scripts or configurations cannot accidentally pollute the agent's authentication setup and cause self-perpetuating "not logged in" errors on subsequent runs.
 :::
@@ -301,13 +306,13 @@ After logging in interactively inside the agent (via `scion attach` or the termi
 Credential capture supports scoping captured credentials to either the **project** (visible to all agents in the project) or the **user** (personal secrets visible only to your own agents).
 
 *   **In the Web UI**: Clicking the **Capture Auth** button triggers an interactive dialog allowing you to choose between **Project** scope and **User** scope before executing the capture script.
-*   **Via CLI/Script**: The `capture_auth.py` script accepts a `--scope` argument (`project` or `user`). If omitted, it defaults to `project` for backward compatibility:
+*   **Via CLI/Script**: The `capture_auth.py` script defaults to `user` scope with progeny enabled. You can optionally override this with `--scope project` to make the credential available to all users in the project:
     ```bash
-    # Capture credentials to the project scope (default)
+    # Capture credentials to the user scope (default)
     python3 ~/.scion/harness/capture_auth.py
 
-    # Capture credentials to the user scope (personal secret)
-    python3 ~/.scion/harness/capture_auth.py --scope user
+    # Capture credentials to the project scope
+    python3 ~/.scion/harness/capture_auth.py --scope project
     ```
 
 ### How capture works
@@ -316,7 +321,9 @@ The host generates a capture manifest (`inputs/capture-auth-config.json`) from t
 `auth.types.*.required_files` declarations — every credential file the harness can authenticate
 with that has a well-known path. `capture_auth.py` reads that manifest, locates each file the
 harness just wrote, and stores it as a secret by shelling out to
-`sciontool secret set <key> @<file> --type <type> --target <path> --scope <project|user>`.
+`sciontool secret set <key> @<file> --type <type> --target <path> --scope <project|user> --allow-progeny`.
+
+By default, all capture paths use **user scope** with **progeny enabled** (`--allow-progeny`), meaning the credentials are kept private to your user identity but safely passed down to any child agents (progeny) your agent creates.
 
 - **What is captured** — the harness's credential file(s). For example, Codex captures
   `~/.codex/auth.json` as the `CODEX_AUTH` file secret; Gemini captures

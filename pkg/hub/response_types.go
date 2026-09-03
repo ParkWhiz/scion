@@ -25,6 +25,7 @@ import (
 type AgentWithCapabilities struct {
 	store.Agent
 	Cap                 *Capabilities                    `json:"_capabilities,omitempty"`
+	Messageability      interface{}                      `json:"_messageability,omitempty"`
 	ResolvedHarness     string                           `json:"resolvedHarness,omitempty"`
 	HarnessCapabilities *api.HarnessAdvancedCapabilities `json:"harnessCapabilities,omitempty"`
 	CloudLogging        bool                             `json:"cloudLogging,omitempty"`
@@ -36,6 +37,7 @@ func (a AgentWithCapabilities) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
 		AgentAlias
 		Cap                 *Capabilities                    `json:"_capabilities,omitempty"`
+		Messageability      interface{}                      `json:"_messageability,omitempty"`
 		ResolvedHarness     string                           `json:"resolvedHarness,omitempty"`
 		HarnessCapabilities *api.HarnessAdvancedCapabilities `json:"harnessCapabilities,omitempty"`
 		CloudLogging        bool                             `json:"cloudLogging,omitempty"`
@@ -43,6 +45,7 @@ func (a AgentWithCapabilities) MarshalJSON() ([]byte, error) {
 	}{
 		AgentAlias:          AgentAlias(a.Agent),
 		Cap:                 a.Cap,
+		Messageability:      a.Messageability,
 		ResolvedHarness:     a.ResolvedHarness,
 		HarnessCapabilities: a.HarnessCapabilities,
 		CloudLogging:        a.CloudLogging,
@@ -57,6 +60,7 @@ func (a *AgentWithCapabilities) UnmarshalJSON(data []byte) error {
 	}
 	type WrapperFields struct {
 		Cap                 *Capabilities                    `json:"_capabilities,omitempty"`
+		Messageability      *AgentMessageabilityDetail       `json:"_messageability,omitempty"`
 		ResolvedHarness     string                           `json:"resolvedHarness,omitempty"`
 		HarnessCapabilities *api.HarnessAdvancedCapabilities `json:"harnessCapabilities,omitempty"`
 		CloudLogging        bool                             `json:"cloudLogging,omitempty"`
@@ -66,6 +70,7 @@ func (a *AgentWithCapabilities) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	a.Cap = wrapper.Cap
+	a.Messageability = wrapper.Messageability
 	a.ResolvedHarness = wrapper.ResolvedHarness
 	a.HarnessCapabilities = wrapper.HarnessCapabilities
 	a.CloudLogging = wrapper.CloudLogging
@@ -238,52 +243,6 @@ func (u *UserWithCapabilities) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	u.Cap = aux.Cap
-	return nil
-}
-
-// PolicyWithCapabilities wraps a store.Policy with capability annotations.
-type PolicyWithCapabilities struct {
-	store.Policy
-	Cap *Capabilities `json:"_capabilities,omitempty"`
-}
-
-// MarshalJSON implements custom marshaling to avoid shadowing of fields by the embedded store.Policy.
-func (p PolicyWithCapabilities) MarshalJSON() ([]byte, error) {
-	type PolicyAlias store.Policy
-	return json.Marshal(&struct {
-		PolicyAlias
-		Cap     *Capabilities `json:"_capabilities,omitempty"`
-		GroveID string        `json:"groveId,omitempty"`
-	}{
-		PolicyAlias: PolicyAlias(p.Policy),
-		Cap:         p.Cap,
-		// For policies, GroveID is the ScopeID if ScopeType is "project"
-		GroveID: func() string {
-			if p.ScopeType == store.PolicyScopeProject {
-				return p.ScopeID
-			}
-			return ""
-		}(),
-	})
-}
-
-// UnmarshalJSON implements custom unmarshaling to handle embedded store.Policy and legacy fields.
-func (p *PolicyWithCapabilities) UnmarshalJSON(data []byte) error {
-	type PolicyAlias store.Policy
-	aux := &struct {
-		*PolicyAlias
-		Cap     *Capabilities `json:"_capabilities,omitempty"`
-		GroveID string        `json:"groveId,omitempty"`
-	}{
-		PolicyAlias: (*PolicyAlias)(&p.Policy),
-	}
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-	p.Cap = aux.Cap
-	if p.ScopeType == store.PolicyScopeProject && p.ScopeID == "" && aux.GroveID != "" {
-		p.ScopeID = aux.GroveID
-	}
 	return nil
 }
 
