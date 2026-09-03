@@ -1578,7 +1578,7 @@ func TestHandleGitHubWebhook_UnmatchedProjectCommentBack(t *testing.T) {
 	finalComment = commentBody
 	commentMutex.Unlock()
 
-	expectedMsg := "No matching project or grove was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
+	expectedMsg := "No matching project was found in Scion configured with this repository's Git remote. Please ensure the repository is linked to a Scion project."
 	if finalComment != expectedMsg {
 		t.Errorf("expected comment %q, got %q", expectedMsg, finalComment)
 	}
@@ -2896,7 +2896,7 @@ func TestHandleGitHubWebhook_NoAppropriateProjectCommentBack(t *testing.T) {
 	finalComment = commentBody
 	commentMutex.Unlock()
 
-	if !strings.Contains(finalComment, "No appropriate Scion project/grove could be found") || !strings.Contains(finalComment, "my-cool-feature-branch") {
+	if !strings.Contains(finalComment, "No appropriate Scion project could be found") || !strings.Contains(finalComment, "my-cool-feature-branch") {
 		t.Errorf("expected guidance comment containing command info and branch name, got %q", finalComment)
 	}
 }
@@ -3058,7 +3058,7 @@ func TestHandleGitHubWebhook_FallbackToPRReviewComment(t *testing.T) {
 	finalComment = commentBody
 	commentMutex.Unlock()
 
-	if !strings.Contains(finalComment, "No appropriate Scion project/grove could be found") || !strings.Contains(finalComment, "my-cool-feature-branch") {
+	if !strings.Contains(finalComment, "No appropriate Scion project could be found") || !strings.Contains(finalComment, "my-cool-feature-branch") {
 		t.Errorf("expected fallback review comment containing command info and branch name, got %q", finalComment)
 	}
 }
