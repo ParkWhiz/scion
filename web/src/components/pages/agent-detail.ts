@@ -38,6 +38,7 @@ import type {
 } from '../../shared/types.js';
 import {
   can,
+  canLifecycle,
   isTerminalAvailable,
   getAgentDisplayStatus,
   isAgentRunning,
@@ -844,6 +845,28 @@ export class ScionPageAgentDetail extends LitElement {
         });
 
         if (!response.ok) {
+          // If the broker is unreachable (502/503), offer a force-delete fallback.
+          if (response.status === 502 || response.status === 503) {
+            const forceConfirmed = await showConfirm(
+              'Delete failed — the broker may be unreachable. Force delete this agent? This will remove the hub record without notifying the broker.',
+              { title: 'Force Delete', confirmText: 'Force Delete', variant: 'danger' }
+            );
+            if (forceConfirmed) {
+              const forceResponse = await apiFetch(
+                `/api/v1/agents/${this.agentId}?force=true`,
+                { method: 'DELETE' }
+              );
+              if (!forceResponse.ok) {
+                throw new Error(
+                  await extractApiError(forceResponse, 'Failed to force delete agent')
+                );
+              }
+              window.location.href = this.project
+                ? `/projects/${this.project.id}`
+                : '/agents';
+              return;
+            }
+          }
           throw new Error(await extractApiError(response, 'Failed to delete agent'));
         }
 
@@ -1233,7 +1256,7 @@ export class ScionPageAgentDetail extends LitElement {
             : nothing}
           ${isAgentRunning(agent)
             ? html`
-                ${can(agent._capabilities, 'stop')
+                ${canLifecycle(agent._capabilities)
                   ? html`
                       ${agent.harnessCapabilities?.resume?.support !== 'no'
                         ? html`
@@ -1265,7 +1288,7 @@ export class ScionPageAgentDetail extends LitElement {
                   : nothing}
               `
             : agent.phase === 'suspended'
-              ? can(agent._capabilities, 'start')
+              ? canLifecycle(agent._capabilities)
                 ? html`
                     <sl-button
                       variant="success"
@@ -1279,7 +1302,7 @@ export class ScionPageAgentDetail extends LitElement {
                     </sl-button>
                   `
                 : nothing
-              : can(agent._capabilities, 'start')
+              : canLifecycle(agent._capabilities)
                 ? html`
                     <sl-button
                       variant="success"
@@ -1872,10 +1895,10 @@ export class ScionPageAgentDetail extends LitElement {
 
     // Apply the mode change via API
     try {
-      const response = await apiFetch(`/api/v1/agents/${agent.id}/actions`, {
+      const response = await apiFetch(`/api/v1/agents/${agent.id}/set_message_mode`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'set_message_mode', mode: newMode }),
+        body: JSON.stringify({ mode: newMode }),
       });
 
       if (!response.ok) {

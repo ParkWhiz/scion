@@ -214,6 +214,21 @@ func (a *AuthzService) walkDelegationChain(
 					"principal_id", principalID)
 				return true, "no delegation edge (pre-backfill)", nil
 			}
+			// Post-backfill: edge should exist but is missing (agent
+			// created before edges, or edge lost). Read-only operations
+			// are still allowed — the project-scoped read baseline is
+			// authoritative for reads.  Write/mutate operations remain
+			// denied so that a missing edge cannot grant write authority.
+			// This mirrors the store-error fail-open path for reads.
+			if isReadOnlyOperation(req.Action) {
+				if explain != nil {
+					*explain = append(*explain, DecisionStep{
+						Step:   "delegation_ceiling_no_edge_read_allowed",
+						Detail: fmt.Sprintf("no delegation edge for local %s:%s; read-only operation allowed (project read baseline)", principalType, principalID),
+					})
+				}
+				return true, "no delegation edge (post-backfill, read-only allowed)", nil
+			}
 		}
 		if explain != nil {
 			*explain = append(*explain, DecisionStep{
@@ -268,8 +283,16 @@ func (a *AuthzService) walkDelegationChain(
 			})
 		}
 
-		// Resolve the permission ID from the request action and resource.
-		permissionID := resolvePermissionID(req.Resource, req.Action)
+		// Resolve the permission ID. Honour an explicit request permission the
+		// way Decide does: when a caller names the permission, deriving a
+		// different one here silently denies. Agent secret resolution is the
+		// case in point - it asks for project.secret_read, while deriving from
+		// (resource="secret", action="read") produces "secret.read", which is
+		// not in the registry and maps to no agent scope.
+		permissionID := req.Permission
+		if permissionID == "" {
+			permissionID = resolvePermissionID(req.Resource, req.Action)
+		}
 
 		if edge.DelegatorType == store.DelegationPrincipalUser {
 			allowed, reason, err := a.checkUserHoldsPermission(ctx, edge.DelegatorID, permissionID, edge.ScopeType, edge.ScopeID, explain)

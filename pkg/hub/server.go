@@ -523,6 +523,14 @@ type RemoteCreateAgentRequest struct {
 	// If required keys are missing, the broker returns HTTP 202 with env requirements.
 	GatherEnv bool `json:"gatherEnv,omitempty"`
 
+	// AvailableAsNeededKeys lists the target key names of as_needed
+	// environment-type secrets that the Hub filtered out of ResolvedSecrets
+	// but could resolve in a second pass if the broker reports them as needed.
+	// This lets the broker's autodetect consider these keys when selecting
+	// auth type, closing the chicken-and-egg gap where autodetect only sees
+	// already-resolved keys.
+	AvailableAsNeededKeys []string `json:"availableAsNeededKeys,omitempty"`
+
 	// RequiredSecrets contains declared secrets from the template config.
 	// Passed to the broker so it can include them in env-gather requirements.
 	RequiredSecrets []api.RequiredSecret `json:"requiredSecrets,omitempty"`
@@ -731,6 +739,7 @@ type Server struct {
 	maintenance      *MaintenanceState // Runtime maintenance mode state
 	hubID            string            // Unique hub instance ID for secret namespacing
 	instanceID       string            // Unique per-process ID (uuid); affinity key for broker dispatch
+	encryptionKey    []byte            // AES-256 key for encrypting backup secrets; nil disables encryption
 	embeddedBrokerID string            // Broker ID when running in hub+broker combo mode
 	// statelessEmbeddedBroker is true when the embedded broker identity is a
 	// replica-independent API adapter rather than a process-owned control channel.
@@ -783,6 +792,12 @@ type Server struct {
 	previewService      *PreviewService      // B3 preview engine
 	governanceService   *GovernanceService   // B5 transactional governance
 	capabilitiesService *CapabilitiesService // B6 capabilities computation
+
+	// RS1: Bounded domain service for project membership and ownership mutations.
+	membershipService *ProjectMembershipService
+
+	// RS3: Bounded domain service for project deletion.
+	deletionService *ProjectDeletionService
 
 	// Per-sender token-bucket limiter for the chat send paths (#1054).
 	// Set once in New and read without the lock; nil-safe.
@@ -1031,6 +1046,14 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		srv.secretBackend = cfg.SecretBackend
 	}
 
+	// Derive AES-256 encryption key for encrypting signing key backups in
+	// SQLite. This uses the same shared secret as LocalBackend so that values
+	// written by backupSigningKeyToStore are encrypted at rest, closing the
+	// gap where signing key material was stored in cleartext (miller79/scion#5).
+	if cfg.SharedSigningSecret != "" {
+		srv.encryptionKey = secret.DeriveLocalEncryptionKey(cfg.SharedSigningSecret)
+	}
+
 	// Initialize update tracker for HA integration completion detection.
 	srv.updateTracker = newPendingUpdateTracker()
 
@@ -1100,9 +1123,6 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		fp := sha256.Sum256(userTokenService.config.SigningKey)
 		slog.Info("User token service initialized", "key_fingerprint", hex.EncodeToString(fp[:8]))
 	}
-
-	// Initialize user access token service
-	srv.uatService = NewUserAccessTokenService(s, s, s)
 
 	// Initialize invite code service
 	srv.inviteService = NewInviteService(s)
@@ -1189,6 +1209,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 			IssuerURL:               oidcIssuerURL,
 			RequireStableSigningKey: cfg.RequireStableSigningKey,
 			Log:                     logging.Subsystem("hub.oidc"),
+			EncryptionKey:           srv.encryptionKey,
 		})
 		if err != nil {
 			if isGCPBackend || cfg.RequireStableSigningKey {
@@ -1289,6 +1310,32 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Initialize B3-B6 boundary services (preview, governance, capabilities).
 	srv.initBoundaryServices()
 
+	// RS1: Initialize the project membership domain service.
+	srv.membershipService = NewProjectMembershipService(
+		s, srv.authzService,
+		logging.Subsystem("hub.membership"),
+	)
+
+	// RS3: Initialize the project deletion domain service.
+	srv.deletionService = NewProjectDeletionService(
+		s, srv.authzService,
+		logging.Subsystem("hub.project-deletion"),
+	)
+
+	// RS4: Initialize user access token service with authorization, audit, and
+	// transactional support via the bounded domain service pattern.
+	srv.uatService = NewUserAccessTokenService(s, srv.authzService, logging.Subsystem("hub.uat"))
+
+	// RS1 R2-R2: Run one-binding migration before accepting traffic.
+	// Idempotent — safe to re-run on every startup. Consolidates legacy
+	// multi-role bindings (keeps highest authority) so the D4 one-binding
+	// invariant holds before constraint enforcement begins.
+	if err := srv.runMembershipMigration(ctx); err != nil {
+		// Fail closed: if migration fails, the server should not start with
+		// potentially inconsistent binding state.
+		return nil, fmt.Errorf("membership migration failed (fail-closed): %w", err)
+	}
+
 	// Wire the caller-permission checker for agent service-account assignment.
 	//
 	// GCP IAM check mode: read from config, default to "off" (Q1 ruling).
@@ -1378,8 +1425,18 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 
 	// Backfill role bindings from existing User.Role and project group memberships.
 	// Must run after reconcileBuiltInRoles so the role definitions exist.
+	// Members receive hub-member permissions via the canonical Hub Members group,
+	// not via direct role bindings.
 	if err := BackfillRoleBindings(ctx, s); err != nil {
 		slog.Warn("failed to backfill role bindings", "error", err)
+	}
+
+	// Clean up redundant direct user→hub-member system-scope bindings for users
+	// who already have hub-member permissions via the canonical Hub Members group.
+	// Only system-created bindings (system-backfill / system-reconcile sentinels)
+	// are deleted; administrator-created direct bindings are preserved.
+	if err := CleanupRedundantHubMemberBindings(ctx, s); err != nil {
+		slog.Warn("failed to clean up redundant hub-member bindings", "error", err)
 	}
 
 	// Reconcile super-admin bindings: ensure User.Role == "admin" and
@@ -1465,6 +1522,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		ProxyAuthenticator: cfg.ProxyAuth,
 		FederationAuth:     &srv.federationAuth,
 		CredentialStore:    s,
+		UserStore:          s,
 		AuthMode:           cfg.AuthMode,
 		Debug:              cfg.Debug,
 		Logger:             srv.authLog,
@@ -1630,6 +1688,15 @@ func (s *Server) ensureSigningKey(ctx context.Context, keyName string, existingK
 			// migration or generate a new key rather than silently returning nil.
 			slog.Warn("Store contains empty signing key value (secret backend reference row); treating as not found", "key", keyName)
 		} else {
+			// The stored value may be AES-256-GCM encrypted (enc:v1: prefix).
+			// Decrypt transparently; legacy plaintext passes through as-is.
+			if s.encryptionKey != nil {
+				plaintext, _, decErr := secret.DecryptValue(val, s.encryptionKey)
+				if decErr != nil {
+					return nil, fmt.Errorf("failed to decrypt signing key %s from store: %w", keyName, decErr)
+				}
+				val = plaintext
+			}
 			slog.Info("Loaded existing signing key from store", "key", keyName)
 			key, decErr := base64.StdEncoding.DecodeString(val)
 			if decErr != nil {
@@ -1679,6 +1746,15 @@ func (s *Server) ensureSigningKey(ctx context.Context, keyName string, existingK
 				rawVal, legacyErr := s.store.GetSecretValue(ctx, keyName, store.ScopeHub, legacyScopeID)
 				if legacyErr != nil {
 					continue
+				}
+				// Decrypt if the stored value is encrypted.
+				if s.encryptionKey != nil {
+					plaintext, _, decErr := secret.DecryptValue(rawVal, s.encryptionKey)
+					if decErr != nil {
+						slog.Warn("Failed to decrypt legacy signing key from store", "key", keyName, "legacyScopeID", legacyScopeID, "error", decErr)
+						continue
+					}
+					rawVal = plaintext
 				}
 				val = rawVal
 			}
@@ -1843,10 +1919,21 @@ func logSigningKeyFailure(keyType string, err error) {
 // EncryptedValue is updated — the SecretRef is preserved so the UI and other consumers
 // can see that the secret is backed by Secret Manager.
 func (s *Server) backupSigningKeyToStore(ctx context.Context, keyName, encodedValue, hubID string) error {
+	// Encrypt the value before writing to SQLite so that signing key material
+	// is stored at rest under AES-256-GCM, consistent with LocalBackend.Set().
+	valueToStore := encodedValue
+	if s.encryptionKey != nil {
+		encrypted, err := secret.EncryptValue(encodedValue, s.encryptionKey)
+		if err != nil {
+			return fmt.Errorf("encrypting signing key backup: %w", err)
+		}
+		valueToStore = encrypted
+	}
+
 	existing, err := s.store.GetSecret(ctx, keyName, store.ScopeHub, hubID)
 	if err == nil {
 		// Record exists — update value only, preserving SecretRef and other metadata.
-		existing.EncryptedValue = encodedValue
+		existing.EncryptedValue = valueToStore
 		return s.store.UpdateSecret(ctx, existing)
 	}
 	if err != store.ErrNotFound {
@@ -1856,7 +1943,7 @@ func (s *Server) backupSigningKeyToStore(ctx context.Context, keyName, encodedVa
 	sec := &store.Secret{
 		ID:             signingKeySecretID(keyName, hubID),
 		Key:            keyName,
-		EncryptedValue: encodedValue,
+		EncryptedValue: valueToStore,
 		Scope:          store.ScopeHub,
 		ScopeID:        hubID,
 		SecretType:     store.SecretTypeInternal,
@@ -2239,12 +2326,9 @@ func (s *Server) GetUserTokenService() *UserTokenService {
 	return s.userTokenService
 }
 
-// GetUATService returns the user access token service.
-func (s *Server) GetUATService() *UserAccessTokenService {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.uatService
-}
+// RS4/G13: getUATService accessor removed — no production caller exists and
+// an exported accessor would be a latent bypass door around the bounded service.
+// The uatService field is accessed directly within Server methods.
 
 // GetOAuthService returns the OAuth service.
 func (s *Server) GetOAuthService() *OAuthService {
@@ -2861,6 +2945,11 @@ type MessageEventPayload struct {
 
 // messageEventHandler returns an EventHandler that dispatches scheduled messages
 // to agents via the AgentDispatcher.
+//
+// C1 containment: this handler now performs fire-time authorization via
+// authorizeScheduledMessageFire before any dispatch. Scheduled messages are
+// request-derived (not system-plane) and must pass the production
+// authorizeAgentMessage choke point with isSystemPlane=false.
 func (s *Server) messageEventHandler() EventHandler {
 	return func(ctx context.Context, evt store.ScheduledEvent) error {
 		var payload MessageEventPayload
@@ -2901,17 +2990,29 @@ func (s *Server) messageEventHandler() EventHandler {
 		}
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
-				slog.Warn("Scheduler: target agent no longer exists, marking event as failed",
+				slog.Warn("Scheduler: target agent no longer exists",
 					"eventID", evt.ID,
 					"agentName", payload.AgentName,
 					"agent_id", payload.AgentID,
 					"projectID", evt.ProjectID,
 					"message", payload.Message)
-				now := time.Now()
-				_ = s.store.UpdateScheduledEventStatus(ctx, evt.ID, store.ScheduledEventFailed, &now, "target agent deleted")
-				return nil
+				// Return the error — the enclosing scheduler wrapper
+				// (fireEvent / executeSchedule) owns status recording and
+				// will persist the error message on the event.
+				return fmt.Errorf("target agent deleted: agent %q not found in project %q",
+					targetName, evt.ProjectID)
 			}
 			return fmt.Errorf("failed to resolve agent %q: %w", targetName, err)
+		}
+
+		// ---- C1 containment: fire-time authorization ----
+		// Re-resolve the creator identity and authorize the message through
+		// the production choke point (authorizeAgentMessage, isSystemPlane=false).
+		// Denial returns an error — the enclosing scheduler wrapper owns
+		// status recording. No external effect occurs on denial.
+		_, authErr := s.authorizeScheduledMessageFire(ctx, evt, agent)
+		if authErr != nil {
+			return authErr
 		}
 
 		dispatcher := s.GetDispatcher()
@@ -3396,9 +3497,13 @@ func (s *Server) executeSchedule(ctx context.Context, sched store.Schedule, now 
 		cancel()
 	}
 
-	// Update event status
+	// Update event status. If the handler returned an error, record as
+	// failed rather than fired — matches fireEvent semantics (O-R3-1).
 	firedAt := time.Now()
 	status := store.ScheduledEventFired
+	if errMsg != "" {
+		status = store.ScheduledEventFailed
+	}
 	_ = s.store.UpdateScheduledEventStatus(ctx, evt.ID, status, &firedAt, errMsg)
 
 	// Update schedule run state
@@ -3444,6 +3549,7 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	s.scheduler.RegisterEventHandler("message", s.messageEventHandler())
 	s.scheduler.RegisterEventHandler("dispatch_agent", s.dispatchAgentEventHandler())
 	s.scheduler.RegisterRecurringSingleton("schedule-evaluator", 1, store.LockScheduleEvaluator, s.evaluateSchedulesHandler())
+	s.scheduler.RegisterRecurringSingleton("broker-heartbeat-timeout", 5, store.LockBrokerHeartbeatTimeout, s.brokerHeartbeatTimeoutHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-affinity-reap", 5, store.LockBrokerAffinityReap, s.brokerAffinityReapHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-message-sweep", 5, store.LockBrokerMessageSweep, s.brokerMessageSweepHandler())
 	s.scheduler.RegisterRecurringSingleton("exposed-ports-sweep", 5, store.LockExposedPortsSweep, s.exposedPortsSweepHandler())
@@ -3693,6 +3799,133 @@ func (s *Server) Handler() http.Handler {
 	return s.applyMiddleware(s.mux)
 }
 
+// runMembershipMigration runs the RS1 one-binding migration at startup.
+// R2-R2: wired into production startup, runs before route registration.
+// Idempotent — safe to run on every startup. Fails closed on errors.
+func (s *Server) runMembershipMigration(ctx context.Context) error {
+	log := s.projectsLogger()
+	results, err := s.membershipService.MigrateMultiRoleBindings(ctx)
+	if err != nil {
+		return fmt.Errorf("multi-role binding migration: %w", err)
+	}
+
+	var fixed, migErrors int
+	for _, r := range results {
+		if r.Error != nil {
+			migErrors++
+			log.Error("membership migration error",
+				"project_id", r.ProjectID,
+				"principal_id", r.PrincipalID,
+				"error", r.Error)
+		} else if r.DeletedCount > 0 {
+			fixed++
+		}
+	}
+
+	// Fail closed on any errors (R2-R2 requirement). This covers orphaned
+	// role definitions (D-002) and transaction failures. Valid custom
+	// coexistence (one built-in + N custom, or zero built-in + N custom) is
+	// ignored by migration and never produces errors.
+	if migErrors > 0 {
+		return fmt.Errorf("membership migration had %d errors — resolve before accepting traffic", migErrors)
+	}
+
+	if fixed > 0 {
+		log.Info("membership migration complete",
+			"principals_fixed", fixed)
+	} else {
+		log.Debug("membership migration: no duplicates found")
+	}
+
+	// D4 membership-only unique constraint.
+	//
+	// The original D4 partial index blocked ALL second project bindings per
+	// principal, which prevented custom project-scoped roles from coexisting
+	// with built-in membership. Replace it with a narrower constraint that
+	// only enforces "at most one built-in membership role per principal per
+	// project" via the membership_kind column.
+	//
+	// Steps:
+	//  1. Drop the legacy over-broad index if it exists.
+	//  2. Backfill membership_kind='builtin' on existing built-in membership
+	//     bindings (idempotent — only updates NULL rows that match).
+	//  3. Install the new partial unique index on membership_kind IS NOT NULL.
+	//
+	// Fail-closed: abort startup on any DDL/DML failure.
+	dbProvider, ok := s.store.(interface{ DB() *sql.DB })
+	if !ok {
+		return fmt.Errorf("D4 membership index: store does not expose raw DB — cannot install index (fail-closed)")
+	}
+	db := dbProvider.DB()
+	if db == nil {
+		return fmt.Errorf("D4 membership index: raw DB is nil — cannot install index (fail-closed)")
+	}
+
+	// All three steps run in a single transaction so a crash between
+	// steps cannot leave the database without D4 enforcement. Both SQLite
+	// and PostgreSQL support transactional DDL (DROP INDEX, CREATE INDEX)
+	// and DML (UPDATE) within the same transaction.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("D4 membership index: begin transaction failed (fail-closed): %w", err)
+	}
+	// Rollback on any failure; Commit below replaces it on success.
+	defer func() { _ = tx.Rollback() }()
+
+	// Step 1: Drop legacy over-broad D4 index.
+	const dropLegacyIndex = `DROP INDEX IF EXISTS idx_rolebinding_one_per_principal_per_project`
+	if _, err := tx.ExecContext(ctx, dropLegacyIndex); err != nil {
+		return fmt.Errorf("D4 membership index: drop legacy index failed (fail-closed): %w", err)
+	}
+
+	// Step 2: Backfill membership_kind for existing built-in membership bindings.
+	// Uses a correlated subquery against role_definitions to find bindings whose
+	// role name is a built-in membership role. Idempotent.
+	const backfillDML = `UPDATE role_bindings SET membership_kind = 'builtin' ` +
+		`WHERE membership_kind IS NULL ` +
+		`AND scope_type = 'project' ` +
+		`AND role_definition_id IN (` +
+		`  SELECT id FROM role_definitions ` +
+		`  WHERE name IN ('project-owner', 'project-admin', 'project-member')` +
+		`)`
+	res, err := tx.ExecContext(ctx, backfillDML)
+	if err != nil {
+		return fmt.Errorf("D4 membership index: backfill membership_kind failed (fail-closed): %w", err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Info("D4 membership index: backfilled membership_kind", "rows", n)
+	}
+
+	// Step 3: Install the narrower partial unique index.
+	// Only constrains rows where membership_kind IS NOT NULL, allowing
+	// unlimited custom project-scoped role bindings per principal.
+	//
+	// PostgreSQL concurrency note: the application-level pre-check in
+	// CreateRoleBinding provides clean error messages for sequential callers
+	// but cannot guard against concurrent inserts. This partial unique index
+	// is the authoritative concurrency guard — PostgreSQL enforces it at the
+	// MVCC level, rejecting a second built-in membership binding even when
+	// two transactions race. SQLite tests prove the constraint semantics;
+	// see TestCreateRoleBinding_BuiltInMembership_ConcurrentRace for the
+	// closest approximation. A live PostgreSQL acceptance test exercising
+	// concurrent INSERTs against this index should be run during deployment
+	// QA to confirm production-equivalent behavior.
+	const indexDDL = `CREATE UNIQUE INDEX IF NOT EXISTS ` +
+		`idx_rolebinding_one_membership_per_principal_per_project ` +
+		`ON role_bindings (principal_type, principal_id, scope_id) ` +
+		`WHERE membership_kind IS NOT NULL AND scope_type = 'project'`
+	if _, err := tx.ExecContext(ctx, indexDDL); err != nil {
+		return fmt.Errorf("D4 membership index creation failed (fail-closed): %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("D4 membership index: commit failed (fail-closed): %w", err)
+	}
+	log.Info("D4 membership-only unique index installed on role_bindings")
+
+	return nil
+}
+
 // registerRoutes sets up all API routes.
 func (s *Server) registerRoutes() {
 	// Health and metrics endpoints
@@ -3823,6 +4056,9 @@ func (s *Server) registerRoutes() {
 	// Broker plugin inbound message delivery
 	s.mux.HandleFunc("/api/v1/broker/inbound", s.guarded("/api/v1/broker/inbound", s.handleBrokerInbound))
 
+	// Broker plugin callback delivery (interactive card responses, action acks)
+	s.mux.HandleFunc("/api/v1/broker/callback", s.guarded("/api/v1/broker/callback", s.handleBrokerCallback))
+
 	// Broker plugin project listing (fresh list for /setup flows)
 	s.mux.HandleFunc("/api/v1/broker/projects", s.guarded("/api/v1/broker/projects", s.handleBrokerProjects))
 
@@ -3869,6 +4105,8 @@ func (s *Server) registerRoutes() {
 
 	// Role management (PR-C1)
 	s.mux.HandleFunc("/api/v1/admin/roles", s.guarded("/api/v1/admin/roles", s.handleAdminRoles))
+	s.mux.HandleFunc("/api/v1/admin/roles/export", s.guarded("/api/v1/admin/roles/export", s.handleAdminRolesExport))
+	s.mux.HandleFunc("/api/v1/admin/roles/import", s.guarded("/api/v1/admin/roles/import", s.handleAdminRolesImport))
 	s.mux.HandleFunc("/api/v1/admin/roles/", s.guarded("/api/v1/admin/roles/", s.handleAdminRoleByID))
 	s.mux.HandleFunc("/api/v1/admin/role-bindings", s.guarded("/api/v1/admin/role-bindings", s.handleAdminRoleBindings))
 	s.mux.HandleFunc("/api/v1/admin/role-bindings/", s.guarded("/api/v1/admin/role-bindings/", s.handleAdminRoleBindingByID))
@@ -3877,6 +4115,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/access-constraints/", s.guarded("/api/v1/admin/access-constraints/", s.handleAdminAccessConstraintByID))
 	s.mux.HandleFunc("/api/v1/admin/access-constraint-previews", s.guarded("/api/v1/admin/access-constraint-previews", s.handleAdminAccessConstraintPreviews))
 	s.mux.HandleFunc("/api/v1/admin/access-constraint-previews/", s.guarded("/api/v1/admin/access-constraint-previews/", s.handleAdminAccessConstraintPreviews))
+	s.mux.HandleFunc("/api/v1/admin/effective-access", s.guarded("/api/v1/admin/effective-access", s.handleAdminEffectiveAccess))
 
 	// Notification endpoints (user-facing)
 	s.mux.HandleFunc("/api/v1/notifications", s.guarded("/api/v1/notifications", s.handleNotifications))
@@ -3919,15 +4158,23 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/agent/gcp-token", s.guarded("/api/v1/agent/gcp-token", s.handleAgentGCPToken))
 	s.mux.HandleFunc("/api/v1/agent/gcp-identity-token", s.guarded("/api/v1/agent/gcp-identity-token", s.handleAgentGCPIdentityToken))
 
+	// Agent self-service secret fetch (agent token auth)
+	s.mux.HandleFunc("POST /api/v1/agent/secrets", s.guarded("POST /api/v1/agent/secrets", s.handleAgentSecretFetch))
+
 	// Public settings endpoint (no auth required for telemetry default, etc.)
 	s.mux.HandleFunc("/api/v1/settings/public", s.guarded("/api/v1/settings/public", s.handlePublicSettings))
 
-	// GitHub App integration endpoints: declarative guard enforces hub-admin.
-	s.mux.HandleFunc("/api/v1/github-app", s.guarded("/api/v1/github-app", s.handleGitHubApp))
-	s.mux.HandleFunc("/api/v1/github-app/installations", s.guarded("/api/v1/github-app/installations", s.handleGitHubAppInstallations))
-	s.mux.HandleFunc("/api/v1/github-app/installations/", s.guarded("/api/v1/github-app/installations/", s.handleGitHubAppInstallations))
-	s.mux.HandleFunc("/api/v1/github-app/installations/discover", s.guarded("/api/v1/github-app/installations/discover", s.handleGitHubAppDiscover))
-	s.mux.HandleFunc("/api/v1/github-app/sync-permissions", s.guarded("/api/v1/github-app/sync-permissions", s.handleGitHubAppSyncPermissions))
+	// GitHub App integration endpoints: method-aware permission enforcement.
+	// Read operations use hub.github_app.read; mutations use hub.github_app.update.
+	s.mux.HandleFunc("GET /api/v1/github-app", s.guarded("GET /api/v1/github-app", s.handleGetGitHubApp))
+	s.mux.HandleFunc("PUT /api/v1/github-app", s.guarded("PUT /api/v1/github-app", s.handleUpdateGitHubApp))
+	s.mux.HandleFunc("GET /api/v1/github-app/installations", s.guarded("GET /api/v1/github-app/installations", s.handleListGitHubAppInstallations))
+	s.mux.HandleFunc("POST /api/v1/github-app/installations", s.guarded("POST /api/v1/github-app/installations", s.handleCreateGitHubAppInstallation))
+	s.mux.HandleFunc("GET /api/v1/github-app/installations/", s.guarded("GET /api/v1/github-app/installations/", s.handleGitHubAppInstallationByIDRead))
+	s.mux.HandleFunc("PUT /api/v1/github-app/installations/", s.guarded("PUT /api/v1/github-app/installations/", s.handleGitHubAppInstallationByIDWrite))
+	s.mux.HandleFunc("DELETE /api/v1/github-app/installations/", s.guarded("DELETE /api/v1/github-app/installations/", s.handleGitHubAppInstallationByIDWrite))
+	s.mux.HandleFunc("POST /api/v1/github-app/installations/discover", s.guarded("POST /api/v1/github-app/installations/discover", s.handleGitHubAppDiscover))
+	s.mux.HandleFunc("POST /api/v1/github-app/sync-permissions", s.guarded("POST /api/v1/github-app/sync-permissions", s.handleGitHubAppSyncPermissions))
 
 	// Telegram account linking endpoints
 	s.mux.HandleFunc("/api/v1/telegram/link", s.guarded("/api/v1/telegram/link", s.handleTelegramLink))

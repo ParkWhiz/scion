@@ -169,6 +169,30 @@ func runInit(args []string) int {
 		_ = os.Unsetenv(stagedsecrets.EnvVar)
 		log.Info("Staged %d file secret(s) and %d variable secret(s)",
 			len(staged.FileSecrets), len(staged.VariableSecrets))
+
+		// Re-exec to purge SCION_STAGED_SECRETS from /proc/1/environ.
+		//
+		// os.Unsetenv removes the variable from Go's in-process copy, but
+		// /proc/<pid>/environ is populated by the kernel from the execve(2)
+		// environment and is never updated afterward. In rootless and keep-id
+		// modes the child process shares a UID with PID 1 and can read
+		// /proc/1/environ, exposing the raw secret blob for the lifetime of
+		// the container.
+		//
+		// Re-execing with the cleaned os.Environ() causes a fresh execve(2),
+		// which replaces the kernel's copy. On the second exec the env var is
+		// absent, so the if-block above is skipped and init continues normally.
+		//
+		// All setup that ran before this point (StartReaper, setupHostUser,
+		// log.Chown) is either superseded by the new process image or
+		// idempotent on the second pass.
+		//
+		// See: miller79/scion#7
+		if err := reExecWithCleanEnv(); err != nil {
+			log.Error("Re-exec to clear /proc environ failed: %v (secret remains in /proc)", err)
+			// Fall through — child-process inheritance is still blocked by
+			// os.Unsetenv, so this degrades to the pre-fix behavior.
+		}
 	}
 
 	// Start telemetry pipeline if configured. This must happen after
@@ -1237,6 +1261,30 @@ func extractChildCommand(args []string) []string {
 	return args
 }
 
+// reExecWithCleanEnv re-execs the current process so that the kernel's
+// /proc/<pid>/environ reflects the current (cleaned) environment. This is
+// the only reliable way to remove a variable from /proc/<pid>/environ
+// because the kernel populates that file from the execve(2) arguments and
+// never updates it afterward.
+//
+// On success this function does not return (the process image is replaced).
+// On failure it returns an error and the caller should continue — the
+// in-process environment is already clean, only /proc exposure remains.
+func reExecWithCleanEnv() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve executable: %w", err)
+	}
+	// Resolve symlinks (/proc/self/exe → real path) because some kernels
+	// require the execve target to be a regular file, not a symlink.
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return fmt.Errorf("resolve symlinks: %w", err)
+	}
+	log.Info("Re-execing to clear staged secrets from /proc/%d/environ", os.Getpid())
+	return syscall.Exec(exe, os.Args, os.Environ())
+}
+
 // setupHostUser modifies the scion user's UID/GID to match the host user.
 // This is only done when running as root and SCION_HOST_UID/GID are set.
 // Returns the target UID/GID for the child process (0 = no change) and a
@@ -1280,6 +1328,16 @@ func setupHostUser() (int, int, bool) {
 		}
 		log.Debug("Not running as root, skipping user setup")
 		return 0, 0, false
+	}
+
+	// Safety net: detect restricted capability environments (e.g. gVisor
+	// sandboxes on Cloud Run) where CAP_SETUID is absent. In these
+	// environments, setuid/setgid syscalls return EPERM. Fall back to
+	// rootless-equivalent mode: no privilege drop, no usermod.
+	if !hasCapSetUID() {
+		log.Info("Running as root but CAP_SETUID is absent (restricted sandbox); " +
+			"skipping privilege operations — process will remain UID 0")
+		return 0, 0, true
 	}
 
 	hostUID := os.Getenv("SCION_HOST_UID")
@@ -2160,4 +2218,32 @@ func cleanGcloudConfigForMetadata(gcloudDir string) {
 			log.Debug("Could not remove gcloud config entry %s: %v", p, err)
 		}
 	}
+}
+
+// hasCapSetUID checks whether the current process has CAP_SETUID (bit 7)
+// in its effective capability set by reading /proc/self/status.
+// Returns true if the capability is present, false if absent or on error
+// (safe default: assume restricted, skip privilege operations).
+func hasCapSetUID() bool {
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return false
+	}
+	return parseCapSetUID(string(data))
+}
+
+// parseCapSetUID parses the content of /proc/self/status and returns true
+// if CAP_SETUID (bit 7) is present in the effective capability set.
+func parseCapSetUID(statusContent string) bool {
+	for _, line := range strings.Split(statusContent, "\n") {
+		if strings.HasPrefix(line, "CapEff:") {
+			hexStr := strings.TrimSpace(strings.TrimPrefix(line, "CapEff:"))
+			caps, err := strconv.ParseUint(hexStr, 16, 64)
+			if err != nil {
+				return false
+			}
+			return caps&(1<<7) != 0 // CAP_SETUID = bit 7
+		}
+	}
+	return false
 }

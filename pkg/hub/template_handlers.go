@@ -220,6 +220,17 @@ func (s *Server) listTemplatesV2(w http.ResponseWriter, r *http.Request) {
 			Permission: "template.list",
 		}).Allowed
 	}
+	// Agents with project:read scope can discover all templates.
+	// Global templates are parentless resources that cannot match
+	// project-scoped agent bindings in AuthorizeReadBatch, so agents
+	// would see zero results without this bypass. The agent's read
+	// access was already verified by checkAgentReadScope above.
+	// Individual template GET is separately gated (PR #1494).
+	if !hasAdminView {
+		if agentIdent, ok := identity.(AgentIdentity); ok && agentIdent.HasScope(ScopeProjectRead) {
+			hasAdminView = true
+		}
+	}
 	if identity != nil && !hasAdminView {
 		result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.Template], error) {
 			page, err := s.store.ListTemplates(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
@@ -281,6 +292,18 @@ func (s *Server) createTemplateV2(w http.ResponseWriter, r *http.Request) {
 	scopeID := req.ScopeID
 	if scopeID == "" && req.ProjectID != "" {
 		scopeID = req.ProjectID
+	}
+
+	// SECURITY-GATE: require template.create permission before any mutation.
+	// Scope-aware: project-scoped requests authorize against the project parent
+	// so that project-level role bindings (owner/admin/member) grant access.
+	res := Resource{Type: "template"}
+	if scopeID != "" {
+		res.ParentType = "project"
+		res.ParentID = scopeID
+	}
+	if !s.authorize(w, r, res, ActionCreate) {
+		return
 	}
 
 	// Generate slug from request or name — always sanitize caller-supplied
@@ -457,6 +480,19 @@ func (s *Server) getTemplateV2(w http.ResponseWriter, r *http.Request, id string
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+
+	// Authenticated runtime brokers read templates during agent creation
+	// (template hydration). They pass HMAC auth via middleware but are not
+	// user principals, so the authorization kernel cannot evaluate them.
+	// Allow read access for brokers; the HMAC credential is the trust basis.
+	if GetBrokerIdentityFromContext(ctx) == nil {
+		// SECURITY-GATE: authorize read access to this specific template.
+		// The list endpoint filters via AuthorizeReadBatch; without this check
+		// a caller could bypass list filtering by addressing the template by ID.
+		if !s.authorize(w, r, templateResource(template), ActionRead) {
+			return
+		}
 	}
 
 	resp := TemplateWithCapabilities{Template: *template}

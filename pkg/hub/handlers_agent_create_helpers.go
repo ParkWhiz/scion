@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
@@ -1063,6 +1064,25 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 		return "", store.ErrNotFound
 	}
 
+	// Case 2.5: Hub-level default broker (from hub operational agent_defaults).
+	// Used when the project has no default broker set. The hub default must be a
+	// provider for this project and must be online and dispatchable.
+	if hubDefault := s.hubAgentDefaults().DefaultRuntimeBroker; hubDefault != "" {
+		for _, h := range availableBrokers {
+			if h.ID == hubDefault || strings.EqualFold(h.Name, hubDefault) || strings.EqualFold(h.Slug, hubDefault) {
+				if s.canDispatchToBroker(ctx, &h) {
+					slog.Info("Using hub-level default runtime broker",
+						"broker", h.Name, "brokerID", h.ID, "project_id", project.ID)
+					return h.ID, nil
+				}
+				break
+			}
+		}
+		// Hub default is set but not available/dispatchable for this project — fall through.
+		slog.Debug("Hub-level default broker not available for project, falling through to auto-select",
+			"hubDefault", hubDefault, "project_id", project.ID)
+	}
+
 	// Case 3: No default and no explicit broker - auto-select only when there is
 	// exactly one provider and its broker is online and dispatchable.
 	if len(allProviders) == 1 {
@@ -1207,6 +1227,17 @@ func (s *Server) findBrokerByIDOrSlug(ctx context.Context, identifier string) (*
 	return nil, store.ErrNotFound
 }
 
+// agentHasGCPIdentityAssigned returns true when the agent's own GCPIdentity
+// config has MetadataMode set to assign or passthrough, mirroring the broker's
+// check at pkg/runtimebroker/handlers.go:2186-2187.
+func agentHasGCPIdentityAssigned(agent *store.Agent) bool {
+	if agent == nil || agent.AppliedConfig == nil || agent.AppliedConfig.GCPIdentity == nil {
+		return false
+	}
+	mode := agent.AppliedConfig.GCPIdentity.MetadataMode
+	return mode == store.GCPMetadataModeAssign || mode == store.GCPMetadataModePassthrough
+}
+
 // hasRequiredAuthCredentials checks whether the required auth environment
 // variables and file secrets for the given harness type are available in the
 // agent's env, or in the hub's env/secret stores (user and project scopes).
@@ -1224,6 +1255,9 @@ func (s *Server) hasRequiredAuthCredentials(ctx context.Context, agent *store.Ag
 		gcpSAAssigned, err := s.projectHasVerifiedGCPSA(ctx, agent.ProjectID)
 		if err != nil {
 			return false, err
+		}
+		if !gcpSAAssigned {
+			gcpSAAssigned = agentHasGCPIdentityAssigned(agent)
 		}
 		for authType := range authMeta.Types {
 			satisfied, err := s.isAuthTypeSatisfied(ctx, agent, authMeta, authType, gcpSAAssigned)
@@ -1257,6 +1291,9 @@ func (s *Server) hasRequiredAuthCredentials(ctx context.Context, agent *store.Ag
 		gcpSAAssigned, err := s.projectHasVerifiedGCPSA(ctx, agent.ProjectID)
 		if err != nil {
 			return false, err
+		}
+		if !gcpSAAssigned {
+			gcpSAAssigned = agentHasGCPIdentityAssigned(agent)
 		}
 		fileSecrets := harness.RequiredAuthSecretsFromConfig(authMeta, agent.AppliedConfig.HarnessAuth, gcpSAAssigned)
 		for _, fs := range fileSecrets {

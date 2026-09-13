@@ -31,20 +31,18 @@ assert scion_harness.INTERFACE_VERSION >= 2, (
 
 PROVISION_VERSION = "2026-07-09T01:00:00Z"
 
-FLASH_MODEL = "Gemini 3.7 Flash (Medium)"
+FLASH_MODEL = "Gemini 3.8 Flash (Medium)"
 PRO_MODEL = "Gemini 3.1 Pro (Low)"
 
 
 def _resolve_thinking_tier(level: int) -> str:
-    """Map a thinking level (0-100) to one of AGY's 4 CLI tiers."""
+    """Map a thinking level (0-100) to one of AGY's 3 CLI tiers."""
     level = max(0, min(100, level))
     if level >= 75:
-        return "High"
+        return "high"
     if level >= 50:
-        return "Medium"
-    if level >= 25:
-        return "Low"
-    return "Minimal"
+        return "medium"
+    return "low"
 
 AGY_MCP_MAPPING: dict[str, Any] = {
     "global_config_file": ".gemini/config/mcp_config.json",
@@ -65,7 +63,7 @@ def _get_agy_version() -> tuple[int, ...] | None:
         ).strip()
         parts = out.split(".")
         return tuple(int(p) for p in parts)
-    except (subprocess.SubprocessError, ValueError):
+    except (subprocess.SubprocessError, ValueError, OSError):
         return None
 
 
@@ -492,7 +490,7 @@ print('agy-wrapper: marked enterprise onboarding complete', file=sys.stderr)
 fi
 
 # Exec AGY with all arguments passed through
-exec agy --dangerously-skip-permissions{f' --thinking-level {thinking_tier}' if thinking_tier else ''} "$@"
+exec agy --dangerously-skip-permissions{f' --effort {thinking_tier}' if thinking_tier else ''} "$@"
 """
 
     wrapper_path = os.path.join(home, ".scion", "harness", "agy-wrapper.sh")

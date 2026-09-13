@@ -682,11 +682,11 @@ func TestEnvFor_BasicEnv(t *testing.T) {
 	if env["SCION_HOST_GID"] == "" {
 		t.Error("SCION_HOST_GID not set")
 	}
-	if env["SCION_HOST_UID"] != "1000" {
-		t.Errorf("SCION_HOST_UID = %q, want %q (non-root scion user)", env["SCION_HOST_UID"], "1000")
+	if env["SCION_HOST_UID"] != "0" {
+		t.Errorf("SCION_HOST_UID = %q, want %q (root — CAP_SETUID unavailable in gVisor)", env["SCION_HOST_UID"], "0")
 	}
-	if env["SCION_HOST_GID"] != "1000" {
-		t.Errorf("SCION_HOST_GID = %q, want %q (non-root scion user)", env["SCION_HOST_GID"], "1000")
+	if env["SCION_HOST_GID"] != "0" {
+		t.Errorf("SCION_HOST_GID = %q, want %q (root — CAP_SETGID unavailable in gVisor)", env["SCION_HOST_GID"], "0")
 	}
 }
 
@@ -743,32 +743,33 @@ func TestEnvFor_WorkspaceBackend(t *testing.T) {
 	}
 }
 
-// TestEnvFor_NonRootUID verifies that SCION_HOST_UID and SCION_HOST_GID
-// are always set to the scion user (UID 1000), NOT to os.Getuid(). On
-// Cloud Run the launcher runs as root; passing UID 0 would keep the
-// sandbox process as root, which Claude Code ≥ 2.1.246 rejects.
-func TestEnvFor_NonRootUID(t *testing.T) {
+// TestEnvFor_RootUID verifies that SCION_HOST_UID and SCION_HOST_GID
+// are set to 0 (root). Cloud Run's gVisor sandbox does not grant
+// CAP_SETUID or CAP_SETGID, making runtime privilege drops impossible.
+// Until the sandbox CLI supports --user, the sandbox process must run
+// as root.
+func TestEnvFor_RootUID(t *testing.T) {
 	cfg := RunConfig{}
 	paths := scionPaths{}
 
 	env := envFor(cfg, paths)
 
-	// Must use the scion user's UID/GID (1000), not the process UID.
-	if env["SCION_HOST_UID"] != "1000" {
-		t.Errorf("SCION_HOST_UID = %q, want %q; sandbox must run as non-root scion user",
-			env["SCION_HOST_UID"], "1000")
+	// Must use UID 0 (root) — CAP_SETUID is absent in gVisor.
+	if env["SCION_HOST_UID"] != "0" {
+		t.Errorf("SCION_HOST_UID = %q, want %q; sandbox must run as root (gVisor lacks CAP_SETUID)",
+			env["SCION_HOST_UID"], "0")
 	}
-	if env["SCION_HOST_GID"] != "1000" {
-		t.Errorf("SCION_HOST_GID = %q, want %q; sandbox must run as non-root scion user",
-			env["SCION_HOST_GID"], "1000")
+	if env["SCION_HOST_GID"] != "0" {
+		t.Errorf("SCION_HOST_GID = %q, want %q; sandbox must run as root (gVisor lacks CAP_SETGID)",
+			env["SCION_HOST_GID"], "0")
 	}
 
-	// Verify the constants match the expected scion user UID.
-	if sandboxUID != 1000 {
-		t.Errorf("sandboxUID = %d, want 1000 (scion user from omni Dockerfile)", sandboxUID)
+	// Verify the constants match the expected root UID.
+	if sandboxUID != 0 {
+		t.Errorf("sandboxUID = %d, want 0 (root — gVisor lacks CAP_SETUID)", sandboxUID)
 	}
-	if sandboxGID != 1000 {
-		t.Errorf("sandboxGID = %d, want 1000 (scion user from omni Dockerfile)", sandboxGID)
+	if sandboxGID != 0 {
+		t.Errorf("sandboxGID = %d, want 0 (root — gVisor lacks CAP_SETGID)", sandboxGID)
 	}
 }
 
@@ -791,6 +792,92 @@ func TestEnvArgs_Sorted(t *testing.T) {
 	}
 	if args[2] != "C_KEY=c" {
 		t.Errorf("args[2] = %q, want %q", args[2], "C_KEY=c")
+	}
+}
+
+// -----------------------------------------------------------------------
+// ResolvedAuth application tests
+// -----------------------------------------------------------------------
+
+// TestCloudRunSandboxRuntime_Run_AppliesResolvedAuth verifies that the
+// sandbox runtime applies resolved auth env vars to the sandbox environment.
+// Without this, auth env vars like GOOGLE_CLOUD_PROJECT and
+// GOOGLE_CLOUD_LOCATION do not reach the sandbox process (the Docker
+// runtime applies them via applyResolvedAuth at common.go:289-290).
+func TestCloudRunSandboxRuntime_Run_AppliesResolvedAuth(t *testing.T) {
+	tmpDir := t.TempDir()
+	rootDir := filepath.Join(tmpDir, "scion")
+	argsFile := filepath.Join(tmpDir, "sandbox-args")
+
+	// Create a mock sandbox binary that records its args.
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	script := "#!/bin/sh\nif [ \"$1\" = \"run\" ]; then\n  printf '%s\\n' \"$@\" > " + argsFile + "\nfi\necho sandbox-ok\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmpDir, "agent-home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      rootDir,
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	t.Cleanup(func() {
+		rt.watchMu.Lock()
+		for _, cancel := range rt.watchCancels {
+			cancel()
+		}
+		rt.watchMu.Unlock()
+	})
+
+	cfg := RunConfig{
+		Name:      "auth-agent",
+		HomeDir:   homeDir,
+		Workspace: filepath.Join(tmpDir, "workspace"),
+		Image:     "omni-image",
+		Harness: &mockHarness{
+			command: []string{"gemini"},
+			env:     map[string]string{},
+		},
+		ResolvedAuth: &api.ResolvedAuth{
+			Method: "vertex-ai",
+			EnvVars: map[string]string{
+				"GOOGLE_CLOUD_PROJECT":  "test-project",
+				"GOOGLE_CLOUD_REGION":   "us-central1",
+				"GOOGLE_CLOUD_LOCATION": "us-central1",
+			},
+		},
+	}
+
+	_ = os.MkdirAll(cfg.Workspace, 0755)
+
+	_, err := rt.Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Read the recorded args and verify auth env vars are present.
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read mock binary args: %v", err)
+	}
+	args := string(argsData)
+
+	for _, wantEnv := range []string{
+		"GOOGLE_CLOUD_PROJECT=test-project",
+		"GOOGLE_CLOUD_REGION=us-central1",
+		"GOOGLE_CLOUD_LOCATION=us-central1",
+	} {
+		if !strings.Contains(args, wantEnv) {
+			t.Errorf("sandbox args missing resolved auth env %q\nfull args:\n%s", wantEnv, args)
+		}
 	}
 }
 
@@ -1429,6 +1516,17 @@ func TestCloudRunSandboxRuntime_Run_BuildsCommand(t *testing.T) {
 		watchCancels: make(map[string]context.CancelFunc),
 	}
 
+	// Cancel the background watchSandbox goroutine on test exit so it cannot
+	// write to the state file after t.TempDir() cleanup begins, which would
+	// cause a "directory not empty" failure.
+	t.Cleanup(func() {
+		rt.watchMu.Lock()
+		for _, cancel := range rt.watchCancels {
+			cancel()
+		}
+		rt.watchMu.Unlock()
+	})
+
 	cfg := RunConfig{
 		Name:      "test-agent",
 		HomeDir:   homeDir,
@@ -1450,6 +1548,19 @@ func TestCloudRunSandboxRuntime_Run_BuildsCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
+
+	// Cancel the watcher goroutine started by Run() so its state-file
+	// writes don't race with TempDir cleanup (t.Cleanup runs LIFO, so
+	// this fires before RemoveAll).
+	t.Cleanup(func() {
+		rt.watchMu.Lock()
+		for _, cancel := range rt.watchCancels {
+			cancel()
+		}
+		rt.watchCancels = make(map[string]context.CancelFunc)
+		rt.watchMu.Unlock()
+	})
+
 	if id != "test-agent" {
 		t.Errorf("Run() returned id = %q, want %q", id, "test-agent")
 	}

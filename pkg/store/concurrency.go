@@ -55,6 +55,8 @@ const (
 	LockGitHubAppHealthCheck AdvisoryLockKey = 0x5C100005
 	// LockBrokerAffinityReap guards the stale broker-affinity + stuck dispatch reaper.
 	LockBrokerAffinityReap AdvisoryLockKey = 0x5C100006
+	// LockBrokerHeartbeatTimeout guards the stale-broker → offline sweep.
+	LockBrokerHeartbeatTimeout AdvisoryLockKey = 0x5C100015
 	// LockBrokerMessageSweep guards the periodic stuck-pending-message sweep (B5-2).
 	LockBrokerMessageSweep AdvisoryLockKey = 0x5C100007
 	// LockSchemaMigration guards startup schema migration and built-in seed data
@@ -113,6 +115,10 @@ const (
 	// LockChatLinkCodeEviction guards the periodic chat link code cleanup
 	// that deletes expired entries from the chat_link_codes table.
 	LockChatLinkCodeEviction AdvisoryLockKey = 0x5C100013
+
+	// LockWebchatMigration guards webchat store data migrations so only
+	// one replica runs them during multi-replica cold start.
+	LockWebchatMigration AdvisoryLockKey = 0x5C100014
 
 	// LockWorkspaceProvision is the CLASS ID for per-project workspace
 	// provisioning locks. It is used with the two-int advisory lock form

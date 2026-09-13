@@ -607,6 +607,14 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		warnings = append(warnings, fmt.Sprintf("Auth: resolved as %s", authDetail))
 	}
 authDone:
+	if opts.NoAuth {
+		// Clean up stale auth-candidates from a prior run so the
+		// provisioner sees no candidates and runs in no-auth mode.
+		authCandidatesPath := filepath.Join(agentHome, ".scion", "harness", "inputs", "auth-candidates.json")
+		if err := os.Remove(authCandidatesPath); err != nil && !os.IsNotExist(err) {
+			util.Debugf("Start: failed to remove stale auth-candidates: %v", err)
+		}
+	}
 
 	// Unconditionally clear corrupted opts.HarnessAuth. This runs even when
 	// NoAuth is true (the auth block is skipped) to prevent re-persisting
@@ -666,6 +674,14 @@ authDone:
 	}
 	if _, ok := opts.Env["SCION_MODEL"]; !ok && finalScionCfg != nil && finalScionCfg.Model != "" {
 		opts.Env["SCION_MODEL"] = finalScionCfg.Model
+	}
+	// Re-resolve SCION_MODEL if it contains an unresolved size alias.
+	// The hub may inject a raw alias (e.g. "large") when its store lacks
+	// the harness config's model_aliases map; the broker has the on-disk
+	// config and can resolve it here.
+	if resolved, ok := reResolveModelAlias(opts.Env["SCION_MODEL"], finalScionCfg); ok {
+		util.Debugf("RunAgent: re-resolved leaked model alias %q → %q", opts.Env["SCION_MODEL"], resolved)
+		opts.Env["SCION_MODEL"] = resolved
 	}
 	if _, ok := opts.Env["SCION_THINKING_LEVEL"]; !ok && finalScionCfg != nil && finalScionCfg.ThinkingLevel != nil {
 		opts.Env["SCION_THINKING_LEVEL"] = strconv.Itoa(*finalScionCfg.ThinkingLevel)
@@ -1363,10 +1379,9 @@ func resolveAuthEnvOverlay(opts *api.StartOptions, settings *config.VersionedSet
 	// finalScionCfg.Env (provision.go:1098-1115, ungated). The gate therefore
 	// bought no isolation, it only blinded auth resolution. See design §0.2.
 	//
-	// Profile env is no longer a source here — this reads the harness config
-	// only. Note this does NOT retire profile env: ResolveHarnessConfig still
-	// merges profile.Env into its result (settings_v1.go:54-55), and
-	// provision.go:1098 feeds it to the container regardless. See design §0.3.
+	// Profile env is fully retired — profiles.<p>.env was removed from both
+	// the struct and the JSON schema (G3-full). This reads the harness config
+	// only. See design §0.3.
 	if settings != nil && harnessConfigName != "" {
 		if hcEntry, err := settings.ResolveHarnessConfig(profileName, harnessConfigName); err == nil && len(hcEntry.Env) > 0 {
 			if opts.Env == nil {
@@ -1580,4 +1595,20 @@ func mergeExtraHosts(a, b []string) []string {
 		}
 	}
 	return result
+}
+
+// reResolveModelAlias detects when SCION_MODEL contains an unresolved size
+// alias (e.g. "large") that the hub failed to resolve, and returns the
+// broker-side resolved concrete model from cfg.Model. It returns ("", false)
+// when no re-resolution is needed — either because the value is not a known
+// alias, the config is nil, or the config model is empty.
+func reResolveModelAlias(envModel string, cfg *api.ScionConfig) (string, bool) {
+	if envModel == "" || cfg == nil || cfg.Model == "" {
+		return "", false
+	}
+	normalized := config.NormalizeModelAlias(envModel)
+	if config.KnownModelAliases[normalized] && envModel != cfg.Model {
+		return cfg.Model, true
+	}
+	return "", false
 }

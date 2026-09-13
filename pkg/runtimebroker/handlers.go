@@ -2222,6 +2222,12 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 					}
 				}
 			}
+			// Include as_needed secret targets the hub could resolve in
+			// pass 2. Without this, autodetect cannot see deferred keys
+			// and falls back to default_type, losing the credentials (#1447).
+			for _, k := range req.AvailableAsNeededKeys {
+				resolvedEnvKeys[k] = struct{}{}
+			}
 			if detected := harness.DetectAuthTypeFromEnvVarsFromConfig(authMeta, resolvedEnvKeys); detected != "" {
 				authType = detected
 			}
@@ -2324,15 +2330,9 @@ func (s *Server) extractRequiredEnvKeys(req CreateAgentRequest, hydratedHarnessC
 
 	// Phase 2: Settings-based empty-value env key extraction
 	if settings != nil {
-		// Get profile env keys
+		// Get profile harness override env keys
 		if profileName != "" && settings.Profiles != nil {
 			if profile, ok := settings.Profiles[profileName]; ok {
-				for k, v := range profile.Env {
-					if v == "" {
-						required[k] = struct{}{}
-					}
-				}
-				// Check harness overrides within the profile
 				for _, override := range profile.HarnessOverrides {
 					for k, v := range override.Env {
 						if v == "" {

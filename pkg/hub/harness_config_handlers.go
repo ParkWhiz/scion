@@ -198,6 +198,16 @@ func (s *Server) listHarnessConfigs(w http.ResponseWriter, r *http.Request) {
 			Permission: "harness_config.list",
 		}).Allowed
 	}
+	// Agents with project:read scope can discover all harness configs.
+	// Global harness configs are parentless resources that cannot match
+	// project-scoped agent bindings in AuthorizeReadBatch, so agents
+	// would see zero results without this bypass. The agent's read
+	// access was already verified by checkAgentReadScope above.
+	if !hasAdminView {
+		if agentIdent, ok := identity.(AgentIdentity); ok && agentIdent.HasScope(ScopeProjectRead) {
+			hasAdminView = true
+		}
+	}
 	if identity != nil && !hasAdminView {
 		result, err := authorizedList(ctx, identity, cursor, limit, func(ctx context.Context, cursor string, limit int) (authorizedCandidatePage[store.HarnessConfig], error) {
 			page, err := s.store.ListHarnessConfigs(ctx, filter, store.ListOptions{Limit: limit, Cursor: cursor, SkipTotalCount: true, CursorBinding: cursorBinding})
@@ -262,6 +272,18 @@ func (s *Server) createHarnessConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Harness == "" {
 		ValidationError(w, "harness is required", nil)
+		return
+	}
+
+	// SECURITY-GATE: require harness_config.create permission before any mutation.
+	// Scope-aware: project-scoped requests authorize against the project parent
+	// so that project-level role bindings (owner/admin/member) grant access.
+	res := Resource{Type: "harness_config"}
+	if req.ScopeID != "" {
+		res.ParentType = "project"
+		res.ParentID = req.ScopeID
+	}
+	if !s.authorize(w, r, res, ActionCreate) {
 		return
 	}
 
@@ -403,6 +425,19 @@ func (s *Server) getHarnessConfig(w http.ResponseWriter, r *http.Request, id str
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+
+	// Authenticated runtime brokers read harness configs during agent creation.
+	// They pass HMAC auth via middleware but are not user principals, so the
+	// authorization kernel cannot evaluate them. Allow read access for brokers;
+	// the HMAC credential is the trust basis.
+	if GetBrokerIdentityFromContext(ctx) == nil {
+		// SECURITY-GATE: authorize read access to this specific harness config.
+		// The list endpoint filters via AuthorizeReadBatch; without this check
+		// a caller could bypass list filtering by addressing the config by ID.
+		if !s.authorize(w, r, harnessConfigResource(hc), ActionRead) {
+			return
+		}
 	}
 
 	resp := HarnessConfigWithCapabilities{HarnessConfig: *hc}

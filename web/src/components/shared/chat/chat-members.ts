@@ -32,8 +32,50 @@ import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import type { PropertyValues } from 'lit';
 import { ACTIVITY_DISPLAY } from '../../../shared/agent-state-display.js';
+import { navigateTo } from '../../../client/main.js';
 import './chat-avatar.js';
 import '../status-badge.js';
+
+/** Popup window geometry for a terminal. Roughly 80x24 at a comfortable size. */
+const TERMINAL_POPOUT_WIDTH = 1024;
+const TERMINAL_POPOUT_HEIGHT = 700;
+
+/**
+ * Open an agent's terminal in its own window.
+ *
+ * The window is *named per agent*, which is the whole point: clicking the same
+ * agent again focuses the window that is already open instead of spawning
+ * another one. Six agents means six windows, not one window per click - the
+ * tab pile-up that made this control painful in the first place.
+ *
+ * A terminal is also a poor fit for in-app navigation, because reaching it
+ * replaces the chat you were reading it alongside.
+ *
+ * Note the deliberate absence of `noopener`: a named window cannot be reused
+ * or focused if the opener is severed, and the target is our own same-origin
+ * route. Falls back to in-app navigation when a popup blocker intervenes, so
+ * the control always does something.
+ */
+function openTerminalPopout(agentId: string): void {
+  const features = [
+    'popup=yes',
+    `width=${TERMINAL_POPOUT_WIDTH}`,
+    `height=${TERMINAL_POPOUT_HEIGHT}`,
+    'resizable=yes',
+    'scrollbars=yes',
+  ].join(',');
+
+  const path = `/agents/${agentId}/terminal`;
+  const base = import.meta.env.BASE_URL;
+  const url = base && base !== '/' ? base.replace(/\/$/, '') + path : path;
+
+  const win = window.open(url, `scion-term-${agentId}`, features);
+  if (win) {
+    win.focus();
+    return;
+  }
+  navigateTo(`/agents/${agentId}/terminal`);
+}
 
 /**
  * Statuses that represent a settled agent. Entering one of these is the end of
@@ -80,6 +122,24 @@ export interface ChatAgentMember {
   detailMessage?: string;
   /** When the agent last changed state (not the heartbeat in `lastSeen`). */
   lastActivityEvent?: string;
+  /**
+   * Whether the viewer may open a terminal on this agent, as decided by the
+   * Hub. The sidebar lists every agent in the space's project, but attaching
+   * is gated by authorizeAgentLifecycle, so without this the terminal control
+   * appears for agents the viewer cannot open and clicking it is refused.
+   *
+   * The control renders only on an explicit true. Anything else - absent,
+   * undefined, dropped somewhere in the client - hides it. An earlier version
+   * tested `=== false` so a missing field would keep the old behaviour, and
+   * that is precisely how the gate failed twice: the server omitted false via
+   * omitempty, and the page's own mappers dropped the field while rebuilding
+   * member objects. A permission gate should fail closed.
+   *
+   * Explicitly `| undefined` because exactOptionalPropertyTypes is on: the
+   * mappers below pass the field through unconditionally, and "present but
+   * undefined" has to be assignable for that to typecheck.
+   */
+  canAttach?: boolean | undefined;
 }
 
 export type ChatMember = ChatHumanMember | ChatAgentMember;
@@ -509,15 +569,32 @@ export class ScionChatMembers extends LitElement {
             size="small"
           ></scion-status-badge>
         </div>
-        <a
-          href="/agents/${a.id}/terminal"
-          target="_blank"
-          class="agent-terminal"
-          title="Open terminal"
-          @click=${(e: Event) => e.stopPropagation()}
-        >
-          <sl-icon name="terminal" style="font-size: 0.75rem;"></sl-icon>
-        </a>
+        ${a.canAttach !== true
+          ? nothing
+          : html`<a
+              href="/agents/${a.id}/terminal"
+              class="agent-terminal"
+              title="Open terminal in its own window (Ctrl/Cmd-click for a tab)"
+              @click=${(e: MouseEvent) => {
+                e.stopPropagation();
+                // Leave modified and non-primary clicks to the browser so
+                // Ctrl/Cmd-click, Shift-click and middle-click behave as they
+                // do on any other link.
+                if (
+                  e.button !== 0 ||
+                  e.metaKey ||
+                  e.ctrlKey ||
+                  e.shiftKey ||
+                  e.altKey
+                ) {
+                  return;
+                }
+                e.preventDefault();
+                openTerminalPopout(a.id);
+              }}
+            >
+              <sl-icon name="terminal" style="font-size: 0.75rem;"></sl-icon>
+            </a>`}
         <a
           href="/agents/${a.id}"
           target="_blank"
