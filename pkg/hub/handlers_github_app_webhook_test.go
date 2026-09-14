@@ -1133,10 +1133,11 @@ func TestHandleGitHubWebhook_StrategyD_Fallback(t *testing.T) {
 
 	// 1. Create a project with matching remote, installation id, and a runtime broker (so create agent succeeds)
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-fallback-1"),
-		Slug:   "broker-fallback-1",
-		Name:   "Broker Fallback 1",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-fallback-1"),
+		Slug:        "broker-fallback-1",
+		Name:        "Broker Fallback 1",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -1146,7 +1147,8 @@ func TestHandleGitHubWebhook_StrategyD_Fallback(t *testing.T) {
 		ID: tid("tmpl_default"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: time.Now(), Updated: time.Now(),
+		ContentHash: "abc123",
+		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}
@@ -1379,10 +1381,11 @@ func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
 	srv.mu.Unlock()
 
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-review-fallback-1"),
-		Slug:   "broker-review-fallback-1",
-		Name:   "Broker Review Fallback 1",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-review-fallback-1"),
+		Slug:        "broker-review-fallback-1",
+		Name:        "Broker Review Fallback 1",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -1392,7 +1395,8 @@ func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
 		ID: tid("tmpl_default"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: time.Now(), Updated: time.Now(),
+		ContentHash: "abc123",
+		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}
@@ -1710,10 +1714,11 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 	srv.mu.Unlock()
 
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-validate-fallback-1"),
-		Slug:   "broker-validate-fallback-1",
-		Name:   "Broker Validate Fallback 1",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-validate-fallback-1"),
+		Slug:        "broker-validate-fallback-1",
+		Name:        "Broker Validate Fallback 1",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -1723,7 +1728,8 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 		ID: tid("tmpl_default"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: time.Now(), Updated: time.Now(),
+		ContentHash: "abc123",
+		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}
@@ -1862,7 +1868,8 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 		ID: tid("tmpl_review1"), Slug: "my-custom-review-tpl", Name: "My Custom Review Template",
 		Harness: "claude", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: now, Updated: now,
+		ContentHash: "abc123",
+		Created:     now, Updated: now,
 	}); err != nil {
 		t.Fatalf("failed to create custom review template: %v", err)
 	}
@@ -1871,7 +1878,8 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 		ID: tid("tmpl_validate1"), Slug: "my-custom-validate-tpl", Name: "My Custom Validate Template",
 		Harness: "gemini", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: now, Updated: now,
+		ContentHash: "abc123",
+		Created:     now, Updated: now,
 	}); err != nil {
 		t.Fatalf("failed to create custom validate template: %v", err)
 	}
@@ -1886,10 +1894,11 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 	srv.mu.Unlock()
 
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-tpl-1"),
-		Slug:   "broker-tpl-1",
-		Name:   "Broker Tpl 1",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-tpl-1"),
+		Slug:        "broker-tpl-1",
+		Name:        "Broker Tpl 1",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -2070,8 +2079,7 @@ func TestHandleGitHubWebhook_TemplateResolution_ServerConfig(t *testing.T) {
 active_profile: local
 profiles:
   local:
-    env:
-      SCION_REVIEW_TEMPLATE: my-server-config-review-tpl
+    default_template: my-server-config-review-tpl
 `
 	if err := os.WriteFile(filepath.Join(globalDir, "settings.yaml"), []byte(settingsYAML), 0644); err != nil {
 		t.Fatalf("failed to write settings file: %v", err)
@@ -2109,7 +2117,8 @@ profiles:
 		ID: tid("tmpl_review_server"), Slug: "my-server-config-review-tpl", Name: "My Server Config Review Template",
 		Harness: "claude", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: now, Updated: now,
+		ContentHash: "abc123",
+		Created:     now, Updated: now,
 	}); err != nil {
 		t.Fatalf("failed to create custom review template: %v", err)
 	}
@@ -2124,10 +2133,11 @@ profiles:
 	srv.mu.Unlock()
 
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-srvtpl-1"),
-		Slug:   "broker-srvtpl-1",
-		Name:   "Broker SrvTpl 1",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-srvtpl-1"),
+		Slug:        "broker-srvtpl-1",
+		Name:        "Broker SrvTpl 1",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -2264,7 +2274,8 @@ func TestHandleGitHubWebhook_TemplateResolution_Database(t *testing.T) {
 		ID: tid("tmpl_val_db"), Slug: "my-db-validate-tpl", Name: "My DB Validate Template",
 		Harness: "claude", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: now, Updated: now,
+		ContentHash: "abc123",
+		Created:     now, Updated: now,
 	}); err != nil {
 		t.Fatalf("failed to create custom validate template: %v", err)
 	}
@@ -2292,10 +2303,11 @@ func TestHandleGitHubWebhook_TemplateResolution_Database(t *testing.T) {
 	srv.mu.Unlock()
 
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-srvtpl-2"),
-		Slug:   "broker-srvtpl-2",
-		Name:   "Broker SrvTpl 2",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-srvtpl-2"),
+		Slug:        "broker-srvtpl-2",
+		Name:        "Broker SrvTpl 2",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -3079,10 +3091,11 @@ func TestHandleGitHubWebhook_PlanCommand(t *testing.T) {
 	srv.mu.Unlock()
 
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-plan-1"),
-		Slug:   "broker-plan-1",
-		Name:   "Broker Plan 1",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-plan-1"),
+		Slug:        "broker-plan-1",
+		Name:        "Broker Plan 1",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -3120,7 +3133,8 @@ func TestHandleGitHubWebhook_PlanCommand(t *testing.T) {
 		ID: tid("tmpl_default_plan"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: time.Now(), Updated: time.Now(),
+		ContentHash: "abc123",
+		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}
@@ -3215,10 +3229,11 @@ func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
 	srv.mu.Unlock()
 
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-implement-1"),
-		Slug:   "broker-implement-1",
-		Name:   "Broker Implement 1",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-implement-1"),
+		Slug:        "broker-implement-1",
+		Name:        "Broker Implement 1",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -3256,7 +3271,8 @@ func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
 		ID: tid("tmpl_default_implement"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: time.Now(), Updated: time.Now(),
+		ContentHash: "abc123",
+		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}
@@ -3349,10 +3365,11 @@ func TestHandleGitHubWebhook_PlanCommand_ActiveAgent(t *testing.T) {
 	srv.mu.Unlock()
 
 	brokerObj := &store.RuntimeBroker{
-		ID:     tid("broker-plan-active-1"),
-		Slug:   "broker-plan-active-1",
-		Name:   "Broker Plan Active 1",
-		Status: store.BrokerStatusOnline,
+		ID:          tid("broker-plan-active-1"),
+		Slug:        "broker-plan-active-1",
+		Name:        "Broker Plan Active 1",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
 	}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
@@ -3390,7 +3407,8 @@ func TestHandleGitHubWebhook_PlanCommand_ActiveAgent(t *testing.T) {
 		ID: tid("tmpl_default_plan_active"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
 		Visibility: store.VisibilityPublic, Status: "active",
-		Created: time.Now(), Updated: time.Now(),
+		ContentHash: "abc123",
+		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}

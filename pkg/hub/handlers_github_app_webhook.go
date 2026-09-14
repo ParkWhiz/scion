@@ -1229,7 +1229,6 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 	// Resolve the target template based on environment variables or Scion hierarchy
 	var targetTemplate string
 	if cmd == "/review" || cmd == "/validate" || cmd == "/fix" || cmd == "/plan" || cmd == "/implement" {
-		var activeProfileEnv map[string]string
 		var defaultTemplateFromSettings string
 		if settings, _, err := config.LoadEffectiveSettings(""); err == nil && settings != nil {
 			defaultTemplateFromSettings = settings.DefaultTemplate
@@ -1238,7 +1237,9 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 				profileName = "local"
 			}
 			if profile, ok := settings.Profiles[profileName]; ok {
-				activeProfileEnv = profile.Env
+				if profile.DefaultTemplate != "" {
+					defaultTemplateFromSettings = profile.DefaultTemplate
+				}
 			}
 		}
 
@@ -1293,13 +1294,7 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			if val, ok := dbEnv[key]; ok && val != "" {
 				return val
 			}
-			// 4. Try Scion server config / active profile environment variables
-			if activeProfileEnv != nil {
-				if val, ok := activeProfileEnv[key]; ok && val != "" {
-					return val
-				}
-			}
-			// 5. Fall back to process environment variables
+			// 4. Fall back to process environment variables
 			return os.Getenv(key)
 		}
 
