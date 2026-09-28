@@ -1425,10 +1425,10 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 			if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
 				slog.Error("Failed to persist fallback message", "error", err)
+			} else {
+				// 2. Publish SSE event
+				s.events.PublishUserMessage(ctx, storeMsg, nil)
 			}
-
-			// 2. Publish SSE event
-			s.events.PublishUserMessage(ctx, storeMsg)
 
 			// 3. Dispatch to runtime broker via agent dispatcher
 			dispatcher := s.GetDispatcher()

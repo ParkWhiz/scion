@@ -1297,7 +1297,7 @@ func TestHandleGitHubWebhook_StrategyD_Fallback(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
@@ -1545,7 +1545,7 @@ func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
@@ -1878,7 +1878,7 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
@@ -2018,7 +2018,7 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_review1"), Slug: "my-custom-review-tpl", Name: "My Custom Review Template",
 		Harness: "claude", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     now, Updated: now,
 	}); err != nil {
@@ -2028,7 +2028,7 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_validate1"), Slug: "my-custom-validate-tpl", Name: "My Custom Validate Template",
 		Harness: "gemini", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     now, Updated: now,
 	}); err != nil {
@@ -2267,7 +2267,7 @@ profiles:
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_review_server"), Slug: "my-server-config-review-tpl", Name: "My Server Config Review Template",
 		Harness: "claude", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     now, Updated: now,
 	}); err != nil {
@@ -2424,7 +2424,7 @@ func TestHandleGitHubWebhook_TemplateResolution_Database(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_val_db"), Slug: "my-db-validate-tpl", Name: "My DB Validate Template",
 		Harness: "claude", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     now, Updated: now,
 	}); err != nil {
@@ -3283,7 +3283,7 @@ func TestHandleGitHubWebhook_PlanCommand(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default_plan"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
@@ -3421,7 +3421,7 @@ func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default_implement"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {
@@ -3557,7 +3557,7 @@ func TestHandleGitHubWebhook_PlanCommand_ActiveAgent(t *testing.T) {
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default_plan_active"), Slug: "default", Name: "Default Template",
 		Harness: "gemini", Scope: "global",
-		Visibility: store.VisibilityPublic, Status: "active",
+		Status: "active",
 		ContentHash: "abc123",
 		Created:     time.Now(), Updated: time.Now(),
 	}); err != nil {

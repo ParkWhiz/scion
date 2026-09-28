@@ -129,6 +129,10 @@ func TestPersistedRowEffectEnumeration(t *testing.T) {
 		// The publish mirrors that committed write onto the in-memory copy;
 		// it is not gating persistence, persistence already happened.
 		"message_delivery_failures.go:applyBrokerMessageFailure": "Acts on an already-persisted row (confirmed via GetMessage) after markFailed has already committed; publish mirrors the committed write, not a pending one",
+
+		// handlers_github_app_webhook.go:processComment: direct dispatch fallback
+		// when message broker is uninitialized.
+		"handlers_github_app_webhook.go:processComment": "Publish in else branch of CreateMessage error check",
 	}
 
 	// Build accounted set from guarded entries.
