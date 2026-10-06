@@ -789,7 +789,10 @@ func (s *Server) mintGitHubAppToken(ctx context.Context, project *store.Project)
 		}
 	}
 
-	token, err := client.MintInstallationToken(ctx, installationID, repos, perms)
+	// Pass nil for repos so GitHub grants the token access to all repositories
+	// permitted by this installation (allowing access to shared skill repos in the org).
+	token, err := client.MintInstallationToken(ctx, installationID, nil, perms)
+
 	if err != nil {
 		// Classify the error and update project status
 		var mintErr *githubapp.TokenMintError
