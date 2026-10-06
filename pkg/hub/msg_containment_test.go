@@ -67,11 +67,11 @@ func (d *containmentDispatchSpy) DispatchAgentMessage(_ context.Context, agent *
 	return nil
 }
 
-func (d *containmentDispatchSpy) DispatchAgentCreate(_ context.Context, agent *store.Agent) error {
+func (d *containmentDispatchSpy) DispatchAgentCreate(_ context.Context, agent *store.Agent) (*CreateDispatchResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.calls = append(d.calls, containmentDispatchCall{Method: "DispatchAgentCreate", Agent: agent})
-	return nil
+	return nil, nil
 }
 
 func (d *containmentDispatchSpy) DispatchAgentProvision(_ context.Context, _ *store.Agent) error {
@@ -108,11 +108,11 @@ func (d *containmentDispatchSpy) DispatchAgentExec(_ context.Context, _ *store.A
 func (d *containmentDispatchSpy) DispatchCheckAgentPrompt(_ context.Context, _ *store.Agent) (bool, error) {
 	return false, nil
 }
-func (d *containmentDispatchSpy) DispatchAgentCreateWithGather(_ context.Context, _ *store.Agent) (*RemoteEnvRequirementsResponse, error) {
+func (d *containmentDispatchSpy) DispatchAgentCreateWithGather(_ context.Context, _ *store.Agent) (*CreateDispatchResult, error) {
 	return nil, nil
 }
-func (d *containmentDispatchSpy) DispatchFinalizeEnv(_ context.Context, _ *store.Agent, _ map[string]string) error {
-	return nil
+func (d *containmentDispatchSpy) DispatchFinalizeEnv(_ context.Context, _ *store.Agent, _ map[string]string) (*CreateDispatchResult, error) {
+	return nil, nil
 }
 
 var _ AgentDispatcher = (*containmentDispatchSpy)(nil)
@@ -1102,7 +1102,7 @@ func TestC1_AuthorizeScheduledMessageAuthoring_UATDenied(t *testing.T) {
 		ID: tid("uat-proj"), Name: "UAT Project", Slug: "uat-proj",
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroup(ctx, project)
+	srv.seedProjectCreatorMembership(ctx, project)
 
 	user := &store.User{
 		ID: tid("uat-user"), Email: "uat@test.com", DisplayName: "UAT User",
@@ -1151,7 +1151,7 @@ func TestC1_AuthorizeScheduledMessageAuthoring_ConflictingTarget(t *testing.T) {
 		ID: tid("conflict-proj"), Name: "Conflict Project", Slug: "conflict-proj",
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroup(ctx, project)
+	srv.seedProjectCreatorMembership(ctx, project)
 
 	user := &store.User{
 		ID: tid("conflict-user"), Email: "conflict@test.com", DisplayName: "Conflict User",

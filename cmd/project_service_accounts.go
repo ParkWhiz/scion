@@ -21,6 +21,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/spf13/cobra"
@@ -57,9 +58,8 @@ roles/iam.serviceAccountTokenCreator on the target SA.
 Examples:
   scion project service-accounts add agent-worker@my-project.iam.gserviceaccount.com --gcp-project my-project
   scion project service-accounts add agent-worker@my-project.iam.gserviceaccount.com --gcp-project my-project --name "Worker SA"`,
-	Args:    cobra.ExactArgs(1),
-	PreRunE: checkGCPProjectFlag,
-	RunE:    runSAAdd,
+	Args: gcpProjectArgs(cobra.ExactArgs(1)),
+	RunE: runSAAdd,
 }
 
 var saListCmd = &cobra.Command{
@@ -346,7 +346,7 @@ func runSAVerify(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  ID:          %s\n", sa.ID)
 	fmt.Printf("  Project:     %s\n", sa.ProjectID)
 	fmt.Printf("  Verified:    %v\n", sa.Verified)
-	fmt.Printf("  Verified At: %s\n", sa.VerifiedAt.Format(time.RFC3339))
+	fmt.Printf("  Verified At: %s\n", clitime.Format(sa.VerifiedAt, clitime.Full))
 
 	return nil
 }

@@ -112,6 +112,12 @@ class TelemetryProvisionTest(unittest.TestCase):
         self.assertEqual(disabled['OTEL_METRICS_EXPORTER'], 'none')
         self.assertEqual(disabled['OTEL_LOGS_EXPORTER'], 'none')
 
+    def test_claude_sets_usage_source_native_only_when_enabled(self):
+        enabled_env, _ = self._invoke('claude', True, 4317, provider='otlp')
+        self.assertEqual(enabled_env['SCION_USAGE_SOURCE'], 'native')
+        disabled_env, _ = self._invoke('claude', False, 4317, provider='otlp')
+        self.assertNotIn('SCION_USAGE_SOURCE', disabled_env)
+
     def test_gemini_default_custom_and_disabled(self):
         for enabled, port in ((True, 4317), (True, 14317), (False, 14317)):
             with self.subTest(enabled=enabled, port=port):
@@ -123,6 +129,15 @@ class TelemetryProvisionTest(unittest.TestCase):
                 self.assertEqual(config['otlpEndpoint'], f'http://127.0.0.1:{port}')
                 self.assertEqual(config['target'], 'local')
                 self.assertNotIn('outfile', config)
+
+    def test_gemini_sets_usage_source_native_only_when_enabled(self):
+        # ptone/scion#2234: the native gemini_cli.api_response rule is
+        # fixture-vetted, so gemini-cli now declares the D4/D10 opt-in the
+        # same way claude, codex and copilot do.
+        enabled_env, _ = self._invoke('gemini-cli', True, 4317)
+        self.assertEqual(enabled_env['SCION_USAGE_SOURCE'], 'native')
+        disabled_env, _ = self._invoke('gemini-cli', False, 4317)
+        self.assertNotIn('SCION_USAGE_SOURCE', disabled_env)
 
     def test_codex_default_custom_and_disabled(self):
         for enabled, port in ((True, 4317), (True, 14317), (False, 14317)):
@@ -139,6 +154,35 @@ class TelemetryProvisionTest(unittest.TestCase):
                 self.assertNotIn('statsig', config)
                 self.assertNotIn('cloudtrace.googleapis.com', config)
 
+    def test_codex_gcp_disables_native_metrics_but_keeps_logs(self):
+        # ptone/scion#2053 design §3.7 "codex" bullet: native metrics stay
+        # off on GCP, the same as claude (test_claude_gcp_logs_only_and_generic_metrics
+        # above), narrow to metrics only -- logs and traces are unaffected.
+        for provider, enabled, port in (
+            ('gcp', True, 4317),
+            ('gcp', True, 14317),
+            ('gcp', False, 14317),
+            ('generic', True, 14317),
+        ):
+            with self.subTest(provider=provider, enabled=enabled, port=port):
+                env, config = self._invoke('codex', enabled, port, provider=provider)
+                if not enabled:
+                    self.assertIn('metrics_exporter = "none"', config)
+                    self.assertIn('exporter = "none"', config)
+                    self.assertIn('trace_exporter = "none"', config)
+                elif provider == 'gcp':
+                    self.assertIn('metrics_exporter = "none"', config)
+                    self.assertIn(f'exporter."otlp-grpc".endpoint = "http://127.0.0.1:{port}"', config)
+                    self.assertIn(f'trace_exporter."otlp-grpc".endpoint = "http://127.0.0.1:{port}"', config)
+                else:
+                    self.assertIn(f'metrics_exporter."otlp-grpc".endpoint = "http://127.0.0.1:{port}"', config)
+
+    def test_codex_sets_usage_source_native_only_when_enabled(self):
+        enabled_env, _ = self._invoke('codex', True, 4317)
+        self.assertEqual(enabled_env['SCION_USAGE_SOURCE'], 'native')
+        disabled_env, _ = self._invoke('codex', False, 4317)
+        self.assertNotIn('SCION_USAGE_SOURCE', disabled_env)
+
     def test_copilot_default_custom_and_disabled(self):
         for enabled, port in ((True, 4318), (True, 14318), (False, 14318)):
             with self.subTest(enabled=enabled, port=port):
@@ -150,10 +194,21 @@ class TelemetryProvisionTest(unittest.TestCase):
                     self.assertEqual(env['OTEL_EXPORTER_OTLP_PROTOCOL'], 'http/protobuf')
                     self.assertEqual(env['OTEL_METRICS_EXPORTER'], 'otlp')
                     self.assertEqual(env['OTEL_LOGS_EXPORTER'], 'otlp')
+                    self.assertEqual(env['OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE'], 'delta')
                 else:
                     self.assertNotIn('COPILOT_OTEL_ENABLED', env)
                 self.assertNotIn('OTEL_EXPORTER_OTLP_HEADERS', env)
                 self.assertNotIn('OTEL_EXPORTER_OTLP_CERTIFICATE', env)
+
+    def test_copilot_sets_usage_source_native_only_when_enabled(self):
+        # ptone/scion#2053 phase 3a: copilot's usage rule is metric-sourced;
+        # the deriver converts its cumulative-only metrics to deltas itself
+        # (design §5). SCION_USAGE_SOURCE=native is the same D4/D10 opt-in
+        # claude and codex already use.
+        enabled_env, _ = self._invoke('copilot', True, 14318, port_env_key='SCION_OTEL_HTTP_PORT')
+        self.assertEqual(enabled_env['SCION_USAGE_SOURCE'], 'native')
+        disabled_env, _ = self._invoke('copilot', False, 14318, port_env_key='SCION_OTEL_HTTP_PORT')
+        self.assertNotIn('SCION_USAGE_SOURCE', disabled_env)
 
     def test_copilot_never_reaches_cloud_endpoint(self):
         # #2053: copilot used to resolve SCION_OTEL_ENDPOINT (the generic

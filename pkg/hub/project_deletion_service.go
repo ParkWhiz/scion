@@ -20,8 +20,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/shareddirs"
@@ -109,6 +111,10 @@ type CascadeSummary struct {
 	PreStartHooks     int `json:"pre_start_hooks_deleted"`
 	ProjectProviders  int `json:"project_providers_deleted"`
 	ProjectSyncStates int `json:"project_sync_states_deleted"`
+	DelegationEdges   int `json:"delegation_edges_deactivated"`
+	// DelegationEdgeOpID is the operation ID stamped on every edge
+	// deactivated by the delete; empty when no edge was deactivated.
+	DelegationEdgeOpID string `json:"delegation_edge_op_id,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +256,17 @@ func (svc *ProjectDeletionService) Delete(ctx context.Context, req ProjectDelete
 		// is re-evaluated from the transactional store.
 		reGov := svc.checkDeletionGovernanceFromStore(ctx, tx, req, isSuperAdmin)
 		if !reGov.Allowed {
-			return fmt.Errorf("governance:%d:%s", reGov.HTTPStatus, reGov.Reason)
+			// The deletion decision travels in a MembershipDecision on
+			// purpose: ProjectDeleteDecision has exactly the four fields
+			// below, and all four are copied back after WithTx. DenialCode
+			// is hard-coded to ErrCodeProjectDeleteForbidden so the response
+			// stays byte-identical to the pre-change behaviour.
+			return asGovernanceDenial(MembershipDecision{
+				Allowed:    false,
+				DenialCode: ErrCodeProjectDeleteForbidden,
+				Reason:     reGov.Reason,
+				HTTPStatus: reGov.HTTPStatus,
+			})
 		}
 
 		// 8. Cascade security-relevant state within the transaction.
@@ -290,13 +306,14 @@ func (svc *ProjectDeletionService) Delete(ctx context.Context, req ProjectDelete
 	})
 
 	if txErr != nil {
-		// Parse governance denial from tx error.
-		if status, code, reason, ok := parseGovernanceError(txErr); ok {
+		// Governance denial re-evaluated under lock.
+		var gdErr *governanceDenialError
+		if errors.As(txErr, &gdErr) {
 			return nil, &ProjectDeleteDecision{
 				Allowed:    false,
-				DenialCode: code,
-				Reason:     reason,
-				HTTPStatus: status,
+				DenialCode: gdErr.decision.DenialCode,
+				Reason:     gdErr.decision.Reason,
+				HTTPStatus: gdErr.decision.HTTPStatus,
 			}
 		}
 		svc.logger.Error("project deletion transaction failed",
@@ -323,21 +340,25 @@ func (svc *ProjectDeletionService) Delete(ctx context.Context, req ProjectDelete
 }
 
 // cleanupNFSSharedDirTree removes projectID's shared-dir tree from the NFS
-// export when the hub's own global settings have server.shared_dir_storage
-// configured with backend "nfs" (ptone/scion#1802). It skips cleanup as a
-// silent no-op when the backend is unset/"local" (out of scope for this
-// issue). When the global settings are unreadable or in the legacy format
+// export whenever the hub's own global settings have a complete
+// server.shared_dir_storage.nfs block (ptone/scion#1802), whatever the
+// current backend, runtime or profile settings select: an agent keeps the
+// backend recorded when it was created, so a project can still have a tree
+// on the export after every setting has moved to local. Removing a missing
+// tree is a no-op. Without a complete nfs block it skips cleanup silently,
+// or logs an ERROR when a setting still selects nfs. When the global settings are unreadable or in the legacy format
 // but plausibly mention shared_dir_storage, it logs an ERROR and skips
 // (deletion is best-effort and never blocks or rolls back the DB deletion).
 // Settings are read via the same env-free, global-only loader used by the
-// broker (config.LoadGlobalSettings) so this can never be influenced by a
+// broker (config.LoadGlobalSettingsWithOverlay: the global file plus the
+// DB settings overlay, if installed) so this can never be influenced by a
 // project's own settings.yaml.
 func (svc *ProjectDeletionService) cleanupNFSSharedDirTree(ctx context.Context, projectID string) {
 	// Mirrors resolveNFSSharedDirPath's fail-closed rule. Deletion is
 	// best-effort by design (it never blocks or rolls back the DB deletion),
 	// so "fail closed" here means logging an ERROR instead of silently
 	// skipping cleanup, rather than refusing the request outright.
-	globalSettings, _, err := config.LoadGlobalSettings()
+	globalSettings, _, err := config.LoadGlobalSettingsWithOverlay()
 	if err != nil {
 		if config.GlobalSettingsMentions("shared_dir_storage") {
 			svc.logger.ErrorContext(ctx, "global settings unreadable and mention shared_dir_storage; skipping NFS shared-dir cleanup on project delete",
@@ -345,20 +366,33 @@ func (svc *ProjectDeletionService) cleanupNFSSharedDirTree(ctx context.Context, 
 		}
 		return
 	}
-	if globalSettings.Server == nil || globalSettings.Server.SharedDirStorage == nil {
-		if config.GlobalSettingsIsLegacyFormat() && config.GlobalSettingsMentions("shared_dir_storage") {
-			svc.logger.ErrorContext(ctx, "global settings mention shared_dir_storage but it was not loaded (legacy format); skipping NFS shared-dir cleanup on project delete",
-				"project_id", projectID)
-		}
+	if globalSettings == nil {
 		return
 	}
-	sdCfg := globalSettings.Server.SharedDirStorage
-	if sdCfg.Backend != "nfs" {
+	if (globalSettings.Server == nil || globalSettings.Server.SharedDirStorage == nil) &&
+		config.GlobalSettingsIsLegacyFormat() && config.GlobalSettingsMentions("shared_dir_storage") {
+		svc.logger.ErrorContext(ctx, "global settings mention shared_dir_storage but it was not loaded (legacy format); skipping NFS shared-dir cleanup on project delete",
+			"project_id", projectID)
 		return
+	}
+	// The tree is project-scoped. Agents record their backend on the
+	// broker, which the hub cannot read, so any agent may still be on nfs
+	// while a complete nfs block exists. Clean whenever the block is
+	// complete, whatever the backend settings currently select.
+	var globalSD *config.V1SharedDirStorageConfig
+	if globalSettings.Server != nil {
+		globalSD = globalSettings.Server.SharedDirStorage
+	}
+	globalNFS := globalSD != nil && globalSD.Backend == "nfs"
+	sdCfg := &config.V1SharedDirStorageConfig{Backend: "nfs"}
+	if globalSD != nil {
+		sdCfg.NFS = globalSD.NFS
 	}
 	if err := sdCfg.Validate(); err != nil {
-		svc.logger.ErrorContext(ctx, "shared_dir_storage nfs config is invalid; skipping shared-dir cleanup on project delete",
-			"project_id", projectID, "error", err)
+		if selected, _ := globalSettings.SharedDirStorageNFSAnywhere(); selected != nil {
+			svc.logger.ErrorContext(ctx, "shared_dir_storage nfs config is invalid; skipping shared-dir cleanup on project delete",
+				"project_id", projectID, "error", err)
+		}
 		return
 	}
 	if !shareddirs.ValidProjectID(projectID) {
@@ -370,15 +404,24 @@ func (svc *ProjectDeletionService) cleanupNFSSharedDirTree(ctx context.Context, 
 		return
 	}
 
-	subPathRoot := sdCfg.NFS.SubPathRoot
-	if subPathRoot == "" {
-		subPathRoot = "projects"
-	}
+	subPathRoot := config.SubPathRootOrDefault(sdCfg.NFS.SubPathRoot)
 	res, err := runtime.NewNFSBackend(sdCfg.NFS).Resolve(runtime.ResolveInput{ProjectID: projectID})
 	if err != nil {
 		svc.logger.ErrorContext(ctx, "failed to resolve NFS shared-dir host base for cleanup on project delete",
 			"project_id", projectID, "error", err)
 		return
+	}
+
+	// When the global backend is not nfs, this host may legitimately not
+	// have the export mounted (for example, a hub whose own agents all use
+	// the local backend). A missing or unreadable host base then warns and
+	// skips; it never fails the delete.
+	if !globalNFS {
+		if _, statErr := os.Stat(res.HostBase); statErr != nil {
+			svc.logger.WarnContext(ctx, "NFS shared-dir export not reachable on this host; skipping shared-dir cleanup on project delete",
+				"project_id", projectID, "host_base", res.HostBase, "error", statErr)
+			return
+		}
 	}
 
 	if err := shareddirs.DeleteProjectTree(res.HostBase, subPathRoot, projectID); err != nil {
@@ -649,6 +692,21 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 		cs.ProjectSyncStates = n
 	}
 
+	// 16. Delegation edges — every active edge where an agent of the project
+	// (soft-deleted ones included) is the delegate or the delegator. The edge
+	// rows have no foreign key to the agent and survive the agent delete in
+	// CompositeStore.DeleteProject, so they are deactivated here, as a hard
+	// delete of each agent would, under one operation ID. The audit summary
+	// records that ID so each edge can be traced to this delete.
+	if n, opID, err := deactivateProjectAgentEdges(ctx, tx, projectID, svc.nowFunc()); err != nil {
+		return cs, err
+	} else {
+		cs.DelegationEdges = n
+		if n > 0 {
+			cs.DelegationEdgeOpID = opID
+		}
+	}
+
 	// ---------------------------------------------------------------------------
 	// Cascade inventory disposition — complete project-linked table audit
 	//
@@ -670,7 +728,8 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 	// | project_providers      | Transactional: DeleteProjectProvidersByProject (step 14) | Data     |
 	// |   (DB: project_contributors — store layer uses "provider" vocabulary)              |          |
 	// | project_sync_state     | Transactional: DeleteProjectSyncStatesByProject (step 15)| Data     |
-	// | agents                 | Explicit code in CompositeStore.DeleteProject (step 16)  | Runtime  |
+	// | delegation_edges       | Transactional: deactivated, rows kept (step 16)          | Auth     |
+	// | agents                 | Explicit code in CompositeStore.DeleteProject (step 17)  | Runtime  |
 	// | notifications          | Explicit code in CompositeStore.DeleteProject            | Data     |
 	// | notification_subs      | Explicit code in CompositeStore.DeleteProject            | Data     |
 	// | conversations          | Retained — historical audit/chat data; no auth grants    | None     |
@@ -682,24 +741,54 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 	return cs, nil
 }
 
+// deactivateProjectAgentEdges deactivates every active delegation edge where
+// an agent of projectID, soft-deleted or not, is the delegate or the
+// delegator, with cause agent_hard_delete under one operation ID. It returns
+// the number of edges deactivated and the operation ID.
+func deactivateProjectAgentEdges(ctx context.Context, tx store.Store, projectID string, now time.Time) (int, string, error) {
+	d := store.Deactivation{Cause: store.EdgeDeactivationAgentHardDelete, At: &now, OpID: api.NewUUID()}
+	total := 0
+	cursor := ""
+	for {
+		page, err := tx.ListAgents(ctx, store.AgentFilter{ProjectID: projectID, IncludeDeleted: true},
+			store.ListOptions{Limit: 100, Cursor: cursor, SkipTotalCount: true})
+		if err != nil {
+			return total, d.OpID, fmt.Errorf("list project agents for edge deactivation: %w", err)
+		}
+		if page == nil {
+			// Items holds values, so a page is the only nil the walk can
+			// meet. Fail rather than treat it as empty and leave edges active.
+			return total, d.OpID, fmt.Errorf("%w: nil agent page in deactivateProjectAgentEdges", store.ErrInvalidInput)
+		}
+		for _, a := range page.Items {
+			n, err := tx.DeactivateDelegationEdgesForDelegate(ctx, store.DelegationPrincipalAgent, a.ID, d)
+			if err != nil {
+				return total, d.OpID, fmt.Errorf("deactivate edges delegated to agent %s: %w", a.ID, err)
+			}
+			total += n
+			n, err = tx.DeactivateDelegationEdgesForDelegator(ctx, store.DelegationPrincipalAgent, a.ID, d)
+			if err != nil {
+				return total, d.OpID, fmt.Errorf("deactivate edges delegated by agent %s: %w", a.ID, err)
+			}
+			total += n
+		}
+		if page.NextCursor == "" {
+			return total, d.OpID, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Audit
 // ---------------------------------------------------------------------------
 
 // createAuditRecord writes a mutation audit record within the transaction.
 func (svc *ProjectDeletionService) createAuditRecord(ctx context.Context, txStore store.Store, record *store.MutationAuditRecord) error {
-	if record.ActorPrincipalKind == "" || record.ActorPrincipalID == "" {
-		identity := GetIdentityFromContext(ctx)
-		if identity != nil {
-			record.ActorPrincipalKind = identity.Type()
-			record.ActorPrincipalID = identity.ID()
-			credential := GetCredentialContextFromContext(ctx)
-			if credential.Kind != "" {
-				record.ActorCredentialID = credential.ID
-				record.ActorCredentialType = string(credential.Kind)
-			}
-		}
-	}
+	// E.2a: consolidated actor/credential-snapshot/correlation helper (plan
+	// §3.3), replacing this function's own copy of the extraction logic.
+	// ApplyActor only fills fields the caller has not already set explicitly.
+	auditActorFromContext(ctx).ApplyActor(record)
 	if record.Timestamp.IsZero() {
 		record.Timestamp = svc.nowFunc()
 	}
@@ -713,35 +802,4 @@ func marshalDeletionAuditJSON(m map[string]string) string {
 		return "{}"
 	}
 	return string(b)
-}
-
-// ---------------------------------------------------------------------------
-// Governance error parsing (reuses RS1 pattern)
-// ---------------------------------------------------------------------------
-
-// parseGovernanceError extracts governance denial details from a formatted
-// transaction error. Format: "governance:<status>:<reason>"
-func parseGovernanceError(err error) (status int, code string, reason string, ok bool) {
-	msg := err.Error()
-	var s int
-	var r string
-	if n, _ := fmt.Sscanf(msg, "governance:%d:", &s); n == 1 {
-		// Extract reason after second colon.
-		idx := 0
-		colons := 0
-		for i, c := range msg {
-			if c == ':' {
-				colons++
-				if colons == 2 {
-					idx = i + 1
-					break
-				}
-			}
-		}
-		if idx > 0 && idx < len(msg) {
-			r = msg[idx:]
-		}
-		return s, ErrCodeProjectDeleteForbidden, r, true
-	}
-	return 0, "", "", false
 }

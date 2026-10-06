@@ -150,7 +150,7 @@ func (s *Server) handleTemplatesV2(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		s.createTemplateV2(w, r)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPost)
 	}
 }
 
@@ -208,17 +208,11 @@ func (s *Server) listTemplatesV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity, cursor := GetIdentityFromContext(ctx), query.Get("cursor")
-	cursorBinding := authorizedListCursorBinding("templates", filter)
-	if cursor != "" {
-		if err := validateAuthorizedListCursor(cursor, cursorBinding); err != nil {
-			BadRequest(w, err.Error())
-			return
-		}
-	}
+	cursorBinding := scopedCursorBinding("templates", filter, identity)
 	wideAccess := s.hasCatalogWideListAccess(ctx, identity, "template", "template.list")
 	authorizeEach := identity != nil && !wideAccess
 	result, err := listAuthorizedOrAll(
-		ctx, identity, cursor, limit, cursorBinding, authorizeEach,
+		ctx, identity, cursor, limit, cursorBinding, s.listCursorSealer, authorizeEach,
 		func(ctx context.Context, opts store.ListOptions) (*store.ListResult[store.Template], error) {
 			return s.store.ListTemplates(ctx, filter, opts)
 		},
@@ -327,6 +321,13 @@ func (s *Server) createTemplateV2(w http.ResponseWriter, r *http.Request) {
 			ValidationError(w, "invalid template message mode: "+req.Config.MessageMode, nil)
 			return
 		}
+	}
+
+	if err := validateUploadFilePaths(req.Files); err != nil {
+		if !writeInvalidFilePathError(w, err) {
+			ValidationError(w, "files are invalid", nil)
+		}
+		return
 	}
 
 	// Create template record
@@ -462,7 +463,7 @@ func (s *Server) handleTemplateCRUD(w http.ResponseWriter, r *http.Request, id s
 	case http.MethodDelete:
 		s.deleteTemplateV2(w, r, id)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodPatch, http.MethodDelete)
 	}
 }
 
@@ -664,7 +665,7 @@ func (s *Server) deleteTemplateV2(w http.ResponseWriter, r *http.Request, id str
 	// If deleteFiles is true and we have storage, delete the files
 	if deleteFiles && existing.StoragePath != "" {
 		if stor := s.GetStorage(); stor != nil {
-			if err := stor.DeletePrefix(ctx, existing.StoragePath); err != nil {
+			if err := stor.DeletePrefix(ctx, storage.DirPrefix(existing.StoragePath)); err != nil {
 				slog.Warn("failed to delete template files", "template_id", id, "storage_path", existing.StoragePath, "error", err)
 			}
 		}
@@ -682,7 +683,7 @@ func (s *Server) deleteTemplateV2(w http.ResponseWriter, r *http.Request, id str
 // handleTemplateUpload handles requests for upload URLs.
 func (s *Server) handleTemplateUpload(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -725,6 +726,9 @@ func (s *Server) handleTemplateUpload(w http.ResponseWriter, r *http.Request, id
 	// Generate upload URLs using shared helper
 	uploadURLs, manifestURL, err := generateUploadURLs(ctx, stor, template.StoragePath, req.Files)
 	if err != nil {
+		if writeInvalidFilePathError(w, err) {
+			return
+		}
 		RuntimeError(w, "Failed to generate upload URLs: "+err.Error())
 		return
 	}
@@ -750,7 +754,7 @@ func (s *Server) handleTemplateUpload(w http.ResponseWriter, r *http.Request, id
 // handleTemplateFinalize finalizes a template after file upload.
 func (s *Server) handleTemplateFinalize(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -787,6 +791,9 @@ func (s *Server) handleTemplateFinalize(w http.ResponseWriter, r *http.Request, 
 	// Verify files exist in storage and compute content hash using shared helper
 	contentHash, err := verifyAndFinalizeFiles(ctx, stor, template.StoragePath, req.Manifest.Files)
 	if err != nil {
+		if writeInvalidFilePathError(w, err) {
+			return
+		}
 		ValidationError(w, err.Error(), nil)
 		return
 	}
@@ -825,7 +832,7 @@ func (s *Server) handleTemplateFinalize(w http.ResponseWriter, r *http.Request, 
 // handleTemplateDownload returns signed URLs for downloading template files.
 func (s *Server) handleTemplateDownload(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -883,7 +890,7 @@ func (s *Server) handleTemplateDownload(w http.ResponseWriter, r *http.Request, 
 // handleTemplateValidate validates a template's storage consistency.
 func (s *Server) handleTemplateValidate(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -914,7 +921,7 @@ func (s *Server) handleTemplateValidate(w http.ResponseWriter, r *http.Request, 
 // handleTemplateClone creates a copy of a template.
 func (s *Server) handleTemplateClone(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -1089,7 +1096,7 @@ func (s *Server) handleTemplateClone(w http.ResponseWriter, r *http.Request, id 
 			srcPath := source.StoragePath + "/" + file.Path
 			dstPath := storagePath + "/" + file.Path
 			if _, err := stor.Copy(ctx, srcPath, dstPath); err != nil {
-				_ = stor.DeletePrefix(ctx, storagePath)
+				_ = stor.DeletePrefix(ctx, storage.DirPrefix(storagePath))
 				RuntimeError(w, "Failed to copy files: "+err.Error())
 				return
 			}
@@ -1101,7 +1108,7 @@ func (s *Server) handleTemplateClone(w http.ResponseWriter, r *http.Request, id 
 
 	if err := s.store.CreateTemplate(ctx, clone); err != nil {
 		if stor != nil {
-			_ = stor.DeletePrefix(ctx, storagePath)
+			_ = stor.DeletePrefix(ctx, storage.DirPrefix(storagePath))
 		}
 		if errors.Is(err, store.ErrAlreadyExists) {
 			writeError(w, http.StatusConflict, "conflict", "A resource with this slug already exists in the target scope. Choose a different name.", nil)

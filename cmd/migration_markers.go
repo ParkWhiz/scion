@@ -36,11 +36,31 @@ const migrationsSectionName = "_migrations"
 type MigrationName string
 
 const (
-	MigrationDMKey                   MigrationName = "dm_key_migration"
-	MigrationBackfill                MigrationName = "message_backfill"
-	MigrationGroupRefRepair          MigrationName = "group_ref_repair"
-	MigrationWorkspaceModeLabel      MigrationName = "workspace_mode_label_backfill"
-	MigrationBrokerOwnershipBackfill MigrationName = "broker_ownership_backfill"
+	MigrationDMKey                         MigrationName = "dm_key_migration"
+	MigrationBackfill                      MigrationName = "message_backfill"
+	MigrationGroupRefRepair                MigrationName = "group_ref_repair"
+	MigrationWorkspaceModeLabel            MigrationName = "workspace_mode_label_backfill"
+	MigrationBrokerOwnershipBackfill       MigrationName = "broker_ownership_backfill"
+	MigrationNonAgentDispatchStateBackfill MigrationName = "non_agent_dispatch_state_backfill"
+	// MigrationBrokerQuotaBindingsToSettings is the one-shot migration that
+	// copies existing max_agents_per_broker entitlement bindings
+	// (scopeType=broker) into the broker_settings table (ptone/scion#2061
+	// P2-D4, ptone/scion#2063 items 2 and 3). See
+	// cmd/boot_broker_quota_bindings_to_settings.go.
+	MigrationBrokerQuotaBindingsToSettings MigrationName = "broker_quota_bindings_to_settings"
+	// MigrationEmptyPerAgentLegacyReport is the one-shot, read-only report
+	// of pre-#2703 non-git projects whose workspace-mode label now resolves
+	// to empty-per-agent. See cmd/boot_empty_per_agent_report.go.
+	MigrationEmptyPerAgentLegacyReport MigrationName = "empty_per_agent_legacy_report"
+	// MigrationUTCTimestampRepair records that the boot-time repair of
+	// unreadable SQLite timestamps completed. It only records completion:
+	// the probe runs on every boot regardless. See
+	// cmd/boot_utc_timestamp_repair.go.
+	MigrationUTCTimestampRepair MigrationName = "utc_timestamp_repair"
+	// MigrationRunIntentBackfill is the one-shot migration that sets
+	// agents.run_intent for rows that predate the column. See
+	// cmd/boot_run_intent_backfill.go.
+	MigrationRunIntentBackfill MigrationName = "run_intent_backfill"
 )
 
 // migrationMarker records the completion state of a single migration.
@@ -190,7 +210,10 @@ var ErrUnknownMigration = errors.New("unknown migration name")
 // isKnownMigration returns true if name is a recognised MigrationName.
 func isKnownMigration(name MigrationName) bool {
 	switch name {
-	case MigrationDMKey, MigrationBackfill, MigrationGroupRefRepair, MigrationWorkspaceModeLabel, MigrationBrokerOwnershipBackfill:
+	case MigrationDMKey, MigrationBackfill, MigrationGroupRefRepair, MigrationWorkspaceModeLabel,
+		MigrationBrokerOwnershipBackfill, MigrationNonAgentDispatchStateBackfill,
+		MigrationBrokerQuotaBindingsToSettings, MigrationEmptyPerAgentLegacyReport,
+		MigrationUTCTimestampRepair, MigrationRunIntentBackfill:
 		return true
 	default:
 		return false

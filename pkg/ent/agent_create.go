@@ -352,6 +352,20 @@ func (_c *AgentCreate) SetNillableRuntimeBrokerID(v *string) *AgentCreate {
 	return _c
 }
 
+// SetWorkspacePlacement sets the "workspace_placement" field.
+func (_c *AgentCreate) SetWorkspacePlacement(v string) *AgentCreate {
+	_c.mutation.SetWorkspacePlacement(v)
+	return _c
+}
+
+// SetNillableWorkspacePlacement sets the "workspace_placement" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableWorkspacePlacement(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetWorkspacePlacement(*v)
+	}
+	return _c
+}
+
 // SetWebPtyEnabled sets the "web_pty_enabled" field.
 func (_c *AgentCreate) SetWebPtyEnabled(v bool) *AgentCreate {
 	_c.mutation.SetWebPtyEnabled(v)
@@ -410,6 +424,20 @@ func (_c *AgentCreate) SetAppliedConfig(v string) *AgentCreate {
 func (_c *AgentCreate) SetNillableAppliedConfig(v *string) *AgentCreate {
 	if v != nil {
 		_c.SetAppliedConfig(*v)
+	}
+	return _c
+}
+
+// SetHarnessConfig sets the "harness_config" field.
+func (_c *AgentCreate) SetHarnessConfig(v string) *AgentCreate {
+	_c.mutation.SetHarnessConfig(v)
+	return _c
+}
+
+// SetNillableHarnessConfig sets the "harness_config" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableHarnessConfig(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetHarnessConfig(*v)
 	}
 	return _c
 }
@@ -560,6 +588,488 @@ func (_c *AgentCreate) SetNillableReincarnationUpdatedAt(v *time.Time) *AgentCre
 	return _c
 }
 
+// SetLaunchAsyncOptIn sets the "launch_async_opt_in" field.
+func (_c *AgentCreate) SetLaunchAsyncOptIn(v bool) *AgentCreate {
+	_c.mutation.SetLaunchAsyncOptIn(v)
+	return _c
+}
+
+// SetNillableLaunchAsyncOptIn sets the "launch_async_opt_in" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchAsyncOptIn(v *bool) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchAsyncOptIn(*v)
+	}
+	return _c
+}
+
+// SetLaunchID sets the "launch_id" field.
+func (_c *AgentCreate) SetLaunchID(v string) *AgentCreate {
+	_c.mutation.SetLaunchID(v)
+	return _c
+}
+
+// SetNillableLaunchID sets the "launch_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchID(*v)
+	}
+	return _c
+}
+
+// SetRunID sets the "run_id" field.
+func (_c *AgentCreate) SetRunID(v string) *AgentCreate {
+	_c.mutation.SetRunID(v)
+	return _c
+}
+
+// SetNillableRunID sets the "run_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableRunID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetRunID(*v)
+	}
+	return _c
+}
+
+// SetPreviousRunIds sets the "previous_run_ids" field.
+func (_c *AgentCreate) SetPreviousRunIds(v []string) *AgentCreate {
+	_c.mutation.SetPreviousRunIds(v)
+	return _c
+}
+
+// SetLaunchState sets the "launch_state" field.
+func (_c *AgentCreate) SetLaunchState(v string) *AgentCreate {
+	_c.mutation.SetLaunchState(v)
+	return _c
+}
+
+// SetNillableLaunchState sets the "launch_state" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchState(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchState(*v)
+	}
+	return _c
+}
+
+// SetLaunchEndReason sets the "launch_end_reason" field.
+func (_c *AgentCreate) SetLaunchEndReason(v string) *AgentCreate {
+	_c.mutation.SetLaunchEndReason(v)
+	return _c
+}
+
+// SetNillableLaunchEndReason sets the "launch_end_reason" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchEndReason(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchEndReason(*v)
+	}
+	return _c
+}
+
+// SetLaunchKind sets the "launch_kind" field.
+func (_c *AgentCreate) SetLaunchKind(v string) *AgentCreate {
+	_c.mutation.SetLaunchKind(v)
+	return _c
+}
+
+// SetNillableLaunchKind sets the "launch_kind" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchKind(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchKind(*v)
+	}
+	return _c
+}
+
+// SetLaunchDeadline sets the "launch_deadline" field.
+func (_c *AgentCreate) SetLaunchDeadline(v time.Time) *AgentCreate {
+	_c.mutation.SetLaunchDeadline(v)
+	return _c
+}
+
+// SetNillableLaunchDeadline sets the "launch_deadline" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchDeadline(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchDeadline(*v)
+	}
+	return _c
+}
+
+// SetLaunchLastReportAt sets the "launch_last_report_at" field.
+func (_c *AgentCreate) SetLaunchLastReportAt(v time.Time) *AgentCreate {
+	_c.mutation.SetLaunchLastReportAt(v)
+	return _c
+}
+
+// SetNillableLaunchLastReportAt sets the "launch_last_report_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchLastReportAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchLastReportAt(*v)
+	}
+	return _c
+}
+
+// SetLaunchOwner sets the "launch_owner" field.
+func (_c *AgentCreate) SetLaunchOwner(v string) *AgentCreate {
+	_c.mutation.SetLaunchOwner(v)
+	return _c
+}
+
+// SetNillableLaunchOwner sets the "launch_owner" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchOwner(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchOwner(*v)
+	}
+	return _c
+}
+
+// SetLaunchSeq sets the "launch_seq" field.
+func (_c *AgentCreate) SetLaunchSeq(v int64) *AgentCreate {
+	_c.mutation.SetLaunchSeq(v)
+	return _c
+}
+
+// SetNillableLaunchSeq sets the "launch_seq" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchSeq(v *int64) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchSeq(*v)
+	}
+	return _c
+}
+
+// SetLaunchStep sets the "launch_step" field.
+func (_c *AgentCreate) SetLaunchStep(v string) *AgentCreate {
+	_c.mutation.SetLaunchStep(v)
+	return _c
+}
+
+// SetNillableLaunchStep sets the "launch_step" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchStep(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchStep(*v)
+	}
+	return _c
+}
+
+// SetLaunchError sets the "launch_error" field.
+func (_c *AgentCreate) SetLaunchError(v string) *AgentCreate {
+	_c.mutation.SetLaunchError(v)
+	return _c
+}
+
+// SetNillableLaunchError sets the "launch_error" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchError(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchError(*v)
+	}
+	return _c
+}
+
+// SetDeletionState sets the "deletion_state" field.
+func (_c *AgentCreate) SetDeletionState(v string) *AgentCreate {
+	_c.mutation.SetDeletionState(v)
+	return _c
+}
+
+// SetNillableDeletionState sets the "deletion_state" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionState(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionState(*v)
+	}
+	return _c
+}
+
+// SetDeletionClaim sets the "deletion_claim" field.
+func (_c *AgentCreate) SetDeletionClaim(v int64) *AgentCreate {
+	_c.mutation.SetDeletionClaim(v)
+	return _c
+}
+
+// SetNillableDeletionClaim sets the "deletion_claim" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionClaim(v *int64) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionClaim(*v)
+	}
+	return _c
+}
+
+// SetDeletionLeaseAt sets the "deletion_lease_at" field.
+func (_c *AgentCreate) SetDeletionLeaseAt(v time.Time) *AgentCreate {
+	_c.mutation.SetDeletionLeaseAt(v)
+	return _c
+}
+
+// SetNillableDeletionLeaseAt sets the "deletion_lease_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionLeaseAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionLeaseAt(*v)
+	}
+	return _c
+}
+
+// SetDeletionStartedAt sets the "deletion_started_at" field.
+func (_c *AgentCreate) SetDeletionStartedAt(v time.Time) *AgentCreate {
+	_c.mutation.SetDeletionStartedAt(v)
+	return _c
+}
+
+// SetNillableDeletionStartedAt sets the "deletion_started_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionStartedAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionStartedAt(*v)
+	}
+	return _c
+}
+
+// SetDeletionFailedAt sets the "deletion_failed_at" field.
+func (_c *AgentCreate) SetDeletionFailedAt(v time.Time) *AgentCreate {
+	_c.mutation.SetDeletionFailedAt(v)
+	return _c
+}
+
+// SetNillableDeletionFailedAt sets the "deletion_failed_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionFailedAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionFailedAt(*v)
+	}
+	return _c
+}
+
+// SetDeletionCode sets the "deletion_code" field.
+func (_c *AgentCreate) SetDeletionCode(v string) *AgentCreate {
+	_c.mutation.SetDeletionCode(v)
+	return _c
+}
+
+// SetNillableDeletionCode sets the "deletion_code" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionCode(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionCode(*v)
+	}
+	return _c
+}
+
+// SetDeletionError sets the "deletion_error" field.
+func (_c *AgentCreate) SetDeletionError(v string) *AgentCreate {
+	_c.mutation.SetDeletionError(v)
+	return _c
+}
+
+// SetNillableDeletionError sets the "deletion_error" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionError(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionError(*v)
+	}
+	return _c
+}
+
+// SetDeletionPrior sets the "deletion_prior" field.
+func (_c *AgentCreate) SetDeletionPrior(v string) *AgentCreate {
+	_c.mutation.SetDeletionPrior(v)
+	return _c
+}
+
+// SetNillableDeletionPrior sets the "deletion_prior" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionPrior(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionPrior(*v)
+	}
+	return _c
+}
+
+// SetDeletionRequest sets the "deletion_request" field.
+func (_c *AgentCreate) SetDeletionRequest(v string) *AgentCreate {
+	_c.mutation.SetDeletionRequest(v)
+	return _c
+}
+
+// SetNillableDeletionRequest sets the "deletion_request" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableDeletionRequest(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetDeletionRequest(*v)
+	}
+	return _c
+}
+
+// SetRunIntent sets the "run_intent" field.
+func (_c *AgentCreate) SetRunIntent(v string) *AgentCreate {
+	_c.mutation.SetRunIntent(v)
+	return _c
+}
+
+// SetNillableRunIntent sets the "run_intent" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableRunIntent(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetRunIntent(*v)
+	}
+	return _c
+}
+
+// SetRunIntentAt sets the "run_intent_at" field.
+func (_c *AgentCreate) SetRunIntentAt(v time.Time) *AgentCreate {
+	_c.mutation.SetRunIntentAt(v)
+	return _c
+}
+
+// SetNillableRunIntentAt sets the "run_intent_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableRunIntentAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetRunIntentAt(*v)
+	}
+	return _c
+}
+
+// SetStartClaimID sets the "start_claim_id" field.
+func (_c *AgentCreate) SetStartClaimID(v string) *AgentCreate {
+	_c.mutation.SetStartClaimID(v)
+	return _c
+}
+
+// SetNillableStartClaimID sets the "start_claim_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimID(*v)
+	}
+	return _c
+}
+
+// SetStartClaimKind sets the "start_claim_kind" field.
+func (_c *AgentCreate) SetStartClaimKind(v string) *AgentCreate {
+	_c.mutation.SetStartClaimKind(v)
+	return _c
+}
+
+// SetNillableStartClaimKind sets the "start_claim_kind" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimKind(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimKind(*v)
+	}
+	return _c
+}
+
+// SetStartClaimState sets the "start_claim_state" field.
+func (_c *AgentCreate) SetStartClaimState(v string) *AgentCreate {
+	_c.mutation.SetStartClaimState(v)
+	return _c
+}
+
+// SetNillableStartClaimState sets the "start_claim_state" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimState(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimState(*v)
+	}
+	return _c
+}
+
+// SetStartClaimOwner sets the "start_claim_owner" field.
+func (_c *AgentCreate) SetStartClaimOwner(v string) *AgentCreate {
+	_c.mutation.SetStartClaimOwner(v)
+	return _c
+}
+
+// SetNillableStartClaimOwner sets the "start_claim_owner" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimOwner(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimOwner(*v)
+	}
+	return _c
+}
+
+// SetStartClaimTarget sets the "start_claim_target" field.
+func (_c *AgentCreate) SetStartClaimTarget(v string) *AgentCreate {
+	_c.mutation.SetStartClaimTarget(v)
+	return _c
+}
+
+// SetNillableStartClaimTarget sets the "start_claim_target" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimTarget(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimTarget(*v)
+	}
+	return _c
+}
+
+// SetStartClaimAt sets the "start_claim_at" field.
+func (_c *AgentCreate) SetStartClaimAt(v time.Time) *AgentCreate {
+	_c.mutation.SetStartClaimAt(v)
+	return _c
+}
+
+// SetNillableStartClaimAt sets the "start_claim_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimAt(*v)
+	}
+	return _c
+}
+
+// SetStartClaimLeaseUntil sets the "start_claim_lease_until" field.
+func (_c *AgentCreate) SetStartClaimLeaseUntil(v time.Time) *AgentCreate {
+	_c.mutation.SetStartClaimLeaseUntil(v)
+	return _c
+}
+
+// SetNillableStartClaimLeaseUntil sets the "start_claim_lease_until" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimLeaseUntil(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimLeaseUntil(*v)
+	}
+	return _c
+}
+
+// SetStartClaimUnconfirmedAt sets the "start_claim_unconfirmed_at" field.
+func (_c *AgentCreate) SetStartClaimUnconfirmedAt(v time.Time) *AgentCreate {
+	_c.mutation.SetStartClaimUnconfirmedAt(v)
+	return _c
+}
+
+// SetNillableStartClaimUnconfirmedAt sets the "start_claim_unconfirmed_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimUnconfirmedAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimUnconfirmedAt(*v)
+	}
+	return _c
+}
+
+// SetStartClaimHoldUntil sets the "start_claim_hold_until" field.
+func (_c *AgentCreate) SetStartClaimHoldUntil(v time.Time) *AgentCreate {
+	_c.mutation.SetStartClaimHoldUntil(v)
+	return _c
+}
+
+// SetNillableStartClaimHoldUntil sets the "start_claim_hold_until" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimHoldUntil(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimHoldUntil(*v)
+	}
+	return _c
+}
+
+// SetStartClaimLaunchID sets the "start_claim_launch_id" field.
+func (_c *AgentCreate) SetStartClaimLaunchID(v string) *AgentCreate {
+	_c.mutation.SetStartClaimLaunchID(v)
+	return _c
+}
+
+// SetNillableStartClaimLaunchID sets the "start_claim_launch_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableStartClaimLaunchID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetStartClaimLaunchID(*v)
+	}
+	return _c
+}
+
+// SetSoftDeleteOpID sets the "soft_delete_op_id" field.
+func (_c *AgentCreate) SetSoftDeleteOpID(v string) *AgentCreate {
+	_c.mutation.SetSoftDeleteOpID(v)
+	return _c
+}
+
+// SetNillableSoftDeleteOpID sets the "soft_delete_op_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableSoftDeleteOpID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetSoftDeleteOpID(*v)
+	}
+	return _c
+}
+
 // SetID sets the "id" field.
 func (_c *AgentCreate) SetID(v uuid.UUID) *AgentCreate {
 	_c.mutation.SetID(v)
@@ -668,6 +1178,10 @@ func (_c *AgentCreate) defaults() {
 		v := agent.DefaultDetached
 		_c.mutation.SetDetached(v)
 	}
+	if _, ok := _c.mutation.WorkspacePlacement(); !ok {
+		v := agent.DefaultWorkspacePlacement
+		_c.mutation.SetWorkspacePlacement(v)
+	}
 	if _, ok := _c.mutation.WebPtyEnabled(); !ok {
 		v := agent.DefaultWebPtyEnabled
 		_c.mutation.SetWebPtyEnabled(v)
@@ -691,6 +1205,90 @@ func (_c *AgentCreate) defaults() {
 	if _, ok := _c.mutation.ReincarnationState(); !ok {
 		v := agent.DefaultReincarnationState
 		_c.mutation.SetReincarnationState(v)
+	}
+	if _, ok := _c.mutation.LaunchAsyncOptIn(); !ok {
+		v := agent.DefaultLaunchAsyncOptIn
+		_c.mutation.SetLaunchAsyncOptIn(v)
+	}
+	if _, ok := _c.mutation.LaunchID(); !ok {
+		v := agent.DefaultLaunchID
+		_c.mutation.SetLaunchID(v)
+	}
+	if _, ok := _c.mutation.RunID(); !ok {
+		v := agent.DefaultRunID
+		_c.mutation.SetRunID(v)
+	}
+	if _, ok := _c.mutation.LaunchState(); !ok {
+		v := agent.DefaultLaunchState
+		_c.mutation.SetLaunchState(v)
+	}
+	if _, ok := _c.mutation.LaunchEndReason(); !ok {
+		v := agent.DefaultLaunchEndReason
+		_c.mutation.SetLaunchEndReason(v)
+	}
+	if _, ok := _c.mutation.LaunchKind(); !ok {
+		v := agent.DefaultLaunchKind
+		_c.mutation.SetLaunchKind(v)
+	}
+	if _, ok := _c.mutation.LaunchOwner(); !ok {
+		v := agent.DefaultLaunchOwner
+		_c.mutation.SetLaunchOwner(v)
+	}
+	if _, ok := _c.mutation.LaunchSeq(); !ok {
+		v := agent.DefaultLaunchSeq
+		_c.mutation.SetLaunchSeq(v)
+	}
+	if _, ok := _c.mutation.LaunchStep(); !ok {
+		v := agent.DefaultLaunchStep
+		_c.mutation.SetLaunchStep(v)
+	}
+	if _, ok := _c.mutation.LaunchError(); !ok {
+		v := agent.DefaultLaunchError
+		_c.mutation.SetLaunchError(v)
+	}
+	if _, ok := _c.mutation.DeletionState(); !ok {
+		v := agent.DefaultDeletionState
+		_c.mutation.SetDeletionState(v)
+	}
+	if _, ok := _c.mutation.DeletionClaim(); !ok {
+		v := agent.DefaultDeletionClaim
+		_c.mutation.SetDeletionClaim(v)
+	}
+	if _, ok := _c.mutation.DeletionCode(); !ok {
+		v := agent.DefaultDeletionCode
+		_c.mutation.SetDeletionCode(v)
+	}
+	if _, ok := _c.mutation.DeletionError(); !ok {
+		v := agent.DefaultDeletionError
+		_c.mutation.SetDeletionError(v)
+	}
+	if _, ok := _c.mutation.DeletionPrior(); !ok {
+		v := agent.DefaultDeletionPrior
+		_c.mutation.SetDeletionPrior(v)
+	}
+	if _, ok := _c.mutation.DeletionRequest(); !ok {
+		v := agent.DefaultDeletionRequest
+		_c.mutation.SetDeletionRequest(v)
+	}
+	if _, ok := _c.mutation.StartClaimKind(); !ok {
+		v := agent.DefaultStartClaimKind
+		_c.mutation.SetStartClaimKind(v)
+	}
+	if _, ok := _c.mutation.StartClaimState(); !ok {
+		v := agent.DefaultStartClaimState
+		_c.mutation.SetStartClaimState(v)
+	}
+	if _, ok := _c.mutation.StartClaimOwner(); !ok {
+		v := agent.DefaultStartClaimOwner
+		_c.mutation.SetStartClaimOwner(v)
+	}
+	if _, ok := _c.mutation.StartClaimTarget(); !ok {
+		v := agent.DefaultStartClaimTarget
+		_c.mutation.SetStartClaimTarget(v)
+	}
+	if _, ok := _c.mutation.StartClaimLaunchID(); !ok {
+		v := agent.DefaultStartClaimLaunchID
+		_c.mutation.SetStartClaimLaunchID(v)
 	}
 	if _, ok := _c.mutation.ID(); !ok {
 		v := agent.DefaultID()
@@ -761,6 +1359,15 @@ func (_c *AgentCreate) check() error {
 	}
 	if _, ok := _c.mutation.Generation(); !ok {
 		return &ValidationError{Name: "generation", err: errors.New(`ent: missing required field "Agent.generation"`)}
+	}
+	if _, ok := _c.mutation.LaunchAsyncOptIn(); !ok {
+		return &ValidationError{Name: "launch_async_opt_in", err: errors.New(`ent: missing required field "Agent.launch_async_opt_in"`)}
+	}
+	if _, ok := _c.mutation.LaunchSeq(); !ok {
+		return &ValidationError{Name: "launch_seq", err: errors.New(`ent: missing required field "Agent.launch_seq"`)}
+	}
+	if _, ok := _c.mutation.DeletionClaim(); !ok {
+		return &ValidationError{Name: "deletion_claim", err: errors.New(`ent: missing required field "Agent.deletion_claim"`)}
 	}
 	if len(_c.mutation.ProjectIDs()) == 0 {
 		return &ValidationError{Name: "project", err: errors.New(`ent: missing required edge "Agent.project"`)}
@@ -901,6 +1508,10 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 		_spec.SetField(agent.FieldRuntimeBrokerID, field.TypeString, value)
 		_node.RuntimeBrokerID = value
 	}
+	if value, ok := _c.mutation.WorkspacePlacement(); ok {
+		_spec.SetField(agent.FieldWorkspacePlacement, field.TypeString, value)
+		_node.WorkspacePlacement = value
+	}
 	if value, ok := _c.mutation.WebPtyEnabled(); ok {
 		_spec.SetField(agent.FieldWebPtyEnabled, field.TypeBool, value)
 		_node.WebPtyEnabled = value
@@ -920,6 +1531,10 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.AppliedConfig(); ok {
 		_spec.SetField(agent.FieldAppliedConfig, field.TypeString, value)
 		_node.AppliedConfig = value
+	}
+	if value, ok := _c.mutation.HarnessConfig(); ok {
+		_spec.SetField(agent.FieldHarnessConfig, field.TypeString, value)
+		_node.HarnessConfig = value
 	}
 	if value, ok := _c.mutation.Ancestry(); ok {
 		_spec.SetField(agent.FieldAncestry, field.TypeJSON, value)
@@ -964,6 +1579,146 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.ReincarnationUpdatedAt(); ok {
 		_spec.SetField(agent.FieldReincarnationUpdatedAt, field.TypeTime, value)
 		_node.ReincarnationUpdatedAt = &value
+	}
+	if value, ok := _c.mutation.LaunchAsyncOptIn(); ok {
+		_spec.SetField(agent.FieldLaunchAsyncOptIn, field.TypeBool, value)
+		_node.LaunchAsyncOptIn = value
+	}
+	if value, ok := _c.mutation.LaunchID(); ok {
+		_spec.SetField(agent.FieldLaunchID, field.TypeString, value)
+		_node.LaunchID = value
+	}
+	if value, ok := _c.mutation.RunID(); ok {
+		_spec.SetField(agent.FieldRunID, field.TypeString, value)
+		_node.RunID = value
+	}
+	if value, ok := _c.mutation.PreviousRunIds(); ok {
+		_spec.SetField(agent.FieldPreviousRunIds, field.TypeJSON, value)
+		_node.PreviousRunIds = value
+	}
+	if value, ok := _c.mutation.LaunchState(); ok {
+		_spec.SetField(agent.FieldLaunchState, field.TypeString, value)
+		_node.LaunchState = value
+	}
+	if value, ok := _c.mutation.LaunchEndReason(); ok {
+		_spec.SetField(agent.FieldLaunchEndReason, field.TypeString, value)
+		_node.LaunchEndReason = value
+	}
+	if value, ok := _c.mutation.LaunchKind(); ok {
+		_spec.SetField(agent.FieldLaunchKind, field.TypeString, value)
+		_node.LaunchKind = value
+	}
+	if value, ok := _c.mutation.LaunchDeadline(); ok {
+		_spec.SetField(agent.FieldLaunchDeadline, field.TypeTime, value)
+		_node.LaunchDeadline = &value
+	}
+	if value, ok := _c.mutation.LaunchLastReportAt(); ok {
+		_spec.SetField(agent.FieldLaunchLastReportAt, field.TypeTime, value)
+		_node.LaunchLastReportAt = &value
+	}
+	if value, ok := _c.mutation.LaunchOwner(); ok {
+		_spec.SetField(agent.FieldLaunchOwner, field.TypeString, value)
+		_node.LaunchOwner = value
+	}
+	if value, ok := _c.mutation.LaunchSeq(); ok {
+		_spec.SetField(agent.FieldLaunchSeq, field.TypeInt64, value)
+		_node.LaunchSeq = value
+	}
+	if value, ok := _c.mutation.LaunchStep(); ok {
+		_spec.SetField(agent.FieldLaunchStep, field.TypeString, value)
+		_node.LaunchStep = value
+	}
+	if value, ok := _c.mutation.LaunchError(); ok {
+		_spec.SetField(agent.FieldLaunchError, field.TypeString, value)
+		_node.LaunchError = value
+	}
+	if value, ok := _c.mutation.DeletionState(); ok {
+		_spec.SetField(agent.FieldDeletionState, field.TypeString, value)
+		_node.DeletionState = value
+	}
+	if value, ok := _c.mutation.DeletionClaim(); ok {
+		_spec.SetField(agent.FieldDeletionClaim, field.TypeInt64, value)
+		_node.DeletionClaim = value
+	}
+	if value, ok := _c.mutation.DeletionLeaseAt(); ok {
+		_spec.SetField(agent.FieldDeletionLeaseAt, field.TypeTime, value)
+		_node.DeletionLeaseAt = &value
+	}
+	if value, ok := _c.mutation.DeletionStartedAt(); ok {
+		_spec.SetField(agent.FieldDeletionStartedAt, field.TypeTime, value)
+		_node.DeletionStartedAt = &value
+	}
+	if value, ok := _c.mutation.DeletionFailedAt(); ok {
+		_spec.SetField(agent.FieldDeletionFailedAt, field.TypeTime, value)
+		_node.DeletionFailedAt = &value
+	}
+	if value, ok := _c.mutation.DeletionCode(); ok {
+		_spec.SetField(agent.FieldDeletionCode, field.TypeString, value)
+		_node.DeletionCode = value
+	}
+	if value, ok := _c.mutation.DeletionError(); ok {
+		_spec.SetField(agent.FieldDeletionError, field.TypeString, value)
+		_node.DeletionError = value
+	}
+	if value, ok := _c.mutation.DeletionPrior(); ok {
+		_spec.SetField(agent.FieldDeletionPrior, field.TypeString, value)
+		_node.DeletionPrior = value
+	}
+	if value, ok := _c.mutation.DeletionRequest(); ok {
+		_spec.SetField(agent.FieldDeletionRequest, field.TypeString, value)
+		_node.DeletionRequest = value
+	}
+	if value, ok := _c.mutation.RunIntent(); ok {
+		_spec.SetField(agent.FieldRunIntent, field.TypeString, value)
+		_node.RunIntent = &value
+	}
+	if value, ok := _c.mutation.RunIntentAt(); ok {
+		_spec.SetField(agent.FieldRunIntentAt, field.TypeTime, value)
+		_node.RunIntentAt = &value
+	}
+	if value, ok := _c.mutation.StartClaimID(); ok {
+		_spec.SetField(agent.FieldStartClaimID, field.TypeString, value)
+		_node.StartClaimID = &value
+	}
+	if value, ok := _c.mutation.StartClaimKind(); ok {
+		_spec.SetField(agent.FieldStartClaimKind, field.TypeString, value)
+		_node.StartClaimKind = value
+	}
+	if value, ok := _c.mutation.StartClaimState(); ok {
+		_spec.SetField(agent.FieldStartClaimState, field.TypeString, value)
+		_node.StartClaimState = value
+	}
+	if value, ok := _c.mutation.StartClaimOwner(); ok {
+		_spec.SetField(agent.FieldStartClaimOwner, field.TypeString, value)
+		_node.StartClaimOwner = value
+	}
+	if value, ok := _c.mutation.StartClaimTarget(); ok {
+		_spec.SetField(agent.FieldStartClaimTarget, field.TypeString, value)
+		_node.StartClaimTarget = value
+	}
+	if value, ok := _c.mutation.StartClaimAt(); ok {
+		_spec.SetField(agent.FieldStartClaimAt, field.TypeTime, value)
+		_node.StartClaimAt = &value
+	}
+	if value, ok := _c.mutation.StartClaimLeaseUntil(); ok {
+		_spec.SetField(agent.FieldStartClaimLeaseUntil, field.TypeTime, value)
+		_node.StartClaimLeaseUntil = &value
+	}
+	if value, ok := _c.mutation.StartClaimUnconfirmedAt(); ok {
+		_spec.SetField(agent.FieldStartClaimUnconfirmedAt, field.TypeTime, value)
+		_node.StartClaimUnconfirmedAt = &value
+	}
+	if value, ok := _c.mutation.StartClaimHoldUntil(); ok {
+		_spec.SetField(agent.FieldStartClaimHoldUntil, field.TypeTime, value)
+		_node.StartClaimHoldUntil = &value
+	}
+	if value, ok := _c.mutation.StartClaimLaunchID(); ok {
+		_spec.SetField(agent.FieldStartClaimLaunchID, field.TypeString, value)
+		_node.StartClaimLaunchID = value
+	}
+	if value, ok := _c.mutation.SoftDeleteOpID(); ok {
+		_spec.SetField(agent.FieldSoftDeleteOpID, field.TypeString, value)
+		_node.SoftDeleteOpID = &value
 	}
 	if nodes := _c.mutation.ProjectIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{
@@ -1498,6 +2253,24 @@ func (u *AgentUpsert) ClearRuntimeBrokerID() *AgentUpsert {
 	return u
 }
 
+// SetWorkspacePlacement sets the "workspace_placement" field.
+func (u *AgentUpsert) SetWorkspacePlacement(v string) *AgentUpsert {
+	u.Set(agent.FieldWorkspacePlacement, v)
+	return u
+}
+
+// UpdateWorkspacePlacement sets the "workspace_placement" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateWorkspacePlacement() *AgentUpsert {
+	u.SetExcluded(agent.FieldWorkspacePlacement)
+	return u
+}
+
+// ClearWorkspacePlacement clears the value of the "workspace_placement" field.
+func (u *AgentUpsert) ClearWorkspacePlacement() *AgentUpsert {
+	u.SetNull(agent.FieldWorkspacePlacement)
+	return u
+}
+
 // SetWebPtyEnabled sets the "web_pty_enabled" field.
 func (u *AgentUpsert) SetWebPtyEnabled(v bool) *AgentUpsert {
 	u.Set(agent.FieldWebPtyEnabled, v)
@@ -1579,6 +2352,24 @@ func (u *AgentUpsert) UpdateAppliedConfig() *AgentUpsert {
 // ClearAppliedConfig clears the value of the "applied_config" field.
 func (u *AgentUpsert) ClearAppliedConfig() *AgentUpsert {
 	u.SetNull(agent.FieldAppliedConfig)
+	return u
+}
+
+// SetHarnessConfig sets the "harness_config" field.
+func (u *AgentUpsert) SetHarnessConfig(v string) *AgentUpsert {
+	u.Set(agent.FieldHarnessConfig, v)
+	return u
+}
+
+// UpdateHarnessConfig sets the "harness_config" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateHarnessConfig() *AgentUpsert {
+	u.SetExcluded(agent.FieldHarnessConfig)
+	return u
+}
+
+// ClearHarnessConfig clears the value of the "harness_config" field.
+func (u *AgentUpsert) ClearHarnessConfig() *AgentUpsert {
+	u.SetNull(agent.FieldHarnessConfig)
 	return u
 }
 
@@ -1753,6 +2544,630 @@ func (u *AgentUpsert) UpdateReincarnationUpdatedAt() *AgentUpsert {
 // ClearReincarnationUpdatedAt clears the value of the "reincarnation_updated_at" field.
 func (u *AgentUpsert) ClearReincarnationUpdatedAt() *AgentUpsert {
 	u.SetNull(agent.FieldReincarnationUpdatedAt)
+	return u
+}
+
+// SetLaunchAsyncOptIn sets the "launch_async_opt_in" field.
+func (u *AgentUpsert) SetLaunchAsyncOptIn(v bool) *AgentUpsert {
+	u.Set(agent.FieldLaunchAsyncOptIn, v)
+	return u
+}
+
+// UpdateLaunchAsyncOptIn sets the "launch_async_opt_in" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchAsyncOptIn() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchAsyncOptIn)
+	return u
+}
+
+// SetLaunchID sets the "launch_id" field.
+func (u *AgentUpsert) SetLaunchID(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchID, v)
+	return u
+}
+
+// UpdateLaunchID sets the "launch_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchID() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchID)
+	return u
+}
+
+// ClearLaunchID clears the value of the "launch_id" field.
+func (u *AgentUpsert) ClearLaunchID() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchID)
+	return u
+}
+
+// SetRunID sets the "run_id" field.
+func (u *AgentUpsert) SetRunID(v string) *AgentUpsert {
+	u.Set(agent.FieldRunID, v)
+	return u
+}
+
+// UpdateRunID sets the "run_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateRunID() *AgentUpsert {
+	u.SetExcluded(agent.FieldRunID)
+	return u
+}
+
+// ClearRunID clears the value of the "run_id" field.
+func (u *AgentUpsert) ClearRunID() *AgentUpsert {
+	u.SetNull(agent.FieldRunID)
+	return u
+}
+
+// SetPreviousRunIds sets the "previous_run_ids" field.
+func (u *AgentUpsert) SetPreviousRunIds(v []string) *AgentUpsert {
+	u.Set(agent.FieldPreviousRunIds, v)
+	return u
+}
+
+// UpdatePreviousRunIds sets the "previous_run_ids" field to the value that was provided on create.
+func (u *AgentUpsert) UpdatePreviousRunIds() *AgentUpsert {
+	u.SetExcluded(agent.FieldPreviousRunIds)
+	return u
+}
+
+// ClearPreviousRunIds clears the value of the "previous_run_ids" field.
+func (u *AgentUpsert) ClearPreviousRunIds() *AgentUpsert {
+	u.SetNull(agent.FieldPreviousRunIds)
+	return u
+}
+
+// SetLaunchState sets the "launch_state" field.
+func (u *AgentUpsert) SetLaunchState(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchState, v)
+	return u
+}
+
+// UpdateLaunchState sets the "launch_state" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchState() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchState)
+	return u
+}
+
+// ClearLaunchState clears the value of the "launch_state" field.
+func (u *AgentUpsert) ClearLaunchState() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchState)
+	return u
+}
+
+// SetLaunchEndReason sets the "launch_end_reason" field.
+func (u *AgentUpsert) SetLaunchEndReason(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchEndReason, v)
+	return u
+}
+
+// UpdateLaunchEndReason sets the "launch_end_reason" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchEndReason() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchEndReason)
+	return u
+}
+
+// ClearLaunchEndReason clears the value of the "launch_end_reason" field.
+func (u *AgentUpsert) ClearLaunchEndReason() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchEndReason)
+	return u
+}
+
+// SetLaunchKind sets the "launch_kind" field.
+func (u *AgentUpsert) SetLaunchKind(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchKind, v)
+	return u
+}
+
+// UpdateLaunchKind sets the "launch_kind" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchKind() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchKind)
+	return u
+}
+
+// ClearLaunchKind clears the value of the "launch_kind" field.
+func (u *AgentUpsert) ClearLaunchKind() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchKind)
+	return u
+}
+
+// SetLaunchDeadline sets the "launch_deadline" field.
+func (u *AgentUpsert) SetLaunchDeadline(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldLaunchDeadline, v)
+	return u
+}
+
+// UpdateLaunchDeadline sets the "launch_deadline" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchDeadline() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchDeadline)
+	return u
+}
+
+// ClearLaunchDeadline clears the value of the "launch_deadline" field.
+func (u *AgentUpsert) ClearLaunchDeadline() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchDeadline)
+	return u
+}
+
+// SetLaunchLastReportAt sets the "launch_last_report_at" field.
+func (u *AgentUpsert) SetLaunchLastReportAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldLaunchLastReportAt, v)
+	return u
+}
+
+// UpdateLaunchLastReportAt sets the "launch_last_report_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchLastReportAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchLastReportAt)
+	return u
+}
+
+// ClearLaunchLastReportAt clears the value of the "launch_last_report_at" field.
+func (u *AgentUpsert) ClearLaunchLastReportAt() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchLastReportAt)
+	return u
+}
+
+// SetLaunchOwner sets the "launch_owner" field.
+func (u *AgentUpsert) SetLaunchOwner(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchOwner, v)
+	return u
+}
+
+// UpdateLaunchOwner sets the "launch_owner" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchOwner() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchOwner)
+	return u
+}
+
+// ClearLaunchOwner clears the value of the "launch_owner" field.
+func (u *AgentUpsert) ClearLaunchOwner() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchOwner)
+	return u
+}
+
+// SetLaunchSeq sets the "launch_seq" field.
+func (u *AgentUpsert) SetLaunchSeq(v int64) *AgentUpsert {
+	u.Set(agent.FieldLaunchSeq, v)
+	return u
+}
+
+// UpdateLaunchSeq sets the "launch_seq" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchSeq() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchSeq)
+	return u
+}
+
+// AddLaunchSeq adds v to the "launch_seq" field.
+func (u *AgentUpsert) AddLaunchSeq(v int64) *AgentUpsert {
+	u.Add(agent.FieldLaunchSeq, v)
+	return u
+}
+
+// SetLaunchStep sets the "launch_step" field.
+func (u *AgentUpsert) SetLaunchStep(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchStep, v)
+	return u
+}
+
+// UpdateLaunchStep sets the "launch_step" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchStep() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchStep)
+	return u
+}
+
+// ClearLaunchStep clears the value of the "launch_step" field.
+func (u *AgentUpsert) ClearLaunchStep() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchStep)
+	return u
+}
+
+// SetLaunchError sets the "launch_error" field.
+func (u *AgentUpsert) SetLaunchError(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchError, v)
+	return u
+}
+
+// UpdateLaunchError sets the "launch_error" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchError() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchError)
+	return u
+}
+
+// ClearLaunchError clears the value of the "launch_error" field.
+func (u *AgentUpsert) ClearLaunchError() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchError)
+	return u
+}
+
+// SetDeletionState sets the "deletion_state" field.
+func (u *AgentUpsert) SetDeletionState(v string) *AgentUpsert {
+	u.Set(agent.FieldDeletionState, v)
+	return u
+}
+
+// UpdateDeletionState sets the "deletion_state" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionState() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionState)
+	return u
+}
+
+// ClearDeletionState clears the value of the "deletion_state" field.
+func (u *AgentUpsert) ClearDeletionState() *AgentUpsert {
+	u.SetNull(agent.FieldDeletionState)
+	return u
+}
+
+// SetDeletionClaim sets the "deletion_claim" field.
+func (u *AgentUpsert) SetDeletionClaim(v int64) *AgentUpsert {
+	u.Set(agent.FieldDeletionClaim, v)
+	return u
+}
+
+// UpdateDeletionClaim sets the "deletion_claim" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionClaim() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionClaim)
+	return u
+}
+
+// AddDeletionClaim adds v to the "deletion_claim" field.
+func (u *AgentUpsert) AddDeletionClaim(v int64) *AgentUpsert {
+	u.Add(agent.FieldDeletionClaim, v)
+	return u
+}
+
+// SetDeletionLeaseAt sets the "deletion_lease_at" field.
+func (u *AgentUpsert) SetDeletionLeaseAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldDeletionLeaseAt, v)
+	return u
+}
+
+// UpdateDeletionLeaseAt sets the "deletion_lease_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionLeaseAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionLeaseAt)
+	return u
+}
+
+// ClearDeletionLeaseAt clears the value of the "deletion_lease_at" field.
+func (u *AgentUpsert) ClearDeletionLeaseAt() *AgentUpsert {
+	u.SetNull(agent.FieldDeletionLeaseAt)
+	return u
+}
+
+// SetDeletionStartedAt sets the "deletion_started_at" field.
+func (u *AgentUpsert) SetDeletionStartedAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldDeletionStartedAt, v)
+	return u
+}
+
+// UpdateDeletionStartedAt sets the "deletion_started_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionStartedAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionStartedAt)
+	return u
+}
+
+// ClearDeletionStartedAt clears the value of the "deletion_started_at" field.
+func (u *AgentUpsert) ClearDeletionStartedAt() *AgentUpsert {
+	u.SetNull(agent.FieldDeletionStartedAt)
+	return u
+}
+
+// SetDeletionFailedAt sets the "deletion_failed_at" field.
+func (u *AgentUpsert) SetDeletionFailedAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldDeletionFailedAt, v)
+	return u
+}
+
+// UpdateDeletionFailedAt sets the "deletion_failed_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionFailedAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionFailedAt)
+	return u
+}
+
+// ClearDeletionFailedAt clears the value of the "deletion_failed_at" field.
+func (u *AgentUpsert) ClearDeletionFailedAt() *AgentUpsert {
+	u.SetNull(agent.FieldDeletionFailedAt)
+	return u
+}
+
+// SetDeletionCode sets the "deletion_code" field.
+func (u *AgentUpsert) SetDeletionCode(v string) *AgentUpsert {
+	u.Set(agent.FieldDeletionCode, v)
+	return u
+}
+
+// UpdateDeletionCode sets the "deletion_code" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionCode() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionCode)
+	return u
+}
+
+// ClearDeletionCode clears the value of the "deletion_code" field.
+func (u *AgentUpsert) ClearDeletionCode() *AgentUpsert {
+	u.SetNull(agent.FieldDeletionCode)
+	return u
+}
+
+// SetDeletionError sets the "deletion_error" field.
+func (u *AgentUpsert) SetDeletionError(v string) *AgentUpsert {
+	u.Set(agent.FieldDeletionError, v)
+	return u
+}
+
+// UpdateDeletionError sets the "deletion_error" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionError() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionError)
+	return u
+}
+
+// ClearDeletionError clears the value of the "deletion_error" field.
+func (u *AgentUpsert) ClearDeletionError() *AgentUpsert {
+	u.SetNull(agent.FieldDeletionError)
+	return u
+}
+
+// SetDeletionPrior sets the "deletion_prior" field.
+func (u *AgentUpsert) SetDeletionPrior(v string) *AgentUpsert {
+	u.Set(agent.FieldDeletionPrior, v)
+	return u
+}
+
+// UpdateDeletionPrior sets the "deletion_prior" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionPrior() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionPrior)
+	return u
+}
+
+// ClearDeletionPrior clears the value of the "deletion_prior" field.
+func (u *AgentUpsert) ClearDeletionPrior() *AgentUpsert {
+	u.SetNull(agent.FieldDeletionPrior)
+	return u
+}
+
+// SetDeletionRequest sets the "deletion_request" field.
+func (u *AgentUpsert) SetDeletionRequest(v string) *AgentUpsert {
+	u.Set(agent.FieldDeletionRequest, v)
+	return u
+}
+
+// UpdateDeletionRequest sets the "deletion_request" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateDeletionRequest() *AgentUpsert {
+	u.SetExcluded(agent.FieldDeletionRequest)
+	return u
+}
+
+// ClearDeletionRequest clears the value of the "deletion_request" field.
+func (u *AgentUpsert) ClearDeletionRequest() *AgentUpsert {
+	u.SetNull(agent.FieldDeletionRequest)
+	return u
+}
+
+// SetRunIntent sets the "run_intent" field.
+func (u *AgentUpsert) SetRunIntent(v string) *AgentUpsert {
+	u.Set(agent.FieldRunIntent, v)
+	return u
+}
+
+// UpdateRunIntent sets the "run_intent" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateRunIntent() *AgentUpsert {
+	u.SetExcluded(agent.FieldRunIntent)
+	return u
+}
+
+// ClearRunIntent clears the value of the "run_intent" field.
+func (u *AgentUpsert) ClearRunIntent() *AgentUpsert {
+	u.SetNull(agent.FieldRunIntent)
+	return u
+}
+
+// SetRunIntentAt sets the "run_intent_at" field.
+func (u *AgentUpsert) SetRunIntentAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldRunIntentAt, v)
+	return u
+}
+
+// UpdateRunIntentAt sets the "run_intent_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateRunIntentAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldRunIntentAt)
+	return u
+}
+
+// ClearRunIntentAt clears the value of the "run_intent_at" field.
+func (u *AgentUpsert) ClearRunIntentAt() *AgentUpsert {
+	u.SetNull(agent.FieldRunIntentAt)
+	return u
+}
+
+// SetStartClaimID sets the "start_claim_id" field.
+func (u *AgentUpsert) SetStartClaimID(v string) *AgentUpsert {
+	u.Set(agent.FieldStartClaimID, v)
+	return u
+}
+
+// UpdateStartClaimID sets the "start_claim_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimID() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimID)
+	return u
+}
+
+// ClearStartClaimID clears the value of the "start_claim_id" field.
+func (u *AgentUpsert) ClearStartClaimID() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimID)
+	return u
+}
+
+// SetStartClaimKind sets the "start_claim_kind" field.
+func (u *AgentUpsert) SetStartClaimKind(v string) *AgentUpsert {
+	u.Set(agent.FieldStartClaimKind, v)
+	return u
+}
+
+// UpdateStartClaimKind sets the "start_claim_kind" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimKind() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimKind)
+	return u
+}
+
+// ClearStartClaimKind clears the value of the "start_claim_kind" field.
+func (u *AgentUpsert) ClearStartClaimKind() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimKind)
+	return u
+}
+
+// SetStartClaimState sets the "start_claim_state" field.
+func (u *AgentUpsert) SetStartClaimState(v string) *AgentUpsert {
+	u.Set(agent.FieldStartClaimState, v)
+	return u
+}
+
+// UpdateStartClaimState sets the "start_claim_state" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimState() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimState)
+	return u
+}
+
+// ClearStartClaimState clears the value of the "start_claim_state" field.
+func (u *AgentUpsert) ClearStartClaimState() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimState)
+	return u
+}
+
+// SetStartClaimOwner sets the "start_claim_owner" field.
+func (u *AgentUpsert) SetStartClaimOwner(v string) *AgentUpsert {
+	u.Set(agent.FieldStartClaimOwner, v)
+	return u
+}
+
+// UpdateStartClaimOwner sets the "start_claim_owner" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimOwner() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimOwner)
+	return u
+}
+
+// ClearStartClaimOwner clears the value of the "start_claim_owner" field.
+func (u *AgentUpsert) ClearStartClaimOwner() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimOwner)
+	return u
+}
+
+// SetStartClaimTarget sets the "start_claim_target" field.
+func (u *AgentUpsert) SetStartClaimTarget(v string) *AgentUpsert {
+	u.Set(agent.FieldStartClaimTarget, v)
+	return u
+}
+
+// UpdateStartClaimTarget sets the "start_claim_target" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimTarget() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimTarget)
+	return u
+}
+
+// ClearStartClaimTarget clears the value of the "start_claim_target" field.
+func (u *AgentUpsert) ClearStartClaimTarget() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimTarget)
+	return u
+}
+
+// SetStartClaimAt sets the "start_claim_at" field.
+func (u *AgentUpsert) SetStartClaimAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldStartClaimAt, v)
+	return u
+}
+
+// UpdateStartClaimAt sets the "start_claim_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimAt)
+	return u
+}
+
+// ClearStartClaimAt clears the value of the "start_claim_at" field.
+func (u *AgentUpsert) ClearStartClaimAt() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimAt)
+	return u
+}
+
+// SetStartClaimLeaseUntil sets the "start_claim_lease_until" field.
+func (u *AgentUpsert) SetStartClaimLeaseUntil(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldStartClaimLeaseUntil, v)
+	return u
+}
+
+// UpdateStartClaimLeaseUntil sets the "start_claim_lease_until" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimLeaseUntil() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimLeaseUntil)
+	return u
+}
+
+// ClearStartClaimLeaseUntil clears the value of the "start_claim_lease_until" field.
+func (u *AgentUpsert) ClearStartClaimLeaseUntil() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimLeaseUntil)
+	return u
+}
+
+// SetStartClaimUnconfirmedAt sets the "start_claim_unconfirmed_at" field.
+func (u *AgentUpsert) SetStartClaimUnconfirmedAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldStartClaimUnconfirmedAt, v)
+	return u
+}
+
+// UpdateStartClaimUnconfirmedAt sets the "start_claim_unconfirmed_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimUnconfirmedAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimUnconfirmedAt)
+	return u
+}
+
+// ClearStartClaimUnconfirmedAt clears the value of the "start_claim_unconfirmed_at" field.
+func (u *AgentUpsert) ClearStartClaimUnconfirmedAt() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimUnconfirmedAt)
+	return u
+}
+
+// SetStartClaimHoldUntil sets the "start_claim_hold_until" field.
+func (u *AgentUpsert) SetStartClaimHoldUntil(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldStartClaimHoldUntil, v)
+	return u
+}
+
+// UpdateStartClaimHoldUntil sets the "start_claim_hold_until" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimHoldUntil() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimHoldUntil)
+	return u
+}
+
+// ClearStartClaimHoldUntil clears the value of the "start_claim_hold_until" field.
+func (u *AgentUpsert) ClearStartClaimHoldUntil() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimHoldUntil)
+	return u
+}
+
+// SetStartClaimLaunchID sets the "start_claim_launch_id" field.
+func (u *AgentUpsert) SetStartClaimLaunchID(v string) *AgentUpsert {
+	u.Set(agent.FieldStartClaimLaunchID, v)
+	return u
+}
+
+// UpdateStartClaimLaunchID sets the "start_claim_launch_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateStartClaimLaunchID() *AgentUpsert {
+	u.SetExcluded(agent.FieldStartClaimLaunchID)
+	return u
+}
+
+// ClearStartClaimLaunchID clears the value of the "start_claim_launch_id" field.
+func (u *AgentUpsert) ClearStartClaimLaunchID() *AgentUpsert {
+	u.SetNull(agent.FieldStartClaimLaunchID)
+	return u
+}
+
+// SetSoftDeleteOpID sets the "soft_delete_op_id" field.
+func (u *AgentUpsert) SetSoftDeleteOpID(v string) *AgentUpsert {
+	u.Set(agent.FieldSoftDeleteOpID, v)
+	return u
+}
+
+// UpdateSoftDeleteOpID sets the "soft_delete_op_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateSoftDeleteOpID() *AgentUpsert {
+	u.SetExcluded(agent.FieldSoftDeleteOpID)
+	return u
+}
+
+// ClearSoftDeleteOpID clears the value of the "soft_delete_op_id" field.
+func (u *AgentUpsert) ClearSoftDeleteOpID() *AgentUpsert {
+	u.SetNull(agent.FieldSoftDeleteOpID)
 	return u
 }
 
@@ -2311,6 +3726,27 @@ func (u *AgentUpsertOne) ClearRuntimeBrokerID() *AgentUpsertOne {
 	})
 }
 
+// SetWorkspacePlacement sets the "workspace_placement" field.
+func (u *AgentUpsertOne) SetWorkspacePlacement(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetWorkspacePlacement(v)
+	})
+}
+
+// UpdateWorkspacePlacement sets the "workspace_placement" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateWorkspacePlacement() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateWorkspacePlacement()
+	})
+}
+
+// ClearWorkspacePlacement clears the value of the "workspace_placement" field.
+func (u *AgentUpsertOne) ClearWorkspacePlacement() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearWorkspacePlacement()
+	})
+}
+
 // SetWebPtyEnabled sets the "web_pty_enabled" field.
 func (u *AgentUpsertOne) SetWebPtyEnabled(v bool) *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
@@ -2406,6 +3842,27 @@ func (u *AgentUpsertOne) UpdateAppliedConfig() *AgentUpsertOne {
 func (u *AgentUpsertOne) ClearAppliedConfig() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearAppliedConfig()
+	})
+}
+
+// SetHarnessConfig sets the "harness_config" field.
+func (u *AgentUpsertOne) SetHarnessConfig(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetHarnessConfig(v)
+	})
+}
+
+// UpdateHarnessConfig sets the "harness_config" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateHarnessConfig() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateHarnessConfig()
+	})
+}
+
+// ClearHarnessConfig clears the value of the "harness_config" field.
+func (u *AgentUpsertOne) ClearHarnessConfig() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearHarnessConfig()
 	})
 }
 
@@ -2609,6 +4066,734 @@ func (u *AgentUpsertOne) UpdateReincarnationUpdatedAt() *AgentUpsertOne {
 func (u *AgentUpsertOne) ClearReincarnationUpdatedAt() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearReincarnationUpdatedAt()
+	})
+}
+
+// SetLaunchAsyncOptIn sets the "launch_async_opt_in" field.
+func (u *AgentUpsertOne) SetLaunchAsyncOptIn(v bool) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchAsyncOptIn(v)
+	})
+}
+
+// UpdateLaunchAsyncOptIn sets the "launch_async_opt_in" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchAsyncOptIn() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchAsyncOptIn()
+	})
+}
+
+// SetLaunchID sets the "launch_id" field.
+func (u *AgentUpsertOne) SetLaunchID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchID(v)
+	})
+}
+
+// UpdateLaunchID sets the "launch_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchID()
+	})
+}
+
+// ClearLaunchID clears the value of the "launch_id" field.
+func (u *AgentUpsertOne) ClearLaunchID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchID()
+	})
+}
+
+// SetRunID sets the "run_id" field.
+func (u *AgentUpsertOne) SetRunID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunID(v)
+	})
+}
+
+// UpdateRunID sets the "run_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateRunID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunID()
+	})
+}
+
+// ClearRunID clears the value of the "run_id" field.
+func (u *AgentUpsertOne) ClearRunID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunID()
+	})
+}
+
+// SetPreviousRunIds sets the "previous_run_ids" field.
+func (u *AgentUpsertOne) SetPreviousRunIds(v []string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetPreviousRunIds(v)
+	})
+}
+
+// UpdatePreviousRunIds sets the "previous_run_ids" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdatePreviousRunIds() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdatePreviousRunIds()
+	})
+}
+
+// ClearPreviousRunIds clears the value of the "previous_run_ids" field.
+func (u *AgentUpsertOne) ClearPreviousRunIds() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearPreviousRunIds()
+	})
+}
+
+// SetLaunchState sets the "launch_state" field.
+func (u *AgentUpsertOne) SetLaunchState(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchState(v)
+	})
+}
+
+// UpdateLaunchState sets the "launch_state" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchState() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchState()
+	})
+}
+
+// ClearLaunchState clears the value of the "launch_state" field.
+func (u *AgentUpsertOne) ClearLaunchState() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchState()
+	})
+}
+
+// SetLaunchEndReason sets the "launch_end_reason" field.
+func (u *AgentUpsertOne) SetLaunchEndReason(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchEndReason(v)
+	})
+}
+
+// UpdateLaunchEndReason sets the "launch_end_reason" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchEndReason() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchEndReason()
+	})
+}
+
+// ClearLaunchEndReason clears the value of the "launch_end_reason" field.
+func (u *AgentUpsertOne) ClearLaunchEndReason() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchEndReason()
+	})
+}
+
+// SetLaunchKind sets the "launch_kind" field.
+func (u *AgentUpsertOne) SetLaunchKind(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchKind(v)
+	})
+}
+
+// UpdateLaunchKind sets the "launch_kind" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchKind() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchKind()
+	})
+}
+
+// ClearLaunchKind clears the value of the "launch_kind" field.
+func (u *AgentUpsertOne) ClearLaunchKind() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchKind()
+	})
+}
+
+// SetLaunchDeadline sets the "launch_deadline" field.
+func (u *AgentUpsertOne) SetLaunchDeadline(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchDeadline(v)
+	})
+}
+
+// UpdateLaunchDeadline sets the "launch_deadline" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchDeadline() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchDeadline()
+	})
+}
+
+// ClearLaunchDeadline clears the value of the "launch_deadline" field.
+func (u *AgentUpsertOne) ClearLaunchDeadline() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchDeadline()
+	})
+}
+
+// SetLaunchLastReportAt sets the "launch_last_report_at" field.
+func (u *AgentUpsertOne) SetLaunchLastReportAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchLastReportAt(v)
+	})
+}
+
+// UpdateLaunchLastReportAt sets the "launch_last_report_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchLastReportAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchLastReportAt()
+	})
+}
+
+// ClearLaunchLastReportAt clears the value of the "launch_last_report_at" field.
+func (u *AgentUpsertOne) ClearLaunchLastReportAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchLastReportAt()
+	})
+}
+
+// SetLaunchOwner sets the "launch_owner" field.
+func (u *AgentUpsertOne) SetLaunchOwner(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchOwner(v)
+	})
+}
+
+// UpdateLaunchOwner sets the "launch_owner" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchOwner() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchOwner()
+	})
+}
+
+// ClearLaunchOwner clears the value of the "launch_owner" field.
+func (u *AgentUpsertOne) ClearLaunchOwner() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchOwner()
+	})
+}
+
+// SetLaunchSeq sets the "launch_seq" field.
+func (u *AgentUpsertOne) SetLaunchSeq(v int64) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchSeq(v)
+	})
+}
+
+// AddLaunchSeq adds v to the "launch_seq" field.
+func (u *AgentUpsertOne) AddLaunchSeq(v int64) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.AddLaunchSeq(v)
+	})
+}
+
+// UpdateLaunchSeq sets the "launch_seq" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchSeq() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchSeq()
+	})
+}
+
+// SetLaunchStep sets the "launch_step" field.
+func (u *AgentUpsertOne) SetLaunchStep(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchStep(v)
+	})
+}
+
+// UpdateLaunchStep sets the "launch_step" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchStep() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchStep()
+	})
+}
+
+// ClearLaunchStep clears the value of the "launch_step" field.
+func (u *AgentUpsertOne) ClearLaunchStep() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchStep()
+	})
+}
+
+// SetLaunchError sets the "launch_error" field.
+func (u *AgentUpsertOne) SetLaunchError(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchError(v)
+	})
+}
+
+// UpdateLaunchError sets the "launch_error" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchError() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchError()
+	})
+}
+
+// ClearLaunchError clears the value of the "launch_error" field.
+func (u *AgentUpsertOne) ClearLaunchError() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchError()
+	})
+}
+
+// SetDeletionState sets the "deletion_state" field.
+func (u *AgentUpsertOne) SetDeletionState(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionState(v)
+	})
+}
+
+// UpdateDeletionState sets the "deletion_state" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionState() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionState()
+	})
+}
+
+// ClearDeletionState clears the value of the "deletion_state" field.
+func (u *AgentUpsertOne) ClearDeletionState() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionState()
+	})
+}
+
+// SetDeletionClaim sets the "deletion_claim" field.
+func (u *AgentUpsertOne) SetDeletionClaim(v int64) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionClaim(v)
+	})
+}
+
+// AddDeletionClaim adds v to the "deletion_claim" field.
+func (u *AgentUpsertOne) AddDeletionClaim(v int64) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.AddDeletionClaim(v)
+	})
+}
+
+// UpdateDeletionClaim sets the "deletion_claim" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionClaim() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionClaim()
+	})
+}
+
+// SetDeletionLeaseAt sets the "deletion_lease_at" field.
+func (u *AgentUpsertOne) SetDeletionLeaseAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionLeaseAt(v)
+	})
+}
+
+// UpdateDeletionLeaseAt sets the "deletion_lease_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionLeaseAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionLeaseAt()
+	})
+}
+
+// ClearDeletionLeaseAt clears the value of the "deletion_lease_at" field.
+func (u *AgentUpsertOne) ClearDeletionLeaseAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionLeaseAt()
+	})
+}
+
+// SetDeletionStartedAt sets the "deletion_started_at" field.
+func (u *AgentUpsertOne) SetDeletionStartedAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionStartedAt(v)
+	})
+}
+
+// UpdateDeletionStartedAt sets the "deletion_started_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionStartedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionStartedAt()
+	})
+}
+
+// ClearDeletionStartedAt clears the value of the "deletion_started_at" field.
+func (u *AgentUpsertOne) ClearDeletionStartedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionStartedAt()
+	})
+}
+
+// SetDeletionFailedAt sets the "deletion_failed_at" field.
+func (u *AgentUpsertOne) SetDeletionFailedAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionFailedAt(v)
+	})
+}
+
+// UpdateDeletionFailedAt sets the "deletion_failed_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionFailedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionFailedAt()
+	})
+}
+
+// ClearDeletionFailedAt clears the value of the "deletion_failed_at" field.
+func (u *AgentUpsertOne) ClearDeletionFailedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionFailedAt()
+	})
+}
+
+// SetDeletionCode sets the "deletion_code" field.
+func (u *AgentUpsertOne) SetDeletionCode(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionCode(v)
+	})
+}
+
+// UpdateDeletionCode sets the "deletion_code" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionCode() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionCode()
+	})
+}
+
+// ClearDeletionCode clears the value of the "deletion_code" field.
+func (u *AgentUpsertOne) ClearDeletionCode() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionCode()
+	})
+}
+
+// SetDeletionError sets the "deletion_error" field.
+func (u *AgentUpsertOne) SetDeletionError(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionError(v)
+	})
+}
+
+// UpdateDeletionError sets the "deletion_error" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionError() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionError()
+	})
+}
+
+// ClearDeletionError clears the value of the "deletion_error" field.
+func (u *AgentUpsertOne) ClearDeletionError() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionError()
+	})
+}
+
+// SetDeletionPrior sets the "deletion_prior" field.
+func (u *AgentUpsertOne) SetDeletionPrior(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionPrior(v)
+	})
+}
+
+// UpdateDeletionPrior sets the "deletion_prior" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionPrior() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionPrior()
+	})
+}
+
+// ClearDeletionPrior clears the value of the "deletion_prior" field.
+func (u *AgentUpsertOne) ClearDeletionPrior() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionPrior()
+	})
+}
+
+// SetDeletionRequest sets the "deletion_request" field.
+func (u *AgentUpsertOne) SetDeletionRequest(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionRequest(v)
+	})
+}
+
+// UpdateDeletionRequest sets the "deletion_request" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateDeletionRequest() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionRequest()
+	})
+}
+
+// ClearDeletionRequest clears the value of the "deletion_request" field.
+func (u *AgentUpsertOne) ClearDeletionRequest() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionRequest()
+	})
+}
+
+// SetRunIntent sets the "run_intent" field.
+func (u *AgentUpsertOne) SetRunIntent(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunIntent(v)
+	})
+}
+
+// UpdateRunIntent sets the "run_intent" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateRunIntent() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunIntent()
+	})
+}
+
+// ClearRunIntent clears the value of the "run_intent" field.
+func (u *AgentUpsertOne) ClearRunIntent() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunIntent()
+	})
+}
+
+// SetRunIntentAt sets the "run_intent_at" field.
+func (u *AgentUpsertOne) SetRunIntentAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunIntentAt(v)
+	})
+}
+
+// UpdateRunIntentAt sets the "run_intent_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateRunIntentAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunIntentAt()
+	})
+}
+
+// ClearRunIntentAt clears the value of the "run_intent_at" field.
+func (u *AgentUpsertOne) ClearRunIntentAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunIntentAt()
+	})
+}
+
+// SetStartClaimID sets the "start_claim_id" field.
+func (u *AgentUpsertOne) SetStartClaimID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimID(v)
+	})
+}
+
+// UpdateStartClaimID sets the "start_claim_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimID()
+	})
+}
+
+// ClearStartClaimID clears the value of the "start_claim_id" field.
+func (u *AgentUpsertOne) ClearStartClaimID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimID()
+	})
+}
+
+// SetStartClaimKind sets the "start_claim_kind" field.
+func (u *AgentUpsertOne) SetStartClaimKind(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimKind(v)
+	})
+}
+
+// UpdateStartClaimKind sets the "start_claim_kind" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimKind() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimKind()
+	})
+}
+
+// ClearStartClaimKind clears the value of the "start_claim_kind" field.
+func (u *AgentUpsertOne) ClearStartClaimKind() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimKind()
+	})
+}
+
+// SetStartClaimState sets the "start_claim_state" field.
+func (u *AgentUpsertOne) SetStartClaimState(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimState(v)
+	})
+}
+
+// UpdateStartClaimState sets the "start_claim_state" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimState() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimState()
+	})
+}
+
+// ClearStartClaimState clears the value of the "start_claim_state" field.
+func (u *AgentUpsertOne) ClearStartClaimState() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimState()
+	})
+}
+
+// SetStartClaimOwner sets the "start_claim_owner" field.
+func (u *AgentUpsertOne) SetStartClaimOwner(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimOwner(v)
+	})
+}
+
+// UpdateStartClaimOwner sets the "start_claim_owner" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimOwner() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimOwner()
+	})
+}
+
+// ClearStartClaimOwner clears the value of the "start_claim_owner" field.
+func (u *AgentUpsertOne) ClearStartClaimOwner() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimOwner()
+	})
+}
+
+// SetStartClaimTarget sets the "start_claim_target" field.
+func (u *AgentUpsertOne) SetStartClaimTarget(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimTarget(v)
+	})
+}
+
+// UpdateStartClaimTarget sets the "start_claim_target" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimTarget() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimTarget()
+	})
+}
+
+// ClearStartClaimTarget clears the value of the "start_claim_target" field.
+func (u *AgentUpsertOne) ClearStartClaimTarget() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimTarget()
+	})
+}
+
+// SetStartClaimAt sets the "start_claim_at" field.
+func (u *AgentUpsertOne) SetStartClaimAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimAt(v)
+	})
+}
+
+// UpdateStartClaimAt sets the "start_claim_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimAt()
+	})
+}
+
+// ClearStartClaimAt clears the value of the "start_claim_at" field.
+func (u *AgentUpsertOne) ClearStartClaimAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimAt()
+	})
+}
+
+// SetStartClaimLeaseUntil sets the "start_claim_lease_until" field.
+func (u *AgentUpsertOne) SetStartClaimLeaseUntil(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimLeaseUntil(v)
+	})
+}
+
+// UpdateStartClaimLeaseUntil sets the "start_claim_lease_until" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimLeaseUntil() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimLeaseUntil()
+	})
+}
+
+// ClearStartClaimLeaseUntil clears the value of the "start_claim_lease_until" field.
+func (u *AgentUpsertOne) ClearStartClaimLeaseUntil() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimLeaseUntil()
+	})
+}
+
+// SetStartClaimUnconfirmedAt sets the "start_claim_unconfirmed_at" field.
+func (u *AgentUpsertOne) SetStartClaimUnconfirmedAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimUnconfirmedAt(v)
+	})
+}
+
+// UpdateStartClaimUnconfirmedAt sets the "start_claim_unconfirmed_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimUnconfirmedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimUnconfirmedAt()
+	})
+}
+
+// ClearStartClaimUnconfirmedAt clears the value of the "start_claim_unconfirmed_at" field.
+func (u *AgentUpsertOne) ClearStartClaimUnconfirmedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimUnconfirmedAt()
+	})
+}
+
+// SetStartClaimHoldUntil sets the "start_claim_hold_until" field.
+func (u *AgentUpsertOne) SetStartClaimHoldUntil(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimHoldUntil(v)
+	})
+}
+
+// UpdateStartClaimHoldUntil sets the "start_claim_hold_until" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimHoldUntil() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimHoldUntil()
+	})
+}
+
+// ClearStartClaimHoldUntil clears the value of the "start_claim_hold_until" field.
+func (u *AgentUpsertOne) ClearStartClaimHoldUntil() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimHoldUntil()
+	})
+}
+
+// SetStartClaimLaunchID sets the "start_claim_launch_id" field.
+func (u *AgentUpsertOne) SetStartClaimLaunchID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimLaunchID(v)
+	})
+}
+
+// UpdateStartClaimLaunchID sets the "start_claim_launch_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateStartClaimLaunchID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimLaunchID()
+	})
+}
+
+// ClearStartClaimLaunchID clears the value of the "start_claim_launch_id" field.
+func (u *AgentUpsertOne) ClearStartClaimLaunchID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimLaunchID()
+	})
+}
+
+// SetSoftDeleteOpID sets the "soft_delete_op_id" field.
+func (u *AgentUpsertOne) SetSoftDeleteOpID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetSoftDeleteOpID(v)
+	})
+}
+
+// UpdateSoftDeleteOpID sets the "soft_delete_op_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateSoftDeleteOpID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateSoftDeleteOpID()
+	})
+}
+
+// ClearSoftDeleteOpID clears the value of the "soft_delete_op_id" field.
+func (u *AgentUpsertOne) ClearSoftDeleteOpID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearSoftDeleteOpID()
 	})
 }
 
@@ -3334,6 +5519,27 @@ func (u *AgentUpsertBulk) ClearRuntimeBrokerID() *AgentUpsertBulk {
 	})
 }
 
+// SetWorkspacePlacement sets the "workspace_placement" field.
+func (u *AgentUpsertBulk) SetWorkspacePlacement(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetWorkspacePlacement(v)
+	})
+}
+
+// UpdateWorkspacePlacement sets the "workspace_placement" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateWorkspacePlacement() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateWorkspacePlacement()
+	})
+}
+
+// ClearWorkspacePlacement clears the value of the "workspace_placement" field.
+func (u *AgentUpsertBulk) ClearWorkspacePlacement() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearWorkspacePlacement()
+	})
+}
+
 // SetWebPtyEnabled sets the "web_pty_enabled" field.
 func (u *AgentUpsertBulk) SetWebPtyEnabled(v bool) *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
@@ -3429,6 +5635,27 @@ func (u *AgentUpsertBulk) UpdateAppliedConfig() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearAppliedConfig() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearAppliedConfig()
+	})
+}
+
+// SetHarnessConfig sets the "harness_config" field.
+func (u *AgentUpsertBulk) SetHarnessConfig(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetHarnessConfig(v)
+	})
+}
+
+// UpdateHarnessConfig sets the "harness_config" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateHarnessConfig() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateHarnessConfig()
+	})
+}
+
+// ClearHarnessConfig clears the value of the "harness_config" field.
+func (u *AgentUpsertBulk) ClearHarnessConfig() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearHarnessConfig()
 	})
 }
 
@@ -3632,6 +5859,734 @@ func (u *AgentUpsertBulk) UpdateReincarnationUpdatedAt() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearReincarnationUpdatedAt() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearReincarnationUpdatedAt()
+	})
+}
+
+// SetLaunchAsyncOptIn sets the "launch_async_opt_in" field.
+func (u *AgentUpsertBulk) SetLaunchAsyncOptIn(v bool) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchAsyncOptIn(v)
+	})
+}
+
+// UpdateLaunchAsyncOptIn sets the "launch_async_opt_in" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchAsyncOptIn() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchAsyncOptIn()
+	})
+}
+
+// SetLaunchID sets the "launch_id" field.
+func (u *AgentUpsertBulk) SetLaunchID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchID(v)
+	})
+}
+
+// UpdateLaunchID sets the "launch_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchID()
+	})
+}
+
+// ClearLaunchID clears the value of the "launch_id" field.
+func (u *AgentUpsertBulk) ClearLaunchID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchID()
+	})
+}
+
+// SetRunID sets the "run_id" field.
+func (u *AgentUpsertBulk) SetRunID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunID(v)
+	})
+}
+
+// UpdateRunID sets the "run_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateRunID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunID()
+	})
+}
+
+// ClearRunID clears the value of the "run_id" field.
+func (u *AgentUpsertBulk) ClearRunID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunID()
+	})
+}
+
+// SetPreviousRunIds sets the "previous_run_ids" field.
+func (u *AgentUpsertBulk) SetPreviousRunIds(v []string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetPreviousRunIds(v)
+	})
+}
+
+// UpdatePreviousRunIds sets the "previous_run_ids" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdatePreviousRunIds() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdatePreviousRunIds()
+	})
+}
+
+// ClearPreviousRunIds clears the value of the "previous_run_ids" field.
+func (u *AgentUpsertBulk) ClearPreviousRunIds() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearPreviousRunIds()
+	})
+}
+
+// SetLaunchState sets the "launch_state" field.
+func (u *AgentUpsertBulk) SetLaunchState(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchState(v)
+	})
+}
+
+// UpdateLaunchState sets the "launch_state" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchState() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchState()
+	})
+}
+
+// ClearLaunchState clears the value of the "launch_state" field.
+func (u *AgentUpsertBulk) ClearLaunchState() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchState()
+	})
+}
+
+// SetLaunchEndReason sets the "launch_end_reason" field.
+func (u *AgentUpsertBulk) SetLaunchEndReason(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchEndReason(v)
+	})
+}
+
+// UpdateLaunchEndReason sets the "launch_end_reason" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchEndReason() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchEndReason()
+	})
+}
+
+// ClearLaunchEndReason clears the value of the "launch_end_reason" field.
+func (u *AgentUpsertBulk) ClearLaunchEndReason() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchEndReason()
+	})
+}
+
+// SetLaunchKind sets the "launch_kind" field.
+func (u *AgentUpsertBulk) SetLaunchKind(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchKind(v)
+	})
+}
+
+// UpdateLaunchKind sets the "launch_kind" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchKind() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchKind()
+	})
+}
+
+// ClearLaunchKind clears the value of the "launch_kind" field.
+func (u *AgentUpsertBulk) ClearLaunchKind() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchKind()
+	})
+}
+
+// SetLaunchDeadline sets the "launch_deadline" field.
+func (u *AgentUpsertBulk) SetLaunchDeadline(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchDeadline(v)
+	})
+}
+
+// UpdateLaunchDeadline sets the "launch_deadline" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchDeadline() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchDeadline()
+	})
+}
+
+// ClearLaunchDeadline clears the value of the "launch_deadline" field.
+func (u *AgentUpsertBulk) ClearLaunchDeadline() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchDeadline()
+	})
+}
+
+// SetLaunchLastReportAt sets the "launch_last_report_at" field.
+func (u *AgentUpsertBulk) SetLaunchLastReportAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchLastReportAt(v)
+	})
+}
+
+// UpdateLaunchLastReportAt sets the "launch_last_report_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchLastReportAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchLastReportAt()
+	})
+}
+
+// ClearLaunchLastReportAt clears the value of the "launch_last_report_at" field.
+func (u *AgentUpsertBulk) ClearLaunchLastReportAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchLastReportAt()
+	})
+}
+
+// SetLaunchOwner sets the "launch_owner" field.
+func (u *AgentUpsertBulk) SetLaunchOwner(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchOwner(v)
+	})
+}
+
+// UpdateLaunchOwner sets the "launch_owner" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchOwner() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchOwner()
+	})
+}
+
+// ClearLaunchOwner clears the value of the "launch_owner" field.
+func (u *AgentUpsertBulk) ClearLaunchOwner() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchOwner()
+	})
+}
+
+// SetLaunchSeq sets the "launch_seq" field.
+func (u *AgentUpsertBulk) SetLaunchSeq(v int64) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchSeq(v)
+	})
+}
+
+// AddLaunchSeq adds v to the "launch_seq" field.
+func (u *AgentUpsertBulk) AddLaunchSeq(v int64) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.AddLaunchSeq(v)
+	})
+}
+
+// UpdateLaunchSeq sets the "launch_seq" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchSeq() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchSeq()
+	})
+}
+
+// SetLaunchStep sets the "launch_step" field.
+func (u *AgentUpsertBulk) SetLaunchStep(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchStep(v)
+	})
+}
+
+// UpdateLaunchStep sets the "launch_step" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchStep() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchStep()
+	})
+}
+
+// ClearLaunchStep clears the value of the "launch_step" field.
+func (u *AgentUpsertBulk) ClearLaunchStep() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchStep()
+	})
+}
+
+// SetLaunchError sets the "launch_error" field.
+func (u *AgentUpsertBulk) SetLaunchError(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchError(v)
+	})
+}
+
+// UpdateLaunchError sets the "launch_error" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchError() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchError()
+	})
+}
+
+// ClearLaunchError clears the value of the "launch_error" field.
+func (u *AgentUpsertBulk) ClearLaunchError() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchError()
+	})
+}
+
+// SetDeletionState sets the "deletion_state" field.
+func (u *AgentUpsertBulk) SetDeletionState(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionState(v)
+	})
+}
+
+// UpdateDeletionState sets the "deletion_state" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionState() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionState()
+	})
+}
+
+// ClearDeletionState clears the value of the "deletion_state" field.
+func (u *AgentUpsertBulk) ClearDeletionState() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionState()
+	})
+}
+
+// SetDeletionClaim sets the "deletion_claim" field.
+func (u *AgentUpsertBulk) SetDeletionClaim(v int64) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionClaim(v)
+	})
+}
+
+// AddDeletionClaim adds v to the "deletion_claim" field.
+func (u *AgentUpsertBulk) AddDeletionClaim(v int64) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.AddDeletionClaim(v)
+	})
+}
+
+// UpdateDeletionClaim sets the "deletion_claim" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionClaim() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionClaim()
+	})
+}
+
+// SetDeletionLeaseAt sets the "deletion_lease_at" field.
+func (u *AgentUpsertBulk) SetDeletionLeaseAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionLeaseAt(v)
+	})
+}
+
+// UpdateDeletionLeaseAt sets the "deletion_lease_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionLeaseAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionLeaseAt()
+	})
+}
+
+// ClearDeletionLeaseAt clears the value of the "deletion_lease_at" field.
+func (u *AgentUpsertBulk) ClearDeletionLeaseAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionLeaseAt()
+	})
+}
+
+// SetDeletionStartedAt sets the "deletion_started_at" field.
+func (u *AgentUpsertBulk) SetDeletionStartedAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionStartedAt(v)
+	})
+}
+
+// UpdateDeletionStartedAt sets the "deletion_started_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionStartedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionStartedAt()
+	})
+}
+
+// ClearDeletionStartedAt clears the value of the "deletion_started_at" field.
+func (u *AgentUpsertBulk) ClearDeletionStartedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionStartedAt()
+	})
+}
+
+// SetDeletionFailedAt sets the "deletion_failed_at" field.
+func (u *AgentUpsertBulk) SetDeletionFailedAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionFailedAt(v)
+	})
+}
+
+// UpdateDeletionFailedAt sets the "deletion_failed_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionFailedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionFailedAt()
+	})
+}
+
+// ClearDeletionFailedAt clears the value of the "deletion_failed_at" field.
+func (u *AgentUpsertBulk) ClearDeletionFailedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionFailedAt()
+	})
+}
+
+// SetDeletionCode sets the "deletion_code" field.
+func (u *AgentUpsertBulk) SetDeletionCode(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionCode(v)
+	})
+}
+
+// UpdateDeletionCode sets the "deletion_code" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionCode() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionCode()
+	})
+}
+
+// ClearDeletionCode clears the value of the "deletion_code" field.
+func (u *AgentUpsertBulk) ClearDeletionCode() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionCode()
+	})
+}
+
+// SetDeletionError sets the "deletion_error" field.
+func (u *AgentUpsertBulk) SetDeletionError(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionError(v)
+	})
+}
+
+// UpdateDeletionError sets the "deletion_error" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionError() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionError()
+	})
+}
+
+// ClearDeletionError clears the value of the "deletion_error" field.
+func (u *AgentUpsertBulk) ClearDeletionError() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionError()
+	})
+}
+
+// SetDeletionPrior sets the "deletion_prior" field.
+func (u *AgentUpsertBulk) SetDeletionPrior(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionPrior(v)
+	})
+}
+
+// UpdateDeletionPrior sets the "deletion_prior" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionPrior() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionPrior()
+	})
+}
+
+// ClearDeletionPrior clears the value of the "deletion_prior" field.
+func (u *AgentUpsertBulk) ClearDeletionPrior() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionPrior()
+	})
+}
+
+// SetDeletionRequest sets the "deletion_request" field.
+func (u *AgentUpsertBulk) SetDeletionRequest(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetDeletionRequest(v)
+	})
+}
+
+// UpdateDeletionRequest sets the "deletion_request" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateDeletionRequest() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateDeletionRequest()
+	})
+}
+
+// ClearDeletionRequest clears the value of the "deletion_request" field.
+func (u *AgentUpsertBulk) ClearDeletionRequest() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearDeletionRequest()
+	})
+}
+
+// SetRunIntent sets the "run_intent" field.
+func (u *AgentUpsertBulk) SetRunIntent(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunIntent(v)
+	})
+}
+
+// UpdateRunIntent sets the "run_intent" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateRunIntent() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunIntent()
+	})
+}
+
+// ClearRunIntent clears the value of the "run_intent" field.
+func (u *AgentUpsertBulk) ClearRunIntent() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunIntent()
+	})
+}
+
+// SetRunIntentAt sets the "run_intent_at" field.
+func (u *AgentUpsertBulk) SetRunIntentAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunIntentAt(v)
+	})
+}
+
+// UpdateRunIntentAt sets the "run_intent_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateRunIntentAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunIntentAt()
+	})
+}
+
+// ClearRunIntentAt clears the value of the "run_intent_at" field.
+func (u *AgentUpsertBulk) ClearRunIntentAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunIntentAt()
+	})
+}
+
+// SetStartClaimID sets the "start_claim_id" field.
+func (u *AgentUpsertBulk) SetStartClaimID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimID(v)
+	})
+}
+
+// UpdateStartClaimID sets the "start_claim_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimID()
+	})
+}
+
+// ClearStartClaimID clears the value of the "start_claim_id" field.
+func (u *AgentUpsertBulk) ClearStartClaimID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimID()
+	})
+}
+
+// SetStartClaimKind sets the "start_claim_kind" field.
+func (u *AgentUpsertBulk) SetStartClaimKind(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimKind(v)
+	})
+}
+
+// UpdateStartClaimKind sets the "start_claim_kind" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimKind() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimKind()
+	})
+}
+
+// ClearStartClaimKind clears the value of the "start_claim_kind" field.
+func (u *AgentUpsertBulk) ClearStartClaimKind() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimKind()
+	})
+}
+
+// SetStartClaimState sets the "start_claim_state" field.
+func (u *AgentUpsertBulk) SetStartClaimState(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimState(v)
+	})
+}
+
+// UpdateStartClaimState sets the "start_claim_state" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimState() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimState()
+	})
+}
+
+// ClearStartClaimState clears the value of the "start_claim_state" field.
+func (u *AgentUpsertBulk) ClearStartClaimState() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimState()
+	})
+}
+
+// SetStartClaimOwner sets the "start_claim_owner" field.
+func (u *AgentUpsertBulk) SetStartClaimOwner(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimOwner(v)
+	})
+}
+
+// UpdateStartClaimOwner sets the "start_claim_owner" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimOwner() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimOwner()
+	})
+}
+
+// ClearStartClaimOwner clears the value of the "start_claim_owner" field.
+func (u *AgentUpsertBulk) ClearStartClaimOwner() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimOwner()
+	})
+}
+
+// SetStartClaimTarget sets the "start_claim_target" field.
+func (u *AgentUpsertBulk) SetStartClaimTarget(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimTarget(v)
+	})
+}
+
+// UpdateStartClaimTarget sets the "start_claim_target" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimTarget() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimTarget()
+	})
+}
+
+// ClearStartClaimTarget clears the value of the "start_claim_target" field.
+func (u *AgentUpsertBulk) ClearStartClaimTarget() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimTarget()
+	})
+}
+
+// SetStartClaimAt sets the "start_claim_at" field.
+func (u *AgentUpsertBulk) SetStartClaimAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimAt(v)
+	})
+}
+
+// UpdateStartClaimAt sets the "start_claim_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimAt()
+	})
+}
+
+// ClearStartClaimAt clears the value of the "start_claim_at" field.
+func (u *AgentUpsertBulk) ClearStartClaimAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimAt()
+	})
+}
+
+// SetStartClaimLeaseUntil sets the "start_claim_lease_until" field.
+func (u *AgentUpsertBulk) SetStartClaimLeaseUntil(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimLeaseUntil(v)
+	})
+}
+
+// UpdateStartClaimLeaseUntil sets the "start_claim_lease_until" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimLeaseUntil() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimLeaseUntil()
+	})
+}
+
+// ClearStartClaimLeaseUntil clears the value of the "start_claim_lease_until" field.
+func (u *AgentUpsertBulk) ClearStartClaimLeaseUntil() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimLeaseUntil()
+	})
+}
+
+// SetStartClaimUnconfirmedAt sets the "start_claim_unconfirmed_at" field.
+func (u *AgentUpsertBulk) SetStartClaimUnconfirmedAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimUnconfirmedAt(v)
+	})
+}
+
+// UpdateStartClaimUnconfirmedAt sets the "start_claim_unconfirmed_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimUnconfirmedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimUnconfirmedAt()
+	})
+}
+
+// ClearStartClaimUnconfirmedAt clears the value of the "start_claim_unconfirmed_at" field.
+func (u *AgentUpsertBulk) ClearStartClaimUnconfirmedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimUnconfirmedAt()
+	})
+}
+
+// SetStartClaimHoldUntil sets the "start_claim_hold_until" field.
+func (u *AgentUpsertBulk) SetStartClaimHoldUntil(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimHoldUntil(v)
+	})
+}
+
+// UpdateStartClaimHoldUntil sets the "start_claim_hold_until" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimHoldUntil() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimHoldUntil()
+	})
+}
+
+// ClearStartClaimHoldUntil clears the value of the "start_claim_hold_until" field.
+func (u *AgentUpsertBulk) ClearStartClaimHoldUntil() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimHoldUntil()
+	})
+}
+
+// SetStartClaimLaunchID sets the "start_claim_launch_id" field.
+func (u *AgentUpsertBulk) SetStartClaimLaunchID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetStartClaimLaunchID(v)
+	})
+}
+
+// UpdateStartClaimLaunchID sets the "start_claim_launch_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateStartClaimLaunchID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateStartClaimLaunchID()
+	})
+}
+
+// ClearStartClaimLaunchID clears the value of the "start_claim_launch_id" field.
+func (u *AgentUpsertBulk) ClearStartClaimLaunchID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearStartClaimLaunchID()
+	})
+}
+
+// SetSoftDeleteOpID sets the "soft_delete_op_id" field.
+func (u *AgentUpsertBulk) SetSoftDeleteOpID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetSoftDeleteOpID(v)
+	})
+}
+
+// UpdateSoftDeleteOpID sets the "soft_delete_op_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateSoftDeleteOpID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateSoftDeleteOpID()
+	})
+}
+
+// ClearSoftDeleteOpID clears the value of the "soft_delete_op_id" field.
+func (u *AgentUpsertBulk) ClearSoftDeleteOpID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearSoftDeleteOpID()
 	})
 }
 

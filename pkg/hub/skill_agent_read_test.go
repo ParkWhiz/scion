@@ -78,7 +78,7 @@ func setupAgentSkillFixture(t *testing.T) *agentSkillFixture {
 		OwnerID: alice.ID, CreatedBy: alice.ID, Created: time.Now(), Updated: time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, q))
-	srv.createProjectMembersGroup(ctx, q)
+	srv.seedProjectCreatorMembership(ctx, q)
 
 	createTestUserWithProjectRole(t, s, u.ID, u.Email, p.ID, store.ProjectRoleMember)
 	createTestUserWithProjectRole(t, s, u.ID, u.Email, q.ID, store.ProjectRoleMember)
@@ -423,12 +423,11 @@ func TestAgentSkillRead_FilterParamsCannotWiden(t *testing.T) {
 }
 
 // A17: a project-less agent never gets a project bucket, and its predicate is
-// never nil (unfiltered). Its granted set is the hub catalog plus its
-// creator's user skills: the delegation ceiling walks with an empty scope
-// (it logs "no project scope" but does not itself deny), and post-backfill
-// reads by a hub-attested agent with no edge are allowed. With no origin user
-// there is no user bucket. Pinned here, together with probe ⇔ per-row
-// agreement on every fixture skill.
+// never nil (unfiltered). Its granted set is the hub catalog. It gets no
+// user bucket: a personal-skill progeny read requires the source user's
+// admission to the agent's execution project, and a project-less agent has
+// none. Pinned here, together with probe ⇔ per-row agreement on every
+// fixture skill.
 func TestAgentSkillRead_ProjectlessAgent(t *testing.T) {
 	f := setupAgentSkillFixture(t)
 	ctx := context.Background()
@@ -437,7 +436,7 @@ func TestAgentSkillRead_ProjectlessAgent(t *testing.T) {
 		ancestry []string
 		wantUser string
 	}{
-		{"with-creator", []string{f.u.ID}, f.u.ID},
+		{"with-creator", []string{f.u.ID}, ""},
 		{"no-ancestry", nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -475,52 +474,6 @@ func agentPredicateMatches(scope *store.SkillAccessScope, sk *store.Skill) bool 
 		}
 	}
 	return false
-}
-
-// The creator user-skill grant matches only a read of a user-scoped skill
-// owned by a hub-attested agent's origin user. A child agent (ancestry
-// [U, parent]) gets U's bucket, never its parent's or anyone else's.
-func TestAgentCreatorUserSkillGrant_Conditions(t *testing.T) {
-	u, v, parent := tid("cus-user-u"), tid("cus-user-v"), tid("cus-parent")
-	agent := func(ancestry ...string) PrincipalContext {
-		ident := &agentIdentityWrapper{&AgentTokenClaims{
-			Claims: jwt.Claims{Subject: tid("cus-agent")}, ProjectID: tid("cus-p"),
-			Scopes: ScopesForRole(AgentRoleBaseline), Ancestry: ancestry,
-		}}
-		return PrincipalContext{ID: ident.ID(), Kind: PrincipalKindAgent, Identity: ident}
-	}
-	su := skillScopeResource(store.SkillScopeUser, u)
-	sv := skillScopeResource(store.SkillScopeUser, v)
-	fed := NewFederatedAgentIdentity("https://other.example", tid("cus-fed"), tid("cus-p"), "fed", u, []string{u}, ScopesForRole(AgentRoleBaseline))
-
-	cases := []struct {
-		name      string
-		principal PrincipalContext
-		resource  Resource
-		action    Action
-		want      bool
-	}{
-		{"creator skill", agent(u), su, ActionRead, true},
-		{"child agent gets origin user's skill", agent(u, parent), su, ActionRead, true},
-		{"other user's skill", agent(u), sv, ActionRead, false},
-		{"parent agent id is not a user bucket", agent(u, parent), skillScopeResource(store.SkillScopeUser, parent), ActionRead, false},
-		{"no ancestry", agent(), su, ActionRead, false},
-		{"update", agent(u), su, ActionUpdate, false},
-		{"delete", agent(u), su, ActionDelete, false},
-		{"global skill", agent(u), skillScopeResource(store.SkillScopeGlobal, ""), ActionRead, false},
-		{"project skill", agent(u), skillScopeResource(store.SkillScopeProject, u), ActionRead, false},
-		{"user scope without owner", agent(u), skillScopeResource(store.SkillScopeUser, ""), ActionRead, false},
-		{"no scope kind", agent(u), Resource{Type: "skill", ScopeUserID: u}, ActionRead, false},
-		{"not a skill", agent(u), Resource{Type: "secret", ScopeKind: store.SkillScopeUser, ScopeUserID: u}, ActionRead, false},
-		{"federated agent", PrincipalContext{ID: fed.ID(), Kind: PrincipalKindAgent, Identity: fed}, su, ActionRead, false},
-		{"user principal", PrincipalContext{ID: u, Kind: PrincipalKindUser}, su, ActionRead, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, ok := agentCreatorUserSkillGrant(tc.principal, tc.resource, tc.action)
-			assert.Equal(t, tc.want, ok)
-		})
-	}
 }
 
 // A15: the synthetic catalog grant applies to no

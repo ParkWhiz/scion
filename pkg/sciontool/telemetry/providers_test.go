@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/telemetrycontract"
+	"go.opentelemetry.io/otel/attribute"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/metric"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
@@ -55,6 +57,7 @@ func TestNewProviders_IgnoresExternalEndpoint(t *testing.T) {
 		Enabled:      true,
 		CloudEnabled: true,
 		Endpoint:     "", // no endpoint
+		GRPCPort:     startStubLoopbackReceiver(t),
 	}
 	p, err := NewProviders(context.Background(), cfg, false)
 	if err != nil {
@@ -219,6 +222,25 @@ func TestHookProviderEmitsCounterDeltaAndOtherInstrumentTemporalities(t *testing
 }
 
 func TestHookProviderEmittedResourceAndPointsPassStrictCloudAdmission(t *testing.T) {
+	t.Run("clean env", func(t *testing.T) {
+		testHookProviderStrictCloudAdmission(t, nil)
+	})
+	// ptone/scion#2249: the OTel SDK merges resource.Environment() into
+	// every provider resource, so OTEL_RESOURCE_ATTRIBUTES and
+	// OTEL_SERVICE_NAME in sciontool's environment must not reach the
+	// loopback providers' resource and fail GCP admission.
+	t.Run("OTEL resource env set", func(t *testing.T) {
+		testHookProviderStrictCloudAdmission(t, map[string]string{
+			"OTEL_RESOURCE_ATTRIBUTES": "deployment.environment=prod,host.name=leak,service.name=env-service,scion.agent.id=env-agent",
+			"OTEL_SERVICE_NAME":        "env-service-name",
+		})
+	})
+}
+
+func testHookProviderStrictCloudAdmission(t *testing.T, ambient map[string]string) {
+	for key, value := range ambient {
+		t.Setenv(key, value)
+	}
 	for key, value := range map[string]string{
 		"SCION_AGENT_ID": "agent", "SCION_AGENT_SLUG": "slug", "SCION_PROJECT_ID": "project",
 		"SCION_HARNESS": "claude", "SCION_MODEL": "model", "SCION_BROKER_ID": "broker-id", "SCION_BROKER_NAME": "broker",
@@ -238,6 +260,7 @@ func TestHookProviderEmittedResourceAndPointsPassStrictCloudAdmission(t *testing
 		for key, want := range map[string]string{
 			"scion.agent.id": "agent", "scion.agent.slug": "slug", "scion.project.id": "project",
 			"scion.harness": "claude", "scion.model": "model", "scion.broker.id": "broker-id", "scion.broker.name": "broker",
+			"service.name": "sciontool",
 		} {
 			if got := attrValue(decision.Data[0].Resource.Attributes, key); got != want {
 				results <- fmt.Errorf("authoritative resource %s = %q, want %q", key, got, want)
@@ -264,9 +287,9 @@ func TestHookProviderEmittedResourceAndPointsPassStrictCloudAdmission(t *testing
 	}
 	meter := providers.MeterProvider.Meter(hookMetricScope)
 	tool, _ := meter.Int64Counter("agent.tool.calls", metric.WithUnit("{call}"))
-	tokens, _ := meter.Int64Counter("scion.hook.tokens.input", metric.WithUnit("{token}"))
+	tokens, _ := meter.Int64Counter(telemetrycontract.MetricUsageTokens, metric.WithUnit("{token}"))
 	tool.Add(context.Background(), 1)
-	tokens.Add(context.Background(), 3)
+	tokens.Add(context.Background(), 3, metric.WithAttributes(attribute.String(telemetrycontract.TokenTypeLabel, telemetrycontract.TokenTypeInput)))
 	if err := providers.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -361,6 +384,7 @@ func TestNewProviders_CloudDisabledStillUsesLocalBoundary(t *testing.T) {
 		Enabled:      true,
 		CloudEnabled: false,
 		Endpoint:     "localhost:4317",
+		GRPCPort:     startStubLoopbackReceiver(t),
 	}
 	p, err := NewProviders(context.Background(), cfg, false)
 	if err != nil {
@@ -372,12 +396,31 @@ func TestNewProviders_CloudDisabledStillUsesLocalBoundary(t *testing.T) {
 	shutdownProvidersForTest(t, p)
 }
 
+// startStubLoopbackReceiver starts a loopback receiver with no-op handlers
+// on an ephemeral port and returns that port, so provider tests export to a
+// live endpoint instead of dialing 127.0.0.1:0 and waiting out the export
+// timeout at Shutdown.
+func startStubLoopbackReceiver(t *testing.T) int {
+	t.Helper()
+	receiver := NewReceiver(&Config{Enabled: true},
+		func(context.Context, []*tracepb.ResourceSpans) error { return nil },
+		WithLogHandler(func(context.Context, []*logspb.ResourceLogs) error { return nil }),
+		WithMetricHandler(func(context.Context, []*metricpb.ResourceMetrics) error { return nil }),
+	)
+	if err := receiver.Start(context.Background()); err != nil {
+		t.Fatalf("start stub receiver: %v", err)
+	}
+	t.Cleanup(func() { _ = receiver.Stop(context.Background()) })
+	port, _ := receiver.BoundPorts()
+	return port
+}
+
 func shutdownProvidersForTest(t *testing.T, providers *Providers) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := providers.Shutdown(ctx); err != nil {
-		t.Logf("Shutdown returned expected error without a receiver: %v", err)
+		t.Fatalf("Shutdown: %v", err)
 	}
 }
 
@@ -394,6 +437,7 @@ func TestNewProviders_SyncMode(t *testing.T) {
 		CloudEnabled: true,
 		Endpoint:     "localhost:4317",
 		Insecure:     true,
+		GRPCPort:     startStubLoopbackReceiver(t),
 	}
 	p, err := NewProviders(context.Background(), cfg, false)
 	if err != nil {
@@ -412,13 +456,7 @@ func TestNewProviders_SyncMode(t *testing.T) {
 		t.Error("expected non-nil MeterProvider")
 	}
 
-	// Shutdown may return export errors when no collector is listening;
-	// this is expected in tests and not a provider creation failure.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := p.Shutdown(ctx); err != nil {
-		t.Logf("Shutdown returned expected export error (no collector): %v", err)
-	}
+	shutdownProvidersForTest(t, p)
 }
 
 func TestNewProviders_BatchMode(t *testing.T) {
@@ -427,6 +465,7 @@ func TestNewProviders_BatchMode(t *testing.T) {
 		CloudEnabled: true,
 		Endpoint:     "localhost:4317",
 		Insecure:     true,
+		GRPCPort:     startStubLoopbackReceiver(t),
 	}
 	p, err := NewProviders(context.Background(), cfg, true)
 	if err != nil {
@@ -445,11 +484,5 @@ func TestNewProviders_BatchMode(t *testing.T) {
 		t.Error("expected non-nil MeterProvider")
 	}
 
-	// Shutdown may return export errors when no collector is listening;
-	// this is expected in tests and not a provider creation failure.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := p.Shutdown(ctx); err != nil {
-		t.Logf("Shutdown returned expected export error (no collector): %v", err)
-	}
+	shutdownProvidersForTest(t, p)
 }

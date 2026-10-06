@@ -158,11 +158,13 @@ func gcpServiceAccountResource(sa *store.GCPServiceAccount) Resource {
 		ID:      sa.ID,
 		OwnerID: sa.CreatedBy,
 	}
-	// Only project-scoped service accounts are children of a project, so the
-	// project owner/admin bypass applies to them alone (mirrors
-	// harnessConfigResource). For hub- and user-scoped accounts ScopeID is a hub
-	// or user ID, not a project ID: claiming a project parent there would hand
-	// the bypass to the owner of whatever project happened to share that ID.
+	// Only project-scoped service accounts get a project ParentType/ParentID
+	// (mirrors harnessConfigResource). That link — not any SA-specific rule in
+	// the kernel — is what makes the ComputeCapabilities owner/admin
+	// short-circuit below apply to project-scoped accounts alone. For hub- and
+	// user-scoped accounts ScopeID is a hub or user ID, not a project ID:
+	// giving them a project parent would hand the short-circuit to the owner
+	// of whatever project happened to share that ID.
 	if sa.Scope == store.ScopeProject && sa.ScopeID != "" {
 		r.ParentType = "project"
 		r.ParentID = sa.ScopeID
@@ -172,6 +174,10 @@ func gcpServiceAccountResource(sa *store.GCPServiceAccount) Resource {
 
 // ComputeCapabilities evaluates which actions the identity can perform on a single resource.
 func (a *AuthzService) ComputeCapabilities(ctx context.Context, identity Identity, resource Resource) *Capabilities {
+	// Reuse the caller's principals, access constraints and delegation edges
+	// across every decision below (no-op if a memo or mask is already set).
+	// Nothing below writes authorization state, so the memo stays valid.
+	ctx = withAuthzInputMemo(ctx)
 	actions, ok := ResourceActions[resource.Type]
 	if !ok {
 		return &Capabilities{Actions: []string{}}
@@ -183,17 +189,8 @@ func (a *AuthzService) ComputeCapabilities(ctx context.Context, identity Identit
 		return a.computeCapabilitiesWithContext(ctx, identity, resource, actions)
 	}
 
-	// Project owner/admin short-circuit: full access on project and project-scoped
-	// resources. Mirrors the kernel evaluation so capability lists match what
-	// the user can actually do.
-	if user, ok := identity.(UserIdentity); ok {
-		if projectID := projectIDForResource(resource); projectID != "" {
-			if a.isProjectOwnerOrAdmin(ctx, user.ID(), projectID) {
-				return a.projectOwnerAdminCapabilities(ctx, identity, resource, actions)
-			}
-		}
-	}
-
+	// Every action is answered by the common decision, so the capability
+	// list is exactly what the caller can do.
 	var allowed []string
 	for _, action := range actions {
 		decision := a.CheckAccess(ctx, identity, resource, action)
@@ -208,7 +205,15 @@ func (a *AuthzService) ComputeCapabilities(ctx context.Context, identity Identit
 }
 
 // ComputeScopeCapabilities evaluates scope-level actions (e.g., create, list) for a resource type.
+// Each action is decided without an explicit permission, so an action whose
+// (resource type, action) pair does not resolve to exactly one registered
+// permission is reported as not allowed. Every "hub" scope action is such a
+// pair; hub-level checks pass an explicit Permission to Decide instead.
 func (a *AuthzService) ComputeScopeCapabilities(ctx context.Context, identity Identity, scopeType, scopeID, resourceType string) *Capabilities {
+	// Reuse the caller's principals, access constraints and delegation edges
+	// across every decision below (no-op if a memo or mask is already set).
+	// Nothing below writes authorization state, so the memo stays valid.
+	ctx = withAuthzInputMemo(ctx)
 	actions, ok := ScopeActions[resourceType]
 	if !ok {
 		return &Capabilities{Actions: []string{}}
@@ -226,14 +231,6 @@ func (a *AuthzService) ComputeScopeCapabilities(ctx context.Context, identity Id
 		return a.computeCapabilitiesWithContext(ctx, identity, resource, actions)
 	}
 
-	// Project owner/admin short-circuit at scope level (e.g. agent:create
-	// inside a project the user owns).
-	if user, ok := identity.(UserIdentity); ok && scopeType == "project" && scopeID != "" {
-		if a.isProjectOwnerOrAdmin(ctx, user.ID(), scopeID) {
-			return allActions(actions)
-		}
-	}
-
 	var allowed []string
 	for _, action := range actions {
 		decision := a.CheckAccess(ctx, identity, resource, action)
@@ -247,9 +244,27 @@ func (a *AuthzService) ComputeScopeCapabilities(ctx context.Context, identity Id
 	return &Capabilities{Actions: allowed}
 }
 
-// ComputeCapabilitiesBatch evaluates capabilities for a list of resources, optimized
-// for batch operation by expanding groups and fetching policies once.
+// ComputeCapabilitiesBatch evaluates capabilities for a list of resources.
+// It installs the request-local authorization input memo, so the caller's
+// principals, access constraints and delegation edges are loaded once for
+// the whole batch rather than once per decision; every decision still runs
+// the full evaluation path.
+//
+// PINNED to ComputeCapabilitiesForActions below: the two evaluation loops
+// (the IsScopedUserIdentity branch and the CheckAccess branch) must stay in
+// lockstep, field for field, with ComputeCapabilitiesForActions's loops over
+// an explicit action list. They are intentionally a duplicated body rather
+// than one delegating to the other. Both install the request-local input
+// memo at entry, so either can be called directly or nested inside an outer
+// install site with the same result.
+// TestListProjectAgentsSorted_CapsDeepEqualLegacy asserts the two stay
+// byte-identical on real requests; if you change one loop, change the other
+// and re-run that test.
 func (a *AuthzService) ComputeCapabilitiesBatch(ctx context.Context, identity Identity, resources []Resource, resourceType string) []*Capabilities {
+	// Reuse the caller's principals, access constraints and delegation edges
+	// across every decision below (no-op if a memo or mask is already set).
+	// Nothing below writes authorization state, so the memo stays valid.
+	ctx = withAuthzInputMemo(ctx)
 	actions, ok := ResourceActions[resourceType]
 	if !ok {
 		caps := make([]*Capabilities, len(resources))
@@ -269,33 +284,11 @@ func (a *AuthzService) ComputeCapabilitiesBatch(ctx context.Context, identity Id
 		return caps
 	}
 
-	// Per-batch project ownership cache. Most batches list resources from a
-	// single project, so this collapses to one lookup per project.
-	projectOwnerCache := map[string]bool{}
-	isProjectOwner := func(projectID string) bool {
-		if projectID == "" {
-			return false
-		}
-		user, ok := identity.(UserIdentity)
-		if !ok {
-			return false
-		}
-		if cached, ok := projectOwnerCache[projectID]; ok {
-			return cached
-		}
-		v := a.isProjectOwnerOrAdmin(ctx, user.ID(), projectID)
-		projectOwnerCache[projectID] = v
-		return v
-	}
-
+	// Every principal, project owners and admins included, gets each
+	// capability from one Decide call per resource and action, so a batch
+	// costs len(resources) × len(actions) decisions.
 	caps := make([]*Capabilities, len(resources))
 	for i, resource := range resources {
-		// Project owner/admin short-circuit
-		if isProjectOwner(projectIDForResource(resource)) {
-			caps[i] = a.projectOwnerAdminCapabilities(ctx, identity, resource, actions)
-			continue
-		}
-
 		var allowed []string
 		for _, action := range actions {
 			decision := a.CheckAccess(ctx, identity, resource, action)
@@ -309,6 +302,70 @@ func (a *AuthzService) ComputeCapabilitiesBatch(ctx context.Context, identity Id
 		caps[i] = &Capabilities{Actions: allowed}
 	}
 	return caps
+}
+
+// ComputeCapabilitiesForActions evaluates identity's capabilities over
+// resources for exactly the given actions, in that order, rather than the
+// full ResourceActions[resourceType] set ComputeCapabilitiesBatch uses. It is
+// the thin read-pass variant used by the sorted project endpoint for its
+// per-candidate ActionRead-only pass and for the full-row re-decision and
+// remaining-actions merge.
+//
+// It runs the identical evaluation path ComputeCapabilitiesBatch does —
+// DecideFromContext for a scoped UAT, CheckAccess otherwise — so a caller
+// that passes ResourceActions[resourceType] here gets byte-identical results
+// to ComputeCapabilitiesBatch (the decision-count test suite's
+// non-waivable gate asserts this deep-equality for the merged per-item
+// result). Each (resource, action) pair costs exactly one decision and one
+// audit record, same as today.
+func (a *AuthzService) ComputeCapabilitiesForActions(ctx context.Context, identity Identity, resources []Resource, actions []Action) []*Capabilities {
+	// Reuse the caller's principals, access constraints and delegation edges
+	// across every decision below (no-op if a memo or mask is already set).
+	// Nothing below writes authorization state, so the memo stays valid.
+	ctx = withAuthzInputMemo(ctx)
+	if IsScopedUserIdentity(identity) {
+		caps := make([]*Capabilities, len(resources))
+		for i, resource := range resources {
+			caps[i] = a.computeCapabilitiesWithContext(ctx, identity, resource, actions)
+		}
+		return caps
+	}
+
+	caps := make([]*Capabilities, len(resources))
+	for i, resource := range resources {
+		var allowed []string
+		for _, action := range actions {
+			decision := a.CheckAccess(ctx, identity, resource, action)
+			if decision.Allowed {
+				allowed = append(allowed, string(action))
+			}
+		}
+		if allowed == nil {
+			allowed = []string{}
+		}
+		caps[i] = &Capabilities{Actions: allowed}
+	}
+	return caps
+}
+
+// mergeCapabilities combines a read-only capability result (the read pass,
+// evaluated on the member snapshot) with a capability result for the
+// remaining actions (evaluated on the full row), preserving the action order
+// ResourceActions[resourceType] defines — the same order
+// ComputeCapabilitiesBatch produces, which is what the non-waivable
+// deep-equality gate requires and what the decision-count accounting
+// depends on: an item whose read decision came from the read pass and
+// whose remaining actions came from the remaining-actions pass must look
+// identical to one where every action was decided by a single
+// ComputeCapabilitiesBatch call.
+func mergeCapabilities(order []Action, readCap, restCap *Capabilities) *Capabilities {
+	allowed := make([]string, 0, len(order))
+	for _, action := range order {
+		if capabilityAllows(readCap, action) || capabilityAllows(restCap, action) {
+			allowed = append(allowed, string(action))
+		}
+	}
+	return &Capabilities{Actions: allowed}
 }
 
 // computeCapabilitiesWithContext evaluates every action through the canonical
@@ -325,47 +382,6 @@ func (a *AuthzService) computeCapabilitiesWithContext(ctx context.Context, ident
 		}
 	}
 	return &Capabilities{Actions: allowed}
-}
-
-// allActions returns a Capabilities with all provided actions.
-// ownerAdminExcludedActions are actions the project owner/admin capability
-// short-circuit must not grant blindly. Agents run with their creator's
-// user-scoped secrets, so attach and port access to another member's agent
-// would expose that member's credentials (miller79/scion#88). The seeded
-// project-owner/project-admin roles do not carry these permissions; access is
-// resolved per resource from the resource-owner/ancestor relationship grants.
-var ownerAdminExcludedActions = map[Action]bool{
-	ActionAttach:     true,
-	ActionPortAccess: true,
-}
-
-// projectOwnerAdminCapabilities returns the capability set for a project
-// owner/admin: every action except those in ownerAdminExcludedActions, which
-// are included only when the user owns the resource or appears in its
-// ancestry. This is a local check (no CheckAccess/DB lookup per action) so
-// ComputeCapabilitiesBatch stays O(resources) for owners/admins.
-func (a *AuthzService) projectOwnerAdminCapabilities(ctx context.Context, identity Identity, resource Resource, actions []Action) *Capabilities {
-	strs := make([]string, 0, len(actions))
-	userID := ""
-	if u, ok := identity.(UserIdentity); ok {
-		userID = u.ID()
-	}
-	ownsOrAncestor := userID != "" && (resource.OwnerID == userID || canAccessAsAncestor(userID, resource))
-	for _, action := range actions {
-		if ownerAdminExcludedActions[action] && !ownsOrAncestor {
-			continue
-		}
-		strs = append(strs, string(action))
-	}
-	return &Capabilities{Actions: strs}
-}
-
-func allActions(actions []Action) *Capabilities {
-	strs := make([]string, len(actions))
-	for i, a := range actions {
-		strs[i] = string(a)
-	}
-	return &Capabilities{Actions: strs}
 }
 
 // capabilityAllows returns true when the capability set includes the action.

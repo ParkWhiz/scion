@@ -85,6 +85,9 @@ func TestAdvisoryLockKeys_NonOverlapping(t *testing.T) {
 		LockFailedMessageRetention,
 		LockBrokerQuotaReconcile,
 		LockReincarnationSweep,
+		LockConduitRegistryReap,
+		LockStartClaimReaper,
+		LockAgentLaunchDeadline,
 	}
 
 	seen := make(map[AdvisoryLockKey]bool, len(singletonKeys)+2)
@@ -164,14 +167,18 @@ func TestAdvisoryLockKeys_AllUnique(t *testing.T) {
 		{"LockDataMigrations", LockDataMigrations},
 		{"LockRecoveryAuthz", LockRecoveryAuthz},
 		{"LockReincarnationSweep", LockReincarnationSweep},
+		{"LockConduitRegistryReap", LockConduitRegistryReap},
+		{"LockStartClaimReaper", LockStartClaimReaper},
 		// Per-object class IDs (different range, but must not collide
 		// with singletons or each other).
 		{"LockWorkspaceProvision", LockWorkspaceProvision},
 		{"LockQuotaEnforcement", LockQuotaEnforcement},
+		{"LockAgentHomeStart", LockAgentHomeStart},
 		{"LockNotificationDispatchSweep", LockNotificationDispatchSweep},
 		{"LockReleaseUpdateCheck", LockReleaseUpdateCheck},
 		{"LockFailedMessageRetention", LockFailedMessageRetention},
 		{"LockBrokerQuotaReconcile", LockBrokerQuotaReconcile},
+		{"LockAgentLaunchDeadline", LockAgentLaunchDeadline},
 	}
 
 	// --- Check 1: value uniqueness ---

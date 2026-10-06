@@ -55,6 +55,9 @@ type UserResponse struct {
 	DisplayName string `json:"displayName"`
 	Role        string `json:"role"`
 	AvatarURL   string `json:"avatarUrl,omitempty"`
+
+	// Preferences is populated only by handleAuthMe, from a live store read.
+	Preferences *store.UserPreferences `json:"preferences,omitempty"`
 }
 
 // AuthTokenRequest is the request body for /api/v1/auth/token.
@@ -146,11 +149,39 @@ type CLIAuthTokenResponse struct {
 }
 
 // TokenCreateRequest is the request body for creating a user access token.
+//
+// The token boundary is named by exactly one of two forms:
+//   - Boundary, the explicit form: {"kind":"project","projectId":...} or
+//     {"kind":"hub"}.
+//   - ProjectID, the project-boundary shorthand.
+//
+// A request that names neither is rejected; it is never read as a hub
+// boundary. A request that uses both forms must name the same project
+// boundary in each. A hub boundary with any project ID is rejected.
 type TokenCreateRequest struct {
-	Name      string     `json:"name"`
-	ProjectID string     `json:"projectId"`
-	Scopes    []string   `json:"scopes"`
-	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+	Name      string                `json:"name"`
+	ProjectID string                `json:"projectId"`
+	Boundary  *TokenBoundaryRequest `json:"boundary,omitempty"`
+	Scopes    []string              `json:"scopes"`
+	ExpiresAt *time.Time            `json:"expiresAt,omitempty"`
+
+	// E.1 descriptive credential metadata: optional, bounded, immutable
+	// after issuance (there is no update endpoint).
+	Purpose string            `json:"purpose,omitempty"`
+	Labels  map[string]string `json:"labels,omitempty"`
+}
+
+// TokenBoundaryRequest is the explicit boundary form of a token create
+// request.
+type TokenBoundaryRequest struct {
+	Kind      string `json:"kind"`
+	ProjectID string `json:"projectId,omitempty"`
+}
+
+// TokenBoundaryResponse is the boundary a token was issued under.
+type TokenBoundaryResponse struct {
+	Kind      string `json:"kind"`
+	ProjectID string `json:"projectId,omitempty"`
 }
 
 // TokenCreateResponse is the response for creating a user access token.
@@ -160,16 +191,26 @@ type TokenCreateResponse struct {
 }
 
 // TokenResponse is the access token info (without the actual token value).
+//
+// Boundary is the authoritative boundary. ProjectID is set for project
+// tokens and omitted for hub tokens; clients read Boundary.Kind to tell
+// the two apart.
 type TokenResponse struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Prefix    string     `json:"prefix"`
-	ProjectID string     `json:"projectId"`
-	Scopes    []string   `json:"scopes"`
-	Revoked   bool       `json:"revoked"`
-	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
-	LastUsed  *time.Time `json:"lastUsed,omitempty"`
-	Created   time.Time  `json:"created"`
+	ID        string                `json:"id"`
+	Name      string                `json:"name"`
+	Prefix    string                `json:"prefix"`
+	Boundary  TokenBoundaryResponse `json:"boundary"`
+	ProjectID string                `json:"projectId,omitempty"`
+	Scopes    []string              `json:"scopes"`
+	Revoked   bool                  `json:"revoked"`
+	ExpiresAt *time.Time            `json:"expiresAt,omitempty"`
+	LastUsed  *time.Time            `json:"lastUsed,omitempty"`
+	Created   time.Time             `json:"created"`
+
+	// E.1 descriptive credential metadata: empty for tokens created before
+	// E.1 or without metadata supplied at issuance.
+	Purpose string            `json:"purpose,omitempty"`
+	Labels  map[string]string `json:"labels,omitempty"`
 }
 
 // ExternalUserInfo carries the provider-verified identity fields needed to
@@ -544,6 +585,32 @@ func (s *Server) handleAuthValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply the same user-record check as UnifiedAuthMiddleware: a token
+	// whose subject has no user record, or whose user is suspended, is not
+	// reported valid. A store failure is reported as 503 store_error, as the
+	// middleware does.
+	if s.store != nil {
+		u, uErr := s.store.GetUser(r.Context(), claims.UserID)
+		switch {
+		case errors.Is(uErr, store.ErrNotFound):
+			writeJSON(w, http.StatusOK, AuthValidateResponse{Valid: false})
+			return
+		case uErr != nil:
+			slog.Error("Auth validate: user store lookup failed",
+				"user_id", claims.UserID, "error", uErr)
+			writeError(w, http.StatusServiceUnavailable, "store_error",
+				"unable to verify user status", nil)
+			return
+		case u == nil:
+			// No user record and no error: treated as not found.
+			writeJSON(w, http.StatusOK, AuthValidateResponse{Valid: false})
+			return
+		case u.Status == store.UserStatusSuspended:
+			writeJSON(w, http.StatusOK, AuthValidateResponse{Valid: false})
+			return
+		}
+	}
+
 	var expiresAt *time.Time
 	if claims.Expiry != nil {
 		t := claims.Expiry.Time()
@@ -606,6 +673,7 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		Email:       user.Email(),
 		DisplayName: user.DisplayName(),
 		Role:        user.Role(),
+		Preferences: loadUserPreferences(r.Context(), s.store, user.ID()),
 	})
 }
 
@@ -623,8 +691,7 @@ type AdminStatusResponse struct {
 // which admin sections are visible, and to allow access to admin routes.
 func (s *Server) handleAuthAdminStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -691,6 +758,15 @@ func requireSessionCredential(ctx context.Context) error {
 	}
 }
 
+// denyTokenManagement logs and writes the standard 403 for a token-management
+// request from a non-session credential — exactly the case where a UAT (or
+// other non-interactive credential) attempting to manage access tokens would
+// show up (plan §3.4, item 4).
+func denyTokenManagement(w http.ResponseWriter, r *http.Request, identity Identity, err error) {
+	logAuthzDenial(r, identity, Resource{Type: "user_access_token"}, ActionManage, err.Error())
+	writeError(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil)
+}
+
 // handleTokens routes user access token requests.
 func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -699,7 +775,7 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		s.handleCreateToken(w, r)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPost)
 	}
 }
 
@@ -720,7 +796,7 @@ func (s *Server) handleTokenByID(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			s.handleRevokeToken(w, r, parts[0])
 		} else {
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodPost)
 		}
 		return
 	}
@@ -733,7 +809,7 @@ func (s *Server) handleTokenByID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		s.handleDeleteToken(w, r, id)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodDelete)
 	}
 }
 
@@ -747,7 +823,7 @@ func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
 
 	// B4/A1: Credential caveat — only session/dev credentials may manage tokens.
 	if err := requireSessionCredential(r.Context()); err != nil {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil)
+		denyTokenManagement(w, r, user, err)
 		return
 	}
 
@@ -775,7 +851,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 
 	// B4/A1: Credential caveat — only session/dev credentials may manage tokens.
 	if err := requireSessionCredential(r.Context()); err != nil {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil)
+		denyTokenManagement(w, r, user, err)
 		return
 	}
 
@@ -785,8 +861,18 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key, token, err := s.uatService.CreateToken(r.Context(), user.ID(), req.Name, req.ProjectID, req.Scopes, req.ExpiresAt)
+	boundary, err := tokenCreateBoundary(req)
 	if err != nil {
+		writeTokenBoundaryError(w, err)
+		return
+	}
+
+	key, token, err := s.uatService.CreateTokenWithParams(r.Context(), CreateTokenParams{
+		UserID: user.ID(), Name: req.Name, Boundary: boundary, ProjectID: req.ProjectID, Scopes: req.Scopes, ExpiresAt: req.ExpiresAt,
+		Metadata: TokenMetadata{Purpose: req.Purpose, Labels: req.Labels},
+	})
+	if err != nil {
+		var metadataErr *ErrInvalidUATMetadata
 		switch {
 		case errors.Is(err, ErrUATLimitExceeded):
 			writeError(w, http.StatusConflict, "limit_exceeded", err.Error(), nil)
@@ -798,14 +884,27 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 			ValidationError(w, err.Error(), nil)
 		case errors.Is(err, ErrUATNameRequired):
 			ValidationError(w, err.Error(), nil)
-		case errors.Is(err, ErrUATProjectIDEmpty):
-			ValidationError(w, err.Error(), nil)
+		case errors.Is(err, ErrUATBoundaryRequired), errors.Is(err, ErrUATBoundaryInvalid):
+			writeTokenBoundaryError(w, err)
 		case errors.Is(err, ErrUATScopeEmpty):
 			ValidationError(w, err.Error(), nil)
 		case errors.Is(err, ErrUATScopeViolation):
-			writeError(w, http.StatusForbidden, "scope_violation", err.Error(), nil)
+			var details map[string]interface{}
+			var violation *UATScopeViolationError
+			if errors.As(err, &violation) {
+				details = map[string]interface{}{
+					"selector": violation.Selector,
+					"reason":   string(violation.Reason),
+				}
+			}
+			writeError(w, http.StatusForbidden, "scope_violation", err.Error(), details)
 		case errors.Is(err, ErrUATProjectForbidden):
 			writeError(w, http.StatusForbidden, ErrCodeForbidden, "forbidden", nil)
+		case errors.As(err, &metadataErr):
+			// E.1: bounded metadata validation failure. The error message
+			// names the field/rule only; it never echoes the offending
+			// value (see ErrInvalidUATMetadata).
+			ValidationError(w, err.Error(), nil)
 		default:
 			InternalError(w)
 		}
@@ -828,7 +927,7 @@ func (s *Server) handleGetToken(w http.ResponseWriter, r *http.Request, id strin
 
 	// B4/A1: Credential caveat — only session/dev credentials may manage tokens.
 	if err := requireSessionCredential(r.Context()); err != nil {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil)
+		denyTokenManagement(w, r, user, err)
 		return
 	}
 
@@ -852,7 +951,7 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request, id st
 
 	// B4/A1: Credential caveat — only session/dev credentials may manage tokens.
 	if err := requireSessionCredential(r.Context()); err != nil {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil)
+		denyTokenManagement(w, r, user, err)
 		return
 	}
 
@@ -875,7 +974,7 @@ func (s *Server) handleDeleteToken(w http.ResponseWriter, r *http.Request, id st
 
 	// B4/A1: Credential caveat — only session/dev credentials may manage tokens.
 	if err := requireSessionCredential(r.Context()); err != nil {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil)
+		denyTokenManagement(w, r, user, err)
 		return
 	}
 
@@ -889,10 +988,11 @@ func (s *Server) handleDeleteToken(w http.ResponseWriter, r *http.Request, id st
 }
 
 func tokenToResponse(t store.UserAccessToken) TokenResponse {
-	return TokenResponse{
+	resp := TokenResponse{
 		ID:        t.ID,
 		Name:      t.Name,
 		Prefix:    t.Prefix,
+		Boundary:  TokenBoundaryResponse{Kind: t.BoundaryKind, ProjectID: t.ProjectID},
 		ProjectID: t.ProjectID,
 		Scopes:    t.Scopes,
 		Revoked:   t.Revoked,
@@ -900,6 +1000,39 @@ func tokenToResponse(t store.UserAccessToken) TokenResponse {
 		LastUsed:  t.LastUsed,
 		Created:   t.Created,
 	}
+	// E.1 descriptive credential metadata.
+	if t.Purpose != nil {
+		resp.Purpose = *t.Purpose
+	}
+	if len(t.Labels) > 0 {
+		resp.Labels = t.Labels
+	}
+	return resp
+}
+
+// tokenCreateBoundary returns the explicit boundary named by req, or the
+// zero boundary when req uses only the project ID shorthand. A boundary
+// object without a kind is rejected. CreateTokenWithParams applies the
+// remaining rules (a request naming no boundary, a blank project ID in
+// either form, disagreeing forms, invalid boundaries).
+func tokenCreateBoundary(req TokenCreateRequest) (TokenBoundary, error) {
+	if req.Boundary == nil {
+		return TokenBoundary{}, nil
+	}
+	if req.Boundary.Kind == "" {
+		return TokenBoundary{}, ErrUATBoundaryInvalid
+	}
+	return TokenBoundary{Kind: BoundaryKind(req.Boundary.Kind), ProjectID: req.Boundary.ProjectID}, nil
+}
+
+// writeTokenBoundaryError writes the 400 response for a token request
+// whose boundary is missing or invalid.
+func writeTokenBoundaryError(w http.ResponseWriter, err error) {
+	reason := "boundary_invalid"
+	if errors.Is(err, ErrUATBoundaryRequired) {
+		reason = "boundary_required"
+	}
+	ValidationError(w, err.Error(), map[string]interface{}{"field": "boundary", "reason": reason})
 }
 
 func tokenResponsePtr(t *store.UserAccessToken) *TokenResponse {
@@ -911,7 +1044,7 @@ func tokenResponsePtr(t *store.UserAccessToken) *TokenResponse {
 // This endpoint generates an OAuth authorization URL for CLI login.
 func (s *Server) handleCLIAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -974,7 +1107,7 @@ func (s *Server) handleCLIAuthAuthorize(w http.ResponseWriter, r *http.Request) 
 // This endpoint returns configured OAuth providers for a given client type.
 func (s *Server) handleCLIAuthProviders(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -1017,7 +1150,7 @@ func (s *Server) handleCLIAuthProviders(w http.ResponseWriter, r *http.Request) 
 // This endpoint exchanges an OAuth authorization code for Hub tokens.
 func (s *Server) handleCLIAuthToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -1151,7 +1284,7 @@ type CLIDeviceTokenResponse struct {
 // This endpoint initiates the device authorization flow.
 func (s *Server) handleCLIDeviceAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -1204,7 +1337,7 @@ func (s *Server) handleCLIDeviceAuthorize(w http.ResponseWriter, r *http.Request
 // This endpoint polls for the device authorization result.
 func (s *Server) handleCLIDeviceToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -1392,96 +1525,90 @@ func (s *Server) provisionUser(ctx context.Context, info *ExternalUserInfo) (*st
 		if user.Role == "admin" {
 			s.ensureSuperAdminBinding(ctx, user.ID)
 		}
-	} else {
-		// Reject suspended users (covers both OAuth and proxy auth paths)
-		if user.Status == "suspended" {
-			slog.Warn("login rejected: user is suspended", "email", info.Email, "user_id", user.ID)
-			return nil, ErrUserSuspended
+		// Make the hub-members group and hub-viewer binding match the role
+		// now, so the user's first request already has the right hub
+		// permissions. Best-effort: a grant write failure degrades the
+		// session but must not fail the login; the startup backfill repairs
+		// it.
+		if err := syncHubRoleGrants(ctx, s.store, user.ID, user.Role, store.SystemReconcileCreatedBy); err != nil {
+			slog.Warn("failed to sync hub role grants on login", "email", info.Email, "user_id", user.ID, "role", user.Role, "error", err)
 		}
+		return user, nil
+	}
 
-		// Track whether we need to create or delete a super-admin
-		// RoleBinding. The actual mutation is deferred until after
-		// UpdateUser succeeds so that a failed UpdateUser cannot leave
-		// the binding state diverged from User.Role.
-		var bindingSuperAdmin string // "", "ensure", or "delete"
+	// Existing record: apply the same live sign-in policy and account-state
+	// handling every sign-in path shares (see applyLiveSignInPolicy in
+	// sign_in_policy.go). The sign-in policy was already checked above for
+	// both branches of this function, so preAuthorized=true here — the
+	// helper still enforces suspension unconditionally.
+	user, err = applyLiveSignInPolicy(ctx, s.signInPolicyDeps(), user, info.DisplayName, info.AvatarURL, true, signInPolicyPersistOpts{AlwaysPersist: true})
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
 
-		if user.Status == store.UserStatusInvited {
-			// Transition invited → active on first login
-			slog.Info("user activated from invited state", "email", info.Email, "user_id", user.ID)
-			user.Status = store.UserStatusActive
-			if info.DisplayName != "" {
-				user.DisplayName = info.DisplayName
-			}
-			if info.AvatarURL != "" {
-				user.AvatarURL = info.AvatarURL
-			}
-			user.LastLogin = time.Now()
-			oldRole := user.Role
+// signInPolicyDeps returns the applyLiveSignInPolicy callbacks backed by
+// this Server's config and store. Used by provisionUser for the
+// existing-record case; kept faithful to provisionUser's pre-refactor
+// inline logic field for field.
+func (s *Server) signInPolicyDeps() signInPolicyDeps {
+	return signInPolicyDeps{
+		authorize: s.isUserAuthorized,
+		activationRole: func(ctx context.Context, email, currentRole, userID string) string {
 			// The stored role on an invited row is a placeholder (invites
 			// carry no role), so evaluate as a brand-new user: admin if in
 			// admin_emails, otherwise the current default_user_role. The one
-			// carve-out is a pending invite that was already promoted through
-			// the admin UI; keep that admin.
-			activationRole := ""
-			uiPromoted := user.Role == store.UserRoleAdmin && hasUIPromotedBinding(ctx, s.store, user.ID)
+			// carve-out is a pending invite that was already promoted
+			// through the admin UI; keep that admin.
+			activation := ""
+			uiPromoted := currentRole == store.UserRoleAdmin && hasUIPromotedBinding(ctx, s.store, userID)
 			if uiPromoted {
-				activationRole = user.Role
+				activation = currentRole
 			}
-			user.Role = determineUserRole(info.Email, s.AdminEmails(), activationRole, s.demotionSafe.Load(), uiPromoted, s.DefaultUserRole())
-			if oldRole == "admin" && user.Role != "admin" {
-				bindingSuperAdmin = "delete"
-			} else if user.Role == "admin" && oldRole != "admin" {
-				bindingSuperAdmin = "ensure"
-			}
-			LogInviteAudit(ctx, s.auditLogger, InviteAuditUserActivated, info.Email, "", user.ID, info.Email, nil)
-		} else {
-			// Update last login and backfill profile
-			user.LastLogin = time.Now()
-			if info.AvatarURL != "" && user.AvatarURL == "" {
-				user.AvatarURL = info.AvatarURL
-			}
-			if info.DisplayName != "" && user.DisplayName == "" {
-				user.DisplayName = info.DisplayName
-			}
-			// Re-evaluate admin status on every login.
+			return determineUserRole(email, s.AdminEmails(), activation, s.demotionSafe.Load(), uiPromoted, s.DefaultUserRole())
+		},
+		roleFor: func(ctx context.Context, email, currentRole, userID string) string {
+			// Re-evaluate admin status on every sign-in.
 			// D11-fix2: when demotion actually happens (admin → non-admin),
-			// also delete the super-admin binding so IsSystemAdmin immediately
-			// agrees with IsUnscopedLocalPlatformAdmin. The empty-list guard
-			// is inherited: determineUserRole refuses to demote when AdminEmails
-			// is nil/empty, so oldRole == newRole and this branch is skipped.
-			if newRole := s.getUserRole(ctx, info.Email, user.Role, user.ID); user.Role != newRole {
-				oldRole := user.Role
-				slog.Info("User role changed on login", "email", info.Email, "old_role", oldRole, "new_role", newRole)
-				user.Role = newRole
-				if oldRole == "admin" {
-					bindingSuperAdmin = "delete"
-				} else if newRole == "admin" {
-					bindingSuperAdmin = "ensure"
-				}
+			// also delete the super-admin binding so IsSystemAdmin
+			// immediately agrees with IsUnscopedLocalPlatformAdmin. The
+			// empty-list guard is inherited: determineUserRole refuses to
+			// demote when AdminEmails is nil/empty.
+			return s.getUserRole(ctx, email, currentRole, userID)
+		},
+		UpdateUser:              s.store.UpdateUser,
+		ensureSuperAdminBinding: s.ensureSuperAdminBinding,
+		deleteSuperAdminBinding: s.deleteSuperAdminBinding,
+		syncGrants: func(ctx context.Context, userID, role string) error {
+			return syncHubRoleGrants(ctx, s.store, userID, role, store.SystemReconcileCreatedBy)
+		},
+		auditActivated: func(ctx context.Context, email, userID string) {
+			LogInviteAudit(ctx, s.auditLogger, InviteAuditUserActivated, email, "", userID, email, nil)
+		},
+		// auditDenied mirrors provisionUser's own denial-reason logic above.
+		// provisionUser calls the helper with preAuthorized=true, so this
+		// only fires from a caller (the resolver) that passes
+		// preAuthorized=false and fails the authorize check — provisionUser
+		// itself already audited its denial before ever reaching the helper,
+		// so there is no double-audit for that path.
+		//
+		// Volume note: the external-bearer path validates a cached credential
+		// on every request, so a token that keeps failing the sign-in policy
+		// writes one denial record per request for as long as the caller
+		// keeps presenting it. That is accepted deliberately: a policy
+		// denial is exactly the kind of event the audit trail exists to
+		// capture, an unauthorized caller retrying is expected to stop or be
+		// blocked at a layer above this one, and de-duplicating here would
+		// mean dropping legitimate repeat-denial records.
+		auditDenied: func(ctx context.Context, email string) {
+			reason := "not_on_allow_list"
+			if s.UserAccessMode() != "invite_only" {
+				reason = "domain_not_authorized"
 			}
-		}
-		if err := s.store.UpdateUser(ctx, user); err != nil {
-			slog.Error("failed to update user on login", "email", info.Email, "user_id", user.ID, "error", err)
-			return nil, fmt.Errorf("update user: %w", err)
-		}
-		// Apply binding changes only after UpdateUser has succeeded.
-		switch bindingSuperAdmin {
-		case "ensure":
-			s.ensureSuperAdminBinding(ctx, user.ID)
-		case "delete":
-			s.deleteSuperAdminBinding(ctx, user.ID)
-		}
+			LogInviteAuditFailure(ctx, s.auditLogger, InviteAuditLoginDenied, email, reason)
+		},
 	}
-
-	// Make the hub-members group and hub-viewer binding match the role now,
-	// so the user's first request already has the right hub permissions.
-	// Best-effort: a grant write failure degrades the session but must not
-	// fail the login; the startup backfill repairs it.
-	if err := syncHubRoleGrants(ctx, s.store, user.ID, user.Role, store.SystemReconcileCreatedBy); err != nil {
-		slog.Warn("failed to sync hub role grants on login", "email", info.Email, "user_id", user.ID, "role", user.Role, "error", err)
-	}
-
-	return user, nil
 }
 
 // generateID generates a new UUID.
@@ -1680,7 +1807,7 @@ func hasUIPromotedBinding(ctx context.Context, st store.Store, userID string) bo
 // handleInviteRedeem handles POST /api/v1/auth/invite/redeem.
 func (s *Server) handleInviteRedeem(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -1752,12 +1879,78 @@ func (s *Server) handleInviteRedeem(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// TokenBoundaryDTO is the wire shape for a UAT boundary: {"kind":"project",
+// "projectId":"..."} for a project boundary, or {"kind":"hub"} (projectId
+// omitted) for a hub boundary. This is the shared shape referenced from both
+// the scopes-eligibility response below and the token create/response
+// boundary field; keep both call sites on this one type rather than two
+// independently drifting json structs.
+type TokenBoundaryDTO struct {
+	Kind      string `json:"kind"`
+	ProjectID string `json:"projectId,omitempty"`
+}
+
+func tokenBoundaryToDTO(b TokenBoundary) TokenBoundaryDTO {
+	dto := TokenBoundaryDTO{Kind: string(b.Kind)}
+	if b.Kind == BoundaryKindProject {
+		dto.ProjectID = b.ProjectID
+	}
+	return dto
+}
+
+// ScopeEligibility answers, for one selector and one requested boundary,
+// only "may the authenticated user select this restriction" -- never a
+// capability and never a target list. Eligible is computed fresh from the
+// principal's current authority; it is never widened by any credential the
+// caller happens to present.
+type ScopeEligibility struct {
+	Boundary TokenBoundaryDTO `json:"boundary"`
+	Eligible bool             `json:"eligible"`
+	// Reason is a MintDenialReason code, present only when !Eligible,
+	// including "project_access_required": that code appears here
+	// whenever at least one OTHER selector in the same request was
+	// admitted, since the caller already knows the project exists in that
+	// case. It appears ONLY as the request's uniform 403 -- never here --
+	// when EVERY evaluated selector was denied for project access; see
+	// handleAuthScopes.
+	Reason string `json:"reason,omitempty"`
+	Note   string `json:"note,omitempty"`
+	// IneligibleMembers is set only on an alias entry (AuthScopeAlias): the
+	// subset of ExpandsTo that is not eligible. An alias is Eligible only
+	// when every member is.
+	IneligibleMembers []string `json:"ineligibleMembers,omitempty"`
+}
+
 // AuthScopeEntry is a single UAT scope in the scopes endpoint response.
 type AuthScopeEntry struct {
 	ID          string `json:"id"`
 	Resource    string `json:"resource"`
 	Action      string `json:"action"`
 	Description string `json:"description"`
+
+	// PermissionID is the canonical registry permission ID (e.g.
+	// "agent.attach") this selector resolves to via
+	// permissions.ResolveSelector.
+	PermissionID string `json:"permissionId,omitempty"`
+	// AllowedBoundaries mirrors permissions.PermissionAllowedBoundaries for
+	// this selector: which TokenBoundary kinds may select it at mint time.
+	AllowedBoundaries []string `json:"allowedBoundaries,omitempty"`
+	// EligibilityKind is "flat_role" (the project role's own flat
+	// permission subset, the default for a selector absent from
+	// permissions.MintEligibilityRegistry) or "relationship" (also
+	// mintable via a declared owner/ancestor relationship candidacy, with
+	// no target required to exist yet).
+	EligibilityKind string `json:"eligibilityKind,omitempty"`
+	// Relationships names the candidate relationship types (e.g. "owner",
+	// "ancestor") when EligibilityKind is "relationship".
+	Relationships []string `json:"relationships,omitempty"`
+	// RequiresExistingTarget is always false today: every published
+	// selector, including relationship-eligible ones, may be selected
+	// before any matching target exists.
+	RequiresExistingTarget bool `json:"requiresExistingTarget,omitempty"`
+	// Eligibility is present only when the request named a boundary
+	// (?projectId= or ?boundary=).
+	Eligibility *ScopeEligibility `json:"eligibility,omitempty"`
 }
 
 // AuthScopeAlias is a convenience alias that expands to multiple scopes.
@@ -1765,6 +1958,10 @@ type AuthScopeAlias struct {
 	ID          string   `json:"id"`
 	Description string   `json:"description"`
 	ExpandsTo   []string `json:"expands_to"`
+
+	// Eligibility is present only when the request named a boundary. An
+	// alias is eligible only when every member selector is.
+	Eligibility *ScopeEligibility `json:"eligibility,omitempty"`
 }
 
 // AuthScopesResponse is the response for GET /api/v1/auth/scopes.
@@ -1773,23 +1970,226 @@ type AuthScopesResponse struct {
 	Aliases []AuthScopeAlias `json:"aliases"`
 }
 
+// scopeEligibilityNote returns optional human-readable framing for a
+// relationship-kind entry, eligible or not: eligibility here answers only
+// "may you select this restriction," and a relationship-eligible selector
+// is re-checked against the actual target on every later request.
+// agent.port_access also reaches agents in projects where the holder's role
+// grants it (the built-in project-owner and project-admin roles do), so its
+// note says so.
+func scopeEligibilityNote(permissionID string, kind permissions.MintEligibilityKind) string {
+	if kind != permissions.MintEligibilityRelationship {
+		return ""
+	}
+	if permissionID == "agent.port_access" {
+		return "checked on each target: your own agents and their descendants, plus agents in projects where your role grants agent.port_access (project owners and admins)"
+	}
+	return "checked on each target: your own agents and their descendants"
+}
+
+// dedupStrings returns ss with duplicates removed, order preserved.
+func dedupStrings(ss []string) []string {
+	if len(ss) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// boundaryKindsToStrings converts registry boundary kinds to their wire
+// strings for AuthScopeEntry.AllowedBoundaries.
+func boundaryKindsToStrings(kinds []permissions.BoundaryKind) []string {
+	if len(kinds) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		out = append(out, string(k))
+	}
+	return out
+}
+
+// parseAuthScopesBoundary interprets the ?boundary=/?projectId= query
+// parameters for GET /api/v1/auth/scopes. A nil *TokenBoundary with a nil
+// error means "no boundary requested" (today's unchanged catalog-only
+// response). This validation is intentionally independent of the hub-
+// boundary feature gate below it: when that gate is later removed, the
+// projectId-conflict and missing-projectId 400s must still hold.
+func parseAuthScopesBoundary(w http.ResponseWriter, r *http.Request) (boundary *TokenBoundary, handled bool) {
+	query := r.URL.Query()
+	boundaryParam := query.Get("boundary")
+	projectID := query.Get("projectId")
+
+	switch boundaryParam {
+	case "":
+		if projectID == "" {
+			return nil, false
+		}
+		return &TokenBoundary{Kind: BoundaryKindProject, ProjectID: projectID}, false
+	case "project":
+		if projectID == "" {
+			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "projectId is required for boundary=project", nil)
+			return nil, true
+		}
+		return &TokenBoundary{Kind: BoundaryKindProject, ProjectID: projectID}, false
+	case "hub":
+		// A hub boundary never accepts a projectId, regardless of whether
+		// hub eligibility itself is enabled yet.
+		if projectID != "" {
+			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "boundary=hub does not accept projectId", nil)
+			return nil, true
+		}
+		// Hub-boundary eligibility is not enabled yet; enabling it is this
+		// single switch. The two validation cases above must keep
+		// returning 400 unchanged when it is.
+		writeError(w, http.StatusBadRequest, "unsupported_boundary", "hub boundary eligibility is not available yet", nil)
+		return nil, true
+	default:
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "unknown boundary", nil)
+		return nil, true
+	}
+}
+
 // handleAuthScopes handles GET /api/v1/auth/scopes.
-// Returns all valid UAT scopes from the permissions registry.
+// Returns all valid UAT scopes from the permissions registry. With
+// ?projectId= (or the equivalent ?boundary=project&projectId=), each entry
+// additionally reports whether the authenticated user may currently select
+// it as a project-boundary restriction (CanMintSelector), computed fresh for
+// the principal and never widened by whatever credential made this request.
+//
+// Project-access aggregation: the whole response collapses to the same
+// oracle-resistant 403 as token mint ONLY when the batch has at least one
+// MintDenialProjectAccessRequired result AND no result is admitted
+// (OK=true) -- that combination is indistinguishable from "project does
+// not exist" (no membership and no exact-permission system authority for
+// anything relevant), so existence stays unobservable in that all-denied
+// case. A selector denied for an unrelated, structural reason
+// (boundary_not_allowed, unknown_selector -- e.g. a hub-only selector
+// requested under a project boundary, true for every principal) neither
+// triggers nor blocks the collapse; it is orthogonal to project access and
+// always shown per-entry either way. Otherwise the response answers
+// per-entry, and an entry denied for project access reports
+// eligible=false, reason="project_access_required" verbatim: a caller
+// admitted for at least one selector already knows the project exists, so
+// seeing which of their own selectors also lack authority is not a new
+// oracle. This keeps the listing consistent with mint: a selector the list
+// shows eligible must mint, and one it shows ineligible must not.
 func (s *Server) handleAuthScopes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
+		return
+	}
+
+	boundary, handled := parseAuthScopesBoundary(w, r)
+	if handled {
 		return
 	}
 
 	options := permissions.UATScopeOptions(false)
+
+	var eligByScope map[string]SelectorEligibility
+	if boundary != nil {
+		// Eligibility is a per-user computation (CanMintSelector requires a
+		// local user principal); the parameterless catalog below has no
+		// such requirement and stays available to any authenticated
+		// identity, exactly as before this endpoint gained eligibility.
+		user := GetUserIdentityFromContext(r.Context())
+		if user == nil {
+			Unauthorized(w)
+			return
+		}
+		selectors := make([]string, 0, len(options))
+		for _, opt := range options {
+			selectors = append(selectors, opt.UATScope)
+		}
+		principal := principalContextForIdentity(user)
+		results, err := s.authzService.CanMintSelector(r.Context(), principal, *boundary, selectors)
+		if err != nil {
+			slog.Warn("auth scopes: CanMintSelector failed",
+				"user_id", user.ID(), "project_id", boundary.ProjectID, "error", err)
+			// Fail closed, oracle-resistant: identical to mint's forbidden
+			// response for an inaccessible or nonexistent project.
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "forbidden", nil)
+			return
+		}
+		// Aggregate across the whole batch. A selector denied for a reason
+		// OTHER than project access (boundary_not_allowed, unknown_selector)
+		// is a static, principal-independent fact -- e.g. a hub-only
+		// selector requested under a project boundary always fails that
+		// way, for every principal -- and must not count toward, or
+		// against, "every selector lacks project access": it is simply
+		// irrelevant to that question. Only project_access_required
+		// results and OK=true results inform the aggregate.
+		var sawProjectAccessDenial, sawAdmitted bool
+		for _, res := range results {
+			if res.OK {
+				sawAdmitted = true
+			}
+			if res.Reason == MintDenialProjectAccessRequired {
+				sawProjectAccessDenial = true
+			}
+		}
+		if sawProjectAccessDenial && !sawAdmitted {
+			// Every selector that reached the project-admission gate was
+			// denied for lack of project access, and nothing else was
+			// admitted: identical to a nonexistent or wholly inaccessible
+			// project. Collapse to mint's uniform 403 rather than confirm
+			// "you have zero authority here" per entry.
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "forbidden", nil)
+			return
+		}
+		eligByScope = make(map[string]SelectorEligibility, len(results))
+		for _, res := range results {
+			eligByScope[res.Selector] = res
+		}
+	}
+
 	scopes := make([]AuthScopeEntry, 0, len(options))
 	for _, opt := range options {
-		scopes = append(scopes, AuthScopeEntry{
-			ID:          opt.UATScope,
-			Resource:    opt.Resource,
-			Action:      opt.Action,
-			Description: opt.Description,
-		})
+		entry := AuthScopeEntry{
+			ID:           opt.UATScope,
+			Resource:     opt.Resource,
+			Action:       opt.Action,
+			Description:  opt.Description,
+			PermissionID: opt.ID,
+		}
+		if mapping, ok := permissions.ResolveSelector(opt.UATScope); ok {
+			entry.AllowedBoundaries = boundaryKindsToStrings(mapping.AllowedBoundaries)
+		}
+		entry.EligibilityKind = string(permissions.MintEligibilityFlatRole)
+		if descriptor, ok := permissions.MintEligibilityRegistry[opt.ID]; ok {
+			entry.RequiresExistingTarget = descriptor.RequiresExistingTarget
+			var relationships []string
+			for _, src := range descriptor.Sources {
+				if src.Kind == permissions.MintEligibilityRelationship {
+					entry.EligibilityKind = string(permissions.MintEligibilityRelationship)
+					relationships = append(relationships, src.RelationshipTypes...)
+				}
+			}
+			entry.Relationships = dedupStrings(relationships)
+		}
+		if boundary != nil {
+			if res, ok := eligByScope[opt.UATScope]; ok {
+				elig := &ScopeEligibility{
+					Boundary: tokenBoundaryToDTO(*boundary),
+					Eligible: res.OK,
+				}
+				if !res.OK {
+					elig.Reason = string(res.Reason)
+				}
+				elig.Note = scopeEligibilityNote(entry.PermissionID, permissions.MintEligibilityKind(entry.EligibilityKind))
+				entry.Eligibility = elig
+			}
+		}
+		scopes = append(scopes, entry)
 	}
 
 	// Build aliases dynamically from the manage alias registry.
@@ -1801,11 +2201,31 @@ func (s *Server) handleAuthScopes(w http.ResponseWriter, r *http.Request) {
 	aliases := make([]AuthScopeAlias, 0, len(aliasKeys))
 	for _, alias := range aliasKeys {
 		resource := permissions.UATManageAliases[alias]
-		aliases = append(aliases, AuthScopeAlias{
+		expandsTo := permissions.UATManageScopesFor(resource)
+		aliasEntry := AuthScopeAlias{
 			ID:          alias,
 			Description: fmt.Sprintf("All %s management operations", resource),
-			ExpandsTo:   permissions.UATManageScopesFor(resource),
-		})
+			ExpandsTo:   expandsTo,
+		}
+		if boundary != nil {
+			elig := &ScopeEligibility{
+				Boundary: tokenBoundaryToDTO(*boundary),
+				Eligible: true,
+			}
+			var ineligible []string
+			for _, member := range expandsTo {
+				res, ok := eligByScope[member]
+				if !ok || !res.OK {
+					ineligible = append(ineligible, member)
+				}
+			}
+			if len(ineligible) > 0 {
+				elig.Eligible = false
+				elig.IneligibleMembers = ineligible
+			}
+			aliasEntry.Eligibility = elig
+		}
+		aliases = append(aliases, aliasEntry)
 	}
 
 	writeJSON(w, http.StatusOK, AuthScopesResponse{

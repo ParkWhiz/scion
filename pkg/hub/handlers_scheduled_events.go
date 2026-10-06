@@ -38,6 +38,14 @@ type CreateScheduledEventRequest struct {
 	Interrupt bool   `json:"interrupt,omitempty"`
 	Plain     bool   `json:"plain,omitempty"`
 
+	// There is no top-level raw convenience field. This request surface
+	// never accepted one: a "raw" key here is an unknown field that JSON
+	// decoding ignores, and the "message" auto-construct path below reads
+	// only AgentID/AgentName/Message/Interrupt/Plain. The caller-supplied
+	// Payload is different: callers write that JSON directly, so a "raw"
+	// key inside it is rejected with raw_input_removed
+	// (validateAndRejectScheduledPayload).
+
 	// Convenience fields for "dispatch_agent" events — used to auto-construct Payload
 	Template string `json:"template,omitempty"`
 	Task     string `json:"task,omitempty"`
@@ -152,7 +160,7 @@ func (s *Server) handleScheduledEvents(w http.ResponseWriter, r *http.Request, p
 		case http.MethodPost:
 			action = ActionCreate
 		default:
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodGet, http.MethodPost)
 			return
 		}
 	} else {
@@ -162,7 +170,7 @@ func (s *Server) handleScheduledEvents(w http.ResponseWriter, r *http.Request, p
 		case http.MethodDelete:
 			action = ActionDelete
 		default:
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodGet, http.MethodDelete)
 			return
 		}
 	}
@@ -211,8 +219,23 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", req.EventType), nil)
 		return
 	}
-	if req.EventType == "dispatch_agent" && !s.authorizeAgentCreate(w, r, projectID) {
+	// The payload "raw" tombstone applies to both supported event types:
+	// the advanced Payload field is accepted verbatim for "dispatch_agent"
+	// too, and neither payload type has a raw field. A "raw" key (any case,
+	// any value including false/null) is rejected with 422
+	// raw_input_removed before storage and before either event type's own
+	// authorization runs. A malformed or non-object payload is rejected
+	// first, with a sanitized 400; see validateAndRejectScheduledPayload.
+	if !s.validateAndRejectScheduledPayload(w, r, req.EventType, req.Payload) {
 		return
+	}
+	if req.EventType == "dispatch_agent" {
+		if !s.authorizeScheduledDispatchAgentAuthoring(w, r) {
+			return
+		}
+		if !s.authorizeAgentCreate(w, r, projectID) {
+			return
+		}
 	}
 	// C1 containment: for message events, validate the target agent belongs to
 	// this project and the caller is authorized to message it. Scheduled messages
@@ -318,6 +341,10 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 		Payload:   payload,
 		Status:    store.ScheduledEventPending,
 		CreatedBy: createdBy,
+		// E.2b: record the authoring request's initiator attribution in the
+		// same write as the event row (design check (a): atomic by
+		// construction, since ScheduleEvent below issues a single insert).
+		InitiatorAttribution: newInitiatorAttribution(r.Context()),
 	}
 
 	if err := s.scheduler.ScheduleEvent(r.Context(), evt); err != nil {
@@ -394,6 +421,14 @@ func (s *Server) cancelScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 		writeErrorFromErr(w, err, "")
 		return
 	}
+
+	// No future dispatch remains after a cancel, so there is no
+	// re-attribution — just a record of who cancelled it.
+	s.emitMutationAudit(r.Context(), &store.MutationAuditRecord{
+		MutationType: "scheduled_event_cancel",
+		TargetType:   "scheduled_event",
+		TargetID:     eventID,
+	})
 
 	w.WriteHeader(http.StatusNoContent)
 }

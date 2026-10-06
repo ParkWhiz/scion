@@ -765,8 +765,9 @@ func TestNewEnvelopeToLegacy_TextInform_Agent(t *testing.T) {
 	}}
 
 	old := NewEnvelopeToLegacy(msg, addrs)
-	if old.Type != messages.TypeAssistantReply {
-		t.Errorf("type: got %q, want assistant-reply", old.Type)
+	// The retired assistant-reply type is never emitted, even for agents.
+	if old.Type != messages.TypeChat {
+		t.Errorf("type: got %q, want chat", old.Type)
 	}
 }
 
@@ -828,13 +829,20 @@ func TestNewEnvelopeToLegacy_EventStateChanged(t *testing.T) {
 
 func TestNewEnvelopeToLegacy_EventSystem(t *testing.T) {
 	tests := []struct {
-		name      string
-		eventType EventType
-		wantCat   string
+		name       string
+		eventType  EventType
+		status     string
+		wantCat    string
+		wantStatus string
 	}{
-		{"schedule.fired", EventScheduleFired, messages.SystemCategoryScheduler},
-		{"port.exposed", EventPortExposed, messages.SystemCategoryPortForward},
-		{"delivery.failed", EventDeliveryFailed, messages.SystemCategoryDeliveryFailed},
+		{"schedule.fired", EventScheduleFired, "", messages.SystemCategoryScheduler, ""},
+		{"port.exposed", EventPortExposed, "", messages.SystemCategoryPortForward, ""},
+		{"delivery.failed", EventDeliveryFailed, "", messages.SystemCategoryDeliveryFailed, ""},
+		// O-c (p2a-r2 review): the deferred notice (design agent-reincarnate
+		// §3.7) reuses EventDeliveryFailed's type with a distinct Status —
+		// the round trip must recover SystemCategoryDeliveryDeferred, not
+		// collapse back to SystemCategoryDeliveryFailed.
+		{"delivery.failed/deferred", EventDeliveryFailed, "DELIVERY_DEFERRED", messages.SystemCategoryDeliveryDeferred, "DELIVERY_DEFERRED"},
 	}
 
 	for _, tc := range tests {
@@ -843,7 +851,7 @@ func TestNewEnvelopeToLegacy_EventSystem(t *testing.T) {
 				ID:        "msg-1",
 				From:      "system:scheduler",
 				Kind:      KindEvent,
-				Event:     &EventBody{Type: tc.eventType},
+				Event:     &EventBody{Type: tc.eventType, Status: tc.status},
 				Body:      "System event",
 				CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
 			}
@@ -855,7 +863,27 @@ func TestNewEnvelopeToLegacy_EventSystem(t *testing.T) {
 			if old.Metadata["system_category"] != tc.wantCat {
 				t.Errorf("system_category: got %q, want %q", old.Metadata["system_category"], tc.wantCat)
 			}
+			if old.Status != tc.wantStatus {
+				t.Errorf("status: got %q, want %q", old.Status, tc.wantStatus)
+			}
 		})
+	}
+}
+
+// TestMapSystemCategory_DeliveryDeferred is the forward-direction half of
+// O-c (p2a-r2 review): messages.SystemCategoryDeliveryDeferred must not fall
+// to mapSystemCategory's default branch (which would log a WARN and
+// silently reclassify the notice as agent.state-changed).
+func TestMapSystemCategory_DeliveryDeferred(t *testing.T) {
+	body := mapSystemCategory(messages.SystemCategoryDeliveryDeferred)
+	if body == nil {
+		t.Fatal("mapSystemCategory returned nil")
+	}
+	if body.Type != EventDeliveryFailed {
+		t.Errorf("type: got %v, want EventDeliveryFailed", body.Type)
+	}
+	if body.Status != "DELIVERY_DEFERRED" {
+		t.Errorf("status: got %q, want DELIVERY_DEFERRED", body.Status)
 	}
 }
 
@@ -964,7 +992,9 @@ func TestRoundTrip_OldToNewToOld(t *testing.T) {
 			expectedType: messages.TypeChat,
 		},
 		{
-			name: "assistant-reply",
+			// A historical assistant-reply row reads back as chat: the
+			// retired type is never emitted again.
+			name: "assistant-reply (historical)",
 			old: &messages.StructuredMessage{
 				Version:   1,
 				Timestamp: "2026-08-27T10:00:00Z",
@@ -974,7 +1004,7 @@ func TestRoundTrip_OldToNewToOld(t *testing.T) {
 				Msg:       "Done",
 				Type:      messages.TypeAssistantReply,
 			},
-			expectedType: messages.TypeAssistantReply,
+			expectedType: messages.TypeChat,
 		},
 		{
 			name: "state-change",

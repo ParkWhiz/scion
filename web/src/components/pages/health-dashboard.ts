@@ -33,6 +33,7 @@ import { customElement, state } from 'lit/decorators.js';
 
 import { apiFetch, extractApiError } from '../../client/api.js';
 import { showToast } from '../../utils/toast.js';
+import { formatRelative } from '../../utils/time.js';
 
 interface HealthSummary {
   status: string;
@@ -43,6 +44,10 @@ interface HealthSummary {
     connected_brokers: number;
     active_agents: number;
     projects: number;
+    /** The hub's /healthz check map. */
+    checks?: Record<string, string>;
+    /** Non-healthy checks as "key: value" — the cause of a degraded/unhealthy hub. */
+    unhealthy_checks?: string[];
   };
   database: {
     status: string;
@@ -324,6 +329,12 @@ export class ScionPageHealthDashboard extends LitElement {
       color: var(--scion-text-muted, #64748b);
     }
 
+    .check-problem {
+      font-size: 0.8125rem;
+      padding: 0.125rem 0 0.25rem;
+      word-break: break-word;
+    }
+
     .broker-grid {
       display: flex;
       flex-wrap: wrap;
@@ -594,6 +605,12 @@ export class ScionPageHealthDashboard extends LitElement {
           >
           ${d.hub.status}
         </div>
+        ${(d.hub.unhealthy_checks ?? []).map(
+          (c) =>
+            html`<div class="check-problem" style="color: ${this.statusColor(d.hub.status)}">
+              ${c}
+            </div>`
+        )}
         <div class="stat-row"><span class="label">Uptime</span><span>${d.hub.uptime}</span></div>
         <div class="stat-row"><span class="label">Version</span><span>${d.hub.version}</span></div>
         <div class="stat-row">
@@ -842,22 +859,10 @@ export class ScionPageHealthDashboard extends LitElement {
 
   private timeAgo(isoDate: string): string {
     if (!isoDate) return 'never';
-    try {
-      const d = new Date(isoDate);
-      if (isNaN(d.getTime())) return 'unknown';
-      const now = Date.now();
-      const diffMs = now - d.getTime();
-      if (diffMs < 0) return 'just now';
-      const seconds = Math.floor(diffMs / 1000);
-      if (seconds < 60) return `${seconds}s ago`;
-      const minutes = Math.floor(seconds / 60);
-      if (minutes < 60) return `${minutes}m ago`;
-      const hours = Math.floor(minutes / 60);
-      if (hours < 24) return `${hours}h ago`;
-      const days = Math.floor(hours / 24);
-      return `${days}d ago`;
-    } catch {
-      return 'unknown';
-    }
+    const ms = new Date(isoDate).getTime();
+    if (Number.isNaN(ms)) return 'unknown';
+    // A future instant is clock skew between hub and browser.
+    if (ms > Date.now()) return 'just now';
+    return formatRelative(isoDate, { style: 'narrow' });
   }
 }

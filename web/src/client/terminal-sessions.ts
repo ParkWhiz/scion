@@ -18,7 +18,7 @@ import type { Agent } from '../shared/types.js';
 import { isTerminalAvailable } from '../shared/types.js';
 import { extractApiError } from './api.js';
 import { TerminalMetadata } from './terminal-metadata.js';
-import { classifyPtyClose, PTY_CLOSE } from './terminal-close-codes.js';
+import { AGENT_STOPPED_CLOSE_REASON, classifyPtyClose, PTY_CLOSE } from './terminal-close-codes.js';
 
 /** Supplied by authenticated bootstrap, never by a terminal route or peer message. */
 export interface TerminalScope {
@@ -27,12 +27,12 @@ export interface TerminalScope {
 }
 
 export type TerminalConnectionState =
-  | 'loading'
-  | 'connecting'
-  | 'connected'
-  | 'disconnected'
-  | 'unavailable'
-  | 'closed';
+  // Restored (from the persisted terminal list), not yet connected. No
+  // socket or renderer has ever been allocated for
+  // this entry. Connects when it becomes frontmost (Session.setFrontmost)
+  // or on an explicit connect() call, exactly like a fresh open() — from
+  // that point on 'idle' never recurs for this session.
+  'idle' | 'loading' | 'connecting' | 'connected' | 'disconnected' | 'unavailable' | 'closed';
 
 /**
  * Classifies the cause of a disconnection or unavailability so the UI
@@ -67,6 +67,14 @@ export const AGENT_UNAVAILABLE_REASONS: ReadonlySet<TerminalDisconnectReason> = 
   'agent-phase',
   'agent-offline',
 ]);
+
+/**
+ * Shared copy for the agent-stopped unavailable state. Used by both the
+ * close-frame-driven path (Session's onclose) and the SSE-driven path
+ * (terminal-workspace-root.ts's markUnavailable call) so the two cannot
+ * drift apart.
+ */
+export const AGENT_STOPPED_MESSAGE = 'Agent has stopped.';
 
 export interface TerminalSize {
   readonly cols: number;
@@ -149,8 +157,30 @@ export interface TerminalSession {
    * already classified itself as agent-phase/agent-offline). Re-arms
    * auto-reconnect: it fires immediately if the pane is already frontmost,
    * otherwise on the next foregrounding.
+   *
+   * Only takes effect once this session has independently observed the
+   * agent actually down (via noteAgentDown() or a markUnavailable('agent-stopped')
+   * call, which also records it) since its last attempt. A WebSocket close
+   * carrying an agent-stopped reason can reach the client before SSE's own
+   * view of the agent catches up with the crash, so a metadata snapshot
+   * that still says "running" right after that close is not proof the agent
+   * is back — it is proof SSE has not seen the crash yet. Without this
+   * gate, every such stale snapshot would dial and immediately fail again
+   * at the broker's own open-time check (ptone/scion#2096).
    */
   noteAgentAvailable(): void;
+  /**
+   * Records that this session has independently observed the agent's own
+   * state as down (SSE phase stopped/error), regardless of the session's
+   * current connection state. Callers should invoke this whenever they see
+   * that signal, even when the session is already 'unavailable' for the
+   * same reason (so markUnavailable() itself is a no-op) — this is exactly
+   * the case a WebSocket close carrying an agent-stopped reason produces
+   * before SSE catches up. Required before noteAgentAvailable() will act on
+   * a later "running again" signal; consumed (cleared) at the start of the
+   * next attempt, manual or automatic.
+   */
+  noteAgentDown(): void;
   /** Immediate transport write, including xterm protocol responses. Never queues input. */
   sendData(data: string): boolean;
   resize(cols: number, rows: number): void;
@@ -206,14 +236,25 @@ export class TerminalSessionRegistry {
     this.metadata = new TerminalMetadata(this.hubUrl);
   }
 
-  /** Registers synchronously before any asynchronous work. Existing entries never rebind/reconnect. */
-  open(agentId: string, initialize: TerminalResourceInitializer): TerminalSession {
+  /**
+   * Registers synchronously before any asynchronous work. Existing entries
+   * never rebind/reconnect (options is ignored when returning an existing
+   * session). options.deferConnect creates the entry in the 'idle' state
+   * without calling connect() — no socket or renderer is allocated until the
+   * session becomes frontmost or connect() is called explicitly.
+   */
+  open(
+    agentId: string,
+    initialize: TerminalResourceInitializer,
+    options?: { deferConnect?: boolean }
+  ): TerminalSession {
     if (this.disposed) throw new Error('Terminal registry is disposed.');
     if (!uuid.test(agentId)) throw new Error('Terminal requires an agent UUID.');
     const id = agentId.toLowerCase();
     const existing = this.sessions.get(id);
     if (existing) return existing;
     const key = JSON.stringify([this.hubUrl, this.accountId, id]);
+    const deferConnect = options?.deferConnect ?? false;
     const session = new Session(
       key,
       id,
@@ -226,12 +267,13 @@ export class TerminalSessionRegistry {
           this.notify();
         }
       },
-      (agent) => this.metadata.seed(id, agent)
+      (agent) => this.metadata.seed(id, agent),
+      deferConnect
     );
     this.sessions.set(id, session);
     this.metadata.retain(id);
     this.notify();
-    void session.connect();
+    if (!deferConnect) void session.connect();
     return session;
   }
 
@@ -302,6 +344,17 @@ class Session implements TerminalSession {
    * new noteAgentAvailable() call to re-arm it.
    */
   private autoArmed = false;
+  /**
+   * True once this session has independently observed (via noteAgentDown()
+   * or a markUnavailable('agent-stopped') call) that the agent's own state
+   * is actually down, since the start of the current/last attempt. Gates
+   * noteAgentAvailable(): a "running" signal that arrives without this
+   * having been set first is a stale snapshot racing an agent-stopped close,
+   * not proof of a real down-then-up transition (ptone/scion#2096). Cleared
+   * at the start of every attempt (startAttempt), consuming it whether the
+   * attempt was automatic or a manual reconnect.
+   */
+  private agentSeenDown = false;
   /** Which trigger started the in-flight/most recent attempt. */
   private currentAttemptManual = true;
   /** The only background timer this session runs: FAILED -> DISCONNECTED after 2 min. */
@@ -319,13 +372,14 @@ class Session implements TerminalSession {
     private readonly hubUrl: string,
     private readonly initialize: TerminalResourceInitializer,
     private readonly remove: () => void,
-    private readonly seedMetadata: (agent: Agent) => void
+    private readonly seedMetadata: (agent: Agent) => void,
+    deferConnect = false
   ) {
     this.snapshot = {
       key,
       agentId,
       generation: 0,
-      connection: 'loading',
+      connection: deferConnect ? 'idle' : 'loading',
       agent: null,
       error: null,
       disconnectReason: null,
@@ -376,6 +430,10 @@ class Session implements TerminalSession {
     this.clearFirstFrameGuard();
     this.clearBackgroundResetTimer();
     this.attemptReachedOpen = false;
+    // Consume the seen-down observation: it authorized at most this one
+    // attempt (manual or automatic). A subsequent stale/duplicate "running"
+    // signal must not dial again without a fresh down observation.
+    this.agentSeenDown = false;
     this.currentAttemptManual = manual;
     const wasEverConnected = this.everConnected;
     const controller = new AbortController();
@@ -432,6 +490,11 @@ class Session implements TerminalSession {
     this.controller?.abort();
     // Not armed until a fresh noteAgentAvailable() call re-arms it.
     this.autoArmed = false;
+    // A markUnavailable('agent-stopped') call is itself a direct observation
+    // that the agent is down (it is how the SSE bridge reports that), so it
+    // satisfies noteAgentAvailable()'s gate the same as an explicit
+    // noteAgentDown() call would.
+    if (reason === 'agent-stopped') this.agentSeenDown = true;
     this.update({
       connection: 'unavailable',
       error: message,
@@ -441,11 +504,25 @@ class Session implements TerminalSession {
     });
   }
 
+  noteAgentDown(): void {
+    if (this.state.connection === 'closed') return;
+    this.agentSeenDown = true;
+  }
+
   setFrontmost(frontmost: boolean): void {
     if (this.state.connection === 'closed' || this.frontmost === frontmost) return;
     this.frontmost = frontmost;
     if (frontmost) {
       this.clearBackgroundResetTimer();
+      // An idle (restored, never-connected) entry connects the first time it
+      // becomes frontmost — via selection, placing it in a visible slot, or
+      // the tab foregrounding while it is visible. maybeAutoAttempt() would
+      // no-op here regardless (everConnected is false for an idle session),
+      // so this is a distinct path, not a special case of it.
+      if (this.state.connection === 'idle') {
+        void this.connect();
+        return;
+      }
       this.maybeAutoAttempt();
     } else if (this.state.reconnectFailed) {
       this.armBackgroundResetTimer();
@@ -459,6 +536,12 @@ class Session implements TerminalSession {
     )
       return;
     if (!this.everConnected) return;
+    // Require an independent down observation first: see the doc comment on
+    // the interface method and on agentSeenDown. Without this, a "running"
+    // snapshot that is merely stale relative to an agent-stopped close would
+    // dial and fail again at the broker's own open-time check, once per such
+    // snapshot (ptone/scion#2096).
+    if (!this.agentSeenDown) return;
     this.autoArmed = true;
     this.maybeAutoAttempt();
   }
@@ -531,6 +614,10 @@ class Session implements TerminalSession {
         // Not auto-retriable from here: re-arming for a stopped agent goes
         // through markUnavailable/noteAgentAvailable, driven by SSE, not this path.
         this.autoArmed = false;
+        // This attempt's own fetch just observed the agent not running/offline
+        // firsthand — unlike a WS close reason, this is not a stale signal,
+        // so it satisfies noteAgentAvailable()'s down-observation gate too.
+        this.agentSeenDown = true;
         this.update({
           connection: 'unavailable',
           disconnectReason: agent.activity === 'offline' ? 'agent-offline' : 'agent-phase',
@@ -645,7 +732,7 @@ class Session implements TerminalSession {
         this.socket = null;
         this.stopHeartbeat();
         this.clearFirstFrameGuard();
-        const reason = closeReasonFor(event.code);
+        const reason = closeReasonFor(event.code, event.reason);
         // If this attempt's socket never proved live and we had connected
         // before, this was itself a failed reconnect attempt, not a fresh
         // disconnect.
@@ -654,10 +741,29 @@ class Session implements TerminalSession {
         // Only 'network' (a retriable close code) arms a further attempt; a
         // terminal or detached code clears it, same as any other terminal outcome.
         this.autoArmed = reason === 'network';
+        // agent-stopped is unavailable-because-of-the-agent, same as the SSE
+        // markUnavailable path, so it surfaces the same connection state and
+        // copy and re-arms the same way, via noteAgentAvailable() only.
+        //
+        // Deliberately does NOT set agentSeenDown here: the broker's own
+        // check that produced this close is authoritative about the agent
+        // being down right now, but SSE's independently-polled view of the
+        // agent can still be lagging behind it. Trusting this close alone as
+        // "seen down" would let a metadata snapshot that has not caught up
+        // yet — still reporting the pre-crash 'running' phase — satisfy
+        // noteAgentAvailable()'s gate immediately, reintroducing the stale
+        // "running" dial loop this gate exists to prevent. agentSeenDown is
+        // set only by an independent SSE observation (noteAgentDown() or
+        // markUnavailable('agent-stopped')), via the workspace-root bridge.
+        const agentStopped = reason === 'agent-stopped';
         this.update({
-          connection: 'disconnected',
+          connection: agentStopped ? 'unavailable' : 'disconnected',
           disconnectReason: reason,
-          error: reason === 'detached' ? null : `Connection closed (code: ${event.code})`,
+          error: agentStopped
+            ? AGENT_STOPPED_MESSAGE
+            : reason === 'detached'
+              ? null
+              : `Connection closed (code: ${event.code})`,
         });
         if (reason === 'network') {
           if (wasFailedAttempt) this.markReconnectFailed();
@@ -884,8 +990,18 @@ class Session implements TerminalSession {
   }
 }
 
-/** Maps a PTY WebSocket close code to a disconnect reason. */
-function closeReasonFor(code: number): TerminalDisconnectReason {
+/**
+ * Maps a PTY WebSocket close code (and, for 4410, its close-frame reason
+ * string) to a disconnect reason. A 4410 closed because the runtime reports
+ * the agent's container stopped or crashed (reason agent_stopped) becomes
+ * 'agent-stopped', which AGENT_UNAVAILABLE_REASONS re-arms once the agent is
+ * confirmed running again (ptone/scion#2096); a plain 4410 (session_ended,
+ * container_removed, an empty string, or an undefined/missing reason — the
+ * real CloseEvent.reason is always a string, but this stays permissive for
+ * test doubles and non-standard runtimes) stays 'session-ended', with no
+ * auto attempt ever.
+ */
+function closeReasonFor(code: number, reason: string | undefined): TerminalDisconnectReason {
   const disposition = classifyPtyClose(code);
   if (disposition === 'detached') return 'detached';
   if (disposition === 'terminal') {
@@ -897,7 +1013,7 @@ function closeReasonFor(code: number): TerminalDisconnectReason {
       case PTY_CLOSE.AGENT_NOT_FOUND:
         return 'not-found';
       case PTY_CLOSE.SESSION_GONE:
-        return 'session-ended';
+        return reason === AGENT_STOPPED_CLOSE_REASON ? 'agent-stopped' : 'session-ended';
       default:
         // Unknown application code: fail safe, same as the Go/TS classifiers.
         return 'server-error';

@@ -49,7 +49,12 @@ type metricAdmission struct {
 
 // Pipeline orchestrates the telemetry collection and forwarding.
 type Pipeline struct {
-	config           *Config
+	config *Config
+	// loopbackConfig is a copy of config whose GRPCPort/HTTPPort are the
+	// ports the receiver actually bound (they differ when config asks for
+	// port 0). Set by Start once the receiver listens; config itself is
+	// never mutated so a restart re-binds against the configured ports.
+	loopbackConfig   atomic.Pointer[Config]
 	receiver         *Receiver
 	exporter         *CloudExporter
 	policy           *receiverPolicy
@@ -65,6 +70,7 @@ type Pipeline struct {
 	exportErrors     otelmetric.Int64Counter
 	meter            otelmetric.Meter
 	retryConfig      RetryConfig
+	usageDeriver     atomic.Pointer[UsageDeriver]
 	intakeMu         sync.Mutex
 	intakeClosed     bool
 	intakeActive     int
@@ -237,6 +243,27 @@ func (p *Pipeline) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start receiver: %w", err)
 	}
 
+	// Construct the usage deriver after the receiver is listening, since it
+	// exports over loopback back into this same receiver (design §3.3). A
+	// harness with no matching rule, or SCION_USAGE_SOURCE unset, yields a
+	// cheap no-op deriver (D4/D10); only a construction failure is logged.
+	// p.usageDeriver is an atomic.Pointer: a log request can arrive
+	// concurrently with this Store, between receiver.Start returning above
+	// and this assignment running, and handleLogs's Load must never race it.
+	// In-process loopback producers (this deriver, initSelfMetrics, and
+	// init.go's lifecycle providers via Config) dial the receiver's bound
+	// gRPC port, not the configured one: with SCION_OTEL_GRPC_PORT=0 the
+	// configured port is 0 and the receiver listens on an ephemeral port.
+	grpcPort, httpPort := p.receiver.BoundPorts()
+	loopbackConfig := *p.config
+	loopbackConfig.GRPCPort, loopbackConfig.HTTPPort = grpcPort, httpPort
+	p.loopbackConfig.Store(&loopbackConfig)
+	if deriver, err := NewUsageDeriver(ctx, &loopbackConfig); err != nil {
+		log.Error("Failed to create usage deriver: %v", err)
+	} else {
+		p.usageDeriver.Store(deriver)
+	}
+
 	p.running = true
 	p.deliveryState.Store("running")
 	p.startDiagnosticSnapshots(ctx)
@@ -258,7 +285,7 @@ func (p *Pipeline) Start(ctx context.Context) error {
 		p.initSelfMetrics(ctx)
 	}
 
-	log.Info("Telemetry pipeline started (gRPC: %d, HTTP: %d)", p.config.GRPCPort, p.config.HTTPPort)
+	log.Info("Telemetry pipeline started (gRPC: %d, HTTP: %d)", grpcPort, httpPort)
 
 	return nil
 }
@@ -274,6 +301,24 @@ func (p *Pipeline) Stop(ctx context.Context) error {
 
 	if !p.running {
 		return nil
+	}
+
+	// Shut the usage deriver down first, before intake/receiver close (R-2):
+	// its Shutdown does a final ForceFlush over its loopback connection back
+	// into this same receiver, which must still be listening for that flush
+	// to land in the still-open pipeline and reach the exporter via
+	// flushMetricsOnStop below. Shutting it down after the receiver closes
+	// (as an earlier version of this fix did) makes that flush retry against
+	// a dead loopback for its own timeout — measured at 10s — and loses the
+	// final increment entirely. This also runs ahead of every early-return
+	// branch further down in Stop, so a slow or incomplete pipeline shutdown
+	// never skips it.
+	if deriver := p.usageDeriver.Swap(nil); deriver != nil {
+		deriverCtx, cancel := context.WithTimeout(ctx, usageDeriverFlushTimeout)
+		if err := deriver.Shutdown(deriverCtx); err != nil {
+			log.Error("Usage deriver shutdown error: %v", err)
+		}
+		cancel()
 	}
 
 	var errs []error
@@ -509,10 +554,16 @@ func (p *Pipeline) IsRunning() bool {
 	return p.running
 }
 
-// Config returns the pipeline configuration.
+// Config returns the pipeline configuration. Once Start has bound the
+// receiver, the returned copy carries the bound GRPCPort and HTTPPort, so
+// loopback providers built from it dial the live receiver even when the
+// configured ports were 0. Callers must not mutate the result.
 func (p *Pipeline) Config() *Config {
 	if p == nil {
 		return nil
+	}
+	if cfg := p.loopbackConfig.Load(); cfg != nil {
+		return cfg
 	}
 	return p.config
 }
@@ -620,6 +671,20 @@ func (p *Pipeline) handleMetrics(ctx context.Context, resourceMetrics []*metricp
 	if records == 0 {
 		return nil
 	}
+	// The usage deriver sees every request whose wire format is valid, on the
+	// raw pre-policy input — mirroring handleLogs's validateLogs guard, even
+	// though processMetrics has no per-metric filter to route around (design
+	// §3.3). Matched metric names are consumed below, after policy
+	// processing, on the GCP path only. Gated on HasMetricRule so a harness
+	// with no metric-sourced rule (every one except copilot today) pays
+	// neither this extra validateMetrics pass nor ProcessResourceMetrics's
+	// walk over the batch.
+	var matchedUsageMetrics map[string]bool
+	if deriver := p.usageDeriver.Load(); deriver.HasMetricRule() {
+		if err := validateMetrics(resourceMetrics); err == nil {
+			matchedUsageMetrics = deriver.ProcessResourceMetrics(ctx, resourceMetrics)
+		}
+	}
 	if err := p.budget.reserve(bytes, records); err != nil {
 		p.metricDiagnostics.rejected.Add(int64(records))
 		return err
@@ -640,6 +705,15 @@ func (p *Pipeline) handleMetrics(ctx context.Context, resourceMetrics []*metricp
 	}
 	processed := decision.Data
 	p.metricDiagnostics.filtered.Add(decision.Filtered)
+	if len(matchedUsageMetrics) > 0 && p.config.IsGCP() {
+		// Design §3.3 "Consume semantics for metric-sourced rules": on GCP,
+		// matched native metrics are removed here, before metricStreams.add,
+		// so they are neither rejected (which would fail the whole request)
+		// nor admitted. Generic OTLP leaves processed untouched, so they are
+		// forwarded as-is alongside the canonical counters the deriver just
+		// emitted over loopback.
+		processed = stripMatchedUsageMetrics(processed, matchedUsageMetrics)
+	}
 	if len(processed) == 0 {
 		return nil
 	}
@@ -1037,6 +1111,16 @@ func (p *Pipeline) handleLogs(ctx context.Context, resourceLogs []*logspb.Resour
 	if logCount == 0 {
 		return nil
 	}
+	// The usage deriver sees every request the policy admits, before its
+	// event filter can drop a record (design §3.3, AC-1.4): it must not
+	// depend on Filter.Include, and derivation happens independently of
+	// whether the raw logs go on to export successfully. It runs after
+	// validateLogs so a request the policy would reject outright is never
+	// derived from — policy.processLogs re-validates below, which is
+	// deterministic and cheap on typical log batch sizes.
+	if err := validateLogs(resourceLogs); err == nil {
+		p.usageDeriver.Load().ProcessResourceLogs(ctx, resourceLogs)
+	}
 	if err := p.budget.reserve(bytes, logCount); err != nil {
 		p.logDiagnostics.rejected.Add(int64(logCount))
 		return err
@@ -1100,7 +1184,7 @@ func (p *Pipeline) handleLogs(ctx context.Context, resourceLogs []*logspb.Resour
 // initSelfMetrics creates a minimal MeterProvider for self-monitoring metrics
 // (pipeline health gauge and export error counter) and starts the health ticker.
 func (p *Pipeline) initSelfMetrics(ctx context.Context) {
-	providers, err := NewProviders(ctx, p.config, true)
+	providers, err := NewProviders(ctx, p.Config(), true)
 	if err != nil || providers == nil || providers.MeterProvider == nil {
 		log.Debug("Could not create MeterProvider for pipeline self-metrics: %v", err)
 		p.meter = noop.Meter{}

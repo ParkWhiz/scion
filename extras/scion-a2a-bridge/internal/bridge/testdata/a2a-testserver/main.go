@@ -53,6 +53,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/extras/scion-a2a-bridge/internal/bridge"
 	"github.com/GoogleCloudPlatform/scion/extras/scion-a2a-bridge/internal/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/agentkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 )
@@ -161,6 +162,17 @@ func (m *mockProdAgentService) SendStructuredMessage(ctx context.Context, agentI
 	return nil, nil
 }
 
+// SendStructuredMessageWithOptions mirrors SendStructuredMessage's mock
+// behaviour: the real hubclient implementation has SendStructuredMessage
+// delegate to this method, so the mock records the send the same way
+// regardless of which one a caller uses. Mentions are not modeled here —
+// this test server exercises the A2A bridge's own send path, not the hub's
+// mention fan-out.
+func (m *mockProdAgentService) SendStructuredMessageWithOptions(ctx context.Context, agentID string, msg *messages.StructuredMessage, opts hubclient.SendMessageOptions) (*hubclient.MessageResponse, error) {
+	m.hub.recordSend(agentID, msg)
+	return nil, nil
+}
+
 func (m *mockProdAgentService) List(ctx context.Context, opts *hubclient.ListAgentsOptions) (*hubclient.ListAgentsResponse, error) {
 	return &hubclient.ListAgentsResponse{
 		Agents: []hubclient.Agent{
@@ -190,17 +202,17 @@ func (m *mockProdAgentService) ResetAuth(ctx context.Context, agentID string) er
 func (m *mockProdAgentService) Delete(ctx context.Context, agentID string, opts *hubclient.DeleteAgentOptions) error {
 	return fmt.Errorf("not implemented")
 }
-func (m *mockProdAgentService) Start(ctx context.Context, agentID string) error {
-	return fmt.Errorf("not implemented")
+func (m *mockProdAgentService) Start(ctx context.Context, agentID string) (*hubclient.LifecycleResponse, error) {
+	return nil, fmt.Errorf("not implemented")
 }
-func (m *mockProdAgentService) Stop(ctx context.Context, agentID string) error {
-	return fmt.Errorf("not implemented")
+func (m *mockProdAgentService) Stop(ctx context.Context, agentID string) (*hubclient.LifecycleResponse, error) {
+	return nil, fmt.Errorf("not implemented")
 }
-func (m *mockProdAgentService) Suspend(ctx context.Context, agentID string) error {
-	return fmt.Errorf("not implemented")
+func (m *mockProdAgentService) Suspend(ctx context.Context, agentID string) (*hubclient.LifecycleResponse, error) {
+	return nil, fmt.Errorf("not implemented")
 }
-func (m *mockProdAgentService) Restart(ctx context.Context, agentID string) error {
-	return fmt.Errorf("not implemented")
+func (m *mockProdAgentService) Restart(ctx context.Context, agentID string) (*hubclient.LifecycleResponse, error) {
+	return nil, fmt.Errorf("not implemented")
 }
 func (m *mockProdAgentService) StopAll(ctx context.Context) (*hubclient.StopAllResponse, error) {
 	return nil, fmt.Errorf("not implemented")
@@ -233,6 +245,12 @@ func (m *mockProdAgentService) StreamCloudLogs(ctx context.Context, agentID stri
 	return fmt.Errorf("not implemented")
 }
 func (m *mockProdAgentService) SetMessageMode(ctx context.Context, agentID string, req *hubclient.SetMessageModeRequest, opts *hubclient.SetMessageModeOptions) (*hubclient.SetMessageModeResponse, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+func (m *mockProdAgentService) Reincarnate(ctx context.Context, agentID string, req *hubclient.ReincarnateAgentRequest) (*hubclient.ReincarnateAgentResponse, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+func (m *mockProdAgentService) SendKeys(ctx context.Context, agentID string, keys string) (*agentkeys.Response, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 

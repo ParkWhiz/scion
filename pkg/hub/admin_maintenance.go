@@ -27,6 +27,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 	"github.com/GoogleCloudPlatform/scion/pkg/version"
 )
 
@@ -47,7 +48,7 @@ func (s *Server) handleAdminMaintenanceOps(w http.ResponseWriter, r *http.Reques
 
 	if subPath == "" {
 		if r.Method != http.MethodGet {
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodGet)
 			return
 		}
 		s.listMaintenanceOperations(w, r)
@@ -60,7 +61,7 @@ func (s *Server) handleAdminMaintenanceOps(w http.ResponseWriter, r *http.Reques
 
 	if len(parts) == 1 {
 		if r.Method != http.MethodGet {
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodGet)
 			return
 		}
 		s.getMaintenanceOperation(w, r, key)
@@ -72,13 +73,13 @@ func (s *Server) handleAdminMaintenanceOps(w http.ResponseWriter, r *http.Reques
 	switch action {
 	case "run":
 		if r.Method != http.MethodPost {
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodPost)
 			return
 		}
 		s.executeOperation(w, r, key, user)
 	case "runs":
 		if r.Method != http.MethodGet {
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodGet)
 			return
 		}
 		if len(parts) == 3 && parts[2] != "" {
@@ -96,7 +97,7 @@ func (s *Server) handleAdminMaintenanceOps(w http.ResponseWriter, r *http.Reques
 // Authorization: enforced by routeGuard via hub.maintenance.execute permission.
 func (s *Server) handleAdminMaintenanceMigrations(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -141,10 +142,10 @@ func (s *Server) executeMigration(w http.ResponseWriter, r *http.Request, key st
 		return
 	}
 
-	// Prevent re-running completed migrations. There is no CLI flag that
-	// re-runs a completed migration through this endpoint; the message must
-	// not claim one exists.
-	if op.Status == store.MaintenanceStatusCompleted {
+	// Prevent re-running completed migrations, except the idempotent ones in
+	// rerunnableMigrations. There is no CLI flag that re-runs a completed
+	// migration through this endpoint; the message must not claim one exists.
+	if op.Status == store.MaintenanceStatusCompleted && !rerunnableMigrations[key] {
 		writeError(w, http.StatusConflict, ErrCodeConflict, "Migration already completed", nil)
 		return
 	}
@@ -162,6 +163,15 @@ func (s *Server) executeMigration(w http.ResponseWriter, r *http.Request, key st
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
 	params := parseMigrationParams(body)
+
+	// A dry run of a completed (rerunnable) migration is rejected: its
+	// outcome would overwrite the completed record (a dry run resets the
+	// operation to pending, and a failed one marks it failed), and a real
+	// re-run is idempotent and reports its own count.
+	if op.Status == store.MaintenanceStatusCompleted && params["dryRun"] == "true" {
+		writeError(w, http.StatusConflict, ErrCodeConflict, "Migration already completed; a re-run is idempotent, so run it without dryRun", nil)
+		return
+	}
 
 	// Resolve the executor for this migration key.
 	executor, err := s.resolveMaintenanceExecutor(key)
@@ -265,6 +275,13 @@ func (s *Server) resolveMaintenanceExecutor(key string) (MaintenanceExecutor, er
 			Store:         s.store,
 			SecretBackend: s.GetSecretBackend(),
 		}, nil
+	case entadapter.AppliedConfigTZCleanupKey:
+		return &AppliedConfigTZCleanupExecutor{Store: s.store}, nil
+	case entadapter.AutoExposeEnvNormalizeKey:
+		return &AutoExposeEnvNormalizeExecutor{Store: s.store}, nil
+	case entadapter.UTCTimestampNormalizeKey:
+		db, dbDialect := s.storeDB()
+		return &UTCTimestampNormalizeExecutor{DB: db, Dialect: dbDialect}, nil
 	case "pull-images":
 		log.Debug("Resolved pull-images executor",
 			"runtime_bin", mc.RuntimeBin, "registry", mc.ImageRegistry,
@@ -661,7 +678,7 @@ func toMaintenanceRunResponse(run store.MaintenanceOperationRun) maintenanceRunR
 // Authorization: enforced by routeGuard via hub.maintenance.execute permission.
 func (s *Server) handleCheckForUpdates(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -717,7 +734,7 @@ func (s *Server) handleCheckForUpdates(w http.ResponseWriter, r *http.Request) {
 // Authorization: enforced by routeGuard via hub.maintenance.execute permission.
 func (s *Server) handleGetUpdateAvailable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -754,7 +771,7 @@ func (s *Server) handleGetUpdateAvailable(w http.ResponseWriter, r *http.Request
 // Authorization: enforced by routeGuard via hub.maintenance.execute permission.
 func (s *Server) handleDismissUpdateAvailable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodDelete)
 		return
 	}
 
@@ -777,7 +794,7 @@ func (s *Server) handleUpdateAvailable(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		s.handleDismissUpdateAvailable(w, r)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodDelete)
 	}
 }
 
@@ -788,7 +805,7 @@ func (s *Server) handleUpdateAvailable(w http.ResponseWriter, r *http.Request) {
 // Authorization: enforced by routeGuard via hub.maintenance.execute permission.
 func (s *Server) handleAdminRestart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 

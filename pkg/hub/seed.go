@@ -124,7 +124,7 @@ func BuiltInRoles() []BuiltInRole {
 			Name:        store.SystemRoleHubMember,
 			Description: "Hub member with read access to directory resources and project creation",
 			ScopeType:   store.RoleScopeSystem,
-			Revision:    2,
+			Revision:    3, // R3: add broker.create (ptone/scion#2138) — explicit hub-member grant for broker registration
 			Permissions: hubMemberPermissionIDs(),
 		},
 		{
@@ -143,21 +143,21 @@ func BuiltInRoles() []BuiltInRole {
 			Name:        store.ProjectRoleOwner,
 			Description: "Project owner with full project permissions",
 			ScopeType:   store.RoleScopeProject,
-			Revision:    3, // R3: attach/port_access → agent.lifecycle (miller79/scion#88)
+			Revision:    5, // R5: agent.port_access for owners and admins; R4: add gcp_service_account.assign (ptone/scion#2147)
 			Permissions: projectOwnerPermissionIDs(),
 		},
 		{
 			Name:        store.ProjectRoleAdmin,
 			Description: "Project admin with most project permissions (no delete, no set_message_mode)",
 			ScopeType:   store.RoleScopeProject,
-			Revision:    3, // R3: attach/port_access → agent.lifecycle (miller79/scion#88)
+			Revision:    5, // R5: agent.port_access for owners and admins; R4: add gcp_service_account.assign (ptone/scion#2147)
 			Permissions: projectAdminPermissionIDs(),
 		},
 		{
 			Name:        store.ProjectRoleMember,
 			Description: "Project member with basic project permissions",
 			ScopeType:   store.RoleScopeProject,
-			Revision:    3, // R3: remove agent.message (policy alignment with agent.attach)
+			Revision:    4, // R4: add gcp_service_account.assign (ptone/scion#2147)
 			Permissions: projectMemberCuratedPermissionIDs(),
 		},
 
@@ -214,9 +214,12 @@ func hubMemberPermissionIDs() []string {
 		// Harness config catalog (read-only)
 		"harness_config.read",
 		"harness_config.list",
-		// Broker catalog (read-only)
+		// Broker catalog (read-only), plus registration (ptone/scion#2138):
+		// merely being an authenticated user is not enough to register a
+		// broker — it requires this explicit hub-member grant.
 		"broker.read",
 		"broker.list",
+		"broker.create",
 		// GCP service account catalog (read-only)
 		"gcp_service_account.read",
 		"gcp_service_account.list",
@@ -281,22 +284,36 @@ func projectOwnerPermissionIDs() []string {
 		// token_refresh, identity_token, port_forward, notify) are excluded:
 		// those are intended for agent identities, not human project admins.
 		//
-		// agent.attach and agent.port_access are excluded (R3,
-		// miller79/scion#88): agents run with their creator's user-scoped
-		// secrets, so terminal/port access to another member's agent would
-		// expose that member's credentials. Owners reach their own agents
-		// and progeny via the resource-owner and ancestor relationship grants.
-		// agent.lifecycle (start/stop/suspend/restart/restore) is retained so
-		// owners keep management oversight of members' agents.
+		// agent.attach is excluded (R3): agents run with
+		// their creator's user-scoped secrets, so a terminal on another
+		// member's agent would expose that member's credentials. Owners reach
+		// their own agents and progeny via the resource-owner and ancestor
+		// relationship grants. agent.lifecycle (start/stop/suspend/restart/
+		// restore) is retained so owners keep management oversight of
+		// members' agents.
+		//
+		// agent.port_access is included (R5) so owners and admins can open
+		// members' already-exposed ports for oversight. It does not grant
+		// terminal, exec or env access (agent.attach), or port registration
+		// (hub-level). project-member still does not carry it; grant it to
+		// members through a custom role.
 		"agent.create",
 		"agent.delete",
 		"agent.lifecycle",
 		"agent.list",
 		"agent.message",
+		"agent.port_access",
 		"agent.read",
 		"agent.set_message_mode",
 		"agent.stop_all",
 		"agent.update",
+		// GCP service account management (project-scoped). Lets a project
+		// owner assign project-scoped service accounts in the project
+		// (ptone/scion#2147). When gcpIamCheckMode is enforce, the immediate
+		// creator's IAM actAs grant (iam.serviceAccounts.actAs) is also
+		// checked; in the default off mode this permission alone authorizes
+		// assignment of project-scoped service accounts.
+		"gcp_service_account.assign",
 		// Harness config management
 		"harness_config.create",
 		"harness_config.delete",
@@ -351,15 +368,23 @@ func projectOwnerPermissionIDs() []string {
 func projectAdminPermissionIDs() []string {
 	return []string{
 		// Agent lifecycle and operations (no delete, no set_message_mode,
-		// no agent-self credential permissions, no attach/port_access — see
-		// projectOwnerPermissionIDs for the miller79/scion#88 rationale)
+		// no agent-self credential permissions, no attach — see
+		// projectOwnerPermissionIDs for the rationale)
 		"agent.create",
 		"agent.lifecycle",
 		"agent.list",
 		"agent.message",
+		"agent.port_access",
 		"agent.read",
 		"agent.stop_all",
 		"agent.update",
+		// GCP service account management (project-scoped). Lets a project
+		// admin assign project-scoped service accounts in the project
+		// (ptone/scion#2147). When gcpIamCheckMode is enforce, the immediate
+		// creator's IAM actAs grant (iam.serviceAccounts.actAs) is also
+		// checked; in the default off mode this permission alone authorizes
+		// assignment of project-scoped service accounts.
+		"gcp_service_account.assign",
 		// Harness config management (no delete)
 		"harness_config.create",
 		"harness_config.list",
@@ -409,6 +434,13 @@ func projectMemberCuratedPermissionIDs() []string {
 		"agent.create",
 		"agent.list",
 		"agent.read",
+		// GCP service account management (project-scoped). Lets a project
+		// member assign project-scoped service accounts in the project
+		// (ptone/scion#2147). When gcpIamCheckMode is enforce, the immediate
+		// creator's IAM actAs grant (iam.serviceAccounts.actAs) is also
+		// checked; in the default off mode this permission alone authorizes
+		// assignment of project-scoped service accounts.
+		"gcp_service_account.assign",
 		// Harness config (create, read, list)
 		"harness_config.create",
 		"harness_config.list",
@@ -814,24 +846,103 @@ func agentRolePermissionIDs(role AgentRole) []string {
 	return ids
 }
 
-// BackfillRoleBindings creates role bindings from existing User.Role values and
-// project ownership. It is idempotent (skips if binding already exists) and
-// called from the startup/migration path.
+// BackfillRoleBindings runs the startup role-binding backfills:
+//   - system role bindings from User.Role;
+//   - project-owner role bindings from Project.CreatedBy (only when the
+//     User.Role step succeeded, preserving the original ordering);
+//   - clearing the legacy Group.OwnerID on project members groups
+//     (ptone/scion#2599), which always runs regardless of earlier failures.
+//
+// Every step is idempotent. Steps do not stop at the first failure: their
+// errors are combined with errors.Join and returned together, and the
+// startup caller logs them as a warning.
 func BackfillRoleBindings(ctx context.Context, s store.Store) error {
+	var errs []error
+
 	// Backfill system role bindings from User.Role
 	if err := backfillUserRoleBindings(ctx, s); err != nil {
-		return fmt.Errorf("backfill user role bindings: %w", err)
+		errs = append(errs, fmt.Errorf("backfill user role bindings: %w", err))
+	} else if err := backfillProjectOwnerRoleBindings(ctx, s); err != nil {
+		// Backfill project-owner role bindings from Project.CreatedBy.
+		// Pre-existing projects (created before project-scoped RoleBindings were
+		// introduced) have a legacy CreatedBy/OwnerID but no project-owner
+		// RoleBinding. This causes the project members view to show "no members"
+		// and the "my projects" filter to miss RoleBinding-based membership.
+		errs = append(errs, fmt.Errorf("backfill project owner role bindings: %w", err))
 	}
 
-	// Backfill project-owner role bindings from Project.CreatedBy.
-	// Pre-existing projects (created before project-scoped RoleBindings were
-	// introduced) have a legacy CreatedBy/OwnerID but no project-owner
-	// RoleBinding. This causes the project members view to show "no members"
-	// and the "my projects" filter to miss RoleBinding-based membership.
-	if err := backfillProjectOwnerRoleBindings(ctx, s); err != nil {
-		return fmt.Errorf("backfill project owner role bindings: %w", err)
+	// Clear the legacy Group.OwnerID copied from Project.OwnerID onto
+	// project members groups (ptone/scion#2599). This is security-relevant
+	// (it removes a stale group.* grant) and independent of the steps above,
+	// so it runs even when they fail, and its error is joined with theirs
+	// rather than hiding them.
+	if err := backfillClearProjectMembersGroupOwners(ctx, s); err != nil {
+		errs = append(errs, fmt.Errorf("clear project members group owners: %w", err))
 	}
 
+	return errors.Join(errs...)
+}
+
+// projectMembersGroupOwnerBackfillPageSize is the ListGroups page size for
+// backfillClearProjectMembersGroupOwners. It is a package variable, not a
+// const, so tests can shrink it to exercise the pagination loop.
+var projectMembersGroupOwnerBackfillPageSize = 200
+
+// backfillClearProjectMembersGroupOwners clears Group.OwnerID on every
+// project members group (ptone/scion#2599). createProjectMembersGroup used to
+// copy Project.OwnerID into Group.OwnerID, and the owner/user/group
+// relationship row grants group.* to Group.OwnerID, so a creator removed
+// from the project without an ownership transfer kept managing the members
+// group. Project.OwnerID confers no authority (ptone/scion#2586), and the
+// members group is now created without an owner.
+//
+// Groups are identified by the project-members-group marker annotation
+// (either key, see store.LegacyAnnotationProjectMembersGroup), never by
+// slug, so a user-created group with a look-alike slug is left untouched.
+// The pass runs on every startup and is idempotent: a group whose OwnerID is
+// already empty is skipped, so a second run changes nothing. Per-group update
+// errors are logged and skipped.
+func backfillClearProjectMembersGroupOwners(ctx context.Context, s store.Store) error {
+	// All groups are scanned rather than filtering by GroupType: the scan is
+	// paginated and cheap, and a type filter could miss legacy group shapes.
+	var cursor string
+	var cleared int
+	for {
+		groups, err := s.ListGroups(ctx, store.GroupFilter{}, store.ListOptions{
+			Limit:          projectMembersGroupOwnerBackfillPageSize,
+			Cursor:         cursor,
+			SkipTotalCount: true,
+		})
+		if err != nil {
+			return fmt.Errorf("list groups for members group owner backfill: %w", err)
+		}
+
+		for i := range groups.Items {
+			g := &groups.Items[i]
+			if g.OwnerID == "" || !hasProjectMembersGroupMarker(g) {
+				continue
+			}
+			prevOwner := g.OwnerID
+			g.OwnerID = ""
+			if err := s.UpdateGroup(ctx, g); err != nil {
+				slog.Warn("failed to clear project members group owner during backfill",
+					"group_id", g.ID, "project_id", g.ProjectID, "error", err)
+				continue
+			}
+			slog.Info("cleared project members group owner",
+				"group_id", g.ID, "project_id", g.ProjectID, "previous_owner_id", prevOwner)
+			cleared++
+		}
+
+		if groups.NextCursor == "" {
+			break
+		}
+		cursor = groups.NextCursor
+	}
+
+	if cleared > 0 {
+		slog.Info("cleared project members group owners", "cleared", cleared)
+	}
 	return nil
 }
 
@@ -944,6 +1055,13 @@ func reconcileSyncHubRoleGrants(ctx context.Context, s store.Store, u *store.Use
 // user but no corresponding project-owner RoleBinding, which causes the
 // project members view to show "no members". This function is idempotent:
 // it skips projects that already have the binding.
+//
+// The backfill only runs for a project that has ZERO project-owner bindings
+// (for any principal). It runs on every startup, so without that gate a
+// creator who was later removed, or who transferred ownership and was then
+// removed, would be re-made owner on each restart (ptone/scion#2554). A
+// project that has an owner is never a legacy pre-RoleBinding project, so
+// skipping it loses nothing.
 func backfillProjectOwnerRoleBindings(ctx context.Context, s store.Store) error {
 	ownerRoleDef, err := s.GetRoleDefinitionByName(ctx, store.ProjectRoleOwner, store.RoleScopeProject)
 	if err != nil {
@@ -965,11 +1083,22 @@ func backfillProjectOwnerRoleBindings(ctx context.Context, s store.Store) error 
 
 		for i := range projects.Items {
 			p := &projects.Items[i]
+			warnOwnerOnlyLegacyProject(ctx, s, p, ownerRoleDef.ID)
 			if p.CreatedBy == "" {
 				continue
 			}
 
-			_, err := s.CreateRoleBinding(ctx, &store.RoleBinding{
+			hasOwner, err := projectHasOwnerBinding(ctx, s, p.ID, ownerRoleDef.ID)
+			if err != nil {
+				slog.Warn("failed to check project owner bindings during backfill; skipping",
+					"project_id", p.ID, "error", err)
+				continue
+			}
+			if hasOwner {
+				continue
+			}
+
+			_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
 				RoleDefinitionID: ownerRoleDef.ID,
 				PrincipalType:    store.RoleBindingPrincipalUser,
 				PrincipalID:      p.CreatedBy,
@@ -998,6 +1127,70 @@ func backfillProjectOwnerRoleBindings(ctx context.Context, s store.Store) error 
 		slog.Info("backfilled project-owner role bindings", "created", created)
 	}
 	return nil
+}
+
+// projectHasOwnerBinding reports whether any principal holds a project-owner
+// role binding on the given project.
+func projectHasOwnerBinding(ctx context.Context, s store.Store, projectID, ownerRoleDefID string) (bool, error) {
+	bindings, err := s.ListRoleBindingsForScope(ctx, store.RoleScopeProject, projectID)
+	if err != nil {
+		return false, err
+	}
+	for _, b := range bindings {
+		if b != nil && b.RoleDefinitionID == ownerRoleDefID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// warnOwnerOnlyLegacyProject logs, once per project per startup, a project
+// whose OwnerID is not backed by a project-owner binding. Project.OwnerID is
+// not an authorization source (ptone/scion#2586), so it grants nothing; this
+// only logs and never grants. Two shapes warn:
+//   - OwnerID set, CreatedBy empty, and no project-owner binding at all: the
+//     project has no owner until an admin grants one.
+//   - OwnerID set, CreatedBy set but different, and OwnerID itself holds no
+//     project-owner binding: the named owner has no access through OwnerID.
+//
+// A project where OwnerID equals CreatedBy never warns; the backfill grants
+// CreatedBy.
+func warnOwnerOnlyLegacyProject(ctx context.Context, s store.Store, p *store.Project, ownerRoleDefID string) {
+	if p.OwnerID == "" || p.OwnerID == p.CreatedBy {
+		return
+	}
+	if p.CreatedBy == "" {
+		hasOwner, err := projectHasOwnerBinding(ctx, s, p.ID, ownerRoleDefID)
+		if err != nil {
+			slog.Warn("failed to check project owner bindings for owner-only legacy project; skipping",
+				"project_id", p.ID, "error", err)
+			return
+		}
+		if hasOwner {
+			return // any owner binding: the project has an owner
+		}
+		slog.Warn("project has OwnerID but no CreatedBy and no project-owner binding; OwnerID grants no access, an admin must add an owner",
+			"project_id", p.ID, "owner_id", p.OwnerID)
+		return
+	}
+	// OwnerID differs from a non-empty CreatedBy. projectHasOwnerBinding
+	// answers "does anyone own the project", which is not this question:
+	// the backfill grants CreatedBy, so check that OwnerID itself holds a
+	// project-owner binding.
+	bindings, err := s.ListRoleBindingsForScope(ctx, store.RoleScopeProject, p.ID)
+	if err != nil {
+		slog.Warn("failed to check project owner bindings for owner-only legacy project; skipping",
+			"project_id", p.ID, "error", err)
+		return
+	}
+	for _, b := range bindings {
+		if b != nil && b.RoleDefinitionID == ownerRoleDefID &&
+			b.PrincipalType == store.RoleBindingPrincipalUser && b.PrincipalID == p.OwnerID {
+			return
+		}
+	}
+	slog.Warn("project OwnerID differs from CreatedBy and holds no project-owner binding; OwnerID grants no access",
+		"project_id", p.ID, "owner_id", p.OwnerID, "created_by", p.CreatedBy)
 }
 
 // ReconcileSuperAdminBindings ensures bidirectional consistency between
@@ -1243,15 +1436,25 @@ func ReconcileSuperAdminBindings(ctx context.Context, s store.Store, adminEmails
 // the whole Instance it runs on, including the control plane in the
 // single-node tier, after already returning HTTP 201). Seeding it at 0 would
 // leave every new deployment exposed to that crash until an operator
-// discovers and sets the limit, which defeats the fix. The default below is
-// a conservative flat number safe for the smallest supported tier (4
-// CPU/8 GiB observed a ~17-18 agent ceiling); operators on larger tiers, or
-// running multiple brokers of different sizes, can raise it per broker via
-// the existing admin limits/entitlements API (scope_type=broker,
-// scope_id=<broker ID>) once they know their own headroom — the relationship
-// between host size and ceiling is not linear (see
-// .design/hosted/cloud-run-single-node.md §9.1), so no formula is offered
-// here, only an override.
+// discovers and sets the limit, which defeats the fix.
+//
+// The default below is ptone's ruling (2026-09-29): keep the global default
+// at 100 for now, matching what scion-next already runs, rather than the
+// old 12. No per-broker tuning until there is a proper UI (ptone/scion#2177,
+// folded into ptone/scion#2061 P2); until then this is one global value for
+// every broker on the hub.
+//
+// 100 is above the observed crash point of single-node Cloud Run (~19-20
+// idle agents on 4 CPU/8 GiB, ~51 idle on 8 CPU/32 GiB — see
+// .design/hosted/cloud-run-single-node.md §9.1), so a fresh single-node
+// Cloud Run deployment is effectively unguarded by this default alone; the
+// cap still stops an unbounded runaway loop. Operators deploying single-node
+// Cloud Run should lower this value right after deploying (about 16 is
+// recommended) via Admin → Quotas, or PUT /api/v1/admin/limits/{id} for the
+// max_agents_per_broker system limit definition (ptone/scion#2061 P1a,
+// ptone/scion#2063). Seeding is insert-only: it never overwrites an existing
+// row, so a hub that already has 12, 30, or any other deliberately-set value
+// keeps it across upgrades.
 func seedLimitDefinitions(ctx context.Context, s store.Store) {
 	systemLimits := []struct {
 		name         string
@@ -1263,7 +1466,7 @@ func seedLimitDefinitions(ctx context.Context, s store.Store) {
 		{store.LimitMaxAgentsPerProject, "agent", "count", "Maximum agents per project", 0},
 		{store.LimitMaxProjectsPerUser, "project", "count", "Maximum projects per user", 0},
 		{store.LimitMaxMembersPerGroup, "group", "count", "Maximum members per group", 0},
-		{store.LimitMaxAgentsPerBroker, "agent", "count", "Maximum concurrently live agents per runtime broker (crash-prevention ceiling, ptone/scion#1303)", 12},
+		{store.LimitMaxAgentsPerBroker, "agent", "count", "Maximum concurrently live agents per runtime broker (crash-prevention ceiling, ptone/scion#1303)", 100},
 	}
 
 	for _, lim := range systemLimits {

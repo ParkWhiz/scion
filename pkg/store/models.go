@@ -17,11 +17,14 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
+	"github.com/google/uuid"
 )
 
 // Agent represents an agent record in the Hub database.
@@ -68,6 +71,14 @@ type Agent struct {
 	TaskSummary     string        `json:"taskSummary,omitempty"`
 	Message         string        `json:"message,omitempty"`
 
+	// WorkspacePlacement is where the agent's last start placed its
+	// workspace, as its broker reported it: api.WorkspacePlacementExport
+	// (the broker's shared NFS export) or api.WorkspacePlacementLocal. ""
+	// means unknown. CreateAgent and UpdateAgent never write it; the only
+	// writer is SetAgentWorkspacePlacement, so a whole-row write holding an
+	// older copy cannot clobber a newer report.
+	WorkspacePlacement string `json:"workspacePlacement,omitempty"`
+
 	// Enriched fields (populated by Hub when returning data, not persisted)
 	Project           string `json:"project,omitempty"`           // Project name (resolved from ProjectID)
 	RuntimeBrokerName string `json:"runtimeBrokerName,omitempty"` // Broker name (resolved from RuntimeBrokerID)
@@ -111,6 +122,151 @@ type Agent struct {
 	// A6.6) keys on this instead of Updated. Nil means no reincarnation has
 	// ever touched this agent.
 	ReincarnationUpdatedAt *time.Time `json:"reincarnationUpdatedAt,omitempty"`
+
+	// --- Async agent create (design §3.3) ---
+	// These are the persisted launch_* columns. They are internal bookkeeping,
+	// not the client-facing shape — untagged (json:"-") so they never leak
+	// directly onto the wire. See Launch/AgentLaunch below for the
+	// client-facing computed view derived from these columns.
+	//
+	// UpdateAgent (the whole-row CAS writer) never sets any of these from the
+	// caller's struct: they are absent from its Ent builder chain entirely.
+	// The only writers are BeginLaunch, MarkLaunchAccepted, EndLaunch,
+	// ApplyLaunchReport and RunLaunchReaperTick, plus the narrow "clear
+	// launch_error / end an active launch" rule inside UpdateAgent and
+	// UpdateAgentStatus when the written phase is "running" (§3.3).
+	LaunchAsyncOptIn   bool      `json:"-"`
+	LaunchID           string    `json:"-"`
+	LaunchState        string    `json:"-"` // "" | "active" | "ended"
+	LaunchEndReason    string    `json:"-"`
+	LaunchKind         string    `json:"-"` // "create" | "start" | "restart"
+	LaunchDeadline     time.Time `json:"-"`
+	LaunchLastReportAt time.Time `json:"-"`
+	LaunchOwner        string    `json:"-"`
+	LaunchSeq          int64     `json:"-"`
+	LaunchStep         string    `json:"-"`
+	LaunchError        string    `json:"-"`
+
+	// RunID is the identity of the agent's current or most recent run
+	// (ptone/scion#2550), minted by the Hub per create/start/restart
+	// dispatch and carried on the runtime entry as the scion.run_id label.
+	// "" for a row not dispatched since run IDs existed. Like the launch
+	// columns, UpdateAgent never writes it; the only writer is SetAgentRunID,
+	// so a concurrent whole-row CAS write cannot clobber it.
+	RunID string `json:"-"`
+
+	// PreviousRunIDs are the runs, oldest first, whose runtime entries may
+	// still exist besides RunID's (ptone/scion#3097): SetAgentRunID appends
+	// the run it replaced (see AppendPreviousRunID),
+	// CompareAndSwapAgentRunID, which settles the run, clears them, and
+	// RevertAgentRunID leaves them (so the list may also hold RunID). A
+	// delete names each of them other than RunID. Like RunID, UpdateAgent
+	// never writes it.
+	PreviousRunIDs []string `json:"-"`
+
+	// RunIntent is whether the agent should be running ("running" or
+	// "stopped"); "" means unknown (NULL). RunIntentAt is the store-clock
+	// time of the last intent write. Internal bookkeeping, untagged like the
+	// launch columns. UpdateAgent and CreateAgent never write them; the only
+	// writers are SetRunIntent, RevertRunIntent and BackfillRunIntent.
+	RunIntent   RunIntent  `json:"-"`
+	RunIntentAt *time.Time `json:"-"`
+
+	// Start claim (see start_claim.go). StartClaimID is "" when no claim is
+	// held. Internal bookkeeping, untagged like the launch columns.
+	// UpdateAgent and CreateAgent never write them; the only writers are the
+	// AgentStore start-claim methods and a launch's terminal write.
+	StartClaimID            string          `json:"-"`
+	StartClaimKind          StartClaimKind  `json:"-"`
+	StartClaimState         StartClaimState `json:"-"`
+	StartClaimOwner         string          `json:"-"`
+	StartClaimTarget        string          `json:"-"`
+	StartClaimAt            *time.Time      `json:"-"`
+	StartClaimLeaseUntil    *time.Time      `json:"-"`
+	StartClaimUnconfirmedAt *time.Time      `json:"-"`
+	StartClaimHoldUntil     *time.Time      `json:"-"`
+	// StartClaimLaunchID is the launch a create claim is linked to ("" when
+	// none): only that launch's end settles the claim.
+	StartClaimLaunchID string `json:"-"`
+
+	// Launch is the computed, client-facing view of the launch_* columns
+	// above (design §3.2; see launch_view.go). It is nil unless a
+	// caller populates it (e.g. enrichAgent/enrichAgents in pkg/hub via
+	// ComputeAgentLaunch) — store methods that return an *Agent do not
+	// populate it themselves, so a snapshot always reflects the fields
+	// present at the moment it was computed, not at load time.
+	Launch *AgentLaunch `json:"launch,omitempty"`
+
+	// ProvisionedOnly is a computed, read-only view (ptone/scion#2929):
+	// true when the agent was provisioned but never asked to run (see
+	// ComputeAgentProvisionedOnly). Like Launch, only the hub populates it,
+	// at response time. No omitempty (as on the SSE status event): this
+	// struct is the REST agent shape, and an explicit false lets the web's
+	// partial seed merge clear a previously merged true.
+	ProvisionedOnly bool `json:"provisionedOnly"`
+
+	// --- Backend-driven agent delete (design ptone/scion#2483 §2.1) ---
+	// The persisted deletion_* columns: a leased, sticky delete marker.
+	// Internal bookkeeping, untagged (json:"-") like the launch_* columns.
+	// UpdateAgent never writes them (they are absent from its Ent builder
+	// chain); the only writer is UpdateAgentDeletion. See deletion_view.go
+	// for the client-facing Deletion view and the predicates.
+	DeletionState     string     `json:"-"` // "" | "deleting" | "finalizing" | "failed"
+	DeletionClaim     int64      `json:"-"` // claim epoch, bumped on every successful claim
+	DeletionLeaseAt   *time.Time `json:"-"` // lease expiry; renewed by the live engine
+	DeletionStartedAt *time.Time `json:"-"`
+	DeletionFailedAt  *time.Time `json:"-"`
+	DeletionCode      string     `json:"-"`
+	DeletionError     string     `json:"-"`
+	DeletionPrior     string     `json:"-"` // JSON DeletionPriorState
+	DeletionRequest   string     `json:"-"` // JSON DeletionRequestInfo
+
+	// SoftDeleteOpID is the operation ID of the soft delete that set
+	// DeletedAt ("" when the agent is live or was soft-deleted before the
+	// column existed). Restore reactivates only the delegation edges
+	// deactivated under this ID. Only Store.SetAgentSoftDeleteOpID writes
+	// it; UpdateAgent ignores this field. No authorization decision reads it.
+	SoftDeleteOpID string `json:"-"`
+
+	// Deletion is the computed, client-facing view of the deletion_* columns
+	// (design §2.2; see ComputeAgentDeletion). Like Launch it is populated
+	// only by the hub at response time. Unlike Launch it is always present
+	// on the wire: an explicit null when no delete is active or failed, so
+	// web delta merges clear it.
+	Deletion *DeletionInfo `json:"deletion"`
+}
+
+// InFlightPhases are the agent phases considered "in flight" for a launch
+// (design §3.3 in-flight predicate). Used by the store-side predicates
+// (IsInFlight, IsIncompleteCreate).
+var InFlightPhases = map[string]bool{
+	"created":      true,
+	"provisioning": true,
+	"cloning":      true,
+	"starting":     true,
+}
+
+// IsInFlight reports whether a matches the in-flight predicate (design
+// §3.3): a launch is currently occupying the agent's pre-running phases.
+func (a *Agent) IsInFlight() bool {
+	return a.LaunchState == "active" && InFlightPhases[a.Phase] && a.DeletedAt.IsZero()
+}
+
+// IsIncompleteCreate reports whether a matches the incomplete-create
+// predicate (design §3.3, §0c Option R): a create launch that ended (or is
+// winding down) leaving the agent on a phase where it never ran. Only
+// applicable when LaunchKind == "create" — start/restart launches (P6) are
+// out of scope for P1a and never set this predicate true.
+func (a *Agent) IsIncompleteCreate() bool {
+	if a.LaunchKind != "create" || !a.DeletedAt.IsZero() {
+		return false
+	}
+	switch a.Phase {
+	case "suspended", "stopping", "stopped", "error":
+	default:
+		return false
+	}
+	return a.LaunchState == "active" || a.LaunchError != ""
 }
 
 // ReincarnationState values for Agent.ReincarnationState.
@@ -136,13 +292,20 @@ type ExposedPort struct {
 
 // AgentAppliedConfig stores the effective configuration of an agent.
 type AgentAppliedConfig struct {
-	Image         string              `json:"image,omitempty"`
-	HarnessConfig string              `json:"harnessConfig,omitempty"`
-	HarnessAuth   string              `json:"harnessAuth,omitempty"` // Late-binding override for auth_selected_type
-	Env           map[string]string   `json:"env,omitempty"`
-	Model         string              `json:"model,omitempty"`
-	ThinkingLevel *int                `json:"thinkingLevel,omitempty"`
-	Profile       string              `json:"profile,omitempty"`   // Settings profile for the runtime broker
+	Image         string            `json:"image,omitempty"`
+	HarnessConfig string            `json:"harnessConfig,omitempty"`
+	HarnessAuth   string            `json:"harnessAuth,omitempty"` // Late-binding override for auth_selected_type
+	Env           map[string]string `json:"env,omitempty"`
+	Model         string            `json:"model,omitempty"`
+	ThinkingLevel *int              `json:"thinkingLevel,omitempty"`
+	Profile       string            `json:"profile,omitempty"` // Settings profile for the runtime broker
+	// RuntimeTarget is the broker runtime target (runtime name, plus cluster
+	// context and namespace for Kubernetes) whose listing reported the agent.
+	// Recorded from heartbeats once two consecutive reports name the same
+	// target (see RuntimeTargetCandidate) and cleared when a create, start or
+	// restart is accepted; the missing-container reconcile only considers an
+	// agent whose recorded target a heartbeat lists as complete.
+	RuntimeTarget string              `json:"runtimeTarget,omitempty"`
 	Task          string              `json:"task,omitempty"`      // Initial task/prompt for the agent
 	Attach        bool                `json:"attach,omitempty"`    // If true, signals interactive attach mode to the broker/harness
 	Branch        string              `json:"branch,omitempty"`    // Git branch name (defaults to agent slug if empty)
@@ -152,6 +315,13 @@ type AgentAppliedConfig struct {
 	// Template info for Runtime Broker hydration
 	TemplateID   string `json:"templateId,omitempty"`   // Hub template ID for fetching
 	TemplateHash string `json:"templateHash,omitempty"` // Content hash for cache validation
+
+	// RuntimeTargetCandidate is a target reported by one heartbeat that
+	// differs from RuntimeTarget. It becomes RuntimeTarget only when the next
+	// heartbeat reports the same target, so a single heartbeat built before a
+	// start was accepted cannot record the agent's previous target. Cleared
+	// together with RuntimeTarget.
+	RuntimeTargetCandidate string `json:"runtimeTargetCandidate,omitempty"`
 
 	// Harness-config info for Runtime Broker hydration. When set, the broker
 	// fetches the harness-config from the Hub's storage backend instead of
@@ -205,10 +375,40 @@ type AgentAppliedConfig struct {
 	// into $HOME/.scion/hooks/pre-start.d/30-project-custom before container start.
 	ProjectPreStartHookScript string `json:"projectPreStartHookScript,omitempty"`
 
-	// CreateInputs snapshots the explicit request-level inputs captured at
-	// create time, before any template/harness-config/hub-default derivation
-	// ran. See AgentCreateInputs. Nil for agents created before this field
-	// existed (falls back to a heuristic reconstruction at reincarnate time).
+	// ExplicitTimezone is the agent's pinned container timezone (an IANA
+	// name such as "Europe/Paris"). It is the first rung of the hub's agent
+	// TZ chain (see resolveAgentTZ in pkg/hub) and outranks hub env-var
+	// storage and agent_defaults.default_timezone. Empty means "not pinned".
+	// It is written only by explicit acts: the create pipeline (a TZ from
+	// the request config, the hub template or the hub harness config), the
+	// agent PATCH's top-level explicitTimezone field, legacy adoption of a
+	// TZ persisted in Env before this field existed, and the reincarnate
+	// carry-forward. TZ never lives in Env or InlineConfig.Env once this
+	// field is in use.
+	ExplicitTimezone string `json:"explicitTimezone,omitempty"`
+
+	// ExplicitTimezoneLegacy records that ExplicitTimezone was adopted from
+	// a TZ persisted in Env (or InlineConfig.Env) by an older hub, rather
+	// than set by an explicit act. It is provenance only: the resolver
+	// reports such a pin with the source "legacy". Any PATCH of
+	// explicitTimezone clears it.
+	ExplicitTimezoneLegacy bool `json:"explicitTimezoneLegacy,omitempty"`
+
+	// ExplicitTimezoneUnpinned records an explicit unpin (a PATCH with
+	// explicitTimezone ""). It stops the create pipeline from re-pinning a
+	// template or create-time TZ, including on reincarnate. A non-empty
+	// explicitTimezone write clears it.
+	ExplicitTimezoneUnpinned bool `json:"explicitTimezoneUnpinned,omitempty"`
+
+	// CreateInputs snapshots the explicit request-level inputs: the ones
+	// captured at create time, before any template/harness-config/hub-default
+	// derivation ran, PLUS any later PATCH /api/v1/agents/{id} edit that
+	// changed a field's live value (Option C, ptone/scion#2493; see
+	// recordExplicitEdits in pkg/hub). An echoed PATCH value -- one that
+	// merely reflects the live, derived config back unchanged, as the
+	// configure page's Save and Start both do -- is never recorded here. See
+	// AgentCreateInputs. Nil for agents created before this field existed
+	// (falls back to a heuristic reconstruction at reincarnate time).
 	CreateInputs *AgentCreateInputs `json:"createInputs,omitempty"`
 
 	// envResponseVisible gates whether MarshalJSON includes Env. It defaults
@@ -384,11 +584,17 @@ func (ac AgentAppliedConfig) MarshalJSON() ([]byte, error) {
 
 // AgentCreateInputs snapshots the explicit request-level inputs an agent was
 // created with, independent of anything the template/harness-config/hub
-// defaults later filled in on top of them. `scion reincarnate` (design
-// /scion-volumes/scratchpad/projects/agent-migrate/design.md §3.3 Amendment
-// A1) replays these — plus its own request overrides — through the same
-// derivation resolveDerivedConfig applies at create, against a freshly built
-// AgentAppliedConfig. It must never call resolveDerivedConfig on the
+// defaults later filled in on top of them -- PLUS any later PATCH
+// /api/v1/agents/{id} edit that changed one of these fields' (or an Env
+// key's) live value (Option C, ptone/scion#2493: see recordExplicitEdits in
+// pkg/hub, called from applyAgentUpdate). Invariant E: a PATCH changes a
+// field here if and only if it changed that field's live value, so a PATCH
+// that only echoes the live, derived config back (as the configure page's
+// Save and Start both do) never touches this struct. `scion reincarnate`
+// (design /scion-volumes/scratchpad/projects/agent-migrate/design.md §3.3
+// Amendment A1) replays these — plus its own request overrides — through the
+// same derivation resolveDerivedConfig applies at create, against a freshly
+// built AgentAppliedConfig. It must never call resolveDerivedConfig on the
 // existing (already-derived, possibly stale) AppliedConfig: several fields
 // (Image, Model, Env, HarnessAuth, Workspace, Branch) are dual-purpose —
 // resolveDerivedConfig and populateAgentConfig only fill them in when empty,
@@ -397,6 +603,9 @@ func (ac AgentAppliedConfig) MarshalJSON() ([]byte, error) {
 //
 // Deliberately excludes Task: reincarnate's hub-built preamble plus handoff
 // always replaces it, so the original create-time task is never replayed.
+// recordExplicitEdits excludes it too, for the same reason, along with
+// Harness/HarnessConfig/DefaultHarnessConfig (an unvalidated harness switch
+// must not take effect only at reincarnate).
 type AgentCreateInputs struct {
 	// InlineConfig is a deep copy of the request's Config (ScionConfig) as
 	// given at create time, before resolveDerivedConfig had a chance to stamp
@@ -451,6 +660,57 @@ const (
 	LabelTemplate = "scion.io/template"
 )
 
+// Project members group marker annotations (ptone/scion#2556).
+const (
+	// AnnotationProjectMembersGroup marks a group as the hub-managed
+	// project:<slug>:members group. It is the only key the hub writes and the
+	// key project registration checks before adopting an existing group with
+	// that slug. The hub (createProjectMembersGroup) and the store marker
+	// backfill both write it.
+	AnnotationProjectMembersGroup = "scion.io/project-members-group"
+
+	// LegacyAnnotationProjectMembersGroup is the marker key the store marker
+	// backfill wrote before ptone/scion#2556. The one-shot migration
+	// MigrateLegacyProjectMembersGroupMarkers rewrites it to
+	// AnnotationProjectMembersGroup. No current code sets it; the migration
+	// only removes it. The group API marker guards and the owner-clearing
+	// backfill still accept it, because an older binary may write it during
+	// a rolling upgrade.
+	LegacyAnnotationProjectMembersGroup = "scion.io/system-project-members-group"
+)
+
+// AnnotationProjectAgentsGroup marks a group as the hub-managed
+// project:<slug>:agents group. The hub (createProjectGroup) writes it and
+// checks it (isSystemProjectAgentsGroup) before adopting an existing group
+// with that slug, and the store agents group marker backfill writes it on
+// legitimate pre-upgrade groups.
+const AnnotationProjectAgentsGroup = "scion.io/project-agents-group"
+
+// IsProjectMembersGroup reports whether g is a system project members group:
+// it belongs to a project and carries either members-group marker key with
+// the value "true".
+//
+// Project members groups are system-managed. They cannot be the principal of
+// a role binding or be nested as a child of another group; the store
+// refuses both with ErrProjectMembersGroupPrincipal.
+func IsProjectMembersGroup(g *Group) bool {
+	if g == nil || g.ProjectID == "" || g.Annotations == nil {
+		return false
+	}
+	return g.Annotations[AnnotationProjectMembersGroup] == "true" ||
+		g.Annotations[LegacyAnnotationProjectMembersGroup] == "true"
+}
+
+// Git source labels for git-anchored projects. LabelCloneURL is the URL agents
+// and shared-workspace init actually clone from (it takes precedence over
+// Project.GitRemote), LabelSourceURL records the remote as the user entered it,
+// and LabelDefaultBranch is the branch to clone.
+const (
+	LabelCloneURL      = "scion.dev/clone-url"
+	LabelSourceURL     = "scion.dev/source-url"
+	LabelDefaultBranch = "scion.dev/default-branch"
+)
+
 // Workspace mode constants for git projects.
 // When a git project has the workspace mode label set to "shared", it uses a
 // single shared clone mounted by all agents instead of per-agent clones.
@@ -484,6 +744,15 @@ const (
 	// on K8s are not supported and fall back to clone-per-agent).
 	// Maps from label value "worktree-per-agent".
 	SharingModeWorktreePerAgent WorkspaceSharingMode = "worktree-per-agent"
+
+	// SharingModeEmptyPerAgent: each agent gets its own private, initially
+	// empty, non-git directory. Only valid for non-git (hub-managed) projects;
+	// the hub derives it from the "per-agent" label on a project without a git
+	// remote (see ResolveProjectSharingMode). It is the canonical value sent to
+	// brokers and exported as SCION_WORKSPACE_MODE; the bare "per-agent" label
+	// is never forwarded for such projects because label-only resolution maps
+	// it to clone-per-agent.
+	SharingModeEmptyPerAgent WorkspaceSharingMode = "empty-per-agent"
 )
 
 // ResolveWorkspaceSharingMode maps a workspace mode label value (wire format) to
@@ -498,9 +767,52 @@ func ResolveWorkspaceSharingMode(label string) WorkspaceSharingMode {
 		return SharingModeClonePerAgent
 	case WorkspaceModeWorktreePerAgent:
 		return SharingModeWorktreePerAgent
+	case string(SharingModeEmptyPerAgent):
+		return SharingModeEmptyPerAgent
 	default:
 		// Empty or unrecognized: default to shared-plain.
 		return SharingModeSharedPlain
+	}
+}
+
+// ResolveProjectSharingMode is the single source of truth mapping a project's
+// workspace-mode label and git-ness to the canonical WorkspaceSharingMode.
+// For git projects it matches ResolveWorkspaceSharingMode, except that a raw
+// "empty-per-agent" label (a non-git-only mode) resolves to
+// SharingModeSharedPlain like any other unrecognized value. For non-git
+// projects, "per-agent" (or the canonical "empty-per-agent") resolves to
+// SharingModeEmptyPerAgent and everything else to SharingModeSharedPlain.
+func ResolveProjectSharingMode(label string, isGit bool) WorkspaceSharingMode {
+	if isGit {
+		if label == string(SharingModeEmptyPerAgent) {
+			return SharingModeSharedPlain
+		}
+		return ResolveWorkspaceSharingMode(label)
+	}
+	switch label {
+	case WorkspaceModePerAgent, string(SharingModeEmptyPerAgent):
+		return SharingModeEmptyPerAgent
+	default:
+		return SharingModeSharedPlain
+	}
+}
+
+// ValidateWorkspaceMode reports whether a requested workspace mode (API/label
+// value) is allowed for a project of the given git-ness. An empty mode is
+// always valid (it means "no label"). worktree-per-agent requires a git
+// remote; unknown values are rejected.
+func ValidateWorkspaceMode(mode string, isGit bool) error {
+	switch mode {
+	case "", WorkspaceModeShared, WorkspaceModePerAgent:
+		return nil
+	case WorkspaceModeWorktreePerAgent:
+		if !isGit {
+			return fmt.Errorf("workspace mode %q requires a git remote", mode)
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid workspace mode %q: must be one of %q, %q, %q",
+			mode, WorkspaceModeShared, WorkspaceModePerAgent, WorkspaceModeWorktreePerAgent)
 	}
 }
 
@@ -566,6 +878,19 @@ func (p *Project) IsWorktreePerAgent() bool {
 	return p.GitRemote != "" && p.Labels[LabelWorkspaceMode] == WorkspaceModeWorktreePerAgent
 }
 
+// SharingMode returns the canonical workspace sharing mode for this project,
+// derived from its workspace-mode label and whether it has a git remote.
+func (p *Project) SharingMode() WorkspaceSharingMode {
+	return ResolveProjectSharingMode(p.Labels[LabelWorkspaceMode], p.GitRemote != "")
+}
+
+// IsEmptyPerAgent returns true if this is a non-git project configured so
+// each agent gets its own empty, private workspace directory. It is defined
+// via SharingMode so the two can never disagree.
+func (p *Project) IsEmptyPerAgent() bool {
+	return p != nil && p.SharingMode() == SharingModeEmptyPerAgent
+}
+
 // IsTemplate returns true if this project is marked as a project template.
 func (p *Project) IsTemplate() bool {
 	return p.Labels[LabelTemplate] == "true"
@@ -591,6 +916,25 @@ type RuntimeBroker struct {
 
 	// Profiles available (stored as JSON)
 	Profiles []BrokerProfile `json:"profiles,omitempty"`
+
+	// DefaultProfile is the broker's own active/default profile name,
+	// recorded at registration from the broker's local active_profile
+	// setting (config.Settings.ActiveProfile). It lets the hub resolve an
+	// agent dispatch with no explicit profile against the broker's
+	// registered profiles instead of guessing. This is registration-time
+	// data: the broker's own dispatch-time settings can still resolve the
+	// same profile name differently (project-level or DB-overlay
+	// settings), which is why passthrough grants that depend on this field
+	// also carry a broker-side re-check (RequireLocalRuntime). Empty means
+	// the broker has not reported one (e.g. registered before this field
+	// existed) or the hub has not yet learned it.
+	DefaultProfile string `json:"defaultProfile,omitempty"`
+
+	// WorkspaceStorage describes where the broker places agent workspaces,
+	// reported at registration and refreshed on every heartbeat (stored as
+	// JSON). Nil means the broker has never reported it (an older broker);
+	// the hub refuses a cross-broker move involving such a broker.
+	WorkspaceStorage *api.BrokerWorkspaceStorage `json:"workspaceStorage,omitempty"`
 
 	// Metadata
 	Labels      map[string]string `json:"labels,omitempty"`
@@ -634,6 +978,25 @@ type BrokerCapabilities struct {
 	// unset (design /scion-volumes/scratchpad/projects/agent-migrate/design.md
 	// §5 "Broker/hub version skew").
 	Reprovision bool `json:"reprovision"`
+	// AsyncLaunch indicates the broker understands the non-blocking agent
+	// create path and the launch-report protocol (design t1-async-create-v11.md
+	// §3.2, §7 P1b-1).
+	AsyncLaunch bool `json:"asyncLaunch"`
+	// EmptyPerAgentWorkspace indicates the broker can provision the
+	// empty-per-agent workspace sharing mode (private empty directory per
+	// agent on non-git projects). The hub refuses to dispatch such agents to
+	// brokers without it, returning 412 (fail closed; design #2703 D3).
+	EmptyPerAgentWorkspace bool `json:"emptyPerAgentWorkspace"`
+	// AgentMove indicates the broker can take part in moving an agent
+	// between brokers that share a workspace export (`scion reincarnate
+	// --broker`). The hub refuses a move unless both the source and the
+	// target broker report it (412).
+	AgentMove bool `json:"agentMove"`
+	// StartsInFlight indicates the broker reports the agent starts still
+	// running on it in every heartbeat (BrokerHeartbeat.StartsInFlight). Only
+	// then does the hub read a start's absence from that list as "no start
+	// in flight".
+	StartsInFlight bool `json:"startsInFlight,omitempty"`
 }
 
 // BrokerProfile describes a runtime profile available on a broker.
@@ -643,6 +1006,14 @@ type BrokerProfile struct {
 	Available bool   `json:"available"`
 	Context   string `json:"context,omitempty"`   // K8s context
 	Namespace string `json:"namespace,omitempty"` // K8s namespace
+	// Attach reports whether this profile's runtime supports interactive
+	// attach, mirrored from pkg/runtimebroker.BrokerProfile.Attach. A
+	// pointer, not a plain bool: a profile recorded from an older broker
+	// that predates this field decodes with Attach == nil, and nil must
+	// mean supported (the same missing-capability default
+	// pkg/runtime.HasAttachSupport uses), not false. A plain bool could not
+	// tell that "never reported" apart from an explicit false.
+	Attach *bool `json:"attach,omitempty"`
 }
 
 // ProjectProvider links a runtime broker to a project.
@@ -775,20 +1146,17 @@ type HarnessConfig struct {
 
 // HarnessConfigData holds the harness-specific configuration details.
 type HarnessConfigData struct {
-	Harness                 string                   `json:"harness,omitempty"`
-	Image                   string                   `json:"image,omitempty"`
-	User                    string                   `json:"user,omitempty"`
-	Model                   string                   `json:"model,omitempty"`
-	Args                    []string                 `json:"args,omitempty"`
-	Env                     map[string]string        `json:"env,omitempty"`
-	AuthSelectedType        string                   `json:"authSelectedType,omitempty"`
-	Secrets                 []api.RequiredSecret     `json:"secrets,omitempty"`
-	ModelAliases            map[string]string        `json:"modelAliases,omitempty"`
-	ThinkingBudgetMap       map[string]int           `json:"thinkingBudgetMap,omitempty"`
-	ThinkingBudgetFlag      string                   `json:"thinkingBudgetFlag,omitempty"`
-	ThinkingBudgetConfigKey string                   `json:"thinkingBudgetConfigKey,omitempty"`
-	NoAuthBehavior          string                   `json:"noAuthBehavior,omitempty"`
-	AuthMeta                *api.HarnessAuthMetadata `json:"authMeta,omitempty"`
+	Harness          string                   `json:"harness,omitempty"`
+	Image            string                   `json:"image,omitempty"`
+	User             string                   `json:"user,omitempty"`
+	Model            string                   `json:"model,omitempty"`
+	Args             []string                 `json:"args,omitempty"`
+	Env              map[string]string        `json:"env,omitempty"`
+	AuthSelectedType string                   `json:"authSelectedType,omitempty"`
+	Secrets          []api.RequiredSecret     `json:"secrets,omitempty"`
+	ModelAliases     map[string]string        `json:"modelAliases,omitempty"`
+	NoAuthBehavior   string                   `json:"noAuthBehavior,omitempty"`
+	AuthMeta         *api.HarnessAuthMetadata `json:"authMeta,omitempty"`
 }
 
 // HarnessConfigStatus constants
@@ -879,7 +1247,8 @@ type User struct {
 type UserPreferences struct {
 	DefaultTemplate string `json:"defaultTemplate,omitempty"`
 	DefaultProfile  string `json:"defaultProfile,omitempty"`
-	Theme           string `json:"theme,omitempty"` // light, dark
+	Theme           string `json:"theme,omitempty"`    // light, dark
+	Timezone        string `json:"timezone,omitempty"` // IANA zone name; empty means Auto (browser zone)
 }
 
 // UserRole constants
@@ -1083,6 +1452,21 @@ type BrokerDispatch struct {
 	CreatedAt  time.Time  `json:"createdAt"`
 	UpdatedAt  time.Time  `json:"updatedAt"`
 	DeadlineAt *time.Time `json:"deadlineAt,omitempty"`
+
+	// Initiator attribution (E.2b, path F). Set once at insert
+	// (deferredDataOpResult / deferredLifecycle) from the request context
+	// that originated the cross-node op; never updated afterward. This is a
+	// separate, smaller field set from InitiatorAttribution (no snapshot, no
+	// version, no revision): a broker dispatch is a transport retry of an
+	// already-authorized operation, not a re-evaluated authoring point.
+	InitiatorPrincipalKind  string `json:"initiatorPrincipalKind,omitempty"`
+	InitiatorPrincipalID    string `json:"initiatorPrincipalId,omitempty"`
+	InitiatorCredentialKind string `json:"initiatorCredentialKind,omitempty"` // session|uat|agent|dev_local|legacy_unknown
+	InitiatorCredentialID   string `json:"initiatorCredentialId,omitempty"`
+	// CorrelationID ties this dispatch row back to the originating request's
+	// log/audit trail (the same request ID plumbed through decision/mutation
+	// audit).
+	CorrelationID string `json:"correlationId,omitempty"`
 }
 
 // BrokerDispatch.State values.
@@ -1098,7 +1482,36 @@ const (
 	MessageDispatchPending    = "pending"
 	MessageDispatchDispatched = "dispatched"
 	MessageDispatchFailed     = "failed"
+	// MessageDispatchDeferred marks a row persisted while the recipient was
+	// mid-`scion reincarnate` (design agent-reincarnate §3.7, migration
+	// gate): the message is saved to history for catch-up but was
+	// deliberately never handed to a dispatcher. Distinct from "failed"
+	// (dispatch was attempted and rejected) and "pending" (dispatch is
+	// still outstanding) — deferred means dispatch was never attempted.
+	MessageDispatchDeferred = "deferred"
+	// MessageDispatchNoRecipient marks a group-thread message that resolved
+	// no agent recipient (no default agent, no reply-to agent, no agent
+	// @mention). It is saved to the thread but no agent was given it, so it
+	// must not read as "dispatched". Terminal: nothing retries it.
+	MessageDispatchNoRecipient = "no_recipient"
 )
+
+// MessageExpiredStuckPendingReason is the exact DispatchFailureReason the
+// stuck-message sweep (pkg/hub/sweep.go's brokerMessageSweepHandler) writes
+// when ExpireStuckPendingMessages flips a stuck-pending row to "failed". The
+// non-agent dispatch_state backfill (cmd/boot_non_agent_dispatch_state_backfill.go)
+// matches this exact string to identify rows the sweep mislabeled rather than
+// a genuine, differently-reasoned delivery failure. Both sites must use this
+// single constant — two independent literals can drift, silently breaking
+// the backfill's ability to find and repair swept rows.
+//
+// Do not change this value. Production messages.dispatch_failure_reason rows
+// already carry this exact string, written before this constant existed;
+// changing it would silently strand those rows outside the backfill's exact-
+// match predicate. Pinned by TestMessageExpiredStuckPendingReason_Value in
+// pkg/store/models_test.go — if this literal ever needs to change, that
+// change must ship together with a data migration for existing rows.
+const MessageExpiredStuckPendingReason = "expired: stuck in pending state beyond TTL"
 
 // =============================================================================
 // Notifications (Agent Status Notification System)
@@ -1179,8 +1592,22 @@ type ListOptions struct {
 	// Stores reject a cursor whose binding does not match.
 	CursorBinding string
 	Labels        map[string]string // Label selectors
-	SortBy        string            // Sort field (interpretation is store-specific)
-	SortDir       string            // Sort direction: "asc" or "desc" (default depends on field)
+	// SortBy and SortDir select the agent list's sorted mode: "created" or
+	// "updated", with "asc" or "desc". Empty SortBy is the legacy path
+	// (ORDER BY created DESC, id DESC), which AgentStore.ListAgents leaves
+	// byte-identical to today. Unknown non-empty values fail closed with
+	// ErrInvalidInput.
+	SortBy  string // Sort field (interpretation is store-specific)
+	SortDir string // Sort direction: "asc" or "desc" (default depends on field)
+	// SortCursor is the decoded v2 sorted-mode position, consulted only
+	// when SortBy is non-empty, in place of Cursor: the caller decodes and
+	// validates the opaque cursor itself via store.DecodeAgentCursor before
+	// any store call, so this carries the already-trusted position rather
+	// than requiring the store to decode an opaque string a second time.
+	// nil means page 0. A non-empty Cursor in sorted mode is rejected with
+	// ErrInvalidInput. CursorBinding above is still consulted in sorted
+	// mode, to mint NextCursor via store.EncodeAgentCursor.
+	SortCursor *AgentCursor
 }
 
 // ListResult is a generic result container for list operations.
@@ -1572,14 +1999,102 @@ type UserAccessToken struct {
 	KeyHash string `json:"-"`      // SHA-256 hash (never exposed)
 
 	// Scoping
-	ProjectID string   `json:"projectId"` // Required: project this token is scoped to
-	Scopes    []string `json:"scopes"`    // Action scopes (resource:action pairs)
+	//
+	// BoundaryKind is the credential-side boundary this token was issued
+	// under (permissions.BoundaryKind: "project" or "hub"). ProjectID is
+	// set iff BoundaryKind == "project"; it is empty for a hub-boundary
+	// token and must never be interpreted as hub — an empty or missing
+	// ProjectID with a "project" BoundaryKind is invalid, not hub-scoped
+	// (see ValidateBoundary).
+	BoundaryKind string   `json:"boundaryKind"`
+	ProjectID    string   `json:"projectId"` // set iff BoundaryKind == "project"; empty otherwise; never interpreted as hub
+	Scopes       []string `json:"scopes"`    // Action scopes (resource:action pairs)
+
+	// CeilingVersion and CeilingPermissionIDs hold the normalized, frozen
+	// permission ceiling. CeilingVersionUnspecified (zero value) with
+	// CeilingPermissionIDs == nil means no ceiling has been persisted for
+	// this row yet: NormalizedCeiling recomputes it from Scopes via the
+	// frozen legacy snapshot rather than trusting a zero value that could
+	// equally mean "persisted, and resolves to nothing." Once
+	// CeilingPermissionIDs is non-nil — backfilled, or set at mint for any
+	// CeilingVersionV1+ row — it is the authoritative, already-resolved
+	// value and Scopes is retained only for display/audit, never re-derived.
+	// Excluded from JSON: the HTTP token response is a separate type, and
+	// omitempty would collapse the nil-vs-empty-list distinction on a round
+	// trip.
+	CeilingVersion       permissions.CeilingVersion `json:"-"`
+	CeilingPermissionIDs []string                   `json:"-"`
 
 	// Lifecycle
 	Revoked   bool       `json:"revoked"`
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"` // Required for UATs
 	LastUsed  *time.Time `json:"lastUsed,omitempty"`
 	Created   time.Time  `json:"created"`
+
+	// E.1 descriptive credential metadata. Immutable after issuance: there
+	// is no update path. nil/empty means no metadata was supplied (always
+	// true for tokens created before E.1).
+	Purpose *string           `json:"purpose,omitempty"`
+	Labels  map[string]string `json:"labels,omitempty"`
+}
+
+// NormalizedCeiling returns t's FrozenPermissionCeiling. A row that has never
+// been normalized — CeilingVersion is CeilingVersionUnspecified and
+// CeilingPermissionIDs is nil, meaning no value has been persisted, not even
+// an explicit empty one — is normalized on the fly from the raw stored Scopes
+// via permissions.NormalizeLegacyUATScopes, the frozen legacy snapshot. This
+// never calls the live, mutable permissions.ResolveSelector, so a later
+// Registry or alias change cannot retroactively change what an existing
+// token means. Once CeilingPermissionIDs has been persisted
+// (by the migration backfill, or because the token was minted under
+// CeilingVersionV1+), that value is authoritative and is returned as-is,
+// including when it is an explicit empty list — which denies, not
+// "unrestricted."
+func (t *UserAccessToken) NormalizedCeiling() permissions.FrozenPermissionCeiling {
+	if t.CeilingVersion == permissions.CeilingVersionUnspecified && t.CeilingPermissionIDs == nil {
+		return permissions.FrozenPermissionCeiling{
+			Version:       permissions.CeilingVersionUnspecified,
+			PermissionIDs: permissions.NormalizeLegacyUATScopes(t.Scopes),
+		}
+	}
+	return permissions.FrozenPermissionCeiling{
+		Version:       t.CeilingVersion,
+		PermissionIDs: t.CeilingPermissionIDs,
+	}
+}
+
+// ErrInvalidUATBoundary is returned when a UserAccessToken's BoundaryKind/
+// ProjectID combination is invalid: an unrecognized kind, a "project"
+// boundary with a missing, malformed or nil-UUID project ID, or a "hub" boundary
+// carrying a project ID. A row that fails this must never authenticate: an
+// empty or malformed ProjectID is never coerced into a hub boundary, and an
+// invalid row is rejected rather than repaired or trusted.
+var ErrInvalidUATBoundary = errors.New("invalid user access token boundary")
+
+// ValidateBoundary reports whether t's BoundaryKind/ProjectID combination is
+// well-formed. It shares its kind/project-id-presence rule with
+// permissions.ValidBoundary — the same rule pkg/hub's TokenBoundary.Valid()
+// calls — so store-layer and authorization-layer validation cannot drift.
+// It additionally requires ProjectID to parse as a non-nil UUID when
+// BoundaryKind is "project", since pkg/store owns the wire representation of
+// that ID. The nil UUID is rejected because no project carries it: a stored
+// empty project_id string scans back as the nil UUID, so accepting it would let a
+// row with no project authenticate as a project token.
+func (t *UserAccessToken) ValidateBoundary() error {
+	kind := permissions.BoundaryKind(t.BoundaryKind)
+	if !permissions.ValidBoundary(kind, t.ProjectID) {
+		return fmt.Errorf("%w: kind=%q project_id_set=%v", ErrInvalidUATBoundary, t.BoundaryKind, t.ProjectID != "")
+	}
+	if kind == permissions.BoundaryKindProject {
+		id, err := uuid.Parse(t.ProjectID)
+		if err != nil {
+			return fmt.Errorf("%w: project id is not a valid UUID", ErrInvalidUATBoundary)
+		}
+		if id == uuid.Nil {
+			return fmt.Errorf("%w: project id is the nil UUID", ErrInvalidUATBoundary)
+		}
+	}
+	return nil
 }
 
 // UATPrefix is the token prefix that distinguishes UATs from other token types.
@@ -1707,6 +2222,18 @@ type GCPIdentityConfig struct {
 	ServiceAccountID    string `json:"serviceAccountId,omitempty"`    // FK to GCPServiceAccount (required for "assign")
 	ServiceAccountEmail string `json:"serviceAccountEmail,omitempty"` // Denormalized for runtime use
 	ProjectID           string `json:"projectId,omitempty"`           // Denormalized
+
+	// RequireLocalRuntime marks a "passthrough" mode as granted by the
+	// hub-default rung specifically (hubDefaultRuntimeAllowed,
+	// default_gcp_identity.go), never by an explicit request or a
+	// project-level default. The hub resolves the runtime this agent will
+	// dispatch under from the broker's own registration data, which can
+	// differ from what the broker resolves at dispatch time against
+	// project-effective settings. The broker re-checks this flag once it
+	// knows the real resolved runtime, and downgrades to "block" itself if
+	// that runtime turns out not to be a local container runtime — a second
+	// line of defense behind the hub-side gate, not a replacement for it.
+	RequireLocalRuntime bool `json:"requireLocalRuntime,omitempty"`
 }
 
 // GCPVerificationStatus constants describe the outcome of the Hub's last
@@ -1806,6 +2333,15 @@ type MessageFilter struct {
 	After          time.Time // Lower bound for created_at (exclusive)
 }
 
+// LatestMessageOptions narrows the per-key latest-message lookups
+// (LatestMessagesByThreadIDs, LatestMessagesByConversationIDs). Each field
+// has the meaning of the MessageFilter field of the same name; empty fields
+// do not filter.
+type LatestMessageOptions struct {
+	Channel     string // Only messages on this channel
+	ExcludeType string // Ignore messages of this type
+}
+
 // =============================================================================
 // Conversations (Multi-Party Messaging)
 // =============================================================================
@@ -1861,6 +2397,83 @@ type ConversationFilter struct {
 }
 
 // =============================================================================
+// Initiator attribution (async work; tracker E.2b, ptone/scion#2127)
+// =============================================================================
+
+// InitiatorAttribution records the initiating principal/credential of an
+// asynchronously authored or executed row. It is embedded identically in
+// both ScheduledEvent and Schedule, via one ent mixin
+// (pkg/ent/schema/mixin_initiator_attribution.go), so a recurring fire is a
+// single struct assignment (event.InitiatorAttribution =
+// schedule.InitiatorAttribution) and B.3 reads the same shape from either
+// row (rulings "E.2b field names", "B.3 adoption" — names are committed and
+// adopted verbatim; do not rename).
+//
+// A row written before E.2b (AttributionVersion NULL/0) reads with every
+// field its zero value. Callers MUST treat that as legacy_unknown — never as
+// an interactive credential (plan correction (c); use the scheduledInitiator
+// read helper in pkg/hub rather than reading these fields directly).
+//
+// Attribution is not authority (cutover rule): E.2b records and exposes the
+// initiator; it does not change who is authorized at fire time. B.3 owns the
+// fire-time authority decision and its own ceiling column(s) on the same
+// rows, updated in the same transaction as an attribution replacement.
+type InitiatorAttribution struct {
+	InitiatorPrincipalKind      string `json:"initiatorPrincipalKind,omitempty"`
+	InitiatorPrincipalID        string `json:"initiatorPrincipalId,omitempty"`
+	InitiatorCredentialKind     string `json:"initiatorCredentialKind,omitempty"` // session|uat|agent|dev_local|legacy_unknown
+	InitiatorCredentialID       string `json:"initiatorCredentialId,omitempty"`
+	InitiatorCredentialSnapshot string `json:"initiatorCredentialSnapshot,omitempty"` // bounded JSON: name, boundary, purpose, labels
+	AttributionVersion          int    `json:"attributionVersion,omitempty"`          // 0/absent = legacy_unknown; 1 = written by E.2b
+	// AuthorizationRevision is bumped atomically with each attribution
+	// replacement (ruling Q2): a fully reauthorized mutation that changes
+	// future dispatch replaces the attribution and this revision together.
+	// Schedules own the counter; events copy the schedule's current value at
+	// materialization and keep it unchanged afterward (already-materialized
+	// events keep their revision snapshot). B.3's delegation edge reads it
+	// back as a typed SourceAuthorizationRevision.
+	AuthorizationRevision int `json:"authorizationRevision,omitempty"`
+}
+
+// InitiatorCredentialKind* are the values InitiatorAttribution.InitiatorCredentialKind
+// may hold. This is a deliberately smaller, committed domain than
+// hub.CredentialKind: async attribution only ever records one of these five
+// values (rulings "E.2b field names"; dev_local added by ptone/scion#2342).
+//
+// InitiatorCredentialKindDevLocal is a narrow, server-attested exception:
+// hub.captureInitiatorAttribution emits it only for the concrete trusted
+// local-dev identity (hub.DevUser, produced solely by hub.NewDevUser /
+// DevAuthMiddleware) and only when that identity's ID matches the
+// well-known hub.DevUserID. It is never derived from an identity's
+// self-reported Type(), from request input, or from any other identity
+// implementation that merely looks like the dev user. Every other
+// unrecognized or absent credential still maps to legacy_unknown. Like
+// every other value in this domain, dev_local is attribution, not
+// authority: it grants nothing by itself, and B.3 owns the fire-time
+// authority decision built on top of it.
+const (
+	InitiatorCredentialKindSession       = "session"
+	InitiatorCredentialKindUAT           = "uat"
+	InitiatorCredentialKindAgent         = "agent"
+	InitiatorCredentialKindDevLocal      = "dev_local"
+	InitiatorCredentialKindLegacyUnknown = "legacy_unknown"
+)
+
+// ScheduleFieldMask marks which of Schedule's mutable metadata fields
+// UpdateSchedule should write from the struct passed to it. A field left
+// false is not referenced at all by the write — no Set, no Clear — so a
+// struct built from a possibly-stale read can never revert a column the
+// caller did not intend to change in this call.
+type ScheduleFieldMask struct {
+	Name      bool
+	CronExpr  bool
+	EventType bool
+	Payload   bool
+	Status    bool
+	NextRunAt bool
+}
+
+// =============================================================================
 // Scheduled Events (One-Shot Timers)
 // =============================================================================
 
@@ -1877,6 +2490,15 @@ type ScheduledEvent struct {
 	FiredAt    *time.Time `json:"firedAt,omitempty"`
 	Error      string     `json:"error,omitempty"`
 	ScheduleID string     `json:"scheduleId,omitempty"` // FK to schedules.id for recurring schedule fires
+
+	// InitiatorAttribution is set at authoring time (one-shot create) or
+	// copied from the parent schedule at each recurrence (E.2b). See the
+	// type doc above. json:"-": nothing in the brief or plan asks for wire
+	// exposure, and a token's descriptive metadata (name, purpose, labels,
+	// boundary) is otherwise shown only to its owner. Callers that need it
+	// read the row from the store; B.3 and E.2b's own tests read the
+	// embedded struct field directly.
+	InitiatorAttribution `json:"-"`
 }
 
 // ScheduledEventStatus constants
@@ -1918,6 +2540,13 @@ type Schedule struct {
 	CreatedAt     time.Time  `json:"createdAt"`
 	CreatedBy     string     `json:"createdBy,omitempty"`
 	UpdatedAt     time.Time  `json:"updatedAt"`
+
+	// InitiatorAttribution is set at authoring time and replaced atomically
+	// (together with AuthorizationRevision) whenever a fully reauthorized
+	// mutation changes future dispatch (E.2b, ruling Q2). CreatedBy is never
+	// overwritten by a re-attribution. See the type doc above. json:"-": see
+	// ScheduledEvent's field doc above for why.
+	InitiatorAttribution `json:"-"`
 }
 
 // ScheduleStatus constants
@@ -2244,6 +2873,31 @@ type HubSetting struct {
 	UpdatedAt time.Time       `json:"updatedAt"`
 }
 
+// =============================================================================
+// Broker Settings (ptone/scion#2061 P2, ptone/scion#2177)
+// =============================================================================
+
+// BrokerSettings is the typed document stored per runtime broker. It is a
+// general per-broker settings mechanism (design.md §5.1): each field is one
+// key in the pkg/hub/brokersettings registry. maxAgents is the first key: a
+// per-broker override of the max_agents_per_broker quota. nil means
+// "inherit" (fall through to the entitlement engine / hub-wide default); 0
+// means unlimited; a positive value is the cap, and may be lower than the
+// hub-wide default or any system-scoped entitlement binding.
+type BrokerSettings struct {
+	MaxAgents *int64 `json:"maxAgents,omitempty"`
+}
+
+// BrokerSettingsRecord is a BrokerSettings document plus the metadata needed
+// for optimistic concurrency and attribution.
+type BrokerSettingsRecord struct {
+	BrokerID  string         `json:"brokerId"`
+	Settings  BrokerSettings `json:"settings"`
+	Revision  int64          `json:"revision"`
+	UpdatedBy string         `json:"updatedBy,omitempty"`
+	Updated   time.Time      `json:"updated"`
+}
+
 // SkillRegistryType constants
 const (
 	SkillRegistryTypeHub = "hub"
@@ -2486,6 +3140,123 @@ type DelegationEdge struct {
 	Grandfathered bool      `json:"grandfathered"`
 	CreatedAt     time.Time `json:"createdAt"`
 	UpdatedAt     time.Time `json:"updatedAt"`
+
+	// AuthorityProvenance, EffectCeiling and Deactivation are recorded at
+	// write time and stay off public JSON. Their zero values mean
+	// "unrecorded": an edge written without them never reads as principal.
+	AuthorityProvenance
+	EffectCeiling
+	Deactivation
+}
+
+// EffectCeilingKind is the kind of a frozen effect ceiling.
+type EffectCeilingKind string
+
+const (
+	// EffectCeilingUnrecorded is the zero value: provenance was not
+	// recorded. It never carries permission IDs and is never read as
+	// EffectCeilingPrincipal.
+	EffectCeilingUnrecorded EffectCeilingKind = ""
+	// EffectCeilingBounded carries a complete permission allow-list
+	// interpreted under Version. An empty list allows nothing.
+	EffectCeilingBounded EffectCeilingKind = "bounded"
+	// EffectCeilingPrincipal carries no credential caveat: the live
+	// principal's authority is the only bound.
+	EffectCeilingPrincipal EffectCeilingKind = "principal"
+)
+
+// EffectCeiling is the frozen upper bound recorded with an
+// authority-producing write. It is never recomputed after the write.
+type EffectCeiling struct {
+	Kind              EffectCeilingKind          `json:"-"`
+	Version           permissions.CeilingVersion `json:"-"` // bounded only: copied unchanged from a UAT source, or V1 for coverage computed from an agent parent
+	PermissionIDs     []string                   `json:"-"` // bounded only; sorted, de-duplicated
+	BoundaryKind      string                     `json:"-"` // permissions.BoundaryKind of the source credential; "" for principal
+	BoundaryProjectID string                     `json:"-"`
+	SourceExpiresAt   *time.Time                 `json:"-"` // UAT expiry when the source credential is a UAT (descriptive only)
+}
+
+// Frozen returns the permission ceiling for a bounded ceiling. ok is false
+// for principal and unrecorded; callers must branch on Kind and must never
+// treat !ok as unrestricted.
+func (c EffectCeiling) Frozen() (permissions.FrozenPermissionCeiling, bool) {
+	if c.Kind != EffectCeilingBounded {
+		return permissions.FrozenPermissionCeiling{}, false
+	}
+	ids := c.PermissionIDs
+	if ids == nil {
+		ids = []string{}
+	}
+	return permissions.FrozenPermissionCeiling{Version: c.Version, PermissionIDs: ids}, true
+}
+
+// SourceCredentialKind is the credential that authenticated the source of an
+// authority-producing write.
+type SourceCredentialKind string
+
+const (
+	SourceCredentialSession         SourceCredentialKind = "session"
+	SourceCredentialDevLocal        SourceCredentialKind = "dev_local"
+	SourceCredentialUAT             SourceCredentialKind = "uat"
+	SourceCredentialAgent           SourceCredentialKind = "agent"
+	SourceCredentialScheduler       SourceCredentialKind = "scheduler"
+	SourceCredentialSystemMigration SourceCredentialKind = "system_migration"
+)
+
+// ProvenanceVersionV1 is the first recorded AuthorityProvenance layout.
+// ProvenanceVersion 0 means provenance was not recorded.
+const ProvenanceVersionV1 = 1
+
+// AuthorityProvenance records who authorized an authority-producing write
+// and with which credential. The Initiator* fields use the
+// InitiatorAttribution names and value domain.
+type AuthorityProvenance struct {
+	ProvenanceVersion           int                  `json:"-"` // 0 = unrecorded, 1 = v1
+	SourcePrincipalKind         string               `json:"-"` // "user" | "agent"
+	SourcePrincipalID           string               `json:"-"`
+	SourceCredentialKind        SourceCredentialKind `json:"-"`
+	SourceCredentialID          string               `json:"-"` // UAT ID, agent credential JTI; "" for session and dev_local
+	SourceEventID               string               `json:"-"` // scheduler: fired scheduled event ID (reference only)
+	SourceScheduleID            string               `json:"-"` // scheduler: recurring schedule ID, may be empty
+	SourceAuthorizationRevision int                  `json:"-"` // scheduler: revision the event snapshotted
+	InitiatorPrincipalKind      string               `json:"-"`
+	InitiatorPrincipalID        string               `json:"-"`
+	InitiatorCredentialKind     string               `json:"-"` // InitiatorCredentialKind* domain
+	InitiatorCredentialID       string               `json:"-"`
+}
+
+// EdgeDeactivationCause records why a delegation edge or assignment was
+// deactivated. The empty value means active, or deactivated before causes
+// were recorded.
+type EdgeDeactivationCause string
+
+const (
+	EdgeDeactivationAgentSoftDelete     EdgeDeactivationCause = "agent_soft_delete"
+	EdgeDeactivationAgentHardDelete     EdgeDeactivationCause = "agent_hard_delete"
+	EdgeDeactivationDelegatorDeleted    EdgeDeactivationCause = "delegator_deleted"
+	EdgeDeactivationCreateCompensation  EdgeDeactivationCause = "create_compensation"
+	EdgeDeactivationReincarnateReplaced EdgeDeactivationCause = "reincarnate_replaced"
+)
+
+// ValidEdgeDeactivationCause reports whether c is a cause that may be
+// recorded on a delegation edge.
+func ValidEdgeDeactivationCause(c EdgeDeactivationCause) bool {
+	switch c {
+	case EdgeDeactivationAgentSoftDelete,
+		EdgeDeactivationAgentHardDelete,
+		EdgeDeactivationDelegatorDeleted,
+		EdgeDeactivationCreateCompensation,
+		EdgeDeactivationReincarnateReplaced:
+		return true
+	}
+	return false
+}
+
+// Deactivation is the deactivation record of an edge or assignment.
+type Deactivation struct {
+	Cause EdgeDeactivationCause `json:"-"`
+	At    *time.Time            `json:"-"`
+	OpID  string                `json:"-"` // one ID per deactivating operation
 }
 
 // Delegation edge principal types
@@ -2551,6 +3322,39 @@ type DecisionAuditRecord struct {
 	PolicyID       string
 	CorrelationID  string
 	Sampled        bool
+
+	// E.2a additive fields (ptone/scion#2127, plan §3.2). All optional,
+	// default "".
+
+	// PermissionID is the exact canonical permission ID AuthzService.decide
+	// was given and evaluated (AuthzRequest.Permission after the request's
+	// own permission resolution) — never independently re-derived from
+	// ResourceType/Permission here (ruling Q7). Left empty for decisions that
+	// fail before permission resolution (missing principal, unsupported
+	// principal kind).
+	PermissionID string
+	// CredentialName/CredentialBoundaryKind/CredentialBoundaryProjectID/
+	// CredentialLabels are E.1's descriptive credential decoration,
+	// snapshotted at decision time (audits outlive tokens — see
+	// useraccesstoken.go's delete). Empty for credentials E.1 does not
+	// decorate (non-UAT).
+	CredentialName              string
+	CredentialBoundaryKind      string
+	CredentialBoundaryProjectID string
+	CredentialLabels            string // bounded JSON object, "" when absent
+	// ExecutorKind/ExecutorID identify what is currently executing a
+	// deferred-execution decision, as distinct from the initiating
+	// principal/credential above (plan §3.5). Empty for an ordinary live
+	// request — E.2a defines the accessor pair; E.2b's async entry points
+	// are the ones that set it.
+	ExecutorKind string
+	ExecutorID   string
+	// DeniedBy is the Decision's typed denial-source string (hub.DeniedBy),
+	// recorded verbatim by Decide's single audit exit through
+	// BuildDecisionAuditRecord, for example "delegation_ceiling". It is empty
+	// on allow and on a deny not attributed to a named stage. The aggregated
+	// list-filter record (G) leaves it empty by agreement.
+	DeniedBy string
 }
 
 // DecisionAuditFilter defines query parameters for listing decision audit records.
@@ -2588,6 +3392,23 @@ type MutationAuditRecord struct {
 	AfterSummary        string
 	CanDelegateResult   string
 	CanDelegateReason   string
+
+	// E.2a additive fields (ptone/scion#2127, plan §3.3). All optional,
+	// default "". See AuditActor/ApplyActor (audit_actor.go), which populate
+	// them for every mutation-audit writer.
+	CredentialName              string
+	CredentialBoundaryKind      string
+	CredentialBoundaryProjectID string
+	CredentialLabels            string // bounded JSON object, "" when absent
+	// CorrelationID is the request ID shared with the request log and
+	// decision audit for the same request (plan §3.2 "decision/mutation
+	// agreement").
+	CorrelationID string
+	// ExecutorKind/ExecutorID identify what is currently executing, as
+	// distinct from the initiating principal/credential above (plan §3.5).
+	// Empty for an ordinary live request.
+	ExecutorKind string
+	ExecutorID   string
 }
 
 // MutationAuditFilter defines query parameters for listing mutation audit records.
@@ -2598,6 +3419,7 @@ type MutationAuditFilter struct {
 	ActorCredentialID  string
 	TargetType         string
 	TargetID           string
+	CorrelationID      string
 	Since              time.Time
 	Until              time.Time
 	Limit              int
@@ -2616,7 +3438,7 @@ type LimitDefinition struct {
 	Unit         string    `json:"unit"`         // e.g. "count"
 	Description  string    `json:"description"`
 	DefaultValue int64     `json:"defaultValue"` // 0 = unlimited
-	System       bool      `json:"system"`       // true = seeded, not user-modifiable
+	System       bool      `json:"system"`       // true = seeded; only default_value/description are editable, cannot be deleted
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`
 }
@@ -2713,6 +3535,27 @@ type AccessConstraint struct {
 	CreatedBy            string     `json:"createdBy"`
 	CreatedAt            time.Time  `json:"createdAt"`
 	UpdatedAt            time.Time  `json:"updatedAt"`
+}
+
+// AccessConstraintHistory is the purpose-specific retained timeline for one
+// live access constraint. It mirrors the typed access-boundary audit payload;
+// it is not a generic serialized audit event.
+type AccessConstraintHistory struct {
+	EventID           string
+	ConstraintID      string
+	OccurredAt        time.Time
+	Operation         string
+	ActorKind         string
+	ActorID           string
+	CorrelationID     string
+	BatchOperationID  string
+	BeforeRevision    *int64
+	AfterRevision     *int64
+	Classification    string
+	PreviewID         string
+	DraftHash         string
+	ImpactCountsJSON  string
+	ChangedFieldsJSON string
 }
 
 // AccessConstraintListOptions defines filtering, sorting, and cursor-based

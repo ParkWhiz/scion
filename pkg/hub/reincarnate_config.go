@@ -23,6 +23,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -40,12 +41,17 @@ import (
 //   - the requester's original explicit inputs (Image, Model, Env,
 //     InlineConfig, HarnessConfig, HarnessAuth, Profile, ThinkingLevel), from
 //     AppliedConfig.CreateInputs, or a heuristic reconstruction for an agent
-//     that predates that field. HarnessConfig and HarnessAuth are
-//     dual-purpose exactly like Model, NOT kept fields — left empty here
-//     (rather than copied from the live config) is what lets
-//     deriveAgentConfig's project/template/hub resolution below fill them
-//     fresh from the CURRENT catalog when the requester never set them,
-//     instead of freezing in whatever generation N happened to resolve;
+//     that predates that field. Since Option C (ptone/scion#2493),
+//     CreateInputs also picks up any later PATCH /api/v1/agents/{id} edit
+//     that changed one of these fields' (or an Env key's) live value — see
+//     recordExplicitEdits — so "explicit inputs" here means the create
+//     request plus any explicit edit made since, not just what create itself
+//     saw. HarnessConfig and HarnessAuth are dual-purpose exactly like Model,
+//     NOT kept fields — left empty here (rather than copied from the live
+//     config) is what lets deriveAgentConfig's project/template/hub
+//     resolution below fill them fresh from the CURRENT catalog when the
+//     requester never set them, instead of freezing in whatever generation N
+//     happened to resolve;
 //   - then deriveAgentConfig run on THAT fresh config: harness-config
 //     resolution, applyProjectDefaults, applyHubAgentDefaults, then
 //     populateAgentConfig/resolveDerivedConfig — so every derived slot is
@@ -56,8 +62,20 @@ import (
 //
 // Returns the fresh config, any warnings to surface on the plan (e.g. the
 // legacy-fallback notice), and an error only for a genuine failure (missing
-// AppliedConfig).
+// AppliedConfig, or a workspace storage timeout from deriveAgentConfig,
+// which wraps errWorkspaceContentTimeout).
 func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent, project *store.Project, imageRegistry string) (*store.AgentAppliedConfig, []string, error) {
+	return s.buildPatchedAppliedConfig(ctx, agent, project, imageRegistry, nil)
+}
+
+// buildPatchedAppliedConfig is buildFreshAppliedConfig with an optional,
+// already-authorized reincarnate patch (ptone/scion#3302). The patch's
+// Image/Model/ThinkingLevel/HarnessAuth are recorded into a copy of
+// CreateInputs (recordReincarnatePatchEdits) before the pipeline runs, so
+// they take the explicit-input slot and the new generation keeps them; its
+// Role and GCPIdentity replace the kept values. A nil patch is exactly
+// buildFreshAppliedConfig. agent.AppliedConfig is never mutated.
+func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Agent, project *store.Project, imageRegistry string, patch *reincarnatePatch) (*store.AgentAppliedConfig, []string, error) {
 	old := agent.AppliedConfig
 	if old == nil {
 		return nil, nil, fmt.Errorf("agent %s has no applied config", agent.ID)
@@ -82,10 +100,21 @@ func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent
 		templateEnv = resolvedTemplate.Config.Env
 	}
 
+	// Adopt a legacy env TZ into ExplicitTimezone before anything reads
+	// old's env: legacyCreateInputsFromAppliedConfig below would otherwise
+	// replay it as a create-time env value instead of a carried-forward pin.
+	adoptLegacyTZ(old)
+
 	createInputs := old.CreateInputs
 	var warnings []string
 	if createInputs == nil {
 		createInputs, warnings = legacyCreateInputsFromAppliedConfig(old, templateEnv)
+	}
+	if patch != nil {
+		// A copy: createInputs may be the outgoing generation's own record
+		// (old.CreateInputs, also saved as PreviousAppliedConfig).
+		createInputs = cloneCreateInputs(createInputs)
+		recordReincarnatePatchEdits(createInputs, patch)
 	}
 
 	fresh := &store.AgentAppliedConfig{
@@ -107,6 +136,15 @@ func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent
 		Branch:                 old.Branch,
 		GCPIdentity:            old.GCPIdentity,
 
+		// Writer (d) of ExplicitTimezone: the pin, its legacy label and the
+		// unpin record are carried forward. deriveAgentConfig's create-time
+		// capture never overwrites a non-empty pin and moves nothing when
+		// the agent was unpinned, so only an agent with neither re-derives
+		// its timezone from CreateInputs and the current template.
+		ExplicitTimezone:         old.ExplicitTimezone,
+		ExplicitTimezoneLegacy:   old.ExplicitTimezoneLegacy,
+		ExplicitTimezoneUnpinned: old.ExplicitTimezoneUnpinned,
+
 		// Explicit-only: empty here (rather than copied from `old`) is what
 		// lets deriveAgentConfig's pipeline fill these fresh from the CURRENT
 		// project/template/hub configuration when the requester never set
@@ -127,6 +165,21 @@ func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent
 		CreateInputs: createInputs,
 	}
 
+	// Kept fields a reincarnate patch replaces. Set before NoAuth is
+	// derived below (role=none implies NoAuth) and before deriveAgentConfig
+	// (GCPIdentity feeds its auto-no-auth check).
+	if patch != nil {
+		if patch.Role != "" {
+			fresh.AgentRole = string(patch.Role)
+			// An explicitly patched role is not a backfilled one.
+			fresh.AgentRoleGrandfathered = false
+		}
+		if patch.GCPIdentity != nil {
+			g := *patch.GCPIdentity
+			fresh.GCPIdentity = &g
+		}
+	}
+
 	// Design §3.5: make an empty (implicit-default) branch explicit, so a
 	// template change cannot silently rename it. Today's implicit default
 	// for clone-per-agent (init.go) and the value here are the same
@@ -137,14 +190,12 @@ func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent
 		fresh.Branch = "scion/" + agent.Slug
 	}
 
-	// Unlike buildAppliedConfig, deliberately do NOT alias Image/Model/Env to
-	// InlineConfig's backing map (design §3.3 A1 addendum 2, rule 3):
-	// InlineConfig is a fresh, independent copy, and Env gets its own clone,
-	// so resolveDerivedConfig's template-env merge below cannot write through
-	// to CreateInputs.InlineConfig.Env or leave the new InlineConfig carrying
-	// merged values it didn't have explicitly. De-aliasing the create path
-	// itself is out of scope (unaudited downstream readers); CreateInputs
-	// makes it unnecessary there.
+	// Do NOT alias Image/Model/Env to InlineConfig's backing map (design
+	// §3.3 A1 addendum 2, rule 3): InlineConfig is a fresh, independent copy,
+	// and Env gets its own clone (as buildAppliedConfig does on create), so
+	// resolveDerivedConfig's template-env merge and auto-expose project tier
+	// below cannot write through to CreateInputs.InlineConfig.Env or leave the
+	// new InlineConfig carrying merged values it didn't have explicitly.
 	if createInputs.InlineConfig != nil {
 		fresh.InlineConfig = deepCopyScionConfig(createInputs.InlineConfig)
 		fresh.Image = fresh.InlineConfig.Image
@@ -162,7 +213,7 @@ func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent
 	// agent — reincarnate with NoAuth reset to false and regain injected
 	// secrets on its next start. This is OR'd, never overwritten: nothing
 	// here can flip a true back to false.
-	if createInputs.NoAuth || fresh.HarnessAuth == "none" || fresh.AgentRole == string(AgentRoleNone) {
+	if createInputs.NoAuth || harness.IsNoAuthType(fresh.HarnessAuth) || fresh.AgentRole == string(AgentRoleNone) {
 		fresh.NoAuth = true
 	}
 
@@ -179,42 +230,64 @@ func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent
 	// resolveDerivedConfig alone would skip the project/hub defaulting step
 	// and let the template win over a project or hub default (design §3.3
 	// Amendment A1 property 1).
-	s.deriveAgentConfig(ctx, freshAgent, project, resolvedTemplate)
+	if err := s.deriveAgentConfig(ctx, freshAgent, project, resolvedTemplate); err != nil {
+		return nil, nil, err
+	}
 
-	// Design §3.4 Amendment A11.1(a): fill Image from the resolved harness
-	// config when deriveAgentConfig still left it empty. resolveDerivedConfig
-	// only fills Image from an explicit inline config or the template (see
-	// its own Image-fill code) — it never reads a harness config's image at
-	// all. On create, that gap is invisible because the broker resolves and
-	// echoes the harness-config image back (applyBrokerResponse), and the
-	// create response handler persists it. The reincarnate plan has no
-	// broker round trip to see that value before deciding what to show, so
-	// it is resolved here instead.
+	// Design §3.4 Amendment A11.1(a): fill Image from Hub settings, then the
+	// resolved harness config, when deriveAgentConfig still left it empty.
+	// resolveDerivedConfig only fills Image from an explicit inline config or
+	// the template (see its own Image-fill code) — it never reads a Hub
+	// settings harness_configs entry or a harness config's own image at all.
+	// On create, that gap is invisible because the broker resolves and
+	// echoes the actual image back (applyBrokerResponse), and the create
+	// response handler persists it. The reincarnate plan has no broker round
+	// trip to see that value before deciding what to show, so it is resolved
+	// here instead.
 	//
-	// This preserves the broker's own image-resolution precedence: explicit
-	// inline, then template, then harness config. fresh.Image already
-	// reflects "explicit inline, then template" by this point (set from
-	// CreateInputs.InlineConfig.Image above, then possibly filled from the
-	// template by resolveDerivedConfig inside deriveAgentConfig) — see
-	// pkg/agent/provision.go's merge order (inline is merged over the
-	// template first; that combined result is then merged, as the
-	// higher-precedence side, over a harness-config base:
-	// `finalScionCfg = config.MergeScionConfig(hcCfg, finalScionCfg)`) and
-	// pkg/config/templates.go's MergeScionConfig, whose override side
-	// (`if override.Image != "" { result.Image = override.Image }`) only
-	// wins when non-empty — so filling from the harness config ONLY when
+	// This preserves the broker's own image-resolution precedence (fixed by
+	// ptone/scion#2156): explicit inline, then template, then Hub settings
+	// harness_configs.<name> (profiles.<p>.harness_overrides.<name>
+	// outranking the base entry), then the harness config's own stored
+	// image. fresh.Image already reflects "explicit inline, then template"
+	// by this point (set from CreateInputs.InlineConfig.Image above, then
+	// possibly filled from the template by resolveDerivedConfig inside
+	// deriveAgentConfig) — see pkg/agent/provision.go's merge order (inline
+	// is merged over the template first; that combined result is then
+	// merged, as the higher-precedence side, over a harness-config-or-
+	// settings base: `finalScionCfg = config.MergeScionConfig(hcCfg,
+	// finalScionCfg)`) and pkg/config/templates.go's MergeScionConfig, whose
+	// override side (`if override.Image != "" { result.Image =
+	// override.Image }`) only wins when non-empty — so filling only when
 	// fresh.Image is still empty here reproduces that exact order.
 	//
 	// Deliberately NOT added to resolveDerivedConfig itself: that would
 	// change create's own behavior, which the Phase 0 golden test pins.
-	if fresh.Image == "" && fresh.HarnessConfigID != "" {
-		hc, err := s.store.GetHarnessConfig(ctx, fresh.HarnessConfigID)
+	var hc *store.HarnessConfig
+	if fresh.HarnessConfigID != "" {
+		var err error
+		hc, err = s.store.GetHarnessConfig(ctx, fresh.HarnessConfigID)
 		if err != nil {
 			s.agentLifecycleLog.Warn("reincarnate: failed to resolve harness config for the image fallback",
 				"agent_id", agent.ID, "harness_config_id", fresh.HarnessConfigID, "error", err)
-		} else if hc.Config != nil && hc.Config.Image != "" {
-			fresh.Image = hc.Config.Image
+			hc = nil
 		}
+	}
+	if fresh.Image == "" && hc != nil {
+		// Look up settings by the same key the broker dispatches with —
+		// fresh.HarnessConfig is the harness-config slug/name as resolved
+		// for this dispatch (GetHarnessConfigBySlug's input, echoed through
+		// opts.HarnessConfig), not hc.Name (the harness config's own
+		// display name, which can differ from its slug). Fall back to
+		// hc.Slug only if fresh.HarnessConfig is somehow unset.
+		settingsKey := fresh.HarnessConfig
+		if settingsKey == "" {
+			settingsKey = hc.Slug
+		}
+		fresh.Image = s.settingsHarnessConfigImage(settingsKey, fresh.Profile)
+	}
+	if fresh.Image == "" && hc != nil && hc.Config != nil && hc.Config.Image != "" {
+		fresh.Image = hc.Config.Image
 	}
 
 	// Store the image in the form the broker actually runs: the dispatcher
@@ -223,7 +296,44 @@ func (s *Server) buildFreshAppliedConfig(ctx context.Context, agent *store.Agent
 	// and for an already-qualified name.
 	fresh.Image = config.RewriteImageRegistry(fresh.Image, imageRegistry)
 
+	// deriveAgentConfig's timezone capture already stripped TZ from the
+	// fresh env copies; strip again so no step after it can leave one.
+	stripAgentEnvTZ(fresh)
 	return fresh, warnings, nil
+}
+
+// settingsHarnessConfigImage resolves the Hub settings image for a named
+// harness-config (harness_configs.<name>.image, with
+// profiles.<profileName>.harness_overrides.<name>.image outranking the base
+// entry — same precedence as pkg/config.VersionedSettings.ResolveHarnessConfig,
+// which this reuses directly). Returns "" when settings has no image for
+// this harness-config, in which case the caller falls back to the harness
+// config's own stored default.
+//
+// The settings view comes from the hub's own config.LoadEffectiveSettings(""),
+// which — in postgres mode — already reflects DB-backed harness_configs and
+// profiles through the process-global settings overlay that
+// OperationalSettings.Refresh populates (pkg/config/settings_overlay.go), the
+// same overlay a co-located broker's own LoadEffectiveSettings call sees. In
+// file/SQLite mode it reads the hub's settings.yaml directly.
+func (s *Server) settingsHarnessConfigImage(harnessConfigName, profileName string) string {
+	if harnessConfigName == "" {
+		return ""
+	}
+	vs, _, err := config.LoadEffectiveSettings("")
+	if err != nil {
+		s.agentLifecycleLog.Warn("reincarnate: failed to load settings for the image fallback",
+			"harness_config_name", harnessConfigName, "error", err)
+		return ""
+	}
+	if vs == nil {
+		return ""
+	}
+	resolved, err := vs.ResolveHarnessConfig(profileName, harnessConfigName)
+	if err != nil {
+		return ""
+	}
+	return resolved.Image
 }
 
 // imageRegistryProvider is implemented by dispatchers that rewrite image
@@ -258,12 +368,15 @@ func dispatchImageRegistry(dispatcher AgentDispatcher) string {
 //   - InlineConfig.Telemetry is dropped: it is always a hub/project/template
 //     default once populated (see resolveDerivedConfig), never something the
 //     requester provided directly in a way this reconstruction could trust.
-//   - InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"] is stripped: it is a
-//     project- or hub-level default, never an explicit request input.
+//   - InlineConfig.Env["SCION_AUTO_EXPOSE_PORTS"] is stripped: on a legacy
+//     agent it is usually the project or hub default an older hub stamped
+//     there, and cannot be told apart from an explicit value. The caller then
+//     re-derives the project and template tiers through deriveAgentConfig
+//     (resolveAutoExposeEnv), exactly as for an agent with CreateInputs.
 //   - Every other key InlineConfig.Env shares with templateEnv (the CURRENT
 //     template's env map) is also dropped, whatever its value (A1 addendum
-//     2, rule 2): buildAppliedConfig aliases AppliedConfig.Env to
-//     InlineConfig.Env, so a legacy agent's InlineConfig.Env is
+//     2, rule 2): the hub that created a legacy agent aliased
+//     AppliedConfig.Env to InlineConfig.Env, so its InlineConfig.Env is
 //     indistinguishable-by-inspection from a mix of explicit keys and
 //     template defaults merged in at create time. Assuming "the template
 //     still owns this key" errs toward template freshness — reincarnate's

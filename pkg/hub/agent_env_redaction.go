@@ -36,8 +36,8 @@ import (
 //     cannot attach to the agent's container cannot read its live env
 //     either, so withholding the persisted copy from them removes a read
 //     path without removing any capability that didn't already exist
-//     (mirrors the attach/port-access carve-out in ownerAdminExcludedActions,
-//     capabilities.go).
+//     (mirrors attach and port access coming only from the owner/ancestor
+//     relationship to the agent, not from project roles).
 //   - canAttach == true: every key is returned except GITHUB_TOKEN, which is
 //     never included in a response regardless of viewer or classification --
 //     it is not a legitimate value to keep surfacing from the durable config
@@ -86,4 +86,16 @@ func redactedAgentCopy(ctx context.Context, s *Server, agent *store.Agent) *stor
 	redacted := *agent
 	redacted.AppliedConfig = redactAppliedConfigEnvForResponse(agent.AppliedConfig, canViewAgentEnv(ctx, s, agent))
 	return &redacted
+}
+
+// envViewAllowed decides whether a response for identity may include
+// agent's persisted env, given the capability set the handler already
+// computed for identity on agent. Env is included only when that set
+// allows attach; a nil set includes nothing. Every list and single-agent
+// response that computes capabilities decides env visibility here.
+func (s *Server) envViewAllowed(ctx context.Context, identity Identity, agent *store.Agent, cap *Capabilities) bool {
+	if identity == nil || agent == nil {
+		return false
+	}
+	return capabilityAllows(cap, ActionAttach)
 }

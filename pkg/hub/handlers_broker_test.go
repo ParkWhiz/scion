@@ -76,12 +76,9 @@ func setupBrokerAuthzTest(t *testing.T) (srv *Server, s store.Store, alice, bob,
 	ensureHubMembership(ctx, s, bob.ID)
 	ensureHubMembership(ctx, s, admin.ID)
 
-	// CO1: Grant runtime_broker.read to all users so they can access the
-	// GET /api/v1/runtime-brokers/:id endpoint (the inline authz check
-	// uses resource type "runtime_broker" rather than the canonical "broker").
-	grantUserRuntimeBrokerAccess(t, s, alice.ID)
-	grantUserRuntimeBrokerAccess(t, s, bob.ID)
-	grantUserRuntimeBrokerAccess(t, s, admin.ID)
+	// The hub-member role's broker.read (granted via ensureHubMembership
+	// above) already covers GET /api/v1/runtime-brokers/:id and its
+	// /projects sub-route — no extra grant needed here.
 
 	// Create a project owned by alice
 	project = &store.Project{
@@ -94,7 +91,7 @@ func setupBrokerAuthzTest(t *testing.T) (srv *Server, s store.Store, alice, bob,
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroup(ctx, project)
+	srv.seedProjectCreatorMembership(ctx, project)
 
 	// CO1: Add bob as a project member via role binding so he can create
 	// agents (project-level authz).
@@ -438,7 +435,12 @@ func TestAgentCreate_BrokerResolution(t *testing.T) {
 			"runtimeBrokerId": "non-existent",
 		}
 		rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents", body)
-		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		// A broker that does not exist at all is a 404, not a 503
+		// (ptone/scion#2715).
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, ErrCodeRuntimeBrokerNotFound, errResp.Error.Code)
 	})
 }
 

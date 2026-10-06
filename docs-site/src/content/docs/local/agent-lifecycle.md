@@ -114,6 +114,14 @@ exit code (the authoritative path), and the Hub also derives `error` from a
 non-zero container exit reported in the broker heartbeat — which covers cases
 where the container died before `sciontool` could report.
 
+A third path covers a container that vanishes without reporting an exit (for
+example, removed outside Scion). In Hub-connected setups, a `running` agent
+that is missing from its online Runtime Broker's complete runtime inventory for longer
+than `missing_agent_grace` (default **3 minutes**, see
+[server configuration](/scion/reference/server-config/)) moves to `error` with
+exit reason `container_missing`, instead of staying `running` while messages
+to it are buffered. It can then be restarted like any other `error`-phase agent.
+
 :::note
 A normal `scion stop` sends `SIGTERM`, which harnesses like Claude Code handle
 gracefully and exit cleanly (code 0). Only a *genuine* crash or a hard kill
@@ -142,7 +150,7 @@ In Hub-connected setups, the same recovery is available in the web UI as a **Res
 
 #### Reincarnating an Agent
 
-To move an existing agent onto the current template, image, and harness config without losing its identity, use [`scion reincarnate`](/scion/reference/cli/#scion-reincarnate). It keeps the agent ID and slug, starts a new generation with a freshly resolved config, and hands it the task you supply with `--handoff-file`. Use `--dry-run` to preview the changes first. Reincarnation requires a Hub.
+To move an existing agent onto the current template, image, and harness config without losing its identity, use [`scion reincarnate`](/scion/reference/cli/#scion-reincarnate). It keeps the agent ID and slug, starts a new generation with a freshly resolved config, and hands it the task you supply with `--handoff-file`. Use `--dry-run` to preview the changes first. Reincarnation requires a Hub, and works for agents in clone-per-agent, shared-workspace, and Hub-managed workspaces; agents in worktree-per-agent projects are not yet supported.
 
 ## Auto-Suspend of Stalled Agents
 
@@ -195,7 +203,7 @@ Always start by running `scion look <agent-name>` to inspect the active screen s
 | **Phase `created` / lastSeen zero** for 5+ minutes | The agent creation timed out or failed to schedule. | The system is likely under heavy resource pressure. Wait a few minutes. If still stuck, delete and recreate. **To prevent:** reduce concurrent agent starts. |
 | **Start fails with `no_runtime_broker` (422)** | Temporary connection issue after a system restart or project reconnect. | Wait 30–60 seconds and try starting again. If persistent, verify broker status with `scion broker status`. |
 | **Split-Brain Configuration** (git project ignore settings) | Config files are loading incorrectly due to overlapping global vs. project settings. | Run `scion config dir` to see the effective config path. Ensure the merge chain matches: `defaults → global → in-repo → external → environment`. |
-| **Interactive prompt blocking** | The agent's harness is stuck waiting for an unhandled prompt (e.g. yes/no query). | Send the dismissive keystroke raw to the terminal: `scion keys <agent-name> "ENTER"` (or `"y"`, etc.). |
+| **Interactive prompt blocking** | The agent's harness is stuck waiting for an unhandled prompt (e.g. yes/no query). | Send the dismissive keystroke to the terminal: `scion keys <agent-name> "Enter"` (or `"y"`, etc.). One key per call — there is no sequence syntax. |
 
 ---
 

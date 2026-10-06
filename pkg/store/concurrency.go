@@ -110,6 +110,11 @@ const (
 	// restarted mid-migration (design §3.7).
 	LockReincarnationSweep AdvisoryLockKey = 0x5C100022
 
+	// LockStartClaimReaper guards the periodic start-claim reaper, which
+	// demotes start claims whose lease expired and releases unconfirmed
+	// claims once the runtime shows the start's outcome.
+	LockStartClaimReaper AdvisoryLockKey = 0x5C100024
+
 	// LockInlineSecretsMigration guards the one-shot migration of inline
 	// plugin secrets from settings.yaml to the secret backend at boot time.
 	LockInlineSecretsMigration AdvisoryLockKey = 0x5C100011
@@ -158,6 +163,19 @@ const (
 	// window (Server.Config.FailedMessageRetentionDays).
 	LockFailedMessageRetention AdvisoryLockKey = 0x5C100019
 
+	// LockAgentLaunchDeadline guards RunLaunchReaperTick, the T1 async-create
+	// launch reaper (design t1-async-create-v11.md §3.7). Unlike every other
+	// key in this block it is NOT taken through the AdvisoryLocker interface:
+	// the reaper needs a transaction-scoped pg_try_advisory_xact_lock (so the
+	// lock and every statement of the tick share one connection and are
+	// released together at commit/rollback), which AdvisoryLocker's
+	// session-level, dedicated-connection TryAdvisoryLock cannot express. The
+	// constant is registered here only so the numeric key is allocated
+	// centrally and cannot collide with another lock; RunLaunchReaperTick
+	// issues `SELECT pg_try_advisory_xact_lock($1)` against it directly on its
+	// own hand-built *sql.Tx.
+	LockAgentLaunchDeadline AdvisoryLockKey = 0x5C10001A
+
 	// LockWorkspaceProvision is the CLASS ID for per-project workspace
 	// provisioning locks. It is used with the two-int advisory lock form
 	// pg_try_advisory_lock(classid, objid), where classid is this constant
@@ -181,11 +199,24 @@ const (
 	// sequence is atomic, preventing over-allocation.
 	LockQuotaEnforcement AdvisoryLockKey = 0x5C101002
 
+	// LockAgentHomeStart is the CLASS ID for per-agent start locks of
+	// agents whose home is on NFS, used with the two-int form where objid
+	// is StableProjectHash("<projectID>/<agentID>"). It is held from before
+	// the agent's previous pod is removed until the new pod exists, so two
+	// starts of one agent never overlap.
+	LockAgentHomeStart AdvisoryLockKey = 0x5C101003
+
 	// LockBrokerQuotaReconcile guards the periodic (and startup, tick 0)
 	// reconcile of stale max_agents_per_broker reservations (ptone/scion#1963)
 	// — rows left with released_at IS NULL for agents that are no longer in a
 	// counted phase (stopped/suspended/error) or no longer exist.
 	LockBrokerQuotaReconcile AdvisoryLockKey = 0x5C100021
+
+	// LockConduitRegistryReap guards the conduit registry maintenance
+	// singleton (design v2.4 §3.4): ReapStaleRelays, ReapStaleSessions and
+	// PruneRelayInstances run together under this one lock, as the registry
+	// requires.
+	LockConduitRegistryReap AdvisoryLockKey = 0x5C100023
 )
 
 // AdvisoryLocker is implemented by backends that can take a cluster-wide

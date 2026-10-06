@@ -26,6 +26,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/daemon"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
@@ -64,6 +65,7 @@ var (
 	brokerBrokerID    string // --broker flag for remote broker operations
 	brokerMakeDefault bool   // --make-default flag to set broker as project default
 	brokerHubFlag     string // --hub flag to target a specific hub connection
+	brokerProvidePath string // --path flag: explicit local project path for provide
 
 	// broker register transport flags
 	brokerTransportMode     string
@@ -196,8 +198,14 @@ Examples:
   # Add local broker as provider for current project
   scion runtime-broker provide
 
-  # Add local broker as provider for a specific project
+  # Add local broker as provider for a specific project. No local path is
+  # sent: an existing provider path for this broker is kept (a stored
+  # global-directory path is cleared), otherwise the broker uses its
+  # hub-managed project directory.
   scion runtime-broker provide --project <project-id>
+
+  # Add local broker as provider for a project linked to a local checkout
+  scion runtime-broker provide --project <project-id> --path /path/to/checkout
 
   # Add a remote broker as provider for a project (admin only)
   scion runtime-broker provide --broker <broker-id> --project <project-id>
@@ -366,6 +374,7 @@ func init() {
 	brokerProvideCmd.Flags().StringVar(&brokerBrokerID, "broker", "", "Broker name or ID to use (for remote broker operations)")
 	brokerProvideCmd.Flags().BoolVar(&brokerMakeDefault, "make-default", false, "Set this broker as the default for the project")
 	brokerProvideCmd.Flags().StringVar(&brokerHubFlag, "hub", "", "Hub connection name (from 'scion runtime-broker hubs')")
+	brokerProvideCmd.Flags().StringVar(&brokerProvidePath, "path", "", "Local project path to register for this broker (default with --project: none sent; an existing provider path is kept unless it is the global directory, otherwise the broker uses its hub-managed project directory)")
 
 	brokerWithdrawCmd.Flags().StringVar(&brokerProjectID, "project", "", "Project name or ID to remove as provider from")
 
@@ -530,14 +539,10 @@ func runBrokerRegister(cmd *cobra.Command, args []string) error {
 
 		// Phase 1: Create broker registration
 		createReq := &hubclient.CreateBrokerRequest{
-			BrokerID: stableBrokerID,
-			Name:     brokerName,
-			Capabilities: []string{
-				"sync",
-				"attach",
-				"reprovision",
-			},
-			AutoProvide: brokerAutoProvide,
+			BrokerID:     stableBrokerID,
+			Name:         brokerName,
+			Capabilities: brokerRegistrationCapabilities(),
+			AutoProvide:  brokerAutoProvide,
 			Labels: map[string]string{
 				"scion.io/broker-role": "remote",
 			},
@@ -559,16 +564,14 @@ func runBrokerRegister(cmd *cobra.Command, args []string) error {
 
 		// Phase 2: Complete broker join with join token
 		joinReq := &hubclient.JoinBrokerRequest{
-			BrokerID:  createResp.BrokerID,
-			JoinToken: createResp.JoinToken,
-			Hostname:  brokerName,
-			Version:   version.Version,
-			Capabilities: []string{
-				"sync",
-				"attach",
-				"reprovision",
-			},
-			Profiles: profiles,
+			BrokerID:         createResp.BrokerID,
+			JoinToken:        createResp.JoinToken,
+			Hostname:         brokerName,
+			Version:          version.Version,
+			Capabilities:     brokerRegistrationCapabilities(),
+			Profiles:         profiles,
+			WorkspaceStorage: loadBrokerRegistrationWorkspaceStorage(),
+			DefaultProfile:   brokerRegistrationDefaultProfile(settings),
 		}
 
 		joinResp, err := client.RuntimeBrokers().Join(ctx, joinReq)
@@ -800,6 +803,44 @@ func isServerDaemonManagingBroker(globalDir string) (running bool, pid int) {
 	return true, serverPID
 }
 
+// buildBrokerForegroundArgs constructs the `server start` args used when
+// `runtime-broker start --foreground` runs the server command directly,
+// in-process, via serverStartCmd.RunE (no re-exec, no daemon).
+//
+// --foreground MUST be included here: runServerStartOrDaemon (serverStartCmd's
+// RunE) decides whether to daemonize based on the --foreground flag being set
+// on serverStartCmd itself, not on the fact that the caller is already inside
+// runBrokerStart's foreground branch. Dropping it caused serverStartCmd.RunE
+// to spawn a background daemon child instead of running inline: fatal under a
+// systemd Type=simple unit, whose ExecStart is expected to stay in the
+// foreground, since the parent then exits 0 immediately and systemd's cgroup
+// cleanup reaps the now-orphaned daemon child.
+func buildBrokerForegroundArgs(port int, autoProvide, debug bool) []string {
+	// Use --hosted to avoid workstation defaults (we only want the broker).
+	args := []string{"--foreground", "--hosted", "--enable-runtime-broker"}
+	if port != DefaultBrokerPort {
+		args = append(args, fmt.Sprintf("--runtime-broker-port=%d", port))
+	}
+	if autoProvide {
+		args = append(args, "--auto-provide")
+	}
+	if debug {
+		args = append(args, "--debug")
+	}
+	return args
+}
+
+// buildBrokerDaemonArgs constructs the `server start --foreground` argv used
+// to (re-)launch the broker as a background daemon: the re-exec'd child itself
+// runs with --foreground, and daemon.Start is what backgrounds that child.
+// Shared by runBrokerStart's daemon path and runBrokerRestart. Built on top of
+// buildBrokerForegroundArgs (with the "server", "start" command name prefixed)
+// so the flag list can't drift between the two paths the way --foreground once
+// did.
+func buildBrokerDaemonArgs(port int, autoProvide, debug bool) []string {
+	return append([]string{"server", "start"}, buildBrokerForegroundArgs(port, autoProvide, debug)...)
+}
+
 func runBrokerStart(cmd *cobra.Command, args []string) error {
 	// Get global directory for daemon files
 	globalDir, err := config.GetGlobalDir()
@@ -814,18 +855,7 @@ func runBrokerStart(cmd *cobra.Command, args []string) error {
 
 	// Foreground mode - just run the server command directly
 	if brokerStartForeground {
-		// Build args for server start (just the flags, no command names)
-		// Use --hosted to avoid workstation defaults (we only want the broker)
-		serverArgs := []string{"--hosted", "--enable-runtime-broker"}
-		if brokerStartPort != DefaultBrokerPort {
-			serverArgs = append(serverArgs, fmt.Sprintf("--runtime-broker-port=%d", brokerStartPort))
-		}
-		if brokerStartAutoProvide {
-			serverArgs = append(serverArgs, "--auto-provide")
-		}
-		if brokerStartDebug {
-			serverArgs = append(serverArgs, "--debug")
-		}
+		serverArgs := buildBrokerForegroundArgs(brokerStartPort, brokerStartAutoProvide, brokerStartDebug)
 
 		fmt.Printf("Starting broker in foreground on port %d...\n", brokerStartPort)
 		fmt.Println("Press Ctrl+C to stop.")
@@ -854,18 +884,7 @@ func runBrokerStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build args for the daemon process
-	// Use --foreground so the child process runs directly (daemon.Start handles backgrounding)
-	// Use --hosted to avoid workstation defaults (we only want the broker)
-	daemonArgs := []string{"server", "start", "--foreground", "--hosted", "--enable-runtime-broker"}
-	if brokerStartPort != DefaultBrokerPort {
-		daemonArgs = append(daemonArgs, fmt.Sprintf("--runtime-broker-port=%d", brokerStartPort))
-	}
-	if brokerStartAutoProvide {
-		daemonArgs = append(daemonArgs, "--auto-provide")
-	}
-	if brokerStartDebug {
-		daemonArgs = append(daemonArgs, "--debug")
-	}
+	daemonArgs := buildBrokerDaemonArgs(brokerStartPort, brokerStartAutoProvide, brokerStartDebug)
 
 	// Start daemon
 	fmt.Printf("Starting broker as daemon on port %d...\n", brokerStartPort)
@@ -973,18 +992,7 @@ func runBrokerRestart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build args for the daemon process
-	// Use --foreground so the child process runs directly (daemon.Start handles backgrounding)
-	// Use --hosted to avoid workstation defaults (we only want the broker)
-	daemonArgs := []string{"server", "start", "--foreground", "--hosted", "--enable-runtime-broker"}
-	if brokerRestartPort != DefaultBrokerPort {
-		daemonArgs = append(daemonArgs, fmt.Sprintf("--runtime-broker-port=%d", brokerRestartPort))
-	}
-	if brokerRestartAutoProvide {
-		daemonArgs = append(daemonArgs, "--auto-provide")
-	}
-	if brokerRestartDebug {
-		daemonArgs = append(daemonArgs, "--debug")
-	}
+	daemonArgs := buildBrokerDaemonArgs(brokerRestartPort, brokerRestartAutoProvide, brokerRestartDebug)
 
 	// Start new daemon
 	fmt.Printf("Starting broker with new binary...\n")
@@ -1035,6 +1043,7 @@ func runBrokerProvide(cmd *cobra.Command, args []string) error {
 	var projectID string
 	var projectName string
 	var localProjectPath string // Local path to the project's .scion directory on this broker
+	var projectSlug string      // Hub slug of the target project when known ("global" for the global project)
 
 	if brokerProjectID != "" {
 		projectID = brokerProjectID
@@ -1063,6 +1072,7 @@ func runBrokerProvide(cmd *cobra.Command, args []string) error {
 		// Get project name for display
 		if isGlobal {
 			projectName = "global"
+			projectSlug = "global"
 		} else {
 			gitRemote := util.GetGitRemote()
 			if gitRemote != "" {
@@ -1081,21 +1091,11 @@ func runBrokerProvide(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		// Try to resolve local project path when using --hub flag with --project
-		if localProjectPath == "" {
-			if rp, _, err := config.ResolveProjectPath(projectPath); err == nil {
-				localProjectPath = rp
-			}
-		}
 	} else {
 		resolvedPath, _, err := config.ResolveProjectPath(projectPath)
 		if err != nil {
 			return fmt.Errorf("failed to resolve project path: %w", err)
 		}
-		if localProjectPath == "" {
-			localProjectPath = resolvedPath
-		}
-
 		settings, err := config.LoadSettings(resolvedPath)
 		if err != nil {
 			return fmt.Errorf("failed to load settings: %w", err)
@@ -1118,6 +1118,7 @@ func runBrokerProvide(cmd *cobra.Command, args []string) error {
 		}
 		projectID = project.ID
 		projectName = project.Name
+		projectSlug = project.Slug
 	}
 
 	// If we used --broker flag, resolve broker by name or ID
@@ -1131,6 +1132,17 @@ func runBrokerProvide(cmd *cobra.Command, args []string) error {
 		if brokerName == "" {
 			brokerName = brokerID[:8]
 		}
+	}
+
+	// An explicit --path replaces the current-project path. With --project
+	// and no --path, no path is sent: the current directory need not belong
+	// to the named project.
+	if brokerProvidePath != "" {
+		explicitPath, err := resolveProvidePath(brokerProvidePath, projectName, projectSlug)
+		if err != nil {
+			return err
+		}
+		localProjectPath = explicitPath
 	}
 
 	// Show confirmation prompt
@@ -1153,6 +1165,11 @@ func runBrokerProvide(cmd *cobra.Command, args []string) error {
 
 	fmt.Println()
 	fmt.Printf("Broker '%s' added as provider for project '%s'\n", brokerName, resp.Project.Name)
+	if localProjectPath != "" {
+		fmt.Printf("Local project path: %s\n", localProjectPath)
+	} else {
+		fmt.Println("No local path sent; an existing provider path for this broker is kept (a stored global-directory path is cleared), otherwise the broker uses its hub-managed project directory.")
+	}
 
 	// Handle --make-default flag
 	if brokerMakeDefault {
@@ -1195,6 +1212,22 @@ func runBrokerProvide(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// resolveProvidePath resolves an explicit provide --path to the project
+// path registered with the hub. It refuses the global scion directory unless
+// the target project is the global project (hub slug "global"): registering
+// that directory for any other project makes the broker treat its global
+// directory as that project.
+func resolveProvidePath(path, projectName, projectSlug string) (string, error) {
+	resolved, isGlobal, err := config.ResolveProjectPath(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve --path %q: %w", path, err)
+	}
+	if (isGlobal || config.IsGlobalProjectDir(resolved)) && projectSlug != "global" {
+		return "", fmt.Errorf("--path %q is the global scion directory and cannot be registered for project %q", path, projectName)
+	}
+	return resolved, nil
 }
 
 func runBrokerWithdraw(cmd *cobra.Command, args []string) error {
@@ -1447,7 +1480,11 @@ func runBrokerStatus(cmd *cobra.Command, args []string) error {
 					// Get projects this broker provides for (only if still registered)
 					if status.Registered {
 						projectsResp, err := client.RuntimeBrokers().ListProjects(ctx, status.BrokerID)
-						if err == nil && projectsResp != nil {
+						if err != nil {
+							// Record the failure instead of silently treating
+							// it the same as a confirmed-empty provider list.
+							status.ProjectsError = err.Error()
+						} else if projectsResp != nil {
 							for _, g := range projectsResp.Projects {
 								status.Projects = append(status.Projects, brokerProjectStatus{
 									ID:   g.ProjectID,
@@ -1523,7 +1560,7 @@ func runBrokerStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("    Auth:        %s\n", conn.AuthMode)
 			fmt.Printf("    Status:      %s\n", connStatus)
 			if !conn.RegisteredAt.IsZero() {
-				fmt.Printf("    Registered:  %s\n", conn.RegisteredAt.Format("2006-01-02"))
+				fmt.Printf("    Registered:  %s\n", clitime.Format(conn.RegisteredAt, clitime.Date))
 			}
 		}
 		if status.HubConnected {
@@ -1532,7 +1569,7 @@ func runBrokerStatus(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  Status:      %s\n", status.BrokerStatus)
 			}
 			if !status.LastHeartbeat.IsZero() {
-				fmt.Printf("  Last seen:   %s\n", formatRelativeTime(status.LastHeartbeat))
+				fmt.Printf("  Last seen:   %s\n", clitime.Ago(status.LastHeartbeat))
 			}
 		} else if status.Registered {
 			fmt.Printf("\n  Connected:   no (Hub unreachable)\n")
@@ -1555,7 +1592,7 @@ func runBrokerStatus(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  Status:      %s\n", status.BrokerStatus)
 			}
 			if !status.LastHeartbeat.IsZero() {
-				fmt.Printf("  Last seen:   %s\n", formatRelativeTime(status.LastHeartbeat))
+				fmt.Printf("  Last seen:   %s\n", clitime.Ago(status.LastHeartbeat))
 			}
 		} else {
 			fmt.Printf("  Connected:   no (Hub unreachable)\n")
@@ -1575,6 +1612,13 @@ func runBrokerStatus(cmd *cobra.Command, args []string) error {
 		for _, g := range status.Projects {
 			fmt.Printf("  - %s (ID: %s)\n", g.Name, g.ID)
 		}
+	} else if status.ProjectsError != "" {
+		// Distinguish a failed lookup from a confirmed-empty list: printing
+		// "(none)" here would tell the operator to re-provide a project that
+		// may already be provisioned correctly.
+		fmt.Println("Projects (Provider)")
+		fmt.Println("-----------------")
+		fmt.Printf("  (unknown - failed to fetch provider list: %s)\n", status.ProjectsError)
 	} else if status.Registered {
 		fmt.Println("Projects (Provider)")
 		fmt.Println("-----------------")
@@ -1637,7 +1681,7 @@ func runBrokerHubs(cmd *cobra.Command, args []string) error {
 	for _, c := range allCreds {
 		regDate := ""
 		if !c.RegisteredAt.IsZero() {
-			regDate = c.RegisteredAt.Format("2006-01-02")
+			regDate = clitime.Format(c.RegisteredAt, clitime.Date)
 		}
 		authMode := string(c.AuthMode)
 		if authMode == "" {
@@ -1688,7 +1732,9 @@ func runRemoteBrokerStatus(brokerID string) error {
 
 	// Get projects this broker provides for
 	projectsResp, err := client.RuntimeBrokers().ListProjects(ctx, brokerID)
-	if err == nil && projectsResp != nil {
+	if err != nil {
+		status.ProjectsError = err.Error()
+	} else if projectsResp != nil {
 		for _, g := range projectsResp.Projects {
 			status.Projects = append(status.Projects, brokerProjectStatus{
 				ID:   g.ProjectID,
@@ -1716,7 +1762,7 @@ func runRemoteBrokerStatus(brokerID string) error {
 	}
 	fmt.Printf("  Status:      %s\n", status.BrokerStatus)
 	if !status.LastHeartbeat.IsZero() {
-		fmt.Printf("  Last seen:   %s\n", formatRelativeTime(status.LastHeartbeat))
+		fmt.Printf("  Last seen:   %s\n", clitime.Ago(status.LastHeartbeat))
 	}
 	fmt.Printf("  Hub:         %s\n", status.HubEndpoint)
 	fmt.Println()
@@ -1728,6 +1774,10 @@ func runRemoteBrokerStatus(brokerID string) error {
 		for _, g := range status.Projects {
 			fmt.Printf("  - %s (ID: %s)\n", g.Name, g.ID)
 		}
+	} else if status.ProjectsError != "" {
+		fmt.Println("Projects (Provider)")
+		fmt.Println("-----------------")
+		fmt.Printf("  (unknown - failed to fetch provider list: %s)\n", status.ProjectsError)
 	} else {
 		fmt.Println("Projects (Provider)")
 		fmt.Println("-----------------")
@@ -1772,6 +1822,10 @@ type brokerStatusInfo struct {
 
 	// Projects
 	Projects []brokerProjectStatus `json:"projects,omitempty"`
+	// ProjectsError records why the provider list could not be fetched, so a
+	// failed lookup (e.g. a transient Hub error) is never displayed the same
+	// way as a confirmed-empty list.
+	ProjectsError string `json:"projectsError,omitempty"`
 }
 
 // brokerHubConnectionStatus holds status for a single hub connection.
@@ -1900,6 +1954,21 @@ func getLocalBrokerID() string {
 	return ""
 }
 
+// brokerRegistrationCapabilities builds the capability-name list this
+// command reports at registration/join time. There is no live runtime
+// instance available here to ask (this command only sends metadata to the
+// Hub; it does not start the broker daemon or construct a runtime), so
+// "attach" is always included — the same missing-capability-implies-
+// supported default used everywhere else this feature answers the
+// question, applied because there is nothing here to say otherwise. The
+// same holds for "emptyPerAgentWorkspace" (false only for Cloud Run). A
+// runtime that actually opts out reports it once the broker itself runs
+// and registers/heartbeats with a live instance in hand (see
+// buildStoreBrokerProfiles and HeartbeatService.buildHeartbeat).
+func brokerRegistrationCapabilities() []string {
+	return []string{"sync", "attach", "reprovision", "emptyPerAgentWorkspace"}
+}
+
 // buildBrokerProfiles builds BrokerProfile objects from settings.Profiles.
 // It converts the user-defined profiles in settings.yaml to the format expected by the Hub.
 func buildBrokerProfiles(settings *config.Settings) []hubclient.BrokerProfile {
@@ -1934,6 +2003,28 @@ func buildBrokerProfiles(settings *config.Settings) []hubclient.BrokerProfile {
 	}
 
 	return profiles
+}
+
+// brokerRegistrationDefaultProfile returns the broker's default (active)
+// profile name to report at join, or nil when settings could not be loaded
+// (the hub then keeps what it has).
+func brokerRegistrationDefaultProfile(settings *config.Settings) *string {
+	if settings == nil {
+		return nil
+	}
+	name := settings.ActiveProfile
+	return &name
+}
+
+// brokerHeartbeatDefaultProfile returns the default profile the running
+// broker reports on every heartbeat: settings' active profile, or nil when
+// settings failed to load, so the heartbeat omits it and the hub keeps what
+// it has (the same rule as join).
+func brokerHeartbeatDefaultProfile(settings *config.Settings, loaded bool) *string {
+	if !loaded {
+		return nil
+	}
+	return brokerRegistrationDefaultProfile(settings)
 }
 
 // getHubClientForConnection creates a hub client using credentials from a named hub connection.

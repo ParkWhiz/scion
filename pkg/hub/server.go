@@ -29,6 +29,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -37,13 +38,17 @@ import (
 
 	"github.com/go-jose/go-jose/v4/jwt"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"golang.org/x/sync/singleflight"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/agentkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/imagecheck"
@@ -52,12 +57,14 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dbmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
+	"github.com/GoogleCloudPlatform/scion/pkg/observability/reapermetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/transfer"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
+	"github.com/GoogleCloudPlatform/scion/resources"
 	"github.com/google/uuid"
-	"github.com/robfig/cron/v3"
 )
 
 const (
@@ -110,6 +117,20 @@ type ServerConfig struct {
 	// Operators enabling it must provide a SharedSigningSecret or pre-provision
 	// the signing keys; otherwise first boot will (correctly) refuse to start.
 	RequireStableSigningKey bool
+
+	// ConduitTCPAllowedPorts is the operator allow-list of agent-local
+	// loopback ports a Conduit tcp stream grant may target in addition to
+	// the agent's exposed ports. The reserved ports (9810, 18380) are always
+	// refused. Only used behind the hub.conduit experiment.
+	ConduitTCPAllowedPorts []int
+	// ConduitGrantKeyActivation is how long a rotated-in Conduit grant key
+	// is published before it signs (default 15m). It must be at least the
+	// maximum interval at which grant targets refresh their key set
+	// (Welcome and token refresh); otherwise a target that has not yet
+	// learned the new key refuses its grants. It must also be at least the
+	// hub's ring refresh interval (1m). Only used behind the hub.conduit
+	// experiment.
+	ConduitGrantKeyActivation time.Duration
 	// AuthMode is the exclusive human auth mode: "oauth" (default), "proxy", "dev".
 	AuthMode string
 	// ProxyAuthenticator is the configured proxy authenticator (when AuthMode == "proxy").
@@ -150,6 +171,16 @@ type ServerConfig struct {
 	// before being marked as stalled (default: 5 minutes). Only applies to
 	// agents with a recent heartbeat (not already offline).
 	StalledThreshold time.Duration
+	// StartClaim holds the start-claim timing settings from the settings
+	// file (zero fields use defaults; out-of-range values are replaced by
+	// defaults with a warning). Hot-reloaded through ApplySnapshot.
+	StartClaim StartClaimSettings
+	// MissingAgentGrace is how long a running agent must be continuously
+	// absent from its runtime broker's complete heartbeat inventory before
+	// the Hub marks it phase=error with exit reason container_missing (an
+	// existing preempted or evicted exit reason is kept) (default: 3 minutes,
+	// minimum: 1 minute; lower values use the default).
+	MissingAgentGrace time.Duration
 	// AutoSuspendStalled controls whether stalled agents are automatically
 	// suspended (container stopped, phase set to "suspended"). Default: false.
 	AutoSuspendStalled bool
@@ -158,6 +189,20 @@ type ServerConfig struct {
 	SoftDeleteRetention time.Duration
 	// SoftDeleteRetainFiles controls whether workspace files are preserved during soft-delete.
 	SoftDeleteRetainFiles bool
+	// AsyncAgentLaunch is the non-blocking agent create kill switch. Off by
+	// default; a launch is non-blocking only when this is on AND the request
+	// opts in.
+	AsyncAgentLaunch bool
+	// LaunchTimeout is the whole-launch budget for an opted-in launch
+	// (design §3.10). Default 5 minutes. Below minLaunchTimeout the broker's
+	// fixed 20s abort margin (§3.10) would leave no time for a launch to
+	// actually run, so New() rejects it and falls back to the default.
+	LaunchTimeout time.Duration
+	// LaunchKeepaliveSeconds is the broker keepalive interval, in seconds
+	// (design §3.7). It is sent to the broker as launchKeepaliveSeconds in
+	// each asynchronous create request, and sets the reaper's staleness
+	// window (8x this value). Default 15.
+	LaunchKeepaliveSeconds int
 	// AdminMode restricts access to admin users only (maintenance mode).
 	AdminMode bool
 	// MaintenanceMessage is the custom message shown during admin mode.
@@ -168,6 +213,15 @@ type ServerConfig struct {
 	// AutoExposePortsDefault is the default auto-expose-ports enabled state for new agents.
 	// Exposed via GET /api/v1/settings/public so the web UI can pre-populate the checkbox.
 	AutoExposePortsDefault *bool
+	// EnforceBrokerQuotas controls whether the per-broker agent quota cap
+	// (max_agents_per_broker) is enforced on create. nil means unset — the
+	// fail-safe default (enforced) applies. See brokerQuotasEnforced.
+	EnforceBrokerQuotas *bool
+	// AgentSecretsUserScopeOnly controls whether agents are restricted to
+	// writing user (profile) scope secrets only. nil means unset — the
+	// permissive default (agents may write project scope) applies. See
+	// agentSecretsUserScopeOnly.
+	AgentSecretsUserScopeOnly *bool
 	// DefaultScratchpad controls whether new projects automatically get a
 	// "scratchpad" shared directory. When nil, the compiled default (true) applies.
 	DefaultScratchpad *bool
@@ -265,6 +319,11 @@ type ServerConfig struct {
 	// Workstation indicates non-production, single-user mode (e.g. local laptop).
 	// When true, /api/v1/system/* and other workstation-only endpoints are enabled.
 	Workstation bool
+
+	// ConfigPath is the --config path the server was started with ("" for
+	// none). The workstation server-config PUT uses it to find the legacy
+	// server.yaml sources the config loader would read.
+	ConfigPath string
 	// DevUserConfig holds optional identity overrides for the development user.
 	DevUserConfig DevUserConfig
 
@@ -314,6 +373,13 @@ type ServerConfig struct {
 	// the AuditRetentionDays pattern. Zero or negative falls back to the
 	// default rather than disabling the sweep.
 	FailedMessageRetentionDays int
+
+	// Experiments is the compiled experiments registry used to resolve
+	// hub-wide feature flags (pkg/experiments). Production leaves this nil;
+	// every reader goes through the nil-safe Server.experimentRegistry(),
+	// which falls back to experiments.Default(). Tests that need a
+	// server-layer experiment inject their own registry here (ptone/scion#2217).
+	Experiments *experiments.Registry
 }
 
 // MaintenanceConfig holds configuration for routine maintenance operation executors.
@@ -383,18 +449,55 @@ func DefaultServerConfig() ServerConfig {
 			"X-Scion-Broker-ID", "X-Scion-Timestamp", "X-Scion-Nonce",
 			"X-Scion-Signature", "X-Scion-Signed-Headers",
 		},
-		CORSMaxAge:       3600,
-		StalledThreshold: 5 * time.Minute,
-		BrokerAuthConfig: DefaultBrokerAuthConfig(),
+		CORSMaxAge:             3600,
+		StalledThreshold:       5 * time.Minute,
+		BrokerAuthConfig:       DefaultBrokerAuthConfig(),
+		LaunchTimeout:          5 * time.Minute,
+		LaunchKeepaliveSeconds: 15,
+		MissingAgentGrace:      DefaultMissingAgentGrace,
 	}
+}
+
+// brokerQuotasEnforced reports whether the per-broker agent quota cap
+// (max_agents_per_broker) is enforced on create. Fail-safe default: an
+// absent (nil) switch means enforced (design P1-D4/P1-D5).
+//
+// Thread-safe: s.config.EnforceBrokerQuotas is written under s.mu.Lock() by
+// ApplySnapshot (on the admin PUT path, and on every replica via the
+// LISTEN/NOTIFY + 60s poll propagation loop in postgres mode), so it must be
+// read under s.mu.RLock() here — this is called on every QuotaService.Reserve,
+// for every limit, on every create/start/restart/resume/wake.
+func (s *Server) brokerQuotasEnforced() bool {
+	s.mu.RLock()
+	v := s.config.EnforceBrokerQuotas
+	s.mu.RUnlock()
+	return v == nil || *v
+}
+
+// agentSecretsUserScopeOnly reports whether agents are restricted to
+// writing user (profile) scope secrets only. Permissive default: an absent
+// (nil) switch means agents may write project scope, as they do today
+// (design ptone/scion#2291 §5).
+//
+// Thread-safe: s.config.AgentSecretsUserScopeOnly is written under
+// s.mu.Lock() by ApplySnapshot (on the admin PUT path, and on every replica
+// via the LISTEN/NOTIFY + 60s poll propagation loop in postgres mode), so it
+// must be read under s.mu.RLock() here.
+func (s *Server) agentSecretsUserScopeOnly() bool {
+	s.mu.RLock()
+	v := s.config.AgentSecretsUserScopeOnly
+	s.mu.RUnlock()
+	return v != nil && *v
 }
 
 // AgentDispatcher is the interface for dispatching agent operations to a runtime broker.
 // Implementations may be local (co-located hub+broker) or remote (HTTP-based).
 type AgentDispatcher interface {
 	// DispatchAgentCreate creates and starts an agent on the runtime broker.
-	// Returns the updated agent info after creation/start.
-	DispatchAgentCreate(ctx context.Context, agent *store.Agent) error
+	// It updates agent in place from the broker's answer. A non-nil result
+	// with Launch set means the broker accepted the create for asynchronous
+	// launch (see CreateDispatchResult).
+	DispatchAgentCreate(ctx context.Context, agent *store.Agent) (*CreateDispatchResult, error)
 
 	// DispatchAgentProvision provisions an agent on the runtime broker without starting it.
 	// This sets up directories, worktree, templates, and settings but does not launch the container.
@@ -445,12 +548,15 @@ type AgentDispatcher interface {
 	DispatchCheckAgentPrompt(ctx context.Context, agent *store.Agent) (bool, error)
 
 	// DispatchAgentCreateWithGather creates an agent with env-gather support.
-	// If the broker returns 202 with env requirements, it returns the requirements
-	// instead of an error. The second return value is non-nil when gather is needed.
-	DispatchAgentCreateWithGather(ctx context.Context, agent *store.Agent) (*RemoteEnvRequirementsResponse, error)
+	// If the broker returns 202 with env requirements, the result carries them
+	// in EnvReqs instead of an error. Launch is set when the broker accepted
+	// the create for asynchronous launch.
+	DispatchAgentCreateWithGather(ctx context.Context, agent *store.Agent) (*CreateDispatchResult, error)
 
 	// DispatchFinalizeEnv sends gathered env vars to the broker to complete agent creation.
-	DispatchFinalizeEnv(ctx context.Context, agent *store.Agent, env map[string]string) error
+	// Launch is set in the result when the broker accepted the create for
+	// asynchronous launch.
+	DispatchFinalizeEnv(ctx context.Context, agent *store.Agent, env map[string]string) (*CreateDispatchResult, error)
 }
 
 // WorkspaceDispatchSpec carries the inputs a broker needs to recreate an
@@ -478,6 +584,9 @@ type WorkspaceDispatchSpec struct {
 	// "worktree-per-agent"), the same value create sends as
 	// RemoteCreateAgentRequest.WorkspaceMode.
 	WorkspaceMode string
+	// SharedWorkspaceClone is a shared-plain git project's workspace clone
+	// settings (RemoteAgentConfig.SharedWorkspaceClone); nil otherwise.
+	SharedWorkspaceClone *api.GitCloneConfig
 }
 
 // StartExtras carries the dispatch-time metadata that the create path already
@@ -500,6 +609,17 @@ type StartExtras struct {
 	ProvisionCredentials map[string]string
 	PreResolvedSkills    *ResolveSkillsResponse
 	Workspace            WorkspaceDispatchSpec
+	// RunID is the run identity the hub minted for this start or restart;
+	// the broker labels the new runtime entry with it (ptone/scion#2550).
+	RunID string
+	// HubAgentDefaults carries the hub defaults a start applies at the
+	// broker's lowest tier (see startHubAgentDefaults). Nil = none.
+	HubAgentDefaults *RemoteHubAgentDefaults
+	// TemplateName is the agent's template slug. The broker uses it for
+	// naming only (the scion.template label, SCION_TEMPLATE_NAME and
+	// agent-info.json), never to locate or load a template. A content hash
+	// is not a template name and is not sent.
+	TemplateName string
 }
 
 // applyStartExtras writes extras onto payload as flat top-level wire keys.
@@ -529,6 +649,18 @@ func applyStartExtras(payload map[string]interface{}, extras StartExtras) {
 	if extras.Workspace.WorkspaceMode != "" {
 		payload["workspaceMode"] = extras.Workspace.WorkspaceMode
 	}
+	if extras.Workspace.SharedWorkspaceClone != nil {
+		payload["sharedWorkspaceClone"] = extras.Workspace.SharedWorkspaceClone
+	}
+	if extras.RunID != "" {
+		payload["runId"] = extras.RunID
+	}
+	if extras.HubAgentDefaults != nil {
+		payload["hubAgentDefaults"] = extras.HubAgentDefaults
+	}
+	if extras.TemplateName != "" && !transfer.IsContentHash(extras.TemplateName) {
+		payload["templateName"] = extras.TemplateName
+	}
 }
 
 // RuntimeBrokerClient is an interface for communicating with runtime brokers over HTTP.
@@ -557,7 +689,13 @@ type RuntimeBrokerClient interface {
 	// StopAgent stops an agent on a remote runtime broker.
 	// brokerID is used for HMAC authentication lookup.
 	// projectID scopes the lookup to a specific project (required for uniqueness).
-	StopAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string) error
+	// runID, when non-empty, names the run the stop is for
+	// (ptone/scion#2550): the broker then stops only that run's entry and
+	// answers a run_mismatch 404 (api.BrokerErrorCodeRunMismatch) when
+	// another run holds the name; only that 404 is returned as
+	// ErrStopRunNotFound, and any other 404 as a plain broker error. An
+	// empty runID keeps the legacy name-scoped stop.
+	StopAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, runID string) error
 
 	// RestartAgent restarts an agent on a remote runtime broker.
 	// brokerID is used for HMAC authentication lookup.
@@ -565,18 +703,21 @@ type RuntimeBrokerClient interface {
 	// resolvedEnv carries fresh auth tokens and identity vars so the restarted
 	// container retains Hub connectivity.
 	// extras carries the dispatch metadata described on StartExtras.
-	RestartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, resolvedEnv map[string]string, extras StartExtras) error
+	// RestartAgent returns the broker's response body when it sent one
+	// (nil when the body is empty or undecodable; the restart still
+	// succeeded), so the dispatcher can adopt the run ID it reports.
+	RestartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, resolvedEnv map[string]string, extras StartExtras) (*RemoteAgentResponse, error)
 
 	// ResetAuthAgent injects a fresh auth token into a running agent without restarting it.
 	// brokerID is used for HMAC authentication lookup.
 	// projectID scopes the lookup to a specific project (required for uniqueness).
-	ResetAuthAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, token string) error
+	ResetAuthAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, token, transportToken string) error
 
 	// DeleteAgent deletes an agent from a remote runtime broker.
 	// brokerID is used for HMAC authentication lookup.
 	// projectID scopes the lookup to a specific project (required for uniqueness).
-	// softDelete and deletedAt are passed as query params for broker-side marking.
-	DeleteAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, deleteFiles, removeBranch, softDelete bool, deletedAt time.Time) error
+	// opts carries the query params (see DeleteAgentOptions).
+	DeleteAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, opts DeleteAgentOptions) error
 
 	// MessageAgent sends a message to an agent on a remote runtime broker.
 	// brokerID is used for HMAC authentication lookup.
@@ -608,6 +749,193 @@ type RuntimeBrokerClient interface {
 	// projectID is passed to enable NFS subtree cleanup (keyed by project ID).
 	// 404 responses are tolerated for idempotency.
 	CleanupProject(ctx context.Context, brokerID, brokerEndpoint, projectSlug, projectID string) error
+}
+
+// DeleteAgentOptions carries the optional parameters of a broker agent delete.
+// SoftDelete and DeletedAt are passed as query params for broker-side
+// marking. RunID, when non-empty, is sent as runId: the broker then deletes
+// only the runtime entry labelled with that run and answers 404 (an
+// idempotent success) when only a different run holds the name
+// (ptone/scion#2550). NotAfter, when non-zero, is sent as notAfter: the
+// broker refuses the delete with 409 stale_dispatch, doing nothing, if it
+// arrives after that instant (ptone/scion#2906, see agent_delete_fence.go).
+type DeleteAgentOptions struct {
+	DeleteFiles  bool
+	RemoveBranch bool
+	SoftDelete   bool
+	DeletedAt    time.Time
+	RunID        string
+	NotAfter     time.Time
+}
+
+// deleteAgentQuery renders opts (and the context's linked-project path) as
+// the query string both broker transports send, without a leading
+// separator.
+func deleteAgentQuery(ctx context.Context, projectID string, opts DeleteAgentOptions) string {
+	query := fmt.Sprintf("deleteFiles=%t&removeBranch=%t", opts.DeleteFiles, opts.RemoveBranch)
+	if projectID != "" {
+		query += "&projectId=" + url.QueryEscape(projectID)
+	}
+	query += deleteProjectPathQuery(ctx)
+	if opts.RunID != "" {
+		query += "&runId=" + url.QueryEscape(opts.RunID)
+	}
+	if !opts.NotAfter.IsZero() {
+		query += "&notAfter=" + url.QueryEscape(opts.NotAfter.UTC().Format(time.RFC3339))
+	}
+	if opts.SoftDelete {
+		query += fmt.Sprintf("&softDelete=true&deletedAt=%s", url.QueryEscape(opts.DeletedAt.UTC().Format(time.RFC3339)))
+	}
+	// The recorded runtime (GoogleCloudPlatform/scion#2423) rides on ctx, as
+	// for every other existing-agent operation, so both transports send it
+	// beside runId.
+	return withRecordedRuntimeQuery(ctx, query)
+}
+
+// stopAgentQuery builds the query string for a broker stop request. runId,
+// when set, names the run the stop is for (ptone/scion#2550); an old broker
+// ignores it and stops by name as before.
+func stopAgentQuery(ctx context.Context, projectID, runID string) string {
+	var query string
+	if projectID != "" {
+		query = "projectId=" + url.QueryEscape(projectID)
+	}
+	if runID != "" {
+		if query != "" {
+			query += "&"
+		}
+		query += "runId=" + url.QueryEscape(runID)
+	}
+	return withRecordedRuntimeQuery(ctx, query)
+}
+
+// withRunIDURL appends the runId query parameter to a start or restart
+// request URL (or path) when runID is set (ptone/scion#2550). The run also
+// travels in the body; the parameter lets the broker record it on the
+// tracked start before reading the body, so a run-scoped stop never sees
+// that start without its run. An older broker ignores it.
+func withRunIDURL(endpoint, runID string) string {
+	if runID == "" {
+		return endpoint
+	}
+	if strings.Contains(endpoint, "?") {
+		return endpoint + "&runId=" + url.QueryEscape(runID)
+	}
+	return endpoint + "?runId=" + url.QueryEscape(runID)
+}
+
+// withRunIDQuery is withRunIDURL for a bare query string.
+func withRunIDQuery(query, runID string) string {
+	if runID == "" {
+		return query
+	}
+	if query == "" {
+		return "runId=" + url.QueryEscape(runID)
+	}
+	return query + "&runId=" + url.QueryEscape(runID)
+}
+
+// ErrStopRunNotFound reports that a run-scoped stop found no entry of the
+// requested run on the broker: the broker answered 404 with error code
+// api.BrokerErrorCodeRunMismatch, because a different run holds the
+// agent's name and was left untouched (ptone/scion#2550). Callers must not
+// record the current run as stopped because of it. The error still unwraps
+// to the broker's status error; brokerStopCurrentRunID reads the run the
+// broker reported holding the name.
+var ErrStopRunNotFound = errors.New("runtime broker has no entry for the requested run")
+
+// stopAgentError marks the broker's run-mismatch 404 on a run-scoped stop
+// as ErrStopRunNotFound, on both transports. It keys on the broker's error
+// code, not the status alone, so a 404 from anything else (a proxy, an
+// unknown route) is returned unchanged, as is any error on a legacy stop
+// without a run ID.
+func stopAgentError(err error, runID string) error {
+	if err == nil || runID == "" || !isBrokerStatus(err, http.StatusNotFound) {
+		return err
+	}
+	var se *brokerStatusError
+	if !errors.As(err, &se) || se.brokerErrorCode() != api.BrokerErrorCodeRunMismatch {
+		return err
+	}
+	if current, ok := se.brokerErrorDetails()[api.BrokerErrorDetailCurrentRunID].(string); ok && current != "" {
+		return fmt.Errorf("%w (requested run %s; the broker holds run %s): %w", ErrStopRunNotFound, runID, current, err)
+	}
+	return fmt.Errorf("%w (requested run %s): %w", ErrStopRunNotFound, runID, err)
+}
+
+// brokerStopCurrentRunID returns the run the broker reported holding the
+// agent's name when it refused a run-scoped stop (ErrStopRunNotFound), so
+// a hub/broker run drift can be logged. ok is false for any other error or
+// when the broker did not know the run.
+func brokerStopCurrentRunID(err error) (string, bool) {
+	if !errors.Is(err, ErrStopRunNotFound) {
+		return "", false
+	}
+	var se *brokerStatusError
+	if !errors.As(err, &se) {
+		return "", false
+	}
+	current, ok := se.brokerErrorDetails()[api.BrokerErrorDetailCurrentRunID].(string)
+	return current, ok && current != ""
+}
+
+// recordStopStatus writes upd, the stopped (or suspended) status a caller
+// records after a stop it dispatched for run runID, only while the row
+// still holds runID (store.AgentStatusUpdate.IfRunID, ptone/scion#2550).
+// A broker's 202 for run X must never mark a newer run Y stopped.
+//
+// It reports whether the status was written. When the row has moved to
+// another run it writes nothing, logs a Warn naming both runs, and returns
+// false with a nil error: the caller must then skip its quota release and
+// publish too. An empty runID (a row from before run IDs) writes
+// unconditionally, as before.
+func (s *Server) recordStopStatus(ctx context.Context, agentID, runID, action string, upd store.AgentStatusUpdate) (bool, error) {
+	upd.IfRunID = runID
+	err := s.store.UpdateAgentStatus(ctx, agentID, upd)
+	if errors.Is(err, store.ErrRunChanged) {
+		current := ""
+		if a, gerr := s.store.GetAgent(ctx, agentID); gerr == nil {
+			current = a.RunID
+		}
+		s.agentLifecycleLog.Warn("Agent "+action+": the agent moved to a newer run after the stop was dispatched; not recording the "+action,
+			"agent_id", agentID, "stopped_run_id", runID, "current_run_id", current)
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// stopRunStillCurrent reports whether the row still holds runID, for a
+// caller that has no status to write after a stop dispatched for runID but
+// must not release a newer run's reservation (ptone/scion#2550). It logs a
+// Warn naming both runs when the run changed. An empty runID, or a failed
+// read, counts as current, as before run IDs.
+func (s *Server) stopRunStillCurrent(ctx context.Context, agentID, runID, action string) bool {
+	if runID == "" {
+		return true
+	}
+	current, err := s.store.GetAgent(ctx, agentID)
+	if err != nil || current.RunID == runID {
+		return true
+	}
+	s.agentLifecycleLog.Warn("Agent "+action+": the agent moved to a newer run after the stop was dispatched; not recording the "+action,
+		"agent_id", agentID, "stopped_run_id", runID, "current_run_id", current.RunID)
+	return false
+}
+
+// logStopRunMismatch logs a run-scoped stop the broker refused because a
+// different run holds the agent's name, naming both runs, so the operator
+// can see a hub/broker run drift behind the failed stop or suspend. It is a
+// no-op for any other error.
+func (s *Server) logStopRunMismatch(agent *store.Agent, action string, err error) {
+	if !errors.Is(err, ErrStopRunNotFound) {
+		return
+	}
+	current, _ := brokerStopCurrentRunID(err)
+	s.agentLifecycleLog.Warn("Agent "+action+": broker holds a different run than the hub recorded; nothing was stopped",
+		"agent_id", agent.ID, "agent", agent.Slug, "hub_run_id", agent.RunID, "broker_run_id", current)
 }
 
 // RemoteCreateAgentRequest is the request body for creating an agent on a remote runtime broker.
@@ -644,6 +972,11 @@ type RemoteCreateAgentRequest struct {
 	NoAuth bool `json:"noAuth,omitempty"`
 	// Attach indicates the agent should start in interactive attach mode (not detached).
 	Attach bool `json:"attach,omitempty"`
+	// RunID is the run identity the hub minted for this create; the broker
+	// labels the runtime entry with it (scion.run_id) so a later delete can
+	// target exactly this run (ptone/scion#2550). Empty for provision-only
+	// requests, which create no runtime entry.
+	RunID string `json:"runId,omitempty"`
 	// ProvisionOnly indicates the agent should be provisioned (dirs, worktree, templates)
 	// but not started. The container will not be launched.
 	ProvisionOnly bool `json:"provisionOnly,omitempty"`
@@ -652,6 +985,14 @@ type RemoteCreateAgentRequest struct {
 	// catalog rather than reused (`scion reincarnate`, design §3.4). See
 	// runtimebroker.CreateAgentRequest.Reprovision, the wire twin this maps to.
 	Reprovision bool `json:"reprovision,omitempty"`
+	// AsyncLaunch, LaunchID, LaunchTimeoutSeconds and LaunchKeepaliveSeconds
+	// mirror runtimebroker.CreateAgentRequest's async launch fields. They are
+	// set only by dispatchLaunching. LaunchTimeoutSeconds is the remaining
+	// launch budget at send time.
+	AsyncLaunch            bool   `json:"asyncLaunch,omitempty"`
+	LaunchID               string `json:"launchId,omitempty"`
+	LaunchTimeoutSeconds   int    `json:"launchTimeoutSeconds,omitempty"`
+	LaunchKeepaliveSeconds int    `json:"launchKeepaliveSeconds,omitempty"`
 	// ProjectPath is the local filesystem path to the project on the target runtime broker.
 	// This is looked up from the project provider record for the target broker.
 	ProjectPath string `json:"projectPath,omitempty"`
@@ -764,6 +1105,14 @@ type RemoteAgentConfig struct {
 	// worktree/clone creation and configures per-agent git credentials.
 	SharedWorkspace bool `json:"sharedWorkspace,omitempty"`
 
+	// SharedWorkspaceClone carries a shared-plain git project's workspace
+	// clone settings (URL, default branch, full depth). Unlike GitClone it
+	// never makes the broker clone into a per-agent workspace: only the
+	// Kubernetes runtime uses it, to clone into an NFS-backed shared
+	// workspace from the workspace-provision init container. A broker that
+	// does not know the field ignores it.
+	SharedWorkspaceClone *api.GitCloneConfig `json:"sharedWorkspaceClone,omitempty"`
+
 	// GCPIdentity holds the GCP identity assignment for the agent.
 	GCPIdentity *RemoteGCPIdentityConfig `json:"gcpIdentity,omitempty"`
 
@@ -779,7 +1128,8 @@ type RemoteAgentConfig struct {
 }
 
 // RemoteHubAgentDefaults carries the four limit/resource operational
-// agent_defaults from the hub to a runtime broker.
+// agent_defaults, plus the auto-expose-ports default, from the hub to a
+// runtime broker.
 //
 // Only the fields that need no hub-side resolution travel here.
 // default_template and default_harness_config are absent by design: the hub
@@ -795,10 +1145,12 @@ type RemoteAgentConfig struct {
 // the broker decodes into; TestRemoteHubAgentDefaults_WireCompatibleWithBroker
 // pins that.
 type RemoteHubAgentDefaults struct {
-	MaxTurns      int               `json:"maxTurns,omitempty"`
-	MaxModelCalls int               `json:"maxModelCalls,omitempty"`
-	MaxDuration   string            `json:"maxDuration,omitempty"`
-	Resources     *api.ResourceSpec `json:"resources,omitempty"`
+	MaxTurns        int               `json:"maxTurns,omitempty"`
+	MaxModelCalls   int               `json:"maxModelCalls,omitempty"`
+	MaxDuration     string            `json:"maxDuration,omitempty"`
+	Resources       *api.ResourceSpec `json:"resources,omitempty"`
+	AutoExposePorts *bool             `json:"autoExposePorts,omitempty"`
+	Experiments     []string          `json:"experiments,omitempty"`
 }
 
 // RemoteGCPIdentityConfig holds GCP identity configuration sent from Hub to Broker.
@@ -806,6 +1158,13 @@ type RemoteGCPIdentityConfig struct {
 	MetadataMode string `json:"metadata_mode"`        // "block", "passthrough", "assign"
 	SAEmail      string `json:"sa_email,omitempty"`   // Service account email
 	ProjectID    string `json:"project_id,omitempty"` // GCP project ID
+
+	// RequireLocalRuntime carries store.GCPIdentityConfig.RequireLocalRuntime
+	// across the wire — see that field's doc comment. The JSON tag must stay
+	// in sync with runtimebroker.GCPIdentityConfig's own field of the same
+	// name; the two types are decoded independently (no shared Go type), so
+	// nothing but the tag keeps them in step.
+	RequireLocalRuntime bool `json:"require_local_runtime,omitempty"`
 }
 
 // RemoteAgentResponse is the response from creating an agent on a remote runtime broker.
@@ -820,6 +1179,15 @@ type RemoteAgentResponse struct {
 	// an old broker has no such field and silently ran a plain Provision
 	// instead, which must not be reported as reincarnate success.
 	Reprovisioned bool `json:"reprovisioned,omitempty"`
+
+	// LaunchPending, LaunchID and LaunchInstanceID mirror
+	// runtimebroker.CreateAgentResponse's async launch echo. LaunchPending
+	// with a LaunchID equal to the request's means the broker accepted the
+	// create for asynchronous launch; LaunchInstanceID is the broker process
+	// that owns it.
+	LaunchPending    bool   `json:"launchPending,omitempty"`
+	LaunchID         string `json:"launchId,omitempty"`
+	LaunchInstanceID string `json:"launchInstanceId,omitempty"`
 }
 
 // RemoteEnvRequirementsResponse is returned by the broker when env gather is needed.
@@ -857,22 +1225,53 @@ type RemoteAgentInfo struct {
 	Activity        string `json:"activity,omitempty"` // Runtime activity
 	Status          string `json:"status"`             // Legacy: kept for backward compat with older brokers
 	ContainerStatus string `json:"containerStatus,omitempty"`
+	// Warnings mirrors runtimebroker.AgentResponse.Warnings: the broker's
+	// hub-only env drop warnings (for example a broker-local TZ that was
+	// ignored). Older brokers omit it.
+	Warnings []string `json:"warnings,omitempty"`
+	// RunID mirrors runtimebroker.AgentResponse.RunID: the run identity of
+	// the runtime entry the broker created or found (ptone/scion#2550).
+	// Older brokers omit it.
+	RunID string `json:"runId,omitempty"`
+	// WorkspacePlacement mirrors runtimebroker.AgentResponse.WorkspacePlacement:
+	// where the start this answers placed the agent's workspace. Empty
+	// when no start resolved it (provision-only, older brokers).
+	WorkspacePlacement string `json:"workspacePlacement,omitempty"`
 }
 
 // Server is the Hub API HTTP server.
 type Server struct {
-	config                 ServerConfig
-	store                  store.Store
-	httpServer             *http.Server
-	mux                    *http.ServeMux
-	mu                     sync.RWMutex
-	startTime              time.Time
-	dispatcher             AgentDispatcher         // Optional dispatcher for co-located runtime broker
-	storage                storage.Storage         // Optional storage backend for templates
-	secretBackend          secret.SecretBackend    // Optional secret backend
-	agentTokenService      *AgentTokenService      // Agent JWT token service
-	userTokenService       *UserTokenService       // User JWT token service
-	downloadSigningKey     []byte                  // HMAC key for skill file capability URLs (#1792)
+	config ServerConfig
+	// startupHubName is the name resolved at startup (ServerConfig.HubName,
+	// from LoadGlobalConfig(serverConfigPath), else the hostname).
+	// ApplySnapshot returns to it when the configured hub_name is unset.
+	// See startupHubNameOrDefault. In file mode a name removed from
+	// settings.yaml therefore stays in use until restart (ptone/scion#3070).
+	startupHubName     string
+	store              store.Store
+	httpServer         *http.Server
+	mux                *http.ServeMux
+	mu                 sync.RWMutex
+	startTime          time.Time
+	dispatcher         AgentDispatcher      // Optional dispatcher for co-located runtime broker
+	storage            storage.Storage      // Optional storage backend for templates
+	secretBackend      secret.SecretBackend // Optional secret backend
+	agentTokenService  *AgentTokenService   // Agent JWT token service
+	userTokenService   *UserTokenService    // User JWT token service
+	downloadSigningKey []byte               // HMAC key for skill file capability URLs (#1792)
+
+	// chatSpacesBatch sets the GET /chat/spaces rollup batch sizes; the
+	// zero value uses the defaults (handlers_chat_v2.go).
+	chatSpacesBatch chatSpacesBatchSizes
+
+	// Conduit stream grant key ring cache (conduit_grants.go); created on
+	// first use behind the hub.conduit experiment.
+	conduitGrantsOnce sync.Once
+	conduitGrants     *conduitGrantKeys
+	// conduit is the in-process conduit relay (conduit_relay.go); nil
+	// unless hub.conduit was on at startup.
+	conduit                atomic.Pointer[conduitRuntime]
+	listCursorSealer       *listCursorSealer       // AEAD sealer for authorizedList's opaque pagination cursors (ptone/scion#2124)
 	uatService             *UserAccessTokenService // User access token service
 	inviteService          *InviteService          // Invite code service
 	oauthService           *OAuthService           // OAuth service for CLI authentication
@@ -969,6 +1368,23 @@ type Server struct {
 	// Set once in New and read without the lock; nil-safe.
 	chatSendLimiter *chatSendLimiter
 
+	// Per-pair sliding-window limiter for agent @mention fan-out loop/storm
+	// protection. Set once in New and read without the lock; nil-safe.
+	mentionPairLimiter *mentionPairLimiter
+
+	// Independent token-bucket limiters for the agent-keys operation
+	// (task 2.2, .design/agent-keys-contract.md "Concrete defaults"):
+	// keysPrincipalLimiter is keyed per authenticated principal+project,
+	// keysTargetLimiter is keyed per target agent. Both must allow a
+	// request; they are separate from chatSendLimiter's aggregate DM
+	// allowance (keys must not charge or evade it) and are shared by the
+	// /keys routes. Set once in New and read without the lock; nil-safe.
+	// In-memory and per-Hub instance, not a distributed quota service (contract §5): N Hub
+	// replicas behind a load balancer allow N times the configured rate in
+	// aggregate, and a Hub restart resets both buckets to full.
+	keysPrincipalLimiter *keysRateLimiter
+	keysTargetLimiter    *keysRateLimiter
+
 	// In-memory idempotency cache for chat message sends (#1055).
 	// Keyed by senderID:idempotencyKey with a 5-minute TTL.
 	chatIdempotency *ChatIdempotencyCache
@@ -1026,6 +1442,28 @@ type Server struct {
 	// GCP token metrics tracker (nil = disabled)
 	gcpTokenMetrics GCPTokenMetricsRecorder
 
+	// gs:// link fetch endpoint (/api/v1/gcs/object; no per-SA client cache —
+	// a fresh token and client are minted/built per request).
+	// gcsLinkBaseTransport is the one shared, credential-free base transport
+	// every per-request client's oauth2.Transport wraps.
+	// gcsLinkRateLimiter enforces the per-viewer rate limit; gcsLinkSem is
+	// the process-wide concurrency semaphore. gcsLinkSourceFactory overrides
+	// gcsObjectSourceFor in tests (nil in production).
+	// gcsLinkRequestDeadlineOverride shortens the whole-request deadline
+	// (gcsLinkRequestDeadline, which also bounds the mint and the response
+	// write — see handleGCSObject steps 10 and 13) in tests; zero in
+	// production, meaning "use the constant". gcsLinkEndpointOverride points
+	// gcsObjectSourceFor's *storage.Client at a fake GCS server in tests;
+	// empty in production, meaning "use the real GCS endpoint". The feature
+	// itself is gated on both the web.gcs_links experiment and
+	// gcpTokenGenerator != nil (step 1).
+	gcsLinkBaseTransport           *http.Transport
+	gcsLinkRateLimiter             *GCPTokenRateLimiter
+	gcsLinkSem                     chan struct{}
+	gcsLinkSourceFactory           gcsSourceFactory
+	gcsLinkRequestDeadlineOverride time.Duration
+	gcsLinkEndpointOverride        string
+
 	// Database connection-pool / notify metrics recorder (P0-5). Defaults to a
 	// disabled no-op recorder; SetDBMetrics wires a real exporter. Drives the
 	// connection-pool sampler started in StartBackgroundServices.
@@ -1034,6 +1472,12 @@ type Server struct {
 	// Broker dispatch metrics recorder (B5-2). Defaults to a disabled no-op
 	// recorder; SetDispatchMetrics wires a real exporter.
 	dispatchMetrics dispatchmetrics.Recorder
+
+	// Launch reaper metrics recorder (design §3.7): tick-outcome counter,
+	// row-error counter, disarmed-time gauge. Nil until SetReaperMetrics is
+	// called; the reaper tick handler nil-checks before recording, matching
+	// dbMetrics/dispatchMetrics.
+	reaperMetrics reapermetrics.Recorder
 
 	// stopPoolSampler stops the DB pool-stats sampling goroutine on shutdown.
 	stopPoolSampler func()
@@ -1044,8 +1488,9 @@ type Server struct {
 	// User last-seen activity tracker (nil = disabled)
 	userActivity *UserActivityTracker
 
-	// operationalSettings manages Layer-1 settings from the DB in postgres mode.
-	// Nil (zero value) in file/SQLite mode (settings-db §3.7).
+	// operationalSettings manages Layer-1 settings from the DB on every DB
+	// driver (SQLite included, since #1432). Nil only when the hub has no
+	// DB-backed settings, e.g. tests that build a bare Server.
 	// Uses atomic.Pointer for safe concurrent access — Phase 4/5 will add
 	// request-path readers while Set is called during startup.
 	operationalSettings atomic.Pointer[OperationalSettings]
@@ -1055,6 +1500,28 @@ type Server struct {
 
 	// Dedicated message logger for message audit trail (nil = uses messageLog fallback)
 	dedicatedMessageLog *slog.Logger
+
+	// missingAgents and lifecycleOps back the heartbeat missing-container
+	// reconcile (broker_heartbeat_reconcile.go). Zero values are ready to use.
+	missingAgents missingAgentTracker
+	lifecycleOps  lifecycleOpTracker
+
+	// lifecycleTxHooks holds the agent lifecycle transaction hooks
+	// (agent_lifecycle_tx.go). The zero value has no hooks and is ready to use.
+	lifecycleTxHooks agentLifecycleHooks
+
+	// startClaimCfg holds the current start-claim settings (see
+	// start_claim_settings.go); set at New and by ApplySnapshot.
+	startClaimCfg atomic.Pointer[StartClaimSettings]
+	// startClaimsOn turns start claims on (start_claim.go). Off until every
+	// start trigger runs under a claim.
+	startClaimsOn bool
+	// startClaimTestHook, when set, adjusts a claim run before its renewal
+	// starts (tests only).
+	startClaimTestHook func(*startClaimRun)
+	// claimStops records when the start-claim reaper last stopped an
+	// agent's container (agent ID -> time.Time), to rate-limit it.
+	claimStops sync.Map
 
 	// Subsystem loggers for handler methods
 	agentLifecycleLog *slog.Logger
@@ -1111,6 +1578,30 @@ type Server struct {
 	// ghResolutionStore is the DB-backed GitHub skill resolution cache (nil when entClient is nil).
 	ghResolutionStore *GitHubResolutionStore
 
+	// ghResolveFlight coalesces concurrent resolveGitHubSkill calls that
+	// share a cache key (see resolveGitHubSkill), so a burst of creates
+	// hitting a cold or just-expired entry for the same ref makes one
+	// mint+commits+contents+Put sequence instead of one per caller. Zero
+	// value is ready to use.
+	ghResolveFlight singleflight.Group
+
+	// ghRefreshFailMu guards ghLastRefreshFailure, which records the last
+	// time a background stale-refresh failed for a given cache key (see
+	// refreshGitHubSkillInBackground and ghRefreshFailureBackoff).
+	ghRefreshFailMu      sync.Mutex
+	ghLastRefreshFailure map[string]time.Time
+
+	// ghFailures remembers, per cache key, that GitHub recently reported a
+	// gh:// ref as not found (see rememberGHNotFound and resolveGitHubSkill).
+	// It is in memory only, per hub process, and never written to the store.
+	ghFailures agent.FailureMemo
+
+	// ghCooldown holds gh:// resolution requests back per credential
+	// identity after a GitHub rate-limit response (see agent.GitHubCooldown).
+	// Nil means the process-wide agent.SharedGitHubCooldown, the same
+	// tracker the broker-side resolver uses; tests set their own.
+	ghCooldown *agent.GitHubCooldown
+
 	// nonceCacheStore is the DB-backed HMAC nonce replay cache (nil when entClient is nil).
 	// When set, it replaces the in-memory NonceCache in BrokerAuthService for
 	// cross-instance replay protection.
@@ -1143,6 +1634,19 @@ type Server struct {
 	// kept here too so Start can run its cleanup goroutine, the same way
 	// geExchangeRateLimiter's is started below.
 	externalBearerRateLimiter *externalBearerRateLimiter
+
+	// experiments is the compiled feature-flag registry (pkg/experiments).
+	// Nil in production and in most tests; always read through the
+	// nil-safe experimentRegistry() accessor, never directly.
+	experiments *experiments.Registry
+
+	// reincarnationRequesterResolveTimeout bounds
+	// buildReincarnationRequesterContext's store calls (design Amendment
+	// A26.14/A26.18). Zero means use defaultReincarnationRequesterResolveTimeout;
+	// always read through the requesterResolveTimeout() accessor, never
+	// directly. Per-Server rather than a package var so a test can shorten
+	// it on its own Server instance without racing other tests' workers.
+	reincarnationRequesterResolveTimeout time.Duration
 }
 
 // groupsLogger returns the groups subsystem logger, falling back to
@@ -1185,6 +1689,24 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		}
 		cfg.StalledThreshold = defaults.StalledThreshold
 	}
+	const minLaunchTimeout = 30 * time.Second
+	if cfg.LaunchTimeout < minLaunchTimeout {
+		if cfg.LaunchTimeout != 0 {
+			slog.Warn("launch_timeout below minimum 30s, using default",
+				"configured", cfg.LaunchTimeout, "default", defaults.LaunchTimeout)
+		}
+		cfg.LaunchTimeout = defaults.LaunchTimeout
+	}
+	if cfg.LaunchKeepaliveSeconds <= 0 {
+		cfg.LaunchKeepaliveSeconds = defaults.LaunchKeepaliveSeconds
+	}
+	if cfg.MissingAgentGrace < MinMissingAgentGrace {
+		if cfg.MissingAgentGrace != 0 {
+			slog.Warn("missing_agent_grace below minimum 1m, using default",
+				"configured", cfg.MissingAgentGrace, "default", defaults.MissingAgentGrace)
+		}
+		cfg.MissingAgentGrace = defaults.MissingAgentGrace
+	}
 
 	srvCtx, srvCancel := context.WithCancel(context.Background())
 
@@ -1215,6 +1737,10 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		workspaceLog:      logging.Subsystem("hub.workspace"),
 		agentMetricsLog:   logging.Subsystem("hub.agent-metrics"),
 	}
+	// The startup-resolved hub name, which ApplySnapshot returns to when
+	// the configured hub_name is unset.
+	srv.startupHubName = cfg.HubName
+	srv.setStartClaimSettings(cfg.StartClaim)
 
 	// Wire tunnel disconnect handler: when an agent's port-forward tunnel
 	// closes (readLoop exits), clear its exposed port registrations so stale
@@ -1255,15 +1781,42 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// Initialize GCP token metrics
 	srv.gcpTokenMetrics = NewGCPTokenMetrics()
 
+	// Initialize gs:// link fetch endpoint support (shared base transport,
+	// per-viewer rate limiter, global concurrency semaphore). The feature's
+	// own availability gate (step 1 of handleGCSObject) checks the
+	// web.gcs_links experiment and gcpTokenGenerator directly at request
+	// time, so these are safe to build unconditionally even when no
+	// generator is configured yet — exactly like the pre-existing GCP token
+	// rate limiter below, which is likewise built regardless and simply goes
+	// unused until SetGCPTokenGenerator is called.
+	srv.gcsLinkBaseTransport = newGCSLinkBaseTransport()
+	srv.gcsLinkRateLimiter = NewGCPTokenRateLimiter(float64(gcsLinkRateLimitPerMinute)/60.0, gcsLinkRateLimitPerMinute)
+	srv.gcsLinkSem = make(chan struct{}, gcsLinkGlobalConcurrency)
+
 	// Initialize quota enforcement service (Permissions Phase 2B).
+	// limitOverride wires in the ptone/scion#2061 P2 per-broker settings
+	// override (design.md §5.2): see brokerSettingLimitOverride.
 	srv.quotaService = &QuotaService{
 		store:  s,
 		logger: slog.Default().With("component", "quota"),
+		enforced: func(limitName string) bool {
+			return limitName != store.LimitMaxAgentsPerBroker || srv.brokerQuotasEnforced()
+		},
+		limitOverride: srv.brokerSettingLimitOverride,
 	}
 
 	// Per-sender chat send rate limiter (#1054).
 	srv.chatSendLimiter = newChatSendLimiter()
 	srv.chatIdempotency = NewChatIdempotencyCache()
+
+	// Per-pair agent mention loop/storm protection.
+	srv.mentionPairLimiter = newMentionPairLimiter()
+
+	// Agent-keys admission rate limiters (task 2.2, contract "Concrete
+	// defaults"): 5 req/s burst 10 per principal+project, 10 req/s burst 20
+	// per target.
+	srv.keysPrincipalLimiter = newKeysRateLimiter(agentkeys.PrincipalProjectRateLimit, agentkeys.PrincipalProjectBurst)
+	srv.keysTargetLimiter = newKeysRateLimiter(agentkeys.TargetRateLimit, agentkeys.TargetBurst)
 
 	ctx := context.Background()
 
@@ -1316,6 +1869,12 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 
 	// Initialize the dedicated download-URL signing key (#1792).
 	if err := srv.initDownloadSigningKey(ctx); err != nil {
+		return nil, err
+	}
+
+	// Initialize the dedicated authorized-list cursor sealing key
+	// (ptone/scion#2124).
+	if err := srv.initListCursorSealer(ctx); err != nil {
 		return nil, err
 	}
 
@@ -1449,61 +2008,20 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		Debug:          cfg.Debug,
 	}, logging.Subsystem("hub.control-channel"))
 	// Set disconnect callback to mark broker offline when WebSocket drops.
-	// ReleaseAndMarkBrokerOffline atomically clears affinity AND stamps
-	// status=offline in a single CAS write — if a concurrent reconnect has
-	// already claimed the broker with a new session, the compare fails and the
-	// callback is a no-op. This eliminates the TOCTOU race where a separate
-	// ReleaseRuntimeBrokerConnection + UpdateRuntimeBrokerHeartbeat allowed
-	// the offline stamp to clobber a concurrent markBrokerOnline (issue #131).
+	// See handleBrokerDisconnect for the CAS/race rationale (issue #131).
 	srv.controlChannel.SetOnDisconnect(func(brokerID, sessionID string) {
-		ctx := context.Background()
-
-		cleared, err := s.ReleaseAndMarkBrokerOffline(ctx, brokerID, srv.instanceID, sessionID)
-		if err != nil {
-			slog.Error("Failed to release broker affinity on disconnect", "brokerID", brokerID, "sessionID", sessionID, "error", err)
-			return
-		}
-		if !cleared {
-			slog.Info("broker reconnected elsewhere; skipping offline stamp", "brokerID", brokerID, "staleSession", sessionID)
-			return
-		}
-
-		slog.Info("Broker disconnected, marking offline", "brokerID", brokerID, "sessionID", sessionID)
-
-		// Guard: re-read the broker before updating provider statuses. A
-		// concurrent markBrokerOnline may have already re-claimed the broker
-		// between our atomic release+offline and now. If so, skip provider
-		// updates to avoid clobbering the new session's online providers.
-		broker, rerr := s.GetRuntimeBroker(ctx, brokerID)
-		if rerr == nil && broker.ConnectedSessionID != nil && *broker.ConnectedSessionID != "" {
-			slog.Info("broker re-claimed by new session after release; skipping provider offline stamp",
-				"brokerID", brokerID, "staleSession", sessionID, "newSession", *broker.ConnectedSessionID)
-			return
-		}
-
-		// Update all project provider records for this broker
-		providers, err := s.GetBrokerProjects(ctx, brokerID)
-		if err != nil {
-			slog.Error("Failed to get broker projects for status update", "brokerID", brokerID, "error", err)
-		} else {
-			for _, provider := range providers {
-				if err := s.UpdateProviderStatus(ctx, provider.ProjectID, brokerID, store.BrokerStatusOffline); err != nil {
-					slog.Error("Failed to update provider status", "brokerID", brokerID, "project_id", provider.ProjectID, "error", err)
-				}
-			}
-
-			// Publish broker disconnected event
-			projectIDs := make([]string, len(providers))
-			for i, p := range providers {
-				projectIDs[i] = p.ProjectID
-			}
-			srv.events.PublishBrokerDisconnected(ctx, brokerID, projectIDs)
-		}
+		srv.handleBrokerDisconnect(context.Background(), brokerID, sessionID)
 	})
 	slog.Info("Control channel manager initialized")
 
 	// Initialize authorization service
 	srv.authzService = NewAuthzService(s, logging.Subsystem("hub.auth"))
+	// ptone/scion#2342 (B.3 R6): the same condition that enables dev-token
+	// acceptance and DevUserID seeding below (cfg.DevAuthToken != "") also
+	// gates whether this server currently admits dev_local authority at
+	// all. See devLocalAuthorityEnabled's doc comment (devauth.go).
+	srv.authzService.setDevLocalAuthorityEnabled(cfg.DevAuthToken != "")
+	srv.authzService.mintDevAuthOverride = cfg.DevAuthToken != ""
 
 	// Wire decision audit emitter
 	auditEmitter := NewStoreDecisionAuditEmitter(s, logging.Subsystem("hub.decision-audit"))
@@ -1660,7 +2178,7 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 
 	// Seed platform skills into hub_settings["injected_skills"].system (idempotent).
 	// Runs on every startup so that the system list is always in sync with the binary.
-	if err := srv.seedPlatformSkillInsertions(ctx); err != nil {
+	if err := srv.seedPlatformSkillInsertions(ctx, resources.PlatformSkillsFS()); err != nil {
 		slog.Warn("Failed to seed platform skill insertions", "error", err)
 	}
 
@@ -1810,6 +2328,11 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 	// See platformAuthSA above: shared by the GE exchange endpoint and the
 	// external-bearer path, both of which resolve through this instance.
 	googleResolver.SetPlatformAuthSA(cfg.PlatformAuthSA)
+	// Give the resolver's existing-record-by-email branch the same
+	// account-state handling (invited activation, role re-evaluation,
+	// super-admin binding, grant sync, audit) that provisionUser's
+	// existing-record branch uses — see signInPolicyDeps / SetSignInPolicyDeps.
+	googleResolver.SetSignInPolicyDeps(srv.signInPolicyDeps())
 	// The external-bearer path (unlike the exchange endpoint) re-validates on
 	// every request, so it gets a caching decorator in front of the shared
 	// base validator. The exchange endpoint below is
@@ -1871,6 +2394,8 @@ func New(cfg ServerConfig, s store.Store) (*Server, error) {
 		slog.Info("GE Google exchange service initialized",
 			"allowed_client_ids", len(cfg.GEGoogleExchange.AllowedClientIDs))
 	}
+
+	srv.experiments = cfg.Experiments
 
 	srv.registerRoutes()
 
@@ -1951,6 +2476,21 @@ func (s *Server) ensureSigningKey(ctx context.Context, keyName string, existingK
 
 	// Try to load from the secret backend if configured
 	if hasSecretBackend {
+		// Hub-scope signing keys created before ptone/scion#2152 only exist
+		// under the legacy (pre hub-prefix) GCP SM name. Copy the value
+		// forward to the current hub-prefixed name so it is reachable once an
+		// operator narrows IAM to the new prefix, without waiting for an
+		// explicit `migrate-names` run — losing a signing key invalidates
+		// every live session/agent token, so this can't wait on an operator's
+		// schedule the way ordinary secrets can. Idempotent; the legacy
+		// secret is left in place. Best-effort: a failure here just means the
+		// existing (legacy-ref) resolution below is used instead.
+		if gcpBackend, ok := s.secretBackend.(*secret.GCPBackend); ok {
+			if copyErr := gcpBackend.CopyHubSecretForward(ctx, keyName); copyErr != nil && copyErr != store.ErrNotFound {
+				slog.Warn("Failed to copy hub signing key forward to hub-prefixed GCP SM name", "key", keyName, "error", copyErr)
+			}
+		}
+
 		sv, err := s.secretBackend.Get(ctx, keyName, store.ScopeHub, hubID)
 		if err == nil {
 			slog.Info("Loaded existing signing key from secret backend", "key", keyName)
@@ -2367,6 +2907,29 @@ func (s *Server) waitForEmbeddedBroker(ctx context.Context) embeddedBrokerState 
 	}
 }
 
+// embeddedBrokerSnapshot returns the current embedded broker state without
+// waiting for a pending co-located registration to resolve. GetHealthInfo
+// (/healthz and the admin health summary) calls this instead of
+// waitForEmbeddedBroker: it is polled frequently (and often with short
+// client-side timeouts), so blocking up to embeddedBrokerWaitTimeout on
+// every call would make a probe hitting the process during the startup race
+// look like a timeout instead of the deliberate "not registered yet" status
+// it should report. /readyz does not call this and is intentionally
+// unaffected — see checkColocatedBrokerHealth in handlers_health.go for why
+// /healthz degrades on this instead. A pending state self-corrects on the
+// next poll once SetEmbeddedBrokerID or EmbeddedBrokerRegistrationFailed
+// runs; a failure does not self-correct at all (no retry), so it persists
+// until the broker configuration is fixed and the process is restarted.
+func (s *Server) embeddedBrokerSnapshot() embeddedBrokerState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return embeddedBrokerState{
+		id:      s.embeddedBrokerID,
+		regErr:  s.embeddedBrokerRegErr,
+		pending: s.embeddedBrokerPending != nil,
+	}
+}
+
 // SetStatelessEmbeddedBrokerID records a co-located broker whose runtime
 // lifecycle operations are safe from any hub replica.
 func (s *Server) SetStatelessEmbeddedBrokerID(id string) {
@@ -2593,14 +3156,14 @@ func (s *Server) IsPostgres() bool {
 }
 
 // SetOperationalSettings attaches the OperationalSettings service to the
-// server. This is called during postgres-mode startup after seeding and
+// server. This is called during hub startup (any DB driver) after seeding and
 // initial refresh (settings-db §3.5/§3.9). Safe for concurrent use.
 func (s *Server) SetOperationalSettings(ops *OperationalSettings) {
 	s.operationalSettings.Store(ops)
 }
 
 // GetOperationalSettings returns the OperationalSettings service, or nil
-// in file/SQLite mode. Safe for concurrent use.
+// when the hub has no DB-backed settings. Safe for concurrent use.
 func (s *Server) GetOperationalSettings() *OperationalSettings {
 	return s.operationalSettings.Load()
 }
@@ -2801,6 +3364,13 @@ func (s *Server) SetDispatchMetrics(rec dispatchmetrics.Recorder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dispatchMetrics = rec
+}
+
+// SetReaperMetrics wires the launch reaper's metrics recorder (design §3.7).
+func (s *Server) SetReaperMetrics(rec reapermetrics.Recorder) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reaperMetrics = rec
 }
 
 // SetGCPTokenMetrics wires the GCP token metrics recorder.
@@ -3190,6 +3760,8 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 		dispatcher.SetHubName(s.config.HubName)
 	}
 
+	dispatcher.SetConduitCapability(s.conduitServing)
+
 	// Pass hub ID and secret backend to dispatcher if configured
 	dispatcher.SetHubID(s.hubID)
 	if s.secretBackend != nil {
@@ -3245,9 +3817,11 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 	// is then omitted and broker behaviour is unchanged.
 	dispatcher.SetHubAgentDefaultsProvider(s.hubAgentDefaults)
 
-	// Wire profile timezone provider so dispatch can inject TZ from the
-	// profile's first-class timezone field into agent containers.
-	dispatcher.SetProfileTimezoneProvider(s.profileTimezone)
+	// Wire the async agent launch settings. They are static after startup;
+	// the accessor reads them under s.mu.
+	dispatcher.SetAsyncLaunchSettingsProvider(s.asyncLaunchSettings)
+	dispatcher.SetAutoExposePortsDefaultProvider(s.autoExposePortsDefault)
+	dispatcher.SetDispatchExperimentsProvider(s.dispatchExperiments)
 
 	// Set image registry so bare image names are rewritten before dispatch
 	dispatcher.SetImageRegistry(s.resolveImageRegistry())
@@ -3261,6 +3835,10 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 // Dev-auth mode overrides to full if the role would be more restrictive,
 // preserving dev-mode behavior where all agents get full access.
 // Additional scopes are merged with the role-based defaults, deduplicated.
+//
+// It applies no delegation ceiling and has no production caller: every mint
+// and refresh site calls GenerateAgentTokenForAgent. It serves test helpers
+// (TestAllMintSitesUseCeiledHelper pins this).
 func (s *Server) GenerateAgentToken(agentID, projectID string, ancestry []string, role AgentRole, additionalScopes []AgentTokenScope) (string, error) {
 	s.mu.RLock()
 	tokenService := s.agentTokenService
@@ -3397,16 +3975,42 @@ func (s *Server) autoSuspendStalledAgents(ctx context.Context, agents []store.Ag
 			}
 		}
 
+		// The container is stopped before phase=suspended is written; see
+		// beginLifecycleOp.
+		endLifecycleOp := s.beginLifecycleOp(agent.ID)
 		if agent.RuntimeBrokerID != "" {
 			if dispatcher == nil {
 				slog.Error("Scheduler: cannot auto-suspend agent because dispatcher is nil",
 					"agent_id", agent.ID, "agent_name", agent.Name)
+				endLifecycleOp()
 				continue
 			}
+		}
+		priorIntent, intentAt, err := s.swapRunIntent(ctx, agent, store.RunIntentStopped)
+		if err != nil {
+			slog.Error("Scheduler: auto-suspend intent write failed",
+				"agent_id", agent.ID, "agent_name", agent.Name, "error", err)
+			endLifecycleOp()
+			continue
+		}
+		stopRunID := agent.RunID
+		if agent.RuntimeBrokerID != "" {
 			s.syncWorkspaceOnStop(ctx, agent)
 			if err := dispatcher.DispatchAgentStop(ctx, agent); err != nil {
+				s.logStopRunMismatch(agent, "auto-suspend", err)
 				slog.Error("Scheduler: auto-suspend dispatch failed",
 					"agent_id", agent.ID, "agent_name", agent.Name, "error", err)
+				// This stop was the system's, not the user's: if it
+				// replaced a running intent, put that back unless something
+				// newer replaced it. A prior stopped intent (for example a
+				// user stop whose dispatch also failed) stays stopped.
+				if priorIntent == store.RunIntentRunning {
+					if _, rerr := s.store.RevertRunIntent(ctx, agent.ID, store.RunIntentStopped, intentAt, store.RunIntentRunning); rerr != nil {
+						slog.Error("Scheduler: auto-suspend intent revert failed",
+							"agent_id", agent.ID, "agent_name", agent.Name, "error", rerr)
+					}
+				}
+				endLifecycleOp()
 				continue
 			}
 		}
@@ -3416,9 +4020,16 @@ func (s *Server) autoSuspendStalledAgents(ctx context.Context, agents []store.Ag
 			ContainerStatus: "stopped",
 			Activity:        "",
 		}
-		if err := s.store.UpdateAgentStatus(ctx, agent.ID, statusUpdate); err != nil {
+		// Only while the row still holds the run the stop was dispatched
+		// for (ptone/scion#2550).
+		recorded, err := s.recordStopStatus(ctx, agent.ID, stopRunID, "auto-suspend", statusUpdate)
+		endLifecycleOp()
+		if err != nil {
 			slog.Error("Scheduler: auto-suspend status update failed",
 				"agent_id", agent.ID, "agent_name", agent.Name, "error", err)
+			continue
+		}
+		if !recorded {
 			continue
 		}
 
@@ -3496,7 +4107,7 @@ func (s *Server) messageEventHandler() EventHandler {
 				"eventID", evt.ID,
 				"agentName", payload.AgentName,
 				"agent_id", payload.AgentID,
-				"scheduledFor", evt.FireAt.Format(time.RFC3339),
+				"scheduledFor", evt.FireAt.UTC().Format(time.RFC3339),
 				"staleness", staleness.Truncate(time.Second).String())
 		}
 
@@ -3543,6 +4154,20 @@ func (s *Server) messageEventHandler() EventHandler {
 			return authErr
 		}
 
+		// Migration gate (design agent-reincarnate §3.7, R3 p2a-r1 review).
+		// O-a (p2a-r2 review): checked AFTER authorization, not before —
+		// same invariant deliverToAgent states explicitly: a denied creator
+		// must learn nothing about the recipient's migration state. Scheduled
+		// messages are not deferred (there is no sender to persist a "saved
+		// to history" row for, and no request to answer 202 to) — a
+		// scheduled message firing mid-`scion reincarnate` fails loudly
+		// instead of dispatching into a stopped or absent container and
+		// silently succeeding. The event records this as a failure so the
+		// blocked-wait pairing agents rely on is not silently lost.
+		if reincarnationInFlight(agent) {
+			return fmt.Errorf("target agent is reincarnating")
+		}
+
 		dispatcher := s.GetDispatcher()
 		if dispatcher == nil {
 			return fmt.Errorf("no dispatcher available to deliver message")
@@ -3576,8 +4201,19 @@ func (s *Server) messageEventHandler() EventHandler {
 		if err := dispatchWithBrokerRetry(retryCtx, dispatcher, agent, payload.Message, payload.Interrupt, structuredMsg); err != nil {
 			return fmt.Errorf("failed to dispatch message to agent %s: %w", agent.Name, err)
 		}
+		// Log the recorded initiator alongside the executor context set by
+		// the caller (fireEvent / executeSchedule), so a scheduled message is
+		// distinguishable in logs from a live send without changing the live
+		// authorization identity above (cutover rule).
+		initiator := s.scheduledInitiator(evt.InitiatorAttribution)
+		executor, _ := ExecutorContextFromContext(ctx)
 		slog.Info("Scheduler: message delivered to agent",
-			"eventID", evt.ID, "agent_id", agent.ID, "agentName", agent.Name)
+			"eventID", evt.ID, "agent_id", agent.ID, "agentName", agent.Name,
+			"initiator_principal_kind", initiator.PrincipalKind,
+			"initiator_credential_kind", initiator.CredentialKind,
+			"initiator_credential_id", initiator.CredentialID,
+			"executor_kind", executor.Kind,
+			"executor_id", executor.ID)
 		return nil
 	}
 }
@@ -3596,8 +4232,14 @@ func (s *Server) authorizeScheduledAgentCreate(ctx context.Context, evt store.Sc
 	}
 
 	if creator, err := s.store.GetAgent(ctx, evt.CreatedBy); err == nil {
-		if creator.ProjectID != evt.ProjectID {
+		if !creator.DeletedAt.IsZero() {
+			return false, fmt.Errorf("scheduled dispatch creator agent %q is deleted; cannot authorize", evt.CreatedBy)
+		}
+		if creator.ProjectID == "" || creator.ProjectID != evt.ProjectID {
 			return false, fmt.Errorf("scheduled dispatch creator agent %q is not in project %q", evt.CreatedBy, evt.ProjectID)
+		}
+		if s.authzService == nil {
+			return false, fmt.Errorf("scheduled dispatch cannot authorize agent creation without authz service")
 		}
 		role, additionalScopes := agentRoleAndScopes(creator)
 		scopes := append(ScopesForRole(role), additionalScopes...)
@@ -3612,35 +4254,41 @@ func (s *Server) authorizeScheduledAgentCreate(ctx context.Context, evt store.Sc
 			return false, fmt.Errorf("scheduled dispatch creator agent %q missing required scope: %s", evt.CreatedBy, ScopeAgentCreate)
 		}
 
+		agentIdentity := &agentIdentityWrapper{&AgentTokenClaims{
+			Claims:    jwt.Claims{Subject: creator.ID},
+			ProjectID: creator.ProjectID,
+			Scopes:    scopes,
+		}}
+
+		// The creator agent needs agent.create in the project through
+		// Decide, including the delegation ceiling of every live ancestor.
+		if decision := s.agentCreateDecision(ctx, agentIdentity, evt.ProjectID); !decision.Allowed {
+			return false, fmt.Errorf("scheduled dispatch creator agent %q is not authorized to create agents in project %q: %s",
+				evt.CreatedBy, evt.ProjectID, decision.Reason)
+		}
+
 		// CanDelegate check (Phase 1F): at fire time, verify the creator
 		// agent still holds the scopes it would delegate to the new agent.
-		if s.authzService != nil {
-			agentIdentity := &agentIdentityWrapper{&AgentTokenClaims{
-				Claims:    jwt.Claims{Subject: creator.ID},
-				ProjectID: creator.ProjectID,
-				Scopes:    scopes,
-			}}
-			grantDesc := GrantDescriptor{
-				Type:      GrantTypeAgentDelegation,
-				AgentRole: string(role),
-				ProjectID: evt.ProjectID,
-				ScopeType: store.RoleScopeProject,
-				ScopeID:   evt.ProjectID,
-			}
-			delegateDecision := s.authzService.CanDelegate(ctx, agentIdentity, grantDesc)
-			if !delegateDecision.Allowed {
-				s.emitMutationAudit(ctx, &store.MutationAuditRecord{
-					MutationType:       "agent_delegation",
-					ActorPrincipalKind: "agent",
-					ActorPrincipalID:   creator.ID,
-					TargetType:         "scheduled_dispatch",
-					TargetID:           evt.ID,
-					CanDelegateResult:  "deny",
-					CanDelegateReason:  delegateDecision.Reason,
-				})
-				return false, fmt.Errorf("scheduled dispatch creator agent %q failed CanDelegate: %s",
-					evt.CreatedBy, delegateDecision.Reason)
-			}
+		grantDesc := GrantDescriptor{
+			Type:      GrantTypeAgentDelegation,
+			AgentRole: string(role),
+			ProjectID: evt.ProjectID,
+			ScopeType: store.RoleScopeProject,
+			ScopeID:   evt.ProjectID,
+		}
+		delegateDecision := s.authzService.CanDelegate(ctx, agentIdentity, grantDesc)
+		if !delegateDecision.Allowed {
+			s.emitMutationAudit(ctx, &store.MutationAuditRecord{
+				MutationType:       "agent_delegation",
+				ActorPrincipalKind: "agent",
+				ActorPrincipalID:   creator.ID,
+				TargetType:         "scheduled_dispatch",
+				TargetID:           evt.ID,
+				CanDelegateResult:  "deny",
+				CanDelegateReason:  delegateDecision.Reason,
+			})
+			return false, fmt.Errorf("scheduled dispatch creator agent %q failed CanDelegate: %s",
+				evt.CreatedBy, delegateDecision.Reason)
 		}
 
 		return true, nil
@@ -3663,11 +4311,7 @@ func (s *Server) authorizeScheduledAgentCreate(ctx context.Context, evt store.Sc
 		return false, fmt.Errorf("scheduled dispatch cannot authorize agent creation without authz service")
 	}
 	identity := NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "scheduler")
-	decision := s.authzService.CheckAccess(ctx, identity, Resource{
-		Type:       "agent",
-		ParentType: "project",
-		ParentID:   evt.ProjectID,
-	}, ActionCreate)
+	decision := s.agentCreateDecision(ctx, identity, evt.ProjectID)
 	if !decision.Allowed {
 		return false, fmt.Errorf("scheduled dispatch creator user %q is not authorized to create agents in project %q: %s",
 			evt.CreatedBy, evt.ProjectID, decision.Reason)
@@ -3754,10 +4398,16 @@ func (s *Server) scheduledCreatorIdentity(ctx context.Context, createdBy string)
 // The hub-default rung mirrors the project-default rung's existing choice
 // here; it does not introduce a new principal.
 //
-// When neither the project nor the hub has a default GCP identity mode (or
-// either is explicitly "block"), the applied config is left untouched (nil),
-// preserving the scheduler path's prior behaviour (#1797): unlike the create
-// path, this floor of the ladder does not write an explicit "block" record.
+// When neither the project nor the hub has a default GCP identity mode
+// configured at all, the applied config is left untouched (nil): unlike the
+// create path's floor, this rung does not write an explicit "block" record
+// for the "nothing configured" case, so the broker can apply its own
+// runtime-aware default ("block" everywhere except Kubernetes, "passthrough"
+// on Kubernetes — ptone/scion#2328 phase 1, since Kubernetes does not support
+// "block"). An explicit "block" — at the project rung, or as the hub's own
+// configured default — is different from "nothing configured" and always
+// writes an explicit record, exactly as the create path does: an explicit
+// choice must not be silently turned into a runtime-dependent default.
 func (s *Server) applyScheduledProjectDefaultGCPIdentity(ctx context.Context, agent *store.Agent, project *store.Project) error {
 	if agent.AppliedConfig == nil {
 		agent.AppliedConfig = &store.AgentAppliedConfig{}
@@ -3789,9 +4439,17 @@ func (s *Server) applyScheduledProjectDefaultGCPIdentity(ctx context.Context, ag
 	case store.GCPMetadataModeBlock:
 		// Project explicitly set "block" — stop the ladder here, matching the
 		// create path's rule that explicit block does not fall through to
-		// the hub default (handlers_agents_core.go). No case previously
-		// matched "block" on this path, so nothing was written to
-		// AppliedConfig.GCPIdentity; that is unchanged here.
+		// the hub default (handlers_agents_core.go). Written as an explicit
+		// record (not left nil): an explicit project choice must be rejected
+		// on the Kubernetes runtime, the same as an explicit per-agent
+		// request or hub default, rather than silently becoming
+		// "passthrough" now that nil means "apply the runtime-aware
+		// default" (ptone/scion#2328 phase 1). Previously this arm left
+		// AppliedConfig.GCPIdentity nil, which was indistinguishable from
+		// "nothing configured" — see TestScheduledDispatch_ProjectBlockNotOverriddenByHubDefault.
+		agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
+			MetadataMode: store.GCPMetadataModeBlock,
+		}
 	default:
 		// No project default configured (empty string) — fall back to the
 		// hub-level operational default, one rung down the ladder, mirroring
@@ -3801,14 +4459,39 @@ func (s *Server) applyScheduledProjectDefaultGCPIdentity(ctx context.Context, ag
 		case store.GCPMetadataModePassthrough:
 			// Hub-default passthrough is confined to the embedded broker,
 			// exactly as on the create path; see hubDefaultPassthroughAllowed.
-			mode := store.GCPMetadataModeBlock
-			if s.hubDefaultPassthroughAllowed(ctx, agent.RuntimeBrokerID, agent.ProjectID) {
-				mode = store.GCPMetadataModePassthrough
-			}
-			agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{MetadataMode: mode}
-			if mode == store.GCPMetadataModePassthrough && agent.RuntimeBrokerID != "" {
-				if err := s.translatePassthroughForSandbox(ctx, agent, agent.RuntimeBrokerID); err != nil {
-					return fmt.Errorf("failed to configure GCP identity for sandbox runtime: %w", err)
+			// Effective profile and pin-back mirror the create path; see
+			// effectiveRuntimeProfileName.
+			effectiveProfile := effectiveRuntimeProfileName(agent.AppliedConfig.Profile, project)
+			// Only write an explicit record when the grant is allowed. When
+			// denied, leave AppliedConfig.GCPIdentity unset instead of an
+			// explicit "block" record (ptone/scion#2328) — see the create
+			// path's equivalent arm (handlers_agents_core.go) for the full
+			// rationale: the operator chose "passthrough", not "block", so a
+			// denial here is treated like no default at all.
+			if allowed, resolvedProfile := s.hubDefaultPassthroughAllowed(ctx, agent.RuntimeBrokerID, agent.ProjectID, agent.Name, effectiveProfile); allowed {
+				// Pin the resolved profile onto both AppliedConfig.Profile
+				// and CreateInputs.Profile — the latter is what scion
+				// reincarnate replays (design §3.3 Amendment A1), and
+				// CreateInputs is already built above with no Profile set,
+				// so without this the pin would not survive a reincarnate.
+				if agent.AppliedConfig.Profile == "" {
+					agent.AppliedConfig.Profile = resolvedProfile
+				}
+				if agent.AppliedConfig.CreateInputs != nil && agent.AppliedConfig.CreateInputs.Profile == "" {
+					agent.AppliedConfig.CreateInputs.Profile = resolvedProfile
+				}
+				agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
+					MetadataMode: store.GCPMetadataModePassthrough,
+					// RequireLocalRuntime: see the create path's twin in
+					// handlers_agents_core.go. Only ever set here, since this
+					// whole block only runs when hubDefaultPassthroughAllowed
+					// granted it.
+					RequireLocalRuntime: true,
+				}
+				if agent.RuntimeBrokerID != "" {
+					if err := s.translatePassthroughForSandbox(ctx, agent, agent.RuntimeBrokerID); err != nil {
+						return fmt.Errorf("failed to configure GCP identity for sandbox runtime: %w", err)
+					}
 				}
 			}
 		case store.GCPMetadataModeAssign:
@@ -3824,13 +4507,25 @@ func (s *Server) applyScheduledProjectDefaultGCPIdentity(ctx context.Context, ag
 				return err
 			}
 			agent.AppliedConfig.GCPIdentity = cfg
+		case store.GCPMetadataModeBlock:
+			// Hub explicitly configured "block" as its own default — an
+			// explicit choice, kept as an explicit record (rejected on the
+			// Kubernetes runtime by the broker, ptone/scion#2328 phase 1),
+			// mirroring the create path's equivalent case
+			// (handlers_agents_core.go).
+			agent.AppliedConfig.GCPIdentity = &store.GCPIdentityConfig{
+				MetadataMode: store.GCPMetadataModeBlock,
+			}
 		default:
-			// No hub default either (or the hub default is itself "block") —
-			// preserve the scheduler path's prior behaviour when nothing at
-			// all is configured: leave AppliedConfig.GCPIdentity untouched
-			// (nil) rather than writing an explicit "block" record, unlike
-			// the create path's floor. Pinned by
-			// TestScheduledDispatch_NoProjectDefaultLeavesGCPIdentityUnchanged.
+			// No hub default configured at all (empty) — preserve the
+			// scheduler path's prior behaviour when nothing at all is
+			// configured: leave AppliedConfig.GCPIdentity untouched (nil)
+			// rather than writing an explicit "block" record, unlike the
+			// store.GCPMetadataModeBlock case above. Pinned by
+			// TestScheduledDispatch_NoProjectDefaultLeavesGCPIdentityUnchanged
+			// and TestScheduledDispatch_NoHubDefaultLeavesGCPIdentityUnchanged.
+			// This nil now also signals the broker to apply its own
+			// runtime-aware default (ptone/scion#2328 phase 1).
 		}
 	}
 	return nil
@@ -3859,7 +4554,7 @@ func (s *Server) dispatchAgentEventHandler() EventHandler {
 			slog.Warn("Scheduler: firing stale dispatch_agent event",
 				"eventID", evt.ID,
 				"agentName", payload.AgentName,
-				"scheduledFor", evt.FireAt.Format(time.RFC3339),
+				"scheduledFor", evt.FireAt.UTC().Format(time.RFC3339),
 				"staleness", staleness.Truncate(time.Second).String())
 		}
 
@@ -4065,11 +4760,58 @@ func (s *Server) dispatchAgentEventHandler() EventHandler {
 		// Apply project-level defaults, hub operational defaults, and the
 		// template/harness-config derivation pipeline, exactly as on the
 		// agent-create path. See deriveAgentConfig.
-		s.deriveAgentConfig(ctx, agent, project, tmpl)
+		if err := s.deriveAgentConfig(ctx, agent, project, tmpl); err != nil {
+			return fmt.Errorf("scheduled dispatch of agent %q: %w", slug, err)
+		}
+
+		// Scheduled creates have no waiting client, so they opt in to
+		// asynchronous launch server-side. It only takes effect when
+		// hub.asyncAgentLaunch is on.
+		agent.LaunchAsyncOptIn = true
 
 		if err := s.createAgentWithIdentityKey(ctx, agent, slug); err != nil {
 			return fmt.Errorf("failed to create agent %q: %w", slug, err)
 		}
+
+		// E.2b: success-path audit for scheduled dispatch. The deny-path
+		// records for this same CanDelegate check are in
+		// authorizeScheduledAgentCreate above. ActorPrincipalKind/ID mirror
+		// that deny-audit convention (the resolved creator/execution
+		// identity, required non-empty by the ent schema) — the cutover rule
+		// keeps the fire-time execution/authorization identity as CreatedBy,
+		// so the deny and allow audits for the same check agree on who the
+		// actor is.
+		//
+		// The recorded initiator's credential is copied onto the audit ONLY
+		// when the initiator is the same principal as the creator/executor
+		// identity (initiatorMatchesExecutor, scheduled_initiator.go): after
+		// an update or resume by a different user, the initiator is not the
+		// creator, and this check exists specifically to prevent naming
+		// principal A with principal B's credential. dev_local additionally
+		// matches when both sides resolve to the well-known DevUserID —
+		// initiatorMatchesExecutor's doc comment has the exact condition and
+		// why it's needed (scheduledCreatorIdentity never reconstructs the
+		// dev user's Type() as "dev"). When it does match, the value is
+		// mapped back to hub.CredentialKind's vocabulary
+		// (uat/agent_jwt/interactive/dev), since actor_credential_type is a
+		// column every other writer fills from that domain, not
+		// InitiatorAttribution's smaller one.
+		scheduledDispatchAudit := &store.MutationAuditRecord{
+			MutationType:       "agent_delegation",
+			ActorPrincipalKind: creatorIdentity.Type(),
+			ActorPrincipalID:   creatorIdentity.ID(),
+			TargetType:         "agent",
+			TargetID:           agent.ID,
+			CanDelegateResult:  "allow",
+		}
+		initiator := s.scheduledInitiator(evt.InitiatorAttribution)
+		if initiatorMatchesExecutor(initiator, creatorIdentity) {
+			if hubKind := hubCredentialKindForInitiator(initiator.CredentialKind); hubKind != "" {
+				scheduledDispatchAudit.ActorCredentialType = hubKind
+				scheduledDispatchAudit.ActorCredentialID = initiator.CredentialID
+			}
+		}
+		s.emitMutationAudit(ctx, scheduledDispatchAudit)
 
 		// Record delegation edge (Phase 1G) from the schedule creator to the
 		// dispatched agent. Best-effort: log errors but do not fail dispatch.
@@ -4088,27 +4830,46 @@ func (s *Server) dispatchAgentEventHandler() EventHandler {
 		s.recordDelegationEdgeWithType(ctx, agent.ID, evt.ProjectID, edgeRole, delegatorType, evt.CreatedBy)
 
 		// Dispatch to runtime broker
+		dispatchExecutor, _ := ExecutorContextFromContext(ctx)
 		dispatcher := s.GetDispatcher()
 		if dispatcher == nil {
 			slog.Warn("Scheduler: no dispatcher available, agent created but not started",
 				"eventID", evt.ID,
 				"agent_id", agent.ID,
-				"agentName", agent.Name)
+				"agentName", agent.Name,
+				"executor_kind", dispatchExecutor.Kind,
+				"executor_id", dispatchExecutor.ID)
 			return nil
 		}
 
-		if err := dispatcher.DispatchAgentCreate(ctx, agent); err != nil {
+		if _, err := s.recordRunIntent(ctx, agent, store.RunIntentRunning); err != nil {
+			return fmt.Errorf("failed to dispatch agent %q: %w", slug, err)
+		}
+		created, err := dispatcher.DispatchAgentCreate(ctx, agent)
+		if err != nil {
 			slog.Error("Scheduler: failed to dispatch agent creation",
 				"eventID", evt.ID,
 				"agent_id", agent.ID,
 				"agentName", agent.Name,
-				"error", err)
+				"error", err,
+				"executor_kind", dispatchExecutor.Kind,
+				"executor_id", dispatchExecutor.ID)
 			return fmt.Errorf("failed to dispatch agent %q: %w", slug, err)
+		}
+		if created.AcceptedLaunch() != nil {
+			// The row is already provisioning; persist the non-status
+			// fields from the dispatch.
+			if _, err := s.persistAcceptedLaunch(ctx, agent); err != nil {
+				slog.Warn("Scheduler: failed to persist agent after accepted launch",
+					"eventID", evt.ID, "agent_id", agent.ID, "error", err)
+			}
 		}
 
 		slog.Info("Scheduler: agent dispatched successfully",
 			"eventID", evt.ID, "agent_id", agent.ID, "agentName", agent.Name,
-			"project_id", evt.ProjectID)
+			"project_id", evt.ProjectID,
+			"executor_kind", dispatchExecutor.Kind,
+			"executor_id", dispatchExecutor.ID)
 		return nil
 	}
 }
@@ -4145,9 +4906,23 @@ func (s *Server) executeSchedule(ctx context.Context, sched store.Schedule, now 
 		"schedule_id", sched.ID, "schedule_name", sched.Name,
 		"project_id", sched.ProjectID)
 
+	// Backstop for zone-prefixed expressions that reach the evaluator anyway
+	// (for example a row written after the startup pass, or by an older
+	// replica): pause the row instead of recording an invalid-expression
+	// error on every tick.
+	if hasCronZonePrefix(sched.CronExpr) {
+		if err := s.store.UpdateScheduleStatus(ctx, sched.ID, store.ScheduleStatusPaused); err != nil {
+			log.Error("schedule-evaluator: failed to pause schedule with unsupported zone prefix",
+				"cron_expr", sched.CronExpr, "error", err)
+			return
+		}
+		log.Warn("schedule paused: cron zone prefixes are not supported; edit the expression to UTC and resume",
+			"cron_expr", sched.CronExpr)
+		return
+	}
+
 	// Compute next run time
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	cronSchedule, err := parser.Parse(sched.CronExpr)
+	cronSchedule, err := parseScheduleCron(sched.CronExpr)
 	if err != nil {
 		log.Error("schedule-evaluator: invalid cron expression",
 			"cron_expr", sched.CronExpr, "error", err)
@@ -4167,6 +4942,12 @@ func (s *Server) executeSchedule(ctx context.Context, sched store.Schedule, now 
 		Status:     store.ScheduledEventPending,
 		CreatedBy:  sched.CreatedBy,
 		ScheduleID: sched.ID,
+		// E.2b: every recurrence copies the schedule's current initiator
+		// attribution verbatim (plan §3.5) — a single struct assignment,
+		// since Schedule and ScheduledEvent share the same mixin. The
+		// materialized event then keeps this snapshot unchanged even if the
+		// schedule is later re-attributed.
+		InitiatorAttribution: sched.InitiatorAttribution,
 	}
 
 	if err := s.store.CreateScheduledEvent(ctx, &evt); err != nil {
@@ -4183,7 +4964,11 @@ func (s *Server) executeSchedule(ctx context.Context, sched store.Schedule, now 
 		errMsg = fmt.Sprintf("unknown event type: %s", sched.EventType)
 		log.Error("schedule-evaluator: unknown event type", "event_type", sched.EventType)
 	} else {
-		handlerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		// E.2b: mark this as deferred execution of the schedule, distinct
+		// from the initiator attribution just copied onto evt above.
+		handlerCtx, cancel := context.WithTimeout(
+			ContextWithExecutor(ctx, ExecutorContext{Kind: "schedule_evaluator", ID: "schedule:" + sched.ID}),
+			30*time.Second)
 		if handlerErr := handler(handlerCtx, evt); handlerErr != nil {
 			errMsg = handlerErr.Error()
 			log.Warn("schedule-evaluator: event handler failed", "error", handlerErr)
@@ -4206,37 +4991,31 @@ func (s *Server) executeSchedule(ctx context.Context, sched store.Schedule, now 
 	_ = s.store.UpdateScheduleAfterRun(ctx, sched.ID, now, nextRunAt, errMsg)
 }
 
-// StartBackgroundServices initializes and starts the scheduler and notification
-// dispatcher. It is called by Start() for standalone mode and must be called
-// explicitly in combined mode (Hub mounted on WebServer) since Start() is
-// not invoked in that case.
-func (s *Server) StartBackgroundServices(ctx context.Context) {
-	s.mu.Lock()
-	if s.startTime.IsZero() {
-		s.startTime = time.Now()
-	}
-	s.mu.Unlock()
+// registerSchedulerHandlers registers every periodic scheduler task, plus the
+// "message" and "dispatch_agent" event handlers, on s.scheduler, which must
+// already be initialized (StartBackgroundServices does this before calling
+// in). Factored out of StartBackgroundServices so tests can inspect
+// registration metadata (interval, singleton mode) without starting the
+// scheduler's ticker or any other background service.
+//
+// Most recurring sweeps are cluster-wide-once work: under multi-replica
+// Postgres they must run on a single replica per tick (gated by an advisory
+// lock), otherwise every replica would publish duplicate offline/stalled
+// events and race on the schedule claim. On SQLite the lock is a no-op. See
+// CONCURRENCY-AUDIT.md §"Singleton / leader". broker-provider-selfheal is the
+// per-instance exception: every instance must run it, not just one (see its
+// registration below).
+// Non-critical maintenance tasks run every 5 minutes (not every 1 minute) to
+// reduce DB connection pressure. Combined with per-handler jitter in the
+// scheduler, this eliminates the thundering-herd pattern that was causing
+// 9-54 s API latency spikes.
+func (s *Server) registerSchedulerHandlers() {
+	// Async-create launch reaper (design §3.7): its own dedicated ticker,
+	// registered unconditionally — see
+	// registerLaunchReaper's doc comment for its per-tick cost with the
+	// feature off.
+	s.registerLaunchReaper()
 
-	// Initialize and start the scheduler. Interval and concurrency are
-	// configurable via server.scheduler in settings.yaml to let operators
-	// tune background load to match their DB capacity (see issue #367).
-	var schedOpts []SchedulerOption
-	if s.config.SchedulerIntervalSeconds > 0 {
-		schedOpts = append(schedOpts, WithTickInterval(time.Duration(s.config.SchedulerIntervalSeconds)*time.Second))
-	}
-	if s.config.SchedulerMaxConcurrency != nil {
-		schedOpts = append(schedOpts, WithMaxConcurrency(*s.config.SchedulerMaxConcurrency))
-	}
-	s.scheduler = NewScheduler(s.store, logging.Subsystem("hub.scheduler"), schedOpts...)
-	// Recurring sweeps are cluster-wide-once work: under multi-replica Postgres
-	// they must run on a single replica per tick (gated by an advisory lock),
-	// otherwise every replica would publish duplicate offline/stalled events and
-	// race on the schedule claim. On SQLite the lock is a no-op. See
-	// CONCURRENCY-AUDIT.md §"Singleton / leader".
-	// Non-critical maintenance tasks run every 5 minutes (not every 1 minute) to
-	// reduce DB connection pressure. Combined with per-handler jitter in the
-	// scheduler, this eliminates the thundering-herd pattern that was causing
-	// 9-54 s API latency spikes.
 	s.scheduler.RegisterRecurringSingleton("agent-heartbeat-timeout", 5, store.LockAgentHeartbeatTimeout, s.agentHeartbeatTimeoutHandler())
 	s.scheduler.RegisterRecurringSingleton("agent-stalled-detection", 5, store.LockAgentStalledDetection, s.agentStalledDetectionHandler())
 	if s.config.SoftDeleteRetention > 0 {
@@ -4247,6 +5026,10 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	s.scheduler.RegisterRecurringSingleton("schedule-evaluator", 1, store.LockScheduleEvaluator, s.evaluateSchedulesHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-heartbeat-timeout", 5, store.LockBrokerHeartbeatTimeout, s.brokerHeartbeatTimeoutHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-affinity-reap", 5, store.LockBrokerAffinityReap, s.brokerAffinityReapHandler())
+	// Not a singleton: this instance can only self-heal the providers of
+	// brokers it personally holds a live local control-channel socket for
+	// (see brokerProviderSelfHealHandler), so every instance must run it.
+	s.scheduler.RegisterRecurring("broker-provider-selfheal", 1, s.brokerProviderSelfHealHandler())
 	s.scheduler.RegisterRecurringSingleton("broker-message-sweep", 5, store.LockBrokerMessageSweep, s.brokerMessageSweepHandler())
 	s.scheduler.RegisterRecurringSingleton("failed-message-retention", 60, store.LockFailedMessageRetention, s.failedMessageRetentionHandler())
 	s.scheduler.RegisterRecurringSingleton("exposed-ports-sweep", 5, store.LockExposedPortsSweep, s.exposedPortsSweepHandler())
@@ -4257,6 +5040,14 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	// future drift) without a separate one-shot migration.
 	s.scheduler.RegisterRecurringSingleton("broker-quota-reconcile", 60, store.LockBrokerQuotaReconcile, s.ReconcileStaleBrokerQuotaReservations)
 	s.scheduler.RegisterRecurringSingleton("reincarnation-sweep", 5, store.LockReincarnationSweep, s.reincarnationSweepHandler())
+	s.scheduler.RegisterRecurringSingleton("start-claim-reaper", 1, store.LockStartClaimReaper, s.startClaimReaperHandler())
+	go func() {
+		// Bounded: a store that does not answer at startup must not leave
+		// this goroutine behind.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s.demoteOwnClaimsOnRestart(ctx)
+	}()
 
 	// A2A bridge sweep — conditional on the bridge being registered as a standalone plugin.
 	if a2aExternalURL := s.getA2ABridgeExternalURL(); a2aExternalURL != "" {
@@ -4264,6 +5055,14 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 			"a2a-bridge-sweep", 5, store.LockA2ABridgeSweep,
 			s.a2aBridgeSweepHandler(a2aExternalURL),
 		)
+	}
+
+	// Conduit registry maintenance (design v2.4 §3.4): only when this
+	// process runs a relay (hub.conduit on at startup). One replica per tick
+	// under Postgres; the registry requires the three reaps to run together
+	// under one lock.
+	if s.conduit.Load() != nil {
+		s.scheduler.RegisterRecurringSingleton("conduit-registry-reap", conduitRegistryReapInterval, store.LockConduitRegistryReap, s.conduitRegistryReapHandler())
 	}
 
 	// Register GitHub resolution cache TTL eviction (every 10 minutes)
@@ -4317,8 +5116,40 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 			s.releaseUpdateCheckHandler(),
 		)
 	}
+}
 
-	s.scheduler.Start(ctx)
+// StartBackgroundServices initializes and starts the scheduler and notification
+// dispatcher. It is called by Start() for standalone mode and must be called
+// explicitly in combined mode (Hub mounted on WebServer) since Start() is
+// not invoked in that case.
+func (s *Server) StartBackgroundServices(ctx context.Context) {
+	s.mu.Lock()
+	if s.startTime.IsZero() {
+		s.startTime = time.Now()
+	}
+	s.mu.Unlock()
+
+	// Initialize and start the scheduler. Interval and concurrency are
+	// configurable via server.scheduler in settings.yaml to let operators
+	// tune background load to match their DB capacity (see issue #367).
+	var schedOpts []SchedulerOption
+	if s.config.SchedulerIntervalSeconds > 0 {
+		schedOpts = append(schedOpts, WithTickInterval(time.Duration(s.config.SchedulerIntervalSeconds)*time.Second))
+	}
+	if s.config.SchedulerMaxConcurrency != nil {
+		schedOpts = append(schedOpts, WithMaxConcurrency(*s.config.SchedulerMaxConcurrency))
+	}
+	s.scheduler = NewScheduler(s.store, logging.Subsystem("hub.scheduler"), schedOpts...)
+	s.registerSchedulerHandlers()
+
+	// Report non-canonical stored timestamps (SQLite). It runs in the
+	// background: on a large store the check is a full scan per time column,
+	// and nothing at start depends on its result.
+	s.startStoredTimestampCheck(ctx)
+
+	// Pause schedules whose cron expression carries an unsupported zone
+	// prefix before the evaluator's first tick, so it never runs them.
+	s.startScheduler(ctx)
 
 	// Start the DB connection-pool stats sampler (P3-6 -> P0-5 gauges). It is a
 	// no-op unless an enabled recorder was wired via SetDBMetrics and the store
@@ -4326,13 +5157,19 @@ func (s *Server) StartBackgroundServices(ctx context.Context) {
 	// under multi-replica Postgres (see CONNECTION-BUDGET.md).
 	if rec := s.dbMetrics; rec != nil {
 		if dbp, ok := s.store.(interface{ DB() *sql.DB }); ok {
-			s.stopPoolSampler = dbmetrics.StartPoolSampler(ctx, rec, dbp.DB(), 0)
+			stop := dbmetrics.StartPoolSampler(ctx, rec, dbp.DB(), 0)
+			s.mu.Lock()
+			s.stopPoolSampler = stop
+			s.mu.Unlock()
 		}
 	}
 
 	// Start rate limiter cleanup goroutines (exit when ctx is cancelled).
 	if s.gcpTokenRateLimiter != nil {
 		s.gcpTokenRateLimiter.StartCleanup(ctx)
+	}
+	if s.gcsLinkRateLimiter != nil {
+		s.gcsLinkRateLimiter.StartCleanup(ctx)
 	}
 	if s.oidcTokenRateLimiter != nil {
 		s.oidcTokenRateLimiter.StartCleanup(ctx)
@@ -4394,83 +5231,68 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
-// Shutdown gracefully shuts down the server.
+// Shutdown gracefully shuts down the server. It is safe to call even when
+// the Server was never started (e.g. New() followed directly by Shutdown()):
+// the background-service teardown below always runs via CleanupResources,
+// and only the final HTTP listener shutdown is skipped when there is no
+// listener to shut down. It is also safe to call more than once, or
+// together with CleanupResources, since CleanupResources is idempotent and
+// http.Server.Shutdown tolerates repeated calls.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.RLock()
 	srv := s.httpServer
-	cc := s.controlChannel
 	s.mu.RUnlock()
+
+	slog.Info("Hub API server shutting down...")
+
+	// Run the shared background-service teardown (control channel, broker
+	// auth, scheduler, dispatchers, preview service, link services, event
+	// publisher, command bus, etc). CleanupResources is sync.Once-guarded,
+	// so this is a no-op if it already ran.
+	_ = s.CleanupResources(ctx)
 
 	if srv == nil {
 		return nil
 	}
 
-	slog.Info("Hub API server shutting down...")
-
-	// Cancel server-lifetime context to stop background goroutines
-	if s.ctxCancel != nil {
-		s.ctxCancel()
-	}
-
-	// Shutdown control channel first
-	if cc != nil {
-		cc.Shutdown()
-	}
-
-	// Stop the nonce cache cleanup goroutine
-	if s.brokerAuthService != nil {
-		s.brokerAuthService.Close()
-	}
-
-	// Stop scheduler
-	if s.scheduler != nil {
-		s.scheduler.Stop()
-	}
-
-	// Stop the DB pool-stats sampler.
-	if s.stopPoolSampler != nil {
-		s.stopPoolSampler()
-	}
-
-	// Stop notification dispatcher before closing event publisher
-	if s.notificationDispatcher != nil {
-		s.notificationDispatcher.Stop()
-	}
-
-	// Stop lifecycle hook evaluator before closing event publisher
-	if s.lifecycleHookEvaluator != nil {
-		s.lifecycleHookEvaluator.Stop()
-	}
-
-	// Stop presence manager before closing event publisher
-	if s.presenceManager != nil {
-		s.presenceManager.Stop()
-	}
-
-	// Close event publisher
-	if s.events != nil {
-		s.events.Close()
-	}
-	if s.commandBus != nil {
-		s.commandBus.Close()
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	return srv.Shutdown(ctx)
+	return srv.Shutdown(shutdownCtx)
 }
 
 // CleanupResources shuts down Hub-owned resources (control channel, broker auth,
 // event publisher) without stopping an HTTP server. Use this in combined mode
 // where the Hub API is mounted on the WebServer and has no listener of its own.
+// It is also called internally by Shutdown, and is safe to call more than
+// once, including after Shutdown: the teardown below runs at most once.
 func (s *Server) CleanupResources(ctx context.Context) error {
 	s.cleanupOnce.Do(func() {
 		s.mu.RLock()
 		cc := s.controlChannel
+		stopPoolSampler := s.stopPoolSampler
 		s.mu.RUnlock()
 
 		slog.Info("Cleaning up Hub resources...")
+
+		// Drain the conduit relay first, while the database, scheduler and
+		// server context are still up: the relay row goes draining, every
+		// session gets GoAway and the relay deletes its rows (bounded by ctx).
+		s.shutdownConduitRelay(ctx)
+
+		// Stop the DB pool-stats sampler. Safe to call more than once: it
+		// wraps either a context.CancelFunc or a no-op from
+		// StartPoolSampler. Lives in the Once body so combined mode (which
+		// only calls CleanupResources, never Shutdown) also stops it.
+		//
+		// Read under s.mu above rather than accessed directly here: in
+		// combined mode, StartBackgroundServices (which writes this field)
+		// runs in one goroutine while the CleanupResources-on-ctx.Done
+		// goroutine started earlier (see cmd/server_foreground.go) can race
+		// it, so the write and this read must share a lock.
+		if stopPoolSampler != nil {
+			stopPoolSampler()
+		}
 
 		// Cancel server-lifetime context to stop background goroutines
 		if s.ctxCancel != nil {
@@ -4504,6 +5326,10 @@ func (s *Server) CleanupResources(ctx context.Context) error {
 		}
 		if s.teamsLinkService != nil {
 			s.teamsLinkService.Close()
+		}
+		// Stop the B3 preview engine's nonce cleanup goroutine.
+		if s.previewService != nil {
+			s.previewService.Close()
 		}
 		// Stop presence manager before closing event publisher
 		if s.presenceManager != nil {
@@ -4721,6 +5547,20 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/gcp-service-accounts/mint", s.guarded("/api/v1/gcp-service-accounts/mint", s.handleGCPServiceAccountsMint))
 	s.mux.HandleFunc("/api/v1/gcp-service-accounts/", s.guarded("/api/v1/gcp-service-accounts/", s.handleGCPServiceAccountByID))
 
+	s.mux.HandleFunc("/api/v1/gcs/object", s.guarded("/api/v1/gcs/object", s.handleGCSObject))
+	s.mux.HandleFunc("/api/v1/conduit/grant-keys", s.guarded("/api/v1/conduit/grant-keys", s.handleConduitGrantKeys))
+	s.mux.HandleFunc("/api/v1/conduit", s.guarded("/api/v1/conduit", s.handleConduit))
+
+	// Artifact service (pkg/artifacts), behind the hub.artifacts experiment.
+	// The patterns are literal here, not mounted through
+	// artifacts.Service.RegisterRoutes, because the route-metadata tests and
+	// the route-authz manifest lint read registrations from this file;
+	// TestArtifactRoutesMatchService pins them to artifacts.RoutePatterns().
+	artifactsHandler := s.artifactsHandler()
+	s.mux.Handle("/api/v1/artifacts", s.artifactsGuard("/api/v1/artifacts", artifactsHandler))
+	s.mux.Handle("/api/v1/artifacts/", s.artifactsGuard("/api/v1/artifacts/", artifactsHandler))
+	s.mux.Handle("/api/v1/artifacts/shared/", s.artifactsGuard("/api/v1/artifacts/shared/", artifactsHandler))
+
 	s.mux.HandleFunc("/api/v1/skills", s.guarded("/api/v1/skills", s.handleSkills))
 	s.mux.HandleFunc("/api/v1/skills/", s.guarded("/api/v1/skills/", s.handleSkillByID))
 
@@ -4769,6 +5609,9 @@ func (s *Server) registerRoutes() {
 		s.handleUserMeInjectedSkillByID(w, r, entryID)
 	}))
 
+	// User-scoped terminal workspace persistence (/users/me/terminal-workspace)
+	s.mux.HandleFunc("/api/v1/users/me/terminal-workspace", s.guarded("/api/v1/users/me/terminal-workspace", s.handleUserMeTerminalWorkspace))
+
 	// User-scoped template endpoints (/users/me/templates)
 	s.mux.HandleFunc("/api/v1/users/me/templates", s.guarded("/api/v1/users/me/templates", s.handleUserMeTemplates))
 	s.mux.HandleFunc("/api/v1/users/me/templates/", s.guarded("/api/v1/users/me/templates/", func(w http.ResponseWriter, r *http.Request) {
@@ -4815,6 +5658,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/server-config", s.guarded("/api/v1/admin/server-config", s.handleAdminServerConfig))
 	s.mux.HandleFunc("/api/v1/admin/project-defaults", s.guarded("/api/v1/admin/project-defaults", s.handleAdminProjectDefaults))
 	s.mux.HandleFunc("/api/v1/admin/messaging", s.guarded("/api/v1/admin/messaging", s.handleAdminMessaging))
+	s.mux.HandleFunc("/api/v1/admin/experiments", s.guarded("/api/v1/admin/experiments", s.handleAdminExperiments))
 	s.mux.HandleFunc("/api/v1/admin/agents/reset-auth-all", s.guarded("/api/v1/admin/agents/reset-auth-all", s.handleAdminResetAuthAll))
 	s.mux.HandleFunc("/api/v1/admin/gcp-quota", s.guarded("/api/v1/admin/gcp-quota", s.handleAdminGCPQuota))
 	s.mux.HandleFunc("/api/v1/admin/lifecycle-hooks", s.guarded("/api/v1/admin/lifecycle-hooks", s.handleAdminLifecycleHooks))
@@ -4847,6 +5691,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/role-bindings/", s.guarded("/api/v1/admin/role-bindings/", s.handleAdminRoleBindingByID))
 	s.mux.HandleFunc("/api/v1/admin/permissions", s.guarded("/api/v1/admin/permissions", s.handleAdminPermissions))
 	s.mux.HandleFunc("/api/v1/admin/access-constraints", s.guarded("/api/v1/admin/access-constraints", s.handleAdminAccessConstraints))
+	s.mux.HandleFunc("GET /api/v1/admin/access-constraints/{id}/audit", s.guarded("GET /api/v1/admin/access-constraints/{id}/audit", s.handleAdminAccessConstraintAudit))
 	s.mux.HandleFunc("/api/v1/admin/access-constraints/", s.guarded("/api/v1/admin/access-constraints/", s.handleAdminAccessConstraintByID))
 	s.mux.HandleFunc("/api/v1/admin/access-constraint-previews", s.guarded("/api/v1/admin/access-constraint-previews", s.handleAdminAccessConstraintPreviews))
 	s.mux.HandleFunc("/api/v1/admin/access-constraint-previews/", s.guarded("/api/v1/admin/access-constraint-previews/", s.handleAdminAccessConstraintPreviews))
@@ -4878,10 +5723,6 @@ func (s *Server) registerRoutes() {
 		// Chat thread prefs (Phase 3 — visibility mode persistence)
 		s.mux.HandleFunc("/api/v1/chat/prefs", s.guarded("/api/v1/chat/prefs", s.handleChatPrefs))
 
-		// Chat thread endpoints (Phase 5 — thread rail, legacy)
-		s.mux.HandleFunc("/api/v1/chat/threads", s.guarded("/api/v1/chat/threads", s.handleChatThreads))
-		s.mux.HandleFunc("/api/v1/chat/threads/", s.guarded("/api/v1/chat/threads/", s.handleChatThreadRoutes))
-
 		// Wave-2 chat endpoints (conversation REST API)
 		s.mux.HandleFunc("/api/v1/chat/spaces", s.guarded("/api/v1/chat/spaces", s.handleChatSpaces))
 		s.mux.HandleFunc("/api/v1/chat/spaces/", s.guarded("/api/v1/chat/spaces/", s.handleChatSpaceRoutes))
@@ -4907,6 +5748,9 @@ func (s *Server) registerRoutes() {
 
 	// Public settings endpoint (no auth required for telemetry default, etc.)
 	s.mux.HandleFunc("/api/v1/settings/public", s.guarded("/api/v1/settings/public", s.handlePublicSettings))
+
+	// Resolved experiments map for signed-in callers (ptone/scion#2217).
+	s.mux.HandleFunc("/api/v1/experiments", s.guarded("/api/v1/experiments", s.handleExperiments))
 
 	// GitHub App integration endpoints: method-aware permission enforcement.
 	// Read operations use hub.github_app.read; mutations use hub.github_app.update.
@@ -4977,11 +5821,6 @@ func (s *Server) registerRoutes() {
 func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	// Apply middleware in reverse order (last applied runs first)
 	h = s.recoveryMiddleware(h)
-	if s.requestLogger != nil {
-		h = logging.RequestLogMiddleware(s.requestLogger, "hub", logging.HubPathPatterns(), s.config.SlowRequestThreshold)(h)
-	} else {
-		h = s.loggingMiddleware(h)
-	}
 
 	// Apply broker auth middleware (checks X-Scion-Broker-ID header for HMAC auth)
 	// This runs after unified auth but before the handler, allowing hosts to authenticate
@@ -5005,6 +5844,19 @@ func (s *Server) applyMiddleware(h http.Handler) http.Handler {
 	// Apply unified auth middleware
 	// This handles all authentication types: agent tokens, user tokens, API keys, dev tokens
 	h = UnifiedAuthMiddleware(s.authConfig)(h)
+
+	// The request logger wraps UnifiedAuthMiddleware, so it is the request
+	// logger's own next.ServeHTTP call that invokes auth: every request is
+	// logged with its final response status, whether auth allows it through
+	// or rejects it outright. auth_type and principal/credential attributes
+	// come from logging.SetRequestAuth on the shared *RequestMeta this
+	// middleware installs (see RequestLogMiddleware), reachable from every
+	// context derived from it.
+	if s.requestLogger != nil {
+		h = logging.RequestLogMiddleware(s.requestLogger, "hub", logging.HubPathPatterns(), s.config.SlowRequestThreshold)(h)
+	} else {
+		h = s.loggingMiddleware(h)
+	}
 
 	if s.config.CORSEnabled {
 		h = s.corsMiddleware(h)
@@ -5182,6 +6034,13 @@ func (rw *responseWriter) Flush() {
 	}
 }
 
+// Unwrap lets http.NewResponseController reach the underlying
+// ResponseWriter's own optional interfaces (e.g. SetWriteDeadline), through
+// this wrapper rather than stopping at it.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 // logOAuthProviders logs which OAuth providers are configured for a client type.
 func logOAuthProviders(clientType string, cfg OAuthClientConfig) {
 	googleConfigured := cfg.Google.ClientID != "" && cfg.Google.ClientSecret != ""
@@ -5297,6 +6156,30 @@ func (s *Server) handleRuntimeBrokerConnect(w http.ResponseWriter, r *http.Reque
 	s.markBrokerOnline(broker.ID(), sessionID)
 }
 
+// stampProvidersOnline sets status=online on every project-provider row linked
+// to brokerID and returns only the providers it actually stamped online, so
+// its only caller, markBrokerOnline, doesn't have to query the project list
+// twice for event publishing and doesn't announce a project as online when
+// its row was never updated. A failed UpdateProviderStatus for one provider
+// is logged and excluded from the result — a partial stamp is still strictly
+// better than none, but the caller must not treat an excluded provider as
+// online.
+func (s *Server) stampProvidersOnline(ctx context.Context, brokerID string) ([]store.ProjectProvider, error) {
+	providers, err := s.store.GetBrokerProjects(ctx, brokerID)
+	if err != nil {
+		return nil, err
+	}
+	online := make([]store.ProjectProvider, 0, len(providers))
+	for _, provider := range providers {
+		if err := s.store.UpdateProviderStatus(ctx, provider.ProjectID, brokerID, store.BrokerStatusOnline); err != nil {
+			slog.Error("Failed to update provider status", "brokerID", brokerID, "project_id", provider.ProjectID, "error", err)
+			continue
+		}
+		online = append(online, provider)
+	}
+	return online, nil
+}
+
 // markBrokerOnline updates broker and provider statuses to online after a successful WebSocket connection.
 // It claims broker affinity for this hub instance + the connection's sessionID,
 // which also bumps status->online and refreshes the heartbeat in one CAS write.
@@ -5308,15 +6191,10 @@ func (s *Server) markBrokerOnline(brokerID, sessionID string) {
 		slog.Error("Failed to claim broker connection", "brokerID", brokerID, "error", err)
 	}
 
-	providers, err := s.store.GetBrokerProjects(ctx, brokerID)
+	providers, err := s.stampProvidersOnline(ctx, brokerID)
 	if err != nil {
 		slog.Error("Failed to get broker projects for status update", "brokerID", brokerID, "error", err)
 		return
-	}
-	for _, provider := range providers {
-		if err := s.store.UpdateProviderStatus(ctx, provider.ProjectID, brokerID, store.BrokerStatusOnline); err != nil {
-			slog.Error("Failed to update provider status", "brokerID", brokerID, "project_id", provider.ProjectID, "error", err)
-		}
 	}
 
 	// Publish broker connected event
@@ -5345,15 +6223,190 @@ func (s *Server) markBrokerOnline(brokerID, sessionID string) {
 	}
 }
 
+// handleBrokerDisconnect runs when a broker's control-channel WebSocket drops.
+// It is the OnDisconnect callback wired to srv.controlChannel in New; factored
+// out to a method (rather than left as an inline closure) so tests can drive
+// it directly against a lightly-constructed *Server.
+//
+// ReleaseAndMarkBrokerOffline atomically clears affinity AND stamps
+// status=offline in a single CAS write — if a concurrent reconnect has
+// already claimed the broker with a new session, the compare fails and the
+// callback is a no-op. This eliminates the TOCTOU race where a separate
+// ReleaseRuntimeBrokerConnection + UpdateRuntimeBrokerHeartbeat allowed
+// the offline stamp to clobber a concurrent markBrokerOnline (issue #131).
+func (s *Server) handleBrokerDisconnect(ctx context.Context, brokerID, sessionID string) {
+	cleared, err := s.store.ReleaseAndMarkBrokerOffline(ctx, brokerID, s.instanceID, sessionID)
+	if err != nil {
+		slog.Error("Failed to release broker affinity on disconnect", "brokerID", brokerID, "sessionID", sessionID, "error", err)
+		return
+	}
+	if !cleared {
+		slog.Info("broker reconnected elsewhere; skipping offline stamp", "brokerID", brokerID, "staleSession", sessionID)
+		return
+	}
+
+	slog.Info("Broker disconnected, marking offline", "brokerID", brokerID, "sessionID", sessionID)
+
+	// Guard: re-read the broker before updating provider statuses. A
+	// concurrent markBrokerOnline may have already re-claimed the broker
+	// between our atomic release+offline and now. If so, skip provider
+	// updates to avoid clobbering the new session's online providers.
+	broker, rerr := s.store.GetRuntimeBroker(ctx, brokerID)
+	if rerr == nil && broker.ConnectedSessionID != nil && *broker.ConnectedSessionID != "" {
+		slog.Info("broker re-claimed by new session after release; skipping provider offline stamp",
+			"brokerID", brokerID, "staleSession", sessionID, "newSession", *broker.ConnectedSessionID)
+		return
+	}
+
+	// Update all project provider records for this broker
+	providers, err := s.store.GetBrokerProjects(ctx, brokerID)
+	if err != nil {
+		slog.Error("Failed to get broker projects for status update", "brokerID", brokerID, "error", err)
+		return
+	}
+	for _, provider := range providers {
+		if err := s.store.UpdateProviderStatus(ctx, provider.ProjectID, brokerID, store.BrokerStatusOffline); err != nil {
+			slog.Error("Failed to update provider status", "brokerID", brokerID, "project_id", provider.ProjectID, "error", err)
+		}
+	}
+
+	// Publish broker disconnected event
+	projectIDs := make([]string, len(providers))
+	for i, p := range providers {
+		projectIDs[i] = p.ProjectID
+	}
+	s.events.PublishBrokerDisconnected(ctx, brokerID, projectIDs)
+}
+
+// brokerProviderSelfHealHandler returns a recurring handler that re-stamps a
+// broker's project-provider rows online for every broker this hub instance
+// currently holds a live control-channel connection to.
+//
+// issue #2090: the affinity-owning instance's disconnect callback
+// (handleBrokerDisconnect) stamps every project-provider row for that
+// broker_id offline. When the same broker_id is served by more than one
+// instance or session — e.g. a co-located broker embedded in every replica of
+// a multi-instance Hub deployment — the survivors never reconnect, so nothing
+// else ever restores those rows: agent-create stays blocked with "Default
+// runtime broker is unavailable" until an instance reconnects or restarts.
+//
+// This closes the gap from the side that can actually observe it: a live
+// local socket is per-process, in-memory state, so the check must run on
+// every instance rather than as a cluster-wide singleton (contrast
+// brokerHeartbeatTimeoutHandler/brokerAffinityReapHandler in reaper.go, which
+// are registered with RegisterRecurringSingleton because they only need one
+// replica to run them).
+//
+// It deliberately never touches broker affinity (connected_hub_id /
+// connected_session_id): reclaiming affinity from every live instance on
+// every tick would fight over routing ownership between replicas that do not
+// share underlying agent/container state. That reclaim isn't needed for
+// correctness either — broker_routing.go's route() already prefers this
+// instance's own live local socket (routeLocal) over the affinity hint, so
+// dispatch to a connected instance keeps working without an affinity change.
+// Restamping only the provider rows is enough to unblock agent-create, and is
+// safe against a genuine broker loss: it is driven by a live local socket,
+// not a cached flag, so a broker that is actually gone stops appearing in
+// ListConnectedBrokers() and this handler stops touching it. From there,
+// handleBrokerDisconnect is the only place that stamps this broker's
+// project-provider rows offline — the heartbeat-timeout reaper
+// (brokerHeartbeatTimeoutHandler → MarkStaleBrokersOffline) only ever sets
+// runtime_brokers.status, never provider rows. The broker row itself is
+// stamped offline by handleBrokerDisconnect's CAS (or, as a backstop, by the
+// heartbeat-timeout reaper), and getAvailableBrokersForProject requires both
+// rows online, so an actually-dead broker stays out of broker selection even
+// while its provider rows lag behind it.
+func (s *Server) brokerProviderSelfHealHandler() func(ctx context.Context) {
+	return func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		s.selfHealBrokerProviders(ctx, s.controlChannel.ListConnectedBrokers())
+	}
+}
+
+// selfHealBrokerProviders re-stamps provider rows online for every broker ID
+// in snapshot that this instance still holds a live local control-channel
+// connection to. snapshot is normally ListConnectedBrokers() taken by the
+// caller; it is accepted as a parameter (rather than read here) so tests can
+// drive the loop with a snapshot that is already stale with respect to
+// s.controlChannel.connections.
+//
+// Every row this heals from offline to online is announced with the same
+// PublishBrokerConnected event markBrokerOnline publishes on a fresh
+// connect, one call per broker with exactly the project IDs healed for that
+// broker — mirroring handleBrokerDisconnect's PublishBrokerDisconnected on
+// the way down, so the event stream stays an accurate record of provider
+// status for any consumer of project.<id>.broker.status (the in-tree web
+// client does not act on this subject today; see web/src/client/state.ts).
+// Nothing is published for a broker where no row changed. A duplicate
+// PublishBrokerConnected from two instances healing the same row on the same
+// tick is harmless: both carry an identical, stateless status="online"
+// payload for the same project ID, so any consumer that treats the event as
+// a state fact rather than a counted transition sees no difference from a
+// single publish.
+func (s *Server) selfHealBrokerProviders(ctx context.Context, snapshot []string) {
+	for _, brokerID := range snapshot {
+		// snapshot may be stale; re-check right before stamping to narrow the
+		// window against a genuine disconnect that removed this brokerID from
+		// the connections map in between. This does not close the window
+		// (removeConnection can still fire after this check and before the
+		// UPDATE below) — the broker-status gate in getAvailableBrokersForProject
+		// is the backstop that keeps an actually-dead broker out of agent-create
+		// regardless.
+		if !s.controlChannel.IsConnected(brokerID) {
+			continue
+		}
+
+		providers, err := s.store.GetBrokerProjects(ctx, brokerID)
+		if err != nil {
+			slog.Error("Scheduler: broker provider self-heal failed to list projects", "brokerID", brokerID, "error", err)
+			continue
+		}
+		var healedProjectIDs []string
+		for _, provider := range providers {
+			// Skip rows already online. Unlike stampProvidersOnline (used by
+			// markBrokerOnline on connect, which must keep refreshing
+			// last_seen every time), this handler runs every tick on every
+			// instance holding a live socket, so re-stamping an
+			// already-online row on every tick is pure write load with no
+			// effect on status.
+			if provider.Status == store.BrokerStatusOnline {
+				continue
+			}
+			if err := s.store.UpdateProviderStatus(ctx, provider.ProjectID, brokerID, store.BrokerStatusOnline); err != nil {
+				slog.Error("Failed to update provider status", "brokerID", brokerID, "project_id", provider.ProjectID, "error", err)
+				continue
+			}
+			healedProjectIDs = append(healedProjectIDs, provider.ProjectID)
+		}
+		if len(healedProjectIDs) == 0 {
+			continue
+		}
+		broker, err := s.store.GetRuntimeBroker(ctx, brokerID)
+		var brokerName string
+		if err == nil {
+			brokerName = broker.Name
+		}
+		// Only reached when at least one row actually healed; a no-op broker
+		// hits the continue above without logging, keeping Info quiet.
+		slog.Info("Scheduler: broker provider self-heal restamped providers online", "brokerID", brokerID, "brokerName", brokerName, "count", len(healedProjectIDs))
+		s.events.PublishBrokerConnected(ctx, brokerID, brokerName, healedProjectIDs)
+	}
+}
+
 // isWebSocketUpgrade checks if the request is a WebSocket upgrade request.
 func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
-// githubResolutionCacheEvictionHandler returns a recurring handler function that
-// purges expired GitHub skill resolution cache entries. This prevents the cache
-// table from growing unbounded and keeps queries fast.
+// githubResolutionCacheEvictionHandler returns a recurring handler function
+// that purges GitHub skill resolution cache entries once they are too old to
+// ever be served stale again (see GitHubResolutionStore.PurgeExpired and
+// staleCutoff) — not merely once their own TTL has passed, so a branch-ref
+// row survives long enough for resolveGitHubSkill's stale-serve path to still
+// use it. This prevents the cache table from growing unbounded and keeps
+// queries fast.
 func (s *Server) githubResolutionCacheEvictionHandler() func(ctx context.Context) {
 	return func(ctx context.Context) {
 		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)

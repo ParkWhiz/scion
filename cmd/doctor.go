@@ -110,8 +110,17 @@ func runDoctor() error {
 	hubChecks = append(hubChecks, d4)
 	printCheck(d4.Name, d4.Status, d4.Message, d4.Remediation)
 
-	// D5: NFS Mount Status
-	d5 := checkDoctorNFSMounts(hubEP, hubConnected, hubClient)
+	// D5: NFS Mount Status (local check against this host's global
+	// settings and mount table; read-only)
+	nfsSettings, _, nfsErr := config.LoadGlobalSettings()
+	d5 := scionruntime.CheckResult{
+		Name:    "nfs-mounts",
+		Status:  "warn",
+		Message: fmt.Sprintf("Could not load settings to check NFS: %v", nfsErr),
+	}
+	if nfsErr == nil {
+		d5 = checkDoctorNFSMounts(nfsSettings, defaultNFSDoctorProbe())
+	}
 	hubChecks = append(hubChecks, d5)
 	printCheck(d5.Name, d5.Status, d5.Message, d5.Remediation)
 
@@ -357,18 +366,20 @@ func checkDoctorHubConnectivity(hubEP string, client hubclient.Client) scionrunt
 				Remediation: "Verify the Hub is running and the endpoint is correct",
 			}
 		}
-		if healthResp.Status == "degraded" {
-			return scionruntime.CheckResult{
-				Name:    "hub-connectivity",
-				Status:  "warn",
-				Message: fmt.Sprintf("Hub at %s is degraded", hubEP),
+		probe := healthProbeResponse{Status: healthResp.Status, Checks: healthResp.Checks}
+		if len(healthResp.Hub) > 0 {
+			var hub healthProbeComponent
+			if json.Unmarshal(healthResp.Hub, &hub) == nil {
+				probe.Hub = &hub
 			}
 		}
-		return scionruntime.CheckResult{
-			Name:    "hub-connectivity",
-			Status:  "pass",
-			Message: fmt.Sprintf("Hub at %s is healthy", hubEP),
+		if len(healthResp.Broker) > 0 {
+			var broker healthProbeComponent
+			if json.Unmarshal(healthResp.Broker, &broker) == nil {
+				probe.Broker = &broker
+			}
 		}
+		return doctorHubHealthResult(hubEP, probe)
 	}
 
 	cleanEP := strings.TrimRight(hubEP, "/")
@@ -402,9 +413,7 @@ func checkDoctorHubConnectivity(hubEP string, client hubclient.Client) scionrunt
 		}
 	}
 
-	var healthResp struct {
-		Status string `json:"status"`
-	}
+	var healthResp healthProbeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&healthResp); err != nil {
 		return scionruntime.CheckResult{
 			Name:    "hub-connectivity",
@@ -413,19 +422,37 @@ func checkDoctorHubConnectivity(hubEP string, client hubclient.Client) scionrunt
 		}
 	}
 
-	if healthResp.Status == "degraded" {
-		return scionruntime.CheckResult{
-			Name:    "hub-connectivity",
-			Status:  "warn",
-			Message: fmt.Sprintf("Hub at %s is degraded", hubEP),
-		}
-	}
+	return doctorHubHealthResult(hubEP, healthResp)
+}
 
-	return scionruntime.CheckResult{
-		Name:    "hub-connectivity",
-		Status:  "pass",
-		Message: fmt.Sprintf("Hub at %s is healthy", hubEP),
+// doctorHubHealthResult maps a parsed /healthz response to the D1 check
+// result, using the same severity semantics as the hub (ptone/scion#1094):
+// healthy passes; degraded (up, a non-critical check failing) warns; unhealthy
+// (a critical check such as the database failing) fails; any other status
+// warns with the status verbatim. Non-healthy checks are named in the message.
+func doctorHubHealthResult(hubEP string, health healthProbeResponse) scionruntime.CheckResult {
+	res := scionruntime.CheckResult{Name: "hub-connectivity"}
+	checks := ""
+	if names := nonHealthyChecks(health); len(names) > 0 {
+		checks = " (" + strings.Join(names, "; ") + ")"
 	}
+	switch health.Status {
+	case probeStatusHealthy:
+		res.Status = "pass"
+		res.Message = fmt.Sprintf("Hub at %s is healthy", hubEP)
+	case probeStatusDegraded:
+		res.Status = "warn"
+		res.Message = fmt.Sprintf("Hub at %s is degraded%s", hubEP, checks)
+		res.Remediation = "Check Hub server logs (non-critical check failing)"
+	case probeStatusUnhealthy:
+		res.Status = "fail"
+		res.Message = fmt.Sprintf("Hub at %s is unhealthy%s", hubEP, checks)
+		res.Remediation = "Check Hub server logs (critical check failing)"
+	default:
+		res.Status = "warn"
+		res.Message = fmt.Sprintf("Hub at %s reported status %q%s", hubEP, health.Status, checks)
+	}
+	return res
 }
 
 // checkDoctorHubAuth performs D2: Hub authentication check.
@@ -625,41 +652,6 @@ func checkDoctorAgentHealth(hubEP string, hubConnected bool, client hubclient.Cl
 		Name:    "agent-health",
 		Status:  "pass",
 		Message: fmt.Sprintf("All %d agent(s) healthy", len(resp.Agents)),
-	}
-}
-
-// checkDoctorNFSMounts performs D5: NFS mount status check.
-func checkDoctorNFSMounts(hubEP string, hubConnected bool, client hubclient.Client) scionruntime.CheckResult {
-	if hubEP == "" {
-		return scionruntime.CheckResult{
-			Name:        "nfs-mounts",
-			Status:      "skip",
-			Message:     "No Hub endpoint configured",
-			Remediation: "Set SCION_HUB_ENDPOINT or use --hub flag",
-		}
-	}
-	if !hubConnected {
-		return scionruntime.CheckResult{
-			Name:    "nfs-mounts",
-			Status:  "skip",
-			Message: "Skipped (Hub unreachable)",
-		}
-	}
-	if client == nil {
-		return scionruntime.CheckResult{
-			Name:    "nfs-mounts",
-			Status:  "skip",
-			Message: "Skipped (Hub client not available)",
-		}
-	}
-
-	// NFS health info would come from broker capabilities if reported.
-	// Currently the broker heartbeat protocol does not expose NFS-specific
-	// health data, so we cannot evaluate this check.
-	return scionruntime.CheckResult{
-		Name:    "nfs-mounts",
-		Status:  "skip",
-		Message: "NFS health not yet reported by broker API",
 	}
 }
 

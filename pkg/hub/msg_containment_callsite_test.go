@@ -118,6 +118,13 @@ var effectCallSiteClassifications = []effectCallSiteEntry{
 	{file: "messagebroker.go", function: "publishDeliveryFailed", symbol: "DispatchAgentMessage",
 		class: "exempt", reason: "derivative: delivery-failure notice to original sender"},
 
+	// messagebroker.go: publishDeliveryDeferred — derivative notice (design
+	// agent-reincarnate §3.7, O2 p2a-r1 review). Same shape as
+	// publishDeliveryFailed above: tells the original sender their message
+	// was deferred, not dropped, while the recipient is mid-migration.
+	{file: "messagebroker.go", function: "publishDeliveryDeferred", symbol: "DispatchAgentMessage",
+		class: "exempt", reason: "derivative: delivery-deferred notice to original sender"},
+
 	// notifications.go: dispatchToAgent — UNGUARDED notification fan-out.
 	// Subscription-only authorization; revocation not re-evaluated.
 	{file: "notifications.go", function: "dispatchToAgent", symbol: "dispatchWithBrokerRetry",
@@ -152,6 +159,13 @@ var effectCallSiteClassifications = []effectCallSiteEntry{
 	// handleExistingAgent (multiple start calls for existing agent reuse).
 	{file: "handlers_agent_create_helpers.go", function: "handleExistingAgent", symbol: "DispatchAgentStart",
 		class: "guarded", reason: "called after authorization in the agent-create flow"},
+
+	// start_claim.go: startAgentCore — the shared start path that runs a
+	// start under its start claim. It authorizes nothing itself: every caller
+	// has already authorized the start (the lifecycle and create handlers'
+	// authz, the wake's DM admission) before calling it.
+	{file: "start_claim.go", function: "startAgentCore", symbol: "DispatchAgentStart",
+		class: "guarded", reason: "shared start path: every caller authorizes the start before calling it"},
 
 	// handlers_agent_lifecycle.go: DispatchAgentStart in handleAgentLifecycle.
 	{file: "handlers_agent_lifecycle.go", function: "handleAgentLifecycle", symbol: "DispatchAgentStart",
