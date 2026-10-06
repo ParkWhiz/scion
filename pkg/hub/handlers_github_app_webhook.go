@@ -776,19 +776,6 @@ func (s *Server) mintGitHubAppToken(ctx context.Context, project *store.Project)
 		}
 	}
 
-	// Extract repo name from git remote (just the repo name, not owner/repo)
-	var repos []string
-	if project.GitRemote != "" {
-		ownerRepo := extractOwnerRepo(project.GitRemote)
-		if ownerRepo != "" {
-			// GitHub API expects just the repo name, not owner/repo
-			parts := strings.SplitN(ownerRepo, "/", 2)
-			if len(parts) == 2 {
-				repos = []string{parts[1]}
-			}
-		}
-	}
-
 	// Pass nil for repos so GitHub grants the token access to all repositories
 	// permitted by this installation (allowing access to shared skill repos in the org).
 	token, err := client.MintInstallationToken(ctx, installationID, nil, perms)

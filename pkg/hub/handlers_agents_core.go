@@ -2290,7 +2290,7 @@ func (s *Server) createAgentInProject(
 					if len(envReqs.Needs) > 0 {
 						autoResolved := s.tryAutoResolveNeeds(ctx, agent, envReqs.Needs)
 						if len(autoResolved) > 0 && len(autoResolved) == len(envReqs.Needs) {
-							if err := dispatcher.DispatchFinalizeEnv(ctx, agent, autoResolved); err != nil {
+							if _, err := dispatcher.DispatchFinalizeEnv(ctx, agent, autoResolved); err != nil {
 								s.agentLifecycleLog.Warn("Auto-resolve env finalize failed, falling back to CLI gather",
 									"agent_id", agent.ID, "error", err)
 							} else {
