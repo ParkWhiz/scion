@@ -19,7 +19,6 @@ package hub
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,26 +80,15 @@ import (
 // (runMembershipMigration also asserts DB(), but it runs inside New(),
 // before the wrapper exists.)
 
-// storeFaultSwitch gates a store wrapper's failure injection. Wrappers
-// delegate to the inner store until Arm is called. A nil *storeFaultSwitch
-// is always active, so a wrapper built without a switch keeps failing
-// unconditionally (the pre-switch behavior).
-type storeFaultSwitch struct {
-	armed atomic.Bool
-}
-
-// Arm turns on failure injection for every wrapper sharing this switch. It
-// is safe to call from any goroutine.
-func (f *storeFaultSwitch) Arm() { f.armed.Store(true) }
-
-// Active reports whether a wrapper should inject its failure now.
-func (f *storeFaultSwitch) Active() bool { return f == nil || f.armed.Load() }
-
 // installStoreFault wraps srv's current store with wrap, installs the
 // wrapper as srv.store, and returns it together with its (disarmed) switch.
 // Call it right after constructing srv and before any setup that can reach
 // emitMutationAudit or otherwise start goroutines reading srv.store; never
-// call it on a server whose setup has already run.
+// call it on a server whose setup has already run. New() itself starts the
+// startup sweep of user-scope data, which reads srv.store in the
+// background; testServer, testServerWithStore and bypassAgentsServer wait
+// for it to end before they return. For a server built by calling New()
+// directly, call waitUserScopedDataSweep first.
 func installStoreFault[W store.Store](t testing.TB, srv *Server, wrap func(inner store.Store, fault *storeFaultSwitch) W) (W, *storeFaultSwitch) {
 	t.Helper()
 	fault := &storeFaultSwitch{}

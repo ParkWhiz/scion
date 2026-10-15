@@ -982,10 +982,9 @@ func TestSubstrateRun_BootstrapPathRejectedLogsCodeAndPath(t *testing.T) {
 	fa.bootstrapStatus = http.StatusUnprocessableEntity
 	fa.bootstrapBody = "bootstrap_path_symlink: bootstrap file " + strconv.Quote(rejectedPath) + " rejected: path traverses a symlink\n"
 
-	// runtimeLog is slog.Default() with a "subsystem" attr (see common.go),
-	// which by default bridges to the stdlib "log" package — the same
-	// capture pattern common_test.go's TestRunSimpleCommand_NoSecretsInDebugLog
-	// uses.
+	// runtimeLog() resolves slog.Default() at each call (see common.go). The
+	// default handler bridges to the stdlib "log" package, so capturing the
+	// stdlib log output captures the runtime log line.
 	var buf bytes.Buffer
 	origWriter := log.Writer()
 	origFlags := log.Flags()
@@ -1210,6 +1209,60 @@ func TestBuildActorTemplate_SecurityContextGrantsExactlyRequiredCapabilities(t *
 	}
 }
 
+// TestBuildActorTemplate_WakeupProbeTargetsServeHealthz confirms the agent
+// container carries a wakeup probe on substrate-serve's healthz: path
+// /scion/v1/healthz (substrateHealthzPath) on port 80 (substrate-serve's
+// --addr default; the template's Command passes no --addr). Without it,
+// Substrate takes the golden snapshot even when the entrypoint has already
+// exited, and every later restore of that golden fails. The literals are
+// spelled out rather than read back from the constants, so a change to
+// either side has to be made here on purpose.
+func TestBuildActorTemplate_WakeupProbeTargetsServeHealthz(t *testing.T) {
+	image := "repo/image@sha256:" + strings.Repeat("b", 64)
+	for _, sc := range []config.V1SubstrateConfig{
+		{},
+		{SandboxClass: "microvm", EgressTrustBundle: "egress-mitm.ate.dev"},
+	} {
+		tmpl := buildActorTemplate("scion-test", "scion-abc123", image, sc, nil)
+		if len(tmpl.GetContainers()) != 1 {
+			t.Fatalf("Containers = %d, want 1", len(tmpl.GetContainers()))
+		}
+		probe := tmpl.GetContainers()[0].GetWakeupProbe()
+		if probe == nil {
+			t.Fatalf("Container.WakeupProbe is nil (config %+v), want an HTTP GET on /scion/v1/healthz port 80", sc)
+		}
+		if got := probe.GetHttpGet().GetPath(); got != "/scion/v1/healthz" {
+			t.Errorf("WakeupProbe.HttpGet.Path = %q, want %q", got, "/scion/v1/healthz")
+		}
+		if got := probe.GetHttpGet().GetPort(); got != 80 {
+			t.Errorf("WakeupProbe.HttpGet.Port = %d, want 80", got)
+		}
+		if got := probe.GetTimeoutSeconds(); got < 30 || got > 3600 {
+			t.Errorf("WakeupProbe.TimeoutSeconds = %d, want within [30, 3600] (Substrate's default and maximum)", got)
+		}
+	}
+}
+
+// TestBuildActorTemplate_WakeupProbeIsFreshPerCall confirms each template
+// gets its own probe value, so mutating one built template cannot change
+// the next one, or what substrateTemplateName hashes for it.
+func TestBuildActorTemplate_WakeupProbeIsFreshPerCall(t *testing.T) {
+	image := "repo/image@sha256:" + strings.Repeat("b", 64)
+	cfg := config.V1SubstrateConfig{SandboxClass: "gvisor"}
+	before := substrateTemplateName(image, cfg, nil)
+
+	first := buildActorTemplate("scion-test", "scion-abc123", image, cfg, nil)
+	first.GetContainers()[0].GetWakeupProbe().GetHttpGet().Path = "/mutated"
+
+	second := buildActorTemplate("scion-test", "scion-abc123", image, cfg, nil)
+	if got := second.GetContainers()[0].GetWakeupProbe().GetHttpGet().GetPath(); got != substrateHealthzPath {
+		t.Errorf("second template's WakeupProbe path = %q after mutating the first, want %q", got, substrateHealthzPath)
+	}
+	if after := substrateTemplateName(image, cfg, nil); after != before {
+		t.Errorf("substrateTemplateName() changed after mutating a built template's probe: %q -> %q", before, after)
+	}
+}
+
 // TestSubstrateTemplateName_ChangesWithImageDigest confirms the image is
 // part of the template's content-address: ensureActorTemplate's reuse
 // decision (same templateName -> assume the existing golden template is
@@ -1384,6 +1437,139 @@ func TestSubstrateExec_ErrorMapping(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "127") {
 		t.Errorf("Exec() error = %v, want it to include the exit code", err)
+	}
+}
+
+// TestSubstrateExec_NonZeroExitIsCommandExitError pins that a command which
+// ran in a live actor and exited non-zero comes back as a typed
+// *CommandExitError, with or without cached secrets (redactExecErr must keep
+// the type), and with the same message as before. The broker classifies it as
+// a command result; a plain error here whose stderr says "not found" was
+// reported as agent_not_found and the agent marked container_missing
+// (ptone/scion#3470). A non-2xx control-server response is not a command
+// exit and must stay untyped.
+func TestSubstrateExec_NonZeroExitIsCommandExitError(t *testing.T) {
+	const id = "scion-proj/agent-a"
+	const secret = "sk-exit-typed-secret-value-0123"
+	tests := []struct {
+		name       string
+		secrets    bool
+		status     int
+		resp       execResponse
+		wantTyped  bool
+		wantCode   int
+		wantErrMsg string
+	}{
+		{
+			name:       "command not found in live actor",
+			resp:       execResponse{Stderr: "sh: 1: foo: not found", ExitCode: 127},
+			wantTyped:  true,
+			wantCode:   127,
+			wantErrMsg: "substrate: exec on scion-proj/agent-a exited 127: sh: 1: foo: not found",
+		},
+		{
+			name:       "command not found with cached secrets redacts and stays typed",
+			secrets:    true,
+			resp:       execResponse{Stderr: "Error: container not found key=" + secret, ExitCode: 1},
+			wantTyped:  true,
+			wantCode:   1,
+			wantErrMsg: "substrate: exec on scion-proj/agent-a exited 1: Error: container not found key=[value of ANTHROPIC_API_KEY redacted]",
+		},
+		{
+			name:      "refused setup or timeout reports -1",
+			resp:      execResponse{Stderr: "exec timed out", ExitCode: -1},
+			wantTyped: true,
+			wantCode:  -1,
+		},
+		{
+			name:   "non-2xx control-server response is not a command exit",
+			status: http.StatusNotFound,
+			resp:   execResponse{Stderr: "actor not found"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &callRecorder{}
+			rt, _, fa, closeServer := newTestSubstrateHarness(t, rec)
+			defer closeServer()
+
+			substrateAgentStateMu.Lock()
+			substrateControlTokens[id] = "tok-123"
+			if tt.secrets {
+				substrateExecSecrets[id] = map[string]string{"ANTHROPIC_API_KEY": secret}
+			}
+			substrateAgentStateMu.Unlock()
+			t.Cleanup(func() {
+				substrateAgentStateMu.Lock()
+				delete(substrateExecSecrets, id)
+				substrateAgentStateMu.Unlock()
+			})
+			fa.execStatus = tt.status
+			fa.execResp = tt.resp
+
+			_, err := rt.Exec(context.Background(), id, []string{"foo"})
+			if err == nil {
+				t.Fatal("Exec() expected an error, got nil")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("Exec() error leaks the cached secret: %v", err)
+			}
+			var exitErr *CommandExitError
+			if got := errors.As(err, &exitErr); got != tt.wantTyped {
+				t.Fatalf("errors.As(*CommandExitError) = %v, want %v (err %T: %v)", got, tt.wantTyped, err, err)
+			}
+			if !tt.wantTyped {
+				return
+			}
+			if exitErr.ExitStatus() != tt.wantCode {
+				t.Errorf("ExitStatus() = %d, want %d", exitErr.ExitStatus(), tt.wantCode)
+			}
+			if tt.wantErrMsg != "" && err.Error() != tt.wantErrMsg {
+				t.Errorf("Error() = %q, want %q", err.Error(), tt.wantErrMsg)
+			}
+		})
+	}
+}
+
+// TestSubstrateRedactExecErr_WrappedCommandExitError pins that a wrapped
+// *CommandExitError (as ExecWithStdin's stdin probe returns) keeps its type
+// through redactExecErr, and that neither the message nor the unwrapped
+// error carries a cached secret, whether the secret sits in the wrapper's
+// own text or in the exit error's fields.
+func TestSubstrateRedactExecErr_WrappedCommandExitError(t *testing.T) {
+	const id = "scion-proj/agent-wrapped"
+	const secret = "sk-wrapped-exit-secret-value-0456"
+	substrateAgentStateMu.Lock()
+	substrateExecSecrets[id] = map[string]string{"ANTHROPIC_API_KEY": secret}
+	substrateAgentStateMu.Unlock()
+	t.Cleanup(func() {
+		substrateAgentStateMu.Lock()
+		delete(substrateExecSecrets, id)
+		substrateAgentStateMu.Unlock()
+	})
+
+	orig := &CommandExitError{Runtime: "substrate", Target: "ns/" + secret, Code: 3, Output: "boom " + secret}
+	wrapped := fmt.Errorf("substrate: stdin capability probe failed for %s (%s): %w", id, secret, orig)
+
+	err := (&SubstrateRuntime{}).redactExecErr(id, wrapped)
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("Error() leaks the cached secret: %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "substrate: stdin capability probe failed for "+id) {
+		t.Errorf("Error() = %q, want the wrapper's context kept", err.Error())
+	}
+	var exitErr *CommandExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("errors.As(*CommandExitError) = false for wrapped exit (err %T: %v)", err, err)
+	}
+	if exitErr == orig {
+		t.Fatal("errors.As reached the unredacted original exit error")
+	}
+	if exitErr.ExitStatus() != 3 {
+		t.Errorf("ExitStatus() = %d, want 3", exitErr.ExitStatus())
+	}
+	if strings.Contains(exitErr.Error(), secret) || strings.Contains(exitErr.Target, secret) || strings.Contains(exitErr.Output, secret) {
+		t.Fatalf("unwrapped exit error leaks the cached secret: %+v", exitErr)
 	}
 }
 

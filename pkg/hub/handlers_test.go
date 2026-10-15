@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,178 +34,6 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/require"
 )
-
-// testDevToken is the development token used for testing.
-const testDevToken = "scion_dev_test_token_for_unit_tests_1234567890"
-
-// testServer creates a test server with an in-memory SQLite store.
-// The server is configured with dev auth enabled using testDevToken.
-func testServer(t *testing.T) (*Server, store.Store) {
-	t.Helper()
-	s, err := newTestStore(":memory:")
-	if err != nil {
-		if strings.Contains(err.Error(), "sqlite driver not registered") {
-			t.Skip("Skipping test because sqlite driver is not registered (build with -tags sqlite to enable)")
-		}
-		t.Fatalf("failed to create test store: %v", err)
-	}
-	return testServerWithStore(t, s)
-}
-
-// testServerWithStore is testServer on a store the caller opened. The store is
-// closed when the test ends.
-func testServerWithStore(t *testing.T, s store.Store) (*Server, store.Store) {
-	t.Helper()
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate test store: %v", err)
-	}
-
-	// Remove the delegation edge backfill marker. Migrate() sets it (the
-	// backfill processes zero agents and writes the completion marker).
-	// Tests that create agents directly via the store bypass the HTTP handler
-	// which normally creates delegation edges, so they would fail the
-	// post-backfill no-edge check. Tests that specifically exercise
-	// post-backfill behavior re-create the marker explicitly.
-	_ = s.DeleteHubSetting(context.Background(), "migration_delegation_edge_backfill_v1")
-
-	cfg := DefaultServerConfig()
-	cfg.DevAuthToken = testDevToken // Enable dev auth for testing
-	cfg.DevUserConfig = DevUserConfig{
-		Username:    "dev",
-		DisplayName: "Development User",
-		Email:       "dev@localhost",
-	}
-	srv, err := New(cfg, s)
-	if err != nil {
-		t.Fatalf("New() failed: %v", err)
-	}
-	srv.SetHubID("test-hub-id")
-	t.Cleanup(func() {
-		// Shutdown runs CleanupResources even though Start was never
-		// called, which stops every background goroutine New() starts
-		// (see TestTestServerCleanupStopsBackgroundGoroutines).
-		_ = srv.Shutdown(context.Background())
-		_ = s.Close() // Release in-memory SQLite database to avoid OOM across many tests.
-	})
-	return srv, s
-}
-
-// doRequest performs an HTTP request against the test server.
-// It automatically includes the dev auth token for authenticated endpoints.
-func doRequest(t *testing.T, srv *Server, method, path string, body interface{}) *httptest.ResponseRecorder {
-	t.Helper()
-	var bodyBytes []byte
-	if body != nil {
-		var err error
-		bodyBytes, err = json.Marshal(body)
-		if err != nil {
-			t.Fatalf("failed to marshal body: %v", err)
-		}
-	}
-
-	req := httptest.NewRequest(method, path, bytes.NewReader(bodyBytes))
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	// Add dev auth token for authenticated endpoints
-	req.Header.Set("Authorization", "Bearer "+testDevToken)
-
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-	return rec
-}
-
-// doRequestNoAuth performs an HTTP request without authentication.
-// Use this for testing unauthenticated access or auth endpoints themselves.
-func doRequestNoAuth(t *testing.T, srv *Server, method, path string, body interface{}) *httptest.ResponseRecorder {
-	t.Helper()
-	var bodyBytes []byte
-	if body != nil {
-		var err error
-		bodyBytes, err = json.Marshal(body)
-		if err != nil {
-			t.Fatalf("failed to marshal body: %v", err)
-		}
-	}
-
-	req := httptest.NewRequest(method, path, bytes.NewReader(bodyBytes))
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-	return rec
-}
-
-// doRequestRaw performs an HTTP request with raw bytes as the body.
-// Useful for testing malformed request bodies.
-func doRequestRaw(t *testing.T, srv *Server, method, path string, body []byte, contentType string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(method, path, bytes.NewReader(body))
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	req.Header.Set("Authorization", "Bearer "+testDevToken)
-
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-	return rec
-}
-
-// grantDevUserRuntimeBrokerAccess creates a custom role with runtime_broker.*
-// permissions and binds it to the dev user. This is needed because the
-// inline authz checks in handleBrokerHeartbeat and handleBrokerSecretByKey
-// use Resource{Type: "runtime_broker"} which does not match the canonical
-// "broker.*" permissions in the registry (getRuntimeBroker and
-// getBrokerProjects have already been aligned to the canonical type; these
-// two remain to be aligned separately). The dev user's super-admin role only
-// includes registry permissions.
-func grantDevUserRuntimeBrokerAccess(t *testing.T, s store.Store) {
-	t.Helper()
-	ctx := context.Background()
-	rd, err := s.CreateRoleDefinition(ctx, &store.RoleDefinition{
-		Name:      "runtime-broker-compat",
-		ScopeType: store.RoleScopeSystem,
-		Permissions: []string{
-			"runtime_broker.read",
-			"runtime_broker.update",
-			"runtime_broker.delete",
-			"runtime_broker.list",
-		},
-	})
-	require.NoError(t, err)
-	_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
-		RoleDefinitionID: rd.ID,
-		PrincipalType:    store.RoleBindingPrincipalUser,
-		PrincipalID:      DevUserID,
-		ScopeType:        store.RoleScopeSystem,
-		ScopeID:          "",
-		CreatedBy:        "test",
-	})
-	require.NoError(t, err)
-}
-
-// grantSuperAdminRole binds the seeded super-admin role definition to the
-// given user. Under the CO1 authorization cutover the AK1 kernel only
-// evaluates role bindings, so User.Role = "admin" alone is insufficient.
-func grantSuperAdminRole(t *testing.T, s store.Store, userID string) {
-	t.Helper()
-	ctx := context.Background()
-	rd, err := s.GetRoleDefinitionByName(ctx, store.SystemRoleSuperAdmin, store.RoleScopeSystem)
-	require.NoError(t, err, "super-admin role definition must exist")
-	_, err = s.CreateRoleBinding(ctx, &store.RoleBinding{
-		RoleDefinitionID: rd.ID,
-		PrincipalType:    store.RoleBindingPrincipalUser,
-		PrincipalID:      userID,
-		ScopeType:        store.RoleScopeSystem,
-		ScopeID:          "",
-		CreatedBy:        store.SystemReconcileCreatedBy,
-	})
-	if err != nil && err != store.ErrAlreadyExists {
-		t.Fatalf("failed to create super-admin role binding: %v", err)
-	}
-}
 
 // ============================================================================
 // Health Endpoint Tests
@@ -2118,34 +1947,6 @@ func TestRuntimeBrokerListWithProjectLocalPath(t *testing.T) {
 // Two-Phase Broker Registration Tests
 // ============================================================================
 
-// testServerWithBrokerAuth creates a test server with broker auth enabled.
-func testServerWithBrokerAuth(t *testing.T) (*Server, store.Store) {
-	t.Helper()
-	s, err := newTestStore(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create test store: %v", err)
-	}
-
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate test store: %v", err)
-	}
-
-	cfg := DefaultServerConfig()
-	cfg.DevAuthToken = testDevToken
-	cfg.BrokerAuthConfig = DefaultBrokerAuthConfig()
-	srv, err := New(cfg, s)
-	if err != nil {
-		t.Fatalf("New() failed: %v", err)
-	}
-	srv.SetHubID("test-hub-id")
-	t.Cleanup(func() {
-		// Shutdown runs CleanupResources; see testServerWithStore.
-		_ = srv.Shutdown(context.Background())
-		_ = s.Close()
-	})
-	return srv, s
-}
-
 func TestBrokerRegistrationTwoPhaseFlow(t *testing.T) {
 	srv, _ := testServerWithBrokerAuth(t)
 
@@ -2434,8 +2235,17 @@ func TestUserList(t *testing.T) {
 	}
 }
 
-func TestUserCreate_Forbidden(t *testing.T) {
-	srv, _ := testServer(t)
+// TestUserCreate_RoleRefusedAndNonAdminForbidden pins POST /api/v1/users
+// (user.admin.provision) for its main refusals: an authorized session
+// caller (a super-admin) that names the admin role gets 422
+// privileged_role_not_provisionable (design §8 row 12); a caller without
+// user.invite gets 403 before any body check (row 8); and on a hub in
+// dev-auth mode every caller gets 403 dev_auth_not_supported, because dev
+// auth is single-user local mode (row 4a). The full outcome table is in
+// handlers_users_provision_test.go.
+func TestUserCreate_RoleRefusedAndNonAdminForbidden(t *testing.T) {
+	srv, s := testServerNoDevAuth(t)
+	ctx := context.Background()
 
 	body := map[string]interface{}{
 		"email":       "newuser@example.com",
@@ -2443,10 +2253,40 @@ func TestUserCreate_Forbidden(t *testing.T) {
 		"role":        "admin",
 	}
 
-	rec := doRequest(t, srv, http.MethodPost, "/api/v1/users", body)
+	adminID := tid("usercreate-super")
+	createTestUserWithRole(t, s, adminID, "usercreate-super@example.com", store.UserRoleAdmin, store.SystemRoleSuperAdmin)
+	admin, err := s.GetUser(ctx, adminID)
+	if err != nil {
+		t.Fatalf("get super-admin: %v", err)
+	}
+	rec := doRequestAsUser(t, srv, admin, http.MethodPost, "/api/v1/users", body)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("authorized caller with role admin: expected status 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "privileged_role_not_provisionable") {
+		t.Errorf("expected reason privileged_role_not_provisionable: %s", rec.Body.String())
+	}
 
+	member := &store.User{ID: tid("usercreate-member"), Email: "usercreate-member@example.com", DisplayName: "Member", Role: store.UserRoleMember, Status: store.UserStatusActive}
+	if err := s.CreateUser(ctx, member); err != nil {
+		t.Fatalf("create member: %v", err)
+	}
+	rec = doRequestAsUser(t, srv, member, http.MethodPost, "/api/v1/users", body)
 	if rec.Code != http.StatusForbidden {
-		t.Errorf("expected status 403, got %d: %s", rec.Code, rec.Body.String())
+		t.Errorf("caller without user.invite: expected status 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if _, err := s.GetUserByEmail(ctx, "newuser@example.com"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("no user record may be created, got err=%v", err)
+	}
+
+	devSrv, devStore := testServer(t)
+	rec = doRequest(t, devSrv, http.MethodPost, "/api/v1/users", body)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "dev_auth_not_supported") {
+		t.Errorf("dev-auth hub: expected 403 dev_auth_not_supported, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := devStore.GetUserByEmail(ctx, "newuser@example.com"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("no user record may be created on the dev-auth hub, got err=%v", err)
 	}
 }
 
@@ -2751,7 +2591,7 @@ func TestProjectRenameSlugOnly(t *testing.T) {
 	}
 }
 
-func TestProjectRenameSlugSanitized(t *testing.T) {
+func TestProjectRenameSlugMustMatchSlugFormat(t *testing.T) {
 	srv, s := testServer(t)
 	ctx := context.Background()
 
@@ -2766,24 +2606,23 @@ func TestProjectRenameSlugSanitized(t *testing.T) {
 		t.Fatalf("failed to create project: %v", err)
 	}
 
-	// Slug with spaces and uppercase should be sanitized
+	// A slug with spaces and uppercase is refused, not rewritten.
 	body := map[string]interface{}{
 		"slug": "My New Project",
 	}
 
 	rec := doRequest(t, srv, http.MethodPatch, fmt.Sprintf("/api/v1/projects/%s", tid("project_rename_san")), body)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var resp store.Project
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+	stored, err := s.GetProject(ctx, tid("project_rename_san"))
+	if err != nil {
+		t.Fatalf("failed to get project: %v", err)
 	}
-
-	if resp.Slug != "my-new-project" {
-		t.Errorf("expected sanitized slug %q, got %q", "my-new-project", resp.Slug)
+	if stored.Slug != "sanitize-test" {
+		t.Errorf("expected slug to stay %q, got %q", "sanitize-test", stored.Slug)
 	}
 }
 

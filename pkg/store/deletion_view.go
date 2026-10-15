@@ -51,12 +51,16 @@ const DeletionDisplayTTL = 15 * time.Minute
 // delete (design §2.2). It appears on the REST agent (Agent.Deletion) and on
 // every AgentStatusEvent, as an explicit null when no delete is active or
 // failed.
+//
+// Code, Error and Claim are detail for platform admins only: the hub clears
+// them for every other caller (pkg/hub redactDeletionForCaller), so all
+// three are omitempty and absent from the generic view.
 type DeletionInfo struct {
 	State          string     `json:"state"`          // "deleting" (incl. finalizing) | "failed"
 	Code           string     `json:"code,omitempty"` // runtime_error | conflict | in_doubt | abandoned | revoke_failed | finalize_failed | runtime_unavailable
 	Error          string     `json:"error,omitempty"`
 	Soft           bool       `json:"soft"`
-	Claim          int64      `json:"claim"` // named to avoid confusion with Agent.Generation (reincarnation)
+	Claim          int64      `json:"claim,omitempty"` // named to avoid confusion with Agent.Generation (reincarnation)
 	StartedAt      time.Time  `json:"startedAt"`
 	LeaseExpiresAt *time.Time `json:"leaseExpiresAt,omitempty"` // deleting
 	ExpiresAt      *time.Time `json:"expiresAt,omitempty"`      // failed, except in_doubt and finalizing
@@ -67,6 +71,15 @@ type DeletionInfo struct {
 	// lapsed lease itself cannot tell that the row never expires from view
 	// and blocks start until a retry or force (design note D4, phase 2).
 	Stage string `json:"stage,omitempty"`
+	// BlocksStart is whether a start of the agent is refused right now
+	// because of this delete (the hub's deleteBlocksStart: a live or
+	// finalizing delete, or an outstanding broker delete intent). It is set
+	// only on the single-agent GET (ptone/scion#3098). List views, the
+	// compact view, other agent responses and SSE status events omit it, as
+	// does a GET whose check could not be read. Absent means "not computed",
+	// never "false": a client that sees no blocksStart infers the block from
+	// state and stage as before.
+	BlocksStart *bool `json:"blocksStart,omitempty"`
 }
 
 // DeletionStageFinalizing is the DeletionInfo.Stage value for a row whose
@@ -82,7 +95,11 @@ type DeletionPriorState struct {
 }
 
 // DeletionRequestInfo is the JSON stored in Agent.DeletionRequest: the
-// parameters of the delete request that holds the current claim.
+// parameters of the request that started the current delete attempt; a
+// finalizing re-claim keeps it (ptone/scion#4183); if it is missing or
+// unreadable, the re-claim stores one derived from the current
+// configuration (retention; an incomplete create and a hard claim are
+// always hard).
 type DeletionRequestInfo struct {
 	DeleteFiles  bool   `json:"deleteFiles,omitempty"`
 	RemoveBranch bool   `json:"removeBranch,omitempty"`

@@ -16,7 +16,7 @@ Scion agents run inside container images that bundle an LLM harness (Claude, Gem
 Scion images are built in layers:
 
 ```
-core-base          System dependencies on node:24-trixie-slim (Go, Node, Python, Git)
+core-base          System dependencies on node:24-trixie-slim (Go, Node, Python, Git, CLI tools)
   └── scion-base   Scion CLI, sciontool binary, scion user, entrypoint
         ├── scion-claude     Claude Code harness
         ├── scion-gemini-cli Gemini CLI harness
@@ -26,6 +26,8 @@ core-base          System dependencies on node:24-trixie-slim (Go, Node, Python,
 ```
 
 The `core-base` layer changes infrequently, but needs to be built at least once as it is a prerequisite for all other layers. Most rebuilds only need `scion-base`, the harness layers, and the hub layer (the `common` build target).
+
+Besides the language runtimes, `core-base` installs the command-line tools agents commonly use, through `image-build/lib/install-core-toolchain.sh`: `gh`, `gcloud`, `gcsfuse`, `kubectl`, `golangci-lint`, Chromium, and `helm`, plus the npm tools `chrome-devtools-mcp` and `@playwright/cli`. `helm` is pinned to an exact version, v3.17.3, the version used by the chart's CI, so agents that work on the `deploy/helm/scion-hub` chart render the same output as CI without downloading `helm` at run time. To change the version, set the `HELM_VERSION`, `HELM_SHA256_AMD64`, and `HELM_SHA256_ARM64` build args together; the build fails if the downloaded archive does not match the checksum for the build architecture. The `thick-prep` layer installs the same pinned `helm`.
 
 ### Non-Root Requirement
 
@@ -228,16 +230,23 @@ profiles:
     image_registry: "us-central1-docker.pkg.dev/myproject/staging"
 ```
 
-Profile-level `image_registry` takes precedence over the top-level setting.
+Profile-level `image_registry` takes precedence over the top-level setting. The profile used is
+the one the agent was provisioned with, recorded broker-side, on every start and restart; see
+[Settings precedence](/scion/reference/settings-precedence/#container-image-and-kubernetes-image-pull-policy--a-separate-chain-from-b1).
 
 ### Override Precedence
 
-The `image_registry` setting is the lowest-priority way to configure images. Explicit overrides always win:
+The `image_registry` setting is the lowest-priority way to configure images. Explicit overrides always win (summary; see the full chain linked below, which also covers inline config and settings `harness_configs.<name>.image`):
 
 1. **CLI `--image` flag** (highest priority)
-2. **Template `scion-agent.yaml`** image field
-3. **Profile `harness_overrides`** image field
-4. **`image_registry`** rewrite (lowest priority)
+2. **Profile `harness_overrides`** image field, when explicitly set
+3. **`image_registry`** rewrite (lowest priority)
+
+A template's `image` field is ignored with a warning; set the image in the harness-config or a profile instead.
+
+Each time a higher-priority source replaces another source's image, the agent start logs it at
+Info. See [Settings precedence](/scion/reference/settings-precedence/#container-image-and-kubernetes-image-pull-policy--a-separate-chain-from-b1)
+for the full chain.
 
 If any higher-priority override specifies a full image path, `image_registry` does not apply to that agent.
 

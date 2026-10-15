@@ -283,6 +283,11 @@ type CreateAgentRequest struct {
 	// the client follows the launch with GET agent. A Hub that does not
 	// support or enable it ignores the field and answers synchronously.
 	AcceptAsyncLaunch bool `json:"acceptAsyncLaunch,omitempty"`
+
+	// ExpectedRuntimeTargetID optionally guards a create against placement
+	// on a different runtime target than the caller showed
+	// (.design/flat-runtime-brokers-contract.md section 9).
+	ExpectedRuntimeTargetID string `json:"expectedRuntimeTargetId,omitempty"`
 }
 
 // GCPIdentityConfig specifies GCP identity configuration for agent creation.
@@ -421,7 +426,7 @@ func (s *agentService) List(ctx context.Context, opts *ListAgentsOptions) (*List
 		ServerTime time.Time `json:"serverTime"`
 	}
 
-	result, err := apiclient.DecodeResponse[listResponse](resp)
+	result, err := apiclient.DecodeRequired[listResponse](resp)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +447,7 @@ func (s *agentService) Get(ctx context.Context, agentID string) (*Agent, error) 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Agent](resp)
+	return apiclient.DecodeRequired[Agent](resp)
 }
 
 // Create creates a new agent.
@@ -451,7 +456,7 @@ func (s *agentService) Create(ctx context.Context, req *CreateAgentRequest) (*Cr
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[CreateAgentResponse](resp)
+	return apiclient.DecodeRequired[CreateAgentResponse](resp)
 }
 
 // SubmitEnv submits gathered environment variables for an agent after a 202 env-gather response.
@@ -460,7 +465,7 @@ func (s *agentService) SubmitEnv(ctx context.Context, agentID string, req *Submi
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[CreateAgentResponse](resp)
+	return apiclient.DecodeRequired[CreateAgentResponse](resp)
 }
 
 // Update updates an agent's metadata.
@@ -469,7 +474,7 @@ func (s *agentService) Update(ctx context.Context, agentID string, req *UpdateAg
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Agent](resp)
+	return apiclient.DecodeRequired[Agent](resp)
 }
 
 // Delete removes an agent.
@@ -483,23 +488,31 @@ func (s *agentService) Delete(ctx context.Context, agentID string, opts *DeleteA
 
 // deletePath builds the DELETE URL, with the query parameters for opts.
 func (s *agentService) deletePath(agentID string, opts *DeleteAgentOptions) string {
-	path := s.agentPath(agentID)
-	if opts != nil {
-		query := url.Values{}
-		// Server defaults deleteFiles/removeBranch to true, so only send
-		// the parameter when the caller explicitly wants to preserve them.
-		if !opts.DeleteFiles {
-			query.Set("deleteFiles", "false")
-		}
-		if !opts.RemoveBranch {
-			query.Set("removeBranch", "false")
-		}
-		if opts.Force {
-			query.Set("force", "true")
-		}
-		if len(query) > 0 {
-			path += "?" + query.Encode()
-		}
+	return withDeleteAgentQuery(s.agentPath(agentID), opts)
+}
+
+// withDeleteAgentQuery appends the DELETE query parameters for opts to path.
+// It is shared by the agent-scoped and project-scoped delete calls so both
+// encode the options identically. A nil opts sends no parameters, leaving the
+// server defaults in place.
+func withDeleteAgentQuery(path string, opts *DeleteAgentOptions) string {
+	if opts == nil {
+		return path
+	}
+	query := url.Values{}
+	// Server defaults deleteFiles/removeBranch to true, so only send
+	// the parameter when the caller explicitly wants to preserve them.
+	if !opts.DeleteFiles {
+		query.Set("deleteFiles", "false")
+	}
+	if !opts.RemoveBranch {
+		query.Set("removeBranch", "false")
+	}
+	if opts.Force {
+		query.Set("force", "true")
+	}
+	if len(query) > 0 {
+		path += "?" + query.Encode()
 	}
 	return path
 }
@@ -550,7 +563,13 @@ type LifecycleResponse struct {
 // body is the agent plus an optional warnings list; a body that cannot be
 // decoded is ignored, since the action itself succeeded.
 func (s *agentService) lifecycle(ctx context.Context, agentID, action string) (*LifecycleResponse, error) {
-	resp, err := s.c.post(ctx, s.agentPath(agentID)+"/"+action, nil, nil)
+	return s.lifecycleWithBody(ctx, agentID, action, nil)
+}
+
+// lifecycleWithBody is lifecycle with a request body; a nil reqBody posts
+// none.
+func (s *agentService) lifecycleWithBody(ctx context.Context, agentID, action string, reqBody interface{}) (*LifecycleResponse, error) {
+	resp, err := s.c.post(ctx, s.agentPath(agentID)+"/"+action, reqBody, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -573,6 +592,52 @@ func (s *agentService) lifecycle(ctx context.Context, agentID, action string) (*
 	return out, nil
 }
 
+// LifecycleStartOptions is the optional body of a start or restart.
+type LifecycleStartOptions struct {
+	// AcceptAsyncLaunch opts in to a non-blocking start or restart. A Hub
+	// that has async start enabled may then answer as soon as the broker
+	// accepts the start, with the agent in a pre-running phase and an
+	// active Launch; the client follows the launch with WaitForLaunch. A
+	// Hub that does not support or enable it ignores the field and answers
+	// synchronously.
+	AcceptAsyncLaunch bool `json:"acceptAsyncLaunch,omitempty"`
+}
+
+// LifecycleOptionsStarter starts or restarts an agent with options. It is a
+// separate interface so AgentService implementations outside this package
+// are not affected; the client's agent service implements it.
+type LifecycleOptionsStarter interface {
+	// StartWithOptions is Start with a request body. Zero options post no
+	// body, exactly like Start. It never asks for a force-resume.
+	StartWithOptions(ctx context.Context, agentID string, opts LifecycleStartOptions) (*LifecycleResponse, error)
+	// RestartWithOptions is Restart with a request body. Zero options post
+	// no body, exactly like Restart.
+	RestartWithOptions(ctx context.Context, agentID string, opts LifecycleStartOptions) (*LifecycleResponse, error)
+}
+
+var _ LifecycleOptionsStarter = (*agentService)(nil)
+
+// StartWithOptions starts a stopped agent with options; see
+// LifecycleOptionsStarter.
+func (s *agentService) StartWithOptions(ctx context.Context, agentID string, opts LifecycleStartOptions) (*LifecycleResponse, error) {
+	return s.lifecycleWithBody(ctx, agentID, "start", lifecycleStartBody(opts))
+}
+
+// RestartWithOptions restarts an agent with options; see
+// LifecycleOptionsStarter.
+func (s *agentService) RestartWithOptions(ctx context.Context, agentID string, opts LifecycleStartOptions) (*LifecycleResponse, error) {
+	return s.lifecycleWithBody(ctx, agentID, "restart", lifecycleStartBody(opts))
+}
+
+// lifecycleStartBody returns the body for opts: nil (no body) for zero
+// options, so a plain start or restart is unchanged on the wire.
+func lifecycleStartBody(opts LifecycleStartOptions) interface{} {
+	if opts == (LifecycleStartOptions{}) {
+		return nil
+	}
+	return opts
+}
+
 // ResetAuth injects a fresh token into a running agent without restarting.
 func (s *agentService) ResetAuth(ctx context.Context, agentID string) error {
 	resp, err := s.c.post(ctx, s.agentPath(agentID)+"/reset-auth", nil, nil)
@@ -582,13 +647,136 @@ func (s *agentService) ResetAuth(ctx context.Context, agentID string) error {
 	return apiclient.CheckResponse(resp)
 }
 
+// ScopeReissuer re-issues an agent's role scopes from its delegator's
+// current authority (hub super-admin only). It is a separate interface so
+// AgentService implementations outside this package are not affected;
+// the client's agent service implements it.
+type ScopeReissuer interface {
+	ReissueScopes(ctx context.Context, agentID string, dryRun bool) (*ScopeReissueResult, error)
+}
+
+// ScopeReissueWithheld is one candidate scope left out of the re-issued set.
+type ScopeReissueWithheld struct {
+	Scope string `json:"scope"`
+	Cause string `json:"cause"`
+}
+
+// ScopeReissueCeilingSource names where the re-issued ceiling came from.
+type ScopeReissueCeilingSource struct {
+	DelegatorKind        string `json:"delegator_kind"`
+	DelegatorID          string `json:"delegator_id"`
+	SourceCredentialKind string `json:"source_credential_kind"`
+	SourceCredentialID   string `json:"source_credential_id,omitempty"`
+	CeilingKind          string `json:"ceiling_kind"`
+}
+
+// ScopeReissueResult is the hub's answer to a scope re-issue.
+type ScopeReissueResult struct {
+	OpID               string                    `json:"op_id"`
+	AgentID            string                    `json:"agent_id"`
+	DryRun             bool                      `json:"dry_run"`
+	Noop               bool                      `json:"noop"`
+	Added              []string                  `json:"added"`
+	Removed            []string                  `json:"removed"`
+	Kept               []string                  `json:"kept"`
+	Withheld           []ScopeReissueWithheld    `json:"withheld"`
+	RoleBefore         string                    `json:"role_before"`
+	RoleAfter          string                    `json:"role_after"`
+	CeilingSource      ScopeReissueCeilingSource `json:"ceiling_source"`
+	EdgeReplaced       string                    `json:"edge_replaced,omitempty"`
+	EdgeNew            string                    `json:"edge_new,omitempty"`
+	CredentialsRevoked int                       `json:"credentials_revoked"`
+	Dispatched         bool                      `json:"dispatched"`
+	DispatchError      string                    `json:"dispatch_error,omitempty"`
+	Message            string                    `json:"message"`
+}
+
+// ReissueScopes posts {"reissue_scopes": true, "dry_run": dryRun} to the
+// agent's reset-auth route. It is not retried: a request that may have
+// committed is re-run by the operator, where it is a no-op.
+func (s *agentService) ReissueScopes(ctx context.Context, agentID string, dryRun bool) (*ScopeReissueResult, error) {
+	body := map[string]bool{"reissue_scopes": true, "dry_run": dryRun}
+	resp, err := s.c.postNoRetry(ctx, s.agentPath(agentID)+"/reset-auth", body, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ScopeReissueResult](resp)
+}
+
+// BulkScopeReissuer runs the hub-wide scope re-issue (hub super-admin
+// only). Dry run unless apply is true. The client's agent service
+// implements it.
+type BulkScopeReissuer interface {
+	ReissueScopesAll(ctx context.Context, apply bool) (*ScopeReissueBulkResult, error)
+}
+
+// ScopeReissueBulkAgent is one agent's outcome in a bulk re-issue.
+type ScopeReissueBulkAgent struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	ProjectID     string   `json:"project_id"`
+	Depth         int      `json:"depth"`
+	Outcome       string   `json:"outcome"`
+	Cause         string   `json:"cause,omitempty"`
+	Added         []string `json:"added,omitempty"`
+	Removed       []string `json:"removed,omitempty"`
+	RoleBefore    string   `json:"role_before,omitempty"`
+	RoleAfter     string   `json:"role_after,omitempty"`
+	OpID          string   `json:"op_id,omitempty"`
+	DispatchError string   `json:"dispatch_error,omitempty"`
+}
+
+// ScopeReissueBulkRef names an agent in a bulk result list.
+type ScopeReissueBulkRef struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Cause string `json:"cause,omitempty"`
+}
+
+// ScopeReissueBulkResult is the hub's answer to a bulk re-issue.
+type ScopeReissueBulkResult struct {
+	BatchOpID  string                  `json:"batch_op_id"`
+	DryRun     bool                    `json:"dry_run"`
+	Total      int                     `json:"total"`
+	Succeeded  []ScopeReissueBulkRef   `json:"succeeded"`
+	Noop       []ScopeReissueBulkRef   `json:"noop"`
+	Refused    []ScopeReissueBulkRef   `json:"refused"`
+	PushFailed []ScopeReissueBulkRef   `json:"push_failed"`
+	Agents     []ScopeReissueBulkAgent `json:"agents"`
+	// DepthUnresolved lists agents whose delegation edge could not be read
+	// when ordering the run.
+	DepthUnresolved []string `json:"depth_unresolved"`
+	// BatchAuditRecorded is false when the hub could not write the batch
+	// audit row.
+	BatchAuditRecorded bool `json:"batch_audit_recorded"`
+}
+
+// ReissueScopesAll posts the bulk re-issue to the admin reset-auth-all
+// route. It is not retried. The run can take much longer than the client's
+// default request timeout, so this one call waits until ctx's deadline
+// instead (callers must set one).
+func (s *agentService) ReissueScopesAll(ctx context.Context, apply bool) (*ScopeReissueBulkResult, error) {
+	body := map[string]bool{"reissue_scopes": true, "dry_run": !apply}
+	tr := *s.c.transport
+	if deadline, ok := ctx.Deadline(); ok && tr.HTTPClient != nil {
+		hc := *tr.HTTPClient
+		hc.Timeout = time.Until(deadline)
+		tr.HTTPClient = &hc
+	}
+	resp, err := tr.PostNoRetry(ctx, "/api/v1/admin/agents/reset-auth-all", body, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ScopeReissueBulkResult](resp)
+}
+
 // StopAll stops all running agents in scope.
 func (s *agentService) StopAll(ctx context.Context) (*StopAllResponse, error) {
 	resp, err := s.c.post(ctx, s.agentsPath()+"/stop-all", nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[StopAllResponse](resp)
+	return apiclient.DecodeRequired[StopAllResponse](resp)
 }
 
 // Restore restores a soft-deleted agent.
@@ -597,7 +785,7 @@ func (s *agentService) Restore(ctx context.Context, agentID string) (*Agent, err
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Agent](resp)
+	return apiclient.DecodeRequired[Agent](resp)
 }
 
 // SendMessage sends a message to an agent.
@@ -630,6 +818,24 @@ type MessageResponse struct {
 	// one entry per resolved mention name. Empty when the message had no
 	// mentions, or on hubs that predate this field.
 	MentionResults []messages.MentionResult `json:"mention_results,omitempty"`
+	// ArtifactWarning is set when artifact references the message named
+	// were not attached. Empty on hubs that predate this field.
+	ArtifactWarning string `json:"artifact_warning,omitempty"`
+
+	// AttachmentWarnings lists attachments the hub could not record on the
+	// message, which was still sent without them. Empty when every
+	// attachment was recorded, or on hubs that predate this field.
+	AttachmentWarnings []AttachmentWarning `json:"attachment_warnings,omitempty"`
+}
+
+// AttachmentWarning names one attachment the hub could not record on a sent
+// message, for example because the file was staged on a different broker
+// than the hub and so does not exist on the hub host.
+type AttachmentWarning struct {
+	// Path is the attachment path as sent.
+	Path string `json:"path"`
+	// Reason is the hub's short explanation.
+	Reason string `json:"reason"`
 }
 
 // SendMessageOptions holds the optional parameters for
@@ -678,7 +884,7 @@ func (s *agentService) SendStructuredMessageWithOptions(ctx context.Context, age
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[MessageResponse](resp)
+	return apiclient.DecodeRequired[MessageResponse](resp)
 }
 
 // SendKeys implements AgentService.SendKeys. See that method's doc comment
@@ -781,6 +987,24 @@ type OutboundMessageResult struct {
 	// one entry per resolved mention name. Empty when the message had no
 	// mentions, or on hubs that predate this field.
 	MentionResults []messages.MentionResult `json:"mention_results,omitempty"`
+	// DefaultAgentResult reports the delivery of a group post to the
+	// conversation's default agent. Set only for a group post that
+	// @mentioned no agent, in a conversation with a default agent.
+	DefaultAgentResult *messages.MentionResult `json:"default_agent_result,omitempty"`
+	// WokenAgents lists the agents a group post reached, through
+	// @mentions or the conversation's default agent.
+	WokenAgents []string `json:"woken_agents,omitempty"`
+	// NoAgentWoken is true when a group post reached no agent. Always
+	// false for other sends, and on hubs that predate this field.
+	NoAgentWoken bool `json:"no_agent_woken,omitempty"`
+	// ArtifactWarning is set when artifact references the message named
+	// were not attached. Empty on hubs that predate this field.
+	ArtifactWarning string `json:"artifact_warning,omitempty"`
+
+	// AttachmentWarnings lists attachments the hub could not record on the
+	// message, which was still sent without them. Empty when every
+	// attachment was recorded, or on hubs that predate this field.
+	AttachmentWarnings []AttachmentWarning `json:"attachment_warnings,omitempty"`
 }
 
 // SendOutboundMessage sends a message from an agent via the outbound endpoint.
@@ -792,6 +1016,7 @@ func (s *agentService) SendOutboundMessage(ctx context.Context, agentID string, 
 	if err != nil {
 		return nil, err
 	}
+	// No body is valid here: the CLI prints a minimal confirmation on a 204.
 	return apiclient.DecodeResponse[OutboundMessageResult](resp)
 }
 
@@ -802,6 +1027,9 @@ type BroadcastResponse struct {
 	Targeted         int            `json:"targeted"`
 	Skipped          int            `json:"skipped"`
 	SkippedBreakdown map[string]int `json:"skipped_breakdown,omitempty"`
+	// Starting counts targeted agents that are still initializing; the
+	// message is held until their harness is ready. Included in Targeted.
+	Starting int `json:"starting,omitempty"`
 }
 
 // BroadcastMessage broadcasts a structured message to all running agents in the project.
@@ -820,6 +1048,7 @@ func (s *agentService) BroadcastMessage(ctx context.Context, msg *messages.Struc
 	if err != nil {
 		return nil, err
 	}
+	// No body is valid here: the CLI reports "Broadcast accepted." on a 204.
 	return apiclient.DecodeResponse[BroadcastResponse](resp)
 }
 
@@ -836,7 +1065,7 @@ func (s *agentService) Exec(ctx context.Context, agentID string, command []strin
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ExecResponse](resp)
+	return apiclient.DecodeRequired[ExecResponse](resp)
 }
 
 // GetLogs retrieves agent logs.
@@ -860,7 +1089,7 @@ func (s *agentService) GetLogs(ctx context.Context, agentID string, opts *GetLog
 		Logs string `json:"logs"`
 	}
 
-	result, err := apiclient.DecodeResponse[logsResponse](resp)
+	result, err := apiclient.DecodeRequired[logsResponse](resp)
 	if err != nil {
 		return "", err
 	}
@@ -928,7 +1157,7 @@ func (s *agentService) GetCloudLogs(ctx context.Context, agentID string, opts *G
 		return nil, err
 	}
 
-	return apiclient.DecodeResponse[CloudLogsResponse](resp)
+	return apiclient.DecodeRequired[CloudLogsResponse](resp)
 }
 
 // StreamCloudLogs opens an SSE connection for streaming cloud log entries.
@@ -1008,7 +1237,7 @@ func (s *agentService) SetMessageMode(ctx context.Context, agentID string, req *
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[SetMessageModeResponse](resp)
+	return apiclient.DecodeRequired[SetMessageModeResponse](resp)
 }
 
 // Reincarnate requests a `scion reincarnate` migration for an agent (design
@@ -1018,7 +1247,7 @@ func (s *agentService) Reincarnate(ctx context.Context, agentID string, req *Rei
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ReincarnateAgentResponse](resp)
+	return apiclient.DecodeRequired[ReincarnateAgentResponse](resp)
 }
 
 // ReincarnateAgentRequest is the request body for Reincarnate. Besides
@@ -1032,6 +1261,13 @@ type ReincarnateAgentRequest struct {
 	// TargetBroker (a broker ID, name or slug) asks to move the agent to
 	// that broker, which must mount the same NFS export as its current one.
 	TargetBroker string `json:"targetBroker,omitempty"`
+	// SharedDirBackends changes the recorded shared-dir storage backend of
+	// the named shared dirs (dir name to "nfs" or "local"). Only the
+	// agent's record changes; the data is copied by the operator.
+	SharedDirBackends map[string]string `json:"sharedDirBackends,omitempty"`
+	// AllowEmptySharedDir skips the start check that refuses an empty
+	// directory on the new backend while the previous one is not empty.
+	AllowEmptySharedDir bool `json:"allowEmptySharedDir,omitempty"`
 
 	// Patch fields: each changes the next generation's setting, and later
 	// reincarnations keep it. Empty (nil for ThinkingLevel) is unchanged.
@@ -1125,4 +1361,8 @@ type ReincarnationPlan struct {
 	ServiceAccount *FieldChange `json:"serviceAccount,omitempty"`
 	ThinkingLevel  *FieldChange `json:"thinkingLevel,omitempty"`
 	HarnessAuth    *FieldChange `json:"harnessAuth,omitempty"`
+	// SharedDirBackends and AllowEmptySharedDir echo the request's shared
+	// dir backend change.
+	SharedDirBackends   map[string]string `json:"sharedDirBackends,omitempty"`
+	AllowEmptySharedDir bool              `json:"allowEmptySharedDir,omitempty"`
 }

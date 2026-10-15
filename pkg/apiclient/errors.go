@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 // APIError represents a structured error response from the API.
@@ -41,11 +42,39 @@ type APIError struct {
 
 // Error implements the error interface.
 func (e *APIError) Error() string {
+	msg := e.Message + e.messageDeniedSuffix()
 	if e.RequestID != "" {
 		return fmt.Sprintf("%s: %s (status: %d, request: %s)",
-			e.Code, e.Message, e.StatusCode, e.RequestID)
+			e.Code, msg, e.StatusCode, e.RequestID)
 	}
-	return fmt.Sprintf("%s: %s (status: %d)", e.Code, e.Message, e.StatusCode)
+	return fmt.Sprintf("%s: %s (status: %d)", e.Code, msg, e.StatusCode)
+}
+
+// messageDeniedSuffix returns the server's denial reason and the two
+// message modes for a message_denied error, e.g.
+// " [reason: mode_branch_no_edge, sender mode: branch, recipient mode:
+// branch]". The reason is the Hub's API-safe denial code. The Hub sends these as details on every message_denied
+// response; without them the CLI could only say "Message delivery denied"
+// (ptone/scion#4411). It returns "" for any other error, or when the
+// details carry none of the fields.
+func (e *APIError) messageDeniedSuffix() string {
+	if e.Code != ErrCodeMessageDenied || len(e.Details) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, f := range []struct{ key, label string }{
+		{"reason", "reason"},
+		{"senderMode", "sender mode"},
+		{"recipientMode", "recipient mode"},
+	} {
+		if v, ok := e.Details[f.key].(string); ok && v != "" {
+			parts = append(parts, f.label+": "+v)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " [" + strings.Join(parts, ", ") + "]"
 }
 
 // IsNotFound returns true if the error is a 404 Not Found.
@@ -102,6 +131,20 @@ const (
 	// an unknown agent (pkg/hub/errors.go ErrCodeAgentNotFound), as opposed
 	// to a generic not_found (e.g. "Project not found").
 	ErrCodeAgentNotFound = "agent_not_found"
+
+	// ErrCodeDeleteInProgress is the hub's 409 code for a request that lost
+	// to a delete of the same agent (pkg/hub/errors.go
+	// ErrCodeDeleteInProgress). The answer may carry details.warnings, which
+	// reports the outcome of the hub's removal of a container the broker had
+	// already started.
+	ErrCodeDeleteInProgress = "delete_in_progress"
+	// ErrCodeStartOutcomeUnknown is the hub's 504 code for a create or env
+	// submit whose dispatch to the runtime broker ended without an answer.
+	// The agent was kept and may still be starting (pkg/hub/apierr).
+	ErrCodeStartOutcomeUnknown = "start_outcome_unknown"
+	// ErrCodeMessageDenied is returned when message-send authorization
+	// denies a delivery. Details carry reason, senderMode and recipientMode.
+	ErrCodeMessageDenied = "message_denied"
 )
 
 // errorResponse matches the API error response format.

@@ -21,8 +21,6 @@
  * display preference here is Asia/Tokyo (UTC+9), where 15:00Z is midnight.
  */
 
-// @vitest-environment happy-dom
-
 import { describe, it, expect, afterEach } from 'vitest';
 import { setPreferredTimeZone } from '../../utils/time.js';
 
@@ -46,6 +44,9 @@ describe('scion-effective-role-provenance lifecycle times (tz-refactor task 20)'
     el = document.createElement('scion-effective-role-provenance');
     document.body.appendChild(el);
     el.loading = false;
+    // Grant the list read directly; the panel renders nothing without it.
+    el._permissionsRead = true;
+    el._canRead = true;
     el.bindings = [
       {
         id: 'rb-1',

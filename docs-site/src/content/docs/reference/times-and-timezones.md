@@ -28,6 +28,17 @@ Each user picks a zone with the **Display timezone** card on the profile setting
 - The value is stored as the `timezone` user preference, an IANA name; empty means Auto. `PATCH /api/v1/users/:id` with an invalid name returns `400` (see the [Users API](/scion/reference/api/)).
 - The display zone never changes an agent's `TZ`.
 
+### Metrics dashboard day buckets
+
+The metrics dashboard groups daily figures (daily sessions, active agents per day, and API calls and tokens per day) by calendar day in your display zone. The Hub computes the buckets, so the page sends the zone along with each request.
+
+- The page sends your display zone as the `tz` query parameter, for example `GET /api/v1/metrics/?view=sessions&period=7&tz=America/Chicago`. That is your **Display timezone** preference, or your browser's zone when it is set to **Auto**.
+- The Hub resolves `tz` with the IANA zone database. If `tz` is missing, is `Local`, is not an IANA zone name, or is any other value it cannot resolve, the Hub uses UTC. A bad `tz` never fails the request.
+- Every view's response includes the zone the Hub used, as `timeZone`. Chart headings and the x-axis title show that zone, for example `Daily Sessions (America/Chicago)` and `Day (America/Chicago)`, or `(UTC)` for UTC.
+- A day is a calendar day in that zone. Days when daylight saving time starts or ends are 23 or 25 hours long, and zones with a fractional offset (for example `Asia/Kathmandu`, +05:45) are handled the same way as any other.
+- "Last N days" means the last N calendar days in that zone, today included. The window starts at local midnight N−1 days ago, and the summary totals use the same window.
+- Changing your display zone reloads the dashboard in the new zone.
+
 ### CLI
 
 The CLI shows times in the local zone of the machine it runs on. Inside an agent container, that is the agent's `TZ`. Two global flags override it:
@@ -66,7 +77,7 @@ Admins set it in the web dashboard under **Admin → Server Config**, in the **A
 - Empty means no Hub default.
 - In `settings.yaml` it is the top-level `default_timezone` key.
 
-See [Operational settings](/scion/reference/server-config/#layer-1--operational-postgres-hub_settings-table) and [Admin settings](/scion/reference/admin-settings/).
+See [Operational settings](/scion/reference/server-config/#layer-1--operational-hub_settings-table) and [Admin settings](/scion/reference/admin-settings/).
 
 To give every agent on one Runtime Broker a zone, set a broker-scope `TZ` variable on the Hub:
 
@@ -78,11 +89,11 @@ scion hub env set --broker=<broker> --always TZ Europe/Berlin
 
 - **Runtime profiles.** There is no profile step. A `TZ` in a profile's `harness_overrides` env is not used, and profiles have no `env` key. See [Removed: profile `timezone`](/scion/reference/orchestrator-settings/#removed-profile-timezone).
 - **Broker-local values.** The Runtime Broker ignores `TZ` from:
-  - broker-local templates;
+  - templates stored on the Runtime Broker host (skipped silently: template env never sets `TZ` for a Hub-dispatched agent);
   - the broker settings' harness-config entry `env`;
   - the agent's persisted `scion-agent.json`.
 
-  It logs a warning, and adds a start warning, for each non-empty value it drops that differs from the value the Hub sent. An empty `TZ: ""` marker never passes the broker host's `TZ` through.
+  For the other two sources, it logs a warning, and adds a start warning, for each non-empty value it drops that differs from the value the Hub sent. An empty `TZ: ""` marker never passes the Runtime Broker host's `TZ` through.
 - **`config.env` on update.** A `TZ` key in `config.env` on an agent `PATCH` is ignored with the warning `TZ in config.env is ignored; use explicitTimezone`.
 - **Secrets.** A secret that targets `TZ` is dropped with a warning.
 
@@ -90,7 +101,7 @@ scion hub env set --broker=<broker> --always TZ Europe/Berlin
 
 A pin is the agent's explicit timezone. It is set in three ways:
 
-- **At create.** A `TZ` value in the create request's `config.env`, in a Hub-resolved template, or in the Hub harness config becomes the pin.
+- **At create.** A `TZ` value in the create request's `config.env` or in the Hub harness config becomes the pin. A template cannot set `TZ` for a Hub-dispatched agent.
 - **Later, by API.** `PATCH /api/v1/agents/:id` with `explicitTimezone`:
   - an IANA name pins the agent; an invalid name, or `Local`, returns `400`;
   - `""` unpins it, and the agent follows steps 2-5 from then on.
@@ -106,7 +117,7 @@ An agent created by an older Hub may have a `TZ` saved in its applied config env
 
 - a pin, including a `legacy` pin, is carried to the new agent;
 - an unpin is carried too, so a create-time `TZ` does not come back;
-- an agent with neither re-derives its pin from its original create inputs and the current template.
+- an agent with neither re-derives its pin from its original create inputs and its Hub harness config (a template cannot set `TZ`).
 
 ## Cron schedules are UTC only
 
@@ -116,20 +127,6 @@ Recurring schedules are evaluated in UTC, and there is no schedule timezone sett
 - Schedules saved with such a prefix by an older Hub are paused at Hub start, with one warning per schedule in the Hub log. To resume one, edit its expression to UTC first.
 
 See [Scheduling](/scion/hosted/user/scheduling/#recurring-schedules).
-
-## Local mode
-
-Without a Hub there is no `TZ` chain, no Hub default timezone and no display preference.
-
-- **Agent `TZ`** comes only from the `env` you give the agent:
-  - a template's `env`;
-  - the harness-config `env` in `settings.yaml`, including a profile's `harness_overrides` entry for that harness config;
-  - an inline config passed with `scion create --config`.
-
-  An empty `TZ: ""` in a template or an inline config passes your machine's `TZ` through. A `TZ` in a `settings.yaml` harness-config entry (or a profile's `harness_overrides`) takes precedence over a template or inline-config `TZ`. If it is empty, `TZ` is omitted with a warning, even when a template or inline config sets one, and the container uses the image default (UTC). With no `TZ` in any of them, the container uses the image default (UTC).
-- **CLI display** uses your local zone, with `--tz` and `--utc` as above.
-
-A Hub-created agent that is later started with a local `scion start` uses the `TZ` saved in its `scion-agent.json` again.
 
 ## Operator steps
 

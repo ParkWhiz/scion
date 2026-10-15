@@ -28,11 +28,13 @@ import { can } from '../../shared/types.js';
 import type { StatusType } from '../shared/status-badge.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
 import '../shared/status-badge.js';
+import '../shared/detail-header.js';
 import '../shared/hash-display.js';
 import '../shared/skill-publish-dialog.js';
 import { showToast } from '../../utils/toast.js';
 import { showConfirm } from '../shared/confirm-dialog.js';
 import { formatRelative } from '../../utils/time.js';
+import { navigateTo } from '../../client/navigation.js';
 
 @customElement('scion-page-skill-detail')
 export class ScionPageSkillDetail extends LitElement {
@@ -71,55 +73,11 @@ export class ScionPageSkillDetail extends LitElement {
       display: block;
     }
 
-    .back-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-      color: var(--scion-text-muted, #64748b);
-      text-decoration: none;
-      font-size: 0.875rem;
-      margin-bottom: 1rem;
-    }
-    .back-link:hover {
-      color: var(--scion-primary, #3b82f6);
-    }
-
-    .header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      margin-bottom: 1.5rem;
-      gap: 1rem;
-    }
-    .header-info {
-      flex: 1;
-    }
-    .header-title {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      margin-bottom: 0.5rem;
-    }
-    .header-title sl-icon {
-      color: var(--scion-primary, #3b82f6);
-      font-size: 1.5rem;
-    }
-    .header h1 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      color: var(--scion-text, #1e293b);
-      margin: 0;
-    }
     .header-meta {
       display: flex;
       align-items: center;
       gap: 0.75rem;
       margin-top: 0.5rem;
-    }
-    .header-actions {
-      display: flex;
-      gap: 0.5rem;
-      flex-shrink: 0;
     }
 
     sl-tab-group {
@@ -436,11 +394,11 @@ export class ScionPageSkillDetail extends LitElement {
   private versionStatusType(status: string): StatusType {
     switch (status) {
       case 'published':
-        return 'success' as StatusType;
+        return 'success';
       case 'deprecated':
-        return 'warning' as StatusType;
+        return 'warning';
       case 'archived':
-        return 'danger' as StatusType;
+        return 'danger';
       default:
         return 'default' as StatusType;
     }
@@ -533,8 +491,7 @@ export class ScionPageSkillDetail extends LitElement {
       if (!res.ok) {
         throw new Error(await extractApiError(res, 'Failed to archive skill'));
       }
-      window.history.pushState({}, '', '/skills');
-      window.dispatchEvent(new PopStateEvent('popstate'));
+      navigateTo('/skills');
     } catch (err) {
       console.error('Failed to archive skill:', err);
       showToast(err instanceof Error ? err.message : 'Failed to archive skill');
@@ -632,11 +589,6 @@ export class ScionPageSkillDetail extends LitElement {
     if (this.error || !this.skill) return this.renderError();
 
     return html`
-      <a href="/skills" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        Back to Skills
-      </a>
-
       ${this.renderHeader()}
 
       <sl-tab-group @sl-tab-show=${this.handleTabShow}>
@@ -655,66 +607,69 @@ export class ScionPageSkillDetail extends LitElement {
 
   private renderHeader() {
     const skill = this.skill!;
+    const canUpdate = can(skill._capabilities, 'update');
+    const canDelete = can(skill._capabilities, 'delete');
+    // prettier-ignore
     return html`
-      <div class="header">
-        <div class="header-info">
-          <div class="header-title">
-            <sl-icon name="lightning-charge"></sl-icon>
-            <h1>${skill.name}</h1>
-            <scion-status-badge
-              status=${skill.status as StatusType}
-              label=${skill.status}
-            ></scion-status-badge>
-          </div>
-          <div class="header-meta">
-            <span class="scope-badge">${skill.scope}</span>
-          </div>
+      <scion-detail-header heading=${skill.name}>
+        <scion-back-link slot="back" href="/skills">Back to Skills</scion-back-link>
+        <sl-icon slot="icon" name="lightning-charge"></sl-icon>
+        <scion-status-badge
+          status=${skill.status}
+          label=${skill.status}
+        ></scion-status-badge>
+        <div slot="meta" class="header-meta">
+          <span class="scope-badge">${skill.scope}</span>
         </div>
-        <div class="header-actions">
-          ${can(skill._capabilities, 'update')
-            ? html`
-                <sl-button
-                  variant="default"
-                  size="small"
-                  outline
-                  @click=${() => this.startEditing()}
-                >
-                  <sl-icon slot="prefix" name="pencil"></sl-icon>
-                  Edit
-                </sl-button>
-              `
-            : nothing}
-          ${can(skill._capabilities, 'update')
-            ? html`
-                <sl-button
-                  variant="primary"
-                  size="small"
-                  @click=${() => {
-                    this.publishDialogOpen = true;
-                  }}
-                >
-                  <sl-icon slot="prefix" name="upload"></sl-icon>
-                  Publish Version
-                </sl-button>
-              `
-            : nothing}
-          ${can(skill._capabilities, 'delete')
-            ? html`
-                <sl-button
-                  variant="danger"
-                  size="small"
-                  outline
-                  ?loading=${this.actionLoading['archive']}
-                  ?disabled=${this.actionLoading['archive']}
-                  @click=${() => this.handleArchive()}
-                >
-                  <sl-icon slot="prefix" name="trash"></sl-icon>
-                  Archive
-                </sl-button>
-              `
-            : nothing}
-        </div>
-      </div>
+        ${canUpdate || canDelete
+          ? html`
+              <div slot="actions" class="header-actions">
+                ${canUpdate
+                  ? html`
+                      <sl-button
+                        variant="default"
+                        size="small"
+                        outline
+                        @click=${() => this.startEditing()}
+                      >
+                        <sl-icon slot="prefix" name="pencil"></sl-icon>
+                        Edit
+                      </sl-button>
+                    `
+                  : nothing}
+                ${canUpdate
+                  ? html`
+                      <sl-button
+                        variant="primary"
+                        size="small"
+                        @click=${() => {
+                          this.publishDialogOpen = true;
+                        }}
+                      >
+                        <sl-icon slot="prefix" name="upload"></sl-icon>
+                        Publish Version
+                      </sl-button>
+                    `
+                  : nothing}
+                ${canDelete
+                  ? html`
+                      <sl-button
+                        variant="danger"
+                        size="small"
+                        outline
+                        ?loading=${this.actionLoading['archive']}
+                        ?disabled=${this.actionLoading['archive']}
+                        @click=${() => this.handleArchive()}
+                      >
+                        <sl-icon slot="prefix" name="trash"></sl-icon>
+                        Archive
+                      </sl-button>
+                    `
+                  : nothing}
+              </div>
+            `
+          : nothing}
+      </scion-detail-header>
     `;
   }
 
@@ -787,7 +742,7 @@ export class ScionPageSkillDetail extends LitElement {
             <span class="info-label">Status</span>
             <span class="info-value">
               <scion-status-badge
-                status=${skill.status as StatusType}
+                status=${skill.status}
                 label=${skill.status}
                 size="small"
               ></scion-status-badge>
@@ -1124,10 +1079,7 @@ export class ScionPageSkillDetail extends LitElement {
 
   private renderError() {
     return html`
-      <a href="/skills" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        Back to Skills
-      </a>
+      <scion-back-link href="/skills">Back to Skills</scion-back-link>
       <div class="error-state">
         <sl-icon name="exclamation-triangle"></sl-icon>
         <h2>Failed to Load Skill</h2>

@@ -32,15 +32,24 @@ const (
 	DeletionStateFailed   = "failed"
 )
 
+// DeletionStageFinalizing is the DeletionInfo.Stage value for a row whose
+// teardown has run and that is finalizing. It mirrors
+// store.DeletionStageFinalizing. Such a row stays held (it blocks start
+// until a retry or force) even after its lease expires, when its State
+// reads failed.
+const DeletionStageFinalizing = "finalizing"
+
 // DeletionInfo is the hub's view of an active or failed agent delete
 // (design ptone/scion#2483 §2.2). It mirrors store.DeletionInfo field for
-// field; the JSON is the contract.
+// field; the JSON is the contract. Code, Error and Claim are present only
+// for a caller the hub treats as a platform admin; every other caller gets
+// them omitted (zero here).
 type DeletionInfo struct {
 	State          string     `json:"state"`          // "deleting" | "failed"
 	Code           string     `json:"code,omitempty"` // runtime_error | conflict | in_doubt | abandoned | revoke_failed | finalize_failed
 	Error          string     `json:"error,omitempty"`
 	Soft           bool       `json:"soft"`
-	Claim          int64      `json:"claim"`
+	Claim          int64      `json:"claim,omitempty"`
 	StartedAt      time.Time  `json:"startedAt"`
 	LeaseExpiresAt *time.Time `json:"leaseExpiresAt,omitempty"`
 	ExpiresAt      *time.Time `json:"expiresAt,omitempty"`
@@ -48,6 +57,11 @@ type DeletionInfo struct {
 	// the row never expires from view and blocks start until a retry or
 	// force); omitted otherwise. Mirrors store.DeletionInfo.Stage.
 	Stage string `json:"stage,omitempty"`
+	// BlocksStart is the hub's current answer to "is a start refused because
+	// of this delete"; set only on the single-agent GET, absent elsewhere and
+	// when the hub could not compute it. Absent means unknown, not false.
+	// Mirrors store.DeletionInfo.BlocksStart.
+	BlocksStart *bool `json:"blocksStart,omitempty"`
 }
 
 // DeleteResult is the outcome of a DELETE that the hub answered with 2xx.

@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,36 +50,6 @@ func getAssignableRoles(t *testing.T, f *mmrFixture, actor *store.User) map[stri
 	}
 	require.Len(t, byID, len(body.Items), "no role is listed twice")
 	return byID
-}
-
-// asgManagerActor creates a user with NO built-in project role who still
-// passes the endpoint's project.manage gate, through a custom project role
-// carrying project.read and project.manage. With hubAdmin it also holds the
-// system hub-admin role (system role_binding.*): the hub-override actor
-// reachable over HTTP. Without it, the actor has neither a project role nor
-// hub authority, so the PUT refuses it before governance. A plain hub admin
-// is refused at the project.manage gate (see
-// TestAssignableRoles_HubAdminWithNoProjectRole).
-func asgManagerActor(t *testing.T, f *mmrFixture, suffix string, hubAdmin bool) (*store.User, *store.RoleDefinition) {
-	t.Helper()
-	ctx := context.Background()
-	manager, err := f.store.CreateRoleDefinition(ctx, &store.RoleDefinition{
-		Name: "asg-manager-" + tid(t.Name() + suffix)[:8], ScopeType: store.RoleScopeProject,
-		Permissions: []string{"project.read", "project.manage"},
-	})
-	require.NoError(t, err)
-	u := grpUser(t, f.store, t.Name()+"-"+suffix, "Manager "+suffix)
-	grpBind(t, f.store, "user", u.ID, manager.ID, f.projectID)
-	if hubAdmin {
-		mmrSeedHubAdmin(t, f.store, u.ID)
-	}
-	return u, manager
-}
-
-// asgHubOverrideActor is asgManagerActor with the hub-admin seed.
-func asgHubOverrideActor(t *testing.T, f *mmrFixture) (*store.User, *store.RoleDefinition) {
-	t.Helper()
-	return asgManagerActor(t, f, "huboverride", true)
 }
 
 // asgJSONNormalize round-trips v through JSON so maps built with different
@@ -183,11 +154,11 @@ func TestAssignableRoles_SystemRolesNeverListedAndOrdered(t *testing.T) {
 	require.NoError(t, err)
 	projectRoles := 0
 	for _, rd := range all {
-		if rd.ScopeType == store.RoleScopeProject {
+		if rd.ScopeType == store.RoleScopeProject && rd.ConfersProjectMembership() {
 			projectRoles++
 		}
 	}
-	require.Len(t, body.Items, projectRoles, "every project-scoped role is listed")
+	require.Len(t, body.Items, projectRoles, "every project-scoped role that confers membership is listed")
 	for _, it := range body.Items {
 		rd, err := f.store.GetRoleDefinition(ctx, it.ID)
 		require.NoError(t, err)
@@ -277,6 +248,32 @@ func TestAssignableRoles_CredentialGateRefusesEverything(t *testing.T) {
 	for _, it := range items {
 		assert.False(t, it.Grantable, "%s", it.Name)
 		assert.Equal(t, ErrCodeMembershipCredentialInsufficient, it.DenialCode)
+	}
+}
+
+// TestAssignableRoles_TokenItemsCarrySessionOnlyDetails pins that a user
+// access token passing the endpoint's project.manage gate gets every role
+// listed as not grantable, each item carrying the PUT's credential refusal:
+// denialCode credential_insufficient with details.reason GOV_PENDING and
+// details.credential session_required.
+func TestAssignableRoles_TokenItemsCarrySessionOnlyDetails(t *testing.T) {
+	f := setupMMRFixture(t)
+	ensureHubMembership(context.Background(), f.store, f.owner.ID)
+	key, _, err := f.srv.uatService.CreateTokenWithParams(rs4MintContext(f.owner.ID), CreateTokenParams{
+		UserID: f.owner.ID, Name: "asg-token", Boundary: projectBoundary(f.projectID), Scopes: []string{"project:manage"},
+	})
+	require.NoError(t, err)
+
+	rec := doRequestWithUAT(t, f.srv, key, http.MethodGet, assignableRolesPath(f.projectID), nil)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var body listAssignableRolesResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.NotEmpty(t, body.Items)
+	for _, it := range body.Items {
+		assert.False(t, it.Grantable, "%s", it.Name)
+		assert.Equal(t, ErrCodeMembershipCredentialInsufficient, it.DenialCode, "%s", it.Name)
+		assert.Equal(t, string(authzop.ReasonGovernancePending), it.Details["reason"], "%s: details.reason", it.Name)
+		assert.Equal(t, sessionRequiredCredential, it.Details["credential"], "%s: details.credential", it.Name)
 	}
 }
 

@@ -39,7 +39,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -49,52 +49,6 @@ import (
 // ---------------------------------------------------------------------------
 // Fixture helpers
 // ---------------------------------------------------------------------------
-
-// uatpMember creates a project-member user, matching production shape: a
-// project-scoped member role binding AND the seeded hub-members group
-// (seed.go:462-480), which every logged-in user actually holds. Tests in
-// this file deliberately do not use a minimal fixture that omits hub
-// membership: the seeded hub-member system role interacts with the
-// live-project-access gate (see
-// TestProjectUAT_HubMembershipAloneDoesNotGrantProjectAccess and the
-// seeded-role regressions below), and a fixture without that binding would
-// hide the interaction instead of exposing it.
-func uatpMember(t *testing.T, s store.Store, projectID, userID string) {
-	t.Helper()
-	createTestUserWithProjectRole(t, s, userID, userID+"@test.com", projectID, store.ProjectRoleMember)
-	ensureHubMembership(context.Background(), s, userID)
-}
-
-// uatpAgent creates an agent directly via the store with Hub-recorded
-// OwnerID/Ancestry, rather than through the HTTP handler.
-func uatpAgent(t *testing.T, s store.Store, projectID, ownerID, idSuffix string, ancestry ...string) *store.Agent {
-	t.Helper()
-	agent := &store.Agent{
-		ID:        tid("uatp-agent-" + idSuffix),
-		Slug:      "uatp-agent-" + idSuffix,
-		Name:      "UATP Agent " + idSuffix,
-		ProjectID: projectID,
-		OwnerID:   ownerID,
-		Phase:     string(state.PhaseStopped),
-		Ancestry:  ancestry,
-	}
-	require.NoError(t, s.CreateAgent(context.Background(), agent))
-	return agent
-}
-
-// uatpExposePort registers an exposed port directly via the store, instead
-// of the HTTP registration path (which scoped UATs cannot use --
-// authorizePortRegistration always denies ScopedUserIdentity, by design).
-func uatpExposePort(t *testing.T, s store.Store, agent *store.Agent, port int) {
-	t.Helper()
-	ports := append([]store.ExposedPort(nil), agent.ExposedPorts...)
-	ports = append(ports, store.ExposedPort{
-		Port: port, Label: "web", Host: "127.0.0.1", Mode: "rw",
-		ExposedAt: time.Now().UTC(), ExposedBy: "agent",
-	})
-	require.NoError(t, s.UpdateAgentExposedPorts(context.Background(), agent.ID, ports))
-	agent.ExposedPorts = ports
-}
 
 // assertAuthorizedPTY asserts rec is the "authorized, no runtime broker"
 // signal for a /pty preflight: pty_handlers.go runs authorization first and
@@ -108,13 +62,6 @@ func assertAuthorizedPTY(t *testing.T, rec *httptest.ResponseRecorder, msgAndArg
 	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code, msgAndArgs...)
 }
 
-// requireAuthorizedPTY is assertAuthorizedPTY's require-semantics twin, for
-// sanity preconditions a test cannot usefully continue past.
-func requireAuthorizedPTY(t *testing.T, rec *httptest.ResponseRecorder, msgAndArgs ...interface{}) {
-	t.Helper()
-	require.Equal(t, http.StatusUnprocessableEntity, rec.Code, msgAndArgs...)
-}
-
 // assertAuthorizedPortProxy is assertAuthorizedPTY's port-proxy equivalent:
 // authorization runs first, and an authorized request against a port with
 // no active tunnel returns 503.
@@ -123,43 +70,41 @@ func assertAuthorizedPortProxy(t *testing.T, rec *httptest.ResponseRecorder, msg
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, msgAndArgs...)
 }
 
-// uatpDeleteProjectBinding removes userID's direct project-scoped role
-// binding(s) in projectID, modeling an admin removing the member.
-func uatpDeleteProjectBinding(t *testing.T, s store.Store, userID, projectID string) {
+// uatpInsertLegacyToken inserts a project-boundary token row with the given
+// scopes directly into the store, without minting, so a test can evaluate a
+// stored scope that mint would refuse. Use-time evaluation applies the
+// ceiling, boundary eligibility and current authority.
+func uatpInsertLegacyToken(t *testing.T, s store.Store, userID, projectID string, scopes []string) string {
 	t.Helper()
-	ctx := context.Background()
-	bindings, err := s.ListRoleBindingsForPrincipal(ctx, store.RoleBindingPrincipalUser, userID)
-	require.NoError(t, err)
-	for _, b := range bindings {
-		if b.ScopeType == store.RoleScopeProject && b.ScopeID == projectID {
-			require.NoError(t, s.DeleteRoleBinding(ctx, b.ID))
-		}
-	}
+	return uatpInsertStoredToken(t, s, userID, "", projectID, scopes)
 }
 
-// uatpInsertLegacyToken inserts a project-scoped UAT row directly via the
-// store, instead of through CreateToken's mint-time eligibility/boundary
-// checks. Used to model a scope already present on a credential (a
-// legacy token minted before a rule existed, or a future relaxed rule)
-// when CanMintSelector would refuse to mint that same scope fresh -- this
-// lets a test prove separately that use-time evaluation never re-derives
-// or re-checks mint-time issuance rules (selector boundaries, eligibility)
-// against an already-stored scope; only current authority decides.
-func uatpInsertLegacyToken(t *testing.T, s store.Store, userID, projectID string, scopes []string) string {
+// uatpInsertHubToken inserts a hub-boundary token row with the given
+// scopes and no ceiling version directly into the store, without minting.
+func uatpInsertHubToken(t *testing.T, s store.Store, userID string, scopes []string) string {
+	t.Helper()
+	return uatpInsertStoredToken(t, s, userID, string(BoundaryKindHub), "", scopes)
+}
+
+// uatpInsertStoredToken inserts a token row with the given boundary kind,
+// project ID and scopes, and returns its key. An empty boundary kind
+// stores a project boundary.
+func uatpInsertStoredToken(t *testing.T, s store.Store, userID, boundaryKind, projectID string, scopes []string) string {
 	t.Helper()
 	ctx := context.Background()
 	keyBody := uuid.NewString()
 	key := store.UATPrefix + keyBody
 	hash := sha256.Sum256([]byte(key))
 	require.NoError(t, s.CreateUserAccessToken(ctx, &store.UserAccessToken{
-		ID:        uuid.NewString(),
-		UserID:    userID,
-		Name:      "legacy",
-		Prefix:    key[:len(store.UATPrefix)+UATPrefixLength],
-		KeyHash:   hex.EncodeToString(hash[:]),
-		ProjectID: projectID,
-		Scopes:    scopes,
-		Created:   time.Now(),
+		ID:           uuid.NewString(),
+		UserID:       userID,
+		Name:         "legacy",
+		Prefix:       key[:len(store.UATPrefix)+UATPrefixLength],
+		KeyHash:      hex.EncodeToString(hash[:]),
+		BoundaryKind: boundaryKind,
+		ProjectID:    projectID,
+		Scopes:       scopes,
+		Created:      time.Now(),
 	}))
 	return key
 }
@@ -294,10 +239,12 @@ func TestProjectUAT_AttachDeniedForOtherMembersAgents(t *testing.T) {
 
 // TestProjectUAT_OwnerAdminPortAccessOnMembersAgent pins use-time behaviour
 // of owner and admin user access tokens on another member's agent. The
-// project-owner and project-admin roles carry agent.port_access, so an
-// agent:port_access token opens the member's already-exposed ports. The same
-// token cannot attach, manage ports, open the tunnel, exec or read env; an
-// agent:attach token stays denied on the member's agent; a token without
+// project-owner and project-admin roles carry agent.port_access within the
+// project, so an agent:port_access token opens the member's already-exposed
+// ports. Managing ports needs agent.port_access at hub level, so the same
+// token cannot register, delete or clear the member's agent's ports, and it
+// cannot attach, open the tunnel, exec or read env; an agent:attach token
+// stays denied on the member's agent; a token without
 // agent:port_access (agent:manage excludes it) cannot open ports; and
 // another member's port_access token is refused.
 func TestProjectUAT_OwnerAdminPortAccessOnMembersAgent(t *testing.T) {
@@ -332,15 +279,24 @@ func TestProjectUAT_OwnerAdminPortAccessOnMembersAgent(t *testing.T) {
 			rec = doRequestWithUAT(t, srv, portKey, http.MethodGet, base+"/pty", nil)
 			assert.Equal(t, http.StatusForbidden, rec.Code, "%s port_access token must not attach: %s", tc.name, rec.Body.String())
 
-			for _, m := range []struct{ method, path string }{
-				{http.MethodPost, base + "/ports"},
-				{http.MethodDelete, base + "/ports"},
-				{http.MethodDelete, base + "/ports/8080"},
+			// Managing ports needs agent.port_access at hub level, which the
+			// project roles do not carry.
+			for _, mc := range []struct {
+				method, path string
+				body         map[string]any
+			}{
+				{http.MethodPost, base + "/ports", map[string]any{"port": 9090}},
+				{http.MethodDelete, base + "/ports/8080", nil},
+				{http.MethodDelete, base + "/ports", nil},
 			} {
-				rec := doRequestWithUAT(t, srv, portKey, m.method, m.path, map[string]any{"port": 8080})
+				rec = doRequestWithUAT(t, srv, portKey, mc.method, mc.path, mc.body)
 				assert.Equal(t, http.StatusForbidden, rec.Code,
-					"%s port_access token must not manage a member's ports (%s %s): %s", tc.name, m.method, m.path, rec.Body.String())
+					"%s port_access token must not manage a member's agent's ports (%s %s): %s", tc.name, mc.method, mc.path, rec.Body.String())
 			}
+			stored, err := s.GetAgent(context.Background(), agent.ID)
+			require.NoError(t, err)
+			require.Len(t, stored.ExposedPorts, 1, "%s: refused requests change no stored port", tc.name)
+			assert.Equal(t, 8080, stored.ExposedPorts[0].Port)
 
 			req := httptest.NewRequest(http.MethodGet, base+"/ports/tunnel", nil)
 			req.Header.Set("Authorization", "Bearer "+portKey)
@@ -813,20 +769,16 @@ func TestProjectUAT_PTYTicketPathFailsClosed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Session characterization: unchanged, documented only.
+// Session characterization (ptone/scion#2141).
 // ---------------------------------------------------------------------------
 
-// TestSessionOwnerAttach_CurrentBehaviourAfterProjectAccessRemoved documents
-// the CURRENT rule for interactive sessions: an owner/ancestor relationship
-// grant does not check current project membership, so a session user whose
-// project binding was removed still passes attach and port-access
-// authorization on their own agent. This behavior is unchanged here --
-// interactive sessions get this characterization test only, no behavior
-// change. Extending active-project-access enforcement to interactive
-// sessions is a separate, pending product decision tracked at
-// ptone/scion#2141; this test names today's rule and is not evidence of a
-// defect to fix here.
-func TestSessionOwnerAttach_CurrentBehaviourAfterProjectAccessRemoved(t *testing.T) {
+// TestSessionOwnerAttach_DeniedAfterProjectAccessRemoved pins the rule for
+// interactive sessions: an owner/ancestor relationship grant on a project
+// target requires the user's active project access at use time, so a
+// session user whose project binding was removed is denied attach and
+// port access on their own agent. The row-level coverage is in
+// authz_relationship_project_access_test.go.
+func TestSessionOwnerAttach_DeniedAfterProjectAccessRemoved(t *testing.T) {
 	srv, s := testServer(t)
 	projectID := tid("uatp-session-project")
 	ownerID := tid("uatp-session-owner")
@@ -844,13 +796,16 @@ func TestSessionOwnerAttach_CurrentBehaviourAfterProjectAccessRemoved(t *testing
 
 	uatpDeleteProjectBinding(t, s, memberID, projectID)
 
+	// ptone/scion#2141: an interactive owner relationship on a project
+	// target requires active project access at use time (relationship
+	// stage 2c), the same as a project UAT.
 	rec = doRequestAsUser(t, srv, memberUser, http.MethodGet, "/api/v1/agents/"+agent.ID+"/pty", nil)
-	assertAuthorizedPTY(t, rec,
-		"current rule (unchanged; ptone/scion#2141 pending): session owner attach survives project access removal: %s", rec.Body.String())
+	assert.Equal(t, http.StatusForbidden, rec.Code,
+		"session owner attach requires active project access: %s", rec.Body.String())
 
 	rec = doRequestAsUser(t, srv, memberUser, http.MethodGet, "/api/v1/agents/"+agent.ID+"/ports/7070/proxy/", nil)
-	assertAuthorizedPortProxy(t, rec,
-		"current rule (unchanged; ptone/scion#2141 pending): session owner port access survives project access removal: %s", rec.Body.String())
+	assert.Equal(t, http.StatusForbidden, rec.Code,
+		"session owner port access requires active project access: %s", rec.Body.String())
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,10 +973,13 @@ func TestProjectUAT_AttachRecheckedOnEachHandshake(t *testing.T) {
 // project-admin grant agent.port_access (opening a member's already-exposed
 // ports); project-member does not.
 func TestProjectRoles_AttachAndPortAccessLockIn(t *testing.T) {
+	// R6/R6/R5 added artifact.read and artifact.create; R8/R7 added agent
+	// delegation grant management for project-bounded grants; R9/R8 added
+	// project.manage_visitors.
 	revisions := map[string]int{
-		store.ProjectRoleOwner:  5,
-		store.ProjectRoleAdmin:  5,
-		store.ProjectRoleMember: 4,
+		store.ProjectRoleOwner:  9,
+		store.ProjectRoleAdmin:  8,
+		store.ProjectRoleMember: 5,
 	}
 	portAccess := map[string]bool{
 		store.ProjectRoleOwner: true,
@@ -1177,8 +1135,20 @@ func TestUATProjectAdmission_SystemAuthorityForExactPermission(t *testing.T) {
 				}))
 				grantPermissionViaRoleBinding(t, s, userID, tc.permissionID, store.RoleScopeSystem, "")
 
-				scoped := NewScopedUserIdentity(NewAuthenticatedUser(userID, userID+"@test.com", "User", "member", "api"), projectID, []string{tc.uatScope})
+				user := NewAuthenticatedUser(userID, userID+"@test.com", "User", "member", "api")
+				// The permission is hub-only: a project token is not
+				// eligible for it.
+				scoped := NewScopedUserIdentity(user, projectID, []string{tc.uatScope})
 				decision := srv.authzService.CheckAccess(ctx, scoped, tc.resource(projectID), tc.action)
+				assert.False(t, decision.Allowed)
+				assert.Equal(t, "permission is not eligible for this token boundary", decision.Reason)
+
+				// A hub token with the selector reaches the project target
+				// through system authority for the exact permission.
+				ceiling, ok := permissions.BuildCeilingFromSelectors([]string{tc.uatScope})
+				require.True(t, ok)
+				hub := NewScopedUserIdentityWithBoundaryAndDecoration(user, TokenBoundary{Kind: BoundaryKindHub}, []string{tc.uatScope}, "", ceiling, nil)
+				decision = srv.authzService.CheckAccess(ctx, hub, tc.resource(projectID), tc.action)
 				assert.True(t, decision.Allowed, "system authority for the exact permission should admit a project target: %s", decision.Reason)
 			})
 
@@ -1297,19 +1267,14 @@ func TestUATProjectAdmission_CrossPermissionMemoIsolation(t *testing.T) {
 // rather than a direct CheckAccess call, so this coverage survives a future
 // refactor that moves enforceUATConstraints's body elsewhere.
 //
-// group.addMember has a Hub-only mint-time issuance boundary
-// (permissions.PermissionAllowedBoundaries["group.addMember"] ==
-// []BoundaryKind{BoundaryKindHub}), so CanMintSelector would refuse to mint
-// a fresh PROJECT-boundary "group:addMember" selector
-// (boundary_not_allowed) -- there is no way to reach this case through
-// CreateToken today. The token row is inserted directly
-// (uatpInsertLegacyToken) to model a scope already present on a
-// project-scoped credential, proving separately that use-time evaluation
-// never re-checks mint-time issuance boundaries: only current authority
-// (ProjectTargetAdmission plus the kernel) decides. This also doubles as
-// the group family's real-HTTP exercise.
+// group.addMember is hub-only (permissions.PermissionAllowedBoundaries).
+// A project token carrying it, inserted directly as a stored row
+// (uatpInsertLegacyToken), is not eligible for the permission's boundary
+// and is denied at use time. A hub token minted with the selector is
+// admitted through system authority for the exact permission. This also
+// doubles as the group family's real-HTTP exercise.
 func TestProjectUAT_GroupAddMemberExactSystemPermissionAtRealRoute(t *testing.T) {
-	t.Run("system-scope binding with the exact permission allows the request", func(t *testing.T) {
+	t.Run("system-scope binding admits a hub token and not a project token", func(t *testing.T) {
 		srv, s := testServer(t)
 		ctx := context.Background()
 		projectID := tid("uatp-groupaddmember-project")
@@ -1335,33 +1300,44 @@ func TestProjectUAT_GroupAddMemberExactSystemPermissionAtRealRoute(t *testing.T)
 		}
 		require.NoError(t, s.CreateGroup(ctx, group))
 
+		// group.addMember is hub-only: a project token carrying it is not
+		// eligible for the permission's boundary.
 		uatKey := uatpInsertLegacyToken(t, s, userID, projectID, []string{"group:addMember"})
 		rec := doRequestWithUAT(t, srv, uatKey, http.MethodPost, "/api/v1/groups/"+group.ID+"/members",
 			map[string]any{"memberType": "user", "memberId": targetID, "role": "member"})
+		assert.Equal(t, http.StatusForbidden, rec.Code,
+			"a project token is not eligible for a hub-only permission: %s", rec.Body.String())
+		assert.NotContains(t, rec.Body.String(), "Only group owners or admins can add members")
+		projectToken, err := srv.uatService.ValidateToken(ctx, uatKey)
+		require.NoError(t, err)
+		decision := srv.authzService.CheckAccess(ctx, projectToken, groupResource(group), ActionAddMember)
+		assert.False(t, decision.Allowed)
+		assert.Equal(t, bearerReasonBoundaryIneligible, decision.Reason)
+		eval := srv.authzService.EvaluateBearerCeiling(ctx, principalContextForIdentity(bearerUser(userID)), projectToken.Boundary(), projectToken.Ceiling(), "group.addMember", groupResource(group), BearerOptions{})
+		assert.Equal(t, BearerStageBoundaryEligibility, eval.Stage, eval.Decision.Reason)
+
+		// A hub token with the selector is admitted through system authority
+		// for the exact permission.
+		hubKey, _, err := srv.uatService.CreateTokenWithParams(rs4MintContext(userID), CreateTokenParams{
+			UserID: userID, Name: "hub", Boundary: TokenBoundary{Kind: BoundaryKindHub}, Scopes: []string{"group:addMember"},
+		})
+		require.NoError(t, err)
+		rec = doRequestWithUAT(t, srv, hubKey, http.MethodPost, "/api/v1/groups/"+group.ID+"/members",
+			map[string]any{"memberType": "user", "memberId": targetID, "role": "member"})
 		assert.Equal(t, http.StatusCreated, rec.Code,
-			"system authority for the exact permission should admit the request even though this scope could never be freshly minted for a project boundary: %s", rec.Body.String())
+			"system authority for the exact permission should admit a hub token: %s", rec.Body.String())
 	})
 
-	t.Run("owner without the system binding is still denied by the project-access gate", func(t *testing.T) {
-		// Identical group-ownership fixture as the positive case above
-		// (OwnerID == caller) -- the pair differs ONLY in the missing
-		// group.addMember system-role binding -- rather than a fixture
-		// with no ownership at all, because addGroupMember's own
-		// role-hierarchy check has a separate allowance for a group's
-		// resource owner, and the owner relationship grant
-		// (checkRelationshipGrants) has no resource-type restriction: if
-		// Decide ever reached the kernel/relationship steps for this
-		// request, ownership alone would admit it regardless of the
-		// group.addMember binding. The project-access gate in
-		// enforceUATConstraints runs BEFORE those steps for a UAT
-		// credential (Decide step 1), so this must still deny -- proving
-		// the positive case above exercises the exact-permission admission
-		// path, not group ownership. A denial via the handler's own "Only
-		// group owners or admins can add members" message would mean the
-		// request passed s.authorize and reached the handler's internal
-		// check instead, which that owner allowance would actually let
-		// through -- so this also asserts the response does NOT contain
-		// that text.
+	t.Run("hub token of a group owner without the system binding is denied at project access", func(t *testing.T) {
+		// The fixture matches the positive case above (OwnerID == caller)
+		// except that the caller holds no group.addMember system binding.
+		// The token is a hub-boundary row carrying group:addMember, so it
+		// passes the ceiling and boundary eligibility stages. The group is
+		// homed in a project the caller is not a member of, so the bearer
+		// gate denies at the project access stage, before group ownership
+		// is considered by the kernel, relationship grants or the handler's
+		// own role-hierarchy check. The response therefore must not carry
+		// the handler's "Only group owners or admins can add members" text.
 		srv, s := testServer(t)
 		ctx := context.Background()
 		projectID := tid("uatp-groupaddmember-nobind-project")
@@ -1381,13 +1357,19 @@ func TestProjectUAT_GroupAddMemberExactSystemPermissionAtRealRoute(t *testing.T)
 		}
 		require.NoError(t, s.CreateGroup(ctx, group))
 
-		uatKey := uatpInsertLegacyToken(t, s, userID, projectID, []string{"group:addMember"})
-		rec := doRequestWithUAT(t, srv, uatKey, http.MethodPost, "/api/v1/groups/"+group.ID+"/members",
+		hubKey := uatpInsertHubToken(t, s, userID, []string{"group:addMember"})
+		rec := doRequestWithUAT(t, srv, hubKey, http.MethodPost, "/api/v1/groups/"+group.ID+"/members",
 			map[string]any{"memberType": "user", "memberId": targetID, "role": "member"})
 		assert.Equal(t, http.StatusForbidden, rec.Code,
-			"group ownership alone must not satisfy the project-access gate: %s", rec.Body.String())
+			"group ownership alone does not satisfy project access: %s", rec.Body.String())
 		assert.NotContains(t, rec.Body.String(), "Only group owners or admins can add members",
-			"denial must come from the project-access gate, not from the handler's owner-allowed role-hierarchy check: %s", rec.Body.String())
+			"the bearer gate denies before the handler's role-hierarchy check: %s", rec.Body.String())
+		hubToken, err := srv.uatService.ValidateToken(ctx, hubKey)
+		require.NoError(t, err)
+		require.Equal(t, BoundaryKindHub, hubToken.Boundary().Kind)
+		eval := srv.authzService.EvaluateBearerCeiling(ctx, principalContextForIdentity(bearerUser(userID)), hubToken.Boundary(), hubToken.Ceiling(), "group.addMember", groupResource(group), BearerOptions{})
+		assert.False(t, eval.Decision.Allowed)
+		assert.Equal(t, BearerStageProjectAccess, eval.Stage, eval.Decision.Reason)
 	})
 }
 

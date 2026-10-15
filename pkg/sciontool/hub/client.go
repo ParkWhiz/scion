@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,7 +37,9 @@ import (
 	"time"
 
 	state "github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/conduit/clock"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/backoff"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/dirfd"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
@@ -69,6 +72,9 @@ const (
 	EnvHubToken = "SCION_AUTH_TOKEN"
 	// EnvAgentID is the environment variable for the agent ID.
 	EnvAgentID = "SCION_AGENT_ID"
+	// EnvLaunchID is the environment variable for the agent's run (launch)
+	// id, set by the broker.
+	EnvLaunchID = "SCION_LAUNCH_ID"
 	// EnvAgentMode is the environment variable for the agent mode.
 	EnvAgentMode = "SCION_AGENT_MODE"
 
@@ -155,6 +161,12 @@ type StatusUpdate struct {
 
 	// Exit tracking
 	ExitCode *int `json:"exitCode,omitempty"`
+
+	// SSHHostKey is the public key (authorized_keys line) of the agent's
+	// conduit SSH server host key. The hub records it with the conduit
+	// experiment on; the reported host key is bound to the reporting
+	// agent's current run.
+	SSHHostKey string `json:"sshHostKey,omitempty"`
 }
 
 // Client is a Hub API client for sciontool.
@@ -182,6 +194,24 @@ type Client struct {
 	// contract.
 	tokenChownUID int
 	tokenChownGID int
+	// runID is the agent's run id (EnvLaunchID), sent as RunIDHeader.
+	runID string
+	// writes paces status writes after the hub refuses the agent's token.
+	writes writeGate
+	// refreshKick holds at most one pending KickTokenRefresh for the
+	// refresh loop, so kicks coalesce. Created on first use.
+	refreshKickOnce sync.Once
+	refreshKick     chan struct{}
+	// refreshSubs are notified of each refresh attempt the loop makes
+	// (SubscribeTokenRefresh), keyed by registration.
+	refreshSubsMu sync.Mutex
+	refreshSubs   map[uint64]func(TokenRefreshResult)
+	refreshSubSeq uint64
+	// refreshSeq is the Seq of the last refresh attempt's result.
+	refreshSeq atomic.Uint64
+	// onKickWait, when set, is called by KickTokenRefreshWait once it has
+	// subscribed and kicked (test hook).
+	onKickWait func()
 }
 
 // NewClient creates a new Hub client from environment variables.
@@ -220,6 +250,7 @@ func NewClient() *Client {
 		hubURL:         hubURL,
 		token:          token,
 		agentID:        agentID,
+		runID:          os.Getenv(EnvLaunchID),
 		maxRetries:     DefaultMaxRetries,
 		retryBaseDelay: DefaultRetryBaseDelay,
 		retryMaxDelay:  DefaultRetryMaxDelay,
@@ -316,7 +347,16 @@ func (c *Client) UpdateStatus(ctx context.Context, status StatusUpdate) error {
 	return c.postJSONWithRetry(ctx, endpoint, body)
 }
 
+// ReportSSHHostKey sends the conduit SSH server's public host key
+// (authorized_keys line) in a status update carrying nothing else.
+func (c *Client) ReportSSHHostKey(ctx context.Context, publicKey string) error {
+	return c.UpdateStatus(ctx, StatusUpdate{SSHHostKey: publicKey})
+}
+
 func (c *Client) postJSONWithRetry(ctx context.Context, endpoint string, body []byte) error {
+	if err := c.writes.allow(); err != nil {
+		return err
+	}
 	// Read token under lock to avoid data race with concurrent RefreshToken calls.
 	c.tokenMu.RLock()
 	currentToken := c.token
@@ -343,7 +383,7 @@ func (c *Client) postJSONWithRetry(ctx context.Context, endpoint string, body []
 		}
 
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Scion-Agent-Token", currentToken)
+		c.setAgentAuth(req.Header, currentToken)
 
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -359,6 +399,7 @@ func (c *Client) postJSONWithRetry(ctx context.Context, endpoint string, body []
 		// Read response body
 		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		c.writes.observe(resp.StatusCode)
 
 		// Success
 		if resp.StatusCode < 400 {
@@ -464,7 +505,7 @@ func (c *Client) RegisterPort(ctx context.Context, req RegisterPortRequest) (*Ex
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	c.setAgentAuth(httpReq.Header, c.AuthToken())
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -472,7 +513,7 @@ func (c *Client) RegisterPort(ctx context.Context, req RegisterPortRequest) (*Ex
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+		return nil, &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	var out ExposedPort
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -491,7 +532,7 @@ func (c *Client) ListPorts(ctx context.Context) ([]ExposedPort, error) {
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	c.setAgentAuth(httpReq.Header, c.AuthToken())
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -499,7 +540,7 @@ func (c *Client) ListPorts(ctx context.Context) ([]ExposedPort, error) {
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+		return nil, &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	var out ListPortsResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -520,7 +561,7 @@ func (c *Client) DeletePort(ctx context.Context, port int) error {
 	if err != nil {
 		return err
 	}
-	httpReq.Header.Set("X-Scion-Agent-Token", c.AuthToken())
+	c.setAgentAuth(httpReq.Header, c.AuthToken())
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return err
@@ -528,9 +569,28 @@ func (c *Client) DeletePort(ctx context.Context, port int) error {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+		return &StatusError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 	return nil
+}
+
+// StatusError is returned by the port API methods when the hub answers
+// with an unexpected HTTP status. Its message keeps the
+// "hub returned error <code>: <body>" form used by the other methods.
+type StatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("hub returned error %d: %s", e.StatusCode, e.Body)
+}
+
+// IsUnauthorized reports whether err carries an HTTP 401 from the hub,
+// meaning the hub did not accept the agent's current credential.
+func IsUnauthorized(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusUnauthorized
 }
 
 func (c *Client) absoluteURL(path string) string {
@@ -575,7 +635,7 @@ func (c *Client) SetSecret(ctx context.Context, key, value, secretType, target, 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -631,7 +691,7 @@ func (c *Client) GetSecret(ctx context.Context, key string) (*GetSecretResponse,
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -682,7 +742,7 @@ func (c *Client) ListSecrets(ctx context.Context) (*ListSecretsResponse, error) 
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -747,7 +807,7 @@ func (c *Client) RefreshToken(ctx context.Context) (string, time.Time, error) {
 		return "", time.Time{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -764,6 +824,7 @@ func (c *Client) RefreshToken(ctx context.Context) (string, time.Time, error) {
 		// "token refresh failed with status %d" wording is preserved for the
 		// non-auth path because existing log-based tooling matches on it.
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			c.writes.refreshRefused()
 			return "", time.Time{}, fmt.Errorf("%w: token refresh failed with status %d: %s",
 				ErrTokenRefreshUnauthorized, resp.StatusCode, string(respBody))
 		}
@@ -786,6 +847,7 @@ func (c *Client) RefreshToken(ctx context.Context) (string, time.Time, error) {
 	c.token = result.Token
 	chownUID, chownGID := c.tokenChownUID, c.tokenChownGID
 	c.tokenMu.Unlock()
+	c.writes.reset()
 
 	// Persist the new token to a file so child processes can read it.
 	// Errors are non-fatal — the in-memory token is already updated.
@@ -936,6 +998,122 @@ type TokenRefreshConfig struct {
 	// RetryMaxDelay overrides the cap on backoff between failed refresh attempts.
 	// Zero uses tokenRefreshRetryMaxDelay.
 	RetryMaxDelay time.Duration
+
+	// clock drives the loop's schedule (tests); nil uses the real clock.
+	clock clock.Clock
+	// onWait, when set, is called each time the loop starts waiting,
+	// with the time it will refresh unless kicked, whether a kick can
+	// wake it, and the number of kicks pending (test hook).
+	onWait func(refreshAt time.Time, kickable bool, pending int)
+}
+
+// KickTokenRefresh queues a refresh request for the loop started by
+// StartTokenRefresh. It never blocks and never refreshes itself: kicks
+// coalesce into at most one pending request, which the loop serves at
+// once while it waits for a scheduled refresh, and only once a failure
+// backoff has elapsed while it is backing off. A refresh satisfies every
+// kick that arrived before it started. A kick made before the loop
+// starts, or while no loop runs (for example when the token's expiry
+// cannot be parsed), stays pending until one starts.
+func (c *Client) KickTokenRefresh() {
+	select {
+	case c.refreshKicks() <- struct{}{}:
+	default: // a kick is already pending
+	}
+}
+
+// TokenRefreshResult is the outcome of one refresh attempt made by the
+// loop started by StartTokenRefresh.
+type TokenRefreshResult struct {
+	// Token is the refreshed agent token ("" when Err is set).
+	Token string
+	// ExpiresAt is the refreshed token's expiry (zero when Err is set).
+	ExpiresAt time.Time
+	// Err is why the attempt failed (nil on success).
+	Err error
+	// Seq numbers the client's refresh attempts in the order they
+	// completed, from 1. Results reach subscribers in that order, but a
+	// subscriber that hands them to other goroutines can use Seq to tell
+	// a newer token from an older one (two tokens can share an expiry).
+	Seq uint64
+}
+
+// SubscribeTokenRefresh registers fn to be called with the result of
+// every refresh attempt the refresh loop completes, successful or not,
+// until the returned function is called. fn runs on the loop's goroutine
+// after the client holds the new token, so it must not block; it is how
+// other components learn of a new token without the loop knowing about
+// them.
+func (c *Client) SubscribeTokenRefresh(fn func(TokenRefreshResult)) (unsubscribe func()) {
+	c.refreshSubsMu.Lock()
+	defer c.refreshSubsMu.Unlock()
+	if c.refreshSubs == nil {
+		c.refreshSubs = make(map[uint64]func(TokenRefreshResult))
+	}
+	c.refreshSubSeq++
+	id := c.refreshSubSeq
+	c.refreshSubs[id] = fn
+	return func() {
+		c.refreshSubsMu.Lock()
+		delete(c.refreshSubs, id)
+		c.refreshSubsMu.Unlock()
+	}
+}
+
+// notifyTokenRefresh calls every subscriber with r, outside the lock.
+func (c *Client) notifyTokenRefresh(r TokenRefreshResult) {
+	c.refreshSubsMu.Lock()
+	subs := make([]func(TokenRefreshResult), 0, len(c.refreshSubs))
+	for _, fn := range c.refreshSubs {
+		subs = append(subs, fn)
+	}
+	c.refreshSubsMu.Unlock()
+	for _, fn := range subs {
+		fn(r)
+	}
+}
+
+// ErrTokenRefreshWaitTimeout is returned by KickTokenRefreshWait when no
+// refresh attempt completed within its bound.
+var ErrTokenRefreshWaitTimeout = errors.New("token refresh did not complete in time")
+
+// KickTokenRefreshWait kicks the refresh loop (KickTokenRefresh) and
+// waits, for at most bound, for the result of the next refresh attempt
+// the loop completes. A kick that coalesces with a refresh already in
+// flight returns that refresh's result. It never refreshes itself, so
+// refreshes stay single-flight in the loop. It returns the attempt's
+// error, ErrTokenRefreshWaitTimeout when bound elapses first (for
+// example while the loop backs off after failures, or when no loop
+// runs), or ctx's error.
+func (c *Client) KickTokenRefreshWait(ctx context.Context, bound time.Duration) error {
+	done := make(chan error, 1)
+	unsubscribe := c.SubscribeTokenRefresh(func(r TokenRefreshResult) {
+		select {
+		case done <- r.Err:
+		default: // an earlier attempt already answered
+		}
+	})
+	defer unsubscribe()
+	// Subscribed before the kick, so an attempt already in flight answers.
+	c.KickTokenRefresh()
+	if c.onKickWait != nil {
+		c.onKickWait()
+	}
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return ErrTokenRefreshWaitTimeout
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) refreshKicks() chan struct{} {
+	c.refreshKickOnce.Do(func() { c.refreshKick = make(chan struct{}, 1) })
+	return c.refreshKick
 }
 
 // DefaultTokenRefreshTimeout is the default timeout for token refresh requests.
@@ -955,22 +1133,24 @@ const (
 
 // tokenRefreshBackoff returns the delay before the next refresh retry after the
 // given number of consecutive failures, using exponential backoff (starting at
-// base, doubling each attempt) capped at max.
-func tokenRefreshBackoff(consecutiveFailures int, base, max time.Duration) time.Duration {
-	if consecutiveFailures < 1 {
-		consecutiveFailures = 1
-	}
-	delay := base
+// base, doubling each attempt) capped at limit. It is the delay the refresh
+// loop gets from the shared backoff helper after that many failures. Unlike
+// the helper-free version it replaced, it returns base when limit < base and
+// starts from the helper's default base when base <= 0; the loop reaches
+// neither case (its base is always positive and its limit at least its base).
+func tokenRefreshBackoff(consecutiveFailures int, base, limit time.Duration) time.Duration {
+	b := newTokenRefreshBackoff(base, limit)
+	d := b.Failure()
 	for i := 1; i < consecutiveFailures; i++ {
-		delay *= 2
-		if delay >= max {
-			return max
-		}
+		d = b.Failure()
 	}
-	if delay > max {
-		delay = max
-	}
-	return delay
+	return d
+}
+
+// newTokenRefreshBackoff returns the refresh loop's retry policy: doubling
+// from base to limit, without jitter.
+func newTokenRefreshBackoff(base, limit time.Duration) *backoff.Backoff {
+	return &backoff.Backoff{Base: base, Max: limit}
 }
 
 // StartTokenRefresh starts a background goroutine that refreshes the agent token
@@ -1004,6 +1184,12 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 		retryMax = retryBase
 	}
 
+	clk := clock.Real()
+	if config != nil && config.clock != nil {
+		clk = config.clock
+	}
+	kicks := c.refreshKicks()
+
 	if config != nil {
 		c.tokenMu.Lock()
 		c.tokenChownUID = config.ChownUID
@@ -1032,25 +1218,44 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 		// adjustRefreshForTransportTokens picks the earlier deadline.
 		refreshAt = c.adjustRefreshForTransportTokens(refreshAt)
 		consecutiveFailures := 0
+		retry := newTokenRefreshBackoff(retryBase, retryMax)
 		authLostNotified := false
 
 		for {
-			delay := time.Until(refreshAt)
+			delay := refreshAt.Sub(clk.Now())
 			if delay < 0 {
 				delay = 0
 			}
-			timer := time.NewTimer(delay)
+			timer, stopTimer := clock.After(clk, delay)
+			// A kick wakes the loop only while it waits for a scheduled
+			// refresh. During a failure backoff it stays pending and is
+			// served when the backoff ends.
+			var kick <-chan struct{}
+			if consecutiveFailures == 0 {
+				kick = kicks
+			}
+			if config != nil && config.onWait != nil {
+				config.onWait(refreshAt, kick != nil, len(kicks))
+			}
 
 			select {
 			case <-ctx.Done():
-				timer.Stop()
+				stopTimer()
 				return
-			case <-timer.C:
+			case <-timer:
+			case <-kick:
+				stopTimer()
+			}
+			// This refresh satisfies any kick that arrived before it.
+			select {
+			case <-kicks:
+			default:
 			}
 
 			refreshCtx, cancel := context.WithTimeout(ctx, timeout)
-			_, newExpiry, err := c.RefreshToken(refreshCtx)
+			newToken, newExpiry, err := c.RefreshToken(refreshCtx)
 			cancel()
+			c.notifyTokenRefresh(TokenRefreshResult{Token: newToken, ExpiresAt: newExpiry, Err: err, Seq: c.refreshSeq.Add(1)})
 
 			if err != nil {
 				if config != nil && config.OnError != nil {
@@ -1065,7 +1270,7 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 				// or a fresh token is injected. The previous implementation reset
 				// the expiry estimate on every retry, so OnAuthLost never fired and
 				// the loop hot-looped every 30s indefinitely.
-				if !authLostNotified && !time.Now().Before(tokenExpiry) {
+				if !authLostNotified && !clk.Now().Before(tokenExpiry) {
 					authLostNotified = true
 					if config != nil && config.OnAuthLost != nil {
 						config.OnAuthLost()
@@ -1073,13 +1278,14 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 				}
 
 				consecutiveFailures++
-				refreshAt = time.Now().Add(tokenRefreshBackoff(consecutiveFailures, retryBase, retryMax))
+				refreshAt = clk.Now().Add(retry.Failure())
 				continue
 			}
 
 			// Successful refresh: reset failure tracking and clear any prior
 			// auth-lost state so a later loss is reported again.
 			consecutiveFailures = 0
+			retry.Reset()
 			authLostNotified = false
 			tokenExpiry = newExpiry
 
@@ -1094,9 +1300,9 @@ func (c *Client) StartTokenRefresh(ctx context.Context, config *TokenRefreshConf
 			// to drive refresh timing (transport tokens ~1h need a tighter margin).
 			refreshAt = c.adjustRefreshForTransportTokens(refreshAt)
 
-			if refreshAt.Before(time.Now()) {
+			if refreshAt.Before(clk.Now()) {
 				// Token duration is very short; refresh in 1 minute
-				refreshAt = time.Now().Add(1 * time.Minute)
+				refreshAt = clk.Now().Add(1 * time.Minute)
 			}
 		}
 	}()
@@ -1120,6 +1326,7 @@ func (c *Client) SetToken(token string) {
 	c.tokenMu.Lock()
 	c.token = token
 	c.tokenMu.Unlock()
+	c.writes.reset()
 }
 
 // Environment variable and file path constants for GitHub App token refresh.
@@ -1165,7 +1372,7 @@ func (c *Client) RefreshGitHubToken(ctx context.Context) (string, time.Time, err
 		return "", time.Time{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1937,12 +2144,19 @@ func ChownTokenFile(uid, gid int) error {
 }
 
 // tokenFileMaxBytes bounds readTokenFileGuarded's read: the agent token is
-// a compact JWT-style string, so anything this long already isn't a token
-// this process (or the host-side agent manager) wrote.
+// a compact JWT-style string, so anything longer already isn't a token
+// this process (or the host-side agent manager) wrote. A longer file is
+// refused, not truncated.
 const tokenFileMaxBytes = 8192
 
+// warnTokenFile reports a token file that exists but was refused (for
+// example because it exceeds tokenFileMaxBytes), so a refusal is visible
+// rather than a silent empty token. A package var so tests can observe it.
+var warnTokenFile = log.Warn
+
 // ReadTokenFile reads the agent token from the canonical token file.
-// Returns empty string if the file doesn't exist or can't be read.
+// Returns empty string if the file doesn't exist or can't be read; a file
+// that exceeds the size limit is also refused, with a warning.
 //
 // This runs inside sciontool init, which is root for its whole life, so
 // the read goes through the same symlink-safe path WriteFileNoFollowChown
@@ -1953,6 +2167,10 @@ const tokenFileMaxBytes = 8192
 func ReadTokenFile() string {
 	token, err := readTokenFileGuarded(TokenFilePath())
 	if err != nil {
+		if errors.Is(err, dirfd.ErrTooLarge) {
+			// err already names the path.
+			warnTokenFile("Ignoring token file: %v", err)
+		}
 		return ""
 	}
 	token = strings.TrimSpace(token)
@@ -1960,6 +2178,32 @@ func ReadTokenFile() string {
 		return ""
 	}
 	return token
+}
+
+// ReadTokenFileUnder reads an agent token file at base/rel, for a caller
+// (the scion CLI) that resolves the file from its own home directory
+// rather than from TokenFilePath. base is trusted and opened normally, so
+// a home directory reached through a linked prefix still works; every
+// component of rel is opened without following a symbolic link. The file
+// itself gets exactly the checks ReadTokenFile applies (single-link regular
+// file, size limit, and the optional owner check), through the same
+// implementation.
+//
+// It returns the trimmed token, or an error: fs.ErrNotExist (wrapped) when
+// the file or a directory on the way to it does not exist, and
+// dirfd.ErrTooLarge or dirfd.ErrNotSingleLinkRegular (wrapped) when the
+// file is refused.
+func ReadTokenFileUnder(base, rel string) (string, error) {
+	dirFd, leaf, err := dirfd.OpenParentNoFollowUnder(base, rel)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = syscall.Close(dirFd) }()
+	token, err := readTokenAt(dirFd, leaf, filepath.Join(base, rel))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(token), nil
 }
 
 // readTokenFileGuarded resolves path through the dirfd parent-directory
@@ -1982,32 +2226,23 @@ func readTokenFileGuarded(path string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = syscall.Close(dirFd) }()
+	return readTokenAt(dirFd, leaf, path)
+}
 
+// readTokenAt applies the token-file checks to leaf, relative to the
+// already-resolved parent directory dirFd; path is used only in errors.
+func readTokenAt(dirFd int, leaf, path string) (string, error) {
 	var dirSt syscall.Stat_t
 	if err := syscall.Fstat(dirFd, &dirSt); err != nil {
 		return "", fmt.Errorf("failed to stat parent directory of %s: %w", path, err)
 	}
 
-	f, err := dirfd.OpenAt(dirFd, leaf, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	data, st, err := dirfd.ReadAtNoFollowStat(dirFd, leaf, tokenFileMaxBytes)
 	if err != nil {
-		return "", err
-	}
-	defer func() { _ = f.Close() }()
-
-	var st syscall.Stat_t
-	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
-		return "", fmt.Errorf("failed to stat %s: %w", path, err)
-	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFREG || st.Nlink != 1 {
-		return "", fmt.Errorf("refusing to read %s: not a single-link regular file", path)
+		return "", fmt.Errorf("%s: %w", path, err)
 	}
 	if enforceTokenFileOwnerChecks.Load() && st.Uid != 0 && st.Uid != dirSt.Uid {
 		return "", fmt.Errorf("refusing to read %s: unexpected owner", path)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(f, tokenFileMaxBytes))
-	if err != nil {
-		return "", fmt.Errorf("failed to read %s: %w", path, err)
 	}
 	return string(data), nil
 }
@@ -2044,7 +2279,7 @@ func (c *Client) SendSelfMessage(ctx context.Context, msg *messages.StructuredMe
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -2139,7 +2374,7 @@ func (c *Client) FetchGCPToken(ctx context.Context, scopes []string) (*GCPAccess
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -2183,7 +2418,7 @@ func (c *Client) FetchGCPIdentityToken(ctx context.Context, audience string) (st
 		return "", fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -2237,7 +2472,7 @@ func (c *Client) RequestIdentityToken(ctx context.Context, audience string) (*Id
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -2268,6 +2503,9 @@ type AgentSelf struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Ancestry    []string          `json:"ancestry,omitempty"`
 	TaskSummary string            `json:"taskSummary,omitempty"`
+	// MessageMode is the agent's effective message mode (none, lineage,
+	// branch, project, hub) as stored on the Hub.
+	MessageMode string `json:"messageMode,omitempty"`
 	// CreatedBy is the ID of the principal (user or agent) that created
 	// this agent.
 	CreatedBy string `json:"createdBy,omitempty"`
@@ -2294,7 +2532,7 @@ func (c *Client) GetSelf(ctx context.Context) (*AgentSelf, error) {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -2314,6 +2552,59 @@ func (c *Client) GetSelf(ctx context.Context) (*AgentSelf, error) {
 	}
 
 	return &result, nil
+}
+
+// GetExperiments fetches the hub's experiment map, read live from GET
+// /api/v1/experiments: every registered web-layer experiment and whether it
+// is on now (this includes server-checked ones such as hub.artifacts). It
+// returns the enabled names, sorted. Unlike SCION_HUB_EXPERIMENTS, which is
+// fixed at start and lists only the experiments dispatched to the agent,
+// the answer is current (ptone/scion#4573).
+func (c *Client) GetExperiments(ctx context.Context) ([]string, error) {
+	if !c.IsConfigured() {
+		return nil, fmt.Errorf("hub client not configured")
+	}
+
+	endpoint := strings.TrimSuffix(c.hubURL, "/") + "/api/v1/experiments"
+
+	c.tokenMu.RLock()
+	currentToken := c.token
+	c.tokenMu.RUnlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	c.setAgentAuth(req.Header, currentToken)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("hub returned error %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Experiments map[string]bool `json:"experiments"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	enabled := []string{}
+	for name, on := range result.Experiments {
+		if on {
+			enabled = append(enabled, name)
+		}
+	}
+	sort.Strings(enabled)
+	return enabled, nil
 }
 
 // --- Agent secret fetch (P2d, #127) ---
@@ -2376,7 +2667,7 @@ func (c *Client) FetchSecrets(ctx context.Context, keys []string) (*SecretFetchR
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Scion-Agent-Token", currentToken)
+	c.setAgentAuth(req.Header, currentToken)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

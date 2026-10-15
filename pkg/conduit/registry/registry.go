@@ -17,6 +17,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
@@ -202,6 +203,16 @@ func (r *Registry) SetSessionDraining(ctx context.Context, sessionID string) err
 	return r.store.SetSessionDraining(ctx, sessionID)
 }
 
+// SetRelaySessionsDraining marks every session of this relay generation
+// draining in one write (planned relay drain). Generation-fenced: a stale
+// generation updates nothing and returns ErrRelaySuperseded.
+func (r *Registry) SetRelaySessionsDraining(ctx context.Context, instanceID string, gen int64) (int, error) {
+	if instanceID == "" || gen <= 0 {
+		return 0, fmt.Errorf("%w: relay session drain needs instance_id and a positive generation", ErrInvalidInput)
+	}
+	return r.store.SetRelaySessionsDraining(ctx, instanceID, gen)
+}
+
 // DeleteSessionCAS deletes a session row only if it was created by
 // relayInstanceID in generation relayGen. A stale generation (e.g. an old
 // disconnect arriving after replacement) deletes nothing.
@@ -330,8 +341,9 @@ func checkWant(principalKind string, w Want) (Reason, error) {
 // only ranked after sessions on non-draining relays, so draining a relay
 // never makes a principal unreachable before it has reconnected elsewhere.
 // Exclusion during a drain happens at the session level: the relay marks
-// each session draining (SetSessionDraining) when it sends GoAway, and
-// draining sessions are filtered out.
+// a session draining (SetSessionDraining, or SetRelaySessionsDraining for
+// every session of its generation on shutdown) before it sends GoAway,
+// and draining sessions are filtered out.
 func (r *Registry) Eligible(ctx context.Context, principalKind, principalID string, w Want, now time.Time) ([]SessionRecord, error) {
 	switch principalKind {
 	case PrincipalAgent, PrincipalBroker:
@@ -453,12 +465,48 @@ func (r *Registry) liveness(v SessionView, now time.Time) Reason {
 		return ReasonRelayMissing
 	case v.Relay.Generation != v.Session.RelayGeneration:
 		return ReasonRelaySuperseded
-	case now.Sub(v.Relay.LastSeen) > r.cfg.RelayStaleAfter:
+	case r.relayStale(*v.Relay, now):
 		return ReasonRelayStale
 	case now.Sub(v.Session.LastSeen) > r.cfg.SessionStaleAfter:
 		return ReasonSessionStale
 	}
 	return ReasonOK
+}
+
+// relayStale is the one relay staleness rule: a relay whose last_seen is
+// older than Config.RelayStaleAfter is dead, and so is every session it
+// holds. Session liveness and relay eligibility both use it.
+func (r *Registry) relayStale(ri RelayInstance, now time.Time) bool {
+	return now.Sub(ri.LastSeen) > r.cfg.RelayStaleAfter
+}
+
+// RelayTransports lists the transports a separate relay serves (design
+// §3.9: ws only while grpc is frozen). Relay rows do not record their
+// transports: every relay serves exactly these.
+var RelayTransports = []string{TransportWS}
+
+// EligibleRelays returns the relays a new session for transport may be
+// placed on (design §3.9 "Relay selection"): live by relayStale, not
+// draining, addressable (a non-empty internal_endpoint) and serving
+// transport. It is the single eligibility filter: readiness reporting and
+// relay selection both use it. It fails closed on a read error.
+func (r *Registry) EligibleRelays(ctx context.Context, transport string, now time.Time) ([]RelayInstance, error) {
+	if !slices.Contains(RelayTransports, transport) {
+		return nil, nil
+	}
+	all, err := r.store.ListRelays(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now = now.UTC()
+	var out []RelayInstance
+	for _, ri := range all {
+		if r.relayStale(ri, now) || ri.Draining || ri.InternalEndpoint == "" {
+			continue
+		}
+		out = append(out, ri)
+	}
+	return out, nil
 }
 
 // EpochCurrent reports whether s holds the current connection_epoch for its

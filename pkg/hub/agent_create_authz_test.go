@@ -30,42 +30,6 @@ import (
 
 // --- helpers ---------------------------------------------------------------
 
-// createFixtureAgent stores an agent in the fixture project with the given
-// ancestry and applied role.
-func createFixtureAgent(t *testing.T, f *bypassAgentsFixture, name string, ancestry []string, role AgentRole) *store.Agent {
-	t.Helper()
-	a := &store.Agent{
-		ID: tid(name), Slug: tid(name), Name: name, ProjectID: f.proj.ID,
-		Phase: "running", CreatedBy: ancestry[0], OwnerID: ancestry[0], Ancestry: ancestry,
-		AppliedConfig: &store.AgentAppliedConfig{AgentRole: string(role)},
-	}
-	require.NoError(t, f.store.CreateAgent(context.Background(), a))
-	return a
-}
-
-// createAsAgent posts a child-agent create in the fixture project with a
-// token for agentID carrying the scopes of its stored role plus
-// ScopeAgentCreate.
-func createAsAgent(t *testing.T, f *bypassAgentsFixture, agentID string, req CreateAgentRequest) *httptest.ResponseRecorder {
-	t.Helper()
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
-	stored, err := f.store.GetAgent(context.Background(), agentID)
-	require.NoError(t, err)
-	role, _ := agentRoleAndScopes(stored)
-	scopes := append([]AgentTokenScope{ScopeProjectRead, ScopeAgentCreate}, ScopesForRole(role)...)
-	tok, err := svc.GenerateAgentToken(agentID, f.proj.ID, scopes, nil)
-	require.NoError(t, err)
-	return doRequestWithAgentToken(t, f.srv, http.MethodPost, "/api/v1/projects/"+f.proj.ID+"/agents", req, tok)
-}
-
-// grantFixtureRole binds userID to a seeded project role in the fixture
-// project.
-func grantFixtureRole(t *testing.T, f *bypassAgentsFixture, userID, role string) {
-	t.Helper()
-	grantProjectRole(t, f.store, userID, f.proj.ID, role)
-}
-
 // assertAgentCreateDenied asserts the neutral create 403 and whether it
 // carries the delegation-ceiling detail.
 func assertAgentCreateDenied(t *testing.T, rec *httptest.ResponseRecorder, ceiling bool) {
@@ -320,23 +284,21 @@ func TestAgentCreate_ScheduledCreatorRequiresLiveDelegator(t *testing.T) {
 		addProjectEdge(t, f.store, store.DelegationPrincipalUser, u.ID, a.ID, f.proj.ID)
 		return f, a, u
 	}
-	evt := func(f *bypassAgentsFixture, creatorID string) store.ScheduledEvent {
-		return store.ScheduledEvent{ID: "sched-dispatch", ProjectID: f.proj.ID, EventType: "dispatch_agent", CreatedBy: creatorID}
+	evt := func(t *testing.T, f *bypassAgentsFixture, creatorID string) store.ScheduledEvent {
+		return withAgentRevision(t, f.srv, store.ScheduledEvent{ID: "sched-dispatch", ProjectID: f.proj.ID, EventType: "dispatch_agent", CreatedBy: creatorID}, creatorID)
 	}
 
 	t.Run("live delegator", func(t *testing.T) {
 		f, a, _ := setup(t)
-		ok, err := f.srv.authorizeScheduledAgentCreate(context.Background(), evt(f, a.ID))
+		_, err := f.srv.authorizeScheduledAgentCreate(context.Background(), evt(t, f, a.ID))
 		require.NoError(t, err)
-		assert.True(t, ok)
 	})
 	t.Run("deleted delegator", func(t *testing.T) {
 		f, a, u := setup(t)
+		e := evt(t, f, a.ID)
 		require.NoError(t, f.store.DeleteUser(context.Background(), u.ID))
-		ok, err := f.srv.authorizeScheduledAgentCreate(context.Background(), evt(f, a.ID))
+		_, err := f.srv.authorizeScheduledAgentCreate(context.Background(), e)
 		require.Error(t, err)
-		assert.False(t, ok)
-		assert.Contains(t, err.Error(), "is not authorized to create agents")
 	})
 	t.Run("delegator without agent.create", func(t *testing.T) {
 		f := bypassAgentsSetup(t)
@@ -344,16 +306,15 @@ func TestAgentCreate_ScheduledCreatorRequiresLiveDelegator(t *testing.T) {
 		u := hubMemberUser(t, f.store, "sched-no-create")
 		a := createFixtureAgent(t, f, "sched-no-create-agent", []string{u.ID}, AgentRoleFull)
 		addProjectEdge(t, f.store, store.DelegationPrincipalUser, u.ID, a.ID, f.proj.ID)
-		ok, err := f.srv.authorizeScheduledAgentCreate(context.Background(), evt(f, a.ID))
+		_, err := f.srv.authorizeScheduledAgentCreate(context.Background(), evt(t, f, a.ID))
 		require.Error(t, err)
-		assert.False(t, ok)
 	})
 	t.Run("soft-deleted creator agent", func(t *testing.T) {
 		f, a, _ := setup(t)
+		e := evt(t, f, a.ID)
 		softDeleteStoredAgent(t, f.store, a.ID)
-		ok, err := f.srv.authorizeScheduledAgentCreate(context.Background(), evt(f, a.ID))
+		_, err := f.srv.authorizeScheduledAgentCreate(context.Background(), e)
 		require.Error(t, err)
-		assert.False(t, ok)
 	})
 }
 
@@ -504,10 +465,10 @@ func TestAgentCreate_AgentCreatorDefaultServiceAccountScope(t *testing.T) {
 			ctx := context.Background()
 			f.srv.seedProjectCreatorMembership(ctx, f.proj)
 			require.NoError(t, f.srv.createProjectOwnerRoleBinding(ctx, f.proj.ID, f.owner.ID))
-			err := f.srv.dispatchAgentEventHandler()(ctx, store.ScheduledEvent{
+			err := f.srv.dispatchAgentEventHandler()(ctx, withAgentRevision(t, f.srv, store.ScheduledEvent{
 				ID: "evt-dsa", ProjectID: f.proj.ID, EventType: "dispatch_agent",
 				Payload: `{"agentName":"dsa-sched","task":"t"}`, CreatedBy: f.caller.ID,
-			})
+			}, f.caller.ID))
 			if tc.allowed {
 				require.NoError(t, err)
 				return

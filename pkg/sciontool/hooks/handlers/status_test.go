@@ -6,6 +6,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -83,10 +84,10 @@ func TestStatusHandler_Handle(t *testing.T) {
 			wantActivity: "",
 		},
 		{
-			name:         "PostStart sets running/working",
+			name:         "PostStart sets running/initializing",
 			event:        &hooks.Event{Name: hooks.EventPostStart},
 			wantPhase:    "running",
-			wantActivity: "working",
+			wantActivity: "initializing",
 		},
 		{
 			name:         "SessionStart sets working activity",
@@ -397,12 +398,15 @@ func TestStatusHandler_Handle_CompletedLifecycle(t *testing.T) {
 	assert.Equal(t, "thinking", info.Activity)
 }
 
+// An agent-set waiting_for_input (sciontool status ask_user writes it with
+// UpdateActivity) is not cleared by tool-end. Only a waiting_for_input that
+// a Notification set is; see status_waiting_clear_test.go.
 func TestStatusHandler_Handle_ToolEndDoesNotClearWaiting(t *testing.T) {
 	tmpDir := t.TempDir()
 	statusPath := filepath.Join(tmpDir, "agent-info.json")
 	h := &StatusHandler{StatusPath: statusPath}
 
-	// Pre-set activity to waiting_for_input
+	// Pre-set activity to waiting_for_input, as sciontool status ask_user does
 	err := h.UpdateActivity(state.ActivityWaitingForInput, "")
 	require.NoError(t, err)
 
@@ -944,4 +948,231 @@ func TestStatusHandler_WriteUsesMode0644(t *testing.T) {
 	fi, err := os.Stat(statusPath)
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0644), fi.Mode().Perm())
+}
+
+// Every readiness event must move the local activity off initializing, so
+// `sciontool init` can use the local file to avoid overwriting a hook-set
+// activity.
+func TestStatusHandler_ReadinessEventsReplaceInitializing(t *testing.T) {
+	events := map[string]string{
+		hooks.EventSessionStart:     "working",
+		hooks.EventPromptSubmit:     "thinking",
+		hooks.EventAgentStart:       "thinking",
+		hooks.EventModelStart:       "thinking",
+		hooks.EventModelEnd:         "working",
+		hooks.EventToolStart:        "executing",
+		hooks.EventToolEnd:          "working",
+		hooks.EventAgentEnd:         "working",
+		hooks.EventNotification:     "waiting_for_input",
+		hooks.EventResponseComplete: "completed",
+	}
+	for name, want := range events {
+		t.Run(name, func(t *testing.T) {
+			statusPath := filepath.Join(t.TempDir(), "agent-info.json")
+			h := &StatusHandler{StatusPath: statusPath}
+			require.NoError(t, h.Handle(&hooks.Event{Name: hooks.EventPostStart}))
+			require.Equal(t, "initializing", readAgentInfo(t, statusPath).Activity)
+			require.NoError(t, h.Handle(&hooks.Event{Name: name, Data: hooks.EventData{ToolName: "Bash"}}))
+			assert.Equal(t, want, readAgentInfo(t, statusPath).Activity)
+		})
+	}
+}
+
+func TestStatusHandler_ReplaceActivityIf(t *testing.T) {
+	statusPath := filepath.Join(t.TempDir(), "agent-info.json")
+	h := &StatusHandler{StatusPath: statusPath}
+	require.NoError(t, h.UpdatePhase(state.PhaseRunning, state.ActivityInitializing, ""))
+
+	swapped, err := h.ReplaceActivityIf(state.ActivityInitializing, state.ActivityWorking)
+	require.NoError(t, err)
+	assert.True(t, swapped)
+	info := readAgentInfo(t, statusPath)
+	assert.Equal(t, "running", info.Phase)
+	assert.Equal(t, "working", info.Activity)
+	assert.Equal(t, state.ActivityWorking, h.CurrentActivity())
+
+	// A hook-set activity is left alone.
+	require.NoError(t, h.UpdateActivity(state.ActivityWaitingForInput, ""))
+	swapped, err = h.ReplaceActivityIf(state.ActivityInitializing, state.ActivityWorking)
+	require.NoError(t, err)
+	assert.False(t, swapped)
+	assert.Equal(t, "waiting_for_input", readAgentInfo(t, statusPath).Activity)
+}
+
+// A clear or compact session-start restarts the session inside the running
+// harness. It keeps blocked, completed, limits_exceeded, crashed and a
+// waiting_for_input the agent set itself, writes nothing locally and sends
+// no Hub update.
+func TestSessionStart_InPlaceKeepsSticky(t *testing.T) {
+	for _, source := range []string{"clear", "compact"} {
+		for _, held := range []state.Activity{
+			state.ActivityBlocked,
+			state.ActivityCompleted,
+			state.ActivityLimitsExceeded,
+			state.ActivityCrashed,
+			state.ActivityWaitingForInput, // agent-set: no notification marker
+		} {
+			t.Run(source+"/"+string(held), func(t *testing.T) {
+				sh, hh, sent := hubRecorderSetup(t)
+				require.NoError(t, sh.UpdateActivity(held, ""))
+				before := readAgentInfoMap(t, sh.StatusPath)
+
+				got, info := sessionStartStep(t, sh, hh, sent, claudeSessionStart(t, source))
+				assert.Equal(t, before, info, "local state unchanged")
+				assert.Equal(t, string(held), info["activity"])
+				assert.NotContains(t, info, activitySourceKey)
+				assert.Empty(t, got, "no Hub report")
+			})
+		}
+	}
+}
+
+// A clear or compact during init says nothing about readiness:
+// initializing is kept and no Hub update is sent.
+func TestSessionStart_InPlaceKeepsInitializing(t *testing.T) {
+	for _, source := range []string{"clear", "compact"} {
+		t.Run(source, func(t *testing.T) {
+			sh, hh, sent := hubRecorderSetup(t)
+			require.NoError(t, sh.Handle(&hooks.Event{Name: hooks.EventPostStart}))
+			before := readAgentInfoMap(t, sh.StatusPath)
+			require.Equal(t, "initializing", before["activity"])
+
+			got, info := sessionStartStep(t, sh, hh, sent, claudeSessionStart(t, source))
+			assert.Equal(t, before, info, "local state unchanged")
+			assert.Empty(t, got, "no Hub report")
+		})
+	}
+}
+
+// A clear or compact does not force working over a non-sticky activity.
+func TestSessionStart_InPlaceDoesNotForceWorking(t *testing.T) {
+	for _, source := range []string{"clear", "compact"} {
+		for _, current := range []state.Activity{state.ActivityThinking, state.ActivityExecuting, state.ActivityWorking} {
+			t.Run(source+"/"+string(current), func(t *testing.T) {
+				sh, hh, sent := hubRecorderSetup(t)
+				require.NoError(t, sh.UpdateActivity(current, ""))
+				before := readAgentInfoMap(t, sh.StatusPath)
+
+				got, info := sessionStartStep(t, sh, hh, sent, claudeSessionStart(t, source))
+				assert.Equal(t, before, info, "local state unchanged")
+				assert.Equal(t, string(current), info["activity"])
+				assert.Empty(t, got, "no Hub report")
+			})
+		}
+	}
+}
+
+// A clear or compact releases a notification-set waiting_for_input, with or
+// without a sub-agent owner list: the local activity becomes working with
+// the session-restart marker and no owner list, and the Hub gets
+// running/working "Session restarted (<source>)".
+func TestSessionStart_InPlaceReleasesNotificationWait(t *testing.T) {
+	for _, source := range []string{"clear", "compact"} {
+		for _, owners := range [][]string{nil, {"a0000000000000aa1", "a0000000000000bb2"}} {
+			t.Run(fmt.Sprintf("%s/%d owners", source, len(owners)), func(t *testing.T) {
+				sh, hh, sent := hubRecorderSetup(t)
+				require.NoError(t, sh.setWaitingFromNotificationFor(""))
+				for _, owner := range owners {
+					require.NoError(t, sh.setWaitingFromNotificationFor(owner))
+				}
+				info := readAgentInfoMap(t, sh.StatusPath)
+				require.Equal(t, activitySourceNotification, info[activitySourceKey])
+				require.Equal(t, owners, notificationWaitOwners(info))
+
+				got, info := sessionStartStep(t, sh, hh, sent, claudeSessionStart(t, source))
+				assert.Equal(t, "working", info["activity"])
+				assert.Equal(t, activitySourceSessionRestart, info[activitySourceKey])
+				assert.NotContains(t, info, notificationWaitAgentsKey)
+				assert.Equal(t, []hubReport{{Phase: "running", Activity: "working", Status: parentHeldWorking, Message: "Session restarted (" + source + ")"}}, got)
+			})
+		}
+	}
+}
+
+// A clear or compact over a wait that sub-agents hold and that also records
+// the parent's own question (parentWaitAgent) does not answer that question:
+// the owner list, the notification marker and parentWait are removed, the
+// parent's agent-set waiting_for_input is kept with no session-restart
+// marker, and no Hub update is sent.
+func TestSessionStart_InPlaceKeepsParentQuestionInOwnerHeldWait(t *testing.T) {
+	for _, source := range []string{"clear", "compact"} {
+		for _, owners := range [][]string{{"a0000000000000aa1"}, {"a0000000000000aa1", "a0000000000000bb2"}} {
+			t.Run(fmt.Sprintf("%s/%d owners", source, len(owners)), func(t *testing.T) {
+				sh, hh, sent := hubRecorderSetup(t)
+				for _, owner := range owners {
+					require.NoError(t, sh.setWaitingFromNotificationFor(owner))
+				}
+				require.NoError(t, sh.setParentQuestionWait())
+				info := readAgentInfoMap(t, sh.StatusPath)
+				require.Equal(t, activitySourceNotification, info[activitySourceKey])
+				require.Equal(t, owners, notificationWaitOwners(info))
+				require.Equal(t, parentWaitAgent, info[parentWaitKey])
+
+				got, info := sessionStartStep(t, sh, hh, sent, claudeSessionStart(t, source))
+				assert.Equal(t, "waiting_for_input", info["activity"], "the parent's question is still open")
+				assert.NotContains(t, info, activitySourceKey, "an agent-set wait, no session-restart marker")
+				assert.NotContains(t, info, notificationWaitAgentsKey)
+				assert.NotContains(t, info, parentWaitKey)
+				assert.Empty(t, got, "no Hub report")
+			})
+		}
+	}
+}
+
+// Every other source (new, missing or unknown) behaves as before: any held
+// status, including a notification wait with its owner list, becomes
+// working with no marker, and the Hub gets running/working "Session
+// started".
+func TestSessionStart_NewSourcesUnchanged(t *testing.T) {
+	for _, source := range []string{"startup", "resume", "new", "fork", "", "weird"} {
+		for _, held := range []string{"blocked", "completed", "limits_exceeded", "crashed", "waiting_for_input", "notification", "initializing", "thinking"} {
+			t.Run(source+"/"+held, func(t *testing.T) {
+				sh, hh, sent := hubRecorderSetup(t)
+				switch held {
+				case "notification":
+					require.NoError(t, sh.setWaitingFromNotificationFor("a0000000000000aa1"))
+				case "initializing":
+					require.NoError(t, sh.Handle(&hooks.Event{Name: hooks.EventPostStart}))
+				default:
+					require.NoError(t, sh.UpdateActivity(state.Activity(held), ""))
+				}
+
+				got, info := sessionStartStep(t, sh, hh, sent, claudeSessionStart(t, source))
+				assert.Equal(t, "working", info["activity"])
+				assert.NotContains(t, info, activitySourceKey)
+				assert.NotContains(t, info, notificationWaitAgentsKey)
+				assert.Equal(t, []hubReport{{Phase: "running", Activity: "working", Status: parentHeldWorking, Message: "Session started"}}, got)
+			})
+		}
+	}
+}
+
+// A sub-agent's clear or compact session-start takes the held sub-agent
+// path. Over a notification wait with no owner list it writes working, and
+// the Hub follows with running/working "Session restarted (<source>)". Over
+// a wait that a sibling sub-agent holds it changes nothing and sends no Hub
+// update.
+func TestSessionStart_InPlaceSubagentHubFollowsLocal(t *testing.T) {
+	for _, source := range []string{"clear", "compact"} {
+		t.Run(source+"/no-owner notification wait", func(t *testing.T) {
+			sh, hh, sent := hubRecorderSetup(t)
+			require.NoError(t, sh.setWaitingFromNotificationFor(""))
+
+			got, info := sessionStartStep(t, sh, hh, sent, parentHeldSessionStart(t, source, parentHeldSubB))
+			assert.Equal(t, "working", info["activity"])
+			assert.NotContains(t, info, activitySourceKey)
+			assert.NotContains(t, info, notificationWaitAgentsKey)
+			assert.Equal(t, []hubReport{{Phase: "running", Activity: "working", Status: parentHeldWorking, Message: "Session restarted (" + source + ")"}}, got)
+		})
+		t.Run(source+"/sibling-held wait", func(t *testing.T) {
+			sh, hh, sent := hubRecorderSetup(t)
+			require.NoError(t, sh.setWaitingFromNotificationFor(parentHeldSubA))
+			before := readAgentInfoMap(t, sh.StatusPath)
+
+			got, info := sessionStartStep(t, sh, hh, sent, parentHeldSessionStart(t, source, parentHeldSubB))
+			assert.Equal(t, before, info, "local state unchanged")
+			assert.Equal(t, []string{parentHeldSubA}, notificationWaitOwners(info))
+			assert.Empty(t, got, "no Hub report")
+		})
+	}
 }

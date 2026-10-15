@@ -34,6 +34,7 @@ import (
 // response, and later checks may rely on earlier ones having passed (the
 // export comparison needs both descriptors).
 const (
+	moveCheckRuntimeTarget     = "runtime_target"
 	moveCheckWorkspaceMode     = "workspace_mode"
 	moveCheckWorkspaceStorage  = "workspace_storage_reported"
 	moveCheckSameExport        = "same_export"
@@ -47,6 +48,7 @@ const (
 
 // moveCheckOrder lists every move eligibility check in evaluation order.
 var moveCheckOrder = []string{
+	moveCheckRuntimeTarget,
 	moveCheckWorkspaceMode,
 	moveCheckWorkspaceStorage,
 	moveCheckSameExport,
@@ -164,6 +166,15 @@ func evaluateMoveEligibility(in moveEligibilityInput) (MoveVerdict, *moveRefusal
 	}
 	src, dst := in.Src, in.Dst
 	srcName, dstName := brokerDisplayName(src), brokerDisplayName(dst)
+
+	// 0. Runtime target: a pinned agent, or a move from or onto a flat
+	// Runtime Broker, is not movable (flat Runtime Brokers serve a single
+	// runtime target; a permitted move would re-pin explicitly).
+	if in.Agent.IsPinned() || src.IsFlat() || dst.IsFlat() {
+		return fail(http.StatusConflict, ErrCodeRuntimeTargetMoveUnsupported,
+			"agents on flat Runtime Brokers, and moves onto a flat Runtime Broker, are not movable")
+	}
+	pass()
 
 	// 1. Workspace mode: the reincarnate workspace gate, plus no linked
 	// project (decided by the caller).
@@ -438,12 +449,10 @@ func writeMoveTargetAmbiguous(w http.ResponseWriter, target string, candidates [
 		map[string]interface{}{"requestedBroker": target, "candidates": summaries})
 }
 
-// isPluginBroker reports whether a broker record is a message-broker plugin
-// rather than a runtime broker.
-func isPluginBroker(b *store.RuntimeBroker) bool {
-	_, ok := b.Labels["scion.io/plugin"]
-	return ok
-}
+// pluginBrokerLabel marks a broker record that represents a message-broker
+// plugin (e.g. a chat integration) rather than a runtime broker. See
+// isPluginBroker in broker_kind.go.
+const pluginBrokerLabel = "scion.io/plugin"
 
 // moveTargetVisible reports whether the caller may learn that dst exists and
 // see its configuration in a move verdict. A broker the caller cannot see

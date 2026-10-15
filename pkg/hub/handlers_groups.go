@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -284,7 +285,7 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var ok bool
-		canDelegateResult, canDelegateReason, ok = s.authorizeGroupMemberGrant(w, r, parent, store.GroupMemberRoleMember)
+		canDelegateResult, canDelegateReason, ok = s.authorizeChildGroupGrant(w, r, parent)
 		if !ok {
 			return
 		}
@@ -321,11 +322,50 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 		CreatedBy:   createdBy,
 	}
 
-	if err := s.store.CreateGroup(ctx, group); err != nil {
+	// The creation-time provenance stamp comes from the request's
+	// principal, never from the request body.
+	if err := stampGroup(ctx, s.store, group, fixturePrincipalFromContext(ctx)); err != nil {
 		if parentEdge != nil {
 			s.releaseGroupMemberSlot(ctx, parentEdge.GroupID, parentEdge.MemberType, parentEdge.MemberID)
 		}
-		if err == store.ErrAlreadyExists {
+		if !writeFixtureRootError(w, err) {
+			writeErrorFromErr(w, err, "")
+		}
+		return
+	}
+
+	// The group, its parent membership, the creator's owner membership, and
+	// the audit record of each membership commit or roll back together.
+	if err := s.store.WithTx(ctx, func(tx store.Store) error {
+		if err := tx.CreateGroup(ctx, group); err != nil {
+			return err
+		}
+		if parentEdge != nil {
+			if err := s.auditGroupMemberAddTx(ctx, tx, parentEdge, canDelegateResult, canDelegateReason); err != nil {
+				return err
+			}
+		}
+		if createdBy == "" {
+			return nil
+		}
+		owner := &store.GroupMember{
+			GroupID:    group.ID,
+			MemberType: store.GroupMemberTypeUser,
+			MemberID:   createdBy,
+			Role:       store.GroupMemberRoleOwner,
+			AddedBy:    createdBy,
+		}
+		if err := tx.AddGroupMember(ctx, owner); err != nil {
+			return fmt.Errorf("add creator as group owner: %w", err)
+		}
+		// The creator's own owner membership runs no delegation check, so
+		// the record carries no CanDelegate result.
+		return s.auditGroupMemberAddTx(ctx, tx, owner, "", "")
+	}); err != nil {
+		if parentEdge != nil {
+			s.releaseGroupMemberSlot(ctx, parentEdge.GroupID, parentEdge.MemberType, parentEdge.MemberID)
+		}
+		if errors.Is(err, store.ErrAlreadyExists) {
 			Conflict(w, "Group with this slug already exists")
 			return
 		}
@@ -333,29 +373,11 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if parentEdge != nil {
-		s.auditGroupMemberAdd(ctx, parentEdge, canDelegateResult, canDelegateReason)
-	}
-
 	s.groupsLogger().Info("group created",
 		"group_id", group.ID,
 		"slug", group.Slug,
 		"group_type", group.GroupType,
 		"created_by", createdBy)
-
-	// Add the creating user as an owner of the new group
-	if createdBy != "" {
-		if err := s.store.AddGroupMember(ctx, &store.GroupMember{
-			GroupID:    group.ID,
-			MemberType: store.GroupMemberTypeUser,
-			MemberID:   createdBy,
-			Role:       store.GroupMemberRoleOwner,
-		}); err != nil && err != store.ErrAlreadyExists {
-			// Log but don't fail the group creation
-			s.groupsLogger().Warn("failed to add creator as owner of new group",
-				"group", group.ID, "user", createdBy, "error", err)
-		}
-	}
 
 	writeJSON(w, http.StatusCreated, group)
 }
@@ -454,6 +476,9 @@ func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request, id string) 
 	if !s.authorize(w, r, groupResource(group), ActionUpdate) {
 		return
 	}
+	if !s.requireSessionForRoleBoundGroup(w, r, group) {
+		return
+	}
 
 	var req UpdateGroupRequest
 	if err := readJSON(r, &req); err != nil {
@@ -515,6 +540,7 @@ func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request, id string) 
 	if req.Annotations != nil {
 		group.Annotations = req.Annotations
 	}
+	ownerChanged := req.OwnerID != "" && req.OwnerID != group.OwnerID
 	if req.OwnerID != "" {
 		group.OwnerID = req.OwnerID
 	}
@@ -522,6 +548,9 @@ func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request, id string) 
 	if err := s.store.UpdateGroup(ctx, group); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
+	}
+	if ownerChanged {
+		s.publishConduitAuthzChanged(conduitAuthzMatch{})
 	}
 
 	s.groupsLogger().Info("group updated",
@@ -565,17 +594,57 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request, id string) 
 		BadRequest(w, "project_agents groups are system-managed and cannot be deleted via API")
 		return
 	}
-
-	if err := s.store.DeleteGroup(ctx, group.ID); err != nil {
-		writeErrorFromErr(w, err, "")
+	if !s.requireSessionForRoleBoundGroup(w, r, group) {
 		return
 	}
 
+	// Users who may lose project access through this group are found
+	// before the delete and re-evaluated after it (ptone/scion#3433).
+	lossUsers, lossErr := transitiveGroupMemberUsers(ctx, s.store, group.ID)
+	if lossErr != nil {
+		writeErrorFromErr(w, lossErr, "")
+		return
+	}
+
+	// The group row, its memberships and child edges, the role bindings
+	// bound to it, and its audit record commit or roll back together. The
+	// loss enqueue and notification below run only after the commit.
+	if err := s.store.WithTx(ctx, func(tx store.Store) error {
+		if err := tx.DeleteGroup(ctx, group.ID); err != nil {
+			return err
+		}
+		return s.auditGroupDeleteTx(ctx, tx, group)
+	}); err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+	s.enqueueGroupChangeLoss(ctx, lossUsers)
+
+	s.publishConduitAuthzChanged(conduitAuthzMatch{})
 	s.groupsLogger().Info("group deleted",
 		"group_id", group.ID,
 		"slug", group.Slug)
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// auditGroupDeleteTx writes the group_delete mutation audit record for group
+// on tx, attributed to the request actor, so it commits or rolls back with
+// the delete.
+func (s *Server) auditGroupDeleteTx(ctx context.Context, tx store.Store, group *store.Group) error {
+	record := &store.MutationAuditRecord{
+		MutationType:  "group_delete",
+		TargetType:    "group",
+		TargetID:      group.ID,
+		BeforeSummary: marshalDeletionAuditJSON(map[string]string{"group_id": group.ID, "group_name": group.Name, "slug": group.Slug, "project_id": group.ProjectID}),
+	}
+	// The store stamps the record's time.
+	s.buildAuditActorFromContext(ctx).ApplyActor(record)
+	applyHubActorFallback(record)
+	if err := tx.CreateMutationAudit(ctx, record); err != nil {
+		return fmt.Errorf("audit group delete: %w", err)
+	}
+	return nil
 }
 
 // handleGroupMembers handles GET and POST on /api/v1/groups/{groupId}/members
@@ -688,8 +757,11 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 
 	// Authorization on the group: addMember, the role hierarchy, and the
 	// delegation check (see authorizeGroupMemberGrant).
-	canDelegateResult, canDelegateReason, ok := s.authorizeGroupMemberGrant(w, r, group, req.Role)
+	canDelegateResult, canDelegateReason, ok := s.authorizeGroupMemberGrant(w, r, group, req.Role, req.MemberType, req.MemberID)
 	if !ok {
+		return
+	}
+	if !s.requireSessionForRoleBoundGroup(w, r, group) {
 		return
 	}
 
@@ -791,17 +863,21 @@ func (s *Server) addGroupMember(w http.ResponseWriter, r *http.Request, group *s
 		return
 	}
 
-	if err := s.store.AddGroupMember(ctx, member); err != nil {
+	// The membership and its audit record commit or roll back together.
+	if err := s.store.WithTx(ctx, func(tx store.Store) error {
+		if err := tx.AddGroupMember(ctx, member); err != nil {
+			return err
+		}
+		return s.auditGroupMemberAddTx(ctx, tx, member, canDelegateResult, canDelegateReason)
+	}); err != nil {
 		s.releaseGroupMemberSlot(ctx, member.GroupID, member.MemberType, member.MemberID)
-		if err == store.ErrAlreadyExists {
+		if errors.Is(err, store.ErrAlreadyExists) {
 			Conflict(w, "Member already exists in this group")
 			return
 		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
-
-	s.auditGroupMemberAdd(ctx, member, canDelegateResult, canDelegateReason)
 
 	s.groupsLogger().Info("group member added",
 		"group_id", groupID,
@@ -859,18 +935,44 @@ func (s *Server) releaseGroupMemberSlot(ctx context.Context, groupID, memberType
 	s.quotaService.Release(ctx, store.LimitMaxMembersPerGroup, groupMembershipQuotaID(groupID, memberType, memberID))
 }
 
-// auditGroupMemberAdd writes the group_member_add mutation audit record for a
-// membership that was just created, with the CanDelegate result and reason
-// returned by authorizeGroupMemberGrant.
-func (s *Server) auditGroupMemberAdd(ctx context.Context, member *store.GroupMember, canDelegateResult, canDelegateReason string) {
-	s.emitMutationAudit(ctx, &store.MutationAuditRecord{
+// auditGroupMemberAddTx writes the group_member_add mutation audit record
+// for member on tx, attributed to the request actor, so it commits or rolls
+// back with the membership.
+func (s *Server) auditGroupMemberAddTx(ctx context.Context, tx store.Store, member *store.GroupMember, canDelegateResult, canDelegateReason string) error {
+	record := &store.MutationAuditRecord{
 		MutationType:      "group_member_add",
 		TargetType:        "group_membership",
 		TargetID:          member.GroupID,
 		AfterSummary:      `{"groupId":"` + member.GroupID + `","memberType":"` + member.MemberType + `","memberId":"` + member.MemberID + `","role":"` + member.Role + `"}`,
 		CanDelegateResult: canDelegateResult,
 		CanDelegateReason: canDelegateReason,
-	})
+	}
+	// The store stamps the record's time.
+	s.buildAuditActorFromContext(ctx).ApplyActor(record)
+	applyHubActorFallback(record)
+	if err := tx.CreateMutationAudit(ctx, record); err != nil {
+		return fmt.Errorf("audit group member add: %w", err)
+	}
+	return nil
+}
+
+// auditGroupMemberRemoveTx writes the group_member_remove mutation audit
+// record on tx, attributed to the request actor, so it commits or rolls back
+// with the removal.
+func (s *Server) auditGroupMemberRemoveTx(ctx context.Context, tx store.Store, groupID, memberType, memberID string) error {
+	record := &store.MutationAuditRecord{
+		MutationType:  "group_member_remove",
+		TargetType:    "group_membership",
+		TargetID:      groupID,
+		BeforeSummary: `{"groupId":"` + groupID + `","memberType":"` + memberType + `","memberId":"` + memberID + `"}`,
+	}
+	// The store stamps the record's time.
+	s.buildAuditActorFromContext(ctx).ApplyActor(record)
+	applyHubActorFallback(record)
+	if err := tx.CreateMutationAudit(ctx, record); err != nil {
+		return fmt.Errorf("audit group member remove: %w", err)
+	}
+	return nil
 }
 
 // authorizeGroupMemberGrant runs the authorization for adding a member with
@@ -885,7 +987,7 @@ func (s *Server) auditGroupMemberAdd(ctx context.Context, member *store.GroupMem
 //
 // On success it returns the CanDelegate result and reason for the audit
 // record.
-func (s *Server) authorizeGroupMemberGrant(w http.ResponseWriter, r *http.Request, group *store.Group, role string) (canDelegateResult, canDelegateReason string, ok bool) {
+func (s *Server) authorizeGroupMemberGrant(w http.ResponseWriter, r *http.Request, group *store.Group, role, memberType, memberID string) (canDelegateResult, canDelegateReason string, ok bool) {
 	ctx := r.Context()
 
 	// Only group owners, group admins or callers granted group.addMember
@@ -962,8 +1064,10 @@ func (s *Server) authorizeGroupMemberGrant(w http.ResponseWriter, r *http.Reques
 		actorIdentity := GetIdentityFromContext(ctx)
 		if actorIdentity != nil {
 			grantDesc := GrantDescriptor{
-				Type:    GrantTypeGroupMembership,
-				GroupID: group.ID,
+				Type:        GrantTypeGroupMembership,
+				GroupID:     group.ID,
+				GranteeType: memberType,
+				GranteeID:   memberID,
 			}
 			delegateDecision := s.authzService.CanDelegate(ctx, actorIdentity, grantDesc)
 			canDelegateResult = "allow"
@@ -977,6 +1081,22 @@ func (s *Server) authorizeGroupMemberGrant(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	return canDelegateResult, canDelegateReason, true
+}
+
+// authorizeChildGroupGrant runs the authorization for creating a group under
+// parent. The new group becomes a member of parent, so the caller needs the
+// authority authorizeGroupMemberGrant requires for a plain member, and the
+// group rule of requireSessionForRoleBoundGroup applies to parent. It writes
+// the refusal response and returns ok=false when the caller may not.
+func (s *Server) authorizeChildGroupGrant(w http.ResponseWriter, r *http.Request, parent *store.Group) (canDelegateResult, canDelegateReason string, ok bool) {
+	canDelegateResult, canDelegateReason, ok = s.authorizeGroupMemberGrant(w, r, parent, store.GroupMemberRoleMember, store.GroupMemberTypeGroup, "")
+	if !ok {
+		return "", "", false
+	}
+	if !s.requireSessionForRoleBoundGroup(w, r, parent) {
+		return "", "", false
+	}
 	return canDelegateResult, canDelegateReason, true
 }
 
@@ -1042,6 +1162,9 @@ func (s *Server) removeGroupMember(w http.ResponseWriter, r *http.Request, group
 	if !s.authorize(w, r, groupResource(group), ActionRemoveMember) {
 		return
 	}
+	if !s.requireSessionForRoleBoundGroup(w, r, group) {
+		return
+	}
 
 	// Constraint-coverage gate (R5): if this group participates in any
 	// AccessConstraint, removing a member silently relaxes that constraint.
@@ -1070,27 +1193,95 @@ func (s *Server) removeGroupMember(w http.ResponseWriter, r *http.Request, group
 		}
 	}
 
-	if err := s.store.RemoveGroupMember(ctx, group.ID, memberType, memberID); err != nil {
+	// Users who may lose project access through this membership are
+	// re-evaluated after the removal (ptone/scion#3433).
+	var lossUsers []string
+	switch memberType {
+	case store.GroupMemberTypeUser:
+		lossUsers = []string{memberID}
+	case store.GroupMemberTypeGroup:
+		var lossErr error
+		if lossUsers, lossErr = transitiveGroupMemberUsers(ctx, s.store, memberID); lossErr != nil {
+			writeErrorFromErr(w, lossErr, "")
+			return
+		}
+	}
+
+	// The removal and its audit record commit or roll back together. The
+	// loss enqueue, quota release and notification below run only after
+	// the commit.
+	if err := s.store.WithTx(ctx, func(tx store.Store) error {
+		if err := tx.RemoveGroupMember(ctx, group.ID, memberType, memberID); err != nil {
+			return err
+		}
+		return s.auditGroupMemberRemoveTx(ctx, tx, group.ID, memberType, memberID)
+	}); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
 	}
+	s.enqueueGroupChangeLoss(ctx, lossUsers)
 
 	// Release quota reservation for the removed member (best-effort).
 	s.releaseGroupMemberSlot(ctx, group.ID, memberType, memberID)
 
-	s.emitMutationAudit(r.Context(), &store.MutationAuditRecord{
-		MutationType:  "group_member_remove",
-		TargetType:    "group_membership",
-		TargetID:      group.ID,
-		BeforeSummary: `{"groupId":"` + group.ID + `","memberType":"` + memberType + `","memberId":"` + memberID + `"}`,
-	})
-
+	if memberType == store.GroupMemberTypeUser {
+		s.publishConduitAuthzChanged(conduitAuthzMatch{UserID: memberID})
+	} else {
+		s.publishConduitAuthzChanged(conduitAuthzMatch{})
+	}
 	s.groupsLogger().Info("group member removed",
 		"group_id", group.ID,
 		"member_type", memberType,
 		"member_id", memberID)
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// groupClosureHasRoleBinding reports whether the group, or any group that
+// transitively contains it, is the principal of a role binding of any
+// scope. A member of the group holds the authority of every such binding.
+func (s *Server) groupClosureHasRoleBinding(ctx context.Context, groupID string) (bool, error) {
+	principals := []store.PrincipalRef{{Type: store.RoleBindingPrincipalGroup, ID: groupID}}
+	parents, err := s.store.GetParentGroups(ctx, groupID)
+	if err != nil {
+		return false, err
+	}
+	for _, pid := range parents {
+		principals = append(principals, store.PrincipalRef{Type: store.RoleBindingPrincipalGroup, ID: pid})
+	}
+	bindings, err := s.store.ListRoleBindingsForPrincipals(ctx, principals, nil, nil)
+	if err != nil {
+		return false, err
+	}
+	return len(bindings) > 0, nil
+}
+
+// requireSessionForRoleBoundGroup refuses a user access token on a change
+// to a group whose closure carries a role binding: updating or deleting the
+// group, adding or removing a member, or creating a child group under it.
+// Such a change moves role-binding authority, so it is session-only with the
+// GOV_PENDING reason (session_only_gate.go). A group with no role binding in
+// its closure, and every other credential, proceed. It runs after the group
+// authorization check, and in deleteGroup after the system-managed and
+// constraint checks. Returns false when the response has been written.
+func (s *Server) requireSessionForRoleBoundGroup(w http.ResponseWriter, r *http.Request, group *store.Group) bool {
+	if !IsScopedUserIdentity(GetIdentityFromContext(r.Context())) {
+		return true
+	}
+	bound, err := s.groupClosureHasRoleBinding(r.Context(), group.ID)
+	if err != nil {
+		// Fail closed: the closure cannot be resolved.
+		writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError,
+			"failed to check role bindings for group", nil)
+		return false
+	}
+	if bound {
+		writeSessionOnlyDenial(w, ErrCodeForbidden,
+			"changing a group that carries a role binding requires an interactive session",
+			authzop.ReasonGovernancePending)
+		return false
+	}
+	return true
 }
 
 // isConstraintBearingGroup checks whether the given group ID appears as a

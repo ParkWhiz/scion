@@ -40,8 +40,9 @@ type ProjectService interface {
 	// Update updates project metadata.
 	Update(ctx context.Context, projectID string, req *UpdateProjectRequest) (*Project, error)
 
-	// Delete removes a project and all its agents.
-	Delete(ctx context.Context, projectID string) error
+	// Delete removes a project and its agent records. Without opts.Force
+	// the hub refuses (409) while the project has agents not yet deleted.
+	Delete(ctx context.Context, projectID string, opts *DeleteProjectOptions) error
 
 	// ListAgents returns agents in a project.
 	ListAgents(ctx context.Context, projectID string, opts *ListAgentsOptions) (*ListAgentsResponse, error)
@@ -66,6 +67,14 @@ type ProjectService interface {
 
 	// UpdateSettings updates project settings.
 	UpdateSettings(ctx context.Context, projectID string, settings *ProjectSettings) (*ProjectSettings, error)
+
+	// GetResolvedSettings retrieves the per-setting report of project
+	// annotations and hub defaults (GET /settings/resolved).
+	GetResolvedSettings(ctx context.Context, projectID string) (*ResolvedProjectSettings, error)
+
+	// UpdateGCPIdentityDefaults writes only the default GCP identity fields
+	// of the project settings; every other setting keeps its stored value.
+	UpdateGCPIdentityDefaults(ctx context.Context, projectID string, update *ProjectGCPIdentityDefaultsUpdate) (*ProjectSettings, error)
 
 	// RefreshCache triggers a cache refresh for a linked project.
 	// The hub pulls the workspace from a connected provider broker.
@@ -229,7 +238,7 @@ func (s *projectService) List(ctx context.Context, opts *ListProjectsOptions) (*
 		TotalCount int       `json:"totalCount,omitempty"`
 	}
 
-	result, err := apiclient.DecodeResponse[listResponse](resp)
+	result, err := apiclient.DecodeRequired[listResponse](resp)
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +258,7 @@ func (s *projectService) Get(ctx context.Context, projectID string) (*Project, e
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Project](resp)
+	return apiclient.DecodeRequired[Project](resp)
 }
 
 // Register registers a project (upsert based on git remote).
@@ -258,7 +267,7 @@ func (s *projectService) Register(ctx context.Context, req *RegisterProjectReque
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[RegisterProjectResponse](resp)
+	return apiclient.DecodeRequired[RegisterProjectResponse](resp)
 }
 
 // Create creates a project without a contributing broker.
@@ -267,7 +276,7 @@ func (s *projectService) Create(ctx context.Context, req *CreateProjectRequest) 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Project](resp)
+	return apiclient.DecodeRequired[Project](resp)
 }
 
 // Update updates project metadata.
@@ -276,12 +285,24 @@ func (s *projectService) Update(ctx context.Context, projectID string, req *Upda
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Project](resp)
+	return apiclient.DecodeRequired[Project](resp)
 }
 
-// Delete removes a project and all its agents.
-func (s *projectService) Delete(ctx context.Context, projectID string) error {
+// DeleteProjectOptions configures project deletion.
+type DeleteProjectOptions struct {
+	// Force deletes the project even while it has agents whose runtime
+	// deletion is not confirmed. Without it the hub refuses such a delete
+	// with 409 conflict, listing the agents in the error details.
+	Force bool
+}
+
+// Delete removes a project and its agent records. Without opts.Force the
+// hub refuses while the project has agents that are not deleted yet.
+func (s *projectService) Delete(ctx context.Context, projectID string, opts *DeleteProjectOptions) error {
 	path := "/api/v1/projects/" + projectID
+	if opts != nil && opts.Force {
+		path += "?force=true"
+	}
 	resp, err := s.c.delete(ctx, path, nil)
 	if err != nil {
 		return err
@@ -331,7 +352,7 @@ func (s *projectService) ListAgents(ctx context.Context, projectID string, opts 
 		TotalCount int     `json:"totalCount,omitempty"`
 	}
 
-	result, err := apiclient.DecodeResponse[listResponse](resp)
+	result, err := apiclient.DecodeRequired[listResponse](resp)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +372,7 @@ func (s *projectService) ListProviders(ctx context.Context, projectID string) (*
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ListProvidersResponse](resp)
+	return apiclient.DecodeRequired[ListProvidersResponse](resp)
 }
 
 // AddProvider adds a broker as a provider to a project.
@@ -360,7 +381,7 @@ func (s *projectService) AddProvider(ctx context.Context, projectID string, req 
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[AddProviderResponse](resp)
+	return apiclient.DecodeRequired[AddProviderResponse](resp)
 }
 
 // RemoveProvider removes a broker from a project.
@@ -378,16 +399,48 @@ func (s *projectService) GetSettings(ctx context.Context, projectID string) (*Pr
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ProjectSettings](resp)
+	return apiclient.DecodeRequired[ProjectSettings](resp)
 }
 
-// UpdateSettings updates project settings.
+// UpdateSettings updates project settings. The server merges the PUT
+// field by field: a field left out of the body, or sent as null, keeps its
+// stored value, and a field's empty value clears it. ProjectSettings drops
+// zero values (omitempty), so through this type only ActiveProfile
+// (pointer to ""), DefaultResources (pointer to an empty spec, sent as {})
+// and DefaultGCPIdentityServiceAccountIDByProfile (empty map, sent as {})
+// can be cleared; other fields cannot be cleared, and the tri-state fields
+// cannot be reset to inherit.
 func (s *projectService) UpdateSettings(ctx context.Context, projectID string, settings *ProjectSettings) (*ProjectSettings, error) {
 	resp, err := s.c.put(ctx, "/api/v1/projects/"+projectID+"/settings", settings, nil)
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ProjectSettings](resp)
+	return apiclient.DecodeRequired[ProjectSettings](resp)
+}
+
+// GetResolvedSettings retrieves the per-setting report of project
+// annotations and hub defaults. It reports which layers carry a value; it
+// does not say which one wins.
+func (s *projectService) GetResolvedSettings(ctx context.Context, projectID string) (*ResolvedProjectSettings, error) {
+	resp, err := s.c.get(ctx, "/api/v1/projects/"+projectID+"/settings/resolved", nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ResolvedProjectSettings](resp)
+}
+
+// UpdateGCPIdentityDefaults sends a settings PUT whose body carries only the
+// fields set in update. The server merges the PUT field by field, so every
+// field the body leaves out, identity or not, keeps its stored value.
+func (s *projectService) UpdateGCPIdentityDefaults(ctx context.Context, projectID string, update *ProjectGCPIdentityDefaultsUpdate) (*ProjectSettings, error) {
+	if update == nil {
+		update = &ProjectGCPIdentityDefaultsUpdate{}
+	}
+	resp, err := s.c.put(ctx, "/api/v1/projects/"+projectID+"/settings", update, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ProjectSettings](resp)
 }
 
 // GetAgent returns an agent by ID or slug within a project.
@@ -396,24 +449,12 @@ func (s *projectService) GetAgent(ctx context.Context, projectID, agentID string
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Agent](resp)
+	return apiclient.DecodeRequired[Agent](resp)
 }
 
 // DeleteAgent removes an agent by ID or slug within a project.
 func (s *projectService) DeleteAgent(ctx context.Context, projectID, agentID string, opts *DeleteAgentOptions) error {
-	path := "/api/v1/projects/" + projectID + "/agents/" + agentID
-	if opts != nil {
-		query := url.Values{}
-		if opts.DeleteFiles {
-			query.Set("deleteFiles", "true")
-		}
-		if opts.RemoveBranch {
-			query.Set("removeBranch", "true")
-		}
-		if len(query) > 0 {
-			path += "?" + query.Encode()
-		}
-	}
+	path := withDeleteAgentQuery("/api/v1/projects/"+projectID+"/agents/"+agentID, opts)
 
 	resp, err := s.c.delete(ctx, path, nil)
 	if err != nil {
@@ -447,7 +488,7 @@ func (s *projectService) RefreshCache(ctx context.Context, projectID string) (*P
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ProjectCacheRefreshResponse](resp)
+	return apiclient.DecodeRequired[ProjectCacheRefreshResponse](resp)
 }
 
 // GetCacheStatus returns the cache status for a project workspace.
@@ -456,7 +497,7 @@ func (s *projectService) GetCacheStatus(ctx context.Context, projectID string) (
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ProjectCacheStatusResponse](resp)
+	return apiclient.DecodeRequired[ProjectCacheStatusResponse](resp)
 }
 
 // Clone creates a new project seeded from an existing project's configuration.
@@ -465,5 +506,5 @@ func (s *projectService) Clone(ctx context.Context, sourceID string, req ClonePr
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Project](resp)
+	return apiclient.DecodeRequired[Project](resp)
 }

@@ -8,6 +8,7 @@
 /build/
 /.build/
 /scion
+/sciontool
 scion-agent
 extras/scion-chat-app/scion-chat-app
 
@@ -96,3 +97,6 @@ pr-*-review*.md
 __pycache__/
 *.pyc
 /checksecuritymarkergates
+
+# Local scratch space (not tracked)
+/scratch/

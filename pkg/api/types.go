@@ -195,6 +195,20 @@ func ValidateServices(services []ServiceSpec) error {
 	return nil
 }
 
+// AgentGCPIdentity is the GCP identity applied to an agent, as shown by
+// scion list --format json.
+type AgentGCPIdentity struct {
+	// Mode is the metadata mode: "block", "passthrough" or "assign".
+	Mode string `json:"mode"`
+	// ServiceAccountID is the registered service account, set for "assign".
+	ServiceAccountID string `json:"serviceAccountId,omitempty"`
+	// ServiceAccountEmail is the service account email, set for "assign".
+	ServiceAccountEmail string `json:"serviceAccountEmail,omitempty"`
+	// DisplayName is the registered service account's display name, when
+	// the caller can read the registration. Empty otherwise.
+	DisplayName string `json:"displayName,omitempty"`
+}
+
 type AgentK8sMetadata struct {
 	Cluster   string `json:"cluster"`
 	Namespace string `json:"namespace"`
@@ -306,6 +320,25 @@ func (v VolumeMount) Validate() error {
 	return nil
 }
 
+// validMessageModes are the agent message modes a scion-agent config may name
+// in message_mode. They match the hub's store.MessageMode* constants
+// (TestValidateMessageMode_MatchesStore pins that).
+var validMessageModes = map[string]struct{}{
+	"none": {}, "lineage": {}, "branch": {}, "project": {}, "hub": {},
+}
+
+// ValidateMessageMode returns an error when mode is set and is not one of the
+// five agent message modes. An empty mode is valid (unset).
+func ValidateMessageMode(mode string) error {
+	if mode == "" {
+		return nil
+	}
+	if _, ok := validMessageModes[mode]; !ok {
+		return fmt.Errorf("invalid message_mode %q: must be one of none, lineage, branch, project, hub", mode)
+	}
+	return nil
+}
+
 // ValidateVolumes validates a slice of VolumeMount entries.
 func ValidateVolumes(volumes []VolumeMount) error {
 	for i, v := range volumes {
@@ -409,6 +442,10 @@ type TelemetryTLS struct {
 	Enabled            *bool  `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 	InsecureSkipVerify *bool  `json:"insecure_skip_verify,omitempty" yaml:"insecure_skip_verify,omitempty"`
 	CAFile             string `json:"ca_file,omitempty" yaml:"ca_file,omitempty"`
+	// CertFile and KeyFile are paths, inside the agent container, to a
+	// PEM-encoded client certificate and key for OTLP mTLS. Set both or neither.
+	CertFile string `json:"cert_file,omitempty" yaml:"cert_file,omitempty"`
+	KeyFile  string `json:"key_file,omitempty" yaml:"key_file,omitempty"`
 }
 
 // TelemetryBatch holds batch export settings.
@@ -423,7 +460,9 @@ type TelemetryHubConfig struct {
 	ReportInterval string `json:"report_interval,omitempty" yaml:"report_interval,omitempty"`
 }
 
-// TelemetryLocalConfig holds local debug telemetry output settings.
+// TelemetryLocalConfig holds local debug telemetry output settings. The keys
+// are accepted so existing configs still load, but no component reads them
+// (ptone/scion#4103).
 type TelemetryLocalConfig struct {
 	Enabled *bool  `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 	File    string `json:"file,omitempty" yaml:"file,omitempty"`
@@ -431,6 +470,7 @@ type TelemetryLocalConfig struct {
 }
 
 // TelemetryFilterConfig holds event filtering and sampling settings.
+// RespectDebugMode is accepted but not read (ptone/scion#4103).
 type TelemetryFilterConfig struct {
 	Enabled          *bool                      `json:"enabled,omitempty" yaml:"enabled,omitempty"`
 	RespectDebugMode *bool                      `json:"respect_debug_mode,omitempty" yaml:"respect_debug_mode,omitempty"`
@@ -458,16 +498,22 @@ type TelemetrySamplingConfig struct {
 }
 
 type ScionConfig struct {
-	Harness          string            `json:"harness,omitempty" yaml:"harness,omitempty"`
-	HarnessConfig    string            `json:"harness_config,omitempty" yaml:"harness_config,omitempty"`
-	ConfigDir        string            `json:"config_dir,omitempty" yaml:"config_dir,omitempty"`
-	Env              map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
-	Volumes          []VolumeMount     `json:"volumes,omitempty" yaml:"volumes,omitempty"`
-	Detached         *bool             `json:"detached" yaml:"detached"`
-	CommandArgs      []string          `json:"command_args,omitempty" yaml:"command_args,omitempty"`
-	TaskFlag         string            `json:"task_flag,omitempty" yaml:"task_flag,omitempty"`
-	Model            string            `json:"model,omitempty" yaml:"model,omitempty"`
-	ThinkingLevel    *int              `json:"thinking_level,omitempty" yaml:"thinking_level,omitempty"`
+	Harness       string            `json:"harness,omitempty" yaml:"harness,omitempty"`
+	HarnessConfig string            `json:"harness_config,omitempty" yaml:"harness_config,omitempty"`
+	ConfigDir     string            `json:"config_dir,omitempty" yaml:"config_dir,omitempty"`
+	Env           map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+	Volumes       []VolumeMount     `json:"volumes,omitempty" yaml:"volumes,omitempty"`
+	Detached      *bool             `json:"detached" yaml:"detached"`
+	CommandArgs   []string          `json:"command_args,omitempty" yaml:"command_args,omitempty"`
+	TaskFlag      string            `json:"task_flag,omitempty" yaml:"task_flag,omitempty"`
+	Model         string            `json:"model,omitempty" yaml:"model,omitempty"`
+	ThinkingLevel *int              `json:"thinking_level,omitempty" yaml:"thinking_level,omitempty"`
+	// MessageMode is the template's initial message mode for agents created
+	// from it (none, lineage, branch, project, hub; see ValidateMessageMode).
+	// A job key: only the hub reads it, from the template's AgentConfig
+	// snapshot, when an agent is created without an explicit mode
+	// (ptone/scion#4222).
+	MessageMode      string            `json:"message_mode,omitempty" yaml:"message_mode,omitempty"`
 	Kubernetes       *KubernetesConfig `json:"kubernetes,omitempty" yaml:"kubernetes,omitempty"`
 	AuthSelectedType string            `json:"auth_selectedType,omitempty" yaml:"auth_selectedType,omitempty"`
 	Resources        *ResourceSpec     `json:"resources,omitempty" yaml:"resources,omitempty"`
@@ -483,10 +529,21 @@ type ScionConfig struct {
 	Hub           *AgentHubConfig            `json:"hub,omitempty" yaml:"hub,omitempty"`
 	Telemetry     *TelemetryConfig           `json:"telemetry,omitempty" yaml:"telemetry,omitempty"`
 
+	// CloneDepth sets the git clone depth for a clone-per-agent
+	// workspace: "full" or a positive integer. It overrides a profile's
+	// clone_depth. Empty keeps the profile value, else the default
+	// shallow clone of depth 1.
+	CloneDepth CloneDepth `json:"clone_depth,omitempty" yaml:"clone_depth,omitempty"`
+
 	Secrets []RequiredSecret `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 
 	// Skills declares skill references to resolve at provision time.
 	Skills []SkillReference `json:"skills,omitempty" yaml:"skills,omitempty" koanf:"skills"`
+
+	// AgentPlugins declares Agent Plugins bundles to install natively into the
+	// harness (experiment hub.agent_plugins). Phase 1 resolves only
+	// template-relative paths.
+	AgentPlugins []AgentPluginReference `json:"agent_plugins,omitempty" yaml:"agent_plugins,omitempty" koanf:"agent_plugins"`
 
 	// Agnostic template fields
 	AgentInstructions    string `json:"agent_instructions,omitempty" yaml:"agent_instructions,omitempty"`
@@ -523,6 +580,18 @@ type ScionConfig struct {
 	// workspace resolution or an enclosing repo root, and so delete skips
 	// worktree/branch cleanup for it.
 	EmptyPerAgentWorkspace bool `json:"empty_per_agent_workspace,omitempty" yaml:"empty_per_agent_workspace,omitempty"`
+
+	// ClearedFields lists the config paths the agent's owner cleared after
+	// the agent was created, so the inherited value applies again
+	// (ptone/scion#3906). The Hub records it on the agent's live inline
+	// config and sends it with every start; a Runtime Broker removes each
+	// path from the agent's persisted config after merging the inline
+	// config over it (see ClearableConfigPath and ApplyClearedFields), and
+	// never writes the list itself to disk. It is wire-only: it is ignored
+	// if a template sets it (yaml:"-", and config.MergeScionConfig does not
+	// carry it). A broker that ignores it starts the agent exactly as before
+	// the field existed.
+	ClearedFields []string `json:"cleared_fields,omitempty" yaml:"-"`
 
 	// Info contains persisted metadata about the agent
 	Info *AgentInfo `json:"-" yaml:"-"`
@@ -594,7 +663,7 @@ type AgentInfo struct {
 	ID            string `json:"id,omitempty"`          // Hub UUID (database primary key, globally unique)
 	Slug          string `json:"slug,omitempty"`        // URL-safe slug identifier (unique per project)
 	ContainerID   string `json:"containerId,omitempty"` // Runtime container ID (ephemeral, runtime-assigned)
-	RunID         string `json:"runId,omitempty"`       // Per-run identity from the LabelRunID label; empty for pre-run-ID entries (ptone/scion#2550). In agent-info.json: the run that owns the agent's files (ptone/scion#2675); List never fills RunID from agent-info.json, so on the wire it is always the label
+	RunID         string `json:"runId,omitempty"`       // Per-run identity from the LabelRunID label; empty for pre-run-ID entries (ptone/scion#2550). The run that owns the agent's files (ptone/scion#2675) is recorded in the host-owned per-agent host state file, not here (ptone/scion#4771); List never fills RunID from agent-info.json, so on the wire it is always the label
 	Name          string `json:"name"`                  // Human-friendly display name
 	Template      string `json:"template"`
 	TemplateHash  string `json:"templateHash,omitempty"`  // Content hash of a template loaded from a content-addressed cache dir; when set, Template is a display name only and is never looked up by name
@@ -606,11 +675,24 @@ type AgentInfo struct {
 	// audit flows so operators can correlate an agent with the exact bundle
 	// it ran.
 	HarnessConfigRevision string `json:"harnessConfigRevision,omitempty"`
-	HarnessAuth           string `json:"harnessAuth,omitempty"` // Resolved harness auth method (api-key, oauth-token, auth-file, vertex-ai)
+	// HarnessConfigSource records which resolution branch supplied the
+	// harness-config (config.HarnessConfigSource: hub-hydrated,
+	// template-bundled, broker-local, builtin, unresolved). Provenance only;
+	// Start always sets it, so empty means an older broker (ptone/scion#620).
+	HarnessConfigSource string `json:"harnessConfigSource,omitempty"`
+	HarnessAuth         string `json:"harnessAuth,omitempty"` // Resolved harness auth method (api-key, oauth-token, auth-file, vertex-ai)
 
 	// Project association
-	Project     string `json:"project"`               // Project name (standard field)
-	ProjectID   string `json:"projectId,omitempty"`   // Hosted format: <uuid>__<name>
+	Project string `json:"project"` // Project name (standard field)
+	// ProjectID depends on where the AgentInfo came from. In agent-info.json
+	// (written at provision time) it is the local project-id marker read
+	// from the project directory. The Docker, Podman, Apple and Kubernetes
+	// List fill it from the container's scion.project_id label, which
+	// carries the Hub project ID; Cloud Run Sandbox List fills it from its
+	// state entry, which records the same value. Cloud Run List leaves it
+	// empty. The two sources can differ; callers that need the Hub project
+	// ID should read the scion.project_id label (ptone/scion#3020).
+	ProjectID   string `json:"projectId,omitempty"`
 	ProjectPath string `json:"projectPath,omitempty"` // Filesystem path (solo mode)
 
 	// Metadata
@@ -622,7 +704,7 @@ type AgentInfo struct {
 	Phase           string       `json:"phase,omitempty"`           // Lifecycle phase (created, provisioning, running, stopped, error)
 	Activity        string       `json:"activity,omitempty"`        // Runtime activity (working, thinking, executing, waiting_for_input, completed)
 	ExitCode        *int         `json:"exitCode,omitempty"`        // Structured exit code from runtime (nil = unknown)
-	ExitReason      string       `json:"exitReason,omitempty"`      // Terminal reason: "crashed" or "limits_exceeded"
+	ExitReason      string       `json:"exitReason,omitempty"`      // Terminal reason (see state.ExitReason), e.g. "crashed", "preempted", "oom_killed"
 	Detail          *AgentDetail `json:"detail,omitempty"`          // Freeform context about the current activity
 
 	// Runtime configuration
@@ -631,6 +713,14 @@ type AgentInfo struct {
 	Runtime    string            `json:"runtime,omitempty"`
 	Profile    string            `json:"profile,omitempty"`
 	Kubernetes *AgentK8sMetadata `json:"kubernetes,omitempty"`
+	// VanishedPodReport marks an entry a Kubernetes runtime List() reports
+	// for an agent pod already removed by a preemption or eviction, rather
+	// than for a pod that still exists (see runtime.IsVanishedPodReport).
+	// Never serialized.
+	VanishedPodReport bool `json:"-"`
+	// GCPIdentity is the GCP identity the Hub applied to the agent. Set
+	// only for agents listed through a Hub; nil when none is recorded.
+	GCPIdentity *AgentGCPIdentity `json:"gcpIdentity,omitempty"`
 	// WorkspacePlacement is where the start that produced this info placed
 	// the agent's workspace: WorkspacePlacementExport or
 	// WorkspacePlacementLocal. Empty when this info did not come from a
@@ -679,8 +769,9 @@ type AgentInfo struct {
 	HubEndpoint       string `json:"hubEndpoint,omitempty"`       // Scion Hub URL if connected
 	WebPTYEnabled     bool   `json:"webPtyEnabled,omitempty"`     // Whether web terminal access is available
 	TaskSummary       string `json:"taskSummary,omitempty"`       // Current task description (for dashboard)
-	// ProvisionedOnly: the Hub reports the agent provisioned but not
-	// started (ptone/scion#2929). No omitempty: an explicit false lets a
+	// ProvisionedOnly: the agent was provisioned but not started. The Hub
+	// computes it (ptone/scion#2929); local List sets it for a
+	// container-less agent in phase "created" (ptone/scion#2875). No omitempty: an explicit false lets a
 	// client that merges responses clear a previously seen true.
 	ProvisionedOnly bool `json:"provisionedOnly"`
 
@@ -717,6 +808,16 @@ type SkillReference struct {
 	// Scope indicates the injection source of this skill reference.
 	// Valid values: "hub", "user", "project", "template", "platform", "" (empty = lowest precedence).
 	// Used for destination-name collision resolution: higher-scope skills win.
+	Scope string `json:"scope,omitempty" yaml:"scope,omitempty" koanf:"scope"`
+}
+
+// AgentPluginReference declares an Agent Plugins bundle to install natively.
+// Phase 1: Path is template-relative only (relative to the directory of the
+// template whose scion-agent.yaml declares it).
+type AgentPluginReference struct {
+	Path     string `json:"path" yaml:"path" koanf:"path"`
+	Optional bool   `json:"optional,omitempty" yaml:"optional,omitempty" koanf:"optional"`
+	// Scope is annotated by MergeScionConfig ("template"); informational in Phase 1.
 	Scope string `json:"scope,omitempty" yaml:"scope,omitempty" koanf:"scope"`
 }
 
@@ -777,7 +878,7 @@ type EnvKind string
 
 const (
 	// EnvKindPlain is a non-sensitive operational value delivered via
-	// --env KEY=VALUE. Examples: SCION_MODEL, SCION_HUB_NAME, SCION_DEBUG.
+	// --env KEY=VALUE. Examples: SCION_MODEL, SCION_HUB_NAME, SCION_LOG_LEVEL.
 	EnvKindPlain EnvKind = "plain"
 
 	// EnvKindSecretFetchable is a value stored in the hub's secret store,
@@ -880,8 +981,8 @@ type runIDContextKey struct{}
 
 // ContextWithRunID returns a new context carrying the run ID of the start
 // that is provisioning the agent (ptone/scion#2550), so provisioning can
-// record it in agent-info.json as the run that owns the agent's files
-// (ptone/scion#2675). An empty runID returns ctx unchanged.
+// record it in the host state file as the run that owns the agent's files
+// (ptone/scion#2675, ptone/scion#4771). An empty runID returns ctx unchanged.
 func ContextWithRunID(ctx context.Context, runID string) context.Context {
 	if runID == "" {
 		return ctx
@@ -905,6 +1006,26 @@ func ContextWithSharedWorkspace(ctx context.Context) context.Context {
 // IsSharedWorkspaceFromContext returns true if the context indicates shared workspace mode.
 func IsSharedWorkspaceFromContext(ctx context.Context) bool {
 	v, _ := ctx.Value(sharedWorkspaceContextKey{}).(bool)
+	return v
+}
+
+type hubProjectIDContextKey struct{}
+
+// ContextWithHubProjectID attaches the Hub-supplied project ID of a broker
+// dispatch. Agent-dir resolution uses it, not the project-id marker inside
+// the project directory, to locate a
+// shared-workspace project's broker-side external agents root.
+func ContextWithHubProjectID(ctx context.Context, projectID string) context.Context {
+	if projectID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, hubProjectIDContextKey{}, projectID)
+}
+
+// HubProjectIDFromContext returns the Hub-supplied project ID attached by
+// ContextWithHubProjectID, or "" (e.g. a local CLI start).
+func HubProjectIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(hubProjectIDContextKey{}).(string)
 	return v
 }
 
@@ -971,22 +1092,44 @@ func IsReprovisionFromContext(ctx context.Context) bool {
 }
 
 // ReincarnateEligible implements the eligibility predicate of design §3.4
-// Amendment A23: a `scion reincarnate` reprovision is safe to attempt for a
-// workspace that is either clone-per-agent (a real GitClone) or an explicit
-// mount (no GitClone, but a non-empty Workspace). Both the Hub (deciding
-// whether to accept a reincarnate request, using AppliedConfig.GitClone and
-// AppliedConfig.Workspace) and the broker (deciding whether Manager.Reprovision
-// may run, using the equivalent StartOptions fields) call this one helper so
-// the two gates cannot drift apart.
+// Amendment A23, extended for empty-per-agent (miller79/scion#167): a
+// `scion reincarnate` reprovision is safe to attempt for a workspace that is
+// clone-per-agent (a real GitClone), an explicit mount (no GitClone, but a
+// non-empty Workspace), or empty-per-agent (the agent's private
+// <agentDir>/workspace directory, reused in place). Both the Hub (deciding
+// whether to accept a reincarnate request, using AppliedConfig.GitClone,
+// AppliedConfig.Workspace and the project's empty-per-agent mode) and the
+// broker (deciding whether Manager.Reprovision may run, using the equivalent
+// StartOptions fields) call this one helper so the two gates cannot drift
+// apart.
 //
 // Neither side treats this as sufficient on its own: the Hub additionally
 // excludes worktree-per-agent projects (which it can detect from the project
 // record but this helper cannot, since GitClone is also set for
-// worktree-per-agent agents — see design §3.4 Amendment A4), and the broker
-// additionally requires the workspace to already exist on disk — Reprovision
-// never creates, clones, pulls, resets, or removes a workspace.
-func ReincarnateEligible(hasGitClone bool, workspace string) bool {
-	return hasGitClone || workspace != ""
+// worktree-per-agent agents — see design §3.4 Amendment A4) and gates
+// empty-per-agent on a local-disk runtime and the broker's
+// ReprovisionEmptyPerAgent capability; the broker additionally requires the
+// workspace to already exist on disk — Reprovision never creates, clones,
+// pulls, resets, or removes a workspace.
+func ReincarnateEligible(hasGitClone bool, workspace string, emptyPerAgent bool) bool {
+	return hasGitClone || workspace != "" || emptyPerAgent
+}
+
+// IsLocalDiskRuntime reports whether a runtime keeps an empty-per-agent
+// workspace as a directory on the broker's own disk, so same-broker
+// reincarnation can reuse it in place (miller79/scion#167). It is the one
+// allow-list behind both the Hub's reincarnate gate and the broker's
+// Manager.Reprovision guard. The values are runtime Name()s ("docker",
+// "podman", "container"), plus "apple", which some brokers record as a
+// profile Type for the Apple container runtime. Kubernetes, cloud runtimes,
+// and empty or unknown values are refused (fail closed).
+func IsLocalDiskRuntime(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "docker", "podman", "container", "apple":
+		return true
+	default:
+		return false
+	}
 }
 
 type provisionedWorktreeRepoRootContextKey struct{}
@@ -1079,9 +1222,16 @@ func TemplateNameFromContext(ctx context.Context) string {
 // AutoExposePorts is the Hub's auto-expose-ports default
 // (SCION_AUTO_EXPOSE_PORTS). It is the lowest env tier: buildAgentEnv applies
 // it only when no higher tier (hub-resolved env, template, harness-config
-// env, scion-agent.json) left the key set. Unlike the four limit fields it is
-// sent on start and restart as well as create, so a change to the Hub default
-// reaches an agent at its next start.
+// env, scion-agent.json) left the key set. It is sent on start and restart as
+// well as create, so a change to the Hub default reaches an agent at its next
+// start.
+//
+// Resources and the three limit fields are also sent on start and restart:
+// the broker applies them per start and never persists them into
+// scion-agent.json (ptone/scion#4561, ptone/scion#623). A broker on this
+// version that talks to an older Hub gets resources only on create, and the
+// limits only on create (so after a restart the broker's own settings.yaml
+// limit defaults apply instead).
 type HubAgentDefaults struct {
 	MaxTurns        int           `json:"maxTurns,omitempty"`
 	MaxModelCalls   int           `json:"maxModelCalls,omitempty"`
@@ -1093,6 +1243,18 @@ type HubAgentDefaults struct {
 	// experiments.K8sNFSHome). The hub sends only names that are on; an
 	// absent name is off.
 	Experiments []string `json:"experiments,omitempty"`
+	// Telemetry is the hub's default telemetry config. It is a DEFAULT,
+	// not policy: the broker applies it at Start in base position, above
+	// the broker settings telemetry applied at Start and below the agent's
+	// own config telemetry (requester inline telemetry from older hubs,
+	// and the stored config). Templates contribute no telemetry once
+	// environment keys are ignored in templates (ptone/scion#4524). It is
+	// applied per start and never persisted into scion-agent.json, so a
+	// later hub change reaches the agent at its next start
+	// (ptone/scion#4218). Note that ProvisionAgent already folds broker
+	// settings telemetry into the stored config on create, so those
+	// fields rank as agent config here (ptone/scion#4241).
+	Telemetry *TelemetryConfig `json:"telemetry,omitempty"`
 }
 
 // ExperimentEnabled reports whether the hub sent name as enabled.
@@ -1108,6 +1270,15 @@ func (d *HubAgentDefaults) ExperimentEnabled(name string) bool {
 	return false
 }
 
+// TelemetryDefault returns the hub's default telemetry config, or nil when
+// the hub sent none. Safe on a nil receiver.
+func (d *HubAgentDefaults) TelemetryDefault() *TelemetryConfig {
+	if d == nil {
+		return nil
+	}
+	return d.Telemetry
+}
+
 // IsEmpty reports whether no default carries a value. An empty set is not put
 // on the wire, which is what keeps file-mode dispatch byte-identical to the
 // pre-change behaviour (the file-mode snapshot leaves these fields zero).
@@ -1116,7 +1287,7 @@ func (d *HubAgentDefaults) IsEmpty() bool {
 		return true
 	}
 	return d.MaxTurns == 0 && d.MaxModelCalls == 0 && d.MaxDuration == "" && d.Resources == nil &&
-		d.AutoExposePorts == nil && len(d.Experiments) == 0
+		d.AutoExposePorts == nil && len(d.Experiments) == 0 && d.Telemetry == nil
 }
 
 // EnvAutoExposePorts is the env key that enables in-container port
@@ -1163,6 +1334,7 @@ type StartOptions struct {
 	Profile           string
 	HarnessConfig     string
 	HarnessConfigPath string // Resolved local dir for the harness-config (set when hydrated from the Hub); bypasses on-disk FindHarnessConfigDir lookup
+	HarnessConfigID   string // Hub harness-config record ID of the hydrated HarnessConfigPath (set with it by the broker); empty otherwise
 	HarnessAuth       string // Late-binding override for auth_selected_type (api-key, oauth-token, auth-file, vertex-ai)
 	Image             string
 	ProjectPath       string
@@ -1187,6 +1359,11 @@ type StartOptions struct {
 	Workspace          string
 	GitClone           *GitCloneConfig // When set, skip workspace creation; sciontool clones inside container
 	SharedWorkspace    bool            // When true, workspace is a shared git clone (git-workspace hybrid); skip worktree, configure credential helper
+	// HubProjectID is the Hub-supplied project ID of a broker dispatch (set
+	// by the broker from the request, never from agent or workspace state).
+	// It locates a shared-workspace project's broker-side external agents
+	// root; see config.AgentsRootForProject. Empty for local CLI starts.
+	HubProjectID string `json:"-"`
 	// SharedWorkspaceClone holds the clone settings of a shared-plain git
 	// project's workspace. Set only with SharedWorkspace and without
 	// GitClone. It does not change how the workspace is mounted or created:
@@ -1203,7 +1380,16 @@ type StartOptions struct {
 	TelemetryOverride *bool        // Explicit telemetry override from CLI flags (--enable-telemetry / --disable-telemetry)
 	InlineConfig      *ScionConfig // Inline config from --config flag, merged over template config
 	SharedDirs        []SharedDir  // Project-level shared directories (from Hub, merged with settings)
-	ExtraHosts        []string     // Extra --add-host entries for container networking (e.g. "example.com:host-gateway")
+	// SharedDirBackendChanges asks a Reprovision to change the recorded
+	// shared-dir storage backend of the named shared dirs (dir name to
+	// backend, "nfs" or "local"). Only the agent's record changes;
+	// no data is copied, moved or deleted. Ignored outside Reprovision.
+	SharedDirBackendChanges map[string]string
+	// AllowEmptySharedDir, with SharedDirBackendChanges, skips the start
+	// check that refuses an empty directory on the new backend while the
+	// dir's directory on its previous backend is not empty.
+	AllowEmptySharedDir bool
+	ExtraHosts          []string // Extra --add-host entries for container networking (e.g. "example.com:host-gateway")
 
 	// EmptyPerAgentWorkspace gives the agent a private, initially empty,
 	// non-git workspace at <projectDir>/agents/<slug>/workspace (design
@@ -1231,6 +1417,20 @@ type StartOptions struct {
 	// start's cleanup: the runtime then skips its own start cleanup and
 	// leaves the reported resources to the caller. Set both hooks together.
 	OnResourceCreated func(ResourceHandle)
+	// Progress, when set, is called by the runtime when an async launch
+	// reaches a new step (a LaunchStep* value) between resource-creating
+	// calls, e.g. while a pod is scheduled or its container is created
+	// (design wave 3 §3 E-b, ptone/scion#4670). message is fixed text for
+	// the step and never carries runtime detail. The hook must not block:
+	// the runtime calls it inline. Nil (the synchronous path) means no
+	// progress is reported.
+	Progress func(step, message string)
+
+	// ObserveResourceCreated, when set, is also called after each true
+	// create of a launch resource (on the synchronous path as well). It
+	// only observes: unlike OnResourceCreated it never changes who cleans
+	// up a failed start. See runtime.RunConfig.ObserveResourceCreated.
+	ObserveResourceCreated func(ResourceHandle)
 
 	// RunID is the per-run identity minted by the hub for this create/start
 	// dispatch (ptone/scion#2550). It is applied to the runtime entry as the
@@ -1246,14 +1446,49 @@ type StartOptions struct {
 	// otherwise comes only from the template chain and the persisted config,
 	// not from InlineConfig.
 	ResolvedKubernetesServiceAccountName string
+
+	// KubernetesBlockIdentity is set by the broker when the dispatch's GCP
+	// identity mode resolved to "block" on the Kubernetes runtime
+	// (ptone/scion#4034). The pod then runs as its ServiceAccountName, or as
+	// the namespace's default ServiceAccount when that is empty, replacing
+	// any template or persisted serviceAccountName, with the Kubernetes API
+	// token not mounted and a node selector for Workload Identity nodes.
+	// Like ResolvedKubernetesServiceAccountName it is never persisted, so it
+	// is recomputed on every dispatch.
+	KubernetesBlockIdentity *KubernetesBlockIdentity
+
+	// HostCredentialFiles is set by a co-located workstation broker whose
+	// host-credential policy allows it (hub on loopback, dev auth,
+	// use_host_credentials on). In broker mode the agent manager then reads
+	// the harness-declared credential files from the broker user's home and
+	// adds them as file secrets, unless a resolved secret with the same name
+	// or target already exists. Like KubernetesBlockIdentity it is never
+	// persisted, so it is recomputed on every dispatch.
+	HostCredentialFiles bool
+
+	// TemplateEnvSource is a local template path (hydrated by the broker on a
+	// start or restart of an agent with a Hub template) used only to compute
+	// the template env fallback (ptone/scion#4524). Unlike Template, it never
+	// affects image, harness-config or agent config resolution.
+	TemplateEnvSource string
+}
+
+// KubernetesBlockIdentity describes how a GCP identity "block" pod runs on
+// the Kubernetes runtime. See StartOptions.KubernetesBlockIdentity.
+type KubernetesBlockIdentity struct {
+	// ServiceAccountName is the operator-configured block ServiceAccount,
+	// or empty for the namespace's default ServiceAccount.
+	ServiceAccountName string
 }
 
 // ResourceHandle identifies one runtime resource created during a launch
 // (design t1-async-create-v11.md §3.8.4), reported by the runtime via
 // StartOptions.OnResourceCreated after each true create. UID is the
-// identity a cleanup deletes by: the Kubernetes object UID, or the
-// container ID for container runtimes. Namespace is empty for runtimes
-// that have no namespaces.
+// identity a cleanup deletes by: the Kubernetes object UID, the
+// container ID for container runtimes, or, for Cloud Run instances and
+// sandboxes, the launch's run ID (scion.run_id), checked against the
+// resource's run label (a sandbox's: its state entry's) before deleting.
+// Namespace is empty for runtimes that have no namespaces.
 type ResourceHandle struct {
 	Kind      string // one of the ResourceKind* constants
 	Namespace string
@@ -1265,6 +1500,17 @@ type ResourceHandle struct {
 // (StartOptions.RunID, AgentInfo.RunID). A delete carrying a run ID only
 // targets the entry with that label (ptone/scion#2550).
 const LabelRunID = "scion.run_id"
+
+// LabelRuntimeBrokerID is the reserved runtime label naming the flat
+// Runtime Broker instance that owns a runtime object (ptone/scion#3274).
+// Only the owning instance sets it, before the object becomes visible;
+// caller, template or agent labels never set or replace it.
+const LabelRuntimeBrokerID = "scion.runtime_broker_id"
+
+// LabelAgentID is the runtime label carrying an agent's immutable Hub agent
+// ID. A start sets it on the main object, and the Kubernetes runtime copies
+// it from the run labels onto every per-launch child object.
+const LabelAgentID = "agent_id"
 
 // Error-detail keys a runtime broker sets on a start or restart failure
 // that happened inside Manager.Start (ptone/scion#2550). By then the broker
@@ -1292,11 +1538,14 @@ const (
 	BrokerErrorDetailCurrentRunID = "currentRunId"
 )
 
-// BrokerErrorCodeRunMismatch is the broker error code of the 404 a stop
-// naming a run gets when another run holds the agent's name
+// BrokerErrorCodeRunMismatch is the broker error code of the 404 a stop or
+// delete naming a run gets when another run holds the agent's name
 // (ptone/scion#2550). Its details carry BrokerErrorDetailRunID (the run the
-// stop named) and, when known, BrokerErrorDetailCurrentRunID (the run that
-// holds the name: the runtime entry's, or an in-flight launch's).
+// stop or delete named) and, when known, BrokerErrorDetailCurrentRunID (the
+// run that holds the name: the runtime entry's, or an in-flight launch's).
+// On a delete, a non-empty currentRunId that differs from runId means the
+// hub must not finalize the agent's row: that run is still on the broker
+// (ptone/scion#3080). Without one, the delete's 404 is "not found" as before.
 const BrokerErrorCodeRunMismatch = "run_mismatch"
 
 // ResourceHandle.Kind values.
@@ -1305,6 +1554,14 @@ const (
 	ResourceKindSecretProviderClass = "secretproviderclass"
 	ResourceKindPod                 = "pod"
 	ResourceKindContainer           = "container"
+	// ResourceKindSandbox is a cloudrun-sandbox sandbox; its handle's UID
+	// is the launch's run ID, not a container ID.
+	ResourceKindSandbox = "sandbox"
+	// ResourceKindCloudRunInstance is a Cloud Run Instances API instance;
+	// its handle's Namespace is the runtime's parent
+	// (projects/<p>/locations/<l>), Name the instance ID and UID the
+	// launch's run ID.
+	ResourceKindCloudRunInstance = "cloudrun_instance"
 )
 
 type StatusEvent struct {

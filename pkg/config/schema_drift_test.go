@@ -54,7 +54,8 @@ var schemaDriftAllowList = map[string]string{
 	// oidc.token_lifetime is a time.Duration. koanf's
 	// StringToTimeDurationHook accepts a Go duration string ("15m"), and
 	// an integer is taken as nanoseconds.
-	"type-union: server.oidc.token_lifetime": "time.Duration: Go duration string or integer nanoseconds",
+	"type-union: server.oidc.token_lifetime":      "time.Duration: Go duration string or integer nanoseconds",
+	"type-union: server.oidc.user_token_lifetime": "time.Duration: Go duration string or integer nanoseconds",
 	// map[string]string values decode weakly (WeaklyTypedInput), so an
 	// unquoted number or boolean loads as its string form.
 	// (Notification params are deliberately string-only: the hub decodes
@@ -126,6 +127,9 @@ type schemaDriftWalker struct {
 	root  map[string]any
 	drift []string
 	seen  map[string]bool
+	// reportOpen also reports "go-only" for objects the schema leaves open
+	// (see TestSettingsSchema_OpenObjectsDocumentGoFields).
+	reportOpen bool
 }
 
 // resolve follows local "$ref" pointers ("#/$defs/name").
@@ -232,7 +236,7 @@ func (w *schemaDriftWalker) walk(path string, t reflect.Type, node map[string]an
 	for name, ft := range fields {
 		sub, ok := props[name].(map[string]any)
 		if !ok {
-			if closed {
+			if closed || w.reportOpen {
 				w.drift = append(w.drift, "go-only: "+joinDriftPath(path, name))
 			}
 			continue

@@ -33,7 +33,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
-	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 // asyncManager is a concurrency-safe agent.Manager fake for the async-create
@@ -612,21 +611,25 @@ func TestAsyncCreate_ClaimOtherOwner_AbortsNoStartNoCleanup(t *testing.T) {
 // specific check.
 //
 // To make this check's removal observable on its own (not just masked by
-// the identical IsAborted checks later in runLaunch), a predecessor record
-// is pre-registered for the same key and deliberately never released: if
-// this check does its job, the launch returns before ever reaching
-// WaitSuperseded, so the stuck predecessor is irrelevant. If this check is
-// missing, the launch falls through into WaitSuperseded and blocks forever,
-// so cleanup never happens within the wait below -- a distinct,
+// the identical IsAborted check after the marker write), the launch marker
+// cannot be written: a regular file stands where the markers directory
+// would go. If this check does its job, the launch returns before the
+// marker step and sends no terminal. If it is missing, the marker write
+// fails and the launch reports failed{runtime_error} -- a distinct,
 // unmistakable failure rather than one a later check could incidentally
 // paper over.
 func TestAsyncCreate_AbortRecordedBeforeClaimSucceeds_NoStart(t *testing.T) {
 	mgr := newAsyncManager()
 	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.launchTimingOverride = fastLaunchTimings(fastTestKeepaliveInterval)
 
-	key := launchKey{Slug: "agent-guard-b"}
-	stuckRec := newLaunchRecord("L-stuck-for-guard-b", "agent-stuck-for-guard-b", store.LaunchKindCreate, "", time.Now().Add(time.Hour), func() {})
-	srv.launchRegistry.Begin(key, stuckRec) // never released by this test
+	projectPath := filepath.Join(t.TempDir(), ".scion")
+	if err := os.MkdirAll(projectPath, 0755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPath, "launch-markers"), []byte("not a directory"), 0644); err != nil {
+		t.Fatalf("block the launch markers directory: %v", err)
+	}
 
 	releaseClaim := make(chan struct{})
 	abortAnswered := make(chan struct{})
@@ -644,7 +647,8 @@ func TestAsyncCreate_AbortRecordedBeforeClaimSucceeds_NoStart(t *testing.T) {
 		"name": "agent-guard-b", "asyncLaunch": true,
 		"launchId":             "L-guard-b",
 		"launchTimeoutSeconds": 300, "launchKeepaliveSeconds": 1,
-		"config": map[string]any{"template": "claude"},
+		"projectPath": projectPath,
+		"config":      map[string]any{"template": "claude"},
 	})
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
@@ -662,7 +666,7 @@ func TestAsyncCreate_AbortRecordedBeforeClaimSucceeds_NoStart(t *testing.T) {
 	close(releaseClaim)
 
 	if !waitUntil(t, 3*time.Second, func() bool { return mgr.CleanupCallCount() >= 1 }) {
-		t.Fatal("expected the already-recorded abort to trigger cleanup right after the claim succeeds, without ever blocking on WaitSuperseded (the predecessor here is never released)")
+		t.Fatal("expected the already-recorded abort to trigger cleanup right after the claim succeeds, before the marker step")
 	}
 	if n := mgr.StartCallCount(); n != 0 {
 		t.Fatalf("Start must never be called when the abort was already recorded before the claim succeeded, got %d calls", n)
@@ -670,81 +674,6 @@ func TestAsyncCreate_AbortRecordedBeforeClaimSucceeds_NoStart(t *testing.T) {
 	for _, r := range rtb.getLaunchReports() {
 		if r.Report.State == hubclient.AgentLaunchReportStateSucceeded || r.Report.State == hubclient.AgentLaunchReportStateFailed {
 			t.Fatalf("an abort recorded before the claim succeeds must send no terminal, got %+v", r.Report)
-		}
-	}
-}
-
-// TestAsyncCreate_AbortRecordedDuringWaitSuperseded_NoMarkerNoStart covers
-// the IsAborted check right after WaitSuperseded/the marker write: a
-// pre-registered record for the same key makes WaitSuperseded actually
-// block, during which a keepalive abort is recorded (and given time to
-// finish); the claim has already succeeded by then (the earlier IsAborted
-// check passed), so only this specific check can be stopping the launch.
-//
-// workspaceStoragePath is set (with no storage bucket configured) so that if
-// this check is missing, the launch falls through into the GCS download
-// step and fails fast with a distinctive "storage bucket not configured"
-// message -- observable independently of the IsAborted check after the
-// download (that one would never even be reached, since a download error
-// fails the launch directly), so this test cannot be satisfied by that
-// later check doing the work instead.
-func TestAsyncCreate_AbortRecordedDuringWaitSuperseded_NoMarkerNoStart(t *testing.T) {
-	mgr := newAsyncManager()
-	srv, rtb := newAsyncTestServer(t, mgr)
-	// A real WorktreeBase, so the workspace directory passes validation
-	// (at admission and in the download) and a launch that wrongly reaches
-	// the download fails at the storage bucket check this test looks for.
-	srv.config.WorktreeBase = t.TempDir()
-
-	key := launchKey{Slug: "agent-guard-c"}
-	oldRec := newLaunchRecord("L-old-for-guard-c", "agent-old-for-guard-c", store.LaunchKindCreate, "", time.Now().Add(time.Hour), func() {})
-	srv.launchRegistry.Begin(key, oldRec)
-
-	abortAnswered := make(chan struct{})
-	var abortAnsweredOnce sync.Once
-	rtb.launchReportFunc = func(req *hubclient.AgentLaunchReport) (*hubclient.AgentLaunchReportResult, error) {
-		if claimState(req) {
-			return &hubclient.AgentLaunchReportResult{Result: hubclient.AgentLaunchReportResultApplied}, nil
-		}
-		abortAnsweredOnce.Do(func() { close(abortAnswered) })
-		return &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusConflict, Code: hubclient.AgentLaunchReportCodeStaleLaunch, Reason: hubclient.AgentLaunchReportReasonDeleted}, nil
-	}
-
-	w := postCreate(t, srv, map[string]any{
-		"name": "agent-guard-c", "asyncLaunch": true,
-		"launchId":             "L-guard-c",
-		"launchTimeoutSeconds": 300, "launchKeepaliveSeconds": 1,
-		"workspaceStoragePath": "some/path",
-		"config":               map[string]any{"template": "claude"},
-	})
-	if w.Code != http.StatusCreated {
-		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
-	}
-
-	select {
-	case <-abortAnswered:
-	case <-time.After(3 * time.Second):
-		t.Fatal("expected the keepalive's abort-triggering answer")
-	}
-	// The claim already succeeded well before this (it is answered
-	// immediately, with no blocking); the new launch is now parked in
-	// WaitSuperseded, since oldRec is still registered. Let
-	// recordKeepaliveAbort finish, then release the predecessor.
-	time.Sleep(100 * time.Millisecond)
-	srv.launchRegistry.Finish(key, oldRec)
-
-	if !waitUntil(t, 3*time.Second, func() bool { return mgr.CleanupCallCount() >= 1 }) {
-		t.Fatal("expected the already-recorded abort to trigger cleanup once WaitSuperseded returns")
-	}
-	if n := mgr.StartCallCount(); n != 0 {
-		t.Fatalf("Start must never be called when the abort was already recorded during WaitSuperseded, got %d calls", n)
-	}
-	for _, r := range rtb.getLaunchReports() {
-		if r.Report.State == hubclient.AgentLaunchReportStateSucceeded {
-			t.Fatalf("an abort recorded during WaitSuperseded must send no terminal, got %+v", r.Report)
-		}
-		if r.Report.State == hubclient.AgentLaunchReportStateFailed && strings.Contains(r.Report.Message, "storage bucket not configured") {
-			t.Fatalf("the launch reached the GCS download step despite the abort already being recorded during WaitSuperseded, got %+v", r.Report)
 		}
 	}
 }
@@ -850,6 +779,7 @@ func TestAsyncCreate_KeepaliveAbortDuringStart_CancelsAndCleansUp(t *testing.T) 
 	mgr.startBlock = make(chan struct{})
 	defer close(mgr.startBlock)
 	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.launchTimingOverride = fastLaunchTimings(fastTestKeepaliveInterval)
 
 	var mu sync.Mutex
 	keepalives := 0
@@ -899,6 +829,7 @@ func TestAsyncCreate_Keepalive401DoesNotAbortDuringStart(t *testing.T) {
 	mgr := newAsyncManager()
 	mgr.startBlock = make(chan struct{})
 	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.launchTimingOverride = fastLaunchTimings(fastTestKeepaliveInterval)
 
 	var mu sync.Mutex
 	keepalives := 0
@@ -966,6 +897,7 @@ func TestAsyncCreate_KeepaliveAnswerAfterTerminalStarts_DoesNotCutOffRetries(t *
 	mgr := newAsyncManager()
 	mgr.startBlock = make(chan struct{}) // held open until the keepalive is confirmed in flight
 	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.launchTimingOverride = fastLaunchTimings(fastTestKeepaliveInterval)
 
 	keepaliveInFlight := make(chan struct{})
 	releaseKeepalive := make(chan struct{})
@@ -1063,6 +995,7 @@ func TestAsyncCreate_AbortRecordedAsStartReturns_CleansUpConsistently(t *testing
 	mgr := newAsyncManager()
 	mgr.startBlock = make(chan struct{})
 	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.launchTimingOverride = fastLaunchTimings(fastTestKeepaliveInterval)
 
 	abortAnswered := make(chan struct{})
 	rtb.launchReportFunc = func(req *hubclient.AgentLaunchReport) (*hubclient.AgentLaunchReportResult, error) {
@@ -1121,6 +1054,7 @@ func TestAsyncCreate_AbortRecordedAsStartReturns_CleansUpConsistently(t *testing
 func TestAsyncCreate_KeepaliveAbortWhileClaimUnreachable_CleansUpWithoutStart(t *testing.T) {
 	mgr := newAsyncManager()
 	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.launchTimingOverride = fastLaunchTimings(fastTestKeepaliveInterval)
 
 	var mu sync.Mutex
 	keepalives := 0
@@ -1167,6 +1101,7 @@ func TestAsyncCreate_KeepaliveAbortWhileClaimUnreachable_CleansUpWithoutStart(t 
 func TestAsyncCreate_ClaimUnreachableUntilDeadline_SendsHubUnreachable(t *testing.T) {
 	mgr := newAsyncManager()
 	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.launchTimingOverride = fastLaunchTimings(0) // many quick claim retries before ctx' expires
 
 	var mu sync.Mutex
 	var terminalCode, terminalStep string
@@ -1181,12 +1116,12 @@ func TestAsyncCreate_ClaimUnreachableUntilDeadline_SendsHubUnreachable(t *testin
 		return &hubclient.AgentLaunchReportResult{Result: hubclient.AgentLaunchReportResultApplied}, nil
 	}
 
-	// LaunchTimeoutSeconds=23 gives ctx' a ~3s budget (23 - the 20s abort
-	// margin), enough to be robust against admission overhead without
-	// making the test slow.
+	// LaunchTimeoutSeconds=21 (the smallest accepted value) gives ctx' a ~1s
+	// budget (21 - the 20s abort margin): admission overhead is a few
+	// milliseconds, and the shortened backoff fits many claim retries in it.
 	w := postCreate(t, srv, map[string]any{
 		"name": "agent-9", "asyncLaunch": true, "launchId": "L-9",
-		"launchTimeoutSeconds": 23, "config": map[string]any{"template": "claude"},
+		"launchTimeoutSeconds": 21, "config": map[string]any{"template": "claude"},
 	})
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
@@ -1210,7 +1145,7 @@ func TestAsyncCreate_ClaimUnreachableUntilDeadline_SendsHubUnreachable(t *testin
 }
 
 // TestAsyncCreate_ClaimLocallyCancelled_SendsNoTerminal covers a local
-// stop/delete (launchRegistry.CancelLocal) waking a claim that is still
+// stop/delete (launchRegistry.CancelLocalFor) waking a claim that is still
 // blocked on an unreachable Hub: the Hub already knows, or will
 // independently learn, that this launch is over, so this must not be
 // reported as failed{hub_unreachable} the way a real ctx' deadline is.
@@ -1232,7 +1167,7 @@ func TestAsyncCreate_ClaimLocallyCancelled_SendsNoTerminal(t *testing.T) {
 	if !waitUntil(t, time.Second, func() bool { return len(rtb.getLaunchReports()) >= 1 }) {
 		t.Fatal("expected at least one claim attempt")
 	}
-	srv.launchRegistry.CancelLocal(launchKey{Slug: "agent-cancel-local"})
+	srv.launchRegistry.CancelLocalFor(launchKey{Slug: "agent-cancel-local"}, "", "")
 
 	time.Sleep(200 * time.Millisecond) // let runLaunch observe the cancellation
 	for _, r := range rtb.getLaunchReports() {
@@ -1245,19 +1180,123 @@ func TestAsyncCreate_ClaimLocallyCancelled_SendsNoTerminal(t *testing.T) {
 	}
 }
 
-// TestCreateAgent_SyncGCSDownloadFailure_PinsOriginalErrorText covers the
-// synchronous path's GCS-download failure body staying byte-identical to
-// what it was before downloadWorkspaceFromGCS existed as a separate
-// function: capitalized, with no wrapped-error prefix.
-func TestCreateAgent_SyncGCSDownloadFailure_PinsOriginalErrorText(t *testing.T) {
+// fakeWorkspaceSync replaces srv's workspace download for the test (through
+// SetWorkspaceDownloader), recording each call's bucket and storage path and
+// returning err.
+type fakeWorkspaceSync struct {
+	mu    sync.Mutex
+	calls []fakeWorkspaceSyncCall
+}
+
+type fakeWorkspaceSyncCall struct{ bucket, prefix, dest string }
+
+func installFakeWorkspaceSync(t *testing.T, srv *Server, err error) *fakeWorkspaceSync {
+	t.Helper()
+	f := &fakeWorkspaceSync{}
+	srv.SetWorkspaceDownloader(func(_ context.Context, bucket, prefix, dest string) error {
+		f.mu.Lock()
+		f.calls = append(f.calls, fakeWorkspaceSyncCall{bucket, prefix, dest})
+		f.mu.Unlock()
+		return err
+	})
+	return f
+}
+
+func (f *fakeWorkspaceSync) Calls() []fakeWorkspaceSyncCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeWorkspaceSyncCall(nil), f.calls...)
+}
+
+// assertWorkspaceStorageUnconfigured checks w is the broker's explicit 422
+// refusal for a workspace upload it has no bucket for (ptone/scion#3422).
+func assertWorkspaceStorageUnconfigured(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, body = %s; want 422", w.Code, w.Body.String())
+	}
+	var errResp ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if errResp.Error.Code != ErrCodeWorkspaceStorageUnconfigured {
+		t.Fatalf("code = %q, want %q", errResp.Error.Code, ErrCodeWorkspaceStorageUnconfigured)
+	}
+	if errResp.Error.Message != workspaceStorageUnconfiguredMessage {
+		t.Fatalf("message = %q, want %q", errResp.Error.Message, workspaceStorageUnconfiguredMessage)
+	}
+}
+
+// TestCreateAgent_SyncGCSNoBucket_Returns422 covers a synchronous create
+// carrying a workspace upload when neither the request nor the broker names
+// a bucket (ptone/scion#3422): it is refused with a typed 422 rather than a
+// runtime error the hub would turn into a 502, before the workspace
+// directory is created, and nothing is downloaded or started.
+func TestCreateAgent_SyncGCSNoBucket_Returns422(t *testing.T) {
 	mgr := newAsyncManager()
 	srv, _ := newAsyncTestServer(t, mgr)
 	// A real WorktreeBase, so the workspace directory passes validation and
-	// the download reaches the (unconfigured) storage bucket check.
+	// the download reaches the bucket check.
 	srv.config.WorktreeBase = t.TempDir()
+	fake := installFakeWorkspaceSync(t, srv, nil)
 
 	w := postCreate(t, srv, map[string]any{
 		"name": "agent-sync-gcs", "workspaceStoragePath": "some/path",
+		"config": map[string]any{"template": "claude"},
+	})
+	assertWorkspaceStorageUnconfigured(t, w)
+	if _, err := os.Lstat(filepath.Join(srv.config.WorktreeBase, "agent-sync-gcs")); !os.IsNotExist(err) {
+		t.Fatalf("expected no workspace directory for a refused create, Lstat err = %v", err)
+	}
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Fatalf("expected no download, got %+v", calls)
+	}
+	if n := mgr.StartCallCount(); n != 0 {
+		t.Fatalf("Start must never be called without a workspace bucket, got %d calls", n)
+	}
+}
+
+// TestCreateAgent_SyncGCSDownload_UsesRequestBucket covers the broker
+// downloading the workspace upload from the bucket the hub sent with the
+// create, even though the broker has no bucket setting of its own
+// (ptone/scion#3422).
+func TestCreateAgent_SyncGCSDownload_UsesRequestBucket(t *testing.T) {
+	mgr := newAsyncManager()
+	srv, _ := newAsyncTestServer(t, mgr)
+	srv.config.WorktreeBase = t.TempDir()
+	fake := installFakeWorkspaceSync(t, srv, nil)
+
+	w := postCreate(t, srv, map[string]any{
+		"name": "agent-sync-gcs-bucket", "workspaceStoragePath": "some/path",
+		"workspaceStorageBucket": "hub-bucket",
+		"config":                 map[string]any{"template": "claude"},
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	calls := fake.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("expected one download, got %+v", calls)
+	}
+	if calls[0].bucket != "hub-bucket" || calls[0].prefix != "some/path/files" {
+		t.Fatalf("download = %+v, want bucket hub-bucket and prefix some/path/files", calls[0])
+	}
+}
+
+// TestCreateAgent_SyncGCSDownloadFailure_PinsFixedText pins the
+// synchronous path's GCS-download failure body (the fixed lead text, with
+// no wrapped error: ptone/scion#3496) through a failing fake download. The
+// request names no bucket, so it also checks the download falls back to the
+// broker's StorageBucket setting.
+func TestCreateAgent_SyncGCSDownloadFailure_PinsFixedText(t *testing.T) {
+	mgr := newAsyncManager()
+	srv, _ := newAsyncTestServer(t, mgr)
+	srv.config.WorktreeBase = t.TempDir()
+	srv.config.StorageBucket = "broker-bucket"
+	fake := installFakeWorkspaceSync(t, srv, errors.New("fake sync failure"))
+
+	w := postCreate(t, srv, map[string]any{
+		"name": "agent-sync-gcs-fail", "workspaceStoragePath": "some/path",
 		"config": map[string]any{"template": "claude"},
 	})
 	if w.Code != http.StatusInternalServerError {
@@ -1267,8 +1306,12 @@ func TestCreateAgent_SyncGCSDownloadFailure_PinsOriginalErrorText(t *testing.T) 
 	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
 		t.Fatalf("decode error response: %v", err)
 	}
-	if errResp.Error.Message != "Storage bucket not configured for workspace bootstrap" {
-		t.Fatalf("message = %q, want the byte-identical capitalized GCS error text", errResp.Error.Message)
+	if errResp.Error.Message != "Failed to download workspace from GCS" {
+		t.Fatalf("message = %q, want the fixed GCS download failure text", errResp.Error.Message)
+	}
+	calls := fake.Calls()
+	if len(calls) != 1 || calls[0].bucket != "broker-bucket" {
+		t.Fatalf("downloads = %+v, want one from the broker setting bucket broker-bucket", calls)
 	}
 }
 
@@ -1316,8 +1359,8 @@ func TestCreateAgent_SyncGCSDownloadInvalidWorkspaceDir_Returns400(t *testing.T)
 	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
 		t.Fatalf("decode error response: %v", err)
 	}
-	if !strings.HasPrefix(errResp.Error.Message, "Invalid workspace directory: ") {
-		t.Fatalf("message = %q, want the \"Invalid workspace directory: \" text", errResp.Error.Message)
+	if errResp.Error.Message != "Invalid workspace directory" {
+		t.Fatalf("message = %q, want the fixed \"Invalid workspace directory\" text", errResp.Error.Message)
 	}
 	assertNoOutsideWorkspace(t, outside)
 	if n := mgr.StartCallCount(); n != 0 {
@@ -1347,8 +1390,8 @@ func TestAsyncCreate_InvalidWorkspaceDir_Returns400BeforeAccept(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
 		t.Fatalf("decode error response: %v", err)
 	}
-	if !strings.HasPrefix(errResp.Error.Message, "Invalid workspace directory: ") {
-		t.Fatalf("message = %q, want the \"Invalid workspace directory: \" text", errResp.Error.Message)
+	if errResp.Error.Message != "Invalid workspace directory" {
+		t.Fatalf("message = %q, want the fixed \"Invalid workspace directory\" text", errResp.Error.Message)
 	}
 	// Registration happens before the 201, so a record for the key would
 	// mean the launch had been accepted.
@@ -1369,15 +1412,16 @@ func TestAsyncCreate_InvalidWorkspaceDir_Returns400BeforeAccept(t *testing.T) {
 
 // TestAsyncCreate_GCSDownloadRunsOnlyOnceInRunLaunch covers the GCS download
 // running only inside runLaunch for an accepted async create, never
-// synchronously during admission. The test server has no storage bucket
-// configured, so a synchronous download attempt (the regression this guards)
-// would fail admission itself with a 500, never reaching the 201 accept.
+// synchronously during admission: the fake download fails, so a synchronous
+// download attempt (the regression this guards) would fail admission itself
+// with a 500, never reaching the 201 accept.
 func TestAsyncCreate_GCSDownloadRunsOnlyOnceInRunLaunch(t *testing.T) {
 	mgr := newAsyncManager()
 	srv, rtb := newAsyncTestServer(t, mgr)
 	// A real WorktreeBase, so runLaunch's download passes workspace
-	// directory validation and fails at the storage bucket check.
+	// directory validation and reaches the (fake, failing) download.
 	srv.config.WorktreeBase = t.TempDir()
+	fake := installFakeWorkspaceSync(t, srv, errors.New("fake sync failure"))
 
 	var mu sync.Mutex
 	var failedMessage string
@@ -1393,7 +1437,8 @@ func TestAsyncCreate_GCSDownloadRunsOnlyOnceInRunLaunch(t *testing.T) {
 	w := postCreate(t, srv, map[string]any{
 		"name": "agent-17", "asyncLaunch": true, "launchId": "L-17",
 		"launchTimeoutSeconds": 300, "workspaceStoragePath": "some/path",
-		"config": map[string]any{"template": "claude"},
+		"workspaceStorageBucket": "hub-bucket",
+		"config":                 map[string]any{"template": "claude"},
 	})
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s (the GCS download must not run during admission)", w.Code, w.Body.String())
@@ -1408,11 +1453,92 @@ func TestAsyncCreate_GCSDownloadRunsOnlyOnceInRunLaunch(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !strings.Contains(failedMessage, "storage bucket not configured") {
+	if failedMessage != "Failed to download workspace from GCS" {
 		t.Fatalf("failed message = %q, want runLaunch's GCS download failure", failedMessage)
+	}
+	if calls := fake.Calls(); len(calls) != 1 || calls[0].bucket != "hub-bucket" {
+		t.Fatalf("downloads = %+v, want exactly one, from the request's bucket", calls)
 	}
 	if n := mgr.StartCallCount(); n != 0 {
 		t.Fatalf("Start must never be called when the download fails first, got %d calls", n)
+	}
+}
+
+// TestAsyncCreate_NoWorkspaceBucket_Returns422BeforeAccept covers an async
+// create carrying a workspace upload with no bucket in the request or on
+// the broker (ptone/scion#3422): it gets the synchronous path's 422 before
+// the launch is accepted, so no launch is registered or reported and
+// nothing is downloaded or started.
+func TestAsyncCreate_NoWorkspaceBucket_Returns422BeforeAccept(t *testing.T) {
+	mgr := newAsyncManager()
+	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.config.WorktreeBase = t.TempDir()
+	fake := installFakeWorkspaceSync(t, srv, nil)
+
+	w := postCreate(t, srv, map[string]any{
+		"name": "agent-async-no-bucket", "asyncLaunch": true, "launchId": "L-async-no-bucket",
+		"launchTimeoutSeconds": 300, "workspaceStoragePath": "some/path",
+		"config": map[string]any{"template": "claude"},
+	})
+	assertWorkspaceStorageUnconfigured(t, w)
+	srv.launchRegistry.mu.Lock()
+	_, registered := srv.launchRegistry.records[launchKey{Slug: "agent-async-no-bucket"}]
+	srv.launchRegistry.mu.Unlock()
+	if registered {
+		t.Fatal("expected no launch registered for a launch rejected before the 201")
+	}
+	if reports := rtb.getLaunchReports(); len(reports) != 0 {
+		t.Fatalf("expected no launch reports, got %d", len(reports))
+	}
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Fatalf("expected no download, got %+v", calls)
+	}
+	if n := mgr.StartCallCount(); n != 0 {
+		t.Fatalf("Start must never be called without a workspace bucket, got %d calls", n)
+	}
+}
+
+// TestAsyncCreate_NoRequestBucket_UsesBrokerStorageBucket covers an async
+// create from a hub that sends no workspace bucket, on a broker configured
+// with its own storage bucket (ptone/scion#3422): admission falls back to the
+// broker setting and accepts the launch with a 201, and runLaunch downloads
+// from that bucket. The fake download fails so the launch ends there.
+func TestAsyncCreate_NoRequestBucket_UsesBrokerStorageBucket(t *testing.T) {
+	mgr := newAsyncManager()
+	srv, rtb := newAsyncTestServer(t, mgr)
+	srv.config.WorktreeBase = t.TempDir()
+	srv.config.StorageBucket = "broker-bucket"
+	fake := installFakeWorkspaceSync(t, srv, errors.New("fake sync failure"))
+
+	var mu sync.Mutex
+	var failedMessage string
+	rtb.launchReportFunc = func(req *hubclient.AgentLaunchReport) (*hubclient.AgentLaunchReportResult, error) {
+		if req.State == hubclient.AgentLaunchReportStateFailed {
+			mu.Lock()
+			failedMessage = req.Message
+			mu.Unlock()
+		}
+		return &hubclient.AgentLaunchReportResult{Result: hubclient.AgentLaunchReportResultApplied}, nil
+	}
+
+	w := postCreate(t, srv, map[string]any{
+		"name": "agent-async-broker-bucket", "asyncLaunch": true, "launchId": "L-async-broker-bucket",
+		"launchTimeoutSeconds": 300, "workspaceStoragePath": "some/path",
+		"config": map[string]any{"template": "claude"},
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s (admission must fall back to the broker bucket)", w.Code, w.Body.String())
+	}
+
+	if !waitUntil(t, 2*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return failedMessage != ""
+	}) {
+		t.Fatal("expected a failed report once runLaunch's download attempt failed")
+	}
+	if calls := fake.Calls(); len(calls) != 1 || calls[0].bucket != "broker-bucket" {
+		t.Fatalf("downloads = %+v, want exactly one, from the broker setting bucket broker-bucket", calls)
 	}
 }
 
@@ -1471,10 +1597,11 @@ func TestAsyncCreate_StartTimeoutNamesLaunchingStep(t *testing.T) {
 		return &hubclient.AgentLaunchReportResult{Result: hubclient.AgentLaunchReportResultApplied}, nil
 	}
 
-	// LaunchTimeoutSeconds=23 gives ctx' a ~3s budget (23 - the 20s abort margin).
+	// LaunchTimeoutSeconds=21 (the smallest accepted value) gives ctx' a ~1s
+	// budget (21 - the 20s abort margin); the claim is answered at once.
 	w := postCreate(t, srv, map[string]any{
 		"name": "agent-19", "asyncLaunch": true, "launchId": "L-19",
-		"launchTimeoutSeconds": 23, "config": map[string]any{"template": "claude"},
+		"launchTimeoutSeconds": 21, "config": map[string]any{"template": "claude"},
 	})
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
@@ -1637,7 +1764,7 @@ func TestAsyncCreate_MarkerWriteFailureFailsLaunch(t *testing.T) {
 // remote broker with hub storage, the hub clears the workspace and sends
 // only projectSlug + workspaceStoragePath. That upload is the explicit
 // workspace source, so the create must reach the GCS download (here: the
-// unconfigured storage bucket) rather than be refused as ambiguous.
+// missing storage bucket's 422) rather than be refused as ambiguous.
 func TestCreateAgent_HubManagedGCSBootstrap_NotAmbiguous(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	mgr := newAsyncManager()
@@ -1651,9 +1778,7 @@ func TestCreateAgent_HubManagedGCSBootstrap_NotAmbiguous(t *testing.T) {
 	if strings.Contains(w.Body.String(), "ambiguous workspace") {
 		t.Fatalf("GCS-bootstrap create refused as ambiguous: %d %s", w.Code, w.Body.String())
 	}
-	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "Storage bucket not configured") {
-		t.Fatalf("status = %d, body = %s; want the GCS download's storage-bucket failure", w.Code, w.Body.String())
-	}
+	assertWorkspaceStorageUnconfigured(t, w)
 }
 
 // TestAsyncCreate_HubManagedGCSBootstrap_NotAmbiguous is B1's async
@@ -1663,6 +1788,7 @@ func TestAsyncCreate_HubManagedGCSBootstrap_NotAmbiguous(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	mgr := newAsyncManager()
 	srv, rtb := newAsyncTestServer(t, mgr)
+	installFakeWorkspaceSync(t, srv, errors.New("fake sync failure"))
 
 	var mu sync.Mutex
 	var failedMessage string
@@ -1678,7 +1804,8 @@ func TestAsyncCreate_HubManagedGCSBootstrap_NotAmbiguous(t *testing.T) {
 	w := postCreate(t, srv, map[string]any{
 		"name": "agent-hub-gcs-async", "id": "agent-hub-gcs-async-id", "projectId": "proj-1",
 		"projectSlug": "notes", "workspaceStoragePath": "workspaces/proj-1/agent-hub-gcs-async-id",
-		"asyncLaunch": true, "launchId": "L-hub-gcs", "launchTimeoutSeconds": 300,
+		"workspaceStorageBucket": "hub-bucket", "asyncLaunch": true,
+		"launchId": "L-hub-gcs", "launchTimeoutSeconds": 300,
 		"config": map[string]any{"template": "claude"},
 	})
 	if w.Code != http.StatusCreated {
@@ -1693,7 +1820,30 @@ func TestAsyncCreate_HubManagedGCSBootstrap_NotAmbiguous(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !strings.Contains(failedMessage, "storage bucket not configured") {
+	if failedMessage != "Failed to download workspace from GCS" {
 		t.Fatalf("failed message = %q, want runLaunch's GCS download failure", failedMessage)
+	}
+}
+
+// TestWorkspaceStorageBucket_Precedence pins the bucket a workspace upload
+// is downloaded from: the hub's bucket on the request, else the broker's
+// own setting, else none (ptone/scion#3422).
+func TestWorkspaceStorageBucket_Precedence(t *testing.T) {
+	cases := []struct {
+		name, reqBucket, cfgBucket, want string
+	}{
+		{"request only", "hub-bucket", "", "hub-bucket"},
+		{"request wins over broker setting", "hub-bucket", "broker-bucket", "hub-bucket"},
+		{"broker setting fallback", "", "broker-bucket", "broker-bucket"},
+		{"neither", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &Server{config: ServerConfig{StorageBucket: tc.cfgBucket}}
+			got := srv.workspaceStorageBucket(CreateAgentRequest{WorkspaceStorageBucket: tc.reqBucket})
+			if got != tc.want {
+				t.Fatalf("workspaceStorageBucket = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

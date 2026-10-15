@@ -21,9 +21,11 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -77,7 +79,7 @@ func emptyTerminalWorkspaceResponse() terminalWorkspaceResponse {
 func (s *Server) handleUserMeTerminalWorkspace(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	actor, ok := s.requireSessionCredential(w, ctx)
+	actor, ok := s.requireSessionCredentialFor(w, ctx, authzop.ReasonInteractiveState)
 	if !ok {
 		return
 	}
@@ -156,7 +158,7 @@ func (s *Server) getUserTerminalWorkspace(w http.ResponseWriter, r *http.Request
 	pruned := len(row.AgentIDs) - len(survivors)
 
 	var frontmost *string
-	if row.FrontmostAgentID != "" && containsString(survivors, row.FrontmostAgentID) {
+	if row.FrontmostAgentID != "" && slices.Contains(survivors, row.FrontmostAgentID) {
 		frontmost = terminalWorkspaceStrPtr(row.FrontmostAgentID)
 	}
 
@@ -237,7 +239,7 @@ func (s *Server) putUserTerminalWorkspace(w http.ResponseWriter, r *http.Request
 			ValidationError(w, "frontmostAgentId must be null when agentIds is empty", nil)
 			return
 		}
-		if !containsString(agentIDs, frontmostAgentID) {
+		if !slices.Contains(agentIDs, frontmostAgentID) {
 			ValidationError(w, "frontmostAgentId must be a member of agentIds", nil)
 			return
 		}

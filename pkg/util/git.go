@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -43,6 +44,131 @@ func IsGitRepoDir(dir string) bool {
 	}
 	err := cmd.Run()
 	return err == nil
+}
+
+// ErrGitDubiousOwnership is matched (via errors.Is) by the error CheckGitRepoDir
+// returns when git refuses a repository because it is owned by a different
+// user and is not listed in the safe.directory setting.
+var ErrGitDubiousOwnership = errors.New("git refused the repository because of its ownership")
+
+// GitOwnershipError reports that git refused a repository because of its
+// ownership. It matches ErrGitDubiousOwnership with errors.Is.
+type GitOwnershipError struct {
+	// Dir is the directory git was run in.
+	Dir string
+	// SuggestedArg is the safe.directory argument from git's own suggested
+	// command, kept verbatim (git shell-quotes it when the path needs it),
+	// or empty if it could not be read.
+	SuggestedArg string
+}
+
+func (e *GitOwnershipError) Error() string {
+	if e.SuggestedArg != "" {
+		return fmt.Sprintf("git refused the repository because it is owned by a different user; "+
+			"if you trust it, run: git config --global --add safe.directory %s", e.SuggestedArg)
+	}
+	return fmt.Sprintf("git refused the repository at %s because it is owned by a different user; "+
+		"if you trust it, run: git config --global --add safe.directory <path> "+
+		"(use the repository's top-level directory)", e.Dir)
+}
+
+// Is reports whether target is ErrGitDubiousOwnership.
+func (e *GitOwnershipError) Is(target error) bool {
+	return target == ErrGitDubiousOwnership
+}
+
+// CheckGitRepoDir reports whether dir (the current directory when empty) is
+// inside a git work tree. Unlike IsGitRepoDir it tells "not a repository"
+// apart from git refusing a repository because of its ownership: in that
+// case it returns false and a *GitOwnershipError. Any other git failure
+// returns (false, nil), as IsGitRepoDir does.
+func CheckGitRepoDir(dir string) (bool, error) {
+	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	// Force untranslated git messages so the stderr match is locale-stable.
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err == nil {
+		return true, nil
+	}
+	msg := stderr.String()
+	if !isGitOwnershipRefusal(msg) {
+		return false, nil
+	}
+	checked := dir
+	if checked == "" {
+		checked, _ = os.Getwd()
+	}
+	if abs, err := filepath.Abs(checked); err == nil {
+		checked = abs
+	}
+	return false, &GitOwnershipError{Dir: checked, SuggestedArg: parseSafeDirectorySuggestion(msg)}
+}
+
+// isGitOwnershipRefusal reports whether git's stderr describes a refusal
+// because of repository ownership. Git 2.36.2 and 2.37.1 onward print
+// "fatal: detected dubious ownership in repository at '<path>'"; 2.35.2 to
+// 2.36.1 and 2.37.0 print "fatal: unsafe repository ('<path>' is owned by
+// someone else)". Only a line that starts with one of these prefixes
+// counts, so other git errors that echo a path containing similar words
+// are not mistaken for a refusal. The prefixes are stable under LC_ALL=C.
+func isGitOwnershipRefusal(stderr string) bool {
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(line, "fatal: detected dubious ownership in repository at ") ||
+			strings.HasPrefix(line, "fatal: unsafe repository (") {
+			return true
+		}
+	}
+	return false
+}
+
+// parseSafeDirectorySuggestion returns the argument of git's suggested
+// "git config --global --add safe.directory <arg>" line verbatim, keeping
+// any shell quoting git applied, or "" if there is no such line or the
+// argument is not a complete shell word (for example a quoted path that
+// contains a newline, which git prints across several lines).
+func parseSafeDirectorySuggestion(stderr string) string {
+	const marker = "--add safe.directory "
+	for _, line := range strings.Split(stderr, "\n") {
+		i := strings.Index(line, marker)
+		if i < 0 {
+			continue
+		}
+		arg := strings.TrimSpace(line[i+len(marker):])
+		if !isCompleteShellWord(arg) {
+			return ""
+		}
+		return arg
+	}
+	return ""
+}
+
+// isCompleteShellWord reports whether s is a non-empty single shell word in
+// the form git prints (plain characters, single-quoted runs and
+// backslash-escaped characters) with every quote closed and no newline.
+func isCompleteShellWord(s string) bool {
+	if s == "" || strings.ContainsAny(s, "\r\n") {
+		return false
+	}
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '\'':
+			inQuote = !inQuote
+		case inQuote:
+		case c == '\\':
+			if i+1 == len(s) {
+				return false
+			}
+			i++
+		case c == ' ' || c == '\t':
+			return false
+		}
+	}
+	return !inQuote
 }
 
 // GetGitVersion returns the git version string and the path to the git binary used.
@@ -271,7 +397,8 @@ func pathResolvedUnderBase(base, candidate string) (ok bool, resolvedCandidate s
 //  1. Gathers git metadata (branch name, repo root) while the worktree exists.
 //  2. Removes the worktree directory using RemoveAllSafe (which uses unlinkat
 //     to avoid autofs triggers).
-//  3. Runs "git worktree prune" to clean up the now-stale worktree record.
+//  3. Removes the now-stale record of this worktree only
+//     (RemoveWorktreeEntryIn), never a repository-wide prune.
 func RemoveWorktree(base, path string, deleteBranch bool) (bool, error) {
 	// Every failure from here through the containment check is a pre-removal
 	// validation failure, not a removal-mechanics failure — none of them have
@@ -345,13 +472,16 @@ func RemoveWorktree(base, path string, deleteBranch bool) (bool, error) {
 	}
 	Debugf("RemoveWorktree: directory removal completed in %v", time.Since(removeStart))
 
-	// Prune stale worktree records — git still has a reference to the
-	// directory we just deleted; pruning cleans that up.
+	// Drop git's record of the directory we just deleted. Only this
+	// worktree's own entry is removed: a repository-wide prune would also
+	// drop the entries of other worktrees whose directories happen to be
+	// missing or unreadable from this process (ptone/scion#5060). Without a
+	// repository root there is no entry to target, so nothing is done.
 	if repoRoot != "" {
-		Debugf("RemoveWorktree: pruning stale worktree records in %s", repoRoot)
-		_ = PruneWorktreesIn(repoRoot)
-	} else {
-		_ = PruneWorktrees()
+		Debugf("RemoveWorktree: removing the worktree entry for %s in %s", resolvedPath, repoRoot)
+		if err := RemoveWorktreeEntryIn(repoRoot, resolvedPath); err != nil {
+			slog.Warn("remove worktree: could not remove the worktree entry", "path", resolvedPath, "repo_root", repoRoot, "error", err)
+		}
 	}
 
 	if deleteBranch && branchName != "" && repoRoot != "" {
@@ -393,6 +523,49 @@ func PruneWorktreesIn(repoRoot string) error {
 	return cmd.Run()
 }
 
+// RemoveWorktreeEntryIn removes git's record of the single worktree at path
+// from the repository at repoRoot, using "git worktree remove" (without
+// --force). Unlike PruneWorktreesIn, it never touches the entries of other
+// worktrees.
+//
+// It only acts once the worktree directory is gone: when path still exists
+// it does nothing. Without --force, git refuses to delete a checkout that
+// has modified or untracked files. A clean directory that reappears at path
+// between the existence check and the git call (for example a concurrent
+// re-create at the same path) is still deleted by git, so callers rely on
+// their own ordering: call this only after the worktree at path has been
+// removed. It does nothing when git has no entry for path
+// (already removed or never registered), and inside agent containers (see
+// PruneWorktrees). path must be absolute, so the existence check and git see
+// the same location. Any other failure (for example a locked entry) is
+// returned; callers must not fall back to a repository-wide prune.
+func RemoveWorktreeEntryIn(repoRoot, path string) error {
+	if os.Getenv("SCION_HOST_UID") != "" {
+		return nil
+	}
+	if repoRoot == "" || path == "" {
+		return nil
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("worktree entry %q: path must be absolute", path)
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("worktree entry %s: %w", path, err)
+	}
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "remove", path)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "is not a working tree") {
+			return nil
+		}
+		return fmt.Errorf("git worktree remove %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // DeleteBranchIn deletes a git branch from the specified repository root.
 // Returns true if the branch was deleted, false otherwise.
 func DeleteBranchIn(repoRoot, branchName string) bool {
@@ -400,10 +573,16 @@ func DeleteBranchIn(repoRoot, branchName string) bool {
 	return cmd.Run() == nil
 }
 
-// FindWorktreeByBranch returns the absolute path of the worktree checked out to the specified branch.
-// It returns an empty string if not found.
-func FindWorktreeByBranch(branchName string) (string, error) {
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+// FindWorktreeByBranchIn returns the absolute path of the worktree checked
+// out to the specified branch in the repository at repoRoot. It returns an
+// empty string if not found. The lookup runs against repoRoot, never the
+// process's current directory, so it gives the same answer whether the caller
+// runs inside the repository (a local CLI) or outside it (a runtime broker).
+func FindWorktreeByBranchIn(repoRoot, branchName string) (string, error) {
+	if repoRoot == "" {
+		return "", fmt.Errorf("find worktree for branch %q: no repository directory given", branchName)
+	}
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "list", "--porcelain")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -602,9 +781,14 @@ func isLinkedWorktreeOf(wtPath, worktreesDir string) bool {
 	return strings.HasPrefix(resolvedTarget, worktreesDir+string(filepath.Separator))
 }
 
-// BranchExists returns true if the branch exists in the repository.
-func BranchExists(branchName string) bool {
-	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
+// BranchExistsIn returns true if the branch exists in the repository at
+// repoRoot. Like FindWorktreeByBranchIn, it never consults the process's
+// current directory; an empty repoRoot reports false.
+func BranchExistsIn(repoRoot, branchName string) bool {
+	if repoRoot == "" {
+		return false
+	}
+	cmd := exec.Command("git", "-C", repoRoot, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
 	err := cmd.Run()
 	return err == nil
 }
@@ -682,15 +866,36 @@ func NormalizeGitRemote(remote string) string {
 	remote = strings.TrimPrefix(remote, "ssh://")
 	remote = strings.TrimPrefix(remote, "git://")
 
-	// Handle SSH shorthand format (git@host:path → host/path)
+	// Handle SSH shorthand format (git@host:path → host/path). A bracketed
+	// IPv6 host (git@[::1]:path) is split after its closing ']'; one followed
+	// by '/' or the end (from ssh://git@[::1]/path) is left as is. A bracketed
+	// host that is not an IPv6 literal, or is followed by anything else
+	// (git@[x@y]:path, git@[::1]x@y:path), is left without the userinfo strip
+	// below, so any '@' in it remains (callers that persist the result refuse
+	// a normalized remote with '@').
+	malformedBracket := false
 	if strings.HasPrefix(remote, "git@") {
 		remote = strings.TrimPrefix(remote, "git@")
-		remote = strings.Replace(remote, ":", "/", 1)
+		if strings.HasPrefix(remote, "[") {
+			end := strings.Index(remote, "]")
+			switch {
+			case end < 0 || !isBracketedIPv6(remote[:end+1]):
+				malformedBracket = true
+			case strings.HasPrefix(remote[end+1:], ":"):
+				remote = remote[:end+1] + "/" + remote[end+2:]
+			case end+1 == len(remote) || remote[end+1] == '/':
+				// ssh://git@[::1]/path: nothing to split.
+			default:
+				malformedBracket = true
+			}
+		} else {
+			remote = strings.Replace(remote, ":", "/", 1)
+		}
 	}
 
 	// Strip user info (user@, user:pass@) for scheme-based URLs.
 	// This handles token-authenticated HTTPS URLs like x-access-token:TOKEN@github.com/...
-	if atIdx := strings.Index(remote, "@"); atIdx >= 0 {
+	if atIdx := strings.Index(remote, "@"); atIdx >= 0 && !malformedBracket {
 		slashIdx := strings.Index(remote, "/")
 		if slashIdx < 0 || atIdx < slashIdx {
 			remote = remote[atIdx+1:]

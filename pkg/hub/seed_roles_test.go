@@ -23,6 +23,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,10 +33,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func seedRoleDefinitions(ctx context.Context, s store.Store) {
-	reconcileBuiltInRoles(ctx, s)
-}
 
 func permissionIDsByActions(actions ...string) []string {
 	actionSet := make(map[string]bool, len(actions))
@@ -112,7 +110,7 @@ func TestBuiltInRoles_HubMemberContainsExpectedPermissions(t *testing.T) {
 
 	// These MUST be present (replacing the old per-type read policies)
 	expected := []string{
-		"user.read", "user.list",
+		"user.read",
 		"group.read", "group.list",
 		"template.read", "template.list",
 		"harness_config.read", "harness_config.list",
@@ -126,6 +124,8 @@ func TestBuiltInRoles_HubMemberContainsExpectedPermissions(t *testing.T) {
 		"hub.settings.read",
 		// project.create (replacing hub-member-create-projects policy)
 		"project.create",
+		// Self-scoped permissions on the holder's own records.
+		"inbox.read", "inbox.write", "user_skill_injection.update",
 	}
 	for _, p := range expected {
 		assert.True(t, permSet[p],
@@ -168,7 +168,8 @@ func TestBuiltInRoles_HubMemberAndViewerAreCurated(t *testing.T) {
 }
 
 // TestBuiltInRoles_SuperAdminHasAllPermissions verifies that super-admin
-// contains every permission in the registry (by design).
+// contains every permission in the registry (by design) except the Reserved
+// rows, which no role may hold.
 func TestBuiltInRoles_SuperAdminHasAllPermissions(t *testing.T) {
 	var superAdminPerms []string
 	for _, role := range BuiltInRoles() {
@@ -199,6 +200,15 @@ func TestBuiltInRoles_HubAdminConstraintPermissions(t *testing.T) {
 		"hub-admin must include access_constraint.read")
 	assert.True(t, permSet["access_constraint.admin"],
 		"hub-admin must include access_constraint.admin for operator-complete access constraint management")
+}
+
+// TestBuiltInRoles_HubAdminRevision pins the hub-admin revision and its
+// latest addition: revision 8 adds project.manage_visitors
+// (ptone/scion#4603).
+func TestBuiltInRoles_HubAdminRevision(t *testing.T) {
+	admin := builtInRoleByName(t, store.SystemRoleHubAdmin)
+	assert.Equal(t, 8, admin.Revision)
+	assert.Contains(t, admin.Permissions, "project.manage_visitors")
 }
 
 // TestBuiltInRoles_ProjectMemberPermissions verifies that the curated
@@ -356,6 +366,80 @@ func TestReconcileBuiltInRoles_DoesNotDowngrade(t *testing.T) {
 		"permissions should not be modified when stored revision >= code revision")
 }
 
+// captureRoleWarnLogs routes slog output to a goroutine-safe buffer
+// (lockedBuffer) for the role revision warning tests.
+func captureRoleWarnLogs(t *testing.T) *lockedBuffer {
+	t.Helper()
+	buf := &lockedBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return buf
+}
+
+func builtInRoleByName(t *testing.T, name string) BuiltInRole {
+	t.Helper()
+	for _, r := range BuiltInRoles() {
+		if r.Name == name {
+			return r
+		}
+	}
+	t.Fatalf("no built-in role %q", name)
+	return BuiltInRole{}
+}
+
+// A stored revision newer than the build's (a newer build started on this
+// database) logs one warning naming the role, its stored revision and the
+// build's revision, and that a binary rollback is unsupported
+// (ptone/scion#4233).
+func TestReconcileBuiltInRoles_WarnsWhenStoredRevisionNewer(t *testing.T) {
+	_, s := testServer(t)
+	ctx := context.Background()
+	member := builtInRoleByName(t, store.SystemRoleHubMember)
+	admin := builtInRoleByName(t, store.SystemRoleHubAdmin)
+	recordBuiltInRoleMarker(ctx, s, member.Name, builtInRoleMarker{Revision: member.Revision + 5, PermHash: "newer"})
+	recordBuiltInRoleMarker(ctx, s, admin.Name, builtInRoleMarker{Revision: admin.Revision + 1, PermHash: "newer"})
+
+	logs := captureRoleWarnLogs(t)
+	reconcileBuiltInRoles(ctx, s)
+
+	out := logs.String()
+	assert.Equal(t, 1, strings.Count(out, storedRoleRevisionsNewerMessage), "exactly one warning per reconcile:\n%s", out)
+	assert.Contains(t, out, "level=WARN")
+	assert.Contains(t, out, "a binary rollback")
+	assert.Contains(t, out, "unsupported")
+	assert.Contains(t, out, fmt.Sprintf("%s (stored revision %d, this build's revision %d)", member.Name, member.Revision+5, member.Revision))
+	assert.Contains(t, out, fmt.Sprintf("%s (stored revision %d, this build's revision %d)", admin.Name, admin.Revision+1, admin.Revision))
+	assert.Contains(t, out, "count=2")
+	for _, r := range BuiltInRoles() {
+		if r.Name != member.Name && r.Name != admin.Name {
+			assert.NotContains(t, out, r.Name+" (stored revision", "role %s is not newer", r.Name)
+		}
+	}
+}
+
+// Equal or older stored revisions log no warning.
+func TestReconcileBuiltInRoles_NoWarningWhenStoredRevisionEqualOrOlder(t *testing.T) {
+	_, s := testServer(t)
+	ctx := context.Background()
+	member := builtInRoleByName(t, store.SystemRoleHubMember)
+
+	t.Run("equal", func(t *testing.T) {
+		// testServer already reconciled: every stored revision equals the build's.
+		logs := captureRoleWarnLogs(t)
+		reconcileBuiltInRoles(ctx, s)
+		assert.NotContains(t, logs.String(), storedRoleRevisionsNewerMessage)
+	})
+
+	t.Run("older", func(t *testing.T) {
+		recordBuiltInRoleMarker(ctx, s, member.Name, builtInRoleMarker{Revision: member.Revision - 1, PermHash: "older"})
+		logs := captureRoleWarnLogs(t)
+		reconcileBuiltInRoles(ctx, s)
+		assert.NotContains(t, logs.String(), storedRoleRevisionsNewerMessage)
+		assert.Equal(t, member.Revision, getAppliedBuiltInRoleMarker(ctx, s, member.Name).Revision, "an older stored revision is reconciled up")
+	})
+}
+
 // TestReconcileBuiltInRoles_RevisionTracking verifies that revision tracking
 // via hub settings works correctly.
 func TestReconcileBuiltInRoles_RevisionTracking(t *testing.T) {
@@ -448,10 +532,10 @@ func TestReconcileBuiltInRole_LegacyIntegerMarkerTriggersReconciliation(t *testi
 	reconcileBuiltInRoles(ctx, s)
 
 	// After reconciliation, marker should now have the hash and the
-	// current revision (hub-member is at revision 3 after adding
-	// broker.create, ptone/scion#2138).
+	// current revision (hub-member is at revision 5 after dropping the
+	// Reserved user.list).
 	updatedMarker := getAppliedBuiltInRoleMarker(ctx, s, roleName)
-	assert.Equal(t, 3, updatedMarker.Revision)
+	assert.Equal(t, 5, updatedMarker.Revision)
 	assert.NotEmpty(t, updatedMarker.PermHash, "marker should have PermHash after reconciliation")
 	assert.Equal(t, permListHash(hubMemberPermissionIDs()), updatedMarker.PermHash)
 }
@@ -656,9 +740,8 @@ func TestNew_ReconcileDemotesToConfiguredDefaultRole(t *testing.T) {
 	cfg := DefaultServerConfig()
 	cfg.AdminEmails = []string{anchor.Email}
 	cfg.DefaultUserRole = store.UserRoleViewer
-	srv, err := New(cfg, s)
+	_, err := newTestHubServer(t, cfg, s)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 
 	u, err := s.GetUser(context.Background(), demoted.ID)
 	require.NoError(t, err)
@@ -963,14 +1046,17 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 			name:  "project-owner",
 			perms: projectOwnerPermissionIDs(),
 			want: []string{
+				"artifact.create", "artifact.read",
 				"agent.create", "agent.delete", "agent.lifecycle", "agent.list",
 				"agent.message", "agent.port_access", "agent.read",
 				"agent.set_message_mode", "agent.stop_all", "agent.update",
+				"agent.delegation.credential.revoke", "agent.delegation.list",
+				"agent.delegation.read", "agent.delegation.revoke",
 				"gcp_service_account.assign",
 				"harness_config.create", "harness_config.delete",
 				"harness_config.list", "harness_config.read", "harness_config.update",
-				"project.delete", "project.list", "project.manage",
-				"project.read", "project.secret_read", "project.update",
+				"project.delete", "project.list", "project.manage", "project.manage_visitors",
+				"project.read", "project.secret_read", "project.set_messaging_policy", "project.update",
 				"scheduled_event.create", "scheduled_event.delete",
 				"scheduled_event.list", "scheduled_event.read", "scheduled_event.update",
 				"skill.create", "skill.delete", "skill.list", "skill.read",
@@ -983,13 +1069,16 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 			name:  "project-admin",
 			perms: projectAdminPermissionIDs(),
 			want: []string{
+				"artifact.create", "artifact.read",
 				"agent.create", "agent.lifecycle", "agent.list",
 				"agent.message", "agent.port_access", "agent.read",
 				"agent.stop_all", "agent.update",
+				"agent.delegation.credential.revoke", "agent.delegation.list",
+				"agent.delegation.read", "agent.delegation.revoke",
 				"gcp_service_account.assign",
 				"harness_config.create",
 				"harness_config.list", "harness_config.read", "harness_config.update",
-				"project.list", "project.manage",
+				"project.list", "project.manage", "project.manage_visitors",
 				"project.read", "project.secret_read", "project.update",
 				"scheduled_event.create",
 				"scheduled_event.list", "scheduled_event.read", "scheduled_event.update",
@@ -1003,6 +1092,7 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 			name:  "project-member",
 			perms: projectMemberCuratedPermissionIDs(),
 			want: []string{
+				"artifact.create", "artifact.read",
 				"agent.create", "agent.list", "agent.read",
 				"gcp_service_account.assign",
 				"harness_config.create", "harness_config.list", "harness_config.read",
@@ -1011,6 +1101,11 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 				"skill.list", "skill.read",
 				"template.create", "template.list", "template.read",
 			},
+		},
+		{
+			name:  "project-visitor",
+			perms: projectVisitorPermissionIDs(),
+			want:  []string{"agent.list", "agent.message", "agent.read"},
 		},
 	}
 	for _, tt := range tests {
@@ -1024,9 +1119,10 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 // TestProjectRoleRevisions verifies the current revision of each project role.
 func TestProjectRoleRevisions(t *testing.T) {
 	wantRevisions := map[string]int{
-		store.ProjectRoleOwner:  5,
-		store.ProjectRoleAdmin:  5,
-		store.ProjectRoleMember: 4,
+		store.ProjectRoleOwner:   9,
+		store.ProjectRoleAdmin:   8,
+		store.ProjectRoleMember:  5,
+		store.ProjectRoleVisitor: 1,
 	}
 	for _, role := range BuiltInRoles() {
 		if role.ScopeType != store.RoleScopeProject {
@@ -1049,9 +1145,10 @@ func TestProjectRoleReconciliationConverges(t *testing.T) {
 		revision    int
 		permissions func() []string
 	}{
-		{store.ProjectRoleOwner, 5, projectOwnerPermissionIDs},
-		{store.ProjectRoleAdmin, 5, projectAdminPermissionIDs},
-		{store.ProjectRoleMember, 4, projectMemberCuratedPermissionIDs},
+		{store.ProjectRoleOwner, 9, projectOwnerPermissionIDs},
+		{store.ProjectRoleAdmin, 8, projectAdminPermissionIDs},
+		{store.ProjectRoleMember, 5, projectMemberCuratedPermissionIDs},
+		{store.ProjectRoleVisitor, 1, projectVisitorPermissionIDs},
 	}
 
 	for _, pr := range projectRoles {
@@ -1259,44 +1356,6 @@ func TestR2_EffectiveGrantsProjectMember(t *testing.T) {
 // =============================================================================
 // syncHubRoleGrants: hub-level grants follow User.Role (design §5.D)
 // =============================================================================
-
-// hubRoleGrantState is the observable hub-level grant state for a user.
-type hubRoleGrantState struct {
-	InHubMembers      bool
-	HubViewerBindings int
-	SuperAdminBinding int
-}
-
-func observeHubRoleGrants(t *testing.T, s store.Store, userID string) hubRoleGrantState {
-	t.Helper()
-	ctx := context.Background()
-
-	group, err := s.GetGroupBySlug(ctx, "hub-members")
-	require.NoError(t, err)
-	_, err = s.GetGroupMembership(ctx, group.ID, store.GroupMemberTypeUser, userID)
-	inGroup := err == nil
-
-	viewerRD, err := s.GetRoleDefinitionByName(ctx, store.SystemRoleHubViewer, store.RoleScopeSystem)
-	require.NoError(t, err)
-	superRD, err := s.GetRoleDefinitionByName(ctx, store.SystemRoleSuperAdmin, store.RoleScopeSystem)
-	require.NoError(t, err)
-
-	bindings, err := s.ListRoleBindingsForPrincipal(ctx, store.RoleBindingPrincipalUser, userID)
-	require.NoError(t, err)
-	st := hubRoleGrantState{InHubMembers: inGroup}
-	for _, b := range bindings {
-		if b.ScopeType != store.RoleScopeSystem {
-			continue
-		}
-		switch b.RoleDefinitionID {
-		case viewerRD.ID:
-			st.HubViewerBindings++
-		case superRD.ID:
-			st.SuperAdminBinding++
-		}
-	}
-	return st
-}
 
 // setupHubRoleGrantState creates a user whose hub-level grants match the
 // given starting role: "none" (no grants), "member" (hub-members group),
@@ -1587,7 +1646,9 @@ func TestR5_ReconciliationGrantsPortAccessToExistingOwnersAndAdmins(t *testing.T
 		require.NoError(t, err)
 		assert.Contains(t, rd.Permissions, "agent.port_access", "%s should carry agent.port_access after reconciliation", name)
 		assert.NotContains(t, rd.Permissions, "agent.attach", "%s must still lack agent.attach", name)
-		assert.Equal(t, 5, getAppliedBuiltInRoleMarker(ctx, s, name).Revision, "%s marker should advance to revision 5", name)
+		// R5 granted agent.port_access; the marker advances to the role's
+		// current revision.
+		assert.Equal(t, builtInRoleRevision(t, name), getAppliedBuiltInRoleMarker(ctx, s, name).Revision, "%s marker should advance to the current revision", name)
 
 		d := authz.CheckAccess(ctx, caller, memberAgent, ActionPortAccess)
 		assert.True(t, d.Allowed, "%s should open a member's ports after reconciliation: %s", name, d.Reason)

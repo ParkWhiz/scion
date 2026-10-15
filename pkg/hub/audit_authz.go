@@ -33,38 +33,10 @@ import (
 // Decision Audit Emitter
 // =============================================================================
 
-// auditWriteTimeout is the maximum time an async audit INSERT may take before
-// the goroutine abandons the attempt and releases its store reference.
+// auditWriteTimeout is the maximum time an async mutation audit INSERT may
+// take before the goroutine abandons the attempt and releases its store
+// reference.
 const auditWriteTimeout = 1 * time.Second
-
-// StoreDecisionAuditEmitter implements DecisionAuditEmitter using the store.
-type StoreDecisionAuditEmitter struct {
-	store  store.Store
-	logger *slog.Logger
-}
-
-// NewStoreDecisionAuditEmitter creates a new store-backed decision audit emitter.
-func NewStoreDecisionAuditEmitter(s store.Store, logger *slog.Logger) *StoreDecisionAuditEmitter {
-	return &StoreDecisionAuditEmitter{store: s, logger: logger}
-}
-
-// EmitDecisionAudit stores a decision audit record asynchronously.
-func (e *StoreDecisionAuditEmitter) EmitDecisionAudit(ctx context.Context, record *store.DecisionAuditRecord) {
-	// Fire-and-forget in a goroutine to avoid blocking the authorization hot path.
-	// Uses a short timeout context to prevent goroutine/memory leaks on shutdown.
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				e.logger.Warn("recovered panic in decision audit emit", "panic", r)
-			}
-		}()
-		writeCtx, cancel := context.WithTimeout(context.Background(), auditWriteTimeout)
-		defer cancel()
-		if err := e.store.CreateDecisionAudit(writeCtx, record); err != nil {
-			e.logger.Warn("failed to emit decision audit record", "error", err)
-		}
-	}()
-}
 
 // emitDecisionAudit builds and emits a decision audit record from a Decide call.
 func (a *AuthzService) emitDecisionAudit(ctx context.Context, request AuthzRequest, decision Decision) {
@@ -129,6 +101,12 @@ func BuildDecisionAuditRecord(ctx context.Context, request AuthzRequest, decisio
 		PolicyID:       decision.BindingID,
 		CorrelationID:  logging.RequestIDFromContext(ctx),
 		DeniedBy:       string(decision.DeniedBy),
+
+		ResourceParentType:     request.Resource.ParentType,
+		ResourceParentID:       request.Resource.ParentID,
+		ResourceAncestryLen:    len(request.Resource.Ancestry),
+		ResourceScopeKind:      request.Resource.ScopeKind,
+		ResourceScopeUserIDSet: request.Resource.ScopeUserID != "",
 	}
 
 	if route := routeFromContext(ctx); route != "" {
@@ -346,7 +324,7 @@ func canonicalizeExplainPermission(resourceType string, action string) string {
 // handleAuthzExplain handles POST /api/v1/authz/explain.
 func (s *Server) handleAuthzExplain(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, ErrCodeInvalidRequest, "Method not allowed", nil)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -834,18 +812,12 @@ func newAgentIdentityFromStore(agent *store.Agent) AgentIdentity {
 func (s *Server) CleanupAuditRecords(ctx context.Context, retentionDays int) error {
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 
-	decisionCount, err := s.store.DeleteDecisionAuditsBefore(ctx, cutoff)
-	if err != nil {
-		return fmt.Errorf("failed to cleanup decision audit records: %w", err)
-	}
-
 	mutationCount, err := s.store.DeleteMutationAuditsBefore(ctx, cutoff)
 	if err != nil {
 		return fmt.Errorf("failed to cleanup mutation audit records: %w", err)
 	}
 
 	slog.Info("audit records cleaned up",
-		"decision_records_deleted", decisionCount,
 		"mutation_records_deleted", mutationCount,
 		"retention_days", retentionDays,
 		"cutoff", cutoff)

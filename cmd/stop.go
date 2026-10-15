@@ -15,8 +15,10 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,14 +34,25 @@ import (
 )
 
 var (
-	stopRm  bool
-	stopAll bool
+	stopRm   bool
+	stopAll  bool
+	stopSelf bool
 )
 
 // stopCmd represents the stop command
 var stopCmd = &cobra.Command{
 	Use:   "stop [agent]",
 	Short: "Stop an agent",
+	Long: `Stop an agent, or every running agent of the project with --all.
+
+With --rm the agent is also removed after it stops, with its local files
+and worktree (the git branch is kept).
+
+Inside an agent, --rm does not remove the current agent (the one the
+command runs in) unless --self is given: naming the current agent with
+--rm is refused and nothing is stopped, and --all --rm skips the current
+agent and stops and removes the others. Outside an agent container --self
+has no effect.`,
 	Args: func(cmd *cobra.Command, args []string) error {
 		if stopAll {
 			if len(args) > 0 {
@@ -59,8 +72,13 @@ var stopCmd = &cobra.Command{
 		return getAgentNames(cmd, args, toComplete)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// A target-hub profile refuses the flags that need local state
+		// (ptone/scion#4240).
+		if err := checkProfileAgentFlags(cmd); err != nil {
+			return err
+		}
 		if stopAll {
-			hubCtx, err := CheckHubAvailability(projectPath)
+			hubCtx, err := requireHub(projectPath)
 			if err != nil {
 				return err
 			}
@@ -73,9 +91,16 @@ var stopCmd = &cobra.Command{
 		agentName := api.Slugify(args[0])
 
 		// Check if Hub should be used, excluding the target agent from sync requirements.
-		hubCtx, err := CheckHubAvailabilityForAgent(projectPath, agentName, true)
+		hubCtx, err := requireHub(projectPath)
 		if err != nil {
 			return err
+		}
+
+		// Checked before the stop, so a refusal leaves the agent running.
+		if stopRm {
+			if err := refuseCurrentAgentTarget([]string{agentName}, hubProjectID(hubCtx), stopSelf); err != nil {
+				return err
+			}
 		}
 
 		if hubCtx != nil {
@@ -163,26 +188,23 @@ func stopAllAgents() error {
 		}
 	}
 
+	// Without a Hub the project ID is unknown, so the current agent is
+	// matched by name (fail closed).
+	running, skipped := skipCurrentAgentForStopAllRm(running, "", func(ra runningAgent) []string {
+		return []string{ra.Name}
+	})
+
 	if len(running) == 0 {
-		if isJSONOutput() {
-			return outputJSON(map[string]interface{}{
-				"status":  "success",
-				"command": "stop",
-				"message": "No running agents found.",
-				"results": []interface{}{},
-			})
-		}
-		statusln("No running agents found.")
-		return nil
+		return reportNoAgentsToStop(skipped)
 	}
 
 	if stopRm {
-		fmt.Printf("\nThe following %d agent(s) will be stopped and removed:\n", len(running))
-		for _, ra := range running {
-			fmt.Printf("  - %s\n", ra.Name)
+		names := make([]string, len(running))
+		for i, ra := range running {
+			names[i] = ra.Name
 		}
-		fmt.Println()
-		if !hubsync.ConfirmAction("Continue?", false, autoConfirm) {
+		if !confirmStopAllRm(names) {
+			// Declined: nothing is stopped; in JSON mode stdout stays empty.
 			return nil
 		}
 	}
@@ -196,14 +218,13 @@ func stopAllAgents() error {
 
 	var (
 		mu      sync.Mutex
-		wg      sync.WaitGroup
 		results []agentResult
 	)
 
-	for _, ra := range running {
-		wg.Add(1)
-		go func(name string) {
-			defer wg.Done()
+	// ptone/scion#3602: at most maxFanOutConcurrency agents in flight at once.
+	boundedFanOut(context.Background(), len(running), maxFanOutConcurrency, lifecycleFanOutQueuedHook,
+		func(i int) {
+			name := running[i].Name
 
 			res := agentResult{Name: name, Status: "success"}
 
@@ -236,10 +257,7 @@ func stopAllAgents() error {
 			mu.Lock()
 			results = append(results, res)
 			mu.Unlock()
-		}(ra.Name)
-	}
-
-	wg.Wait()
+		}, func(int) {})
 
 	if isJSONOutput() {
 		jsonResults := make([]map[string]interface{}, len(results))
@@ -262,11 +280,11 @@ func stopAllAgents() error {
 		if hasErrors {
 			overallStatus = "partial"
 		}
-		return outputJSON(map[string]interface{}{
+		return outputJSONResult(withSkippedAgents(map[string]interface{}{
 			"status":  overallStatus,
 			"command": "stop",
 			"results": jsonResults,
-		})
+		}, skipped), hasErrors, "failed to stop some agents")
 	}
 
 	var errs []string
@@ -285,6 +303,37 @@ func stopAllAgents() error {
 		return fmt.Errorf("failed to stop some agents:\n  %s", strings.Join(errs, "\n  "))
 	}
 	return nil
+}
+
+// confirmStopAllRm lists the agents that stop --all --rm will stop and
+// remove, and asks the user to continue. In JSON mode the list and the
+// prompt go to stderr, and --yes skips the prompt silently, so stdout
+// carries only the JSON document.
+func confirmStopAllRm(names []string) bool {
+	if !isJSONOutput() {
+		fmt.Printf("\nThe following %d agent(s) will be stopped and removed:\n", len(names))
+		for _, n := range names {
+			fmt.Printf("  - %s\n", n)
+		}
+		fmt.Println()
+		return hubsync.ConfirmAction("Continue?", false, autoConfirm)
+	}
+	if autoConfirm {
+		return true
+	}
+	fmt.Fprintf(os.Stderr, "\nThe following %d agent(s) will be stopped and removed:\n", len(names))
+	for _, n := range names {
+		fmt.Fprintf(os.Stderr, "  - %s\n", n)
+	}
+	fmt.Fprint(os.Stderr, "\nContinue? (y/N): ")
+	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		// Like hubsync.ConfirmAction: any read error, including EOF
+		// without a trailing newline, means the default (No).
+		return false
+	}
+	input = strings.ToLower(strings.TrimSpace(input))
+	return input == "y" || input == "yes"
 }
 
 // stopAllAgentsViaHub stops all running agents in the current project via the Hub.
@@ -313,26 +362,21 @@ func stopAllAgentsViaHub(hubCtx *HubContext) error {
 		}
 	}
 
+	running, skipped := skipCurrentAgentForStopAllRm(running, projectID, func(a hubclient.Agent) []string {
+		return []string{a.Name, a.Slug, a.ID}
+	})
+
 	if len(running) == 0 {
-		if isJSONOutput() {
-			return outputJSON(map[string]interface{}{
-				"status":  "success",
-				"command": "stop",
-				"message": "No running agents found.",
-				"results": []interface{}{},
-			})
-		}
-		statusln("No running agents found.")
-		return nil
+		return reportNoAgentsToStop(skipped)
 	}
 
 	if stopRm {
-		fmt.Printf("\nThe following %d agent(s) will be stopped and removed:\n", len(running))
-		for _, a := range running {
-			fmt.Printf("  - %s\n", a.Name)
+		names := make([]string, len(running))
+		for i, a := range running {
+			names[i] = a.Name
 		}
-		fmt.Println()
-		if !hubsync.ConfirmAction("Continue?", false, autoConfirm) {
+		if !confirmStopAllRm(names) {
+			// Declined: nothing is stopped; in JSON mode stdout stays empty.
 			return nil
 		}
 	}
@@ -351,14 +395,13 @@ func stopAllAgentsViaHub(hubCtx *HubContext) error {
 
 	var (
 		mu      sync.Mutex
-		wg      sync.WaitGroup
 		results []agentResult
 	)
 
-	for _, a := range running {
-		wg.Add(1)
-		go func(ag hubclient.Agent) {
-			defer wg.Done()
+	// ptone/scion#3602: at most maxFanOutConcurrency agents in flight at once.
+	boundedFanOut(context.Background(), len(running), maxFanOutConcurrency, lifecycleFanOutQueuedHook,
+		func(i int) {
+			ag := running[i]
 
 			res := agentResult{Name: ag.Name, Status: "success"}
 
@@ -411,25 +454,18 @@ func stopAllAgentsViaHub(hubCtx *HubContext) error {
 			mu.Lock()
 			results = append(results, res)
 			mu.Unlock()
-		}(a)
-	}
+		}, func(int) {})
 
-	wg.Wait()
-
-	if stopRm && hubCtx.ProjectPath != "" {
-		removedAny := false
-		for _, r := range results {
+	if stopRm {
+		// Confirmed removals get the same local cleanup as scion delete
+		// (ptone/scion#2896): agent files, worktree and sync state. It runs
+		// here, one agent at a time, because git worktree operations must
+		// not overlap. The branch is kept, as with a local stop --rm.
+		for i := range results {
+			r := &results[i]
 			if r.Removed && r.Error == "" {
-				removedAny = true
-				break
-			}
-		}
-		if removedAny {
-			// Keep sync watermark current after hub-side delete operations.
-			hubsync.UpdateLastSyncedAt(hubCtx.ProjectPath, time.Time{})
-			for _, r := range results {
-				if r.Removed && r.Error == "" {
-					hubsync.RemoveSyncedAgent(hubCtx.ProjectPath, r.Name)
+				if _, err := cleanupAfterHubDelete(hubCtx, r.Name, false); err != nil {
+					r.Warnings = append(r.Warnings, stopRmCleanupWarning(r.Name, err))
 				}
 			}
 		}
@@ -466,11 +502,11 @@ func stopAllAgentsViaHub(hubCtx *HubContext) error {
 		if hasErrors {
 			overallStatus = "partial"
 		}
-		return outputJSON(map[string]interface{}{
+		return outputJSONResult(withSkippedAgents(map[string]interface{}{
 			"status":  overallStatus,
 			"command": "stop",
 			"results": jsonResults,
-		})
+		}, skipped), hasErrors, "failed to stop some agents via Hub")
 	}
 
 	var errs []string
@@ -555,19 +591,24 @@ func stopAgentViaHub(hubCtx *HubContext, agentName string) error {
 			statusf("Agent '%s' stopped via Hub; %s.\n", agentName, msg)
 			return nil
 		}
-		if hubCtx.ProjectPath != "" {
-			// Keep sync watermark current after hub-side delete operations.
-			hubsync.UpdateLastSyncedAt(hubCtx.ProjectPath, time.Time{})
-			hubsync.RemoveSyncedAgent(hubCtx.ProjectPath, agentName)
+		// Same local cleanup as scion delete (ptone/scion#2896); the branch
+		// is kept, as with a local stop --rm.
+		var warnings []string
+		if _, err := cleanupAfterHubDelete(hubCtx, agentName, false); err != nil {
+			warnings = append(warnings, stopRmCleanupWarning(agentName, err))
 		}
 		if isJSONOutput() {
 			return outputJSON(ActionResult{
-				Status:  "success",
-				Command: "stop",
-				Agent:   agentName,
-				Message: fmt.Sprintf("Agent '%s' stopped and removed via Hub.", agentName),
-				Details: map[string]interface{}{"removed": true, "hub": true},
+				Status:   "success",
+				Command:  "stop",
+				Agent:    agentName,
+				Message:  fmt.Sprintf("Agent '%s' stopped and removed via Hub.", agentName),
+				Warnings: warnings,
+				Details:  map[string]interface{}{"removed": true, "hub": true},
 			})
+		}
+		for _, w := range warnings {
+			statusf("Warning: %s\n", w)
 		}
 		statusf("Agent '%s' stopped and removed via Hub.\n", agentName)
 	} else {
@@ -584,6 +625,64 @@ func stopAgentViaHub(hubCtx *HubContext, agentName string) error {
 	}
 
 	return nil
+}
+
+// skipCurrentAgentForStopAllRm returns items without the current agent when
+// stop --all --rm runs without --self, and the skipped agents. It notes each
+// skipped agent on stderr (in every output mode, so in JSON mode stdout
+// still carries only the JSON document; the JSON result lists them under
+// "skipped"). Otherwise it returns items unchanged and no skipped agents.
+// targetProjectID and refs are as for withoutCurrentAgent. It runs before
+// the confirm list, so that list does not name the current agent.
+func skipCurrentAgentForStopAllRm[T any](items []T, targetProjectID string, refs func(T) []string) (kept []T, skipped []string) {
+	if !stopRm || stopSelf {
+		return items, nil
+	}
+	kept, skipped = withoutCurrentAgent(items, targetProjectID, refs)
+	for _, name := range skipped {
+		fmt.Fprintf(os.Stderr, "Skipping agent '%s': it is the current agent (this command is running inside it); add --self to stop and remove it too.\n", name)
+	}
+	return kept, skipped
+}
+
+// noOtherRunningAgentsMessage is reported by stop --all --rm when the only
+// running agent was the current agent, which it skipped.
+const noOtherRunningAgentsMessage = "No other running agents to stop (current agent skipped; add --self to include it)"
+
+// reportNoAgentsToStop reports that stop --all found nothing to stop.
+// skipped are the agents skipCurrentAgentForStopAllRm left out; when there
+// are any, the message says so and the JSON result lists them.
+func reportNoAgentsToStop(skipped []string) error {
+	msg := "No running agents found."
+	if len(skipped) > 0 {
+		msg = noOtherRunningAgentsMessage
+	}
+	if isJSONOutput() {
+		return outputJSON(withSkippedAgents(map[string]interface{}{
+			"status":  "success",
+			"command": "stop",
+			"message": msg,
+			"results": []interface{}{},
+		}, skipped))
+	}
+	statusln(msg)
+	return nil
+}
+
+// withSkippedAgents adds the agents stop --all --rm skipped to a JSON
+// result document, as "skipped", when there are any.
+func withSkippedAgents(doc map[string]interface{}, skipped []string) map[string]interface{} {
+	if len(skipped) > 0 {
+		doc["skipped"] = skipped
+	}
+	return doc
+}
+
+// stopRmCleanupWarning is the warning for a stop --rm whose Hub removal
+// was confirmed but whose local cleanup failed. The command still succeeds.
+// stop --rm keeps the git branch, so the retry command does too.
+func stopRmCleanupWarning(agentName string, err error) string {
+	return fmt.Sprintf("removed via Hub but local cleanup failed: %v; run '%s' to retry", err, cleanupOnlyCommand(agentName, true))
 }
 
 // stopQueuedNotRemovedMessage is printed when stop --rm finds the stop queued
@@ -626,7 +725,8 @@ func printLifecycleWarnings(resp *hubclient.LifecycleResponse) {
 }
 
 func init() {
-	stopCmd.Flags().BoolVar(&stopRm, "rm", false, "Remove the agent after stopping")
+	stopCmd.Flags().BoolVar(&stopRm, "rm", false, "Remove the agent after stopping, including its local files and worktree (the git branch is kept)")
 	stopCmd.Flags().BoolVarP(&stopAll, "all", "a", false, "Stop all running agents in the current project")
+	stopCmd.Flags().BoolVar(&stopSelf, "self", false, "With --rm, allow removing the current agent when run inside an agent; without it, naming the current agent is refused and --all skips it")
 	rootCmd.AddCommand(stopCmd)
 }

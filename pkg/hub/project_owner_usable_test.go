@@ -36,16 +36,6 @@ import (
 // is active) and is checked on the post-state; it also never drops the last
 // owner binding of any kind (I2, ptone/scion#2554).
 
-// usableOwnerCount returns the number of distinct principals on projectID
-// that hold a usable owner binding. It goes through usableOwnerPrincipals,
-// the same path projectHasUsableOwner (and so enforcement) uses.
-func usableOwnerCount(t *testing.T, s store.Store, projectID string) int {
-	t.Helper()
-	ids, err := usableOwnerPrincipals(context.Background(), s, projectID, time.Now(), "", false)
-	require.NoError(t, err)
-	return len(ids)
-}
-
 // requireLastOwner409 asserts a 409 last_owner refusal.
 func requireLastOwner409(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
@@ -532,13 +522,17 @@ func TestDeleteUser_UsableOwnerRule(t *testing.T) {
 // inside transactions only, so pre-transaction checks pass.
 type faultingGetUserStore struct {
 	store.Store
+	fault  *storeFaultSwitch // nil: always active
 	failID string
 	inTx   bool
 }
 
 func (f *faultingGetUserStore) WithTx(ctx context.Context, fn func(store.Store) error) error {
+	if !f.fault.Active() {
+		return f.Store.WithTx(ctx, fn)
+	}
 	return f.Store.WithTx(ctx, func(tx store.Store) error {
-		return fn(&faultingGetUserStore{Store: tx, failID: f.failID, inTx: true})
+		return fn(&faultingGetUserStore{Store: tx, fault: f.fault, failID: f.failID, inTx: true})
 	})
 }
 
@@ -576,12 +570,14 @@ func TestLastOwner_GetUserFaultIs500(t *testing.T) {
 		assert.ElementsMatch(t, before, ownerBindingIDs(t, f.s, f.projectID))
 	})
 	t.Run("delete guard", func(t *testing.T) {
-		srv, s, alice, bob, project := setupDemoPolicyTest(t)
+		srv, s, alice, bob, project, faulty, fault := setupDemoPolicyTestWithFault(t, func(inner store.Store, f *storeFaultSwitch) *faultingGetUserStore {
+			return &faultingGetUserStore{Store: inner, fault: f}
+		})
 		createOwnerBinding(t, s, bob.ID, project.ID, nil, nil)
 
-		srv.store = &faultingGetUserStore{Store: s, failID: bob.ID}
+		faulty.failID = bob.ID
+		fault.Arm()
 		rec := doRequest(t, srv, http.MethodDelete, "/api/v1/users/"+alice.ID, nil)
-		srv.store = s
 		require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
 		_, err := s.GetUser(context.Background(), alice.ID)
 		require.NoError(t, err, "a failed delete must keep the user")

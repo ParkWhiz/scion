@@ -137,6 +137,11 @@ type usageReservationView struct {
 	// visibly (not tooltip-only) next to the cap, since a limit shown
 	// without that context would look enforced when it is not.
 	BrokerAgentLimitSource string `json:"brokerAgentLimitSource,omitempty"`
+	// ScopeConflict is true for a max_agents_per_broker reservation of a
+	// pinned agent whose Runtime Broker is not the reservation's broker.
+	// Such a reservation is reported, never moved, released or backfilled
+	// (ReconcileStaleBrokerQuotaReservations).
+	ScopeConflict bool `json:"scopeConflict,omitempty"`
 }
 
 // myUsageEntry represents one limit's current/max for the current user.
@@ -157,8 +162,9 @@ type myUsageResponse struct {
 
 // handleAdminLimits handles GET (list) and POST (create) on
 // /api/v1/admin/limits.
-// Authorization: route guard checks quota.read for GET.
-// POST requires quota.create via inline Decide.
+// Authorization: the route guard checks quota.read on the hub-scoped quota
+// target for every method; POST also requires quota.create
+// (requireWritePermissionForQuota).
 func (s *Server) handleAdminLimits(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -288,7 +294,10 @@ func (s *Server) handleAdminUsageByLimit(w http.ResponseWriter, r *http.Request)
 	s.getUsageByLimit(w, r, limitID)
 }
 
-// handleUsageMe handles GET on /api/v1/usage/me.
+// handleUsageMe handles GET on /api/v1/usage/me. It needs no permission: the
+// response holds only the caller's own usage (getMyUsage keys every lookup
+// off the caller's identity), so a user access token reads it with any
+// selector on either boundary.
 func (s *Server) handleUsageMe(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		MethodNotAllowed(w, http.MethodGet)
@@ -708,19 +717,21 @@ func (s *Server) getUsageSummary(w http.ResponseWriter, r *http.Request) {
 		// row showed 0 active agents regardless of real usage. Sum across
 		// every broker instead, the same way getUsageByLimit and
 		// ReconcileStaleBrokerQuotaReservations do (ptone/scion#2061 P2.2).
-		var reservations []*store.UsageReservation
+		var count int
 		var listErr error
 		if def.Name == store.LimitMaxAgentsPerBroker {
-			reservations, listErr = s.listBrokerScopedActiveReservations(ctx, def.ID)
+			count, listErr = s.countBrokerScopedActiveReservations(ctx, def.ID)
 		} else {
+			var reservations []*store.UsageReservation
 			reservations, listErr = s.store.ListActiveReservations(ctx, def.ID, store.QuotaScopeSystem, "")
+			count = len(reservations)
 		}
 		activeCount := 0
 		if listErr != nil {
 			slog.Error("failed to list active reservations for usage summary",
 				"limit_id", def.ID, "error", listErr)
 		} else {
-			activeCount = len(reservations)
+			activeCount = count
 		}
 		entries = append(entries, usageSummaryEntry{
 			LimitDefinition: def,
@@ -764,6 +775,14 @@ func (s *Server) getUsageByLimit(w http.ResponseWriter, r *http.Request, limitID
 	// reservation below (design.md §5.9, AC-P2-10): def is already that one
 	// lookup, so no second query is needed.
 	brokerCapacityCache := make(map[string]BrokerCapacity)
+	var agentsByID map[string]*store.Agent
+	if def.Name == store.LimitMaxAgentsPerBroker {
+		agentsByID, err = s.reservedBrokerAgents(ctx, reservations)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+	}
 	views := make([]usageReservationView, len(reservations))
 	for i, res := range reservations {
 		views[i] = usageReservationView{UsageReservation: res}
@@ -777,6 +796,9 @@ func (s *Server) getUsageByLimit(w http.ResponseWriter, r *http.Request, limitID
 		}
 		views[i].BrokerAgentLimit = bc.Limit
 		views[i].BrokerAgentLimitSource = bc.Source
+		if a, ok := agentsByID[res.ResourceID]; ok && a.IsPinned() && a.RuntimeBrokerID != res.ScopeID {
+			views[i].ScopeConflict = true
+		}
 	}
 
 	writeJSON(w, http.StatusOK, usageByLimitResponse{
@@ -786,35 +808,91 @@ func (s *Server) getUsageByLimit(w http.ResponseWriter, r *http.Request, limitID
 	})
 }
 
+// reservedBrokerAgents loads the agents holding broker-scoped reservations
+// in one query, keyed by agent ID, for the scopeConflict flag. Missing and
+// soft-deleted agents are absent.
+func (s *Server) reservedBrokerAgents(ctx context.Context, reservations []*store.UsageReservation) (map[string]*store.Agent, error) {
+	ids := make([]string, 0, len(reservations))
+	for _, res := range reservations {
+		if res.ScopeType == store.QuotaScopeBroker {
+			ids = append(ids, res.ResourceID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	agents, err := s.store.GetAgentsByIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("load reserved agents: %w", err)
+	}
+	return agents, nil
+}
+
 // listBrokerScopedActiveReservations aggregates active reservations for
 // limitDefinitionID across every runtime broker (ptone/scion#2061 P2.2).
 // max_agents_per_broker reservations are always scoped to a specific broker
-// (store.QuotaScopeBroker, scope_id=broker ID), so listing them requires
-// enumerating brokers first — store.Store.ListActiveReservations takes one
-// exact scope, not a wildcard. This mirrors
-// ReconcileStaleBrokerQuotaReservations's own broker loop (broker_quota.go),
-// including its bounds: 1+B queries (one ListRuntimeBrokers, one
-// ListActiveReservations per broker) and the same 10,000-broker cap, below
-// which a hub with more brokers than that would silently undercount here
-// exactly as reconcile already does. Reviewed and accepted for this PR
-// (round 1, F3); a single-query store method (e.g.
-// ListActiveReservationsByScopeType) usable by both call sites is a
-// follow-up, not required here.
+// (store.QuotaScopeBroker, scope_id=broker ID). The rows come from one
+// ListActiveReservationsByScopeType query (ptone/scion#2314) and are then
+// filtered and ordered by the broker list, so the result is the same as the
+// former one-query-per-broker loop: only brokers returned by
+// ListRuntimeBrokers (capped at 10,000, the same cap
+// ReconcileStaleBrokerQuotaReservations uses) contribute, rows of a scope ID
+// that is not a listed broker (for example a deleted broker) are left out,
+// and rows appear in broker-list order, created_at ascending within a broker.
 func (s *Server) listBrokerScopedActiveReservations(ctx context.Context, limitDefinitionID string) ([]*store.UsageReservation, error) {
-	brokers, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{}, store.ListOptions{Limit: 10000})
+	brokers, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{}, store.ListOptions{Limit: brokerScopedListLimit})
 	if err != nil {
 		return nil, fmt.Errorf("list runtime brokers: %w", err)
 	}
 
+	all, err := s.store.ListActiveReservationsByScopeType(ctx, limitDefinitionID, store.QuotaScopeBroker)
+	if err != nil {
+		return nil, fmt.Errorf("list active broker-scoped reservations: %w", err)
+	}
+	byBroker := groupReservationsByScopeID(all)
+
 	var reservations []*store.UsageReservation
 	for _, broker := range brokers.Items {
-		brokerReservations, err := s.store.ListActiveReservations(ctx, limitDefinitionID, store.QuotaScopeBroker, broker.ID)
-		if err != nil {
-			return nil, fmt.Errorf("list active reservations for broker %q: %w", broker.ID, err)
-		}
-		reservations = append(reservations, brokerReservations...)
+		reservations = append(reservations, byBroker[broker.ID]...)
 	}
 	return reservations, nil
+}
+
+// countBrokerScopedActiveReservations returns the number of rows
+// listBrokerScopedActiveReservations would return, using one grouped count
+// query instead of loading the rows (ptone/scion#2314). The same broker-list
+// filter applies: counts for scope IDs that are not listed brokers are not
+// included.
+func (s *Server) countBrokerScopedActiveReservations(ctx context.Context, limitDefinitionID string) (int, error) {
+	brokers, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{}, store.ListOptions{Limit: brokerScopedListLimit})
+	if err != nil {
+		return 0, fmt.Errorf("list runtime brokers: %w", err)
+	}
+
+	counts, err := s.store.CountActiveReservationsByScope(ctx, limitDefinitionID, store.QuotaScopeBroker)
+	if err != nil {
+		return 0, fmt.Errorf("count active broker-scoped reservations: %w", err)
+	}
+
+	total := 0
+	for _, broker := range brokers.Items {
+		total += int(counts[broker.ID])
+	}
+	return total, nil
+}
+
+// brokerScopedListLimit caps the runtime brokers enumerated by the
+// broker-scoped reservation views and ReconcileStaleBrokerQuotaReservations.
+const brokerScopedListLimit = 10000
+
+// groupReservationsByScopeID groups reservations by ScopeID, keeping their
+// input order within each group.
+func groupReservationsByScopeID(reservations []*store.UsageReservation) map[string][]*store.UsageReservation {
+	grouped := make(map[string][]*store.UsageReservation)
+	for _, res := range reservations {
+		grouped[res.ScopeID] = append(grouped[res.ScopeID], res)
+	}
+	return grouped
 }
 
 func (s *Server) getMyUsage(w http.ResponseWriter, r *http.Request) {
@@ -886,9 +964,11 @@ func (s *Server) getMyUsage(w http.ResponseWriter, r *http.Request) {
 // Authorization helper
 // ---------------------------------------------------------------------------
 
-// requireWritePermissionForQuota checks that the authenticated user has the
-// specified quota permission. It uses the same pattern as requireWritePermission
-// but with the "quota" resource type.
+// requireWritePermissionForQuota checks that the authenticated user holds the
+// specified quota permission on the hub-scoped quota target
+// (hubScopedResource("quota", "hub")), the same target the quota route guard
+// checks. A user access token is admitted only with the permission's
+// selector on a hub boundary; a target without hub evidence denies.
 func (s *Server) requireWritePermissionForQuota(w http.ResponseWriter, r *http.Request, permission string, action string) (UserIdentity, bool) {
 	identity := GetIdentityFromContext(r.Context())
 	if identity == nil {
@@ -907,7 +987,7 @@ func (s *Server) requireWritePermissionForQuota(w http.ResponseWriter, r *http.R
 	decision := s.authzService.Decide(r.Context(), AuthzRequest{
 		Principal:  principalContextForIdentity(user),
 		Credential: credentialContextForIdentity(user),
-		Resource:   Resource{Type: "quota", ID: "hub"},
+		Resource:   hubScopedResource("quota", "hub"),
 		Action:     Action(action),
 		Permission: permission,
 	})

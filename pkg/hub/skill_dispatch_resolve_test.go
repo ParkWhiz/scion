@@ -34,37 +34,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// publishTestSkillVersion adds a published 1.0.0 version to skill.
-func publishTestSkillVersion(t *testing.T, s store.Store, skill *store.Skill) {
-	t.Helper()
-	require.NoError(t, s.CreateSkillVersion(context.Background(), &store.SkillVersion{
-		ID:          api.NewUUID(),
-		SkillID:     skill.ID,
-		Version:     "1.0.0",
-		ContentHash: "sha256:test",
-		Status:      store.SkillVersionStatusPublished,
-		Created:     time.Now(),
-	}))
-}
-
-// dispatchTestAgent returns an agent created by creatorID whose inline config
-// declares refs as required skills.
-func dispatchTestAgent(creatorID, projectID string, refs ...string) *store.Agent {
-	skills := make([]api.SkillReference, len(refs))
-	for i, r := range refs {
-		skills[i] = api.SkillReference{URI: r, Scope: "template"}
-	}
-	return &store.Agent{
-		ID:        api.NewUUID(),
-		ProjectID: projectID,
-		CreatedBy: creatorID,
-		OwnerID:   creatorID,
-		AppliedConfig: &store.AgentAppliedConfig{
-			InlineConfig: &api.ScionConfig{Skills: skills},
-		},
-	}
-}
-
 // The #1784 scenario: a global skill referenced by an agent's config. The
 // broker cannot read it, but the Hub resolves it at dispatch as the creating
 // member, who can.
@@ -388,7 +357,7 @@ func (d *preResolvingDispatcher) DispatchAgentCreate(ctx context.Context, agent 
 // End to end through the scheduler: a dispatch_agent event created by a
 // regular member, naming a Hub template whose scion-agent.yaml requires a
 // private skill, stamps the template ID (#1795) and pre-resolves that skill as
-// the event's creator.
+// the principal of the event's latest revision.
 func TestSchedulerDispatch_PreResolvesTemplatePrivateSkill(t *testing.T) {
 	const skillURI = "skill://scion/global/sched-private@latest"
 	srv, s, alice, _, project := setupSkillAuthzTest(t)
@@ -405,13 +374,13 @@ func TestSchedulerDispatch_PreResolvesTemplatePrivateSkill(t *testing.T) {
 
 	payload, err := json.Marshal(DispatchAgentEventPayload{AgentName: "sched-skill-agent", Template: "sched-skill-tmpl"})
 	require.NoError(t, err)
-	require.NoError(t, srv.dispatchAgentEventHandler()(ctx, store.ScheduledEvent{
+	require.NoError(t, srv.dispatchAgentEventHandler()(ctx, withSessionRevision(store.ScheduledEvent{
 		ID:        tid("sched-skill-event"),
 		ProjectID: project.ID,
 		EventType: "dispatch_agent",
 		Payload:   string(payload),
 		CreatedBy: alice.ID,
-	}))
+	}, alice.ID)))
 
 	// #1795: the scheduled path stamps the resolved template's ID and hash,
 	// as the agent-create path does, so the broker can hydrate it and the

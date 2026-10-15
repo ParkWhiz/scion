@@ -112,7 +112,7 @@ func (r *DockerRuntime) Run(ctx context.Context, config RunConfig) (string, erro
 			// The caller gave up while the daemon may still have been
 			// creating/starting the container. Clean up any partial result
 			// instead of leaking it. See ptone/scion#1886.
-			rollbackCancelledCreate(r.Command, config.Name)
+			rollbackCancelledCreate(r.Command, config.Name, config.Labels[api.LabelRunID])
 			return "", ctx.Err()
 		}
 		return "", fmt.Errorf("container run failed: %w (output: %s)", err, out)
@@ -230,26 +230,7 @@ func (r *DockerRuntime) List(ctx context.Context, labelFilter map[string]string)
 		}
 
 		// Filter by labels if requested
-		match := true
-		for k, v := range labelFilter {
-			actual := labels[k]
-			// Fallback for project labels
-			if actual == "" {
-				switch k {
-				case projectkeys.LabelProject:
-					actual = projectkeys.ProjectNameFromLabels(labels)
-				case projectkeys.LabelProjectID:
-					actual = projectkeys.ProjectIDFromLabels(labels)
-				case projectkeys.LabelProjectPath:
-					actual = projectkeys.ProjectPathFromLabels(labels)
-				}
-			}
-
-			if !projectkeys.LabelValuesMatch(k, actual, v) {
-				match = false
-				break
-			}
-		}
+		match := LabelsMatchFilter(labels, labelFilter)
 
 		if match {
 			// Prefer the scion.name label (slugified) over Docker container name
@@ -311,7 +292,7 @@ func (r *DockerRuntime) execListWithRetry(ctx context.Context) ([]byte, error) {
 
 		jitter := 1 + dockerListJitter*(2*rand.Float64()-1)
 		sleep := time.Duration(float64(backoff) * jitter)
-		runtimeLog.Debug("docker ps failed, retrying", "attempt", attempt, "max_attempts", dockerListMaxAttempts, "backoff", sleep, "error", err)
+		runtimeLog().Debug("docker ps failed, retrying", "attempt", attempt, "max_attempts", dockerListMaxAttempts, "backoff", sleep, "error", err)
 
 		timer := time.NewTimer(sleep)
 		select {
@@ -454,7 +435,10 @@ func (r *DockerRuntime) Exec(ctx context.Context, id string, cmd []string) (stri
 		id = resolveContainerID(agents, id)
 	}
 	args := append([]string{"exec", "--user", "scion", id}, cmd...)
-	return runSimpleCommand(ctx, r.Command, args...)
+	out, err := runSimpleCommand(ctx, r.Command, args...)
+	// A container removed after the lookup above must surface as
+	// ErrContainerNotFound, not as the command's exit (ptone/scion#3655).
+	return out, dockerExecNotFound.classifyExecErr(ctx, err, out, id, r.List)
 }
 
 // ExecWithStdin runs cmd inside the container with stdin piped from the

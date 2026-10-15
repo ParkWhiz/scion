@@ -371,18 +371,6 @@ func TestSAAssign2147_SeedReconciliation_ExistingHubGetsAssignPermission(t *test
 	}
 }
 
-// builtInRoleRevision returns the declared revision of a built-in project role.
-func builtInRoleRevision(t *testing.T, name string) int {
-	t.Helper()
-	for _, role := range BuiltInRoles() {
-		if role.Name == name && role.ScopeType == store.RoleScopeProject {
-			return role.Revision
-		}
-	}
-	t.Fatalf("no built-in project role %q", name)
-	return 0
-}
-
 // ---------------------------------------------------------------------------
 // Project-default HTTP path, end to end, for a service account the caller
 // did not register. Companion to TestProjectDefaultGate_CreatorWith(out)ActAsSucceeds
@@ -723,7 +711,8 @@ func TestSAAssign2147_MemberAgentCreatesAgent_Enforce_EvaluatesCreatingSA(t *tes
 
 // TestSAAssign2147_MemberScheduledDispatch_Enforce_EvaluatesScheduleCreator
 // covers a dispatch_agent scheduled event created by a plain project member.
-// The actAs principal is the schedule's creator.
+// The actAs principal is the principal of the event's latest revision, here
+// the member who created it.
 func TestSAAssign2147_MemberScheduledDispatch_Enforce_EvaluatesScheduleCreator(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -740,13 +729,13 @@ func TestSAAssign2147_MemberScheduledDispatch_Enforce_EvaluatesScheduleCreator(t
 			enforceSAAssign(m.srv, checker)
 
 			agentName := "2147-path-sched-" + tc.name
-			err := m.srv.dispatchAgentEventHandler()(context.Background(), store.ScheduledEvent{
+			err := m.srv.dispatchAgentEventHandler()(context.Background(), withSessionRevision(store.ScheduledEvent{
 				ID:        "evt-" + agentName,
 				ProjectID: m.proj.ID,
 				EventType: "dispatch_agent",
 				Payload:   `{"agentName":"` + agentName + `","task":"scheduled work"}`,
 				CreatedBy: m.member.ID,
-			})
+			}, m.member.ID))
 			if tc.allow {
 				require.NoError(t, err)
 			} else {

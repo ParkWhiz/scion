@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,6 +28,8 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel/sdk/metric"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -69,7 +72,7 @@ func (v *countingRouteValidator) totalCalls() int64 {
 func newGERouteTestServer(t *testing.T, validator GoogleCredentialValidator) *Server {
 	t.Helper()
 
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -82,11 +85,10 @@ func newGERouteTestServer(t *testing.T, validator GoogleCredentialValidator) *Se
 		TokenTTL:         DefaultGETokenTTL,
 	}
 
-	srv, err := New(cfg, s)
+	srv, err := newTestHubServer(t, cfg, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 
 	// Replace the production Google validator with the test double.
 	srv.geExchangeService.validator = validator
@@ -98,7 +100,7 @@ func newGERouteTestServer(t *testing.T, validator GoogleCredentialValidator) *Se
 func newGERouteTestServerDisabled(t *testing.T) *Server {
 	t.Helper()
 
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -107,11 +109,10 @@ func newGERouteTestServerDisabled(t *testing.T) *Server {
 	cfg.DevAuthToken = "test-dev-token-route"
 	// GEGoogleExchange is zero-value (not enabled).
 
-	srv, err := New(cfg, s)
+	srv, err := newTestHubServer(t, cfg, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 
 	return srv
 }
@@ -365,7 +366,7 @@ func TestGEExchange_Route_BodyLimitStillOperates(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGEExchange_Route_SharesValidatorAndResolverWithExternalBearer(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -377,11 +378,10 @@ func TestGEExchange_Route_SharesValidatorAndResolverWithExternalBearer(t *testin
 		TokenTTL:         DefaultGETokenTTL,
 	}
 
-	srv, err := New(cfg, s)
+	srv, err := newTestHubServer(t, cfg, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 
 	if srv.geExchangeService == nil {
 		t.Fatal("expected GE exchange service to be configured")
@@ -424,7 +424,7 @@ func TestGEExchange_Route_SharesValidatorAndResolverWithExternalBearer(t *testin
 // gated on GEGoogleExchange or startup-time trust detection, so that Google
 // trust added later via hot reload takes effect without a restart.
 func TestGEExchange_Route_GoogleStackBuiltWithoutExchangeOrTrust(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -433,11 +433,10 @@ func TestGEExchange_Route_GoogleStackBuiltWithoutExchangeOrTrust(t *testing.T) {
 	// Deliberately no GEGoogleExchange, no Federation config: neither Google
 	// trust nor the exchange is configured.
 
-	srv, err := New(cfg, s)
+	srv, err := newTestHubServer(t, cfg, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 
 	if srv.geExchangeService != nil {
 		t.Fatal("expected no GE exchange service when GEGoogleExchange is not configured")
@@ -457,7 +456,7 @@ func TestGEExchange_Route_GoogleStackBuiltWithoutExchangeOrTrust(t *testing.T) {
 // return srv.getUserRole(ctx, email, "", "") }) actually honours AdminEmails
 // in production. This resolves against the actual resolver New() builds.
 func TestGEExchange_Route_ProductionResolverHonoursAdminEmails(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -465,11 +464,10 @@ func TestGEExchange_Route_ProductionResolverHonoursAdminEmails(t *testing.T) {
 	cfg := DefaultServerConfig()
 	cfg.AdminEmails = []string{"admin@gmail.com"}
 
-	srv, err := New(cfg, s)
+	srv, err := newTestHubServer(t, cfg, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 
 	if srv.authConfig.GoogleResolver == nil {
 		t.Fatal("expected authConfig.GoogleResolver to be set")
@@ -522,7 +520,7 @@ func TestGEExchange_Route_ProductionResolverHonoursAdminEmails(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServer_MetricsSettersReachRunningHandler(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -538,11 +536,10 @@ func TestServer_MetricsSettersReachRunningHandler(t *testing.T) {
 	// no network access — this test is about whether the setter wiring
 	// reaches the request path, not about a specific outcome.
 
-	srv, err := New(cfg, s)
+	srv, err := newTestHubServer(t, cfg, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	srv.geExchangeService.validator = &fakeGoogleValidator{idTokenResult: validGmailIdentity()}
 
 	handler := srv.Handler()
@@ -605,7 +602,7 @@ func TestServer_MetricsSettersReachRunningHandler(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServer_DefaultMetricsWiring_RecordsWithoutSetters(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -620,11 +617,10 @@ func TestServer_DefaultMetricsWiring_RecordsWithoutSetters(t *testing.T) {
 	// Deliberately no Federation config: the /api/v1/auth/me request below
 	// exercises not_applicable, which needs no Google trust and no network.
 
-	srv, err := New(cfg, s)
+	srv, err := newTestHubServer(t, cfg, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	srv.geExchangeService.validator = &fakeGoogleValidator{idTokenResult: validGmailIdentity()}
 
 	handler := srv.Handler()
@@ -705,7 +701,7 @@ func decodeExternalBearerSection(t *testing.T, body []byte) *ExternalBearerMetri
 // ever dropped (passed as nil, a legal value), the section would freeze the
 // moment GCP export is configured.
 func TestServer_DefaultMetricsWiring_OTelSetterStillMovesSnapshot(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
@@ -718,11 +714,10 @@ func TestServer_DefaultMetricsWiring_OTelSetterStillMovesSnapshot(t *testing.T) 
 		TokenTTL:         DefaultGETokenTTL,
 	}
 
-	srv, err := New(cfg, s)
+	srv, err := newTestHubServer(t, cfg, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	srv.geExchangeService.validator = &fakeGoogleValidator{idTokenResult: validGmailIdentity()}
 
 	reader := metric.NewManualReader()
@@ -756,5 +751,115 @@ func TestServer_DefaultMetricsWiring_OTelSetterStillMovesSnapshot(t *testing.T) 
 	decoded := decodeExternalBearerSection(t, metricsW.Body.Bytes())
 	if got := decoded.GEExchangeRequestsTotal[string(GEExchangeOutcomeOK)]; got != 1 {
 		t.Errorf("geExchangeRequestsTotal.ok = %d, want 1 (the OTel recorder must dual-write into the same shared snapshot passed to it)", got)
+	}
+}
+
+// TestGEExchange_Route_RefusesDriverPrincipal (ptone/scion#4240, WS2): a hub
+// built through New with proxy driver principals refuses a driver's Google
+// identity on both Google paths, the GE exchange and the external-bearer
+// path, because New wires the driver set into the shared resolver. No
+// account is created, and an identity that is not a driver still works.
+// The driver legs report with Errorf so that removing the wiring fails
+// both of them.
+func TestGEExchange_Route_RefusesDriverPrincipal(t *testing.T) {
+	const driver = "browser-driver@example.com"
+	s, err := newTestStore(t, ":memory:")
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	cfg := DefaultServerConfig()
+	cfg.DevAuthToken = "test-dev-token-route"
+	cfg.AuthMode = "proxy"
+	cfg.ProxyAuth = newTIIAP(t).auth
+	cfg.ProxyDriverPrincipals = []string{driver}
+	cfg.GEGoogleExchange = GEGoogleExchangeConfig{
+		Enabled:          true,
+		AllowedClientIDs: []string{"test-client-id.apps.googleusercontent.com"},
+		TokenTTL:         DefaultGETokenTTL,
+	}
+	srv, err := newTestHubServer(t, cfg, s)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	// The driver identity is authoritative (hosted domain set), so without
+	// the driver refusal it would be resolved and provisioned: only that
+	// refusal can produce the 403s below.
+	driverIdentity := validGmailIdentity()
+	driverIdentity.Subject = "google-sub-driver"
+	driverIdentity.Email = driver
+	driverIdentity.HostedDomain = "example.com"
+
+	exchange := func(identity *ValidatedGoogleIdentity) *httptest.ResponseRecorder {
+		srv.geExchangeService.validator = &fakeGoogleValidator{idTokenResult: identity}
+		req := httptest.NewRequest("POST", "/api/v1/auth/integrations/google/exchange",
+			bytes.NewBufferString(`{"credential":"test-id-token","credentialType":"id_token"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "192.0.2.1:12345"
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := exchange(driverIdentity)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("GE exchange for a driver: expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "user not authorized") {
+		t.Errorf("expected the not-authorized answer, got %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "accessToken") || strings.Contains(rec.Body.String(), "access_token") {
+		t.Errorf("no token may be returned: %s", rec.Body.String())
+	}
+	if _, err := s.GetUserByEmail(context.Background(), driver); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("expected no user row for the driver, got err=%v", err)
+	}
+
+	rec = exchange(validGmailIdentity())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GE exchange for another identity: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp ExchangeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp.AccessToken == "" {
+		t.Fatalf("expected an access token for another identity: err=%v body=%s", err, rec.Body.String())
+	}
+
+	// The external-bearer path on the same server: Google trust on, the
+	// driver's ID token as the bearer of a protected route.
+	srv.authConfig.FederationAuth = federationAuthPointer(newGoogleTrustFederationAuth(t, "test-client-id.apps.googleusercontent.com"))
+	srv.authConfig.GoogleValidator = &fakeGoogleValidator{idTokenResult: driverIdentity}
+	kp := newGCVTestKeyPair("route-kid")
+	bearerFor := func(email, sub string) string {
+		claims := validIDTokenClaims()
+		claims["email"] = email
+		claims["sub"] = sub
+		claims["hd"] = "example.com"
+		claims["aud"] = "test-client-id.apps.googleusercontent.com"
+		return signIDToken(kp, claims)
+	}
+	projects := func(bearer string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	rec = projects(bearerFor(driver, "google-sub-driver"))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("external bearer for a driver: expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := s.GetUserByEmail(context.Background(), driver); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("expected no user row for the driver after the external bearer, got err=%v", err)
+	}
+
+	// Control on the same server and path: an authoritative identity that
+	// is not a driver is resolved and served.
+	other := validGmailIdentity()
+	other.Subject = "google-sub-other-route"
+	other.Email = "someone-else@example.com"
+	other.HostedDomain = "example.com"
+	srv.authConfig.GoogleValidator = &fakeGoogleValidator{idTokenResult: other}
+	rec = projects(bearerFor(other.Email, other.Subject))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("external bearer for another identity: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

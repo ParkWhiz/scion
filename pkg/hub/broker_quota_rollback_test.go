@@ -30,18 +30,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// failingStartDispatcher is a quotaLifecycleDispatcher whose start dispatch
-// always fails without touching the agent, as a broker that cannot launch
-// the container would.
-type failingStartDispatcher struct {
-	quotaLifecycleDispatcher
-}
-
-func (d *failingStartDispatcher) DispatchAgentStart(_ context.Context, _ *store.Agent, _ string, _ bool) error {
-	d.startCount.Add(1)
-	return errors.New("simulated broker start failure")
-}
-
 // ptone/scion#1978: a failed start on an agent that is already running (and
 // so already holds its max_agents_per_broker reservation) must keep that
 // reservation, and the broker must still reject a start beyond its cap.
@@ -102,25 +90,20 @@ func TestBrokerQuota_FailedRestartReleasesReservation(t *testing.T) {
 	broker, project := newQuotaTestBrokerAndProject(t, s, "rollback-restart")
 	running := newQuotaTestAgent(t, s, broker, project, "rollback-restart", state.PhaseRunning)
 	reserveBrokerSlot(t, s, broker, running.ID)
+	// The agent has a run, as every dispatched agent does: a failed restart
+	// that leaves no run records nothing (ptone/scion#2550 P5, see
+	// TestRestartStartLegFailureWithEmptyCurrentRunRecordsNothing).
+	_, err := s.SetAgentRunID(context.Background(), running.ID, "run-x", nil)
+	require.NoError(t, err)
 
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+running.ID+"/restart", nil)
 	require.GreaterOrEqual(t, rec.Code, 500, rec.Body.String())
 	assert.EqualValues(t, 0, brokerReservationCount(t, s, broker.ID))
 }
 
-// failingStopStartDispatcher fails both legs of a restart, as a broker that
-// cannot reach a still-running container would.
-type failingStopStartDispatcher struct {
-	failingStartDispatcher
-}
-
-func (d *failingStopStartDispatcher) DispatchAgentStop(_ context.Context, _ *store.Agent) error {
-	return errors.New("simulated broker stop failure")
-}
-
-// ptone/scion#1978: when the stop leg of a restart fails, the container may
-// still be running, so its reservation is kept whether or not the start leg
-// then succeeds, and the broker cap still holds.
+// ptone/scion#1978, ptone/scion#2710: when the stop leg of a restart fails,
+// the container may still be running, so the restart aborts before the start
+// leg, its reservation is kept, and the broker cap still holds.
 func TestBrokerQuota_FailedStopLegKeepsReservation(t *testing.T) {
 	for _, startFails := range []bool{true, false} {
 		t.Run(fmt.Sprintf("startFails=%v", startFails), func(t *testing.T) {
@@ -137,11 +120,7 @@ func TestBrokerQuota_FailedStopLegKeepsReservation(t *testing.T) {
 			reserveBrokerSlot(t, s, broker, running.ID)
 
 			rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+running.ID+"/restart", nil)
-			if startFails {
-				require.GreaterOrEqual(t, rec.Code, 500, rec.Body.String())
-			} else {
-				require.Less(t, rec.Code, 300, rec.Body.String())
-			}
+			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
 			assert.EqualValues(t, 1, brokerReservationCount(t, s, broker.ID))
 			assert.True(t, hasReservation(t, s, store.LimitMaxAgentsPerBroker, running.ID))
 
@@ -226,15 +205,6 @@ func (d *swappableStartDispatcher) DispatchAgentStart(ctx context.Context, agent
 	return d.quotaLifecycleDispatcher.DispatchAgentStart(ctx, agent, task, resume)
 }
 
-func hasReservation(t *testing.T, s store.Store, limitName, resourceID string) bool {
-	t.Helper()
-	def, err := s.GetLimitDefinitionByName(context.Background(), limitName)
-	require.NoError(t, err)
-	held, err := s.HasActiveReservation(context.Background(), def.ID, resourceID)
-	require.NoError(t, err)
-	return held
-}
-
 // ptone/scion#1978: the per-project agent reservation lasts as long as the
 // agent exists. Releasing the broker slot (stop, suspend, failed-start
 // rollback) must not release it; delete releases both.
@@ -289,22 +259,6 @@ func TestProjectQuota_KeptAcrossBrokerReleases_ReleasedOnDelete(t *testing.T) {
 	assert.False(t, hasReservation(t, s, store.LimitMaxAgentsPerProject, id), "delete releases the project reservation")
 }
 
-// brokerReservationIDs returns the IDs of broker's active
-// max_agents_per_broker reservations.
-func brokerReservationIDs(t *testing.T, s store.Store, brokerID string) []string {
-	t.Helper()
-	ctx := context.Background()
-	def, err := s.GetLimitDefinitionByName(ctx, store.LimitMaxAgentsPerBroker)
-	require.NoError(t, err)
-	rows, err := s.ListActiveReservations(ctx, def.ID, store.QuotaScopeBroker, brokerID)
-	require.NoError(t, err)
-	ids := make([]string, 0, len(rows))
-	for _, r := range rows {
-		ids = append(ids, r.ID)
-	}
-	return ids
-}
-
 // ptone/scion#1978: a restart holds the agent's broker reservation across
 // the stop and start legs instead of releasing it and reserving again, so
 // there is no point between the legs where another start could take the
@@ -326,10 +280,10 @@ func TestBrokerQuota_RestartHoldsReservationAcrossLegs(t *testing.T) {
 		"restart must keep the existing reservation, not release and re-create it")
 }
 
-// ptone/scion#1978: restarting a stopped agent creates its reservation, so
-// when both the stop and start legs fail the restart must still roll that
-// reservation back.
-func TestBrokerQuota_RestartStoppedAgentBothLegsFailReleasesNewReservation(t *testing.T) {
+// ptone/scion#1978, ptone/scion#2710: a restart of a stopped agent whose
+// stop leg fails aborts before the start leg, so it must not leave a
+// reservation behind or the agent marked starting.
+func TestBrokerQuota_RestartStoppedAgentStopLegFailsLeavesNoReservation(t *testing.T) {
 	srv, s := testServer(t)
 	srv.SetDispatcher(&failingStopStartDispatcher{})
 	setBrokerAgentCeiling(t, s, 2)
@@ -337,10 +291,14 @@ func TestBrokerQuota_RestartStoppedAgentBothLegsFailReleasesNewReservation(t *te
 	a := newQuotaTestAgent(t, s, broker, project, "restart-stopped-bothfail", state.PhaseStopped)
 
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+a.ID+"/restart", nil)
-	require.GreaterOrEqual(t, rec.Code, 500, rec.Body.String())
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
 	assert.EqualValues(t, 0, brokerReservationCount(t, s, broker.ID),
-		"the restart created the reservation, so a failed start rolls it back even when the stop leg also failed")
+		"an aborted restart must not leave a reservation behind")
 	assert.False(t, hasReservation(t, s, store.LimitMaxAgentsPerBroker, a.ID))
+	got, err := s.GetAgent(context.Background(), a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, string(state.PhaseStopped), got.Phase,
+		"an aborted restart must leave a stopped agent stopped, not starting")
 }
 
 // assertCreateExistingAgentFailedStartReleases puts an agent into the state

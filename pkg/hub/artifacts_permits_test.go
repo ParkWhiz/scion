@@ -32,7 +32,13 @@ import (
 // A scoped user access token keeps its own restrictions: it is not treated
 // as the plain user behind it.
 func TestArtifactHostPermits(t *testing.T) {
-	host := newArtifactHost(&Server{})
+	srv, s := testServer(t)
+	host := newArtifactHost(srv)
+	// A real agent with a recorded delegation edge, so its chain allows the
+	// artifact permissions (agentChainAllows).
+	p1 := artifactProject(t, s, "permits-p1")
+	chained, _ := artifactAgent(t, srv, s, p1.ID, "permits-agent", AgentRoleFull)
+	agent := func(scopes ...AgentTokenScope) Identity { return artifactTestAgent(chained.ID, p1.ID, scopes...) }
 	alice := NewAuthenticatedUser("user-1", "alice@example.com", "Alice", "member", "api")
 	uat := func(project string, scopes ...string) Identity { return artifactTestUAT(t, alice, project, scopes...) }
 	synthetic := &agentIdentityWrapper{&AgentTokenClaims{
@@ -56,12 +62,13 @@ func TestArtifactHostPermits(t *testing.T) {
 		{"UAT read scope does not create", uat("p1", "artifact:read"), "p1", artifacts.PermissionCreate, false},
 		{"UAT with artifact:create", uat("p1", "artifact:create"), "p1", artifacts.PermissionCreate, true},
 
-		{"agent with the read scope", artifactTestAgent("agent-1", "p1", ScopeProjectArtifactRead), "p1", artifacts.PermissionRead, true},
-		{"agent read scope, other home project", artifactTestAgent("agent-1", "p1", ScopeProjectArtifactRead), "p2", artifacts.PermissionRead, true},
-		{"agent without the read scope", artifactTestAgent("agent-1", "p1", ScopeProjectRead), "p1", artifacts.PermissionRead, false},
-		{"agent without the write scope", artifactTestAgent("agent-1", "p1", ScopeProjectArtifactRead), "p1", artifacts.PermissionCreate, false},
-		{"agent with the write scope", artifactTestAgent("agent-1", "p1", ScopeProjectArtifactWrite), "p1", artifacts.PermissionCreate, true},
-		{"agent delete is never permitted", artifactTestAgent("agent-1", "p1", ScopeProjectArtifactRead, ScopeProjectArtifactWrite), "p1", artifacts.PermissionDelete, false},
+		{"agent with the read scope", agent(ScopeProjectArtifactRead), p1.ID, artifacts.PermissionRead, true},
+		{"agent read scope, artifact homed elsewhere", agent(ScopeProjectArtifactRead), "p2", artifacts.PermissionRead, true},
+		{"agent without the read scope", agent(ScopeProjectRead), p1.ID, artifacts.PermissionRead, false},
+		{"agent without the write scope", agent(ScopeProjectArtifactRead), p1.ID, artifacts.PermissionCreate, false},
+		{"agent with the write scope", agent(ScopeProjectArtifactWrite), p1.ID, artifacts.PermissionCreate, true},
+		{"agent delete is never permitted", agent(ScopeProjectArtifactRead, ScopeProjectArtifactWrite), p1.ID, artifacts.PermissionDelete, false},
+		{"agent with scopes but no delegation edge", artifactTestAgent("agent-without-edge", p1.ID, ScopeProjectArtifactRead), p1.ID, artifacts.PermissionRead, false},
 		{"in-process agent identity without a token", synthetic, "p1", artifacts.PermissionRead, false},
 
 		{"federated agent", NewFederatedAgentIdentity("https://other.example.com", "remote-agent", "remote-proj", "remote", "root", nil, nil), "p1", artifacts.PermissionRead, false},
@@ -76,14 +83,6 @@ func TestArtifactHostPermits(t *testing.T) {
 		})
 	}
 	assert.False(t, host.Permits(context.Background(), "p1", artifacts.PermissionRead), "no identity")
-}
-
-// artifactTestUAT builds a current-version (V1) user access token bounded
-// to project, whose ceiling is exactly the registry permissions of scopes.
-func artifactTestUAT(t *testing.T, user UserIdentity, project string, scopes ...string) *ScopedUserIdentity {
-	t.Helper()
-	return NewScopedUserIdentityWithCeiling(user, project, scopes, "uat-"+project,
-		permissions.FrozenPermissionCeiling{Version: permissions.CeilingVersionV1, PermissionIDs: uatCeilingFromSelectors(t, scopes...).PermissionIDs})
 }
 
 // TestArtifactHostIgnoresInProcessAgentIdentities: identities the hub
@@ -156,7 +155,14 @@ func TestArtifactHostPermits_ScopedUserTokenKeepsItsLimits(t *testing.T) {
 // bound (unrecorded ceiling) keeps every scope it was issued before and is
 // only not extended the artifact scopes; a principal chain is unchanged.
 func TestLegacyChainsWithholdOnlyArtifactScopes(t *testing.T) {
-	assert.Equal(t, map[string]bool{"artifact.create": true, "artifact.read": true, "artifact.update": true}, legacyChainExcludedPermissions)
+	// The ceiling-optional scopes' coverage (the artifact permissions) plus
+	// every Reserved permission. Reserved rows map to no agent scope, so
+	// they add nothing to the withheld scopes checked below.
+	assert.Equal(t, map[string]bool{
+		"artifact.create": true, "artifact.read": true, "artifact.update": true, "artifact.delete": true,
+		"hub.federation.read": true, "hub.federation.update": true, "hub.teams_manifest.update": true,
+		"user.list": true, "agent.log_append": true,
+	}, legacyChainExcludedPermissions)
 
 	unrecorded := store.EffectCeiling{Kind: store.EffectCeilingUnrecorded}
 	principal := store.EffectCeiling{Kind: store.EffectCeilingPrincipal}
@@ -241,7 +247,7 @@ func TestArtifactHostServesGenuinelyMintedAgentToken(t *testing.T) {
 		t.Helper()
 		rec := f.create(t, f.uat(t, selectors...), CreateAgentRequest{Name: name})
 		agent, _ := f.createdAgent(t, rec, name)
-		tok, err := f.srv.GenerateAgentTokenForAgent(ctx, agent)
+		tok, err := f.srv.issueAgentTokenForTest(ctx, agent)
 		require.NoError(t, err)
 		claims, err := f.srv.agentTokenService.ValidateAgentToken(tok)
 		require.NoError(t, err)

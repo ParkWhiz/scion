@@ -28,8 +28,6 @@
  *     have rendered, and must not override a deliberate user scroll.
  */
 
-// @vitest-environment happy-dom
-
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 /** Stand-in for the global stateManager: only the EventTarget surface is used. */
@@ -56,7 +54,8 @@ const navigateToMock = vi.fn();
 
 const extractApiErrorMock = vi.fn((_res: unknown, _fallback: string) => Promise.resolve('error'));
 
-vi.mock('../../../client/main.js', () => ({
+vi.mock('../../../client/main.js', async () => ({
+  ...(await import('../../../client/__fixtures__/main-stub.js')),
   get navigateTo() {
     return navigateToMock;
   },
@@ -94,6 +93,7 @@ import { chatRecentFiles } from '../../../client/chat-recent-files.js';
 import { wakeConfirmBudgetMs } from './chat-wake.js';
 import { agentGraphHref, terminalHref } from '../../../client/open-terminal.js';
 import { setPreferredTimeZone } from '../../../utils/time.js';
+import { requestBodyText } from '../../../client/__fixtures__/request-url.js';
 
 const CONVERSATION_KEY = 'topic-1';
 
@@ -387,7 +387,7 @@ describe('scion-chat-thread reply send payload (nc-reply-recipient)', () => {
         String(c[0]).endsWith('/messages') && (c[1] as RequestInit | undefined)?.method === 'POST'
     );
     expect(sendCall).toBeDefined();
-    const body = JSON.parse(String((sendCall![1] as RequestInit).body));
+    const body = JSON.parse(requestBodyText((sendCall![1] as RequestInit).body));
     expect(body.reply_to_id).toBe('orig-msg-1');
     expect(body).not.toHaveProperty('reply_to_agent');
   });
@@ -435,7 +435,10 @@ describe('scion-chat-thread interrupt send payload', () => {
         String(c[0]).endsWith('/messages') && (c[1] as RequestInit | undefined)?.method === 'POST'
     );
     expect(sendCall).toBeDefined();
-    return JSON.parse(String((sendCall![1] as RequestInit).body)) as Record<string, unknown>;
+    return JSON.parse(requestBodyText((sendCall![1] as RequestInit).body)) as Record<
+      string,
+      unknown
+    >;
   }
 
   it('sends interrupt: true when the composer requests interruption', async () => {
@@ -498,7 +501,9 @@ describe('scion-chat-thread wake on send', () => {
         (c) =>
           String(c[0]).endsWith('/messages') && (c[1] as RequestInit | undefined)?.method === 'POST'
       )
-      .map((c) => JSON.parse(String((c[1] as RequestInit).body)) as Record<string, unknown>);
+      .map(
+        (c) => JSON.parse(requestBodyText((c[1] as RequestInit).body)) as Record<string, unknown>
+      );
   }
 
   function send(
@@ -1810,7 +1815,7 @@ describe('scion-chat-thread read watermark', () => {
     expect(readCall).toBeDefined();
     const init = readCall![1] as RequestInit;
     expect(init.method).toBe('POST');
-    expect(JSON.parse(String(init.body))).toEqual({ messageId: 'msg-7' });
+    expect(JSON.parse(requestBodyText(init.body))).toEqual({ messageId: 'msg-7' });
   });
 
   it('warns when the server rejects the watermark update', async () => {
@@ -1885,7 +1890,7 @@ describe('scion-chat-thread read watermark', () => {
     const readCall = apiFetch.mock.calls.find(
       (c) => String(c[0]).endsWith('/read') && (c[1] as RequestInit | undefined)?.method === 'POST'
     );
-    const body = JSON.parse(String((readCall![1] as RequestInit).body));
+    const body = JSON.parse(requestBodyText((readCall![1] as RequestInit).body));
     expect(body).toEqual({ messageId: 'm2' });
 
     vi.useRealTimers();
@@ -1936,7 +1941,7 @@ describe('scion-chat-thread read watermark', () => {
             String(c[0]).endsWith('/read') && (c[1] as RequestInit | undefined)?.method === 'POST'
         );
         expect(readCall).toBeDefined();
-        expect(JSON.parse(String((readCall![1] as RequestInit).body))).toEqual({
+        expect(JSON.parse(requestBodyText((readCall![1] as RequestInit).body))).toEqual({
           messageId: tailID,
         });
         const bubbles = el.shadowRoot!.querySelectorAll('scion-chat-message');
@@ -2072,7 +2077,7 @@ describe('scion-chat-thread read watermark', () => {
           String(c[0]).endsWith('/read') && (c[1] as RequestInit | undefined)?.method === 'POST'
       );
       expect(readCalls).toHaveLength(1);
-      expect(JSON.parse(String((readCalls[0][1] as RequestInit).body))).toEqual({
+      expect(JSON.parse(requestBodyText((readCalls[0][1] as RequestInit).body))).toEqual({
         messageId: 'real-msg-1',
       });
     } finally {
@@ -2933,7 +2938,7 @@ describe('scion-chat-thread initial scroll position', () => {
       disconnect(): void {}
     } as unknown as typeof ResizeObserver;
     try {
-      const el = await mountWithHistory();
+      await mountWithHistory();
       expect(observed.some((t) => t.classList.contains('messages-list'))).toBe(true);
       scrollWrites = [];
       for (const cb of callbacks) cb([], {} as ResizeObserver);
@@ -5195,7 +5200,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     el.projectId = '';
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/projects/visibility-removal/scoping.md' },
       }),
@@ -5222,7 +5227,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     } as unknown as Response);
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/projects/visibility-removal/scoping.md' },
       }),
@@ -5251,7 +5256,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     } as unknown as Response);
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/projects/visibility-removal/scoping.md' },
       }),
@@ -5276,7 +5281,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     } as unknown as Response);
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/projects/visibility-removal/scoping.md' },
       }),
@@ -5303,7 +5308,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
 
     // handleAgentOutboundMessage stamps ProjectID on the message but never
     // sets SenderProjectID, so this is the real shape of an agent DM.
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/notes.md' },
       }),
@@ -5326,7 +5331,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     } as unknown as Response);
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/notes.md' },
       }),
@@ -5343,7 +5348,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     el.projectId = '';
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', { detail: { path: 'not-a-path' } }),
       makeMessage({ senderProjectId: 'proj-visibility-removal' })
     );
@@ -5366,7 +5371,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     } as unknown as Response);
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/projects/visibility-removal/scoping.md' },
       }),
@@ -5411,7 +5416,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     } as unknown as Response);
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/notes.md' },
       }),
@@ -5451,7 +5456,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     } as unknown as Response);
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/notes.md' },
       }),
@@ -5480,7 +5485,7 @@ describe('scion-chat-thread path-link project context fallback', () => {
     await vi.waitFor(() => expect(apiFetch).toHaveBeenCalled());
     const internals = el as unknown as Internals;
 
-    await internals.handlePathLinkClick(
+    internals.handlePathLinkClick(
       new CustomEvent('path-link-click', {
         detail: { path: '/scion-volumes/scratchpad/notes.md' },
       }),
@@ -8886,5 +8891,386 @@ describe('scion-chat-thread jump during the initial load', () => {
     expect(rendered(el, 'latest-3')).toBe(true);
     expect(unread).toHaveBeenCalledTimes(expected === 'unread' ? 1 : 0);
     expect(bottom).toHaveBeenCalledTimes(expected === 'bottom' ? 1 : 0);
+  });
+});
+
+describe('scion-chat-thread older-page loads and message jumps', () => {
+  type Internals = {
+    loadOlderMessagesV2(scrollEl: HTMLElement): Promise<void>;
+    messages: Array<{ id: string }>;
+    nextCursor: string | null;
+    _jumpSeq: number;
+    _jumpScrollCleanup: (() => void) | null;
+    pinnedToBottom: boolean;
+  };
+
+  /** The next request answers at once, but its body waits for `release`. */
+  function holdNextBody(): { release: (body: unknown) => void } {
+    const held = { release: (_body: unknown): void => {} };
+    apiFetch.mockImplementationOnce(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          new Promise((resolve) => {
+            held.release = resolve;
+          }),
+      } as unknown as Response)
+    );
+    return held;
+  }
+
+  function olderPage(id: string): unknown {
+    return {
+      items: [
+        {
+          id,
+          projectId: '',
+          sender: 'agent:coder',
+          senderId: 'agent-1',
+          recipient: '',
+          recipientId: '',
+          msg: 'older message',
+          type: 'chat',
+          agentId: '',
+          createdAt: '2026-01-01T00:00:00Z',
+        },
+      ],
+    };
+  }
+
+  /** A scroller whose content height grows from 100 to 400 once the page lands. */
+  function fakeScroller(): { scrollEl: HTMLElement; grow: () => void } {
+    let height = 100;
+    const scrollEl = {
+      scrollTop: 50,
+      get scrollHeight(): number {
+        return height;
+      },
+    } as unknown as HTMLElement;
+    return { scrollEl, grow: (): void => void (height = 400) };
+  }
+
+  async function startOlderLoad(): Promise<{
+    internals: Internals;
+    scrollEl: HTMLElement;
+    grow: () => void;
+    held: { release: (body: unknown) => void };
+    loading: Promise<void>;
+  }> {
+    const el = await mount();
+    const internals = el as unknown as Internals;
+    internals.nextCursor = 'older-cursor';
+    const held = holdNextBody();
+    const { scrollEl, grow } = fakeScroller();
+    const loading = internals.loadOlderMessagesV2(scrollEl);
+    await vi.waitFor(() => expect(apiFetch).toHaveBeenCalled());
+    return { internals, scrollEl, grow, held, loading };
+  }
+
+  beforeEach(() => {
+    apiFetch.mockReset();
+    apiFetch.mockResolvedValue(emptyHistory());
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('merges the older page and keeps the reader in place with no jump', async () => {
+    const { internals, scrollEl, grow, held, loading } = await startOlderLoad();
+    grow();
+    held.release(olderPage('older-1'));
+    await loading;
+
+    expect(internals.messages.some((m) => m.id === 'older-1')).toBe(true);
+    expect(scrollEl.scrollTop).toBe(350);
+  });
+
+  it('drops an older page whose load started before a jump', async () => {
+    const { internals, scrollEl, grow, held, loading } = await startOlderLoad();
+    // A jump starts while the older page is in flight.
+    internals._jumpSeq++;
+    grow();
+    held.release(olderPage('older-1'));
+    await loading;
+
+    expect(internals.messages.some((m) => m.id === 'older-1')).toBe(false);
+    expect(scrollEl.scrollTop).toBe(50);
+  });
+
+  it('does not write scrollTop while a jump scroll is settling', async () => {
+    const { internals, scrollEl, grow, held, loading } = await startOlderLoad();
+    // The jump's smooth scroll is in flight (its settle watcher is armed),
+    // and the reader is no longer at the bottom.
+    internals.pinnedToBottom = false;
+    internals._jumpScrollCleanup = (): void => {};
+    grow();
+    held.release(olderPage('older-1'));
+    await loading;
+
+    expect(internals.messages.some((m) => m.id === 'older-1')).toBe(true);
+    expect(scrollEl.scrollTop).toBe(50);
+    internals._jumpScrollCleanup = null;
+  });
+});
+
+describe('scion-chat-thread default agent stored by ID', () => {
+  const AGENT_ID = '3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f';
+
+  beforeEach(() => {
+    apiFetch.mockReset();
+    apiFetch.mockResolvedValue(emptyHistory());
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  async function mountWithIdDefault(): Promise<ScionChatThread> {
+    const el = await mount();
+    el.currentUserId = 'user-me';
+    el.agentMembers = [
+      { id: AGENT_ID, kind: 'agent', displayName: 'Code Writer', slug: 'coder' },
+      { id: 'agent-2', kind: 'agent', displayName: 'Other', slug: 'other' },
+    ];
+    el.defaultAgent = AGENT_ID;
+    return el;
+  }
+
+  function agentMessage(slug: string, senderId: string): Message {
+    return {
+      id: 'm-' + slug,
+      projectId: '',
+      sender: 'agent:' + slug,
+      senderId,
+      recipient: '',
+      recipientId: '',
+      msg: 'hi',
+      type: 'assistant-reply',
+      agentId: senderId,
+      createdAt: '2026-01-01T00:00:00Z',
+    };
+  }
+
+  it('hides "Make this agent thread default" for the current default agent', async () => {
+    const el = await mountWithIdDefault();
+    const internals = el as unknown as {
+      messageMenuActions(msg: Message): { id: string }[];
+    };
+    const ids = (m: Message): string[] => internals.messageMenuActions(m).map((a) => a.id);
+    expect(ids(agentMessage('coder', AGENT_ID))).not.toContain('set-default-agent');
+    expect(ids(agentMessage('other', 'agent-2'))).toContain('set-default-agent');
+  });
+
+  it('hides the action when only senderId matches the default agent', async () => {
+    const el = await mountWithIdDefault();
+    const internals = el as unknown as {
+      messageMenuActions(msg: Message): { id: string }[];
+    };
+    const ids = internals
+      .messageMenuActions(agentMessage('renamed-slug', AGENT_ID))
+      .map((a) => a.id);
+    expect(ids).not.toContain('set-default-agent');
+  });
+
+  it('falls back to the stored value when the default does not resolve', async () => {
+    const el = await mountWithIdDefault();
+    el.defaultAgent = 'gone-agent';
+    const internals = el as unknown as {
+      messageMap: Map<string, Message>;
+      messageMenuActions(msg: Message): { id: string }[];
+      handleChatSendV2(e: CustomEvent<ChatSendDetail>): Promise<void>;
+    };
+    const ids = (m: Message): string[] => internals.messageMenuActions(m).map((a) => a.id);
+    expect(ids(agentMessage('gone-agent', 'agent-gone'))).not.toContain('set-default-agent');
+    expect(ids(agentMessage('coder', AGENT_ID))).toContain('set-default-agent');
+
+    apiFetch.mockImplementationOnce(() => new Promise<Response>(() => {}));
+    void internals.handleChatSendV2(
+      new CustomEvent<ChatSendDetail>('chat-send', {
+        detail: {
+          text: 'Please help',
+          plain: false,
+          interrupt: false,
+          onSuccess: vi.fn(),
+          mentions: [],
+          attachmentIds: [],
+        },
+      })
+    );
+    const optimistic = Array.from(internals.messageMap.values()).find(
+      (message) => message.dispatchState === 'pending'
+    );
+    expect(optimistic?.recipient).toBe('agent:gone-agent');
+    expect(optimistic?.recipientId).toBe('gone-agent');
+  });
+
+  it('names the agent by slug on the optimistic send', async () => {
+    const el = await mountWithIdDefault();
+    const internals = el as unknown as {
+      messageMap: Map<string, Message>;
+      handleChatSendV2(e: CustomEvent<ChatSendDetail>): Promise<void>;
+    };
+    apiFetch.mockImplementationOnce(() => new Promise<Response>(() => {}));
+
+    void internals.handleChatSendV2(
+      new CustomEvent<ChatSendDetail>('chat-send', {
+        detail: {
+          text: 'Please help',
+          plain: false,
+          interrupt: false,
+          onSuccess: vi.fn(),
+          mentions: [],
+          attachmentIds: [],
+        },
+      })
+    );
+    const optimistic = Array.from(internals.messageMap.values()).find(
+      (message) => message.dispatchState === 'pending'
+    );
+    expect(optimistic?.recipient).toBe('agent:coder');
+    expect(optimistic?.recipientId).toBe(AGENT_ID);
+  });
+});
+
+/**
+ * Every DM entry point mounts this thread with isDM set and, often, a
+ * projectId (an agent DM carries the agent's project; a DM opened from a
+ * project rail or deep link carries the scope's project). The hub accepts
+ * only project-less uploads in a DM, so the upload must go without
+ * project_id there, while a group or topic keeps it (ptone/scion#5084).
+ */
+describe('scion-chat-thread attachment upload scope', () => {
+  const UPLOADED = { id: 'att-1', name: 'a.txt', mime: 'text/plain', size: 5, url: '' };
+
+  function created(body: Record<string, unknown>): Response {
+    return { ok: true, status: 201, json: () => Promise.resolve(body) } as unknown as Response;
+  }
+
+  beforeEach(() => {
+    apiFetch.mockReset();
+    apiFetch.mockImplementation((path: unknown, init?: RequestInit) => {
+      const p = String(path);
+      if (p === '/api/v1/chat/attachments') {
+        return Promise.resolve(created({ attachments: [UPLOADED], failures: [] }));
+      }
+      if (p.endsWith('/messages') && init?.method === 'POST') {
+        return Promise.resolve(created({ id: 'srv-1', attachments: [UPLOADED] }));
+      }
+      return Promise.resolve(emptyHistory());
+    });
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  type Composer = HTMLElement & {
+    updateComplete: Promise<boolean>;
+    uploadFiles(files: File[]): Promise<void>;
+    doSend(interrupt: boolean): void;
+    text: string;
+    pendingFiles: Array<{ id: string }>;
+  };
+
+  async function mountComposer(opts: {
+    key: string;
+    isDM: boolean;
+    projectId: string;
+  }): Promise<{ el: ScionChatThread; composer: Composer }> {
+    const el = document.createElement('scion-chat-thread') as ScionChatThread;
+    el.conversationKey = opts.key;
+    el.isDM = opts.isDM;
+    el.projectId = opts.projectId;
+    el.canSend = true;
+    el.currentUserId = 'u1';
+    document.body.appendChild(el);
+    await el.updateComplete;
+    const composer = el.shadowRoot!.querySelector('scion-chat-composer') as Composer;
+    await composer.updateComplete;
+    return { el, composer };
+  }
+
+  function uploadForm(): FormData {
+    const call = apiFetch.mock.calls.find((c) => c[0] === '/api/v1/chat/attachments');
+    expect(call).toBeTruthy();
+    return (call![1] as RequestInit).body as FormData;
+  }
+
+  for (const [label, key, projectId] of [
+    ['an agent DM (agent page, agent project)', 'dm:agent:a1:user:u1', 'proj-agent'],
+    ['a user DM', 'dm:user:u1:user:u2', ''],
+    ['a user DM opened in a project scope', 'dm:user:u1:user:u2', 'proj-scope'],
+    ['an agent DM opened in a project scope', 'dm:agent:a1:user:u1', 'proj-scope'],
+  ] as const) {
+    it(`uploads without project_id in ${label}`, async () => {
+      const { composer } = await mountComposer({ key, isDM: true, projectId });
+
+      await composer.uploadFiles([new File(['hello'], 'a.txt')]);
+
+      expect(uploadForm().has('project_id')).toBe(false);
+      expect(composer.pendingFiles.map((f) => f.id)).toEqual(['att-1']);
+    });
+  }
+
+  it('uploads with project_id in a topic and sends the attachment', async () => {
+    const { composer } = await mountComposer({
+      key: CONVERSATION_KEY,
+      isDM: false,
+      projectId: 'proj-topic',
+    });
+
+    await composer.uploadFiles([new File(['hello'], 'a.txt')]);
+    expect(uploadForm().get('project_id')).toBe('proj-topic');
+
+    composer.text = 'see file';
+    composer.doSend(false);
+
+    await vi.waitFor(() => {
+      const post = apiFetch.mock.calls.find(
+        (c) => String(c[0]).endsWith('/messages') && (c[1] as RequestInit)?.method === 'POST'
+      );
+      expect(post).toBeTruthy();
+      const body = JSON.parse(requestBodyText((post![1] as RequestInit).body)) as {
+        attachments?: string[];
+      };
+      expect(body.attachments).toEqual(['att-1']);
+    });
+    expect(composer.pendingFiles).toEqual([]);
+  });
+
+  it('drops a file pending in a topic when the thread switches to a DM', async () => {
+    const { el, composer } = await mountComposer({
+      key: CONVERSATION_KEY,
+      isDM: false,
+      projectId: 'proj-topic',
+    });
+    await composer.uploadFiles([new File(['hello'], 'a.txt')]);
+    expect(composer.pendingFiles.map((f) => f.id)).toEqual(['att-1']);
+
+    el.conversationKey = 'dm:user:u1:user:u2';
+    el.isDM = true;
+    await el.updateComplete;
+    await composer.updateComplete;
+    expect(composer.pendingFiles).toEqual([]);
+    expect(composer.shadowRoot!.querySelector('.composer-context')).toBeNull();
+
+    apiFetch.mockClear();
+    composer.text = 'hi';
+    composer.doSend(false);
+
+    await vi.waitFor(() => {
+      const post = apiFetch.mock.calls.find(
+        (c) => String(c[0]).endsWith('/messages') && (c[1] as RequestInit)?.method === 'POST'
+      );
+      expect(post).toBeTruthy();
+      const body = JSON.parse(requestBodyText((post![1] as RequestInit).body)) as Record<
+        string,
+        unknown
+      >;
+      expect(body.content).toBe('hi');
+      expect(body).not.toHaveProperty('attachments');
+    });
   });
 });

@@ -17,6 +17,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -293,12 +294,28 @@ func expandEnvMap(m map[string]string) map[string]string {
 	}
 	expanded := make(map[string]string)
 	for k, v := range m {
-		ek, _ := util.ExpandEnv(k)
+		// These maps become agent env, so names refused for agents
+		// (util.IsAgentRefusedHostEnvName) expand to empty.
+		ek, _, refusedInKey := util.ExpandEnvRefusing(k, util.IsAgentRefusedHostEnvName)
+		val, _, refusedInValue := util.ExpandEnvRefusing(v, util.IsAgentRefusedHostEnvName)
+		for _, name := range append(refusedInKey, refusedInValue...) {
+			slog.Warn("settings env: host environment variable is reserved for the server and is not expanded", "variable", name)
+		}
 		if ek == "" {
 			continue
 		}
-		val, _ := util.ExpandEnv(v)
 		expanded[ek] = val
+	}
+	return expanded
+}
+
+// expandAgentVisiblePath expands ${VAR} references in a path an agent can see,
+// with names refused for agents (util.IsAgentRefusedHostEnvName) expanding to
+// empty and logged by name.
+func expandAgentVisiblePath(path string) string {
+	expanded, _, refused := util.ExpandEnvRefusing(path, util.IsAgentRefusedHostEnvName)
+	for _, name := range refused {
+		slog.Warn("settings volume: host environment variable is reserved and is not expanded", "variable", name)
 	}
 	return expanded
 }
@@ -309,8 +326,10 @@ func expandVolumeMounts(volumes []api.VolumeMount) []api.VolumeMount {
 	}
 	expanded := make([]api.VolumeMount, len(volumes))
 	for i, v := range volumes {
-		s, _ := util.ExpandEnv(v.Source)
-		t, _ := util.ExpandEnv(v.Target)
+		// Mount paths are visible to the agent, so names refused for
+		// agents expand to empty.
+		s := expandAgentVisiblePath(v.Source)
+		t := expandAgentVisiblePath(v.Target)
 		expanded[i] = api.VolumeMount{
 			Source:   s,
 			Target:   t,
@@ -576,8 +595,12 @@ func UpdateSetting(projectPath string, key string, value string, global bool) er
 			// Legacy format detected — auto-migrate to v1 before updating
 			fmt.Fprintf(os.Stderr, "Warning: settings file %s uses legacy format. Auto-migrating to v1 schema.\n", existingPath)
 			fmt.Fprintf(os.Stderr, "  You can also run 'scion config migrate' to migrate manually.\n")
-			if _, err := MigrateSettingsFile(dir, false); err != nil {
+			result, err := MigrateSettingsFile(dir, false)
+			if err != nil {
 				return fmt.Errorf("auto-migration of legacy settings failed: %w\n  Run 'scion config migrate' to migrate manually", err)
+			}
+			for _, w := range result.Warnings {
+				fmt.Fprintf(os.Stderr, "  Migration warning: %s\n", w)
 			}
 			return UpdateVersionedSetting(dir, key, value)
 		}
@@ -810,25 +833,18 @@ func (s *Settings) IsHubConfigured() bool {
 	return s.Hub != nil && s.Hub.Endpoint != ""
 }
 
-// IsHubEnabled returns true if Hub integration is enabled.
-// Hub is considered enabled when:
-//  1. Hub credentials (token or apiKey) AND an endpoint are present.
-//     Credentials imply intent to use the hub and override any
-//     hub.enabled setting from config files. OR
-//  2. hub.enabled is explicitly set to true (without credentials).
-//
-// This allows users with SCION_HUB_TOKEN and SCION_HUB_ENDPOINT env vars
-// to interact with the hub without requiring an explicit hub.enabled=true,
-// even if a stale hub.enabled=false exists in a settings file.
+// IsHubEnabled reports the legacy hub.enabled switch: credentials plus an
+// endpoint, or hub.enabled=true. Deprecated: the CLI no longer reads it (a
+// configured endpoint is what counts); it remains only for the agent
+// manager's non-broker start path, which is removed with the local-mode
+// engine cleanup.
 func (s *Settings) IsHubEnabled() bool {
 	if s.Hub == nil {
 		return false
 	}
-	// Credentials + endpoint present: always enabled (env vars override config)
 	if s.Hub.Endpoint != "" && (s.Hub.Token != "" || s.Hub.APIKey != "") {
 		return true
 	}
-	// Fall back to explicit hub.enabled setting
 	return s.Hub.Enabled != nil && *s.Hub.Enabled
 }
 
@@ -844,14 +860,14 @@ func (s *Settings) IsHubExplicitlyDisabled() bool {
 	return s.Hub != nil && s.Hub.Enabled != nil && !*s.Hub.Enabled
 }
 
-// IsHubLocalOnly returns true if the project is configured for local-only mode.
-// When true, Hub sync checks will error with guidance to use --no-hub.
-func (s *Settings) IsHubLocalOnly() bool {
-	return s.Hub != nil && s.Hub.LocalOnly != nil && *s.Hub.LocalOnly
-}
-
 // DeleteHubConnection removes a hub connection entry from settings at the specified scope.
-// It loads the existing settings file, removes the named connection, and saves.
+// It edits the existing settings file in place, so every other key survives:
+// v1-only keys such as server and image_registry in an unversioned file, and
+// the whole content of a versioned file (ptone/scion#3497). A JSON file is
+// converted to settings.yaml, as before. A missing file is left missing.
+//
+// It does not take LockSettingsFile, as before; a caller that needs the
+// read-modify-write serialised holds the lock around the call.
 func DeleteHubConnection(projectPath string, name string, global bool) error {
 	var dir string
 	if global {
@@ -870,51 +886,5 @@ func DeleteHubConnection(projectPath string, name string, global bool) error {
 		dir = GetProjectConfigDir(projectPath)
 	}
 
-	existingPath := GetSettingsPath(dir)
-	targetPath := filepath.Join(dir, "settings.yaml")
-
-	var current Settings
-	if existingPath != "" {
-		data, err := os.ReadFile(existingPath)
-		if err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		if err == nil {
-			if filepath.Ext(existingPath) == ".json" {
-				if err := util.UnmarshalJSONC(data, &current); err != nil {
-					return fmt.Errorf("failed to parse existing settings at %s: %w", existingPath, err)
-				}
-			} else {
-				if err := yaml.Unmarshal(data, &current); err != nil {
-					return fmt.Errorf("failed to parse existing settings at %s: %w", existingPath, err)
-				}
-			}
-		}
-	}
-
-	if current.HubConnections != nil {
-		delete(current.HubConnections, name)
-		// Clean up empty map
-		if len(current.HubConnections) == 0 {
-			current.HubConnections = nil
-		}
-	}
-
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		return err
-	}
-	newData, err := yaml.Marshal(current)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(targetPath, newData, 0644); err != nil {
-		return err
-	}
-
-	// If we migrated from JSON, remove the old JSON file
-	if existingPath != "" && existingPath != targetPath && filepath.Ext(existingPath) == ".json" {
-		_ = os.Remove(existingPath)
-	}
-
-	return nil
+	return deleteHubConnectionFromFile(dir, name)
 }

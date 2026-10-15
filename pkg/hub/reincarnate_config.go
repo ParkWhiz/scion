@@ -57,7 +57,7 @@ import (
 //     populateAgentConfig/resolveDerivedConfig — so every derived slot is
 //     recomputed against the current catalog exactly the way create computes
 //     it, per-field precedence included (see deriveAgentConfig's doc
-//     comment: Model is request > project > hub > template, HarnessConfig is
+//     comment: Model is request > project > template > hub, HarnessConfig is
 //     request > project > template > hub).
 //
 // Returns the fresh config, any warnings to surface on the plan (e.g. the
@@ -95,6 +95,11 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 			resolvedTemplate = tmpl
 		}
 	}
+	// templateEnv is a legacy read-only filter: its keys are used only to
+	// DROP residue an older hub merged into a legacy agent's env (see
+	// legacyCreateInputsFromAppliedConfig). No template env value is copied
+	// into the fresh config (ptone/scion#4222). Retire or rekey it when the
+	// template row's config column goes (ptone/scion#4224).
 	var templateEnv map[string]string
 	if resolvedTemplate != nil && resolvedTemplate.Config != nil {
 		templateEnv = resolvedTemplate.Config.Env
@@ -121,10 +126,12 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 		// Kept verbatim: identity-adjacent fields the pipeline never touches,
 		// and (for Phase 1, which accepts no --harness/--reset-overrides/etc.
 		// request overrides) never overridden by the request either.
-		// WorkspaceStoragePath and AgentRoleGrandfathered are kept too:
-		// without the storage path a remote broker gets the hub-local path
-		// populateAgentConfig stamps for an empty Workspace instead of the
-		// GCS path it actually needs, and grandfathered-role provenance is
+		// WorkspaceStoragePath (with its bucket) and AgentRoleGrandfathered
+		// are kept too: without the storage path a remote broker gets the
+		// hub-local path populateAgentConfig stamps for an empty Workspace
+		// instead of the GCS path it actually needs, without the bucket a
+		// broker with no bucket setting cannot download it
+		// (ptone/scion#3422), and grandfathered-role provenance is
 		// audit data, not something to re-derive.
 		Attach:                 old.Attach,
 		CreatorName:            old.CreatorName,
@@ -133,6 +140,7 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 		GitClone:               old.GitClone,
 		Workspace:              old.Workspace,
 		WorkspaceStoragePath:   old.WorkspaceStoragePath,
+		WorkspaceStorageBucket: old.WorkspaceStorageBucket,
 		Branch:                 old.Branch,
 		GCPIdentity:            old.GCPIdentity,
 
@@ -193,9 +201,9 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 	// Do NOT alias Image/Model/Env to InlineConfig's backing map (design
 	// §3.3 A1 addendum 2, rule 3): InlineConfig is a fresh, independent copy,
 	// and Env gets its own clone (as buildAppliedConfig does on create), so
-	// resolveDerivedConfig's template-env merge and auto-expose project tier
-	// below cannot write through to CreateInputs.InlineConfig.Env or leave the
-	// new InlineConfig carrying merged values it didn't have explicitly.
+	// the auto-expose project tier below cannot write through to
+	// CreateInputs.InlineConfig.Env or leave the new InlineConfig carrying
+	// derived values it didn't have explicitly.
 	if createInputs.InlineConfig != nil {
 		fresh.InlineConfig = deepCopyScionConfig(createInputs.InlineConfig)
 		fresh.Image = fresh.InlineConfig.Image
@@ -223,6 +231,11 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 		OwnerID:       agent.OwnerID,
 		Ancestry:      agent.Ancestry,
 		AppliedConfig: fresh,
+		// The pin is kept across generations; a pinned (flat) agent does
+		// not re-derive a default Runtime Broker Profile.
+		PinnedRuntimeBrokerID:   agent.PinnedRuntimeBrokerID,
+		PinnedRuntimeTargetID:   agent.PinnedRuntimeTargetID,
+		PinnedRuntimeTargetType: agent.PinnedRuntimeTargetType,
 	}
 	// deriveAgentConfig — not resolveDerivedConfig directly — replays the
 	// FULL create pipeline (applyProjectDefaults, then applyHubAgentDefaults,
@@ -246,7 +259,9 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 	// here instead.
 	//
 	// This preserves the broker's own image-resolution precedence (fixed by
-	// ptone/scion#2156): explicit inline, then template, then Hub settings
+	// ptone/scion#2156, amended by ptone/scion#1799 — an explicit profile
+	// harness_overrides image is applied just below, above the template):
+	// explicit inline, then template, then Hub settings
 	// harness_configs.<name> (profiles.<p>.harness_overrides.<name>
 	// outranking the base entry), then the harness config's own stored
 	// image. fresh.Image already reflects "explicit inline, then template"
@@ -273,6 +288,35 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 			hc = nil
 		}
 	}
+	// ptone/scion#1799: an EXPLICIT profiles.<p>.harness_overrides.<hc>.image
+	// outranks the template (and inline) image the broker would otherwise
+	// pick; only the user's explicit request image ranks above it. Apply
+	// that here so the plan approximates what the broker will run. The plan
+	// is an approximation from the hub's view: it starts from an image the
+	// hub template record may carry (which the broker no longer applies), and
+	// with no harness-config key (the broker resolves it) the profile
+	// override cannot be looked up. The broker resolves the final image and
+	// reports it. The plain harness_configs.<hc>.image default does not gain
+	// this priority and stays in the fallback below.
+	//
+	// The hub's effective settings are loaded once for both this step and
+	// the settings fallback below.
+	vs := s.reincarnateImageSettings()
+	// A pinned (flat) agent never takes Runtime Broker Profile-tier settings:
+	// no profile harness_overrides image and no active_profile fallback, in
+	// either image step below (flat Runtime Brokers contract, section 10).
+	if vs != nil && agent.IsPinned() {
+		vs = vs.ForProfileResolution(config.ProfileResolutionFlatInstance)
+	}
+	if explicitDispatchImage(fresh) == "" {
+		overrideKey := fresh.HarnessConfig
+		if overrideKey == "" && hc != nil {
+			overrideKey = hc.Slug
+		}
+		if img := settingsProfileOverrideImage(vs, overrideKey, fresh.Profile); img != "" {
+			fresh.Image = img
+		}
+	}
 	if fresh.Image == "" && hc != nil {
 		// Look up settings by the same key the broker dispatches with —
 		// fresh.HarnessConfig is the harness-config slug/name as resolved
@@ -284,7 +328,7 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 		if settingsKey == "" {
 			settingsKey = hc.Slug
 		}
-		fresh.Image = s.settingsHarnessConfigImage(settingsKey, fresh.Profile)
+		fresh.Image = settingsHarnessConfigImage(vs, settingsKey, fresh.Profile)
 	}
 	if fresh.Image == "" && hc != nil && hc.Config != nil && hc.Config.Image != "" {
 		fresh.Image = hc.Config.Image
@@ -302,13 +346,9 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 	return fresh, warnings, nil
 }
 
-// settingsHarnessConfigImage resolves the Hub settings image for a named
-// harness-config (harness_configs.<name>.image, with
-// profiles.<profileName>.harness_overrides.<name>.image outranking the base
-// entry — same precedence as pkg/config.VersionedSettings.ResolveHarnessConfig,
-// which this reuses directly). Returns "" when settings has no image for
-// this harness-config, in which case the caller falls back to the harness
-// config's own stored default.
+// reincarnateImageSettings loads the hub's effective settings for the
+// reincarnate plan's image steps, or returns nil (logged) if they cannot be
+// loaded, in which case those steps contribute nothing.
 //
 // The settings view comes from the hub's own config.LoadEffectiveSettings(""),
 // which — in postgres mode — already reflects DB-backed harness_configs and
@@ -316,17 +356,24 @@ func (s *Server) buildPatchedAppliedConfig(ctx context.Context, agent *store.Age
 // OperationalSettings.Refresh populates (pkg/config/settings_overlay.go), the
 // same overlay a co-located broker's own LoadEffectiveSettings call sees. In
 // file/SQLite mode it reads the hub's settings.yaml directly.
-func (s *Server) settingsHarnessConfigImage(harnessConfigName, profileName string) string {
-	if harnessConfigName == "" {
-		return ""
-	}
+func (s *Server) reincarnateImageSettings() *config.VersionedSettings {
 	vs, _, err := config.LoadEffectiveSettings("")
 	if err != nil {
-		s.agentLifecycleLog.Warn("reincarnate: failed to load settings for the image fallback",
-			"harness_config_name", harnessConfigName, "error", err)
-		return ""
+		s.agentLifecycleLog.Warn("reincarnate: failed to load settings for the image plan", "error", err)
+		return nil
 	}
-	if vs == nil {
+	return vs
+}
+
+// settingsHarnessConfigImage resolves the Hub settings image for a named
+// harness-config (harness_configs.<name>.image, with
+// profiles.<profileName>.harness_overrides.<name>.image outranking the base
+// entry — same precedence as pkg/config.VersionedSettings.ResolveHarnessConfig,
+// which this reuses directly). Returns "" when settings has no image for
+// this harness-config, in which case the caller falls back to the harness
+// config's own stored default.
+func settingsHarnessConfigImage(vs *config.VersionedSettings, harnessConfigName, profileName string) string {
+	if vs == nil || harnessConfigName == "" {
 		return ""
 	}
 	resolved, err := vs.ResolveHarnessConfig(profileName, harnessConfigName)
@@ -334,6 +381,16 @@ func (s *Server) settingsHarnessConfigImage(harnessConfigName, profileName strin
 		return ""
 	}
 	return resolved.Image
+}
+
+// settingsProfileOverrideImage returns the image that
+// profiles.<profileName>.harness_overrides.<harnessConfigName>.image sets
+// explicitly in vs, or "" when unset.
+func settingsProfileOverrideImage(vs *config.VersionedSettings, harnessConfigName, profileName string) string {
+	if vs == nil {
+		return ""
+	}
+	return vs.ProfileHarnessOverrideImage(profileName, harnessConfigName)
 }
 
 // imageRegistryProvider is implemented by dispatchers that rewrite image
@@ -382,7 +439,7 @@ func dispatchImageRegistry(dispatcher AgentDispatcher) string {
 //     still owns this key" errs toward template freshness — reincarnate's
 //     whole purpose — at the cost of resetting a genuinely explicit
 //     per-agent override that happens to share a name with a template key.
-//     Each dropped key is surfaced in the plan with its old and new value.
+//     Each dropped key is surfaced in the plan by name only.
 //     Keys InlineConfig.Env has that templateEnv does NOT define are kept as
 //     explicit, but flagged: they may equally be a stale default the
 //     requester never asked for, left over from an earlier version of the
@@ -400,6 +457,10 @@ func legacyCreateInputsFromAppliedConfig(old *store.AgentAppliedConfig, template
 	var inline *api.ScionConfig
 	if old.InlineConfig != nil {
 		inline = deepCopyScionConfig(old.InlineConfig)
+		// cleared_fields belongs to the live generation: a reincarnation
+		// provisions afresh, so the new generation starts with no clears
+		// (ptone/scion#3906).
+		inline.ClearedFields = nil
 
 		if len(inline.Skills) > 0 {
 			refs := make([]string, 0, len(inline.Skills))
@@ -422,16 +483,18 @@ func legacyCreateInputsFromAppliedConfig(old *store.AgentAppliedConfig, template
 
 			var dropped, kept []string
 			for k := range inline.Env {
-				if newVal, definedByTemplate := templateEnv[k]; definedByTemplate {
+				if _, definedByTemplate := templateEnv[k]; definedByTemplate {
 					// Never surface the OLD value (design §3.4 Amendment
 					// A3.9). It came from a
 					// legacy agent's live InlineConfig.Env, which is
 					// indistinguishable-by-inspection from an explicit
 					// per-agent override — and that override could be a
 					// secret that merely happens to share a key name with a
-					// template default. The new value is the template's own
-					// current default, not user data, so it is safe to show.
-					dropped = append(dropped, fmt.Sprintf("%s (new=%q)", k, newVal))
+					// template default. No new value is shown either: the
+					// hub no longer copies template env into the agent; the
+					// template's own file supplies it on the broker
+					// (ptone/scion#4222).
+					dropped = append(dropped, k)
 					delete(inline.Env, k)
 				} else {
 					kept = append(kept, k)
@@ -440,7 +503,7 @@ func legacyCreateInputsFromAppliedConfig(old *store.AgentAppliedConfig, template
 			if len(dropped) > 0 {
 				sort.Strings(dropped)
 				warnings = append(warnings, fmt.Sprintf(
-					"dropped %d env key(s) assumed template-derived (now redefined by the current template): %s",
+					"dropped %d env key(s) assumed template-derived (the template supplies them from its own file): %s",
 					len(dropped), strings.Join(dropped, ", ")))
 			}
 			if len(kept) > 0 {
@@ -487,6 +550,9 @@ func computeReincarnationPlan(old, fresh *store.AgentAppliedConfig, warnings []s
 		EnvKeys:    diffEnvKeys(old.Env, fresh.Env),
 		Branch:     fresh.Branch,
 		Warnings:   warnings,
+
+		SharedDirBackends:   fresh.SharedDirBackendChanges,
+		AllowEmptySharedDir: fresh.AllowEmptySharedDir,
 	}
 	if old.Image != "" && config.RewriteImageRegistry(old.Image, imageRegistry) == fresh.Image {
 		plan.Image.Old = fresh.Image

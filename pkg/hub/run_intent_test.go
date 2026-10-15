@@ -21,8 +21,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,36 +29,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// runIntentDispatcher counts start and stop dispatches and can fail stops.
-type runIntentDispatcher struct {
-	createAgentDispatcher
-	starts  atomic.Int32
-	stops   atomic.Int32
-	stopErr error
-}
-
-// DispatchAgentStart applies a running phase to agent, as a broker's start
-// response does.
-func (d *runIntentDispatcher) DispatchAgentStart(_ context.Context, agent *store.Agent, _ string, _ bool) error {
-	d.starts.Add(1)
-	agent.Phase = string(state.PhaseRunning)
-	return nil
-}
-
-func (d *runIntentDispatcher) DispatchAgentStop(_ context.Context, _ *store.Agent) error {
-	d.stops.Add(1)
-	return d.stopErr
-}
-
-func requireRunIntent(t *testing.T, s store.Store, agentID string, want store.RunIntent) *store.Agent {
-	t.Helper()
-	a, err := s.GetAgent(context.Background(), agentID)
-	require.NoError(t, err)
-	require.Equal(t, want, a.RunIntent)
-	require.NotNil(t, a.RunIntentAt)
-	return a
-}
 
 func TestRunIntent_LifecycleActionsRecordIntent(t *testing.T) {
 	srv, s := testServer(t)
@@ -102,16 +70,39 @@ func TestRunIntent_UserStopKeepsIntentOnDispatchFailure(t *testing.T) {
 	requireRunIntent(t, s, agent.ID, store.RunIntentStopped)
 }
 
+// intentAtDeleteDispatcher records the run intent stored when the delete
+// was dispatched.
+type intentAtDeleteDispatcher struct {
+	deleteDispatcher
+	s        store.Store
+	atDelete store.RunIntent
+}
+
+func (d *intentAtDeleteDispatcher) DispatchAgentDelete(ctx context.Context, a *store.Agent, deleteFiles, removeBranch, soft bool, since time.Time) error {
+	if cur, err := d.s.GetAgent(ctx, a.ID); err == nil {
+		d.atDelete = cur.RunIntent
+	}
+	return d.deleteDispatcher.DispatchAgentDelete(ctx, a, deleteFiles, removeBranch, soft, since)
+}
+
+// A delete records intent stopped before it dispatches; a failed delete
+// that restores the agent's prior phase also restores the intent the delete
+// replaced, so a restored running agent keeps intent running.
 func TestRunIntent_DeleteRecordsStoppedBeforeDispatch(t *testing.T) {
 	srv, s := testServer(t)
-	srv.SetDispatcher(&deleteDispatcher{deleteErr: errors.New("broker refused")})
+	disp := &intentAtDeleteDispatcher{deleteDispatcher: deleteDispatcher{deleteErr: errors.New("broker refused")}, s: s}
+	srv.SetDispatcher(disp)
 	_, _, agent := setupOnlineBrokerAgent(t, s, "ri-del")
 	_, err := s.SetRunIntent(context.Background(), agent.ID, store.RunIntentRunning)
 	require.NoError(t, err)
 
 	rec := doRequest(t, srv, http.MethodDelete, "/api/v1/agents/"+agent.ID, nil)
 	require.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
-	requireRunIntent(t, s, agent.ID, store.RunIntentStopped)
+	assert.Equal(t, store.RunIntentStopped, disp.atDelete, "intent is stopped when the delete is dispatched")
+	requireRunIntent(t, s, agent.ID, store.RunIntentRunning)
+	got, err := s.GetAgent(context.Background(), agent.ID)
+	require.NoError(t, err)
+	assert.Equal(t, agent.Phase, got.Phase, "the prior phase is restored")
 }
 
 func TestRunIntent_OfflineStopIsQueued(t *testing.T) {
@@ -335,6 +326,7 @@ func TestRunIntent_AutoSuspendRevertsIntentOnDispatchFailure(t *testing.T) {
 	_, _, agent := setupOnlineBrokerAgent(t, s, "ri-as")
 	_, err := s.SetRunIntent(ctx, agent.ID, store.RunIntentRunning)
 	require.NoError(t, err)
+	markAgentStalled(t, s, agent.ID)
 	loaded, err := s.GetAgent(ctx, agent.ID)
 	require.NoError(t, err)
 
@@ -357,6 +349,7 @@ func TestRunIntent_AutoSuspendKeepsPriorStoppedIntentOnDispatchFailure(t *testin
 	_, _, agent := setupOnlineBrokerAgent(t, s, "ri-as-prior")
 	userStopAt, err := s.SetRunIntent(ctx, agent.ID, store.RunIntentStopped)
 	require.NoError(t, err)
+	markAgentStalled(t, s, agent.ID)
 	loaded, err := s.GetAgent(ctx, agent.ID)
 	require.NoError(t, err)
 	require.Equal(t, string(state.PhaseRunning), loaded.Phase)
@@ -376,6 +369,7 @@ func TestRunIntent_AutoSuspendRecordsStopped(t *testing.T) {
 	_, _, agent := setupOnlineBrokerAgent(t, s, "ri-as-ok")
 	_, err := s.SetRunIntent(ctx, agent.ID, store.RunIntentRunning)
 	require.NoError(t, err)
+	markAgentStalled(t, s, agent.ID)
 	loaded, err := s.GetAgent(ctx, agent.ID)
 	require.NoError(t, err)
 
@@ -383,24 +377,4 @@ func TestRunIntent_AutoSuspendRecordsStopped(t *testing.T) {
 
 	got := requireRunIntent(t, s, agent.ID, store.RunIntentStopped)
 	assert.Equal(t, string(state.PhaseSuspended), got.Phase)
-}
-
-// recordingCommandBus records the brokers SignalBrokerCmd was called for.
-type recordingCommandBus struct {
-	NoopCommandBus
-	mu      sync.Mutex
-	signals []string
-}
-
-func (b *recordingCommandBus) SignalBrokerCmd(_ context.Context, brokerID string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.signals = append(b.signals, brokerID)
-	return nil
-}
-
-func (b *recordingCommandBus) signaled() []string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([]string(nil), b.signals...)
 }

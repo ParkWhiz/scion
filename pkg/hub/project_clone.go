@@ -96,7 +96,13 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 	// clone-url label by ToHTTPSCloneURL. The query string and fragment are
 	// dropped first: git remotes never need them and they can carry tokens
 	// (?access_token=…).
-	overrideRemote := stripQueryAndFragment(trimRemote(req.GitRemote))
+	overrideRemote, cutOK := util.CutQueryAndFragment(trimRemote(req.GitRemote))
+	if !cutOK {
+		// A '?' or '#' inside the userinfo: cutting there would keep part of
+		// the password.
+		ValidationError(w, errCloneRemoteInvalid, map[string]interface{}{"field": "gitRemote"})
+		return
+	}
 	if overrideRemote != "" {
 		if msg := validateCloneGitRemote(overrideRemote); msg != "" {
 			ValidationError(w, msg, map[string]interface{}{"field": "gitRemote"})
@@ -118,6 +124,8 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 		baseSlug = api.Slugify(req.Name)
 	} else if isReservedProjectSlug(baseSlug) {
 		ValidationError(w, reservedProjectSlugMessage, map[string]interface{}{"field": "slug"})
+		return
+	} else if !requireProjectSlugFormat(w, baseSlug) {
 		return
 	}
 
@@ -197,6 +205,9 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 			}
 			clone.Labels[k] = v
 		}
+		// Labels copied from the source may predate write-time validation.
+		sanitizeSourceURLLabel(clone.Labels)
+		sanitizeCopiedCloneURLLabel(clone.Labels)
 		if len(clone.Labels) == 0 {
 			clone.Labels = nil
 		}
@@ -212,7 +223,10 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 			clone.Labels = make(map[string]string)
 		}
 		clone.Labels[store.LabelCloneURL] = util.ToHTTPSCloneURL(overrideCanonical)
-		clone.Labels[store.LabelSourceURL] = overrideRemote
+		// Defence in depth: overrideRemote is already query-stripped, validated and credential-stripped above.
+		if src := util.SanitizeGitSourceURL(overrideRemote); src != "" {
+			clone.Labels[store.LabelSourceURL] = src
+		}
 		clone.Labels[store.LabelDefaultBranch] = "main"
 	}
 
@@ -260,9 +274,28 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 		}
 	}()
 
-	// ── Step 4: Create project row ───────────────────────────────────────
+	// The caller becomes the clone's owner: the request credential must
+	// cover the owner role before anything is written.
+	if !s.authorizeProjectOwnerGrant(w, ctx) {
+		return
+	}
 
-	if err := s.store.CreateProject(ctx, clone); err != nil {
+	// ── Steps 4 and 5: Create project row and owner role binding ─────────
+	// The clone creator becomes the project owner via a direct role binding
+	// (PM1), written with the project row and its audit record in one
+	// transaction. This is the canonical project membership source.
+
+	if err := s.createProjectWithOwner(ctx, clone, callerID); err != nil {
+		if errors.Is(err, errProjectOwnerBinding) {
+			slog.Error("project clone: failed to create owner role binding",
+				"clone_id", clone.ID, "user_id", callerID, "error", err)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"Failed to create owner role binding: "+err.Error(), nil)
+			return
+		}
+		if writeFixtureRootError(w, err) {
+			return
+		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -278,20 +311,6 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 				"clone_id", clone.ID, "error", delErr)
 		}
 	})
-
-	// ── Step 5: Create owner role binding (PM1: atomic with project) ─────
-	// The clone creator becomes the project owner via a direct role binding.
-	// This is the canonical project membership source. The step 4 rollback
-	// already cascade-deletes all project-scoped bindings.
-	if callerID != "" {
-		if rbErr := s.createProjectOwnerRoleBinding(ctx, clone.ID, callerID); rbErr != nil {
-			slog.Error("project clone: failed to create owner role binding",
-				"clone_id", clone.ID, "user_id", callerID, "error", rbErr)
-			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
-				"Failed to create owner role binding: "+rbErr.Error(), nil)
-			return
-		}
-	}
 
 	// ── Step 6: Create groups ────────────────────────────────────────────
 
@@ -319,6 +338,10 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 	if err := s.cloneProjectTemplates(ctx, src.ID, clone, &rollback); err != nil {
 		slog.Error("project clone: template copy failed",
 			"source_id", src.ID, "clone_id", clone.ID, "error", err)
+		if isTemplateCommitRefusal(err) {
+			writeTemplateCommitError(w, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"Failed to copy templates: "+err.Error(), nil)
 		return
@@ -400,11 +423,18 @@ func (s *Server) handleProjectClone(w http.ResponseWriter, r *http.Request, proj
 		}
 	}
 
-	// ── Step 14: Auto-link providers (best-effort) ───────────────────────
+	// ── Step 15: Auto-link providers (best-effort) ───────────────────────
 
-	s.autoLinkProviders(ctx, clone)
+	s.autoLinkClonedProviders(ctx, clone)
 
-	// ── Step 15: Publish event (best-effort) ─────────────────────────────
+	// ── Step 16: Ensure the #general chat topic (best-effort) ────────────
+	// Runs after every step that can fail and roll the clone back, so a
+	// rolled-back clone never leaves an orphaned topic behind. Skipped for
+	// template clones (asTemplate), which are not chat spaces.
+
+	s.ensureProjectGeneralTopic(ctx, clone)
+
+	// ── Step 17: Publish event (best-effort) ─────────────────────────────
 
 	s.events.PublishProjectCreated(ctx, clone)
 
@@ -473,51 +503,10 @@ func (s *Server) cloneProjectHarnessConfigs(ctx context.Context, srcProjectID st
 
 	stor := s.GetStorage()
 
-	for _, srcHC := range result.Items {
-		newHC := &store.HarnessConfig{
-			ID:          api.NewUUID(),
-			Name:        srcHC.Name,
-			Slug:        srcHC.Slug, // SAME slug — critical for annotation references
-			DisplayName: srcHC.DisplayName,
-			Description: srcHC.Description,
-			Harness:     srcHC.Harness,
-			Config:      srcHC.Config,
-			Scope:       store.HarnessConfigScopeProject,
-			ScopeID:     clone.ID,
-			Status:      srcHC.Status,
-			Files:       srcHC.Files,
-			ContentHash: srcHC.ContentHash,
-		}
-
-		storagePath := storage.HarnessConfigStoragePath(s.HubID(), newHC.Scope, newHC.ScopeID, newHC.Slug)
-		newHC.StoragePath = storagePath
-
-		if stor != nil {
-			newHC.StorageBucket = stor.Bucket()
-			newHC.StorageURI = storage.HarnessConfigStorageURI(s.HubID(), stor.Bucket(), newHC.Scope, newHC.ScopeID, newHC.Slug)
-		}
-
-		// Copy storage files
-		if stor != nil && len(srcHC.Files) > 0 && srcHC.StoragePath != "" {
-			for _, file := range srcHC.Files {
-				srcPath := srcHC.StoragePath + "/" + file.Path
-				dstPath := storagePath + "/" + file.Path
-				if _, err := stor.Copy(ctx, srcPath, dstPath); err != nil {
-					_ = stor.DeletePrefix(ctx, storage.DirPrefix(storagePath))
-					return err
-				}
-			}
-		}
-
-		if err := s.store.CreateHarnessConfig(ctx, newHC); err != nil {
-			if stor != nil {
-				_ = stor.DeletePrefix(ctx, storage.DirPrefix(storagePath))
-			}
-			return err
-		}
-	}
-
-	// Add rollback for all harness configs at once
+	// Register the rollback for all harness configs before creating any, so
+	// a failure part-way through the loop (e.g. a harness config the commit
+	// path refuses) still removes the ones already created. The rollback is
+	// scope-wide and idempotent.
 	*rollback = append(*rollback, func() {
 		rbCtx := context.WithoutCancel(ctx)
 		stor := s.GetStorage()
@@ -530,6 +519,59 @@ func (s *Server) cloneProjectHarnessConfigs(ctx context.Context, srcProjectID st
 				"clone_id", clone.ID, "error", err)
 		}
 	})
+
+	for _, srcHC := range result.Items {
+		// Harness is the fallback for a config.yaml that sets none; Config
+		// is never copied: the commit below re-derives Harness and Config
+		// from the copied files (ptone/scion#4219).
+		newHC := &store.HarnessConfig{
+			ID:          api.NewUUID(),
+			Name:        srcHC.Name,
+			Slug:        srcHC.Slug, // SAME slug — critical for annotation references
+			DisplayName: srcHC.DisplayName,
+			Description: srcHC.Description,
+			Harness:     srcHC.Harness,
+			Scope:       store.HarnessConfigScopeProject,
+			ScopeID:     clone.ID,
+			Status:      srcHC.Status,
+		}
+
+		storagePath := storage.HarnessConfigStoragePath(s.HubID(), newHC.Scope, newHC.ScopeID, newHC.Slug)
+		newHC.StoragePath = storagePath
+
+		if stor != nil {
+			newHC.StorageBucket = stor.Bucket()
+			newHC.StorageURI = storage.HarnessConfigStorageURI(s.HubID(), stor.Bucket(), newHC.Scope, newHC.ScopeID, newHC.Slug)
+		}
+
+		// Copy storage files, then create the row through the commit path.
+		var createErr error
+		if stor != nil && len(srcHC.Files) > 0 && srcHC.StoragePath != "" {
+			for _, file := range srcHC.Files {
+				srcPath := srcHC.StoragePath + "/" + file.Path
+				dstPath := storagePath + "/" + file.Path
+				if _, err := stor.Copy(ctx, srcPath, dstPath); err != nil {
+					_ = stor.DeletePrefix(ctx, storage.DirPrefix(storagePath))
+					return err
+				}
+			}
+			createErr = s.commitHarnessConfigFiles(ctx, newHC, srcHC.Files, harnessConfigCommitOpts{create: true})
+		} else {
+			// No stored content to copy and derive from: create the row
+			// without files, pending, as a harness-config clone does. Files
+			// and their hash are written only by the commit path, and a
+			// manifest copied here would list objects the clone never got.
+			newHC.Status = store.HarnessConfigStatusPending
+			createErr = s.store.CreateHarnessConfig(ctx, newHC)
+		}
+
+		if err := createErr; err != nil {
+			if stor != nil {
+				_ = stor.DeletePrefix(ctx, storage.DirPrefix(storagePath))
+			}
+			return err
+		}
+	}
 
 	return nil
 }
@@ -551,52 +593,10 @@ func (s *Server) cloneProjectTemplates(ctx context.Context, srcProjectID string,
 
 	stor := s.GetStorage()
 
-	for _, srcTmpl := range result.Items {
-		newTmpl := &store.Template{
-			ID:           api.NewUUID(),
-			Name:         srcTmpl.Name,
-			Slug:         srcTmpl.Slug, // SAME slug — critical for annotation references
-			DisplayName:  srcTmpl.DisplayName,
-			Description:  srcTmpl.Description,
-			Harness:      srcTmpl.Harness,
-			Config:       srcTmpl.Config,
-			Scope:        store.TemplateScopeProject,
-			ScopeID:      clone.ID,
-			Status:       srcTmpl.Status,
-			Files:        srcTmpl.Files,
-			ContentHash:  srcTmpl.ContentHash,
-			BaseTemplate: srcTmpl.BaseTemplate,
-		}
-
-		storagePath := storage.TemplateStoragePath(s.HubID(), newTmpl.Scope, newTmpl.ScopeID, newTmpl.Slug)
-		newTmpl.StoragePath = storagePath
-
-		if stor != nil {
-			newTmpl.StorageBucket = stor.Bucket()
-			newTmpl.StorageURI = storage.TemplateStorageURI(s.HubID(), stor.Bucket(), newTmpl.Scope, newTmpl.ScopeID, newTmpl.Slug)
-		}
-
-		// Copy storage files
-		if stor != nil && len(srcTmpl.Files) > 0 && srcTmpl.StoragePath != "" {
-			for _, file := range srcTmpl.Files {
-				srcPath := srcTmpl.StoragePath + "/" + file.Path
-				dstPath := storagePath + "/" + file.Path
-				if _, err := stor.Copy(ctx, srcPath, dstPath); err != nil {
-					_ = stor.DeletePrefix(ctx, storage.DirPrefix(storagePath))
-					return err
-				}
-			}
-		}
-
-		if err := s.store.CreateTemplate(ctx, newTmpl); err != nil {
-			if stor != nil {
-				_ = stor.DeletePrefix(ctx, storage.DirPrefix(storagePath))
-			}
-			return err
-		}
-	}
-
-	// Add rollback for all templates at once
+	// Register the rollback for all templates before creating any, so a
+	// failure part-way through the loop (e.g. a template the commit path
+	// refuses) still removes the templates already created. The rollback is
+	// scope-wide and idempotent.
 	*rollback = append(*rollback, func() {
 		rbCtx := context.WithoutCancel(ctx)
 		stor := s.GetStorage()
@@ -609,6 +609,58 @@ func (s *Server) cloneProjectTemplates(ctx context.Context, srcProjectID string,
 				"clone_id", clone.ID, "error", err)
 		}
 	})
+
+	for _, srcTmpl := range result.Items {
+		newTmpl := &store.Template{
+			ID:           api.NewUUID(),
+			Name:         srcTmpl.Name,
+			Slug:         srcTmpl.Slug, // SAME slug — critical for annotation references
+			DisplayName:  srcTmpl.DisplayName,
+			Description:  srcTmpl.Description,
+			Config:       srcTmpl.Config,
+			Scope:        store.TemplateScopeProject,
+			ScopeID:      clone.ID,
+			Status:       srcTmpl.Status,
+			BaseTemplate: srcTmpl.BaseTemplate,
+		}
+
+		// The clone is created in the blob layout with a row-unique path
+		// (ptone/scion#4221). It sits in the clone project's scope
+		// directory, so the rollback prefix above covers it.
+		newTmpl.Layout = store.TemplateLayoutBlobs
+		storagePath := s.templateBlobStoragePath(newTmpl)
+		newTmpl.StoragePath = storagePath
+
+		if stor != nil {
+			newTmpl.StorageBucket = stor.Bucket()
+			newTmpl.StorageURI = storage.StorageURIForPath(stor.Bucket(), storagePath)
+		}
+
+		// Create the template through the commit path, which copies each
+		// file the source references into the clone's blobs and
+		// re-derives Harness, DefaultHarnessConfig and AgentConfig from
+		// them instead of copying the source's derived fields
+		// (ptone/scion#4217).
+		var createErr error
+		if stor != nil && len(srcTmpl.Files) > 0 && srcTmpl.StoragePath != "" {
+			src := srcTmpl
+			createErr = s.commitTemplateFiles(ctx, newTmpl, srcTmpl.Files, commitOpts{create: true, copyFrom: &src})
+		} else {
+			// No stored content to derive from: keep the manifest as the
+			// source had it and take the harness from the name.
+			newTmpl.Files = srcTmpl.Files
+			newTmpl.ContentHash = srcTmpl.ContentHash
+			newTmpl.Harness = deriveTemplateIndex(nil, "", newTmpl.Name).Harness
+			createErr = s.store.CreateTemplate(ctx, newTmpl)
+		}
+
+		if err := createErr; err != nil {
+			if stor != nil {
+				_ = stor.DeletePrefix(ctx, templateBlobPrefix(storagePath))
+			}
+			return err
+		}
+	}
 
 	return nil
 }
@@ -713,6 +765,27 @@ func (s *Server) cloneProjectGCPServiceAccounts(ctx context.Context, srcProjectI
 			return err
 		}
 		clonedIDs = append(clonedIDs, newSA.ID)
+	}
+
+	// Remap the per-profile default SA map's entries that reference a
+	// source SA. Entries naming other (hub-scoped) accounts are kept.
+	if byProfile := profileDefaultSAIDsFromAnnotations(clone.Annotations); len(byProfile) > 0 {
+		changed := false
+		for profile, saID := range byProfile {
+			for i, srcSA := range accounts {
+				if srcSA.ID == saID {
+					byProfile[profile] = clonedIDs[i]
+					changed = true
+					break
+				}
+			}
+		}
+		if changed {
+			setProfileDefaultSAIDsAnnotation(clone.Annotations, byProfile)
+			if err := s.store.UpdateProject(ctx, clone); err != nil {
+				return fmt.Errorf("remap per-profile default SA annotation: %w", err)
+			}
+		}
 	}
 
 	// Remap default SA annotation if it references a source SA.
@@ -825,19 +898,6 @@ func trimRemote(remote string) string {
 	return strings.Trim(remote, " \t\n\v\f\r")
 }
 
-// isPrintableASCII reports whether s contains only printable, non-space
-// ASCII (0x21-0x7E). This rejects whitespace, control and format characters
-// (e.g. RTL overrides) and non-ASCII homoglyphs; IDN hosts must be given in
-// punycode (xn--...).
-func isPrintableASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x21 || s[i] > 0x7e {
-			return false
-		}
-	}
-	return true
-}
-
 // validRemotePath reports whether a decoded remote path (without the leading
 // '/' of a scheme URL) has only non-empty segments that are neither "." nor
 // "..", and no '@' (ambiguous with userinfo), '\\' or control characters. A single trailing '/' is allowed. Dot
@@ -888,15 +948,6 @@ func validEscapedRemotePath(path string) bool {
 	return err == nil && validRawRemotePath(path) && validRemotePath(path) && validRemotePath(decoded)
 }
 
-// stripQueryAndFragment drops everything from the first '?' or '#'. Git remote
-// URLs never need either, and a query can carry credentials.
-func stripQueryAndFragment(remote string) string {
-	if i := strings.IndexAny(remote, "?#"); i >= 0 {
-		return remote[:i]
-	}
-	return remote
-}
-
 // scpLogin matches the login of an SCP-style remote (user@host:path).
 var scpLogin = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
@@ -939,7 +990,7 @@ func splitSCPRemote(remote string) (login, host, path string, ok bool) {
 // (raw or %40), "." / ".." or empty segments. git:// with a port and
 // http:// with a port other than 80 get errCloneRemoteTLSPort.
 func validateCloneGitRemote(remote string) string {
-	if !isPrintableASCII(remote) {
+	if !util.IsPrintableASCII(remote) {
 		return errCloneRemoteInvalid
 	}
 	if strings.Contains(remote, "://") {
@@ -1138,4 +1189,137 @@ func isGitSourceLabel(k string) bool {
 		return true
 	}
 	return false
+}
+
+// autoLinkClonedProviders auto-links the auto-provide brokers to a new clone
+// and settles its default runtime broker. A default runtime broker must be
+// a provider of the project: the default copied from the source is kept
+// only when the clone has that provider row after auto-linking; otherwise
+// the first auto-linked broker becomes the default, or the default is
+// cleared when there is none. The stored default is read back and written
+// whenever it differs from the settled one, so the store and the returned
+// clone agree. Best-effort: store errors are logged.
+func (s *Server) autoLinkClonedProviders(ctx context.Context, clone *store.Project) {
+	copied := clone.DefaultRuntimeBrokerID
+	clone.DefaultRuntimeBrokerID = ""
+	s.autoLinkProviders(ctx, clone)
+	if copied != "" {
+		if _, err := s.store.GetProjectProvider(ctx, clone.ID, copied); err == nil {
+			clone.DefaultRuntimeBrokerID = copied
+		}
+	}
+	if current, err := s.store.GetProject(ctx, clone.ID); err == nil &&
+		current.DefaultRuntimeBrokerID == clone.DefaultRuntimeBrokerID {
+		return
+	}
+	if err := s.store.UpdateProject(ctx, clone); err != nil {
+		slog.Warn("project clone: failed to settle default runtime broker",
+			"clone_id", clone.ID, "error", err)
+	}
+}
+
+// validateCloneURLLabelValue checks the clone-url label in labels (if any)
+// and returns a user-facing message when it is not a plain repository URL,
+// or "" when it is acceptable. Every hub path that writes project labels from
+// a request calls it, so credentials, query strings and fragments never reach
+// the stored label. Clone authentication belongs in project secrets or the
+// GitHub App instead.
+func validateCloneURLLabelValue(labels map[string]string) string {
+	v, ok := labels[store.LabelCloneURL]
+	if !ok {
+		return ""
+	}
+	if err := util.ValidateCloneURLLabel(v); err != nil {
+		return cloneURLRefusalMessage(err)
+	}
+	return ""
+}
+
+// cloneURLRefusalMessage is the constant user-facing 400 message for a
+// refused clone URL. It names what to remove but never echoes the value.
+func cloneURLRefusalMessage(err error) string {
+	var problem string
+	switch {
+	case errors.Is(err, util.ErrCloneURLInvalid):
+		problem = "remove whitespace and control or non-ASCII characters from the URL"
+	case errors.Is(err, util.ErrCloneURLUserinfo):
+		problem = "remove the username, password or token from the URL ('@' is allowed only in an ssh or scp-style login)"
+	case errors.Is(err, util.ErrCloneURLQuery):
+		problem = "remove the query string (?...) from the URL"
+	case errors.Is(err, util.ErrCloneURLFragment):
+		problem = "remove the fragment (#...) from the URL"
+	default:
+		problem = "use a plain repository URL"
+	}
+	return "Invalid " + store.LabelCloneURL + " label: " + problem +
+		". The label must be a plain repository URL; configure clone authentication with project secrets or the GitHub App instead"
+}
+
+// normalizeRequestGitRemote returns the normalized form of a git remote from a
+// create or register request, or a constant 400 message. The query and
+// fragment are dropped first (as the clone path does): git remotes never need
+// them and they can carry tokens. A remote whose dropped part contains '@'
+// (a '?' or '#' inside the password) or whose normalized form still contains
+// '@' is refused rather than repaired.
+func normalizeRequestGitRemote(raw string) (normalized, msg string) {
+	rest, ok := util.CutQueryAndFragment(raw)
+	if !ok {
+		return "", cloneURLRefusalMessage(util.ErrCloneURLUserinfo)
+	}
+	normalized = util.NormalizeGitRemote(rest)
+	return normalized, validateNormalizedGitRemote(normalized)
+}
+
+// validateNormalizedGitRemote refuses a git remote whose normalized form
+// (util.NormalizeGitRemote, which drops ordinary userinfo) still contains
+// '@': the input carried a password or an extra '@' in scp form
+// (git@user:PASS@host:org/repo), and storing it would keep the credential in
+// Project.GitRemote. The value is not repaired. The message is the same
+// constant as the clone-url refusal and never echoes the value.
+func validateNormalizedGitRemote(normalized string) string {
+	if strings.Contains(normalized, "@") {
+		return cloneURLRefusalMessage(util.ErrCloneURLUserinfo)
+	}
+	return ""
+}
+
+// sanitizeSourceURLLabel rewrites the source-url label in labels (if any) to
+// its credential-, query- and fragment-free form, mirroring how the clone
+// path above sanitizes a git remote override before storing it. The label is
+// readable by project members, so it never keeps what was stripped; a value
+// that cannot be sanitized unambiguously is removed. labels is modified in
+// place.
+func sanitizeSourceURLLabel(labels map[string]string) {
+	v, ok := labels[store.LabelSourceURL]
+	if !ok {
+		return
+	}
+	if clean := util.SanitizeGitSourceURL(v); clean != "" {
+		labels[store.LabelSourceURL] = clean
+	} else {
+		delete(labels, store.LabelSourceURL)
+	}
+}
+
+// sanitizeCopiedCloneURLLabel makes a clone-url label copied from another
+// project (which may predate write-time validation) acceptable to
+// validateCloneURLLabelValue: a value that fails validation is replaced by its
+// sanitized form, or removed when that is still not a plain repository URL.
+// labels is modified in place.
+func sanitizeCopiedCloneURLLabel(labels map[string]string) {
+	v, ok := labels[store.LabelCloneURL]
+	if !ok || util.ValidateCloneURLLabel(v) == nil {
+		return
+	}
+	if clean := util.SanitizeGitSourceURL(v); clean != "" && util.ValidateCloneURLLabel(clean) == nil {
+		labels[store.LabelCloneURL] = clean
+	} else {
+		delete(labels, store.LabelCloneURL)
+	}
+}
+
+// cloneURLLabelErrorDetails is the details payload for a rejected clone-url
+// label. It names the field but never echoes the value.
+func cloneURLLabelErrorDetails() map[string]interface{} {
+	return map[string]interface{}{"field": "labels." + store.LabelCloneURL}
 }

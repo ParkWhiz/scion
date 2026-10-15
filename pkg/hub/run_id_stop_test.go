@@ -83,8 +83,64 @@ func TestStopAgentQuery_RunID(t *testing.T) {
 	}
 }
 
+// The dispatcher sends the hub's agent ID on stop and delete (both
+// transports build their query from stopAgentQuery / deleteAgentQuery), so
+// the broker can leave alone the in-flight start of a newer agent recreated
+// under the same name (ptone/scion#2632).
+func TestDispatchAgentStopAndDelete_SendAgentID(t *testing.T) {
+	ctx := context.Background()
+	f := newRunIDFixture(t, "agentid-stop")
+	want := api.AgentIDQueryParam + "=" + url.QueryEscape(f.agent.ID)
+
+	if err := f.dispatcher.DispatchAgentStop(ctx, f.agent); err != nil {
+		t.Fatalf("DispatchAgentStop: %v", err)
+	}
+	if got := f.client.lastStopAgentIDQuery; got != want {
+		t.Errorf("stop agent ID query = %q, want %q", got, want)
+	}
+	if err := f.dispatcher.DispatchAgentDelete(ctx, f.agent, false, false, false, time.Time{}); err != nil {
+		t.Fatalf("DispatchAgentDelete: %v", err)
+	}
+	if got := f.client.lastDeleteAgentIDQuery; got != want {
+		t.Errorf("delete agent ID query = %q, want %q", got, want)
+	}
+}
+
+func TestStopAndDeleteAgentQuery_AgentID(t *testing.T) {
+	ctx := withDispatchAgentID(context.Background(), "agent a&b")
+	q, err := url.ParseQuery(stopAgentQuery(ctx, "p1", "run-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.Get(api.AgentIDQueryParam) != "agent a&b" || q.Get("runId") != "run-1" || q.Get("projectId") != "p1" {
+		t.Errorf("stop query %v, want projectId, runId and agentId", q)
+	}
+	if got := stopAgentQuery(ctx, "", ""); got != api.AgentIDQueryParam+"=agent+a%26b" {
+		t.Errorf("stop query with only an agent ID = %q", got)
+	}
+	q, err = url.ParseQuery(deleteAgentQuery(ctx, "p1", DeleteAgentOptions{RunID: "run-1"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.Get(api.AgentIDQueryParam) != "agent a&b" || q.Get("runId") != "run-1" {
+		t.Errorf("delete query %v, want runId and agentId", q)
+	}
+	// No agent ID on the context: nothing is sent and the broker matches
+	// by name, as before.
+	for _, raw := range []string{
+		stopAgentQuery(context.Background(), "p1", "run-1"),
+		deleteAgentQuery(context.Background(), "p1", DeleteAgentOptions{}),
+		stopAgentQuery(withDispatchAgentID(context.Background(), ""), "p1", ""),
+	} {
+		q, _ := url.ParseQuery(raw)
+		if q.Has(api.AgentIDQueryParam) {
+			t.Errorf("agentId sent without an agent ID: %q", raw)
+		}
+	}
+}
+
 // runMismatchBody is the broker's run-mismatch 404 body for a stop naming
-// run-1 while run-2 holds the name (runtimebroker.StopRunMismatch).
+// run-1 while run-2 holds the name (runtimebroker.RunMismatch).
 const runMismatchBody = `{"error":{"code":"` + api.BrokerErrorCodeRunMismatch + `","message":"Agent not found for the requested run","details":{"runId":"run-1","currentRunId":"run-2"}}}`
 
 func TestHTTPRuntimeBrokerClient_StopAgentRunID(t *testing.T) {
@@ -177,7 +233,7 @@ func TestExecDispatchStop_UsesIntentRunID(t *testing.T) {
 	client := &mockRuntimeBrokerClient{}
 	srv.SetDispatcher(NewHTTPAgentDispatcherWithClient(s, client, false, slog.Default()))
 	_, _, agent := setupOnlineBrokerAgent(t, s, "stop-intent-run")
-	if _, err := s.SetAgentRunID(ctx, agent.ID, "run-new"); err != nil {
+	if _, err := s.SetAgentRunID(ctx, agent.ID, "run-new", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -213,27 +269,6 @@ func TestStopDispatchArgs_RunIDRoundTrip(t *testing.T) {
 	if got.RunID != "run-1" {
 		t.Errorf("RunID = %q, want run-1", got.RunID)
 	}
-}
-
-// runLabelManager.StopTarget is the broker's stop of a resolved entry on
-// the fake labelled runtime: it records the stop and marks the entry
-// stopped.
-func (m *runLabelManager) StopTarget(_ context.Context, ref runtime.RunRef) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stops = append(m.stops, ref)
-	for i := range m.entries {
-		if m.entries[i].ContainerID == ref.ID {
-			m.entries[i].Phase = "stopped"
-		}
-	}
-	return nil
-}
-
-func (m *runLabelManager) stopSnapshot() ([]api.AgentInfo, []runtime.RunRef) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]api.AgentInfo(nil), m.entries...), append([]runtime.RunRef(nil), m.stops...)
 }
 
 // stopE2EBroker starts a real runtimebroker.Server over HTTP on the fake
@@ -357,7 +392,7 @@ func TestRunID_E2E_StaleStopDoesNotMarkRowStopped(t *testing.T) {
 			}
 			srv.SetDispatcher(NewHTTPAgentDispatcherWithClient(s, NewHTTPRuntimeBrokerClient(), false, slog.Default()))
 			mgr.run(agent.Slug, "cid-b", agent.ProjectID, "", "run-b")
-			if _, err := s.SetAgentRunID(ctx, agent.ID, "run-a"); err != nil {
+			if _, err := s.SetAgentRunID(ctx, agent.ID, "run-a", nil); err != nil {
 				t.Fatal(err)
 			}
 
@@ -380,7 +415,7 @@ func TestRunID_E2E_StaleStopDoesNotMarkRowStopped(t *testing.T) {
 			if action != "stop" {
 				return
 			}
-			if _, err := s.SetAgentRunID(ctx, agent.ID, "run-b"); err != nil {
+			if _, err := s.SetAgentRunID(ctx, agent.ID, "run-b", nil); err != nil {
 				t.Fatal(err)
 			}
 			rec = doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/stop", nil)
@@ -410,7 +445,13 @@ func TestQueueOfflineStop_IntentCarriesRunID(t *testing.T) {
 	srv.SetDispatcher(&runIntentDispatcher{})
 	srv.commandBus = &recordingCommandBus{}
 	_, broker, agent := setupOfflineBrokerAgent(t, s, "stop-q-run")
-	if _, err := s.SetAgentRunID(ctx, agent.ID, "run-q"); err != nil {
+	if _, err := s.SetAgentRunID(ctx, agent.ID, "run-q", nil); err != nil {
+		t.Fatal(err)
+	}
+	// A start claim held when the stop is recorded is carried too, for the
+	// drain to release.
+	claim, err := s.ClaimAgentStart(ctx, agent.ID, "other-hub", store.StartClaimUser, "", time.Minute)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -419,6 +460,17 @@ func TestQueueOfflineStop_IntentCarriesRunID(t *testing.T) {
 		t.Fatalf("offline stop: status %d: %s", rec.Code, rec.Body.String())
 	}
 	assertStopIntentRunID(t, s, broker.ID, "run-q")
+	pending, err := s.ListPendingDispatch(ctx, broker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := UnmarshalStopArgs(pending[0].Args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.SupersedesClaim != claim.ID {
+		t.Errorf("stop intent supersedesClaim = %q, want %q", args.SupersedesClaim, claim.ID)
+	}
 }
 
 // A cross-node stop (DispatchAgentStop → ErrLifecycleDeferred) writes a
@@ -434,7 +486,7 @@ func TestDeferredStop_IntentCarriesRunID(t *testing.T) {
 	dispatcher.SetCrossNodeDeps(events, NoopCommandBus{})
 
 	agent := seedAgentWithBrokerID(t, cs, remoteBroker)
-	if _, err := cs.SetAgentRunID(ctx, agent.ID, "run-d"); err != nil {
+	if _, err := cs.SetAgentRunID(ctx, agent.ID, "run-d", nil); err != nil {
 		t.Fatal(err)
 	}
 	agent.RunID = "run-d"

@@ -77,9 +77,11 @@ func snapshotTree(t *testing.T, dir string) map[string]string {
 
 // reprovisionSetup builds a git project with a gitignored .scion/agents and a
 // global generic harness-config + default template. CWD is set OUTSIDE the
-// repo, as on a runtime broker — this is what makes util.BranchExists return
-// false for a broker process, which is the data-loss condition Reprovision's
-// workspace-mode gate (design §3.4 Amendment A2) exists to catch.
+// repo, as on a runtime broker. ProvisionAgent's branch lookups once ran
+// against the CWD and so missed the agent's branch on a broker, the
+// data-loss condition Reprovision's workspace-mode gate (design §3.4
+// Amendment A2) exists to catch; they now run against the project
+// repository (ptone/scion#4439), and the gate still holds.
 func reprovisionSetup(t *testing.T) (scionDir, globalScionDir string) {
 	t.Helper()
 	t.Setenv("SCION_HOST_UID", "")
@@ -118,7 +120,7 @@ func reprovisionSetup(t *testing.T) (scionDir, globalScionDir string) {
 // TestReprovision_WorktreeMode_Refused is a data-loss regression test
 // (design Amendment A2): Reprovision must refuse — not silently delete — a
 // worktree-mode agent's workspace, so uncommitted work always survives.
-// Before the fix, ProvisionAgent's CWD-dependent BranchExists check returned
+// Before the fix, ProvisionAgent's CWD-dependent branch check returned
 // false on a broker (CWD outside the repo), so it ran os.RemoveAll on the
 // live worktree.
 func TestReprovision_WorktreeMode_Refused(t *testing.T) {
@@ -218,11 +220,12 @@ func TestReprovision_CloneMode_WorkspaceAndHomeSurvive(t *testing.T) {
 	}
 }
 
-// TestReprovision_HarnessConfigImageBumpReplacesFrozenImage pins the whole
-// reason reincarnate exists: a plain restart (Provision, via GetAgent) keeps
-// scion-agent.json frozen at whatever image generation N resolved, but
-// Reprovision replaces it with the current harness-config image.
-func TestReprovision_HarnessConfigImageBumpReplacesFrozenImage(t *testing.T) {
+// TestReprovision_HarnessConfigImageNotPersisted: the harness-config image
+// is an environment value, so neither provisioning nor reprovisioning
+// freezes it into scion-agent.json (ptone/scion#4561); Start resolves it
+// from the current harness-config on every start. Reprovision reports the
+// current (bumped) harness-config image.
+func TestReprovision_HarnessConfigImageNotPersisted(t *testing.T) {
 	scionDir, globalScionDir := reprovisionSetup(t)
 	agentName := "img-agent"
 	gc := &api.GitCloneConfig{URL: "https://example.com/repo.git"}
@@ -240,8 +243,8 @@ func TestReprovision_HarnessConfigImageBumpReplacesFrozenImage(t *testing.T) {
 		_ = json.Unmarshal(b, &c)
 		return c.Image
 	}
-	if got := read(); got != "test-image:latest" {
-		t.Fatalf("gen N image = %q", got)
+	if got := read(); got != "" {
+		t.Fatalf("gen N persisted image = %q, want none", got)
 	}
 	_ = os.WriteFile(filepath.Join(globalScionDir, "harness-configs", "generic", "config.yaml"),
 		[]byte("harness: generic\nimage: test-image:v2\n"), 0644)
@@ -250,8 +253,8 @@ func TestReprovision_HarnessConfigImageBumpReplacesFrozenImage(t *testing.T) {
 	if _, err := mgr.Provision(context.Background(), api.StartOptions{Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true, GitClone: gc}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	if got := read(); got != "test-image:latest" {
-		t.Fatalf("plain Provision (restart) must keep the frozen image; got %q", got)
+	if got := read(); got != "" {
+		t.Fatalf("plain Provision (restart) persisted image = %q, want none", got)
 	}
 	// The restart above went through GetAgent, which clears and recreates an
 	// empty workspace dir for git-clone mode so sciontool performs a fresh
@@ -263,11 +266,15 @@ func TestReprovision_HarnessConfigImageBumpReplacesFrozenImage(t *testing.T) {
 	// only needs a real .git directory to be present.
 	_ = os.MkdirAll(filepath.Join(ws, ".git"), 0755)
 
-	if _, err := mgr.Reprovision(context.Background(), api.StartOptions{Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true, GitClone: gc}); err != nil {
+	reCfg, err := mgr.Reprovision(context.Background(), api.StartOptions{Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true, GitClone: gc})
+	if err != nil {
 		t.Fatalf("Reprovision: %v", err)
 	}
-	if got := read(); got != "test-image:v2" {
-		t.Fatalf("after Reprovision image = %q, want test-image:v2", got)
+	if reCfg == nil || reCfg.Image != "test-image:v2" {
+		t.Fatalf("Reprovision reported config = %+v, want image test-image:v2", reCfg)
+	}
+	if got := read(); got != "" {
+		t.Fatalf("after Reprovision persisted image = %q, want none", got)
 	}
 }
 
@@ -314,38 +321,51 @@ func TestReprovision_PreStartHookReStagedOrRemoved(t *testing.T) {
 	}
 }
 
-// TestReprovision_PromptMDUntouched covers the design §3.4 note that the new
-// generation's task is delivered by DispatchAgentStart, not pre-staged as a
-// file: Reprovision must never write or clear prompt.md.
-func TestReprovision_PromptMDUntouched(t *testing.T) {
-	scionDir, _ := reprovisionSetup(t)
-	agentName := "prompt-agent"
-	gc := &api.GitCloneConfig{URL: "https://example.com/repo.git"}
-	ctx := api.ContextWithGitClone(context.Background(), gc)
-	if _, _, _, err := ProvisionAgent(ctx, agentName, "default", "", "", scionDir, "", "created", "", ""); err != nil {
-		t.Fatalf("initial ProvisionAgent: %v", err)
-	}
-	ws := filepath.Join(scionDir, "agents", agentName, "workspace")
-	_ = os.MkdirAll(filepath.Join(ws, ".git"), 0755)
+// TestReprovision_PromptMDReplaced pins ptone/scion#3985: once Reprovision
+// re-renders the disk for a new generation, prompt.md never holds the
+// previous generation's task, even if no Start follows. It holds the
+// request's task, or is empty when the request carries none.
+func TestReprovision_PromptMDReplaced(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		task string
+	}{
+		{name: "with task", task: "gen 2 task"},
+		{name: "without task", task: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scionDir, _ := reprovisionSetup(t)
+			agentName := "prompt-agent"
+			gc := &api.GitCloneConfig{URL: "https://example.com/repo.git"}
+			ctx := api.ContextWithGitClone(context.Background(), gc)
+			if _, _, _, err := ProvisionAgent(ctx, agentName, "default", "", "", scionDir, "", "created", "", ""); err != nil {
+				t.Fatalf("initial ProvisionAgent: %v", err)
+			}
+			ws := filepath.Join(scionDir, "agents", agentName, "workspace")
+			_ = os.MkdirAll(filepath.Join(ws, ".git"), 0755)
 
-	promptPath := filepath.Join(scionDir, "agents", agentName, "prompt.md")
-	if err := os.WriteFile(promptPath, []byte("gen 1 task"), 0644); err != nil {
-		t.Fatal(err)
-	}
+			promptPath := filepath.Join(scionDir, "agents", agentName, "prompt.md")
+			if err := os.WriteFile(promptPath, []byte("gen 1 task"), 0644); err != nil {
+				t.Fatal(err)
+			}
 
-	mgr := NewManager(&runtime.MockRuntime{})
-	if _, err := mgr.Reprovision(context.Background(), api.StartOptions{
-		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true, GitClone: gc,
-		Task: "this must not be written to prompt.md",
-	}); err != nil {
-		t.Fatalf("Reprovision: %v", err)
-	}
-	data, err := os.ReadFile(promptPath)
-	if err != nil {
-		t.Fatalf("prompt.md must survive: %v", err)
-	}
-	if string(data) != "gen 1 task" {
-		t.Fatalf("prompt.md was modified by Reprovision: got %q", data)
+			// No Start follows: this is the state a later start finds if
+			// the reincarnation's own start never reached the broker.
+			mgr := NewManager(&runtime.MockRuntime{})
+			if _, err := mgr.Reprovision(context.Background(), api.StartOptions{
+				Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true, GitClone: gc,
+				Task: tc.task,
+			}); err != nil {
+				t.Fatalf("Reprovision: %v", err)
+			}
+			data, err := os.ReadFile(promptPath)
+			if err != nil {
+				t.Fatalf("read prompt.md: %v", err)
+			}
+			if string(data) != tc.task {
+				t.Fatalf("prompt.md = %q, want %q (never the previous generation's task)", data, tc.task)
+			}
+		})
 	}
 }
 
@@ -471,7 +491,7 @@ func TestReprovision_ExplicitMount_CheckoutByteIdenticalAndSiblingUntouched(t *t
 	}
 
 	// A real content change between provision and reprovision (R4): bump the
-	// harness-config image, as TestReprovision_HarnessConfigImageBumpReplacesFrozenImage
+	// harness-config image, as TestReprovision_HarnessConfigImageNotPersisted
 	// does, and delete home/agent-info.json so its re-appearance proves
 	// re-rendering rather than "it was already there from the initial
 	// provision".
@@ -492,10 +512,11 @@ func TestReprovision_ExplicitMount_CheckoutByteIdenticalAndSiblingUntouched(t *t
 	gitDirBefore := snapshotTree(t, filepath.Join(sharedCheckout, ".git"))
 
 	mgr := NewManager(&runtime.MockRuntime{})
-	if _, err := mgr.Reprovision(context.Background(), api.StartOptions{
+	reCfg, err := mgr.Reprovision(context.Background(), api.StartOptions{
 		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
 		Workspace: sharedCheckout, SharedWorkspace: true,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Reprovision: %v", err)
 	}
 	checkoutAfter := snapshotTree(t, sharedCheckout)
@@ -517,8 +538,13 @@ func TestReprovision_ExplicitMount_CheckoutByteIdenticalAndSiblingUntouched(t *t
 	if err := json.Unmarshal(cfgData, &cfg); err != nil {
 		t.Fatalf("failed to parse scion-agent.json: %v", err)
 	}
-	if cfg.Image != "test-image:v2" {
-		t.Fatalf("expected the bumped harness-config image to be re-rendered into scion-agent.json, got %q", cfg.Image)
+	// The bumped harness-config image is re-resolved (and reported), but,
+	// as an environment value, not persisted (ptone/scion#4561).
+	if reCfg == nil || reCfg.Image != "test-image:v2" {
+		t.Fatalf("expected Reprovision to report the bumped harness-config image, got %+v", reCfg)
+	}
+	if cfg.Image != "" {
+		t.Fatalf("scion-agent.json persisted image %q, want none", cfg.Image)
 	}
 	if _, err := os.Stat(agentInfoPath); err != nil {
 		t.Fatalf("expected agent-info.json (deleted before Reprovision) to be re-rendered: %v", err)
@@ -594,15 +620,18 @@ func TestReprovision_ExplicitMount_NoAgentDir_Refused(t *testing.T) {
 	agentName := "never-provisioned-agent"
 	workspace := t.TempDir()
 
-	agentDir := config.GetAgentDir(scionDir, agentName, true)
+	agentDir, err := config.AgentDirForProject(scionDir, agentName, true, reprovisionTestHubProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, statErr := os.Stat(agentDir); !os.IsNotExist(statErr) {
 		t.Fatalf("fixture check: agentDir must not exist yet: %v", statErr)
 	}
 
 	mgr := NewManager(&runtime.MockRuntime{})
-	_, err := mgr.Reprovision(context.Background(), api.StartOptions{
+	_, err = mgr.Reprovision(context.Background(), api.StartOptions{
 		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
-		Workspace: workspace, SharedWorkspace: true,
+		Workspace: workspace, SharedWorkspace: true, HubProjectID: reprovisionTestHubProjectID,
 	})
 	if err == nil {
 		t.Fatal("expected Reprovision to refuse an agent with no existing agent directory, got nil error")
@@ -624,7 +653,7 @@ func TestReprovision_ExplicitMount_MissingWorkspacePath_Refused(t *testing.T) {
 	agentName := "missing-ws-agent"
 	validWorkspace := t.TempDir()
 
-	ctx := api.ContextWithSharedWorkspace(context.Background())
+	ctx := api.ContextWithHubProjectID(api.ContextWithSharedWorkspace(context.Background()), reprovisionTestHubProjectID)
 	if _, _, _, err := ProvisionAgent(ctx, agentName, "default", "", "", scionDir, "", "created", "", validWorkspace); err != nil {
 		t.Fatalf("initial ProvisionAgent: %v", err)
 	}
@@ -633,7 +662,7 @@ func TestReprovision_ExplicitMount_MissingWorkspacePath_Refused(t *testing.T) {
 	mgr := NewManager(&runtime.MockRuntime{})
 	_, err := mgr.Reprovision(context.Background(), api.StartOptions{
 		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
-		Workspace: missingWorkspace, SharedWorkspace: true,
+		Workspace: missingWorkspace, SharedWorkspace: true, HubProjectID: reprovisionTestHubProjectID,
 	})
 	if err == nil {
 		t.Fatal("expected Reprovision to refuse a missing explicit workspace path, got nil error")
@@ -656,7 +685,7 @@ func TestReprovision_ExplicitMount_RelativeWorkspaceEscapesRoot_Refused(t *testi
 	agentName := "escape-ws-agent"
 	validWorkspace := t.TempDir()
 
-	ctx := api.ContextWithSharedWorkspace(context.Background())
+	ctx := api.ContextWithHubProjectID(api.ContextWithSharedWorkspace(context.Background()), reprovisionTestHubProjectID)
 	if _, _, _, err := ProvisionAgent(ctx, agentName, "default", "", "", scionDir, "", "created", "", validWorkspace); err != nil {
 		t.Fatalf("initial ProvisionAgent: %v", err)
 	}
@@ -664,7 +693,7 @@ func TestReprovision_ExplicitMount_RelativeWorkspaceEscapesRoot_Refused(t *testi
 	mgr := NewManager(&runtime.MockRuntime{})
 	_, err := mgr.Reprovision(context.Background(), api.StartOptions{
 		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
-		Workspace: "../../etc", SharedWorkspace: true,
+		Workspace: "../../etc", SharedWorkspace: true, HubProjectID: reprovisionTestHubProjectID,
 	})
 	if err == nil {
 		t.Fatal("expected Reprovision to refuse a relative workspace escaping the project root, got nil error")
@@ -685,7 +714,7 @@ func TestReprovision_ExplicitMount_RelativeWorkspaceResolvesToFile_Refused(t *te
 	agentName := "relative-file-ws-agent"
 	validWorkspace := t.TempDir()
 
-	ctx := api.ContextWithSharedWorkspace(context.Background())
+	ctx := api.ContextWithHubProjectID(api.ContextWithSharedWorkspace(context.Background()), reprovisionTestHubProjectID)
 	if _, _, _, err := ProvisionAgent(ctx, agentName, "default", "", "", scionDir, "", "created", "", validWorkspace); err != nil {
 		t.Fatalf("initial ProvisionAgent: %v", err)
 	}
@@ -700,7 +729,7 @@ func TestReprovision_ExplicitMount_RelativeWorkspaceResolvesToFile_Refused(t *te
 	mgr := NewManager(&runtime.MockRuntime{})
 	_, err := mgr.Reprovision(context.Background(), api.StartOptions{
 		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
-		Workspace: "not-a-dir.txt", SharedWorkspace: true,
+		Workspace: "not-a-dir.txt", SharedWorkspace: true, HubProjectID: reprovisionTestHubProjectID,
 	})
 	if err == nil {
 		t.Fatal("expected Reprovision to refuse a relative workspace that resolves to a regular file, got nil error")
@@ -722,7 +751,7 @@ func TestReprovision_ExplicitMount_AbsoluteWorkspaceIsFile_Refused(t *testing.T)
 	agentName := "absolute-file-ws-agent"
 	validWorkspace := t.TempDir()
 
-	ctx := api.ContextWithSharedWorkspace(context.Background())
+	ctx := api.ContextWithHubProjectID(api.ContextWithSharedWorkspace(context.Background()), reprovisionTestHubProjectID)
 	if _, _, _, err := ProvisionAgent(ctx, agentName, "default", "", "", scionDir, "", "created", "", validWorkspace); err != nil {
 		t.Fatalf("initial ProvisionAgent: %v", err)
 	}
@@ -735,7 +764,7 @@ func TestReprovision_ExplicitMount_AbsoluteWorkspaceIsFile_Refused(t *testing.T)
 	mgr := NewManager(&runtime.MockRuntime{})
 	_, err := mgr.Reprovision(context.Background(), api.StartOptions{
 		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
-		Workspace: notADir, SharedWorkspace: true,
+		Workspace: notADir, SharedWorkspace: true, HubProjectID: reprovisionTestHubProjectID,
 	})
 	if err == nil {
 		t.Fatal("expected Reprovision to refuse an absolute workspace that is a regular file, got nil error")
@@ -768,7 +797,7 @@ func TestReprovision_ExplicitMount_RelativeWorkspace_SettingsLoadError_Refused(t
 	agentName := "settings-load-error-agent"
 	validWorkspace := t.TempDir()
 
-	ctx := api.ContextWithSharedWorkspace(context.Background())
+	ctx := api.ContextWithHubProjectID(api.ContextWithSharedWorkspace(context.Background()), reprovisionTestHubProjectID)
 	if _, _, _, err := ProvisionAgent(ctx, agentName, "default", "", "", scionDir, "", "created", "", validWorkspace); err != nil {
 		t.Fatalf("initial ProvisionAgent: %v", err)
 	}
@@ -784,7 +813,7 @@ func TestReprovision_ExplicitMount_RelativeWorkspace_SettingsLoadError_Refused(t
 	mgr := NewManager(&runtime.MockRuntime{})
 	_, err := mgr.Reprovision(context.Background(), api.StartOptions{
 		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
-		Workspace: "relative-subdir", SharedWorkspace: true,
+		Workspace: "relative-subdir", SharedWorkspace: true, HubProjectID: reprovisionTestHubProjectID,
 	})
 	if err == nil {
 		t.Fatal("expected Reprovision to fail when project settings cannot be loaded, got nil error")
@@ -814,6 +843,101 @@ func TestReprovision_NeitherGitCloneNorWorkspace_Refused(t *testing.T) {
 	}
 	if !errors.Is(err, ErrReprovisionRefused) {
 		t.Fatalf("expected ErrReprovisionRefused, got %v", err)
+	}
+}
+
+// reprovisionTestHubProjectID is the hub project ID the shared-workspace
+// explicit-mount fixtures provision and reprovision with, so their agent dir
+// resolves to the broker-side root as on a broker.
+const reprovisionTestHubProjectID = "33333333-4444-5555-6666-777777777777"
+
+// Reprovision resolves the agent dir exactly as ProvisionAgent does: with a
+// hub project ID and no project-id marker, a shared-workspace agent
+// provisioned under the hub-ID root is found there and re-rendered.
+func TestReprovision_ExplicitMount_HubProjectIDWithoutMarker(t *testing.T) {
+	scionDir, _ := reprovisionSetup(t)
+	if _, err := config.ReadProjectID(scionDir); err == nil {
+		t.Fatal("fixture: expected no project-id marker")
+	}
+	agentName := "hub-id-agent"
+	workspace := t.TempDir()
+	ctx := api.ContextWithHubProjectID(api.ContextWithSharedWorkspace(context.Background()), reprovisionTestHubProjectID)
+	if _, _, _, err := ProvisionAgent(ctx, agentName, "default", "", "", scionDir, "", "created", "", workspace); err != nil {
+		t.Fatalf("initial ProvisionAgent: %v", err)
+	}
+	agentDir, err := config.AgentDirForProject(scionDir, agentName, true, reprovisionTestHubProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "scion-agent.json")); err != nil {
+		t.Fatalf("fixture: agent should be provisioned under the hub-ID root: %v", err)
+	}
+	mgr := NewManager(&runtime.MockRuntime{})
+	if _, err := mgr.Reprovision(context.Background(), api.StartOptions{
+		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
+		Workspace: workspace, SharedWorkspace: true, HubProjectID: reprovisionTestHubProjectID,
+	}); err != nil {
+		t.Fatalf("Reprovision: %v", err)
+	}
+	// Agent state (scion-agent.json) stays under the hub-ID root; the agent
+	// home's own location is resolved separately (config.GetAgentHomePath).
+	inProject := config.GetAgentDir(scionDir, agentName, false)
+	entries, _ := os.ReadDir(inProject)
+	for _, e := range entries {
+		if e.Name() != "home" {
+			t.Errorf("Reprovision wrote agent state into the in-project agent dir: %s", filepath.Join(inProject, e.Name()))
+		}
+	}
+
+}
+
+// With a hub project ID, Reprovision checks the hub-ID agent dir: an agent
+// whose only directory is the in-project one is refused, and nothing is
+// created under the hub-ID root.
+func TestReprovision_ExplicitMount_HubProjectIDRequiresHubRootDir(t *testing.T) {
+	scionDir, _ := reprovisionSetup(t)
+	agentName := "in-project-only"
+	workspace := t.TempDir()
+	// Provisioned locally (no hub project ID, no marker): in-project.
+	if _, _, _, err := ProvisionAgent(api.ContextWithSharedWorkspace(context.Background()), agentName, "default", "", "", scionDir, "", "created", "", workspace); err != nil {
+		t.Fatalf("initial ProvisionAgent: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(config.GetAgentDir(scionDir, agentName, false), "scion-agent.json")); err != nil {
+		t.Fatalf("fixture: expected the agent in-project: %v", err)
+	}
+	hubDir, err := config.AgentDirForProject(scionDir, agentName, true, reprovisionTestHubProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewManager(&runtime.MockRuntime{}).Reprovision(context.Background(), api.StartOptions{
+		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
+		Workspace: workspace, SharedWorkspace: true, HubProjectID: reprovisionTestHubProjectID,
+	})
+	if !errors.Is(err, ErrReprovisionRefused) {
+		t.Fatalf("expected ErrReprovisionRefused, got %v", err)
+	}
+	if _, statErr := os.Stat(hubDir); !os.IsNotExist(statErr) {
+		t.Errorf("Reprovision created the hub-ID agent dir (stat err=%v)", statErr)
+	}
+}
+
+// In broker mode a shared-workspace agent with neither a hub project ID nor
+// a project-id marker has no determinable broker-side agent dir: Reprovision
+// refuses up front (ErrReprovisionRefused wrapping
+// config.ErrAgentStateDirUnavailable) instead of using the in-project dir.
+func TestReprovision_ExplicitMount_StrictWithoutRootRefused(t *testing.T) {
+	scionDir, _ := reprovisionSetup(t)
+	agentName := "no-root"
+	workspace := t.TempDir()
+	if _, _, _, err := ProvisionAgent(api.ContextWithSharedWorkspace(context.Background()), agentName, "default", "", "", scionDir, "", "created", "", workspace); err != nil {
+		t.Fatalf("initial ProvisionAgent: %v", err)
+	}
+	_, err := NewManager(&runtime.MockRuntime{}).Reprovision(context.Background(), api.StartOptions{
+		Name: agentName, Template: "default", ProjectPath: scionDir, BrokerMode: true,
+		Workspace: workspace, SharedWorkspace: true,
+	})
+	if !errors.Is(err, ErrReprovisionRefused) || !errors.Is(err, config.ErrAgentStateDirUnavailable) {
+		t.Fatalf("expected ErrReprovisionRefused wrapping ErrAgentStateDirUnavailable, got %v", err)
 	}
 }
 

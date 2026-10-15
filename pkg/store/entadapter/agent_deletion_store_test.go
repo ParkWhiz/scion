@@ -356,7 +356,7 @@ func TestAgentStore_MarkAgentContainerMissing_DeletionGuard(t *testing.T) {
 		t.Run(label+" is left alone", func(t *testing.T) {
 			a := create("dd-" + label)
 			seedDeletion(t, s, a.ID, st, time.Now().Add(tc.leaseIn), "")
-			got, err := s.MarkAgentContainerMissing(ctx, a.ID, "broker-1", cutoff, "gone")
+			got, err := s.MarkAgentContainerMissing(ctx, a.ID, "broker-1", cutoff, "", "gone")
 			require.NoError(t, err)
 			assert.Nil(t, got, "0 rows affected")
 			stored, err := s.GetAgent(ctx, a.ID)
@@ -368,7 +368,7 @@ func TestAgentStore_MarkAgentContainerMissing_DeletionGuard(t *testing.T) {
 	t.Run("failed still applies", func(t *testing.T) {
 		a := create("dd-failed")
 		seedDeletion(t, s, a.ID, store.DeletionStateFailed, time.Now().Add(-time.Minute), store.DeletionCodeRuntimeError)
-		got, err := s.MarkAgentContainerMissing(ctx, a.ID, "broker-1", cutoff, "gone")
+		got, err := s.MarkAgentContainerMissing(ctx, a.ID, "broker-1", cutoff, "", "gone")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, "error", got.Phase)
@@ -423,6 +423,57 @@ func TestAgentStore_UpdateAgentStatus_DeletionGuard(t *testing.T) {
 		got, err := s.GetAgent(ctx, a.ID)
 		require.NoError(t, err)
 		assert.Equal(t, "error", got.Phase)
+	})
+
+	// A finalizing row whose lease expired reads as failed for a status
+	// report, but holds the row against a start (DeletionHoldsRow): a
+	// start's own write (StartWrite) keeps the delete's phase, while a
+	// report still applies.
+	t.Run("lease-expired finalizing row", func(t *testing.T) {
+		start := store.AgentStatusUpdate{Phase: "running", ClearExit: true, ClearTerminalRemnants: true, StartWrite: true}
+		for _, tc := range []struct {
+			name  string
+			upd   store.AgentStatusUpdate
+			phase string
+		}{
+			{"start-held", start, "stopped"},
+			{"report-applies", report, "error"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				a := makeAgent(projectID, "c-fin-"+tc.name)
+				a.Phase = "stopped"
+				require.NoError(t, s.CreateAgent(ctx, a))
+				seedDeletion(t, s, a.ID, store.DeletionStateFinalizing, time.Now().Add(-time.Minute), "")
+				require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, tc.upd))
+				got, err := s.GetAgent(ctx, a.ID)
+				require.NoError(t, err)
+				assert.Equal(t, tc.phase, got.Phase)
+			})
+		}
+	})
+
+	// A deleting row whose lease expired does not hold the row
+	// (DeletionHoldsRow), so a start's own write applies. This separates
+	// the start-block rule from "a start is held by any in-progress delete".
+	t.Run("start write on a lease-expired deleting row applies", func(t *testing.T) {
+		a := makeAgent(projectID, "c-start-del-expired")
+		a.Phase = "stopped"
+		require.NoError(t, s.CreateAgent(ctx, a))
+		seedDeletion(t, s, a.ID, store.DeletionStateDeleting, time.Now().Add(-time.Minute), "")
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{Phase: "running", ClearExit: true, ClearTerminalRemnants: true, StartWrite: true}))
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "running", got.Phase)
+	})
+
+	t.Run("start write on a live row applies", func(t *testing.T) {
+		a := makeAgent(projectID, "c-start-live")
+		a.Phase = "stopped"
+		require.NoError(t, s.CreateAgent(ctx, a))
+		require.NoError(t, s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{Phase: "running", StartWrite: true}))
+		got, err := s.GetAgent(ctx, a.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "running", got.Phase)
 	})
 }
 

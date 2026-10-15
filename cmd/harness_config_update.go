@@ -63,14 +63,10 @@ func runHarnessConfigUpdate(cmd *cobra.Command, args []string) error {
 		gp = projectDir
 	}
 
-	hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
+	hubCtx, err := requireHub(gp)
 	if err != nil {
 		return err
 	}
-	if hubCtx == nil {
-		return fmt.Errorf("hub is not available, the update command requires a hub connection")
-	}
-
 	PrintUsingHub(hubCtx.Endpoint)
 
 	ctx, cancel := context.WithTimeout(cmd.Context(), 120*time.Second)
@@ -91,9 +87,6 @@ func updateSingleHarnessConfig(ctx context.Context, hubCtx *HubContext, name, ur
 	})
 	if err != nil {
 		return fmt.Errorf("failed to search Hub: %w", err)
-	}
-	if resp == nil {
-		return fmt.Errorf("harness-config %q not found on Hub", name)
 	}
 
 	var match *hubclient.HarnessConfig
@@ -123,9 +116,6 @@ func updateSingleHarnessConfig(ctx context.Context, hubCtx *HubContext, name, ur
 	if err != nil {
 		return fmt.Errorf("reimport failed: %w", err)
 	}
-	if result == nil {
-		return fmt.Errorf("reimport returned no result for %q", name)
-	}
 
 	if isJSONOutput() {
 		return outputJSON(ActionResult{
@@ -150,9 +140,6 @@ func updateAllHarnessConfigs(ctx context.Context, hubCtx *HubContext) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to list harness-configs: %w", err)
-	}
-	if resp == nil {
-		return fmt.Errorf("no harness-configs found")
 	}
 
 	var updated, skipped, failed int

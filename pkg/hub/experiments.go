@@ -56,17 +56,7 @@ func (s *Server) experimentEnabled(name string) bool {
 // snapshot and resolve every name from it, so a concurrent refresh cannot
 // produce a mixed answer (ptone/scion#2217).
 func (s *Server) experimentEnabledIn(snap ExperimentsSnapshot, name string) bool {
-	exp, ok := s.experimentRegistry().Lookup(name)
-	if !ok {
-		return false // unknown or retired → off, never panic
-	}
-	if snap.Malformed && exp.HasLayer(experiments.LayerServer) {
-		return false // fail closed for server behaviour
-	}
-	if v, set := snap.Overrides[name]; set {
-		return v
-	}
-	return exp.Default
+	return s.experimentRegistry().Resolve(name, snap.Overrides, snap.Malformed)
 }
 
 // resolvedExperiments returns the effective value of every registered
@@ -103,12 +93,15 @@ func (s *Server) requireExperiment(name string, next http.HandlerFunc) http.Hand
 }
 
 // dispatchExperimentNames are the server-layer experiments whose state the
-// hub sends to brokers with each agent dispatch, because they change what
-// the broker does.
-var dispatchExperimentNames = []string{experiments.K8sNFSHome}
+// hub sends with each agent dispatch, because they change what the broker
+// does. hub.conduit is added separately (see dispatchExperiments).
+var dispatchExperimentNames = []string{experiments.K8sNFSHome, experiments.AgentPlugins}
 
 // dispatchExperiments returns the dispatch experiments that are enabled
-// now, resolved from one snapshot, or nil when none is.
+// now, resolved from one snapshot, or nil when none is. hub.conduit is a
+// derived entry: it is included only while this node serves conduit (the
+// experiment is on in the same snapshot and the relay is running), so an
+// agent dials conduit only where a relay can admit it.
 func (s *Server) dispatchExperiments() []string {
 	snap := s.experimentsSnapshot()
 	var out []string
@@ -116,6 +109,9 @@ func (s *Server) dispatchExperiments() []string {
 		if s.experimentEnabledIn(snap, name) {
 			out = append(out, name)
 		}
+	}
+	if s.conduitServingIn(snap) {
+		out = append(out, conduitExperiment)
 	}
 	return out
 }

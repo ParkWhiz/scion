@@ -24,9 +24,8 @@ import (
 // the web autocomplete inserts, e.g. "John Smith" -> "john-smith"), their
 // email, or the email's local part, case-insensitively.
 //
-// It is a pure function. The human mention notification path
-// (fireHumanMentionNotifications) mirrors these rules in its own copy; the
-// two should be unified later.
+// It is a pure function. Human mention resolution (mentionedHumanIDs)
+// mirrors these rules in its own copy; the two should be unified later.
 func mentionMatchesMember(name string, m chatMemberEntry) bool {
 	n := strings.ToLower(name)
 	if m.DisplayName != "" {
@@ -58,7 +57,9 @@ func mentionMatchesMember(name string, m chatMemberEntry) bool {
 //     ID, any other sender kind), or to a message that cannot be found;
 //   - it @mentions a project member other than the sender;
 //   - a lookup it needs fails.
-func (s *Server) threadMessageUnaddressed(ctx context.Context, projectID string, mentionNames []string, replyToID, senderUserID string) bool {
+//
+// members supplies the project's human members; see projectMembersOnce.
+func (s *Server) threadMessageUnaddressed(ctx context.Context, members func() ([]chatMemberEntry, error), mentionNames []string, replyToID, senderUserID string) bool {
 	if replyToID != "" {
 		refMsgs, err := s.store.GetMessagesByIDs(ctx, []string{replyToID})
 		if err != nil {
@@ -73,18 +74,18 @@ func (s *Server) threadMessageUnaddressed(ctx context.Context, projectID string,
 	if len(mentionNames) == 0 {
 		return true
 	}
-	mentioned, err := s.mentionsProjectHuman(ctx, projectID, mentionNames, senderUserID)
+	mentioned, err := mentionsProjectHuman(members, mentionNames, senderUserID)
 	return err == nil && !mentioned
 }
 
 // mentionsProjectHuman reports whether a message is addressed to at least
 // one mentioned project member other than its sender. A store error is
 // returned rather than read as "no member mentioned".
-func (s *Server) mentionsProjectHuman(ctx context.Context, projectID string, mentionNames []string, senderUserID string) (bool, error) {
-	if projectID == "" || len(mentionNames) == 0 {
+func mentionsProjectHuman(memberSource func() ([]chatMemberEntry, error), mentionNames []string, senderUserID string) (bool, error) {
+	if len(mentionNames) == 0 {
 		return false, nil
 	}
-	members, err := s.projectHumanMembersStrict(ctx, projectID)
+	members, err := memberSource()
 	if err != nil {
 		return false, err
 	}
@@ -100,6 +101,27 @@ func (s *Server) mentionsProjectHuman(ctx context.Context, projectID string, men
 		}
 	}
 	return false, nil
+}
+
+// projectMembersOnce returns a function that fetches projectID's human
+// members with projectHumanMembersStrict on first use and returns the same
+// result afterwards, so one send reads the member list at most once. An
+// empty projectID yields no members.
+func (s *Server) projectMembersOnce(ctx context.Context, projectID string) func() ([]chatMemberEntry, error) {
+	var (
+		done    bool
+		members []chatMemberEntry
+		err     error
+	)
+	return func() ([]chatMemberEntry, error) {
+		if !done {
+			done = true
+			if projectID != "" {
+				members, err = s.projectHumanMembersStrict(ctx, projectID)
+			}
+		}
+		return members, err
+	}
 }
 
 // projectHumanMembersStrict is resolveProjectHumanMembers without its

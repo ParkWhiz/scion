@@ -102,7 +102,7 @@ for tool in gcloud git openssl; do
         case "$tool" in
             gcloud)  check_fail "$tool not found" "Install Google Cloud SDK: https://cloud.google.com/sdk/docs/install" ;;
             git)     check_fail "$tool not found" "Install git: https://git-scm.com/downloads" ;;
-            openssl) check_fail "$tool not found" "Install openssl (needed to generate SESSION_SECRET)" ;;
+            openssl) check_fail "$tool not found" "Install openssl (needed to generate SCION_SERVER_SESSION_SECRET)" ;;
         esac
     fi
 done
@@ -151,7 +151,7 @@ else
 
     REQUIRED_VARS=(
         SCION_HUB_STORAGE_BUCKET
-        SESSION_SECRET
+        SCION_SERVER_SESSION_SECRET
         SCION_SERVER_BASE_URL
         SCION_IMAGE_REGISTRY
     )
@@ -176,7 +176,7 @@ else
         val=$(get_env_value "$var" "${HUB_ENV_FILE}")
         if is_placeholder "$val"; then
             hint="Set ${var} in ${HUB_ENV_FILE}"
-            if [[ "$var" == "SESSION_SECRET" ]]; then
+            if [[ "$var" == "SCION_SERVER_SESSION_SECRET" ]]; then
                 hint="Generate with: openssl rand -base64 32"
             fi
             check_fail "${var} is missing or still a placeholder" "$hint"
@@ -204,12 +204,28 @@ else
     done
 
     # Optional vars — warn if missing
-    for var in SCION_SERVER_HUB_ENDPOINT SCION_SERVER_AUTH_AUTHORIZEDDOMAINS SCION_SERVER_HUB_ADMINEMAILS; do
-        val=$(get_env_value "$var" "${HUB_ENV_FILE}")
-        if [[ -z "$val" ]]; then
-            check_warn "${var} is not set (optional — see hub.env.sample)"
+    val=$(get_env_value SCION_SERVER_HUB_ENDPOINT "${HUB_ENV_FILE}")
+    if [[ -z "$val" ]]; then
+        check_warn "SCION_SERVER_HUB_ENDPOINT is not set (optional — see hub.env.sample)"
+    else
+        check_pass "SCION_SERVER_HUB_ENDPOINT"
+    fi
+
+    # Seed vars — accept the SCION_SEED_SERVER_ name or the older
+    # SCION_SERVER_ name; the warning reports the SEED name.
+    for suffix in AUTH_AUTHORIZEDDOMAINS HUB_ADMINEMAILS; do
+        seed_var="SCION_SEED_SERVER_${suffix}"
+        old_var="SCION_SERVER_${suffix}"
+        val=$(get_env_value "$seed_var" "${HUB_ENV_FILE}")
+        if [[ -n "$val" ]]; then
+            check_pass "${seed_var}"
+            continue
+        fi
+        val=$(get_env_value "$old_var" "${HUB_ENV_FILE}")
+        if [[ -n "$val" ]]; then
+            check_pass "${old_var} (older name; ${seed_var} is preferred)"
         else
-            check_pass "${var}"
+            check_warn "${seed_var} is not set (optional — see hub.env.sample)"
         fi
     done
 fi

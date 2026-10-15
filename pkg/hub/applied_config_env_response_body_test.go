@@ -25,44 +25,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// rawAppliedConfigView decodes just enough of an agent response body to
-// check whether AppliedConfig.Env and AppliedConfig.InlineConfig.Env are
-// present on the wire, without depending on the full response DTO shape.
-type rawAppliedConfigView struct {
-	AppliedConfig *struct {
-		Env          map[string]string `json:"env"`
-		InlineConfig *struct {
-			Env map[string]string `json:"env"`
-		} `json:"inlineConfig"`
-	} `json:"appliedConfig"`
-}
-
-func assertEnvHidden(t *testing.T, view rawAppliedConfigView, context string) {
-	t.Helper()
-	if view.AppliedConfig == nil {
-		return // appliedConfig itself absent is the strongest form of hidden
-	}
-	assert.Nil(t, view.AppliedConfig.Env, "%s: appliedConfig.env must be absent", context)
-	if view.AppliedConfig.InlineConfig != nil {
-		assert.Nil(t, view.AppliedConfig.InlineConfig.Env, "%s: appliedConfig.inlineConfig.env must be absent", context)
-	}
-}
-
-func assertEnvVisibleMinusGitHubToken(t *testing.T, view rawAppliedConfigView, context string) {
-	t.Helper()
-	require.NotNil(t, view.AppliedConfig, "%s: appliedConfig must be present", context)
-	require.NotNil(t, view.AppliedConfig.Env, "%s: appliedConfig.env must be present", context)
-	assert.Equal(t, "plain-value", view.AppliedConfig.Env["PLAIN_VAR"], "%s: appliedConfig.env.PLAIN_VAR", context)
-	_, hasToken := view.AppliedConfig.Env["GITHUB_TOKEN"]
-	assert.False(t, hasToken, "%s: appliedConfig.env.GITHUB_TOKEN must never be present", context)
-
-	require.NotNil(t, view.AppliedConfig.InlineConfig, "%s: appliedConfig.inlineConfig must be present", context)
-	require.NotNil(t, view.AppliedConfig.InlineConfig.Env, "%s: appliedConfig.inlineConfig.env must be present", context)
-	assert.Equal(t, "inline-plain-value", view.AppliedConfig.InlineConfig.Env["INLINE_PLAIN_VAR"], "%s: appliedConfig.inlineConfig.env.INLINE_PLAIN_VAR", context)
-	_, hasInlineToken := view.AppliedConfig.InlineConfig.Env["GITHUB_TOKEN"]
-	assert.False(t, hasInlineToken, "%s: appliedConfig.inlineConfig.env.GITHUB_TOKEN must never be present", context)
-}
-
 // TestListProjectAgentsResponseBody_EnvHiding pins env visibility for both
 // AppliedConfig.Env and AppliedConfig.InlineConfig.Env in the
 // listProjectAgents response body: hidden for a project member with no
@@ -136,11 +98,12 @@ func TestGetProjectAgentSelfRead_EnvHiding(t *testing.T) {
 	t.Run("a peer agent in the same project cannot read it at all", func(t *testing.T) {
 		// getProjectAgent only exempts an agent reading its *own* record
 		// (isSelf) from the ActionRead check; a peer agent goes through the
-		// same authorize() call a user would and is denied outright here --
-		// a stronger guarantee than "can read but env is hidden."
+		// same agent.read check a user would and is denied outright here --
+		// a stronger guarantee than "can read but env is hidden." An agent
+		// caller's denial is answered as a missing agent (ptone/scion#3409).
 		f := projectAgentAuthzSetup(t)
 		rec := doRequestWithAgentToken(t, f.srv, http.MethodGet, getPath(f), nil, f.callerToken(t))
-		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
 	})
 
 	t.Run("a non-attach project member does not see it either", func(t *testing.T) {

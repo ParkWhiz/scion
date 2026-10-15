@@ -69,12 +69,14 @@ type CascadeResult struct {
 // are denied:
 //   - Agents without project:agent:set_message_mode scope (requires full role)
 //   - Agents targeting agents in a different project
-//   - UATs / scoped tokens (no UAT scope exists)
 //   - Project admins who are not also project owners or lineage owners
 //   - Federated agents
 //
 // Allowed callers: super-admin, project owner, lineage owner (user in the
-// agent's ancestry chain), full-role agent (same project).
+// agent's ancestry chain), full-role agent (same project). A user access
+// token of an allowed user needs the agent:set_message_mode selector and a
+// boundary that contains the agent's project; the project-admin denial and
+// the lineage-owner rule apply to it as to the user's session.
 //
 // Mode changes are live (D10): the new mode takes effect on the next message
 // delivery. Every change emits an audit record. All transitions are legal
@@ -155,14 +157,9 @@ func (s *Server) handleSetMessageMode(w http.ResponseWriter, r *http.Request, id
 	}
 
 	if !agentCallerAuthorized {
-		// 5. D7: DENY UATs — no scope exists for set_message_mode.
-		if _, ok := identity.(*ScopedUserIdentity); ok {
-			writeError(w, http.StatusForbidden, ErrCodeForbidden,
-				"Scoped tokens cannot change message mode", nil)
-			return
-		}
-
-		// 5.5. D7: DENY project admins (non-owners).
+		// 5. D7: DENY project admins (non-owners). A user access token is
+		// checked against its holder's membership here, and against its
+		// selector and boundary by the authorization in step 6.
 		// The generic authz bypass grants project admins full access, but D7
 		// restricts set_message_mode to project owners, lineage owners, and
 		// super-admins. Project admins who are NOT super-admins must be denied.
@@ -197,7 +194,9 @@ func (s *Server) handleSetMessageMode(w http.ResponseWriter, r *http.Request, id
 		}
 
 		// 6. Authorize: agent.set_message_mode permission (CapabilityResource).
-		// This checks: lineage owner (ancestry), project owner, super-admin.
+		// This checks: lineage owner (ancestry), project owner, super-admin,
+		// and for a user access token the agent:set_message_mode selector
+		// and the token boundary.
 		if !s.authorize(w, r, agentResource(agent), ActionSetMessageMode) {
 			return // authorize writes 403
 		}

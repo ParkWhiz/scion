@@ -17,21 +17,15 @@
 package hub
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -53,134 +47,6 @@ import (
 //   4. Non-user, non-broker identity (agent) → 403 (unchanged; this gate
 //      runs before the broker is even fetched, so it can't leak existence)
 // ============================================================================
-
-// brokerAuthFixture holds the test world for broker auth gate tests.
-type brokerAuthFixture struct {
-	srv          *Server
-	store        store.Store
-	broker       *store.RuntimeBroker
-	brokerSecret []byte
-	deniedUser   *store.User
-}
-
-// brokerAuthSetup creates a server with broker auth enabled, a runtime broker,
-// and a non-admin user who has no access policies for the broker.
-func brokerAuthSetup(t *testing.T) *brokerAuthFixture {
-	t.Helper()
-
-	// Use bypassAgentsServer which configures broker auth (HMAC).
-	srv, s := bypassAgentsServer(t)
-	ctx := context.Background()
-	f := &brokerAuthFixture{srv: srv, store: s}
-
-	// Create a runtime broker with HMAC secret.
-	f.brokerSecret = []byte("broker-auth-test-secret-32bytes!")
-	f.broker = &store.RuntimeBroker{
-		ID:      uuid.New().String(),
-		Name:    "auth-test-broker",
-		Slug:    "auth-test-broker",
-		Status:  store.BrokerStatusOnline,
-		Created: time.Now(),
-		Updated: time.Now(),
-	}
-	require.NoError(t, s.CreateRuntimeBroker(ctx, f.broker))
-	require.NoError(t, s.CreateBrokerSecret(ctx, &store.BrokerSecret{
-		BrokerID:  f.broker.ID,
-		SecretKey: f.brokerSecret,
-		Algorithm: store.BrokerSecretAlgorithmHMACSHA256,
-		Status:    store.BrokerSecretStatusActive,
-	}))
-
-	// Create a regular member user with no policies granting broker access.
-	f.deniedUser = &store.User{
-		ID:          tid("broker-auth-denied-user"),
-		Email:       "denied@example.com",
-		DisplayName: "Denied User",
-		Role:        store.UserRoleMember,
-		Status:      "active",
-		Created:     time.Now(),
-	}
-	require.NoError(t, s.CreateUser(ctx, f.deniedUser))
-
-	return f
-}
-
-// asBrokerSelf sends an HMAC-signed request as the test broker.
-func (f *brokerAuthFixture) asBrokerSelf(t *testing.T, method, path string, body interface{}) *httptest.ResponseRecorder {
-	t.Helper()
-	var raw []byte
-	if body != nil {
-		var err error
-		raw, err = json.Marshal(body)
-		require.NoError(t, err)
-	}
-	req := httptest.NewRequest(method, path, bytes.NewReader(raw))
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	nonce := "broker-auth-nonce-" + uuid.New().String()
-	req.Header.Set(HeaderBrokerID, f.broker.ID)
-	req.Header.Set(HeaderTimestamp, timestamp)
-	req.Header.Set(HeaderNonce, nonce)
-
-	svc := f.srv.brokerAuthService
-	require.NotNil(t, svc, "broker auth service must be configured")
-	mac := hmac.New(sha256.New, f.brokerSecret)
-	mac.Write(svc.buildCanonicalString(req, timestamp, nonce))
-	req.Header.Set(HeaderSignature, base64.StdEncoding.EncodeToString(mac.Sum(nil)))
-
-	rec := httptest.NewRecorder()
-	f.srv.Handler().ServeHTTP(rec, req)
-	return rec
-}
-
-// asAgent sends a request carrying an agent JWT (non-user, non-broker identity).
-func (f *brokerAuthFixture) asAgent(t *testing.T, method, path string, body interface{}) *httptest.ResponseRecorder {
-	t.Helper()
-
-	// Create a project and agent so we can mint a valid agent token.
-	ctx := context.Background()
-
-	owner := &store.User{
-		ID:          tid("broker-auth-agent-owner"),
-		Email:       "agent-owner@example.com",
-		DisplayName: "Agent Owner",
-		Role:        store.UserRoleMember,
-		Status:      "active",
-		Created:     time.Now(),
-	}
-	// Ignore error if already exists from a previous subtest.
-	_ = f.store.CreateUser(ctx, owner)
-
-	proj := &store.Project{
-		ID:      tid("broker-auth-agent-proj"),
-		Name:    "Agent Project",
-		Slug:    "broker-auth-agent-proj",
-		OwnerID: owner.ID,
-	}
-	_ = f.store.CreateProject(ctx, proj)
-
-	agent := &store.Agent{
-		ID:        tid("broker-auth-agent"),
-		Slug:      "broker-auth-agent",
-		Name:      "broker-auth-agent",
-		ProjectID: proj.ID,
-		Phase:     "running",
-		CreatedBy: owner.ID,
-		OwnerID:   owner.ID,
-	}
-	_ = f.store.CreateAgent(ctx, agent)
-
-	// Mint an agent token.
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
-	tok, err := svc.GenerateAgentToken(agent.ID, agent.ProjectID,
-		[]AgentTokenScope{ScopeProjectRead}, nil)
-	require.NoError(t, err)
-
-	return doRequestWithAgentToken(t, f.srv, method, path, body, tok)
-}
 
 // TestBrokerAuthGates is the regression suite for the authorization gates on
 // the three runtime broker handlers. Each handler is tested with 4 scenarios:
@@ -474,9 +340,12 @@ func TestBrokerHeartbeat_ProjectEntryGroveIdFieldIgnored(t *testing.T) {
 }
 
 // ============================================================================
-// A plain hub member who registers and auto-provides a broker must be able
-// to read the broker record and its provider list back immediately, through
-// the same user-authenticated path `scion runtime-broker status` uses.
+// A plain hub member who registers a broker that has auto-provide turned on
+// must be able to read the broker record and its provider list back
+// immediately, through the same user-authenticated path `scion
+// runtime-broker status` uses. Turning auto-provide on needs
+// broker.auto_provide, which a hub member does not hold, so the setting is
+// written to the store directly after registration.
 // ============================================================================
 func TestBrokerAuthz_AutoProvideRegistration_StatusSeesProviderImmediately(t *testing.T) {
 	srv, s := testServer(t)
@@ -496,19 +365,18 @@ func TestBrokerAuthz_AutoProvideRegistration_StatusSeesProviderImmediately(t *te
 	require.NoError(t, s.CreateUser(ctx, operator))
 	ensureHubMembership(ctx, s, operator.ID)
 
-	// Phase 1: POST /api/v1/brokers — create the broker registration with
-	// auto-provide enabled, exactly as `scion runtime-broker register
-	// --auto-provide` does.
+	// Phase 1: POST /api/v1/brokers — create the broker registration, then
+	// turn auto-provide on in the store.
 	createRec := doRequestAsUser(t, srv, operator, http.MethodPost, "/api/v1/brokers",
 		CreateBrokerRegistrationRequest{
-			Name:        "status-broker",
-			AutoProvide: true,
+			Name: "status-broker",
 		})
 	require.Equal(t, http.StatusCreated, createRec.Code, createRec.Body.String())
 	var createResp CreateBrokerRegistrationResponse
 	require.NoError(t, json.NewDecoder(createRec.Body).Decode(&createResp))
 	require.NotEmpty(t, createResp.BrokerID)
 	require.NotEmpty(t, createResp.JoinToken)
+	setBrokerAutoProvide(t, s, createResp.BrokerID, true)
 
 	// Phase 2: POST /api/v1/brokers/join — unauthenticated, the join token is
 	// the credential.
@@ -554,19 +422,21 @@ func TestBrokerAuthz_AutoProvideRegistration_StatusSeesProviderImmediately(t *te
 	assert.Equal(t, registerResp.Project.ID, projectsResp.Projects[0].ProjectID)
 }
 
-// autoProvideBrokerWithProject registers an auto-provide broker as owner and
-// links it to a new, owner-created project via the two-phase register flow
-// (mirroring the CLI's `register --auto-provide` + project-link step). It
-// returns the broker ID and the created project (with its real name and git
-// remote, for cross-project-disclosure checks).
+// autoProvideBrokerWithProject registers a broker as owner, turns its
+// auto-provide setting on in the store, and links it to a new,
+// owner-created project via the two-phase register flow (mirroring the
+// CLI's `register` + project-link step). It returns the broker ID and the
+// created project (with its real name and git remote, for the project
+// visibility checks).
 func autoProvideBrokerWithProject(t *testing.T, srv *Server, owner *store.User, brokerName, projectName, gitRemote string) (brokerID string, project *store.Project) {
 	t.Helper()
 
 	createRec := doRequestAsUser(t, srv, owner, http.MethodPost, "/api/v1/brokers",
-		CreateBrokerRegistrationRequest{Name: brokerName, AutoProvide: true})
+		CreateBrokerRegistrationRequest{Name: brokerName})
 	require.Equal(t, http.StatusCreated, createRec.Code, createRec.Body.String())
 	var createResp CreateBrokerRegistrationResponse
 	require.NoError(t, json.NewDecoder(createRec.Body).Decode(&createResp))
+	setBrokerAutoProvide(t, srv.store, createResp.BrokerID, true)
 
 	joinRec := doRequestNoAuth(t, srv, http.MethodPost, "/api/v1/brokers/join",
 		BrokerJoinRequest{
@@ -692,22 +562,12 @@ func TestBrokerAuthz_GetBrokerProjects_AdminSeesAll(t *testing.T) {
 	assert.Equal(t, project.ID, adminResp.Projects[0].ProjectID)
 }
 
-// getProjectErrStore wraps a store and forces GetProject to fail for one
-// specific project ID with a caller-supplied error, leaving every other
-// method (including GetProject for any other ID) untouched. Used to exercise
-// getBrokerProjects' handling of a provider record whose project lookup
-// fails, without needing a real deleted-row or connection-failure fixture.
-type getProjectErrStore struct {
-	store.Store
-	projectID string
-	err       error
-}
-
-func (g *getProjectErrStore) GetProject(ctx context.Context, id string) (*store.Project, error) {
-	if id == g.projectID {
-		return nil, g.err
+// getProjectErrWrap returns an installStoreFault wrap func for a
+// getProjectErrStore failing with err; set projectID before arming.
+func getProjectErrWrap(err error) func(store.Store, *storeFaultSwitch) *getProjectErrStore {
+	return func(inner store.Store, fault *storeFaultSwitch) *getProjectErrStore {
+		return &getProjectErrStore{Store: inner, fault: fault, err: err}
 	}
-	return g.Store.GetProject(ctx, id)
 }
 
 // TestBrokerAuthz_GetBrokerProjects_ToleratesNotFoundProject proves that a
@@ -718,7 +578,10 @@ func (g *getProjectErrStore) GetProject(ctx context.Context, id string) (*store.
 // returned (to a caller who can read it) with no name or git remote, since
 // only the enrichment step — not the entry — is skipped.
 func TestBrokerAuthz_GetBrokerProjects_ToleratesNotFoundProject(t *testing.T) {
-	srv, s := testServer(t)
+	// The wrapper is installed before autoProvideBrokerWithProject, whose
+	// project registration emits a mutation audit that reads srv.store
+	// from a goroutine (ptone/scion#3184).
+	srv, s, failing, fault := testServerWithStoreFault(t, getProjectErrWrap(store.ErrNotFound))
 	ctx := context.Background()
 
 	owner := &store.User{
@@ -735,8 +598,8 @@ func TestBrokerAuthz_GetBrokerProjects_ToleratesNotFoundProject(t *testing.T) {
 	brokerID, project := autoProvideBrokerWithProject(t, srv, owner,
 		"notfound-project-broker", "StaleProj", "https://github.com/acme/stale-repo.git")
 
-	srv.store = &getProjectErrStore{Store: s, projectID: project.ID, err: store.ErrNotFound}
-	defer func() { srv.store = s }()
+	failing.projectID = project.ID
+	fault.Arm()
 
 	rec := doRequestAsUser(t, srv, owner, http.MethodGet,
 		"/api/v1/runtime-brokers/"+brokerID+"/projects", nil)
@@ -769,7 +632,8 @@ func TestBrokerAuthz_GetBrokerProjects_ToleratesNotFoundProject(t *testing.T) {
 // error rather than silently treated the same as a not-found and dropped
 // from the list.
 func TestBrokerAuthz_GetBrokerProjects_PropagatesOtherProjectErrors(t *testing.T) {
-	srv, s := testServer(t)
+	// Installed before the audited registration; see the previous test.
+	srv, s, failing, fault := testServerWithStoreFault(t, getProjectErrWrap(errors.New("connection reset by peer")))
 	ctx := context.Background()
 
 	owner := &store.User{
@@ -786,8 +650,8 @@ func TestBrokerAuthz_GetBrokerProjects_PropagatesOtherProjectErrors(t *testing.T
 	brokerID, project := autoProvideBrokerWithProject(t, srv, owner,
 		"getproject-error-broker", "ErrProj", "https://github.com/acme/err-repo.git")
 
-	srv.store = &getProjectErrStore{Store: s, projectID: project.ID, err: errors.New("connection reset by peer")}
-	defer func() { srv.store = s }()
+	failing.projectID = project.ID
+	fault.Arm()
 
 	rec := doRequestAsUser(t, srv, owner, http.MethodGet,
 		"/api/v1/runtime-brokers/"+brokerID+"/projects", nil)
@@ -796,13 +660,13 @@ func TestBrokerAuthz_GetBrokerProjects_PropagatesOtherProjectErrors(t *testing.T
 		"a genuine store error from GetProject must not be silently swallowed into a 200 with an incomplete list, and must map through writeErrorFromErr's default (unrecognized-error) branch: %s", rec.Body.String())
 }
 
-// TestBrokerHeartbeat_BackfillsRuntimeFromResolvedProfile verifies the
-// narrow heartbeat-time companion to the display-time enrichment fix
-// (ptone/scion#2262): once a heartbeat reports the agent's applied profile,
-// the hub resolves it by name against the broker's advertised profiles and
-// backfills agent.Runtime alongside the existing Profile backfill — without
-// guessing from whichever profile happens to be listed first.
-func TestBrokerHeartbeat_BackfillsRuntimeFromResolvedProfile(t *testing.T) {
+// TestBrokerHeartbeat_NoRuntimeGuessPersisted verifies that a heartbeat no
+// longer persists a runtime resolved from the agent's profile: the halt
+// rule trusts the recorded runtime, so only broker reports write it
+// (ptone/scion#4853). The Profile backfill still applies, and display-time
+// enrichment (ptone/scion#2262) still resolves the runtime from the
+// agent's own profile, not whichever profile is listed first.
+func TestBrokerHeartbeat_NoRuntimeGuessPersisted(t *testing.T) {
 	srv, s := testServer(t)
 	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
@@ -858,10 +722,13 @@ func TestBrokerHeartbeat_BackfillsRuntimeFromResolvedProfile(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 
 	updated := getAgentState(t, s, agent.Slug, project.ID)
-	assert.Equal(t, "kubernetes", updated.Runtime,
-		"Runtime should be backfilled from the agent's own resolved profile, not the broker's first profile")
+	assert.Empty(t, updated.Runtime, "a heartbeat must not persist a runtime guess")
 	require.NotNil(t, updated.AppliedConfig)
 	assert.Equal(t, "k8s-prod", updated.AppliedConfig.Profile)
+
+	srv.enrichAgentRuntime(ctx, updated)
+	assert.Equal(t, "kubernetes", updated.Runtime,
+		"display enrichment resolves the agent's own profile, not the broker's first profile")
 }
 
 // TestBrokerHeartbeat_UnresolvedProfileDoesNotBackfillRuntime is the
@@ -1077,48 +944,12 @@ func TestBrokerHeartbeat_RuntimeNotOverwrittenWhenProfileFirstBackfilledSamePass
 		"an already-set Runtime must be kept even when this same heartbeat pass first backfills a Profile that would resolve to a different type")
 }
 
-// countingBrokerLoadStore wraps a store.Store and counts calls to
-// GetRuntimeBroker, optionally injecting an error, so a test can prove the
-// heartbeat handler's lazily-loaded, memoised broker read (ptone/scion#2262,
-// loadHeartbeatBroker) behaves as described: at most one read per heartbeat
-// regardless of how many callers need it, no read at all when nothing needs
-// it, and a failed read that the handler recovers from without crashing.
-//
-// getRuntimeBrokerErrBroker, when set alongside getRuntimeBrokerErr, is
-// returned together with the error, simulating a store call that returns a
-// (non-nil but unreliable) value in the same breath as an error. This proves
-// a caller actually gates on the error rather than trusting whatever value
-// came back whenever one happens to be present.
-//
-// updateRuntimeBrokerCalls counts broker row writes, so a test can prove the
-// heartbeat handler writes the row only when the refreshed state changed.
-type countingBrokerLoadStore struct {
-	store.Store
-	getRuntimeBrokerCalls     int
-	getRuntimeBrokerErr       error
-	getRuntimeBrokerErrBroker *store.RuntimeBroker
-	updateRuntimeBrokerCalls  int
-}
-
-func (s *countingBrokerLoadStore) UpdateRuntimeBroker(ctx context.Context, broker *store.RuntimeBroker) error {
-	s.updateRuntimeBrokerCalls++
-	return s.Store.UpdateRuntimeBroker(ctx, broker)
-}
-
-func (s *countingBrokerLoadStore) GetRuntimeBroker(ctx context.Context, id string) (*store.RuntimeBroker, error) {
-	s.getRuntimeBrokerCalls++
-	if s.getRuntimeBrokerErr != nil {
-		return s.getRuntimeBrokerErrBroker, s.getRuntimeBrokerErr
-	}
-	return s.Store.GetRuntimeBroker(ctx, id)
-}
-
 // TestBrokerHeartbeat_BrokerLoadedOnceForCapabilitiesAndBackfill proves the
 // lazy, memoised broker load shared by the Capabilities refresh and the
-// Runtime backfill (loadHeartbeatBroker) reads the broker row at most once
-// per heartbeat, even when the Capabilities block and two agents needing a
-// Runtime backfill all call it. Without the memoisation
-// (heartbeatBrokerLoaded), this would be three separate reads.
+// Profile backfill's flat-broker check (loadHeartbeatBroker) reads the
+// broker row at most once per heartbeat, even when the Capabilities block
+// and two agents needing a Profile backfill all call it. Without the
+// memoisation (heartbeatBrokerLoaded), this would be three separate reads.
 func TestBrokerHeartbeat_BrokerLoadedOnceForCapabilitiesAndBackfill(t *testing.T) {
 	srv, s := testServer(t)
 	grantDevUserRuntimeBrokerAccess(t, s)
@@ -1200,12 +1031,15 @@ func TestBrokerHeartbeat_BrokerLoadedOnceForCapabilitiesAndBackfill(t *testing.T
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	assert.Equal(t, 1, counting.getRuntimeBrokerCalls,
-		"the broker row backing both the Capabilities refresh and the Runtime backfill for two agents must be read exactly once per heartbeat")
+		"the broker row backing both the Capabilities refresh and the Profile backfill for two agents must be read exactly once per heartbeat")
 
 	updated1 := getAgentState(t, s, agent1.Slug, project.ID)
 	updated2 := getAgentState(t, s, agent2.Slug, project.ID)
-	assert.Equal(t, "kubernetes", updated1.Runtime, "agent 1's Runtime should be backfilled")
-	assert.Equal(t, "kubernetes", updated2.Runtime, "agent 2's Runtime should be backfilled")
+	for _, u := range []*store.Agent{updated1, updated2} {
+		require.NotNil(t, u.AppliedConfig)
+		assert.Equal(t, "k8s-prod", u.AppliedConfig.Profile, "the Profile should be backfilled")
+		assert.Empty(t, u.Runtime, "a heartbeat must not persist a runtime guess")
+	}
 
 	updatedBroker, err := s.GetRuntimeBroker(ctx, broker.ID)
 	require.NoError(t, err)
@@ -1284,7 +1118,7 @@ func TestBrokerHeartbeat_NoBrokerLoadWhenNothingNeedsIt(t *testing.T) {
 // TestBrokerHeartbeat_BrokerLoadErrorDoesNotCrashOrBlockStatusUpdate proves
 // that a GetRuntimeBroker failure does not crash the handler: the
 // Capabilities refresh logs and skips instead of dereferencing a nil broker,
-// the Runtime backfill is skipped (Runtime stays empty), and the agent's
+// no Runtime is persisted (Runtime stays empty), and the agent's
 // status update — which does not depend on the
 // broker row — is still applied.
 func TestBrokerHeartbeat_BrokerLoadErrorDoesNotCrashOrBlockStatusUpdate(t *testing.T) {
@@ -1357,89 +1191,7 @@ func TestBrokerHeartbeat_BrokerLoadErrorDoesNotCrashOrBlockStatusUpdate(t *testi
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	updated := getAgentState(t, s, agent.Slug, project.ID)
-	assert.Empty(t, updated.Runtime, "Runtime must stay empty when the broker load needed to resolve it fails")
+	assert.Empty(t, updated.Runtime, "a heartbeat must not persist a runtime")
 	assert.Equal(t, "running", updated.Phase, "the agent's status update must still apply even though the broker load failed")
 	assert.Equal(t, "working", updated.Activity)
-}
-
-// TestBrokerHeartbeat_BrokerLoadErrorSkipsBackfillEvenWithStaleBrokerValue
-// isolates the Runtime-backfill branch's own error gate from the Capabilities
-// branch: no Capabilities are sent, so this exercises only
-// "if err != nil { skip }" at the backfill call site. The injected error
-// comes back together with a non-nil, resolvable broker value, so a gate
-// that ignored the error (rather than skipping whenever err != nil) would
-// still produce a non-empty, wrong Runtime from that stale value.
-func TestBrokerHeartbeat_BrokerLoadErrorSkipsBackfillEvenWithStaleBrokerValue(t *testing.T) {
-	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
-	ctx := context.Background()
-
-	broker := &store.RuntimeBroker{
-		ID:     tid("hb-load-err-stale-broker"),
-		Name:   "HB Load Err Stale Broker",
-		Slug:   "hb-load-err-stale-broker",
-		Status: store.BrokerStatusOnline,
-		Profiles: []store.BrokerProfile{
-			{Name: "k8s-prod", Type: "kubernetes", Available: true},
-		},
-		Created: time.Now(),
-		Updated: time.Now(),
-	}
-	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
-
-	project := &store.Project{
-		ID:      tid("hb-load-err-stale-project"),
-		Slug:    "hb-load-err-stale-project",
-		Name:    "HB Load Err Stale Project",
-		Created: time.Now(),
-		Updated: time.Now(),
-	}
-	require.NoError(t, s.CreateProject(ctx, project))
-	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
-		ProjectID:  project.ID,
-		BrokerID:   broker.ID,
-		BrokerName: broker.Name,
-		Status:     broker.Status,
-	}))
-
-	agent := &store.Agent{
-		ID:              tid("hb-load-err-stale-agent"),
-		Slug:            "hb-load-err-stale-agent",
-		Name:            "HB Load Err Stale Agent",
-		Template:        "default",
-		ProjectID:       project.ID,
-		RuntimeBrokerID: broker.ID,
-		Phase:           "running",
-		Activity:        "working",
-		Labels:          map[string]string{},
-	}
-	require.NoError(t, s.CreateAgent(ctx, agent))
-
-	// A resolvable, single-type broker value is returned alongside the
-	// error: if the backfill used it regardless of the error, Runtime would
-	// come back "kubernetes" instead of staying empty.
-	counting := &countingBrokerLoadStore{
-		Store:               s,
-		getRuntimeBrokerErr: errors.New("connection reset by peer"),
-		getRuntimeBrokerErrBroker: &store.RuntimeBroker{
-			ID: broker.ID,
-			Profiles: []store.BrokerProfile{
-				{Name: "k8s-prod", Type: "kubernetes", Available: true},
-			},
-		},
-	}
-	srv.store = counting
-	defer func() { srv.store = s }()
-
-	code := sendHeartbeat(t, srv, broker.ID, project.ID, brokerAgentHeartbeat{
-		Slug:    agent.Slug,
-		Status:  "WORKING",
-		Phase:   "running",
-		Profile: "k8s-prod",
-	})
-	require.Equal(t, http.StatusOK, code)
-
-	updated := getAgentState(t, s, agent.Slug, project.ID)
-	assert.Empty(t, updated.Runtime,
-		"the backfill must skip on a GetRuntimeBroker error rather than resolving from whatever broker value came back with it")
 }

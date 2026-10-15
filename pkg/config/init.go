@@ -17,27 +17,33 @@ package config
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/cloudrunenv"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
 
-// isGitRepoFunc is a package-level variable for testing. Defaults to util.IsGitRepo.
-var isGitRepoFunc = util.IsGitRepo
+// isGitRepoFunc is a package-level variable for testing. It reports whether
+// dir (the current directory when dir is empty) is inside a git work tree and
+// returns an error matching util.ErrGitDubiousOwnership when git refuses the
+// repository because of its ownership. Defaults to util.CheckGitRepoDir.
+var isGitRepoFunc = util.CheckGitRepoDir
 
 // OverrideIsGitRepo replaces the git-repo detection function used by InitProject.
 // It returns a restore function that must be called to reset the override.
 // This is intended for use in tests outside the config package.
 func OverrideIsGitRepo(fn func() bool) func() {
 	orig := isGitRepoFunc
-	isGitRepoFunc = fn
+	isGitRepoFunc = func(string) (bool, error) { return fn(), nil }
 	return func() { isGitRepoFunc = orig }
 }
 
@@ -259,6 +265,35 @@ type InitProjectOpts struct {
 	// SkipRuntimeCheck skips local container runtime detection.
 	// Use this when initializing on a hub server where agents run on remote brokers.
 	SkipRuntimeCheck bool
+
+	// ProjectID, when set, is the identity recorded for the project instead
+	// of a generated one. It replaces a different identity already present
+	// in the project. When empty, an existing identity is kept and a new
+	// project gets a generated one.
+	ProjectID string
+}
+
+// newProjectID returns the identity for a newly initialized project.
+func (o InitProjectOpts) newProjectID() string {
+	if o.ProjectID != "" {
+		return o.ProjectID
+	}
+	return GenerateProjectID()
+}
+
+// keepsMarker reports whether the existing marker file at markerPath is kept
+// as the identity of the project rooted at projectRoot. It is kept unless
+// ProjectID is set and the marker does not already record ProjectID under
+// the slug derived from projectRoot.
+func (o InitProjectOpts) keepsMarker(markerPath, projectRoot string) bool {
+	if o.ProjectID == "" {
+		return true
+	}
+	marker, err := ReadProjectMarker(markerPath)
+	if err != nil {
+		return false
+	}
+	return marker.ProjectID == o.ProjectID && marker.ProjectSlug == api.Slugify(filepath.Base(projectRoot))
 }
 
 func InitProject(targetDir string, harnesses []api.Harness, opts ...InitProjectOpts) error {
@@ -267,7 +302,48 @@ func InitProject(targetDir string, harnesses []api.Harness, opts ...InitProjectO
 		opt = opts[0]
 	}
 
-	isGit := isGitRepoFunc()
+	// The layout follows the directory being initialized: the current
+	// directory in the CLI form (empty targetDir), otherwise the directory
+	// that will contain targetDir. If that directory does not exist, the
+	// check reports "not a git repository" and the external layout is used,
+	// deliberately.
+	checkDir := ""
+	if targetDir != "" {
+		// Clean first so a trailing separator does not shift the
+		// directory checked here or the Lstat below.
+		targetDir = filepath.Clean(targetDir)
+		checkDir = filepath.Dir(targetDir)
+	}
+
+	// isGitRepoFunc always reports false alongside an error.
+	isGit, gitErr := isGitRepoFunc(checkDir)
+	if gitErr != nil {
+		// Only the current-directory form (empty targetDir) refuses here.
+		// With an explicit targetDir keep the previous behaviour and treat
+		// the refusal as "not a git repository".
+		if targetDir == "" && errors.Is(gitErr, util.ErrGitDubiousOwnership) {
+			// Returned unwrapped: callers add their own context.
+			return gitErr
+		}
+	}
+
+	if targetDir != "" {
+		if info, err := os.Lstat(targetDir); err == nil {
+			// A symbolic link at an explicit target (for example one
+			// committed to the repository) is refused rather than
+			// followed, so the project is always written at targetDir.
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("cannot initialize project: %s is a symbolic link; replace it with a directory or remove it", targetDir)
+			}
+			// An explicit target that is already a regular file is an
+			// existing project marker (for example one committed to the
+			// repository): keep using it through the external layout
+			// rather than replacing it.
+			if info.Mode().IsRegular() {
+				isGit = false
+			}
+		}
+	}
 
 	var projectDir string
 	var err error
@@ -281,8 +357,10 @@ func InitProject(targetDir string, harnesses []api.Harness, opts ...InitProjectO
 		}
 	}
 
-	// Enforce .scion/agents/ in .gitignore for git repos
-	if isGit {
+	// Enforce .scion/agents/ in .gitignore for git repos initialized from
+	// the current directory. An explicit target leaves the repository's
+	// .gitignore untouched.
+	if isGit && targetDir == "" {
 		root, err := util.RepoRoot()
 		if err == nil {
 			if err := EnsureScionGitignore(root); err != nil {
@@ -306,8 +384,14 @@ func InitProject(targetDir string, harnesses []api.Harness, opts ...InitProjectO
 // The project directory gets a .scion marker file, and the actual project
 // data lives under ~/.scion/project-configs/.
 func initExternalProject(projectDir string, opt InitProjectOpts) error {
-	// projectDir is the intended <project>/.scion path.
-	projectRoot := filepath.Dir(projectDir)
+	// projectDir is the intended <project>/.scion path. Resolve it first so
+	// a relative target (for example ".scion") names the containing
+	// directory rather than ".", the same as the equivalent absolute target.
+	absProjectDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		return fmt.Errorf("cannot initialize project: failed to resolve %s: %w", projectDir, err)
+	}
+	projectRoot := filepath.Dir(absProjectDir)
 	markerPath := filepath.Join(projectRoot, DotScion)
 
 	// TODO(project-migration): Remove this check after a few releases.
@@ -322,7 +406,7 @@ func initExternalProject(projectDir string, opt InitProjectOpts) error {
 	}
 
 	// If a marker file already exists, read it and use the existing external path
-	if IsProjectMarkerFile(markerPath) {
+	if IsProjectMarkerFile(markerPath) && opt.keepsMarker(markerPath, projectRoot) {
 		resolved, err := ResolveProjectMarker(markerPath)
 		if err != nil {
 			return fmt.Errorf("existing project marker is invalid: %w", err)
@@ -334,10 +418,12 @@ func initExternalProject(projectDir string, opt InitProjectOpts) error {
 		return ensureProjectDirs(resolved, opt)
 	}
 
-	// Generate new project identity
-	projectID := GenerateProjectID()
-	projectName := filepath.Base(projectRoot)
-	projectSlug := api.Slugify(projectName)
+	// New project identity
+	projectID := opt.newProjectID()
+	projectName, projectSlug, err := externalProjectNameAndSlug(projectRoot)
+	if err != nil {
+		return err
+	}
 
 	marker := &ProjectMarker{
 		ProjectID:   projectID,
@@ -353,12 +439,11 @@ func initExternalProject(projectDir string, opt InitProjectOpts) error {
 
 	// Write settings with workspace-path and project_id before ensureProjectDirs
 	// (which would create a settings.yaml without workspace_path if one doesn't exist yet).
-	absProjectRoot, _ := filepath.Abs(projectRoot)
 	if err := mkdirUnderProjectConfigs(externalPath, 0755); err != nil {
 		return fmt.Errorf("failed to create external project directory: %w", err)
 	}
 	if GetSettingsPath(externalPath) == "" {
-		if err := writeProjectSettings(externalPath, absProjectRoot, projectID, opt); err != nil {
+		if err := writeProjectSettings(externalPath, projectRoot, projectID, opt); err != nil {
 			return err
 		}
 	}
@@ -380,6 +465,23 @@ func initExternalProject(projectDir string, opt InitProjectOpts) error {
 	return nil
 }
 
+// externalProjectNameAndSlug derives the project name and slug from the
+// absolute project root (the directory that contains the .scion target). It
+// returns an error when the derived slug would be empty, so that nothing is
+// stored under an empty slug.
+func externalProjectNameAndSlug(projectRoot string) (name, slug string, err error) {
+	if projectRoot == filepath.Dir(projectRoot) {
+		// A filesystem root has no directory name to derive a slug from.
+		return "", "", fmt.Errorf("cannot initialize project: the target's containing directory %s has no name usable as a project slug; initialize the project in a named directory", projectRoot)
+	}
+	name = filepath.Base(projectRoot)
+	slug = api.Slugify(name)
+	if slug == "" {
+		return "", "", fmt.Errorf("cannot initialize project: the directory name %q of %s gives an empty project slug; use a directory name that contains ASCII letters or digits (A-Z, a-z, 0-9)", name, projectRoot)
+	}
+	return name, slug, nil
+}
+
 // initInRepoProject creates a git project with .scion as a directory in the repo.
 // Settings are stored externally at ~/.scion/project-configs/<slug>__<uuid>/.scion/
 // and agent homes are stored externally at ~/.scion/project-configs/<slug>__<uuid>/.scion/agents/.
@@ -389,16 +491,24 @@ func initInRepoProject(projectDir string, opt InitProjectOpts) error {
 		return fmt.Errorf("failed to create settings directory: %w", err)
 	}
 
-	// Ensure project-id file exists for split storage
-	if _, err := ReadProjectID(projectDir); err != nil {
-		if os.IsNotExist(err) {
-			projectID := GenerateProjectID()
-			if err := WriteProjectID(projectDir, projectID); err != nil {
-				return fmt.Errorf("failed to write project-id: %w", err)
+	// Ensure project-id file exists for split storage, recording
+	// opt.ProjectID when set. The read, like the writes below, goes through
+	// an os.Root on projectDir so project setup stays inside the project
+	// directory.
+	existingID, err := readProjectIDInDir(projectDir)
+	switch {
+	case err == nil:
+		if opt.ProjectID != "" && existingID != opt.ProjectID {
+			if err := writeProjectIDInDir(projectDir, opt.ProjectID); err != nil {
+				return fmt.Errorf("cannot initialize project: failed to write project-id: %w", err)
 			}
-		} else {
-			return fmt.Errorf("failed to read project-id: %w", err)
 		}
+	case os.IsNotExist(err):
+		if err := writeProjectIDInDir(projectDir, opt.newProjectID()); err != nil {
+			return fmt.Errorf("cannot initialize project: failed to write project-id: %w", err)
+		}
+	default:
+		return fmt.Errorf("cannot initialize project: failed to read project-id: %w", err)
 	}
 
 	// Seed settings.yaml in the external config dir (machine-specific, not committed)
@@ -414,6 +524,13 @@ func initInRepoProject(projectDir string, opt InitProjectOpts) error {
 	if err := ensureProjectSettingsFile(externalConfigDir, opt); err != nil {
 		return err
 	}
+	// Record the repo root and project type, so that project discovery can
+	// tell this config from an orphaned one. Bookkeeping only: a failure is
+	// logged, not fatal (the CLI records it again when it resolves the
+	// project).
+	if err := RecordGitWorkspace(projectDir); err != nil {
+		slog.Warn("failed to record the workspace path of the project", "project", projectDir, "error", err)
+	}
 
 	// Create external agents directory for agent homes
 	externalAgentsDir, err := GetGitProjectExternalAgentsDir(projectDir)
@@ -426,14 +543,16 @@ func initInRepoProject(projectDir string, opt InitProjectOpts) error {
 		}
 	}
 
-	// Create in-repo agents dir for git worktrees only
-	if err := os.MkdirAll(filepath.Join(projectDir, "agents"), 0755); err != nil {
-		return fmt.Errorf("failed to create agents directory: %w", err)
+	// Create in-repo agents dir for git worktrees only. Like the project-id
+	// file above, it is created through an os.Root on projectDir so project
+	// setup writes stay inside the project directory.
+	if err := mkdirAllInDir(projectDir, "agents", 0755); err != nil {
+		return fmt.Errorf("cannot initialize project: failed to create agents directory: %w", err)
 	}
 
 	// Create in-repo templates dir — lives in-repo so project templates can be committed
-	if err := os.MkdirAll(filepath.Join(projectDir, "templates"), 0755); err != nil {
-		return fmt.Errorf("failed to create templates directory: %w", err)
+	if err := mkdirAllInDir(projectDir, "templates", 0755); err != nil {
+		return fmt.Errorf("cannot initialize project: failed to create templates directory: %w", err)
 	}
 
 	return nil
@@ -709,7 +828,7 @@ func InitMachine(harnesses []api.Harness, opts ...InitMachineOpts) error {
 // Duplicated from pkg/runtime to avoid an import cycle (config is lower-level
 // than runtime). Must stay in sync with runtime.DefaultSandboxBin.
 // TestDefaultSandboxBin_MatchesLiteral pins this copy;
-// TestSandboxBinConstantSync_Task92 pins the runtime copy. (O5)
+// TestSandboxBinConstantSync_Task92 (pkg/runtime) pins the runtime copy. (O5)
 const defaultSandboxBin = "/usr/local/gcp/bin/sandbox"
 
 // isCloudRunSandboxEnvironment returns true when the process is running on a
@@ -717,7 +836,7 @@ const defaultSandboxBin = "/usr/local/gcp/bin/sandbox"
 // identifies the single-node hosted tier, which needs a cloudrun-sandbox
 // profile instead of the workstation defaults.
 func isCloudRunSandboxEnvironment() bool {
-	return os.Getenv("CLOUD_RUN_INSTANCE") != "" && sandboxBinExists(defaultSandboxBin)
+	return cloudrunenv.IsInstance() && sandboxBinExists(defaultSandboxBin)
 }
 
 // sandboxBinExists is a test seam for isCloudRunSandboxEnvironment.

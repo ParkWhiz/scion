@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"time"
 
+	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	entharnessconfig "github.com/GoogleCloudPlatform/scion/pkg/ent/harnessconfig"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
@@ -60,6 +62,15 @@ func marshalJSONString(v interface{}) string {
 	return string(data)
 }
 
+// marshalAgentConfig serializes a template's derived agent-config snapshot.
+// A nil snapshot is stored as an empty string (no snapshot), not "null".
+func marshalAgentConfig(cfg *api.ScionConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return marshalJSONString(cfg)
+}
+
 // unmarshalJSONString deserializes a JSON string into v. An empty string is a
 // no-op, leaving v at its zero value.
 func unmarshalJSONString[T any](data string, v *T) {
@@ -91,6 +102,7 @@ func entTemplateRowToStore(e *ent.Template) *store.Template {
 		StorageURI:           e.StorageURI,
 		StorageBucket:        e.StorageBucket,
 		StoragePath:          e.StoragePath,
+		Layout:               e.Layout,
 		BaseTemplate:         e.BaseTemplate,
 		SourceURL:            e.SourceURL,
 		Status:               string(e.Status),
@@ -101,6 +113,7 @@ func entTemplateRowToStore(e *ent.Template) *store.Template {
 		Updated:              e.Updated,
 	}
 	unmarshalJSONString(e.Config, &t.Config)
+	unmarshalJSONString(e.AgentConfig, &t.AgentConfig)
 	unmarshalJSONString(e.Files, &t.Files)
 	return t
 }
@@ -130,6 +143,7 @@ func (s *TemplateStore) CreateTemplate(ctx context.Context, template *store.Temp
 		SetDefaultHarnessConfig(template.DefaultHarnessConfig).
 		SetImage(template.Image).
 		SetConfig(marshalJSONString(template.Config)).
+		SetAgentConfig(marshalAgentConfig(template.AgentConfig)).
 		SetContentHash(template.ContentHash).
 		SetScope(template.Scope).
 		SetScopeID(template.ScopeID).
@@ -137,6 +151,7 @@ func (s *TemplateStore) CreateTemplate(ctx context.Context, template *store.Temp
 		SetStorageURI(template.StorageURI).
 		SetStorageBucket(template.StorageBucket).
 		SetStoragePath(template.StoragePath).
+		SetLayout(template.Layout).
 		SetFiles(marshalJSONString(template.Files)).
 		SetBaseTemplate(template.BaseTemplate).
 		SetSourceURL(template.SourceURL).
@@ -192,7 +207,10 @@ func (s *TemplateStore) GetTemplateBySlug(ctx context.Context, slug, scope, scop
 	return entTemplateRowToStore(e), nil
 }
 
-// UpdateTemplate updates an existing template.
+// UpdateTemplate updates an existing template's metadata. It leaves the
+// content columns (files, content_hash, harness, default_harness_config,
+// agent_config) and the storage columns (layout, storage_path,
+// storage_bucket, storage_uri) alone; see store.TemplateStore.UpdateTemplate.
 func (s *TemplateStore) UpdateTemplate(ctx context.Context, template *store.Template) error {
 	uid, err := parseUUID(template.ID)
 	if err != nil {
@@ -206,18 +224,11 @@ func (s *TemplateStore) UpdateTemplate(ctx context.Context, template *store.Temp
 		SetSlug(template.Slug).
 		SetDisplayName(template.DisplayName).
 		SetDescription(template.Description).
-		SetHarness(template.Harness).
-		SetDefaultHarnessConfig(template.DefaultHarnessConfig).
 		SetImage(template.Image).
 		SetConfig(marshalJSONString(template.Config)).
-		SetContentHash(template.ContentHash).
 		SetScope(template.Scope).
 		SetScopeID(template.ScopeID).
 		SetProjectID(template.ProjectID).
-		SetStorageURI(template.StorageURI).
-		SetStorageBucket(template.StorageBucket).
-		SetStoragePath(template.StoragePath).
-		SetFiles(marshalJSONString(template.Files)).
 		SetBaseTemplate(template.BaseTemplate).
 		SetSourceURL(template.SourceURL).
 		SetStatus(enttemplate.Status(template.Status)).
@@ -229,6 +240,138 @@ func (s *TemplateStore) UpdateTemplate(ctx context.Context, template *store.Temp
 		return mapError(err)
 	}
 	return nil
+}
+
+// UpdateTemplateContent writes the content columns of template (see the
+// column list below) only if the stored row still matches expected. It is
+// one conditional UPDATE (UPDATE ... WHERE id = ? AND content_hash = ? AND
+// layout = ?), so two concurrent commits that read the same row cannot both
+// succeed.
+func (s *TemplateStore) UpdateTemplateContent(ctx context.Context, template *store.Template, expected store.TemplateContentPrecondition) error {
+	uid, err := parseUUID(template.ID)
+	if err != nil {
+		return err
+	}
+
+	updated := time.Now()
+
+	hashMatches := enttemplate.ContentHashEQ(expected.ContentHash)
+	if expected.ContentHash == "" {
+		hashMatches = enttemplate.Or(enttemplate.ContentHashEQ(""), enttemplate.ContentHashIsNil())
+	}
+	// The layout joins the predicate: a row can move from the legacy layout
+	// to blobs with the same content hash (ptone/scion#4221).
+	layoutMatches := enttemplate.LayoutEQ(expected.Layout)
+	if expected.Layout == "" {
+		layoutMatches = enttemplate.Or(enttemplate.LayoutEQ(""), enttemplate.LayoutIsNil())
+	}
+
+	// Only the columns a commit owns are written: the files, what is
+	// derived from them, where they are stored, the lifecycle status and the
+	// import provenance. Metadata (name, slug, display name, description,
+	// image, base template, owner, scope) belongs to UpdateTemplate, so a
+	// commit computed from an older read cannot revert a concurrent metadata
+	// edit, just as a metadata edit cannot revert a commit.
+	n, err := s.client.Template.Update().
+		Where(enttemplate.IDEQ(uid), hashMatches, layoutMatches).
+		SetHarness(template.Harness).
+		SetDefaultHarnessConfig(template.DefaultHarnessConfig).
+		SetAgentConfig(marshalAgentConfig(template.AgentConfig)).
+		SetContentHash(template.ContentHash).
+		SetStorageURI(template.StorageURI).
+		SetStorageBucket(template.StorageBucket).
+		SetStoragePath(template.StoragePath).
+		SetLayout(template.Layout).
+		SetFiles(marshalJSONString(template.Files)).
+		SetSourceURL(template.SourceURL).
+		SetStatus(enttemplate.Status(template.Status)).
+		SetUpdatedBy(template.UpdatedBy).
+		SetUpdated(updated).
+		Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if n == 0 {
+		exists, err := s.client.Template.Query().Where(enttemplate.IDEQ(uid)).Exist(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		if !exists {
+			return store.ErrNotFound
+		}
+		return store.ErrTemplateConflict
+	}
+	template.Updated = updated
+	return nil
+}
+
+// SetTemplateAgentConfig writes only the agent_config column of template id,
+// in one conditional UPDATE (WHERE id = ? AND content_hash = ? AND layout = ?
+// AND agent_config is empty AND updated = <the value it read>), and keeps
+// updated at the value it read (the column has an update default). It
+// reports whether a row was written; a row that no longer matches, or no
+// longer exists, writes nothing and returns (false, nil).
+//
+// The updated precondition means a metadata edit that commits between the
+// read and the UPDATE wins: nothing is written and the edit's updated time
+// is kept, instead of being rolled back to the value read
+// (ptone/scion#4674). As in DeactivateDelegationEdgeGuarded, updated is
+// compared as the exact stored value (see rawStoredText): on SQLite the raw
+// text, read first and bound as a string, so a row whose stored text is not
+// canonical still matches; on Postgres the timestamptz value read, which
+// compares as an instant. Any ent write between that read and the UPDATE
+// bumps updated, so the UPDATE matches no row.
+func (s *TemplateStore) SetTemplateAgentConfig(ctx context.Context, id string, cfg *api.ScionConfig, expected store.TemplateContentPrecondition) (bool, error) {
+	if cfg == nil {
+		return false, nil
+	}
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	pg := s.client.Driver().Dialect() == dialect.Postgres
+	var rawUpdated string
+	if !pg {
+		var found bool
+		rawUpdated, found, err = rawStoredText(ctx, s.client.Driver(), enttemplate.Table, enttemplate.FieldID, enttemplate.FieldUpdated, uid)
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			return false, nil
+		}
+	}
+	current, err := s.client.Template.Get(ctx, uid)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return false, nil
+		}
+		return false, mapError(err)
+	}
+
+	hashMatches := enttemplate.ContentHashEQ(expected.ContentHash)
+	if expected.ContentHash == "" {
+		hashMatches = enttemplate.Or(enttemplate.ContentHashEQ(""), enttemplate.ContentHashIsNil())
+	}
+	layoutMatches := enttemplate.LayoutEQ(expected.Layout)
+	if expected.Layout == "" {
+		layoutMatches = enttemplate.Or(enttemplate.LayoutEQ(""), enttemplate.LayoutIsNil())
+	}
+	noSnapshot := enttemplate.Or(enttemplate.AgentConfigEQ(""), enttemplate.AgentConfigIsNil())
+	unchanged := enttemplate.UpdatedEQ(current.Updated)
+	if !pg {
+		unchanged = predicate.Template(storedTextEQ(enttemplate.FieldUpdated, rawUpdated))
+	}
+
+	n, err := s.client.Template.Update().
+		Where(enttemplate.IDEQ(uid), hashMatches, layoutMatches, noSnapshot, unchanged).
+		SetAgentConfig(marshalAgentConfig(cfg)).
+		SetUpdated(current.Updated).
+		Save(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	return n > 0, nil
 }
 
 // DeleteTemplate removes a template by ID.
@@ -320,6 +463,12 @@ func (s *TemplateStore) ListTemplates(ctx context.Context, filter store.Template
 			enttemplate.DescriptionContainsFold(filter.Search),
 		))
 	}
+	if filter.StoragePath != "" {
+		query.Where(enttemplate.StoragePathEQ(filter.StoragePath))
+	}
+	if filter.StoragePathPrefix != "" {
+		query.Where(enttemplate.StoragePathHasPrefix(filter.StoragePathPrefix))
+	}
 
 	totalCount := 0
 	if !opts.SkipTotalCount {
@@ -390,6 +539,7 @@ func entHarnessConfigToStore(e *ent.HarnessConfig) *store.HarnessConfig {
 		Status:               string(e.Status),
 		ImageStatus:          string(e.ImageStatus),
 		ImageStatusCheckedAt: e.ImageStatusCheckedAt,
+		BuiltImage:           e.BuiltImage,
 		OwnerID:              e.OwnerID,
 		CreatedBy:            e.CreatedBy,
 		UpdatedBy:            e.UpdatedBy,
@@ -437,6 +587,7 @@ func (s *TemplateStore) CreateHarnessConfig(ctx context.Context, hc *store.Harne
 		SetSourceURL(hc.SourceURL).
 		SetStatus(entharnessconfig.Status(hc.Status)).
 		SetImageStatus(entharnessconfig.ImageStatus(hc.ImageStatus)).
+		SetBuiltImage(hc.BuiltImage).
 		SetOwnerID(hc.OwnerID).
 		SetCreatedBy(hc.CreatedBy).
 		SetUpdatedBy(hc.UpdatedBy).
@@ -480,7 +631,10 @@ func (s *TemplateStore) GetHarnessConfigBySlug(ctx context.Context, slug, scope,
 	return entHarnessConfigToStore(e), nil
 }
 
-// UpdateHarnessConfig updates an existing harness config.
+// UpdateHarnessConfig updates an existing harness config's metadata. It
+// leaves the content columns (files, content_hash, harness, config, status)
+// and the storage columns (storage_path, storage_bucket, storage_uri) alone,
+// and never writes built_image; see store.HarnessConfigStore.UpdateHarnessConfig.
 func (s *TemplateStore) UpdateHarnessConfig(ctx context.Context, hc *store.HarnessConfig) error {
 	uid, err := parseUUID(hc.ID)
 	if err != nil {
@@ -497,17 +651,9 @@ func (s *TemplateStore) UpdateHarnessConfig(ctx context.Context, hc *store.Harne
 		SetSlug(hc.Slug).
 		SetDisplayName(hc.DisplayName).
 		SetDescription(hc.Description).
-		SetHarness(hc.Harness).
-		SetConfig(marshalJSONString(hc.Config)).
-		SetContentHash(hc.ContentHash).
 		SetScope(hc.Scope).
 		SetScopeID(hc.ScopeID).
-		SetStorageURI(hc.StorageURI).
-		SetStorageBucket(hc.StorageBucket).
-		SetStoragePath(hc.StoragePath).
-		SetFiles(marshalJSONString(hc.Files)).
 		SetSourceURL(hc.SourceURL).
-		SetStatus(entharnessconfig.Status(hc.Status)).
 		SetImageStatus(entharnessconfig.ImageStatus(hc.ImageStatus)).
 		SetOwnerID(hc.OwnerID).
 		SetUpdatedBy(hc.UpdatedBy).
@@ -516,6 +662,81 @@ func (s *TemplateStore) UpdateHarnessConfig(ctx context.Context, hc *store.Harne
 		update.SetImageStatusCheckedAt(*hc.ImageStatusCheckedAt)
 	}
 	_, err = update.Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
+// UpdateHarnessConfigContent writes the content columns of hc only if the
+// stored row still has the expected content hash. It is one conditional
+// UPDATE (UPDATE ... WHERE id = ? AND content_hash = ?), so two concurrent
+// commits that read the same row cannot both succeed (ptone/scion#4219).
+func (s *TemplateStore) UpdateHarnessConfigContent(ctx context.Context, hc *store.HarnessConfig, expected store.HarnessConfigContentPrecondition) error {
+	uid, err := parseUUID(hc.ID)
+	if err != nil {
+		return err
+	}
+
+	updated := time.Now()
+
+	hashMatches := entharnessconfig.ContentHashEQ(expected.ContentHash)
+	if expected.ContentHash == "" {
+		hashMatches = entharnessconfig.Or(entharnessconfig.ContentHashEQ(""), entharnessconfig.ContentHashIsNil())
+	}
+
+	// Only the columns a commit owns are written: the files, what is
+	// derived from them, where they are stored, the lifecycle status and the
+	// import provenance. Metadata (name, slug, display name, description,
+	// scope, owner, image status) belongs to UpdateHarnessConfig and
+	// built_image to UpdateHarnessConfigBuiltImage, so a commit computed
+	// from an older read cannot revert either.
+	n, err := s.client.HarnessConfig.Update().
+		Where(entharnessconfig.IDEQ(uid), hashMatches).
+		SetHarness(hc.Harness).
+		SetConfig(marshalJSONString(hc.Config)).
+		SetContentHash(hc.ContentHash).
+		SetStorageURI(hc.StorageURI).
+		SetStorageBucket(hc.StorageBucket).
+		SetStoragePath(hc.StoragePath).
+		SetFiles(marshalJSONString(hc.Files)).
+		SetSourceURL(hc.SourceURL).
+		SetStatus(entharnessconfig.Status(hc.Status)).
+		SetUpdatedBy(hc.UpdatedBy).
+		SetUpdated(updated).
+		Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if n == 0 {
+		exists, err := s.client.HarnessConfig.Query().Where(entharnessconfig.IDEQ(uid)).Exist(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		if !exists {
+			return store.ErrNotFound
+		}
+		return store.ErrHarnessConfigConflict
+	}
+	hc.Updated = updated
+	return nil
+}
+
+// UpdateHarnessConfigBuiltImage writes only the built_image column of
+// harness-config id and keeps updated at its stored value.
+func (s *TemplateStore) UpdateHarnessConfigBuiltImage(ctx context.Context, id, image string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	existing, err := s.client.HarnessConfig.Get(ctx, uid)
+	if err != nil {
+		return mapError(err)
+	}
+	_, err = s.client.HarnessConfig.UpdateOneID(uid).
+		SetBuiltImage(image).
+		SetUpdated(existing.Updated).
+		Save(ctx)
 	if err != nil {
 		return mapError(err)
 	}

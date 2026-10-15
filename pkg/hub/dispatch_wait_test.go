@@ -69,6 +69,9 @@ func (f *fakeDispatchStore) ListPendingMessages(_ context.Context, _ string) ([]
 func (f *fakeDispatchStore) ReapStuckDispatch(_ context.Context, _ time.Time, _ int) (int, int, error) {
 	return 0, 0, nil
 }
+func (f *fakeDispatchStore) CountBrokerDispatchHealth(_ context.Context, _, _ time.Time) (int, int, error) {
+	return 0, 0, nil
+}
 func (f *fakeDispatchStore) CountStuckPendingMessages(_ context.Context, _ time.Time) (int, error) {
 	return 0, nil
 }
@@ -107,25 +110,6 @@ func noRowStore() *fakeDispatchStore {
 	return &fakeDispatchStore{dispatches: map[string]*store.BrokerDispatch{}}
 }
 
-// setLifecycleTimings shortens the lifecycle wait timings for one test. A
-// zero value keeps the current setting.
-func setLifecycleTimings(t *testing.T, rolling, poll, grace time.Duration) {
-	t.Helper()
-	oldRolling, oldPoll, oldGrace := lifecycleRollingTimeout, lifecycleRowPollInterval, lifecycleErrorPhaseGrace
-	if rolling > 0 {
-		lifecycleRollingTimeout = rolling
-	}
-	if poll > 0 {
-		lifecycleRowPollInterval = poll
-	}
-	if grace > 0 {
-		lifecycleErrorPhaseGrace = grace
-	}
-	t.Cleanup(func() {
-		lifecycleRollingTimeout, lifecycleRowPollInterval, lifecycleErrorPhaseGrace = oldRolling, oldPoll, oldGrace
-	})
-}
-
 func TestWaitForLifecycleOutcome_SuccessPhase(t *testing.T) {
 	ch := make(chan Event, 8)
 	go func() {
@@ -148,6 +132,76 @@ func TestWaitForLifecycleOutcome_ErrorPhaseWithoutFailedRow(t *testing.T) {
 	err := waitForLifecycleOutcome(context.Background(), ch, func() {}, noRowStore(), "d-1", "start", startTerminal)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "agent entered error phase during start")
+}
+
+// A halted agent (the platform ended the run) fails a start or stop wait
+// like the error phase, with its own message (ptone/scion#4853).
+func TestWaitForLifecycleOutcome_HaltedPhaseFailsStart(t *testing.T) {
+	setLifecycleTimings(t, 0, 0, 20*time.Millisecond)
+	ch := make(chan Event, 8)
+	go func() {
+		sendStatus(ch, "starting", "", nil)
+		sendStatus(ch, "halted", "", nil)
+	}()
+
+	err := waitForLifecycleOutcome(context.Background(), ch, func() {}, noRowStore(), "d-1", "start", isStartTerminal)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "agent entered halted phase during start")
+}
+
+func TestWaitForLifecycleOutcome_HaltedPhaseFailsStop(t *testing.T) {
+	setLifecycleTimings(t, 0, 0, 20*time.Millisecond)
+	ch := make(chan Event, 8)
+	go func() {
+		sendStatus(ch, "halted", "", nil)
+	}()
+
+	err := waitForLifecycleOutcome(context.Background(), ch, func() {}, noRowStore(), "d-1", "stop", isStopTerminal)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "agent entered halted phase during stop")
+}
+
+func TestWaitForLifecycleOutcome_HaltedPhaseWithFinishedRow(t *testing.T) {
+	// The dispatch row has already finished: the halted phase is the
+	// outcome at once, with no grace wait, as for the error phase.
+	// A long grace and a short context: an outcome that fell back to the
+	// grace wait would fail on the context instead of passing slowly.
+	setLifecycleTimings(t, 0, 0, 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ds := &fakeDispatchStore{dispatches: map[string]*store.BrokerDispatch{
+		"d-1": {ID: "d-1", State: store.DispatchStateDone},
+	}}
+	ch := make(chan Event, 8)
+	go func() {
+		sendStatus(ch, "halted", "", nil)
+	}()
+
+	err := waitForLifecycleOutcome(ctx, ch, func() {}, ds, "d-1", "start", isStartTerminal)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "agent entered halted phase during start")
+}
+
+func TestWaitForLifecycleOutcome_HaltedPhaseWithFailedRow(t *testing.T) {
+	// The executor failed the dispatch row: the row's own failure wins over
+	// the halted phase, as for the error phase.
+	// A long grace and a short context: an outcome that fell back to the
+	// grace wait would fail on the context instead of passing slowly.
+	setLifecycleTimings(t, 0, 0, 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ds := &fakeDispatchStore{dispatches: map[string]*store.BrokerDispatch{
+		"d-1": {ID: "d-1", State: store.DispatchStateFailed, Error: "broker refused the start"},
+	}}
+	ch := make(chan Event, 8)
+	go func() {
+		sendStatus(ch, "halted", "", nil)
+	}()
+
+	err := waitForLifecycleOutcome(ctx, ch, func() {}, ds, "d-1", "start", isStartTerminal)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "broker refused the start")
+	assert.NotContains(t, err.Error(), "halted phase")
 }
 
 func TestWaitForLifecycleOutcome_RollingReset(t *testing.T) {

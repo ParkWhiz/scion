@@ -31,6 +31,7 @@ import type { ViewMode } from '../shared/view-toggle.js';
 import '../shared/status-badge.js';
 import '../shared/view-toggle.js';
 import { formatRelative } from '../../utils/time.js';
+import { navigateTo } from '../../client/navigation.js';
 
 @customElement('scion-page-brokers')
 export class ScionPageBrokers extends LitElement {
@@ -165,7 +166,7 @@ export class ScionPageBrokers extends LitElement {
 
     // Subscribe to broker SSE events
     stateManager.setScope({ type: 'brokers-list' });
-    stateManager.addEventListener('brokers-updated', this.boundOnBrokersUpdated as EventListener);
+    stateManager.addEventListener('brokers-updated', this.boundOnBrokersUpdated);
 
     // Periodically re-render to keep relative timestamps fresh
     this.relativeTimeInterval = setInterval(() => this.requestUpdate(), 15_000);
@@ -173,10 +174,7 @@ export class ScionPageBrokers extends LitElement {
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
-    stateManager.removeEventListener(
-      'brokers-updated',
-      this.boundOnBrokersUpdated as EventListener
-    );
+    stateManager.removeEventListener('brokers-updated', this.boundOnBrokersUpdated);
     if (this.relativeTimeInterval) {
       clearInterval(this.relativeTimeInterval);
       this.relativeTimeInterval = null;
@@ -409,7 +407,7 @@ export class ScionPageBrokers extends LitElement {
   private renderCapabilities(capabilities: import('../../shared/types.js').BrokerCapabilities) {
     return html`
       <div class="broker-details">
-        <span class="capability-tag ${capabilities.webPTY ? 'enabled' : ''}">WebPTY</span>
+        <span class="capability-tag ${capabilities.webPty ? 'enabled' : ''}">WebPTY</span>
         <span class="capability-tag ${capabilities.sync ? 'enabled' : ''}">Sync</span>
         <span class="capability-tag ${capabilities.attach ? 'enabled' : ''}">Attach</span>
       </div>
@@ -444,8 +442,7 @@ export class ScionPageBrokers extends LitElement {
       <tr
         class="clickable"
         @click=${() => {
-          window.history.pushState({}, '', `/brokers/${broker.id}`);
-          window.dispatchEvent(new PopStateEvent('popstate'));
+          navigateTo(`/brokers/${broker.id}`);
         }}
       >
         <td>
@@ -468,7 +465,7 @@ export class ScionPageBrokers extends LitElement {
           ${broker.capabilities
             ? html`
                 <span class="capability-tags-inline">
-                  <span class="capability-tag ${broker.capabilities.webPTY ? 'enabled' : ''}"
+                  <span class="capability-tag ${broker.capabilities.webPty ? 'enabled' : ''}"
                     >WebPTY</span
                   >
                   <span class="capability-tag ${broker.capabilities.sync ? 'enabled' : ''}"

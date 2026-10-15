@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -153,7 +154,7 @@ func (t *Transport) Do(ctx context.Context, req *http.Request) (*http.Response, 
 				time.Sleep(t.RetryWait)
 				continue
 			}
-			return nil, fmt.Errorf("request failed: %w", err)
+			return nil, fmt.Errorf("request failed: %w", redactURLError(err))
 		}
 
 		// Retry on 5xx errors
@@ -222,7 +223,7 @@ func (t *Transport) DoNoRetry(ctx context.Context, req *http.Request) (*http.Res
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", redactURLError(err))
 	}
 	return resp, nil
 }
@@ -289,7 +290,7 @@ func (t *Transport) Get(ctx context.Context, path string, headers http.Header) (
 func (t *Transport) GetWithQuery(ctx context.Context, path string, query url.Values, headers http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.buildURL(path, query), nil)
 	if err != nil {
-		return nil, err
+		return nil, redactURLError(err)
 	}
 
 	for k, v := range headers {
@@ -326,7 +327,7 @@ func (t *Transport) Patch(ctx context.Context, path string, body interface{}, he
 func (t *Transport) Delete(ctx context.Context, path string, headers http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.buildURL(path, nil), nil)
 	if err != nil {
-		return nil, err
+		return nil, redactURLError(err)
 	}
 
 	for k, v := range headers {
@@ -356,7 +357,7 @@ func (t *Transport) doJSONVia(ctx context.Context, send func(context.Context, *h
 
 	req, err := http.NewRequestWithContext(ctx, method, t.buildURL(path, nil), bodyReader)
 	if err != nil {
-		return nil, err
+		return nil, redactURLError(err)
 	}
 
 	if body != nil {
@@ -372,20 +373,44 @@ func (t *Transport) doJSONVia(ctx context.Context, send func(context.Context, *h
 
 // DecodeResponse reads and decodes a JSON response body.
 // If the response indicates an error (status >= 400), it returns an APIError.
+// A 204 No Content returns (nil, nil).
 func DecodeResponse[T any](resp *http.Response) (*T, error) {
+	return decode[T](resp, false)
+}
+
+// ErrNoContent is returned by DecodeRequired when a successful response has
+// no body to decode.
+var ErrNoContent = errors.New("server returned no content")
+
+// DecodeRequired is like DecodeResponse, for endpoints that must return a
+// body. A 204 No Content or an empty 2xx body returns an error wrapping
+// ErrNoContent instead of a nil result, so callers never see (nil, nil).
+func DecodeRequired[T any](resp *http.Response) (*T, error) {
+	return decode[T](resp, true)
+}
+
+// decode implements DecodeResponse and DecodeRequired. When required is
+// false, a 204 returns (nil, nil) and an empty body is a decode error; when
+// it is true, both return an error wrapping ErrNoContent.
+func decode[T any](resp *http.Response, required bool) (*T, error) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		return nil, ParseErrorResponse(resp)
 	}
 
-	// Handle 204 No Content
 	if resp.StatusCode == http.StatusNoContent {
+		if required {
+			return nil, fmt.Errorf("%w (status: %d)", ErrNoContent, resp.StatusCode)
+		}
 		return nil, nil
 	}
 
 	var result T
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if required && errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%w (status: %d)", ErrNoContent, resp.StatusCode)
+		}
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 

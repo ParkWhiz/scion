@@ -103,11 +103,23 @@ type BrokerCapabilities struct {
 	// reincarnate --broker`). The hub refuses a move unless both brokers
 	// report it (412).
 	AgentMove bool `json:"agentMove"`
+	// ReprovisionEmptyPerAgent indicates this broker's reprovision reuses an
+	// empty-per-agent agent's private workspace in place (same-broker
+	// `scion reincarnate`, miller79/scion#167). Set on every runtime: the
+	// hub checks runtime suitability separately.
+	ReprovisionEmptyPerAgent bool `json:"reprovisionEmptyPerAgent,omitempty"`
 	// StartsInFlight indicates the broker reports the agent starts still
 	// running on it in every heartbeat (BrokerHeartbeat.StartsInFlight). Only
 	// then does the hub read a start's absence from that list as "no start
 	// in flight".
 	StartsInFlight bool `json:"startsInFlight,omitempty"`
+	// TemplateTiers indicates the broker takes hub settings as separate
+	// tiers (ptone/scion#4218): HubAgentDefaults.Telemetry as a default
+	// below the agent's own config telemetry (requester inline telemetry
+	// from older hubs, and the stored config), and TelemetryPolicy on
+	// create/start/restart as policy above everything. A hub may stop writing those values into
+	// InlineConfig only for a broker that reports this (ptone/scion#4222).
+	TemplateTiers bool `json:"templateTiers,omitempty"`
 }
 
 // ProjectInfo is a summary of a project registered on this broker.
@@ -155,24 +167,29 @@ type AgentResponse struct {
 	// HarnessConfigRevision records the harness-config bundle revision (e.g.
 	// the Hub artifact ContentHash) used to provision this agent. Empty for
 	// built-in or local-only configs without a tracked revision.
-	HarnessConfigRevision string            `json:"harnessConfigRevision,omitempty"`
-	HarnessAuth           string            `json:"harnessAuth,omitempty"` // Resolved harness auth method
-	Image                 string            `json:"image,omitempty"`       // Resolved container image
-	RuntimeType           string            `json:"runtime,omitempty"`     // Runtime type (docker, kubernetes, apple)
-	Profile               string            `json:"profile,omitempty"`     // Settings profile used
-	ProjectID             string            `json:"projectId,omitempty"`
-	UserID                string            `json:"userId,omitempty"`
-	Status                string            `json:"status"`
-	Phase                 string            `json:"phase,omitempty"`
-	Activity              string            `json:"activity,omitempty"`
-	StatusReason          string            `json:"statusReason,omitempty"`
-	Ready                 bool              `json:"ready,omitempty"`
-	ContainerStatus       string            `json:"containerStatus,omitempty"`
-	Config                *AgentConfig      `json:"config,omitempty"`
-	Runtime               *AgentRuntime     `json:"runtimeInfo,omitempty"` // Renamed JSON tag to avoid conflict
-	Labels                map[string]string `json:"labels,omitempty"`
-	CreatedAt             time.Time         `json:"createdAt,omitempty"`
-	UpdatedAt             time.Time         `json:"updatedAt,omitempty"`
+	HarnessConfigRevision string `json:"harnessConfigRevision,omitempty"`
+	// HarnessConfigSource mirrors api.AgentInfo.HarnessConfigSource: which
+	// resolution branch supplied the harness-config (hub-hydrated,
+	// template-bundled, broker-local, builtin, unresolved). Provenance only
+	// (ptone/scion#620).
+	HarnessConfigSource string            `json:"harnessConfigSource,omitempty"`
+	HarnessAuth         string            `json:"harnessAuth,omitempty"` // Resolved harness auth method
+	Image               string            `json:"image,omitempty"`       // Resolved container image
+	RuntimeType         string            `json:"runtime,omitempty"`     // Runtime type (docker, kubernetes, apple)
+	Profile             string            `json:"profile,omitempty"`     // Settings profile used
+	ProjectID           string            `json:"projectId,omitempty"`
+	UserID              string            `json:"userId,omitempty"`
+	Status              string            `json:"status"`
+	Phase               string            `json:"phase,omitempty"`
+	Activity            string            `json:"activity,omitempty"`
+	StatusReason        string            `json:"statusReason,omitempty"`
+	Ready               bool              `json:"ready,omitempty"`
+	ContainerStatus     string            `json:"containerStatus,omitempty"`
+	Config              *AgentConfig      `json:"config,omitempty"`
+	Runtime             *AgentRuntime     `json:"runtimeInfo,omitempty"` // Renamed JSON tag to avoid conflict
+	Labels              map[string]string `json:"labels,omitempty"`
+	CreatedAt           time.Time         `json:"createdAt,omitempty"`
+	UpdatedAt           time.Time         `json:"updatedAt,omitempty"`
 	// Warnings carries only the hub-only env drop warnings (a broker-local
 	// TZ value ignored for a hub-dispatched agent), so the hub can relay
 	// them in its own create and start responses. Other broker-local start
@@ -220,6 +237,11 @@ type ListAgentsResponse struct {
 
 // CreateAgentRequest is the request body for creating an agent.
 type CreateAgentRequest struct {
+	// workspaceAbsentAtAdmission is set by createAgent when the hub-managed
+	// project path ~/.scion/projects/<slug> did not exist when the request
+	// arrived. It is never read from the wire.
+	workspaceAbsentAtAdmission bool
+
 	RequestID   string             `json:"requestId,omitempty"`
 	ID          string             `json:"id,omitempty"`   // Hub UUID for status reporting
 	Slug        string             `json:"slug,omitempty"` // URL-safe identifier
@@ -229,6 +251,13 @@ type CreateAgentRequest struct {
 	Config      *CreateAgentConfig `json:"config,omitempty"`
 	HubEndpoint string             `json:"hubEndpoint,omitempty"`
 	AgentToken  string             `json:"agentToken,omitempty"`
+
+	// ExpectedRuntimeTargetID is the runtime target the Hub pinned the agent
+	// to (.design/flat-runtime-brokers-contract.md section 9). A flat
+	// Runtime Broker instance requires it and refuses a different value; a
+	// legacy Runtime Broker refuses any non-empty value. Checked before any
+	// side effect.
+	ExpectedRuntimeTargetID string `json:"expectedRuntimeTargetId,omitempty"`
 
 	// ResolvedEnv contains the fully merged environment variables and secrets
 	// from all applicable scopes (user, project, runtime broker). These are resolved
@@ -266,12 +295,34 @@ type CreateAgentRequest struct {
 	// while preserving the agent's home directory and clone-per-agent
 	// workspace. Ignored when ProvisionOnly is false.
 	Reprovision bool `json:"reprovision,omitempty"`
+	// SharedDirBackendChanges asks a Reprovision to change the recorded
+	// shared-dir storage backend of the named shared dirs (dir name to
+	// "nfs" or "local"; `scion reincarnate --shared-dir-backend`). Only the agent's
+	// record changes; no data is copied, moved or deleted. Refused on a
+	// request that is not a Reprovision.
+	SharedDirBackendChanges map[string]string `json:"sharedDirBackendChanges,omitempty"`
+	// AllowEmptySharedDir, with SharedDirBackendChanges, skips the start
+	// check that refuses an empty directory on the new backend while the
+	// dir's directory on its previous backend is not empty.
+	AllowEmptySharedDir bool `json:"allowEmptySharedDir,omitempty"`
+	// ExpectExistingNFSWorkspace, on a ProvisionOnly request, says the agent
+	// is being moved here from another broker on the same NFS export: before
+	// provisioning, the broker confirms through its own mount that the
+	// workspace already exists ("agent-dir": <subPathRoot>/<projectID>/
+	// agents/<name>/workspace; "project": <subPathRoot>/<projectID>/
+	// workspace) and refuses with 409 when it does not, instead of
+	// provisioning an empty workspace (design ptone/scion#2727 A9).
+	ExpectExistingNFSWorkspace string `json:"expectExistingNfsWorkspace,omitempty"`
 	// ProjectPath is the local filesystem path to the project on this runtime broker.
 	// This is provided by the Hub from the project provider record.
 	ProjectPath string `json:"projectPath,omitempty"`
 	// WorkspaceStoragePath is the GCS storage path for bootstrapped workspaces.
 	// When set, the broker downloads the workspace from GCS instead of using ProjectPath.
 	WorkspaceStoragePath string `json:"workspaceStoragePath,omitempty"`
+	// WorkspaceStorageBucket is the GCS bucket holding WorkspaceStoragePath,
+	// sent by the hub that uploaded it. When empty the broker falls back to
+	// its own StorageBucket setting (older hubs do not send it).
+	WorkspaceStorageBucket string `json:"workspaceStorageBucket,omitempty"`
 
 	// ProjectSlug is the project slug for hub-managed projects.
 	// When set, the broker creates the workspace at ~/.scion.projects/<slug>/
@@ -417,6 +468,13 @@ type CreateAgentConfig struct {
 	// top-of-chain slot. Nil when the hub sent none: local dispatch, a
 	// file-mode hub, or a hub that predates the field. See design §3.2.3.
 	HubAgentDefaults *api.HubAgentDefaults `json:"hubAgentDefaults,omitempty"`
+
+	// TelemetryPolicy is the project's enforced telemetry on/off (a POLICY
+	// tier, not a default). When set it becomes opts.TelemetryOverride,
+	// applied last at Start, and beats both the agent's config and the
+	// requester's SCION_TELEMETRY_ENABLED env flag (decision E6,
+	// ptone/scion#4218). Nil = no policy.
+	TelemetryPolicy *bool `json:"telemetryPolicy,omitempty"`
 }
 
 // GCPIdentityConfig holds GCP identity configuration passed from Hub to Broker.
@@ -451,6 +509,11 @@ type CreateAgentResponse struct {
 	// treats an absent echo on a reprovision dispatch as a failure, which is
 	// what keeps that failure mode closed instead of a silent no-op.
 	Reprovisioned bool `json:"reprovisioned,omitempty"`
+
+	// SharedDirBackendsChanged is set true when a Reprovision recorded the
+	// request's SharedDirBackendChanges. A broker that predates the field
+	// ignores the change, so the hub treats a missing echo as a failure.
+	SharedDirBackendsChanged bool `json:"sharedDirBackendsChanged,omitempty"`
 
 	// LaunchPending is set true instead of running Manager.Start inline when
 	// the broker accepted an async launch (design §3.2, §7 P1b-1): the Hub
@@ -630,6 +693,7 @@ func AgentInfoToResponse(info api.AgentInfo) AgentResponse {
 		Template:              info.Template,
 		HarnessConfig:         info.HarnessConfig,
 		HarnessConfigRevision: info.HarnessConfigRevision,
+		HarnessConfigSource:   info.HarnessConfigSource,
 		HarnessAuth:           info.HarnessAuth,
 		Image:                 info.Image,
 		RuntimeType:           info.Runtime,

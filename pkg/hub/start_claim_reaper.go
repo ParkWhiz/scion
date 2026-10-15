@@ -59,9 +59,6 @@ func (s *Server) reapStartClaims(ctx context.Context) {
 		slog.Warn("Start claim reaper: listing claims failed", "error", err)
 		return
 	}
-	if len(agents) == 0 {
-		return
-	}
 	now, err := s.store.StoreClock(ctx)
 	if err != nil {
 		slog.Warn("Start claim reaper: reading the store clock failed", "error", err)
@@ -78,6 +75,7 @@ func (s *Server) reapStartClaims(ctx context.Context) {
 		return
 	}
 	views := map[string]*reaperBrokerView{}
+	defer s.reapProvisionedStartsLeftRunning(ctx, now, holds, views)
 	for _, a := range agents {
 		view, ok := views[a.RuntimeBrokerID]
 		if !ok {
@@ -185,12 +183,39 @@ func (s *Server) reapUnconfirmedStartClaim(ctx context.Context, a *store.Agent, 
 	inFlight := obs.InFlight
 	gone := obs.State == store.ObservedAbsent || obs.State == store.ObservedPresentTerminal
 	if gone && !inFlight && !obs.ObservedAt.Before(a.StartClaimUnconfirmedAt.Add(unconfirmedObservationLag)) {
+		// Revoked before the release, while the claim still refuses
+		// other starts, so the revoke cannot reach a newer start's
+		// credential.
+		s.revokeUnconfirmedCreateCredential(ctx, a)
 		release("runtime shows nothing running")
+		if a.Phase == string(state.PhaseCreated) && a.RunIntent == store.RunIntentRunning && a.RunIntentAt != nil {
+			s.settleFailedProvisionedStart(ctx, a.ID, *a.RunIntentAt, provisionedStartNotCompletedMessage)
+		}
 		return
 	}
 	if exp, ok := holds.HoldExpiry(a); ok && !now.Before(exp) && (obs.State == store.ObservedPresentRunning || inFlight) {
 		s.stopUnconfirmedStart(ctx, a.ID, a.StartClaimID)
 	}
+}
+
+// revokeUnconfirmedCreateCredential revokes the credential of a create
+// whose start claim a is about to be released because nothing came up. A
+// create whose dispatch outcome was unknown kept its credential for a
+// start that might still come up (keepUnknownOutcomeStart); nothing did,
+// so it is revoked, as a failed create or a delete would
+// (ptone/scion#4817). It acts only on a create claim, and only while that
+// same claim (a.StartClaimID) is still held unconfirmed: while it is, no
+// other start can claim the agent and mint a credential, so the revoke
+// reaches only this create's.
+func (s *Server) revokeUnconfirmedCreateCredential(ctx context.Context, a *store.Agent) {
+	if a.StartClaimKind != store.StartClaimCreate || a.StartClaimID == "" {
+		return
+	}
+	cur, err := s.store.GetAgent(ctx, a.ID)
+	if err != nil || cur.StartClaimID != a.StartClaimID || cur.StartClaimState != store.StartClaimUnconfirmed {
+		return
+	}
+	revokeAgentCredentialsBestEffort(ctx, s.store, a.ID, agentCredentialRevokeReasonCreateFailed)
 }
 
 // reaperTarget is the target the reaper reads an agent's observation on:
@@ -210,9 +235,9 @@ func reaperTarget(a *store.Agent, view *reaperBrokerView) string {
 // stopUnconfirmedStart stops, with normal grace, a container an unconfirmed
 // start left running past its hold. It does not change run intent. The stop
 // is sent from its own goroutine, so one slow broker does not age the rest
-// of the tick, and only after re-reading the agent: the same unconfirmed
-// claim (claimID) must still be held, so a stop never reaches a newer
-// start's container once that claim was released.
+// of the tick, and only after the same unconfirmed claim (claimID) is
+// swapped for a stop-kind claim under the row lock: a stop never reaches a
+// newer start's container, and no start can begin while the stop runs.
 func (s *Server) stopUnconfirmedStart(ctx context.Context, agentID, claimID string) {
 	if last, ok := s.claimStops.Load(agentID); ok && time.Since(last.(time.Time)) < unconfirmedStopInterval {
 		return
@@ -225,8 +250,25 @@ func (s *Server) stopUnconfirmedStart(ctx context.Context, agentID, claimID stri
 	go func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer cancel()
+		// Swap the unconfirmed claim for a live stop-kind claim first: only
+		// while the same unconfirmed claim is held (a released or newer claim
+		// refuses it), and no start can claim the agent until the stop is
+		// applied. The stop claim then stays held, unconfirmed, until an
+		// inventory shows the container gone, like the claim it replaced.
+		cfg := s.startClaimSettings()
+		stop, err := s.store.ConvertUnconfirmedToStop(stopCtx, agentID, claimID, s.instanceID, cfg.LeaseTTL)
+		if err != nil {
+			return
+		}
+		defer func() {
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(stopCtx), claimReleaseTimeout)
+			defer cancel()
+			if _, err := s.store.MarkStartUnconfirmed(rctx, agentID, stop.ID, s.instanceID, cfg.Holds().For(store.StartClaimStop)); err != nil {
+				slog.Warn("Start claim reaper: keeping the stop claim failed; the reaper will settle it", "agent_id", agentID, "error", err)
+			}
+		}()
 		cur, err := s.store.GetAgent(stopCtx, agentID)
-		if err != nil || cur.StartClaimID != claimID || cur.StartClaimState != store.StartClaimUnconfirmed {
+		if err != nil {
 			return
 		}
 		slog.Info("Start claim reaper: stopping a container an unconfirmed start left running past its hold", "agent_id", agentID)
@@ -252,5 +294,68 @@ func (s *Server) demoteOwnClaimsOnRestart(ctx context.Context) {
 	}
 	if n > 0 {
 		slog.Info("Demoted start claims of a previous process of this pod", "count", n)
+	}
+}
+
+// provisionedStartNotCompletedMessage is the message a provisioned agent gets
+// when the runtime shows its start never produced a container.
+const provisionedStartNotCompletedMessage = "Start did not complete: the runtime shows no container for this agent. " + provisionedRestingNote
+
+// reapProvisionedStartsLeftRunning is the backstop for a provisioned agent
+// (phase created) whose start left run intent running with no claim, no
+// active launch and no message: a start whose failure was not written. Once
+// a fresh complete inventory shows its target has no container and no start
+// in flight, it gets the message and its intent goes back to stopped (its
+// resting state); it can be started again. A provisioned agent at rest
+// (intent stopped) is never touched, and neither is one changed within the
+// create hold.
+func (s *Server) reapProvisionedStartsLeftRunning(ctx context.Context, now time.Time, holds store.StartClaimHolds, views map[string]*reaperBrokerView) {
+	var candidates []store.Agent
+	opts := store.ListOptions{SkipTotalCount: true}
+	for {
+		res, err := s.store.ListAgents(ctx, store.AgentFilter{Phase: string(state.PhaseCreated)}, opts)
+		if err != nil {
+			slog.Warn("Start claim reaper: listing provisioned agents failed", "error", err)
+			return
+		}
+		for _, a := range res.Items {
+			if a.RunIntent == store.RunIntentRunning && a.RunIntentAt != nil && a.StartClaimID == "" &&
+				a.LaunchState != store.LaunchStateActive && a.DeletedAt.IsZero() &&
+				now.Sub(a.Updated) > holds.Create {
+				candidates = append(candidates, a)
+			}
+		}
+		if res.NextCursor == "" {
+			break
+		}
+		opts.Cursor = res.NextCursor
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(candidates))
+	for _, a := range candidates {
+		ids = append(ids, a.ID)
+	}
+	obs, err := s.store.GetRecoveryObservations(ctx, ids)
+	if err != nil {
+		return
+	}
+	for i := range candidates {
+		a := &candidates[i]
+		view, ok := views[a.RuntimeBrokerID]
+		if !ok {
+			view = s.reaperBrokerView(ctx, a.RuntimeBrokerID)
+			views[a.RuntimeBrokerID] = view
+		}
+		o, ok := obs[a.ID]
+		if view == nil || !ok || o.Target == "" || o.Target != reaperTarget(a, view) || !observationFresh(o, view.inv, now) {
+			continue
+		}
+		if o.State != store.ObservedAbsent || o.InFlight {
+			continue
+		}
+		slog.Info("Start claim reaper: provisioned agent's start left no container; back at rest", "agent_id", a.ID)
+		s.settleFailedProvisionedStart(ctx, a.ID, *a.RunIntentAt, provisionedStartNotCompletedMessage)
 	}
 }

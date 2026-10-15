@@ -14,9 +14,9 @@
 
 // Package conduit is the agent end of a conduit session (design §3.3,
 // §3.10): sciontool dials the hub's /api/v1/conduit endpoint, keeps the
-// session alive across relay drains and failures, and serves inbound TCP
-// streams to in-container loopback ports after verifying each stream's
-// grant.
+// session alive across relay drains and failures, and serves inbound
+// streams after verifying each stream's grant: TCP to in-container
+// loopback ports, and PTY as a tmux client on a local pty.
 package conduit
 
 import (
@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -37,6 +38,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/grant"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/target"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/transport/ws"
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/conduit/sshd"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
 	conduitv1 "github.com/GoogleCloudPlatform/scion/proto/conduit/v1"
 )
@@ -48,11 +50,24 @@ const (
 	// scion.run_id label. It is presented as
 	// Hello.capabilities.endpoint_incarnation.
 	EnvLaunchID = "SCION_LAUNCH_ID"
-	// EnvHubConduit is set to "true" by a hub that serves conduit
-	// sessions (hub.conduit on). Without it sciontool never dials
-	// /api/v1/conduit.
-	EnvHubConduit = "SCION_HUB_CONDUIT"
+	// EnvHubExperiments is the comma-separated list of hub experiments
+	// the agent acts on, set by the hub on every dispatch.
+	EnvHubExperiments = "SCION_HUB_EXPERIMENTS"
+	// ExperimentConduit in EnvHubExperiments means the hub serves conduit
+	// sessions. Without it sciontool never dials /api/v1/conduit.
+	ExperimentConduit = "hub.conduit"
 )
+
+// HubServesConduit reports whether the hub listed ExperimentConduit in
+// EnvHubExperiments, read through getenv.
+func HubServesConduit(getenv func(string) string) bool {
+	for _, name := range strings.Split(getenv(EnvHubExperiments), ",") {
+		if strings.TrimSpace(name) == ExperimentConduit {
+			return true
+		}
+	}
+	return false
+}
 
 // Close codes this package classifies that pkg/conduit does not define
 // (they belong to pkg/conduit/relay, which a target does not import).
@@ -124,8 +139,24 @@ type Options struct {
 	// default net.Dialer). It is only ever called with a 127.0.0.1
 	// address.
 	DialLocal func(ctx context.Context, network, addr string) (net.Conn, error)
-	// OnSession is called after each admitted session's grant keys are
-	// installed. Optional.
+	// SpawnPTY starts the tmux client for a PTY stream (test seam). When
+	// it is nil and NoPTY is unset, New installs the default: it runs
+	// `tmux attach-session` on a local pty as PTYUser, when this build
+	// supports ptys and tmux is on PATH at New. When it is still nil
+	// after New (NoPTY set, or no default available) the agent neither
+	// advertises nor serves the pty kind.
+	SpawnPTY PTYSpawner
+	// NoPTY opts out of pty streams: New installs no default SpawnPTY,
+	// so the agent neither advertises nor serves the pty kind even when
+	// tmux is on PATH. SpawnPTY must be nil when NoPTY is set.
+	NoPTY bool
+	// PTYUser is who the default SpawnPTY runs the tmux client as.
+	PTYUser PTYUser
+	// SSH is the embedded SSH server that serves ssh streams (design
+	// §3.8). When nil the agent neither advertises nor serves the ssh
+	// kind. New validates it.
+	SSH *sshd.Config
+	// OnSession is called after each session is admitted. Optional.
 	OnSession func(*conduitv1.Welcome)
 	// OnEnd is called after each attempt or session ends with the
 	// dialer's decision: the redial delay, or the error Run returns.
@@ -136,9 +167,23 @@ type Options struct {
 	Clock   clock.Clock
 	Backoff *core.Backoff
 	Session core.Config
+
+	// RPCRoutes lists the routes Session.RPCHandler serves, advertised
+	// as Hello.capabilities.rpc. It must be empty when
+	// Session.RPCHandler is nil.
+	RPCRoutes []string
+
+	// ptyBeforeAccept, when set, runs after a PTY stream's client is
+	// spawned and before the stream is accepted (test hook).
+	ptyBeforeAccept func(ctx context.Context)
+	// deadlineGrace, when set, replaces target.DeadlineGrace (test hook).
+	deadlineGrace time.Duration
+	// onRenewal, when set, receives the outcome of every renewal grant
+	// once it has been applied or refused (test hook).
+	onRenewal func(streamID uint32, err error)
 }
 
-// Agent is the agent's conduit dialer and TCP target.
+// Agent is the agent's conduit dialer and stream target (TCP, PTY).
 type Agent struct {
 	opts   Options
 	url    string
@@ -146,18 +191,48 @@ type Agent struct {
 	keys   target.KeyHolder
 	replay grant.ReplayCache
 
+	// deadlines enforces the authorization deadlines of accepted streams
+	// and verifies their renewals.
+	deadlines *target.Deadlines
+	// enforceDeadlines is the enforcement mode from the last grant-key
+	// fetch: a user stream's open grant must then carry authz_until.
+	enforceDeadlines atomic.Bool
+	// keyKick asks the key refresh loop for an immediate fetch.
+	keyKick chan struct{}
+	// renewals holds renewals waiting for a key fetch (renewalWorker).
+	renewals chan pendingRenewal
+	// unknownKidMu serializes fetches made for unknown kids;
+	// lastUnknownKidFetch is when the last one started.
+	unknownKidMu        sync.Mutex
+	lastUnknownKidFetch time.Time
+
 	mu            sync.Mutex
-	applied       []*conduitv1.Welcome // Welcomes whose keys were applied, newest last
 	lastCredRefsh time.Time
 	// refusedSince is when the current run of 4409 refusals began (zero
 	// while none is in progress); an admitted session resets it.
 	refusedSince time.Time
+	// live is the most recently admitted session (nil before the first).
+	live core.LocalSession
+	// authToken is a refreshed token not yet sent as AuthRefresh, and
+	// authSeq its refresh sequence number; sentSeq is the sequence number
+	// of the last token sent. A token not newer than both is stale and
+	// never sent.
+	authToken string
+	authSeq   uint64
+	sentSeq   uint64
+
+	// authSendMu serializes AuthRefresh sends, so the newest token is
+	// always the last one sent.
+	authSendMu sync.Mutex
 }
 
 // New validates opts and returns an Agent.
 func New(opts Options) (*Agent, error) {
 	if opts.AgentID == "" || opts.ProjectID == "" {
 		return nil, errors.New("conduit: agent and project ids are required")
+	}
+	if len(opts.RPCRoutes) > 0 && opts.Session.RPCHandler == nil {
+		return nil, errors.New("conduit: RPCRoutes set without Session.RPCHandler")
 	}
 	if opts.Token == nil {
 		return nil, errors.New("conduit: Token is required")
@@ -174,16 +249,31 @@ func New(opts Options) (*Agent, error) {
 		d := &net.Dialer{Timeout: localDialTimeout}
 		opts.DialLocal = d.DialContext
 	}
+	if opts.SSH != nil {
+		if err := opts.SSH.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if opts.NoPTY && opts.SpawnPTY != nil {
+		return nil, errors.New("conduit: NoPTY and SpawnPTY are mutually exclusive")
+	}
+	if opts.SpawnPTY == nil && !opts.NoPTY {
+		opts.SpawnPTY = defaultPTYSpawner(opts.PTYUser)
+	}
 	clk := opts.Clock
 	if clk == nil {
 		clk = clock.Real()
 	}
-	return &Agent{
-		opts:   opts,
-		url:    u,
-		clk:    clk,
-		replay: grant.NewMemoryReplayCache(clk.Now, 0),
-	}, nil
+	a := &Agent{
+		opts:     opts,
+		url:      u,
+		clk:      clk,
+		replay:   grant.NewMemoryReplayCache(clk.Now, 0),
+		keyKick:  make(chan struct{}, 1),
+		renewals: make(chan pendingRenewal, renewalQueueSize),
+	}
+	a.deadlines = &target.Deadlines{Keys: &a.keys, Replay: a.replay, Clock: clk, Grace: opts.deadlineGrace}
+	return a, nil
 }
 
 // EndpointURL returns the ws(s) URL of the hub's conduit endpoint.
@@ -210,18 +300,27 @@ func EndpointURL(hubURL string) (string, error) {
 func (a *Agent) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// The first key fetch runs at once: grants verify only against keys
+	// fetched from the hub, never against a Welcome's.
+	a.kickKeyRefresh()
 	go a.refreshKeysLoop(ctx)
+	go a.renewalWorker(ctx)
 
 	cfg := a.opts.Session
 	cfg.Clock = a.clk
 	cfg.StreamHandler = core.StreamHandlerFunc(a.handleStream)
+	cfg.OnStreamRenewal = a.handleRenewal
 	r := &core.Reconnector{
 		Dialer: &ws.Dialer{URL: a.url, Header: a.header, WS: a.opts.WS},
 		Config: cfg,
 		Hello:  a.hello,
 		OnSession: func(_ context.Context, s core.Session, w *conduitv1.Welcome) {
+			if ls, ok := s.(core.LocalSession); ok {
+				a.mu.Lock()
+				a.live = ls
+				a.mu.Unlock()
+			}
 			a.admitted()
-			a.applyWelcomeKeys(w)
 			log.Info("Conduit session established (session %s, relay %s, incarnation %q)",
 				w.GetSessionId(), w.GetRelayInstanceId(), w.GetEndpointIncarnation())
 			if a.opts.OnSession != nil {
@@ -248,17 +347,26 @@ func (a *Agent) hello() *conduitv1.Hello {
 		PrincipalId:   a.opts.AgentID,
 		ClientVersion: a.opts.ClientVersion,
 		Capabilities: &conduitv1.Capabilities{
-			StreamKinds:         []string{grant.StreamKindTCP},
+			StreamKinds:         a.streamKinds(),
+			Rpc:                 a.opts.RPCRoutes,
 			EndpointIncarnation: a.opts.LaunchID,
+			Features:            []string{core.FeatureStreamRenewal},
 		},
 	}
 }
+
+// runIDHeader carries the agent's run id on agent-token requests (the
+// sciontool hub client's RunIDHeader).
+const runIDHeader = "X-Scion-Run-Id"
 
 // header returns the upgrade request's credentials, read afresh for every
 // attempt so a refreshed token is used.
 func (a *Agent) header(context.Context) (http.Header, error) {
 	h := http.Header{}
 	h.Set("X-Scion-Agent-Token", a.opts.Token())
+	if a.opts.LaunchID != "" {
+		h.Set(runIDHeader, a.opts.LaunchID)
+	}
 	if a.opts.ApplyTransportHeaders != nil {
 		if err := a.opts.ApplyTransportHeaders(h); err != nil {
 			log.Debug("Conduit: no transport credential available: %v", err)
@@ -379,6 +487,51 @@ func (a *Agent) refused(end core.End, cause string) (time.Duration, error) {
 	}
 	log.Warn("Conduit: refused (%v); retrying in %v", cause, core.BackoffMax)
 	return core.BackoffMax, nil
+}
+
+// ErrNoLiveSession is returned by RefreshAuth when no session is live:
+// the next session is admitted with the current token anyway.
+var ErrNoLiveSession = errors.New("conduit: no live session")
+
+// RefreshAuth sends token to the hub as AuthRefresh on the live session,
+// so the hub re-validates the session's credential in band (design §3.3)
+// without disturbing its streams. Call it after each successful token
+// refresh, with seq numbering the refreshes in the order they completed
+// (hub.TokenRefreshResult.Seq). Tokens are sent in seq order, whatever
+// order the calls arrive in: a token whose seq is not greater than the
+// newest one already sent or queued is stale (the hub may already have
+// replaced it) and is dropped, and a call whose token a concurrent call
+// already sent returns nil.
+func (a *Agent) RefreshAuth(token string, seq uint64) error {
+	a.mu.Lock()
+	if seq <= a.sentSeq || seq <= a.authSeq {
+		a.mu.Unlock()
+		return nil
+	}
+	a.authToken, a.authSeq = token, seq
+	a.mu.Unlock()
+
+	a.authSendMu.Lock()
+	defer a.authSendMu.Unlock()
+	a.mu.Lock()
+	s, tok, sendSeq := a.live, a.authToken, a.authSeq
+	a.authToken = ""
+	if tok != "" {
+		a.sentSeq = sendSeq
+	}
+	a.mu.Unlock()
+	if tok == "" {
+		return nil
+	}
+	if s == nil {
+		return ErrNoLiveSession
+	}
+	select {
+	case <-s.Done():
+		return ErrNoLiveSession
+	default:
+	}
+	return s.RefreshAuth([]byte(tok), 0)
 }
 
 // refreshCredential refreshes the agent token, at most once per

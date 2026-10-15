@@ -24,6 +24,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -65,7 +66,7 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		s.listUsers(w, r)
 	case http.MethodPost:
-		s.createUser(w, r)
+		s.handleProvisionUser(w, r)
 	default:
 		MethodNotAllowed(w, http.MethodGet, http.MethodPost)
 	}
@@ -127,13 +128,6 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
-	// User creation is managed by the hub's internal sign-in flows (OAuth).
-	// Direct API creation is not permitted.
-	writeError(w, http.StatusForbidden, ErrCodeForbidden,
-		"user creation is managed through sign-in flows and cannot be performed via the API", nil)
-}
-
 func (s *Server) handleUserByID(w http.ResponseWriter, r *http.Request) {
 	id, action := extractAction(r, "/api/v1/users")
 
@@ -167,7 +161,7 @@ func (s *Server) handleUserByID(w http.ResponseWriter, r *http.Request) {
 // revokeUserSessions increments the user's session generation, invalidating
 // all existing cookie-based sessions for that user.
 func (s *Server) revokeUserSessions(w http.ResponseWriter, r *http.Request, id string) {
-	admin, ok := s.requireAdmin(w, r)
+	admin, ok := s.requireAdminAt(w, r, authzop.ReasonSessionRecovery, "users.sessions.revoke")
 	if !ok {
 		return
 	}
@@ -177,6 +171,7 @@ func (s *Server) revokeUserSessions(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
+	s.publishConduitAuthzChanged(conduitAuthzMatch{UserID: id})
 	slog.Info("Admin revoked all sessions for user",
 		"user_id", id,
 		"admin_id", admin.ID(),
@@ -230,7 +225,8 @@ func stripPreferencesForViewer(ctx context.Context, u *store.User, cap *Capabili
 //
 // User mutation endpoints (PATCH, DELETE) require an interactive session JWT
 // or dev credential. Broker, agent, UAT, and federation credentials are
-// rejected at the boundary.
+// rejected at the boundary by requireSessionCredentialFor
+// (session_only_gate.go), which reports the session-only reason.
 // ---------------------------------------------------------------------------
 
 // allowedMutationCredentials is the closed set of credential kinds permitted
@@ -240,38 +236,15 @@ var allowedMutationCredentials = map[CredentialKind]bool{
 	CredentialKindDev:         true,
 }
 
-// requireSessionCredential verifies the request uses an interactive session
-// JWT or dev credential. Returns the actor UserIdentity on success, writes
-// an HTTP error and returns nil on failure.
-func (s *Server) requireSessionCredential(w http.ResponseWriter, ctx context.Context) (UserIdentity, bool) {
-	if s.authzService == nil {
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"authorization service unavailable", nil)
-		return nil, false
+// updateUserSessionOnlyReason is the session-only reason of PATCH
+// /api/v1/users/{id}: INTERACTIVE_STATE when the path names the caller's
+// own record, GOV_PENDING for any other record. It depends only on the
+// path, so the credential check still runs before the body is read.
+func updateUserSessionOnlyReason(ctx context.Context, id string) authzop.SessionOnlyReason {
+	if identity := GetIdentityFromContext(ctx); identity != nil && identity.ID() == id {
+		return authzop.ReasonInteractiveState
 	}
-
-	identity := GetIdentityFromContext(ctx)
-	if identity == nil {
-		Unauthorized(w)
-		return nil, false
-	}
-
-	actor, ok := identity.(UserIdentity)
-	if !ok {
-		Forbidden(w)
-		return nil, false
-	}
-
-	// Enforce credential boundary: only interactive session JWTs and dev
-	// tokens are allowed for user mutations.
-	cred := GetCredentialContextFromContext(ctx)
-	if !allowedMutationCredentials[cred.Kind] {
-		writeError(w, http.StatusForbidden, ErrCodeForbidden,
-			fmt.Sprintf("user mutations require an interactive session; credential kind %q is not allowed", cred.Kind), nil)
-		return nil, false
-	}
-
-	return actor, true
+	return authzop.ReasonGovernancePending
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +318,7 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
 
 	// Credential boundary + identity check (R4-C5).
-	actor, ok := s.requireSessionCredential(w, ctx)
+	actor, ok := s.requireSessionCredentialFor(w, ctx, updateUserSessionOnlyReason(ctx, id))
 	if !ok {
 		return
 	}
@@ -480,6 +453,16 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 			BadRequest(w, fmt.Sprintf("unsupported role %q; valid values are \"admin\", \"member\" and \"viewer\"", *updates.Role))
 			return
 		}
+	}
+
+	// A test identity's role is fixed at issuance (member or viewer); no
+	// update path changes it, and in particular none can make it admin.
+	// Refused for every row that is not positively human (a test identity
+	// of any kind, or an unrecognized kind).
+	if updates.Role != nil && !user.IsHumanKind() && *updates.Role != user.Role {
+		writeError(w, http.StatusConflict, ErrCodeConflict, errRoleOnTestFixture.Error(),
+			map[string]interface{}{"reason": "test_identity_role_fixed"})
+		return
 	}
 
 	// Validate status field.
@@ -618,6 +601,14 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 			return errActivateInvitedUser
 		}
 
+		// Suspension must not leave a scope with no active constraint
+		// admin (the same check as role-binding removal and deletion).
+		if updates.Status != nil && *updates.Status == store.UserStatusSuspended && beforeStatus != store.UserStatusSuspended {
+			if err := checkUserRemovalAdminLockout(ctx, tx, time.Now(), txUser.ID, userRemovalSuspend); err != nil {
+				return err
+			}
+		}
+
 		// Role transition: derives classification from canonical binding state
 		// inside the transaction, not from User.Role (R4-fix).
 		var bindingMutation bindingMutationKind
@@ -715,7 +706,10 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 	})
 
 	if err != nil {
-		if errors.Is(err, errLastSuperAdmin) || errors.Is(err, errSelfDemotion) || errors.Is(err, errRoleOnInvitedUser) || errors.Is(err, errActivateInvitedUser) {
+		if writeConstraintAdminLockoutError(w, err) {
+			return
+		}
+		if errors.Is(err, errLastSuperAdmin) || errors.Is(err, errSelfDemotion) || errors.Is(err, errRoleOnInvitedUser) || errors.Is(err, errActivateInvitedUser) || errors.Is(err, errRoleOnTestFixture) {
 			writeError(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil)
 		} else if errors.Is(err, errBindingStateDrift) {
 			writeError(w, http.StatusConflict, "binding_state_drift", err.Error(), nil)
@@ -724,6 +718,10 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 				"user update failed: "+err.Error(), nil)
 		}
 		return
+	}
+
+	if needsPromote || needsSuspend {
+		s.publishConduitAuthzChanged(conduitAuthzMatch{UserID: user.ID})
 	}
 
 	// This response applies the same per-viewer preferences visibility rule
@@ -850,6 +848,10 @@ var errLastSuperAdmin = errors.New("cannot remove the last super-admin; promote 
 // binding mutation.
 var errSelfDemotion = errors.New("cannot demote yourself; ask another admin to change your role")
 
+// errRoleOnTestFixture is returned when a role change targets a hub test
+// identity, whose role is fixed at issuance.
+var errRoleOnTestFixture = errors.New("the role of a test identity is fixed at issuance")
+
 // errRoleOnInvitedUser is returned when PATCH sets a role on an invited user.
 var errRoleOnInvitedUser = errors.New("role is assigned when the user first signs in")
 
@@ -911,6 +913,11 @@ func (s *Server) executeRoleTransition(
 	actorID string,
 	preAuthState superAdminBindingState,
 ) (bindingMutationKind, error) {
+	// Containment: a test identity's role never changes, so it can never
+	// become admin. Checked on the transactional row.
+	if !user.IsHumanKind() && newRole != user.Role {
+		return bindingMutationNone, errRoleOnTestFixture
+	}
 	// Determine canonical binding state inside the transaction (R4-fix).
 	txState, err := s.superAdminBindingStateForUser(ctx, tx, user.ID, superAdminRD)
 	if err != nil {
@@ -1022,6 +1029,11 @@ func (s *Server) deleteSuperAdminBindingTx(
 			}
 			slog.Info("deleted super-admin binding via admin role mutation",
 				"user_id", userID, "binding_id", b.ID)
+			// The user's system authority ended: re-evaluate the user's
+			// project standing (ptone/scion#3433).
+			if err := enqueueMembershipLossTx(ctx, tx, userID, "", store.MembershipLossTriggerSystemScopeChange, auditActorFromContext(ctx)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1049,6 +1061,9 @@ func (s *Server) checkLastSuperAdminTx(
 		return fmt.Errorf("acquire admin-guard lock: %w", err)
 	}
 
+	// This read is UNCLAMPED (it does not go through the authorization
+	// service's test-identity grant clamp), so a hub test identity, which
+	// can never hold super-admin authority, is excluded explicitly below.
 	systemBindings, err := tx.ListRoleBindingsForScope(ctx, store.RoleScopeSystem, "")
 	if err != nil {
 		return fmt.Errorf("failed to verify admin count: %w", err)
@@ -1095,7 +1110,12 @@ func (s *Server) checkLastSuperAdminTx(
 				"principal_id", uid, "error", err)
 			continue
 		}
-		if u.Status == "active" {
+		// A hub test identity never counts as a surviving super-admin: the
+		// member clamp drops a fixture's super-admin grant, and an
+		// admin-kind identity's authority expires with it.
+		// Only a positively human row counts: an unrecognized kind never
+		// counts as a surviving super-admin (fail closed).
+		if u.Status == "active" && u.IsHumanKind() {
 			activeAdminCount++
 		}
 	}
@@ -1114,13 +1134,16 @@ func (s *Server) checkLastSuperAdminTx(
 // Guards: self-deletion and last-active-super-admin are prevented based on
 // bindings (not User.Role). All operations — last-admin check, skill cleanup,
 // user deletion, and audit — execute in a single atomic transaction (R4-C2).
+// A user who still owns agents is refused with 409 (ptone/scion#2769). The
+// user's user-scope secrets and env vars are removed after commit, best
+// effort.
 // ---------------------------------------------------------------------------
 
 func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
 
 	// Credential boundary + identity check (R4-C5).
-	actor, ok := s.requireSessionCredential(w, ctx)
+	actor, ok := s.requireSessionCredentialFor(w, ctx, authzop.ReasonGovernancePending)
 	if !ok {
 		return
 	}
@@ -1173,25 +1196,16 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request, id string) {
 		if err := s.checkLastSuperAdminTx(ctx, tx, user.ID, superAdminRD); err != nil {
 			return err
 		}
-
-		// Last-project-owner guard plus role-binding cascade
-		// (ptone/scion#2598). Runs before the user row is deleted, in the
-		// same transaction; a concurrent grant or role change to the
-		// user's bindings that commits before the cascade aborts the
-		// delete with 409 conflict (a concurrent revoke does not; residual
-		// race: ptone/scion#2769).
-		if err := guardAndCascadeUserRoleBindingsTx(ctx, tx, user.ID, s.membershipNow()); err != nil {
+		// Constraint-admin lockout guard, shared with suspension and
+		// role-binding removal.
+		if err := checkUserRemovalAdminLockout(ctx, tx, time.Now(), user.ID, userRemovalDelete); err != nil {
 			return err
 		}
 
-		// Clean up user-scoped skill injections.
-		if _, err := tx.DeleteSkillInjectionsByScope(ctx, store.SkillInjectionScopeUser, id); err != nil {
-			return fmt.Errorf("delete skill injections: %w", err)
-		}
-
-		// Delete the user record.
-		if err := tx.DeleteUser(ctx, id); err != nil {
-			return fmt.Errorf("delete user: %w", err)
+		// Agent guard, binding cascade, skill injections, group
+		// memberships and the user row (deleteUserRowCascadeTx).
+		if err := deleteUserRowCascadeTx(ctx, tx, user.ID, s.membershipNow()); err != nil {
+			return err
 		}
 
 		// Synchronous audit record (R4-C3).
@@ -1211,22 +1225,107 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request, id string) {
 	})
 
 	if err != nil {
-		var lastOwnerErr *lastProjectOwnerDeleteError
 		if errors.Is(err, errLastSuperAdmin) {
 			writeError(w, http.StatusConflict, ErrCodeConflict,
 				"cannot delete the last super-admin; promote another user first", nil)
-		} else if errors.As(err, &lastOwnerErr) {
-			writeLastProjectOwnerDeleteError(w, lastOwnerErr)
-		} else if errors.Is(err, errUserRoleBindingsChanged) {
-			writeUserRoleBindingsChangedError(w)
-		} else {
+		} else if !writeConstraintAdminLockoutError(w, err) && !writeUserDeleteCascadeError(w, err) {
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 				"user deletion failed: "+err.Error(), nil)
 		}
 		return
 	}
 
+	s.afterUserDeleted(ctx, id)
+
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteUserRowCascadeTx deletes the user row of userID and what hangs off
+// it, inside the caller's transaction. It is the part of a user deletion
+// shared by DELETE /api/v1/users/{id} and DELETE
+// /api/v1/test-identities/{id}. In order it:
+//
+//   - refuses while the user owns agents (checkUserOwnsNoAgentsTx; returns
+//     *userOwnsAgentsDeleteError, and store.ErrNotFound when the user no
+//     longer exists);
+//   - runs the last-project-owner guard and the role-binding cascade
+//     (guardAndCascadeUserRoleBindingsTx);
+//   - deletes the user-scope skill injections and the group memberships;
+//   - deletes the user row.
+//
+// The caller runs any caller-specific guard (the last super-admin check)
+// before it, writes its audit record after it in the same transaction, maps
+// errors with writeUserDeleteCascadeError, and calls afterUserDeleted once
+// the transaction commits.
+func deleteUserRowCascadeTx(ctx context.Context, tx store.Store, userID string, now time.Time) error {
+	// Refuse while the user owns agents (ptone/scion#2769).
+	if err := checkUserOwnsNoAgentsTx(ctx, tx, userID); err != nil {
+		return err
+	}
+
+	// Last-project-owner guard plus role-binding cascade
+	// (ptone/scion#2598). Runs before the user row is deleted, in the
+	// same transaction; a concurrent grant or role change to the
+	// user's bindings that commits before the cascade aborts the
+	// delete with 409 conflict (a concurrent revoke does not; residual
+	// race: ptone/scion#2769).
+	if err := guardAndCascadeUserRoleBindingsTx(ctx, tx, userID, now); err != nil {
+		return err
+	}
+
+	// Clean up user-scoped skill injections.
+	if _, err := tx.DeleteSkillInjectionsByScope(ctx, store.SkillInjectionScopeUser, userID); err != nil {
+		return fmt.Errorf("delete skill injections: %w", err)
+	}
+
+	// Remove the user's group memberships before the user row: the
+	// FK is ON DELETE SET NULL, so afterwards they would be orphans
+	// that still count toward group roles (ptone/scion#2769). Residual
+	// race on PostgreSQL: a concurrent AddGroupMember for this user can
+	// insert a row this delete does not see, which the FK then nulls.
+	// It is harmless: orphaned rows are excluded from counts and
+	// listings, and the startup sweep removes them. On PostgreSQL the
+	// call first locks the groups this user owns, so the transaction
+	// takes owned group rows before membership rows, like a concurrent
+	// project delete's group cascade (no 40P01 between the two).
+	if _, err := tx.DeleteGroupMembershipsForUser(ctx, userID); err != nil {
+		return fmt.Errorf("delete group memberships: %w", err)
+	}
+
+	// Delete the user record.
+	if err := tx.DeleteUser(ctx, userID); err != nil {
+		return fmt.Errorf("delete user: %w", err)
+	}
+
+	return nil
+}
+
+// writeUserDeleteCascadeError writes the response for an error returned by
+// deleteUserRowCascadeTx and reports whether it did. It returns false for
+// any other error, which the caller answers itself.
+func writeUserDeleteCascadeError(w http.ResponseWriter, err error) bool {
+	var lastOwnerErr *lastProjectOwnerDeleteError
+	var ownsAgentsErr *userOwnsAgentsDeleteError
+	switch {
+	case errors.As(err, &lastOwnerErr):
+		writeLastProjectOwnerDeleteError(w, lastOwnerErr)
+	case errors.As(err, &ownsAgentsErr):
+		writeUserOwnsAgentsDeleteError(w, ownsAgentsErr)
+	case errors.Is(err, errUserRoleBindingsChanged):
+		writeUserRoleBindingsChangedError(w)
+	default:
+		return false
+	}
+	return true
+}
+
+// afterUserDeleted runs once a user deletion has committed: it tells
+// conduit subscribers the user's authorization changed, then removes the
+// user's user-scope secrets and env vars as a best effort
+// (ptone/scion#2769). Failures are logged, not returned.
+func (s *Server) afterUserDeleted(ctx context.Context, userID string) {
+	s.publishConduitAuthzChanged(conduitAuthzMatch{UserID: userID})
+	s.removeUserScopedData(ctx, userID)
 }
 
 // lastOwnerProjectRef identifies a project that deleting a user would leave
@@ -1490,4 +1589,16 @@ func (s *Server) membershipNow() time.Time {
 		return s.membershipService.nowFunc()
 	}
 	return time.Now()
+}
+
+// writeConstraintAdminLockoutError writes a constraint-admin lockout
+// refusal with the status the role-binding path uses
+// (governanceErrorStatus) and reports whether err was one.
+func writeConstraintAdminLockoutError(w http.ResponseWriter, err error) bool {
+	var ge *GovernanceError
+	if !errors.As(err, &ge) || ge.Code != ErrCodeConstraintAdminLockout {
+		return false
+	}
+	writeError(w, governanceErrorStatus(ge.Code), ge.Code, ge.Message, ge.Details)
+	return true
 }

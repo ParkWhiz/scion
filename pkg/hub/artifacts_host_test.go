@@ -34,15 +34,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func artifactTestAgent(agentID, projectID string, scopes ...AgentTokenScope) *agentIdentityWrapper {
-	return &agentIdentityWrapper{AgentTokenClaims: &AgentTokenClaims{
-		Claims:      jwt.Claims{Subject: agentID, ID: "jti-" + agentID},
-		ProjectID:   projectID,
-		Scopes:      scopes,
-		ScopeSchema: CurrentAgentScopeSchema,
-	}}
-}
-
 func TestArtifactHostPrincipal(t *testing.T) {
 	host := newArtifactHost(&Server{})
 	tests := []struct {
@@ -151,7 +142,7 @@ func TestArtifactHostAuthorizeAgentScopes(t *testing.T) {
 
 	writer := contextWithIdentity(context.Background(), artifactTestAgent(agent.ID, project, ScopeProjectArtifactRead, ScopeProjectArtifactWrite))
 	assert.True(t, host.Authorize(writer, project, artifacts.PermissionCreate), "project:artifact:write grants artifact.create in the agent's project")
-	assert.True(t, host.Authorize(writer, project, artifacts.PermissionUpdate), "project:artifact:write grants artifact.update in the agent's project")
+	assert.False(t, host.Authorize(writer, project, artifacts.PermissionUpdate), "artifact.update is Reserved: no agent scope carries it")
 	assert.False(t, host.Authorize(writer, otherProject, artifacts.PermissionCreate), "artifact.create in another real project")
 
 	writeOnly := contextWithIdentity(context.Background(), artifactTestAgent(agent.ID, project, ScopeProjectArtifactWrite))
@@ -175,6 +166,44 @@ func TestArtifactHostAgentWithoutReadScopeIsNotServed(t *testing.T) {
 	}
 }
 
+// TestArtifactHostMissingScope: only an agent that presented a real token
+// is told which artifact scopes it lacks, every one of them in order
+// (ptone/scion#4571); users, synthetic in-process identities and
+// unauthenticated callers are told nothing, and an agent holding the scopes
+// is told nothing either. MissingScope reports the first of them.
+func TestArtifactHostMissingScope(t *testing.T) {
+	host := newArtifactHost(&Server{})
+	agentCtx := func(scopes ...AgentTokenScope) context.Context {
+		return contextWithIdentity(context.Background(), artifactTestAgent("agent-1", "proj-1", scopes...))
+	}
+	read, write := string(ScopeProjectArtifactRead), string(ScopeProjectArtifactWrite)
+	for name, tc := range map[string]struct {
+		ctx        context.Context
+		permission string
+		want       []string
+	}{
+		"no scopes":              {agentCtx(), artifacts.PermissionCreate, []string{read, write}},
+		"project:read only":      {agentCtx(ScopeProjectRead), artifacts.PermissionCreate, []string{read, write}},
+		"write without read":     {agentCtx(ScopeProjectArtifactWrite), artifacts.PermissionCreate, []string{read}},
+		"read without write":     {agentCtx(ScopeProjectArtifactRead), artifacts.PermissionCreate, []string{write}},
+		"both scopes":            {agentCtx(ScopeProjectArtifactRead, ScopeProjectArtifactWrite), artifacts.PermissionCreate, nil},
+		"no scopes, read":        {agentCtx(), artifacts.PermissionRead, []string{read}},
+		"read for read":          {agentCtx(ScopeProjectArtifactRead), artifacts.PermissionRead, nil},
+		"unknown permission":     {agentCtx(), "agent.read", nil},
+		"no identity":            {context.Background(), artifacts.PermissionCreate, nil},
+		"user":                   {contextWithIdentity(context.Background(), NewAuthenticatedUser("u1", "u1@example.com", "U1", "member", "web")), artifacts.PermissionCreate, nil},
+		"user access token":      {contextWithIdentity(context.Background(), NewScopedUserIdentityWithCeiling(NewAuthenticatedUser("u1", "u1@example.com", "U1", "member", "web"), "proj-1", []string{"agent:read"}, "uat-1", permissions.FrozenPermissionCeiling{Version: permissions.CeilingVersionV1, PermissionIDs: []string{"agent.read"}})), artifacts.PermissionCreate, nil},
+		"synthetic agent, no id": {contextWithIdentity(context.Background(), &agentIdentityWrapper{&AgentTokenClaims{Claims: jwt.Claims{Subject: "agent-1"}, ProjectID: "proj-1"}}), artifacts.PermissionCreate, nil},
+	} {
+		assert.Equal(t, tc.want, host.MissingScopes(tc.ctx, tc.permission), name)
+		first := ""
+		if len(tc.want) > 0 {
+			first = tc.want[0]
+		}
+		assert.Equal(t, first, host.MissingScope(tc.ctx, tc.permission), name)
+	}
+}
+
 // TestArtifactHostAuthorizeUsers checks that user decisions come from the
 // authz engine against the artifact's home project.
 func TestArtifactHostAuthorizeUsers(t *testing.T) {
@@ -183,8 +212,11 @@ func TestArtifactHostAuthorizeUsers(t *testing.T) {
 
 	admin := createScopeSuperAdmin(t, s, "artifact-superadmin")
 	adminCtx := contextWithIdentity(context.Background(), NewAuthenticatedUser(admin.ID, admin.Email, admin.DisplayName, admin.Role, "web"))
-	for _, p := range []string{artifacts.PermissionRead, artifacts.PermissionCreate, artifacts.PermissionUpdate, artifacts.PermissionDelete, artifacts.PermissionManage} {
+	for _, p := range []string{artifacts.PermissionRead, artifacts.PermissionCreate, artifacts.PermissionManage} {
 		assert.True(t, host.Authorize(adminCtx, project.ID, p), "super-admin holds %s", p)
+	}
+	for _, p := range []string{artifacts.PermissionUpdate, artifacts.PermissionDelete} {
+		assert.False(t, host.Authorize(adminCtx, project.ID, p), "%s is Reserved: no role holds it, super-admin included", p)
 	}
 
 	bobCtx := contextWithIdentity(context.Background(), NewAuthenticatedUser(bob.ID, bob.Email, bob.DisplayName, bob.Role, "web"))
@@ -214,6 +246,45 @@ func TestArtifactRoutesMatchService(t *testing.T) {
 		assert.Equal(t, permissions.ResourceArtifact, meta.Resource, pattern)
 	}
 	assert.Equal(t, RoutePublic, routeMetadataTable[artifacts.RouteShared].Classification)
+	assert.Equal(t, RoutePublic, routeMetadataTable[artifacts.RouteView].Classification)
+}
+
+// TestIsArtifactViewRequest: only clean GET or HEAD paths under the view
+// route pass the authentication middleware without credentials.
+func TestIsArtifactViewRequest(t *testing.T) {
+	for _, tc := range []struct {
+		method, target string
+		want           bool
+	}{
+		{http.MethodGet, "/api/v1/artifacts/view/cap/index.html", true},
+		{http.MethodHead, "/api/v1/artifacts/view/cap/img/a.png", true},
+		{http.MethodPost, "/api/v1/artifacts/view/cap/index.html", false},
+		{http.MethodPut, "/api/v1/artifacts/view/cap/index.html", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/../../x", false},
+		{http.MethodGet, "/api/v1/artifacts/view//index.html", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/dir/", false},
+		{http.MethodGet, "/api/v1/artifacts/abc/files/index.html", false},
+		{http.MethodGet, "/api/v1/artifactsview/cap/index.html", false},
+		{http.MethodGet, "/api/v1/agents", false},
+		// Escaped forms (the request URL keeps them in RawPath).
+		{http.MethodGet, "/api/v1/artifacts/view/cap/a%20b.png", true},
+		{http.MethodGet, "/api/v1/artifacts/view%2Fcap/index.html", false},
+		{http.MethodGet, "/api/v1%2Fartifacts/view/cap/index.html", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/a%2Fb.png", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/a%2fb.png", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/%2E%2E/x", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/%2e/x", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/a%5Cb", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/a%5cb", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/x%2F%2e%2E/y", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/a%00b.png", false},
+		{http.MethodGet, "/api/v1/artifacts/view/cap/a%2Eb.png", false},
+		{http.MethodGet, "/api/v1/artifacts/view/c%61p/index.html", false},
+		{http.MethodGet, "/api/v1/artifacts/%76iew/cap/index.html", false},
+	} {
+		r := httptest.NewRequest(tc.method, "http://hub"+tc.target, nil)
+		assert.Equal(t, tc.want, isArtifactViewRequest(r), "%s %s (path %q raw %q)", tc.method, tc.target, r.URL.Path, r.URL.RawPath)
+	}
 }
 
 var artifactRequestPaths = []struct{ method, path string }{
@@ -223,6 +294,7 @@ var artifactRequestPaths = []struct{ method, path string }{
 	{http.MethodDelete, "/api/v1/artifacts/art-1"},
 	{http.MethodGet, "/api/v1/artifacts/art-1/files/index.html"},
 	{http.MethodGet, "/api/v1/artifacts/shared/some-token"},
+	{http.MethodGet, "/api/v1/artifacts/view/some-capability/index.html"},
 }
 
 func serveArtifactRequests(t *testing.T, mux http.Handler, identity Identity) {
@@ -242,7 +314,7 @@ func serveArtifactRequests(t *testing.T, mux http.Handler, identity Identity) {
 	}
 }
 
-// TestArtifactRoutes404WhileExperimentOff covers all three patterns through
+// TestArtifactRoutes404WhileExperimentOff covers every pattern through
 // the hub's real mux: with hub.artifacts off (its default), every route
 // answers 404, for an authenticated caller and an anonymous one alike.
 func TestArtifactRoutes404WhileExperimentOff(t *testing.T) {
@@ -254,9 +326,11 @@ func TestArtifactRoutes404WhileExperimentOff(t *testing.T) {
 	serveArtifactRequests(t, srv.mux, nil)
 }
 
-// TestArtifactRoutes404WhileExperimentOn: P0 has no behaviour, so the
-// mounted handler answers 404 behind the gate too.
-func TestArtifactRoutes404WhileExperimentOn(t *testing.T) {
+// TestArtifactRoutesServedWhileExperimentOn: with hub.artifacts on (via
+// operational settings) the requests reach the service, which answers for
+// itself: routes it does not serve stay 404, a wrong method is 405, and the
+// unconfigured service (no store or storage) is 503.
+func TestArtifactRoutesServedWhileExperimentOn(t *testing.T) {
 	fakeStore := newFakeHubSettingStore()
 	fakeStore.seed("experiments", json.RawMessage(`{"overrides":{"hub.artifacts":true}}`))
 	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
@@ -267,6 +341,40 @@ func TestArtifactRoutes404WhileExperimentOn(t *testing.T) {
 	srv.registerRoutes()
 	require.True(t, srv.experimentEnabled("hub.artifacts"))
 
+	user := NewAuthenticatedUser("u1", "u1@example.com", "U1", "member", "web")
+	for _, tc := range []struct {
+		method, path string
+		status       int
+	}{
+		{http.MethodGet, "/api/v1/artifacts/shared/some-token", http.StatusNotFound},
+		{http.MethodGet, "/api/v1/artifacts/art-1/unknown", http.StatusNotFound},
+		{http.MethodPut, "/api/v1/artifacts", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/api/v1/artifacts", http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/artifacts?mine=1", http.StatusServiceUnavailable},
+		{http.MethodPut, "/api/v1/artifacts/00000000-0000-4000-8000-000000000001", http.StatusMethodNotAllowed},
+		{http.MethodDelete, "/api/v1/artifacts/00000000-0000-4000-8000-000000000001", http.StatusServiceUnavailable},
+		{http.MethodGet, "/api/v1/artifacts/00000000-0000-4000-8000-000000000001", http.StatusServiceUnavailable},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		req = req.WithContext(contextWithIdentity(req.Context(), user))
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+		assert.Equal(t, tc.status, rec.Code, "%s %s: %s", tc.method, tc.path, rec.Body.String())
+	}
+}
+
+// TestArtifactsSettingsDisabledAnswers404: the artifacts settings section's
+// enabled switch closes every route like the experiment does.
+func TestArtifactsSettingsDisabledAnswers404(t *testing.T) {
+	fakeStore := newFakeHubSettingStore()
+	fakeStore.seed("experiments", json.RawMessage(`{"overrides":{"hub.artifacts":true}}`))
+	fakeStore.seed("artifacts", json.RawMessage(`{"enabled":false}`))
+	ops := NewOperationalSettings(fakeStore, emptyKoanf(), emptyKoanf())
+	_, err := ops.Refresh(context.Background())
+	require.NoError(t, err)
+	srv := &Server{config: DefaultServerConfig(), mux: http.NewServeMux()}
+	srv.SetOperationalSettings(ops)
+	srv.registerRoutes()
 	serveArtifactRequests(t, srv.mux, NewAuthenticatedUser("u1", "u1@example.com", "U1", "member", "web"))
 }
 
@@ -279,25 +387,6 @@ func TestArtifactsGuardViaRegisterRoutes(t *testing.T) {
 	mux := http.NewServeMux()
 	artifacts.NewService(newArtifactHost(srv)).RegisterRoutes(mux, srv.artifactsGuard)
 	serveArtifactRequests(t, mux, NewAuthenticatedUser("u1", "u1@example.com", "U1", "member", "web"))
-}
-
-// addRecordedArtifactEdge records an active, principal-bounded delegation
-// edge with recorded provenance from user delegatorID to agentID in project.
-func addRecordedArtifactEdge(t *testing.T, s store.Store, delegatorID, agentID, project string) {
-	t.Helper()
-	edge := &store.DelegationEdge{
-		DelegatorType: store.DelegationPrincipalUser,
-		DelegatorID:   delegatorID,
-		DelegateType:  store.DelegationPrincipalAgent,
-		DelegateID:    agentID,
-		ScopeType:     store.RoleScopeProject,
-		ScopeID:       project,
-		Role:          string(AgentRoleFull),
-		Active:        true,
-	}
-	edge.EffectCeiling = store.EffectCeiling{Kind: store.EffectCeilingPrincipal}
-	edge.AuthorityProvenance = store.AuthorityProvenance{ProvenanceVersion: store.ProvenanceVersionV1, SourceCredentialKind: store.SourceCredentialSession}
-	require.NoError(t, s.CreateDelegationEdge(context.Background(), edge))
 }
 
 // TestArtifactHostNoEdgeAgentDeniedArtifacts: an agent with no delegation

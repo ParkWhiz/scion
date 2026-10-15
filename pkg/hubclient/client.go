@@ -18,9 +18,11 @@ package hubclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -100,6 +102,10 @@ type Client interface {
 	// Conversations returns the conversation operations interface.
 	Conversations() ConversationService
 
+	// ThreadGroups returns the project-scoped chat thread group operations
+	// interface (ptone/scion#4424).
+	ThreadGroups() ThreadGroupService
+
 	// AllowList returns the allow list management operations interface.
 	AllowList() AllowListService
 
@@ -118,6 +124,9 @@ type Client interface {
 	// ProjectPreStartHooks returns a ProjectPreStartHookService scoped to a project.
 	ProjectPreStartHooks(projectID string) ProjectPreStartHookService
 
+	// ProjectVisitors returns a ProjectVisitorService scoped to a project.
+	ProjectVisitors(projectID string) ProjectVisitorService
+
 	// HubPreStartHooks returns the hub-scoped pre-start hook service.
 	HubPreStartHooks() HubPreStartHookService
 
@@ -125,8 +134,23 @@ type Client interface {
 	// the list of skills found at the given GitHub directory URL.
 	DiscoverSkillsDirectory(ctx context.Context, req DiscoverSkillsDirectoryRequest) (*DiscoverSkillsDirectoryResponse, error)
 
+	// Artifacts returns the artifact operations interface.
+	Artifacts() ArtifactService
+
+	// TestIdentities returns the hub test identity operations interface.
+	TestIdentities() TestIdentityService
+
+	// TestIdentityDelegations returns the workload issuer delegation
+	// operations interface.
+	TestIdentityDelegations() TestIdentityDelegationService
+
 	// Health checks API availability.
 	Health(ctx context.Context) (*HealthResponse, error)
+
+	// HealthSummary returns the admin health summary (GET
+	// /api/v1/admin/health/summary), the data behind the health dashboard.
+	// It needs hub.health.read and a user identity.
+	HealthSummary(ctx context.Context) (*HealthSummary, error)
 }
 
 // client is the concrete implementation of Client.
@@ -152,9 +176,13 @@ type client struct {
 	subscriptionTemplates *subscriptionTemplateService
 	messages              *messageService
 	conversations         *conversationService
+	threadGroups          *threadGroupService
 	allowList             *allowListService
 	invites               *inviteService
 	messaging             *messagingService
+	artifacts             *artifactService
+	testIdentities        *testIdentityService
+	testIdentityDelegs    *testIdentityDelegationService
 }
 
 // New creates a new Hub API client.
@@ -206,9 +234,13 @@ func New(baseURL string, opts ...Option) (Client, error) {
 	c.subscriptionTemplates = &subscriptionTemplateService{c: c}
 	c.messages = &messageService{c: c}
 	c.conversations = &conversationService{c: c}
+	c.threadGroups = &threadGroupService{c: c}
 	c.allowList = &allowListService{c: c}
 	c.invites = &inviteService{c: c}
 	c.messaging = &messagingService{c: c}
+	c.artifacts = &artifactService{c: c}
+	c.testIdentities = &testIdentityService{c: c}
+	c.testIdentityDelegs = &testIdentityDelegationService{c: c}
 
 	return c, nil
 }
@@ -328,6 +360,11 @@ func (c *client) Conversations() ConversationService {
 	return c.conversations
 }
 
+// ThreadGroups returns the project-scoped chat thread group operations interface.
+func (c *client) ThreadGroups() ThreadGroupService {
+	return c.threadGroups
+}
+
 // AllowList returns the allow list management operations interface.
 func (c *client) AllowList() AllowListService {
 	return c.allowList
@@ -341,6 +378,20 @@ func (c *client) Invites() InviteService {
 // Messaging returns the cross-project messaging operations interface.
 func (c *client) Messaging() MessagingService {
 	return c.messaging
+}
+
+// Artifacts returns the artifact operations interface.
+func (c *client) Artifacts() ArtifactService {
+	return c.artifacts
+}
+
+// TestIdentities returns the hub test identity operations interface.
+func (c *client) TestIdentities() TestIdentityService {
+	return c.testIdentities
+}
+
+func (c *client) TestIdentityDelegations() TestIdentityDelegationService {
+	return c.testIdentityDelegs
 }
 
 // get performs an HTTP GET request.
@@ -399,7 +450,10 @@ func isProxyIntercepted(resp *http.Response) bool {
 // HintProxyError returns err unchanged in most cases. If the error message
 // matches the pattern produced by apiclient.DecodeResponse when a proxy
 // intercepts a health endpoint and returns a non-JSON body, it appends a
-// diagnostic hint suggesting a Cloud Run / GFE configuration issue.
+// diagnostic hint suggesting a Cloud Run / GFE configuration issue. An
+// error wrapping apiclient.ErrNoContent (an empty body from a call that
+// needs one) gets the same hint, as an empty-body decode failure did before
+// apiclient.DecodeRequired.
 //
 // Note: the trigger ("failed to decode response") fires for any JSON decode
 // failure, including a genuinely malformed response from the hub server
@@ -411,7 +465,7 @@ func HintProxyError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if strings.Contains(err.Error(), "failed to decode response") {
+	if strings.Contains(err.Error(), "failed to decode response") || errors.Is(err, apiclient.ErrNoContent) {
 		return fmt.Errorf("%w\nHint: a reverse proxy may be intercepting "+
 			"/healthz and /health — check your Cloud Run or GFE configuration", err)
 	}
@@ -431,6 +485,8 @@ func (c *client) Health(ctx context.Context) (*HealthResponse, error) {
 			return nil, err
 		}
 	}
+	// Health is a reachability probe; several callers ignore the body, so a
+	// 204 still counts as reachable.
 	return apiclient.DecodeResponse[HealthResponse](resp)
 }
 
@@ -527,10 +583,11 @@ func WithAutoDevAuth() Option {
 }
 
 // WithAgentToken sets agent token authentication using the X-Scion-Agent-Token header.
-// Use this when authenticating as an agent (not a user) to the Hub API.
+// Use this when authenticating as an agent (not a user) to the Hub API. The
+// agent's run id (SCION_LAUNCH_ID), when set, is sent with it.
 func WithAgentToken(token string) Option {
 	return func(c *client) {
-		c.transport.Auth = &apiclient.AgentTokenAuth{Token: token}
+		c.transport.Auth = &apiclient.AgentTokenAuth{Token: token, RunID: os.Getenv("SCION_LAUNCH_ID")}
 	}
 }
 

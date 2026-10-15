@@ -25,12 +25,12 @@ package hub
 // relationship can only admit a permission that is listed here.
 //
 // The tests in this file evaluate every same-type registry permission through
-// Decide for a principal that has no role bindings, so the only possible grant
-// source is the relationship under test.
+// Decide for a principal whose only role binding, where a project-scoped
+// target needs one, grants no permissions (grantProjectAccessOnly), so the only
+// possible grant source is the relationship under test.
 
 import (
 	"context"
-	"sort"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
@@ -40,165 +40,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// relationshipAllowKey identifies one (relationship, principal kind,
-// resource type) cell of the characterization table. PrincipalKind uses the
-// relationship-policy vocabulary ("user", "agent").
-type relationshipAllowKey struct {
-	Relationship  string
-	PrincipalKind string
-	ResourceType  string
-}
-
-// relationshipUnregisteredPermissions lists permission IDs that a production
-// call site derives from a (resource type, action) pair with no registry
-// entry, and that a relationship admits. Each entry names its call sites.
-// These IDs are accepted by the permission resolver and by the relationship
-// policy consistency test only through this list.
-var relationshipUnregisteredPermissions = map[string][]string{}
-
-// relationshipCrossTypePermissions lists relationship cells whose resource
-// type differs from the registry resource of the permission they admit. The
-// value is the production call site that makes that request.
-var relationshipCrossTypePermissions = map[relationshipAllowKey]map[string]string{
-	{Relationship: "progeny", PrincipalKind: "agent", ResourceType: "secret"}: {
-		"project.secret_read": "httpdispatcher.go (agent secret resolution: Resource{Type: \"secret\"}, Permission: project.secret_read)",
-	},
-}
-
-// relationshipCharacterizedAllowlist is the frozen per-cell permission list.
-var relationshipCharacterizedAllowlist = map[relationshipAllowKey][]string{
-	// Resource owner (user principals). Every same-type registry permission.
-	// Hub-scoped gcp_service_account assign is excluded by the rule shape
-	// (see TestRelationshipCharacterization_Owner) and is covered by
-	// hub_member_sa_assign instead.
-	{"owner", "user", "agent"}: {
-		"agent.create", "agent.read", "agent.list", "agent.update", "agent.delete",
-		"agent.attach", "agent.lifecycle", "agent.port_access", "agent.stop_all",
-		"agent.message", "agent.set_message_mode", "agent.grant_hub_mode",
-		"agent.status_update", "agent.log_append", "agent.notify",
-		"agent.token_refresh", "agent.port_forward", "agent.identity_token",
-	},
-	// No {"owner", "user", "project"} cell: Project.OwnerID grants nothing
-	// (ptone/scion#2586); see TestRelationshipCharacterization_OwnerProjectGrantsNothing.
-	{"owner", "user", "template"}: {
-		"template.create", "template.read", "template.update", "template.delete", "template.list",
-	},
-	{"owner", "user", "harness_config"}: {
-		"harness_config.create", "harness_config.read", "harness_config.update",
-		"harness_config.delete", "harness_config.list",
-	},
-	{"owner", "user", "group"}: {
-		"group.create", "group.read", "group.update", "group.delete", "group.list",
-		"group.addMember", "group.removeMember",
-	},
-	{"owner", "user", "broker"}: {
-		"broker.create", "broker.read", "broker.update", "broker.delete", "broker.list", "broker.dispatch",
-	},
-	{"owner", "user", "gcp_service_account"}: {
-		"gcp_service_account.create", "gcp_service_account.read", "gcp_service_account.delete",
-		"gcp_service_account.list", "gcp_service_account.verify", "gcp_service_account.mint",
-		"gcp_service_account.assign",
-	},
-	{"owner", "user", "skill"}: {
-		"skill.create", "skill.create_global", "skill.read", "skill.update", "skill.delete",
-		"skill.list", "skill.register",
-	},
-
-	// Ancestor (a principal in the agent resource's creation chain).
-	{"ancestor", "user", "agent"}: {
-		"agent.create", "agent.read", "agent.list", "agent.update", "agent.delete",
-		"agent.attach", "agent.lifecycle", "agent.port_access", "agent.stop_all",
-		"agent.message", "agent.set_message_mode", "agent.grant_hub_mode",
-		"agent.status_update", "agent.log_append", "agent.notify",
-		"agent.token_refresh", "agent.port_forward", "agent.identity_token",
-	},
-	// Agent ancestors are further limited by their JWT scopes; this cell is
-	// the set reachable when the agent holds every registered agent scope.
-	{"ancestor", "agent", "agent"}: {
-		"agent.create", "agent.delete", "agent.attach", "agent.lifecycle",
-		"agent.set_message_mode", "agent.status_update", "agent.log_append",
-		"agent.notify", "agent.token_refresh", "agent.port_forward", "agent.identity_token",
-	},
-
-	// Progeny read of an ancestor's opted-in user-scoped secret, plus the
-	// reviewed exact pairs (reviewedProgenyExactPairs): runtime use and launch
-	// delivery of opted-in user-scope secrets and env vars.
-	{"progeny", "agent", "secret"}:  {"project.secret_read", "secret.use", "secret.deliver"},
-	{"progeny", "agent", "env_var"}: {"env_var.deliver"},
-
-	// Current hub members may assign hub-scoped service accounts.
-	{"hub_member_sa_assign", "user", "gcp_service_account"}: {"gcp_service_account.assign"},
-
-	// An agent may read its origin user's personal (user-scoped) skills,
-	// through the same progeny relationship as opted-in secrets, keyed on
-	// the skill's owning bucket rather than a per-record creator field.
-	{"progeny", "agent", "skill"}: {"skill.read"},
-}
-
-// sameTypeRegistryPermissions returns every registry permission ID whose
-// Resource is resourceType, in registry order.
-func sameTypeRegistryPermissions(resourceType string) []permissions.Permission {
-	var out []permissions.Permission
-	for _, p := range permissions.Registry {
-		if p.Resource == resourceType {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func characterizedSet(key relationshipAllowKey) map[string]bool {
-	set := map[string]bool{}
-	for _, id := range relationshipCharacterizedAllowlist[key] {
-		set[id] = true
-	}
-	return set
-}
-
-// allRegisteredAgentScopes returns every agent JWT scope referenced by the
-// registry, so an agent carrying them is limited only by the relationship.
-func allRegisteredAgentScopes() []AgentTokenScope {
-	seen := map[string]bool{}
-	var out []AgentTokenScope
-	for _, p := range permissions.Registry {
-		for _, s := range p.AgentScopes {
-			if !seen[s] {
-				seen[s] = true
-				out = append(out, AgentTokenScope(s))
-			}
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
-}
-
-func decideExplicit(t *testing.T, authz *AuthzService, identity Identity, resource Resource, p permissions.Permission) Decision {
-	t.Helper()
-	return authz.Decide(context.Background(), AuthzRequest{
-		Principal:  principalContextForIdentity(identity),
-		Credential: credentialContextForIdentity(identity),
-		Resource:   resource,
-		Action:     Action(p.Action),
-		Permission: p.ID,
-	})
-}
-
-func createCharacterizationUser(t *testing.T, s store.Store, id string) UserIdentity {
-	t.Helper()
-	require.NoError(t, s.CreateUser(context.Background(), &store.User{
-		ID: id, Email: id + "@relchar.test", DisplayName: id, Role: "member", Status: "active",
-	}))
-	return NewAuthenticatedUser(id, id+"@relchar.test", id, "member", "api")
-}
-
 // TestRelationshipCharacterization_Owner pins the owner relationship for a
-// user with no role bindings across every resource type whose constructor
+// user whose only role binding is an access-only binding in the project of
+// the project-scoped targets, across every resource type whose constructor
 // sets OwnerID.
 func TestRelationshipCharacterization_Owner(t *testing.T) {
 	authz, s := authzTestSetup(t)
 	owner := createCharacterizationUser(t, s, tid("relchar-owner"))
 	other := createCharacterizationUser(t, s, tid("relchar-other"))
 	projectID := tid("relchar-project")
+	grantProjectAccessOnly(t, s, owner.ID(), projectID)
 
 	resources := []struct {
 		name     string
@@ -274,6 +125,7 @@ func TestRelationshipCharacterization_UserAncestor(t *testing.T) {
 	authz, s := authzTestSetup(t)
 	root := createCharacterizationUser(t, s, tid("relchar-root"))
 	outsider := createCharacterizationUser(t, s, tid("relchar-outsider"))
+	grantProjectAccessOnly(t, s, root.ID(), tid("relchar-desc-project"))
 	descendant := agentResource(&store.Agent{
 		ID:        tid("relchar-desc"),
 		ProjectID: tid("relchar-desc-project"),
@@ -338,6 +190,8 @@ func TestRelationshipCharacterization_AgentFullHistory(t *testing.T) {
 	owner := createCharacterizationUser(t, s, tid("relchar-m-owner"))
 	root := createCharacterizationUser(t, s, tid("relchar-m-root"))
 	other := createCharacterizationUser(t, s, tid("relchar-m-other"))
+	grantProjectAccessOnly(t, s, owner.ID(), tid("relchar-m-project"))
+	grantProjectAccessOnly(t, s, root.ID(), tid("relchar-m-project"))
 	ancestorID := tid("relchar-m-anc-agent")
 	ancestor := &agentIdentityWrapper{&AgentTokenClaims{
 		Claims:    jwt.Claims{Subject: ancestorID},

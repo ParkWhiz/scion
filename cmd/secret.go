@@ -97,8 +97,8 @@ var agentSecretListCmd = &cobra.Command{
 	Short: "List project-scoped secrets",
 	Long: `List metadata for all project-scoped secrets from the Hub.
 
-Only metadata (key, type, version, updated) is returned — secret values
-are not included.
+Only metadata (key, type, allowProgeny, version, updated) is returned —
+secret values are not included.
 
 Examples:
   scion secret list`,
@@ -119,14 +119,10 @@ func init() {
 func runAgentSecretGet(cmd *cobra.Command, args []string) error {
 	key := args[0]
 
-	hubCtx, err := CheckHubAvailabilityWithOptions(projectPath, true)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return err
 	}
-	if hubCtx == nil {
-		return fmt.Errorf("secret commands require Hub mode (use 'scion hub enable' first)")
-	}
-
 	projectID, err := GetProjectID(hubCtx)
 	if err != nil {
 		return wrapHubError(err)
@@ -238,14 +234,10 @@ func runAgentSecretSet(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	hubCtx, err := CheckHubAvailabilityWithOptions(projectPath, true)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return err
 	}
-	if hubCtx == nil {
-		return fmt.Errorf("secret commands require Hub mode (use 'scion hub enable' first)")
-	}
-
 	projectID, err := GetProjectID(hubCtx)
 	if err != nil {
 		return wrapHubError(err)
@@ -324,14 +316,10 @@ func runAgentSecretSet(cmd *cobra.Command, args []string) error {
 }
 
 func runAgentSecretList(cmd *cobra.Command, _ []string) error {
-	hubCtx, err := CheckHubAvailabilityWithOptions(projectPath, true)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return err
 	}
-	if hubCtx == nil {
-		return fmt.Errorf("secret commands require Hub mode (use 'scion hub enable' first)")
-	}
-
 	projectID, err := GetProjectID(hubCtx)
 	if err != nil {
 		return wrapHubError(err)
@@ -351,9 +339,7 @@ func runAgentSecretList(cmd *cobra.Command, _ []string) error {
 	}
 
 	if isJSONOutput() {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(resp)
+		return outputJSON(newSecretListOutput("project", resp.Secrets))
 	}
 
 	if len(resp.Secrets) == 0 {

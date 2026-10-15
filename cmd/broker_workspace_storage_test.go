@@ -38,25 +38,25 @@ func TestRegisterGlobalProjectAndBroker_WorkspaceStorage(t *testing.T) {
 		Backend: api.WorkspaceStorageBackendNFS,
 		NFS:     &api.BrokerNFSWorkspaceStorage{Server: "10.0.0.2", Export: "/vol1", SubPathRoot: "projects"},
 	}
-	_, err := registerGlobalProjectAndBroker(ctx, s, brokerID, "ws-register-broker", "http://localhost:9800", rt, true, settings, first)
+	_, err := registerGlobalProjectAndBroker(ctx, s, brokerID, "ws-register-broker", "http://localhost:9800", rt, true, settings, first, nil)
 	require.NoError(t, err)
 	b, err := s.GetRuntimeBroker(ctx, brokerID)
 	require.NoError(t, err)
 	assert.Equal(t, first, b.WorkspaceStorage, "create stores the descriptor")
 	require.NotNil(t, b.Capabilities)
-	assert.False(t, b.Capabilities.AgentMove, "agent move is not advertised yet")
+	assert.True(t, b.Capabilities.AgentMove, "this broker binary supports agent move")
 
 	second := &api.BrokerWorkspaceStorage{
 		Backend: api.WorkspaceStorageBackendNFS,
 		NFS:     &api.BrokerNFSWorkspaceStorage{Server: "10.0.0.3", Export: "/vol2", SubPathRoot: "projects"},
 	}
-	_, err = registerGlobalProjectAndBroker(ctx, s, brokerID, "ws-register-broker", "http://localhost:9800", rt, true, settings, second)
+	_, err = registerGlobalProjectAndBroker(ctx, s, brokerID, "ws-register-broker", "http://localhost:9800", rt, true, settings, second, nil)
 	require.NoError(t, err)
 	b, err = s.GetRuntimeBroker(ctx, brokerID)
 	require.NoError(t, err)
 	assert.Equal(t, second, b.WorkspaceStorage, "re-registration refreshes the descriptor")
 
-	_, err = registerGlobalProjectAndBroker(ctx, s, brokerID, "ws-register-broker", "http://localhost:9800", rt, true, settings, nil)
+	_, err = registerGlobalProjectAndBroker(ctx, s, brokerID, "ws-register-broker", "http://localhost:9800", rt, true, settings, nil, nil)
 	require.NoError(t, err)
 	b, err = s.GetRuntimeBroker(ctx, brokerID)
 	require.NoError(t, err)

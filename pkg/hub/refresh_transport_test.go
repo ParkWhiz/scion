@@ -120,16 +120,6 @@ func TestAgentRefresh_NoTransportMinterOmitsField(t *testing.T) {
 	assert.Empty(t, resp.TransportError)
 }
 
-type staticTokenGenerator struct{ token string }
-
-func (g staticTokenGenerator) GenerateAgentToken(string, string, []string, AgentRole, []AgentTokenScope) (string, error) {
-	return g.token, nil
-}
-
-func (g staticTokenGenerator) GenerateAgentTokenForAgent(context.Context, *store.Agent) (string, error) {
-	return g.token, nil
-}
-
 func newResetAuthDispatcher(t *testing.T) (*HTTPAgentDispatcher, *mockRuntimeBrokerClient, *store.Agent) {
 	t.Helper()
 	ctx := context.Background()

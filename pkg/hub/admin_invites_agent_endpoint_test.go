@@ -17,7 +17,6 @@
 package hub
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -30,15 +29,12 @@ import (
 // injected into agents, has no effect on admin-generated invite links: they
 // must keep using the Hub's regular (public) endpoint.
 func TestAdminInvitesCreate_UsesHubEndpointNotAgentEndpoint(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		if strings.Contains(err.Error(), "sqlite driver not registered") {
 			t.Skip("Skipping test because sqlite driver is not registered (build with -tags sqlite to enable)")
 		}
 		t.Fatalf("failed to create test store: %v", err)
-	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate test store: %v", err)
 	}
 
 	srv := &Server{

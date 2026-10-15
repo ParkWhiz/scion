@@ -16,6 +16,8 @@ package entadapter
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
@@ -328,9 +330,27 @@ func (q *QuotaStore) CreateUsageReservation(ctx context.Context, reservation *st
 
 	created, err := builder.Save(ctx)
 	if err != nil {
-		return nil, mapError(err)
+		mapped := mapError(err)
+		if errors.Is(mapped, store.ErrAlreadyExists) && isActiveReservationViolation(reservation, err) {
+			return nil, store.ErrActiveReservationExists
+		}
+		return nil, mapped
 	}
 	return entUsageReservationToStore(created), nil
+}
+
+// isActiveReservationViolation reports whether a unique violation from
+// CreateUsageReservation came from the unique active (limit_definition_id,
+// resource_id) index. The table has two unique indexes, that one and the
+// primary key. With a generated ID only the former can be violated; with a
+// caller-supplied ID, the error text names the index's resource_id column
+// (SQLite lists the columns; Postgres names the index after them), which a
+// primary key violation does not.
+func isActiveReservationViolation(reservation *store.UsageReservation, err error) bool {
+	if reservation.ID == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "resource_id")
 }
 
 // CountActiveReservations counts non-released reservations for a specific
@@ -375,6 +395,26 @@ func (q *QuotaStore) HasActiveReservation(ctx context.Context, limitDefinitionID
 	return count > 0, nil
 }
 
+// GetActiveReservation returns resourceID's non-released reservation for
+// the given limit, whatever its scope, or store.ErrNotFound when none.
+func (q *QuotaStore) GetActiveReservation(ctx context.Context, limitDefinitionID, resourceID string) (*store.UsageReservation, error) {
+	ldUID, err := parseUUID(limitDefinitionID)
+	if err != nil {
+		return nil, err
+	}
+	r, err := q.client.UsageReservation.Query().
+		Where(
+			usagereservation.LimitDefinitionIDEQ(ldUID),
+			usagereservation.ResourceIDEQ(resourceID),
+			usagereservation.ReleasedAtIsNil(),
+		).
+		Only(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return entUsageReservationToStore(r), nil
+}
+
 // ReleaseReservation releases a reservation by setting released_at.
 // Matches on limit_definition_id and resource_id.
 func (q *QuotaStore) ReleaseReservation(ctx context.Context, limitDefinitionID, resourceID string) error {
@@ -400,6 +440,30 @@ func (q *QuotaStore) ReleaseReservation(ctx context.Context, limitDefinitionID, 
 	return nil
 }
 
+// ReleaseReservationByID releases the reservation with reservationID while
+// it is still active, in one conditional write; store.ErrNotFound when no
+// active row has that ID.
+func (q *QuotaStore) ReleaseReservationByID(ctx context.Context, reservationID string) error {
+	uid, err := parseUUID(reservationID)
+	if err != nil {
+		return err
+	}
+	n, err := q.client.UsageReservation.Update().
+		Where(
+			usagereservation.IDEQ(uid),
+			usagereservation.ReleasedAtIsNil(),
+		).
+		SetReleasedAt(time.Now()).
+		Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if n == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
 // ReleaseReservationsByResource releases all reservations for a given resource ID.
 func (q *QuotaStore) ReleaseReservationsByResource(ctx context.Context, resourceID string) error {
 	now := time.Now()
@@ -411,6 +475,62 @@ func (q *QuotaStore) ReleaseReservationsByResource(ctx context.Context, resource
 		SetReleasedAt(now).
 		Save(ctx)
 	return mapError(err)
+}
+
+// ListActiveReservationsByScopeType returns active (non-released)
+// reservations for a limit across every scope ID of scopeType, ordered by
+// created_at ascending, in one query.
+func (q *QuotaStore) ListActiveReservationsByScopeType(ctx context.Context, limitDefinitionID, scopeType string) ([]*store.UsageReservation, error) {
+	ldUID, err := parseUUID(limitDefinitionID)
+	if err != nil {
+		return nil, err
+	}
+	urs, err := q.client.UsageReservation.Query().
+		Where(
+			usagereservation.LimitDefinitionIDEQ(ldUID),
+			usagereservation.ScopeTypeEQ(usagereservation.ScopeType(scopeType)),
+			usagereservation.ReleasedAtIsNil(),
+		).
+		Order(ent.Asc(usagereservation.FieldCreatedAt)).
+		All(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	result := make([]*store.UsageReservation, len(urs))
+	for i, ur := range urs {
+		result[i] = entUsageReservationToStore(ur)
+	}
+	return result, nil
+}
+
+// CountActiveReservationsByScope returns active (non-released) reservation
+// counts for a limit and scopeType, grouped by scope ID, in one query.
+func (q *QuotaStore) CountActiveReservationsByScope(ctx context.Context, limitDefinitionID, scopeType string) (map[string]int64, error) {
+	ldUID, err := parseUUID(limitDefinitionID)
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		ScopeID string `json:"scope_id"`
+		Count   int64  `json:"count"`
+	}
+	err = q.client.UsageReservation.Query().
+		Where(
+			usagereservation.LimitDefinitionIDEQ(ldUID),
+			usagereservation.ScopeTypeEQ(usagereservation.ScopeType(scopeType)),
+			usagereservation.ReleasedAtIsNil(),
+		).
+		GroupBy(usagereservation.FieldScopeID).
+		Aggregate(ent.Count()).
+		Scan(ctx, &rows)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	counts := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		counts[r.ScopeID] = r.Count
+	}
+	return counts, nil
 }
 
 // ListActiveReservations returns active (non-released) reservations for a limit and scope.

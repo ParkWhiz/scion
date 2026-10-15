@@ -110,7 +110,7 @@ var identityOperations = []OperationSpec{
 		DelegationDescription: "Actor must hold all permissions in the bound role (CanDelegate)",
 		AuthorityEval:         AuthorityEvalNone,
 		AuditObligation: &AuditObligation{
-			EventType:     "role.binding.create",
+			EventType:     "role_binding_create",
 			ContextFields: []string{"actor_id"},
 			AfterFields:   []string{"principal_id", "role_name", "scope"},
 			Atomic:        true,
@@ -137,7 +137,7 @@ var identityOperations = []OperationSpec{
 		},
 		AuthorityEval: AuthorityEvalProposedPost,
 		AuditObligation: &AuditObligation{
-			EventType:     "role.binding.delete",
+			EventType:     "role_binding_delete",
 			ContextFields: []string{"actor_id"},
 			BeforeFields:  []string{"principal_id", "role_name", "scope"},
 			Atomic:        true,
@@ -165,7 +165,7 @@ var identityOperations = []OperationSpec{
 		DelegationDescription: "Adding a member to a role-bearing group effectively grants authority; actor must hold the group's role permissions",
 		AuthorityEval:         AuthorityEvalNone,
 		AuditObligation: &AuditObligation{
-			EventType:     "group.member.add",
+			EventType:     "group_member_add",
 			ContextFields: []string{"actor_id", "group_id"},
 			AfterFields:   []string{"member_principal_id"},
 			Atomic:        true,
@@ -195,7 +195,7 @@ var identityOperations = []OperationSpec{
 		},
 		AuthorityEval: AuthorityEvalNone,
 		AuditObligation: &AuditObligation{
-			EventType:     "group.member.remove",
+			EventType:     "group_member_remove",
 			ContextFields: []string{"actor_id", "group_id"},
 			BeforeFields:  []string{"member_principal_id"},
 			Atomic:        true,
@@ -218,7 +218,7 @@ var identityOperations = []OperationSpec{
 		DelegationKind:   DelegationNone,
 		AuthorityEval:    AuthorityEvalNone,
 		AuditObligation: &AuditObligation{
-			EventType:     "group.delete",
+			EventType:     "group_delete",
 			ContextFields: []string{"actor_id"},
 			BeforeFields:  []string{"group_id", "group_name"},
 			Atomic:        true,
@@ -319,6 +319,34 @@ var identityOperations = []OperationSpec{
 	// Domain: credential — token and credential management
 	// =====================================================================
 	{
+		ID:          "credential.token.read",
+		Domain:      "credential",
+		Description: "List or read the caller's own user access tokens",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/auth/tokens", Method: "GET"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/auth/tokens/{id}", Method: "GET"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "user.read",
+		Effects:          []SecurityEffect{EffectListScoped, EffectReadOne},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestSessionOnlyGate_ReasonIsReported"},
+		},
+		Exemptions: []Exemption{{
+			Kind:   ExemptionAuthenticationOnly,
+			Reason: "Token reads are authenticated-only (user reads own tokens); no per-resource permission required beyond session validity",
+			Scope:  "self-token management only",
+			Waives: []WaivedObligation{WaiveBasePermission},
+		}},
+		Bearer: SessionOnly(ReasonCredentialManagement),
+	},
+	{
 		ID:          "credential.token.create",
 		Domain:      "credential",
 		Description: "Create a user access token (UAT)",
@@ -397,6 +425,42 @@ var identityOperations = []OperationSpec{
 		}},
 		Bearer: SessionOnly(ReasonCredentialManagement),
 	},
+	{
+		ID:          "federation.token.mint",
+		Domain:      "federation",
+		Description: "Obtain a short-lived user access credential for the caller, signed with the hub's OIDC key, for one peer hub audience listed in server.oidc.user_token_audiences. Only a local human user with status active; a user access token needs federation_token:mint on a hub boundary. 404 while federation.project_visitors is off",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/auth/federation-token", Method: "POST"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "federation_token.mint",
+		Effects:          []SecurityEffect{EffectMintCredential},
+		DelegationKind:   DelegationNone,
+		Governance: &GovernancePolicy{
+			Kind:        GovernanceIssuerCredential,
+			Description: "A user obtains a credential for themselves only, for an audience the hub admin allows, with a lifetime capped at one hour; it carries no project or agent claims",
+		},
+		AuthorityEval: AuthorityEvalNone,
+		AuditObligation: &AuditObligation{
+			EventType:     "federation_token_issued",
+			ContextFields: []string{"actor_id", "credential_kind"},
+			AfterFields:   []string{"audience", "jti", "expires_at"},
+			Atomic:        true,
+		},
+		DenialCodes: []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestFederationToken_RefusedCallers"},
+			{Package: "pkg/hub", Function: "TestFederationToken_UserAccessTokenNeedsMintScope"},
+			{Package: "pkg/hub", Function: "TestFederationToken_AudienceAllowList"},
+			{Package: "pkg/hub", Function: "TestFederationToken_AuditWritten"},
+			{Package: "pkg/hub", Function: "TestFederationToken_AuditFailureIssuesNothing"},
+			{Package: "pkg/hub", Function: "TestFederationToken_RefusedCredentialKinds"},
+		},
+		Bearer: AdmitOn(BearerTargetSelfRecord, BearerBoundaryHub),
+	},
 
 	// =====================================================================
 	// Domain: user.admin — user administration
@@ -461,6 +525,50 @@ var identityOperations = []OperationSpec{
 		TestRefs:    []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
 	},
 	{
+		ID:          "user.admin.provision",
+		Domain:      "user.admin",
+		Description: "Pre-register a user (status invited) through POST /api/v1/users; invitation-equivalent, shares the invite creation core; no role, no grants",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users", Method: "POST"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT},
+		ResourceResolver: "hub-scoped",
+		BasePermission:   "user.invite",
+		// EffectCreateResource: the invited row. EffectIssueCredential and
+		// GovernanceIssuerCredential label it an admission-conferring
+		// record, as for user.admin.invite: under invite_only it admits a
+		// later sign-in through a configured provider.
+		Effects:        []SecurityEffect{EffectCreateResource, EffectIssueCredential},
+		DelegationKind: DelegationNone,
+		Governance: &GovernancePolicy{
+			Kind:        GovernanceIssuerCredential,
+			Description: "Pre-registration admits sign-in under invite_only, identical to user.admin.invite",
+		},
+		AuthorityEval: AuthorityEvalNone,
+		AuditObligation: &AuditObligation{
+			EventType:     "user.admin.provision",
+			ContextFields: []string{"actor_id", "credential_id", "credential_kind"},
+			AfterFields:   []string{"target_user_id", "email", "status", "display_name"},
+			Atomic:        true,
+		},
+		// forbidden: rows 4, 4a, 5 and 8 (row 4a carries the
+		// dev_auth_not_supported reason, row 5 the session-only reason);
+		// user_suspended: the auth middleware (row 3); conflict: an
+		// existing record (rows 15-17); role_assignment_forbidden: the
+		// denial-log classification of a request that names a role (row
+		// 12, wire code unprocessable). credential_insufficient is added
+		// with hub token admission (rows 6-7).
+		DenialCodes: []DenialCode{DenialForbidden, DenialUserSuspended, DenialConflict,
+			DenialRoleAssignmentForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestHandleProvisionUser"},
+		},
+		// Token admission opens with the hub UAT phase of this operation.
+		Bearer: SessionOnly(ReasonGovernancePending),
+	},
+	{
 		ID:          "user.admin.promote",
 		Domain:      "user.admin",
 		Description: "Promote or demote a user's administrative level (dispatched from PATCH /api/v1/users/{id} when role field is present)",
@@ -508,8 +616,9 @@ var identityOperations = []OperationSpec{
 			Atomic:        true,
 		},
 		// last_owner: the user is the last active owner of a project.
-		// conflict: last super-admin, self-delete, or the user's role
-		// bindings changed concurrently during the delete.
+		// conflict: last super-admin, self-delete, the user still has
+		// agents (owned, descendants, or started by their schedules), or
+		// the user's role bindings changed concurrently during the delete.
 		DenialCodes: []DenialCode{DenialForbidden, DenialLastOwner, DenialConflict},
 		TestRefs:    []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
 		Bearer:      SessionOnly(ReasonGovernancePending),
@@ -676,29 +785,6 @@ var identityOperations = []OperationSpec{
 		TestRefs:         []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
 	},
 	{
-		ID:          "user.provision",
-		Domain:      "user",
-		Description: "Create a user directly through the API; refused for every caller, because sign-in flows create users",
-		EntryPoints: []EntryPoint{
-			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users", Method: "POST"},
-		},
-		Principals:       []PrincipalKind{PrincipalUser},
-		Credentials:      []CredentialKind{CredentialSessionJWT},
-		ResourceResolver: "none",
-		Effects:          []SecurityEffect{EffectCreateResource},
-		DelegationKind:   DelegationNone,
-		AuthorityEval:    AuthorityEvalNone,
-		DenialCodes:      []DenialCode{DenialForbidden},
-		TestRefs:         []TestRef{{Package: "pkg/hub", Function: "TestBearerDisposition_EveryRoutePatternCovered"}},
-		Exemptions: []Exemption{{
-			Kind:   ExemptionInternalOnly,
-			Reason: "Direct user creation is refused for every caller; user records come from sign-in flows",
-			Scope:  "direct user creation",
-			Waives: []WaivedObligation{WaiveBasePermission},
-		}},
-		Bearer: BearerDisposition{Kind: BearerOutOfScope, Owner: BearerOwnerUserProvisioning},
-	},
-	{
 		ID:          "user.session.logout",
 		Domain:      "user",
 		Description: "Sign-in flow logout step; the hub holds no server-side session state for it to change",
@@ -719,5 +805,216 @@ var identityOperations = []OperationSpec{
 			Waives: []WaivedObligation{WaiveBasePermission, WaiveDenialCodes},
 		}},
 		Bearer: NonUser(),
+	},
+	{
+		ID:          "user.session.revoke",
+		Domain:      "user",
+		Description: "Revoke every cookie session of a user (platform admin only)",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/{id}/revoke-sessions", Method: "POST"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT},
+		ResourceResolver: "user-from-url",
+		Effects:          []SecurityEffect{EffectRevokeAuthority},
+		DelegationKind:   DelegationNone,
+		Governance: &GovernancePolicy{
+			Kind:        GovernancePeerSuperior,
+			Description: "Only an unscoped local platform admin may revoke another user's sessions",
+		},
+		AuthorityEval: AuthorityEvalNone,
+		DenialCodes:   []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestSessionOnlyGate_ReasonIsReported"},
+		},
+		Exemptions: []Exemption{{
+			Kind:   ExemptionHubAdmin,
+			Reason: "Platform-admin role check (requireAdminFor); the session generation increment is logged, not audited",
+			Scope:  "user session revocation",
+			Waives: []WaivedObligation{WaiveBasePermission, WaiveAuditObligation},
+		}},
+		Bearer: SessionOnly(ReasonSessionRecovery),
+	},
+	{
+		ID:          "user.terminalworkspace",
+		Domain:      "user",
+		Description: "Read or replace the caller's own terminal workspace",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/terminal-workspace", Method: "GET"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/terminal-workspace", Method: "PUT"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT},
+		ResourceResolver: "self-principal",
+		Effects:          []SecurityEffect{EffectReadOne, EffectUpdateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestSessionOnlyGate_ReasonIsReported"},
+		},
+		Exemptions: []Exemption{{
+			Kind:   ExemptionAuthenticationOnly,
+			Reason: "The path names no user; the subject is always the caller, so no resource permission applies",
+			Scope:  "caller's own terminal workspace",
+			Waives: []WaivedObligation{WaiveBasePermission},
+		}},
+		Bearer: SessionOnly(ReasonInteractiveState),
+	},
+	{
+		ID:          "user.skillinjection.update",
+		Domain:      "user.skillinjection",
+		Description: "Add, replace or remove the skills injected into the caller's own agents. A user access token needs user_skill_injection:update on a hub boundary",
+		EntryPoints: []EntryPoint{
+			// DELETE is listed first: the live-inventory and bearer matrix
+			// tests run entry points in this order, and the PUT probe
+			// replaces the caller's list, including the seeded entry the
+			// DELETE probe removes.
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/injected-skills/{id}", Method: "DELETE"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/injected-skills", Method: "POST"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/injected-skills", Method: "PUT"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "user_skill_injection.update",
+		Effects:          []SecurityEffect{EffectCreateResource, EffectUpdateResource, EffectDeleteResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		AuditObligation: &AuditObligation{
+			EventType:     "user.skillinjection.update",
+			ContextFields: []string{"actor_id"},
+			BeforeFields:  []string{"skill_injection_id"},
+			Atomic:        true,
+		},
+		DenialCodes: []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserInjectedSkillsWrite_TokenNeedsUpdateScope"},
+			{Package: "pkg/hub", Function: "TestUserInjectedSkillsWrite_ProjectBoundaryTokenDenied"},
+			{Package: "pkg/hub", Function: "TestUserInjectedSkillsWrite_SessionAndDevUnchanged"},
+			{Package: "pkg/hub", Function: "TestUserInjectedSkillsWrite_FederatedUserDenied"},
+		},
+		Bearer: AdmitOn(BearerTargetSelfRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "user.skillinjection.read",
+		Domain:      "user.skillinjection",
+		Description: "List the skills injected into the caller's own agents. Any token of the holder reads its own entries; the entries belong to no project",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/injected-skills", Method: "GET"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		Effects:          []SecurityEffect{EffectListScoped},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserInjectedSkillsList_AnyTokenReadsOwnEntries"},
+		},
+		Exemptions: []Exemption{{
+			Kind:   ExemptionAuthenticationOnly,
+			Reason: "The path names no user; the subject is always the caller, and the list carries only the caller's own entries",
+			Scope:  "caller's own user-scope injected skills",
+			Waives: []WaivedObligation{WaiveBasePermission},
+		}},
+		Bearer: BearerDisposition{Kind: BearerAdmitSelf, SelfFilter: BearerSelfFilterNone, Pin: "TestUserInjectedSkillsList_AnyTokenReadsOwnEntries"},
+	},
+	{
+		ID:          "template.user.read",
+		Domain:      "template",
+		Description: "List, read or download the caller's own user-scope templates. A user access token needs template:read on a hub boundary",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/templates", Method: "GET"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/templates/{id}", Method: "GET"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/templates/{id}/download", Method: "GET"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "template.read",
+		Effects:          []SecurityEffect{EffectReadOne, EffectListScoped},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserTemplateWrite_RequiresTemplateSelector"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "template.user.create",
+		Domain:      "template",
+		Description: "Create a template in the caller's own user scope; the scope and owner are the caller. A user access token needs template:create on a hub boundary",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/templates", Method: "POST"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "template.create",
+		Effects:          []SecurityEffect{EffectCreateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserTemplateWrite_RequiresTemplateSelector"},
+			{Package: "pkg/hub", Function: "TestUserTemplateWrites_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "template.user.update",
+		Domain:      "template",
+		Description: "Update, upload to or finalize one of the caller's own user-scope templates. A user access token needs template:update on a hub boundary",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/templates/{id}", Method: "PUT"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/templates/{id}/upload", Method: "POST"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/templates/{id}/finalize", Method: "POST"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "template.update",
+		Effects:          []SecurityEffect{EffectUpdateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserTemplateWrite_RequiresTemplateSelector"},
+			{Package: "pkg/hub", Function: "TestUserTemplateWrites_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "template.user.delete",
+		Domain:      "template",
+		Description: "Delete one of the caller's own user-scope templates, through /api/v1/users/me/templates/{id} or /api/v1/templates/{id}. A user access token needs template:delete on a hub boundary",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/users/me/templates/{id}", Method: "DELETE"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/templates/{id}", Method: "DELETE", Variant: "scope=user"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "template.delete",
+		Effects:          []SecurityEffect{EffectDeleteResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		AuditObligation: &AuditObligation{
+			EventType:     "template.delete",
+			ContextFields: []string{"actor_id"},
+			BeforeFields:  []string{"template_id", "template_name"},
+			Atomic:        true,
+		},
+		DenialCodes: []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserTemplateWrite_RequiresTemplateSelector"},
+			{Package: "pkg/hub", Function: "TestUserTemplateWrites_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
 	},
 }

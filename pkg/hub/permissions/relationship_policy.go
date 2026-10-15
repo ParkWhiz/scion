@@ -14,6 +14,8 @@
 
 package permissions
 
+import "slices"
+
 // RelationshipPolicy is the one authoring surface for "what can an
 // owner/ancestor/progeny/etc. relationship do." B.1's runtime
 // relationship-grant evaluator and A.1's MintEligibilityDescriptor both
@@ -79,8 +81,9 @@ var RelationshipPolicies = []RelationshipPolicy{
 		PermissionIDs: []string{
 			"agent.create", "agent.read", "agent.list", "agent.update", "agent.delete",
 			"agent.lifecycle", "agent.stop_all", "agent.message", "agent.set_message_mode",
-			"agent.grant_hub_mode", "agent.status_update", "agent.log_append", "agent.notify",
+			"agent.grant_hub_mode", "agent.status_update", "agent.notify",
 			"agent.token_refresh", "agent.port_forward", "agent.identity_token",
+			"agent.delegation.create",
 		},
 	},
 	// There is deliberately no owner/user/project row (ptone/scion#2586).
@@ -156,8 +159,9 @@ var RelationshipPolicies = []RelationshipPolicy{
 		PermissionIDs: []string{
 			"agent.create", "agent.read", "agent.list", "agent.update", "agent.delete",
 			"agent.lifecycle", "agent.stop_all", "agent.message", "agent.set_message_mode",
-			"agent.grant_hub_mode", "agent.status_update", "agent.log_append", "agent.notify",
+			"agent.grant_hub_mode", "agent.status_update", "agent.notify",
 			"agent.token_refresh", "agent.port_forward", "agent.identity_token",
+			"agent.delegation.create",
 		},
 	},
 	{
@@ -168,9 +172,20 @@ var RelationshipPolicies = []RelationshipPolicy{
 		ResourceType:   ResourceAgent,
 		PermissionIDs: []string{
 			"agent.create", "agent.delete", "agent.attach", "agent.lifecycle",
-			"agent.set_message_mode", "agent.status_update", "agent.log_append",
-			"agent.notify", "agent.token_refresh", "agent.port_forward", "agent.identity_token",
+			"agent.set_message_mode", "agent.status_update", "agent.notify",
+			"agent.token_refresh", "agent.port_forward", "agent.identity_token",
 		},
+	},
+	{
+		// launcher/agent/agent (ptone/scion#3409, ptone/scion#4568): an agent
+		// reads the status of an agent it launched, directly or through its
+		// descendants, in the same project. The rule produces a candidate
+		// only on the single-agent GET routes.
+		Relationship:   "launcher",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   ResourceAgent,
+		PermissionIDs:  []string{"agent.read"},
+		ReadOnly:       true,
 	},
 	{
 		// progeny/agent/secret (TestRelationshipCharacterization_Progeny). The
@@ -228,10 +243,10 @@ func RelationshipPolicyAllows(relationship, principalKind, resourceType, permiss
 		if p.Relationship != relationship || p.ResourceType != resourceType {
 			continue
 		}
-		if !containsString(p.PrincipalKinds, principalKind) {
+		if !slices.Contains(p.PrincipalKinds, principalKind) {
 			continue
 		}
-		if containsString(p.PermissionIDs, permissionID) {
+		if slices.Contains(p.PermissionIDs, permissionID) {
 			return true
 		}
 	}
@@ -252,19 +267,10 @@ func RelationshipPolicyMintEligible(relationship, principalKind, resourceType, p
 		if p.Relationship != relationship || p.ResourceType != resourceType {
 			continue
 		}
-		if !containsString(p.PrincipalKinds, principalKind) {
+		if !slices.Contains(p.PrincipalKinds, principalKind) {
 			continue
 		}
-		if containsString(p.PermissionIDs, permissionID) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsString(list []string, want string) bool {
-	for _, v := range list {
-		if v == want {
+		if slices.Contains(p.PermissionIDs, permissionID) {
 			return true
 		}
 	}
@@ -291,7 +297,7 @@ func containsString(list []string, want string) bool {
 // agreement across every PrincipalKind constant plus an unknown value.
 func RelationshipPrincipalKind(kind string) string {
 	switch kind {
-	case "user", "dev", "federated_user":
+	case "user", "dev", "federated_user", "visitor":
 		return "user"
 	case "agent", "federated_agent":
 		return "agent"

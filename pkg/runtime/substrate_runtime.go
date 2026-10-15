@@ -356,9 +356,9 @@ var _ PerProfileInstancesRuntime = (*SubstrateRuntime)(nil)
 // succeeded, so callers report this up front instead of after the fact —
 // the broker's direct-connect and control-channel PTY handlers ask
 // HasAttachSupport on the live instance they already resolved
-// (pkg/runtimebroker), and the CLI reads the same answer secondhand from
-// the broker's own advertised metadata (cmd/attach.go's
-// attachSupportedByBroker), not from a compiled runtime-type table.
+// (pkg/runtimebroker), and the Hub reads the same answer secondhand from
+// the broker's stored metadata to choose the PTY path (and answers the
+// CLI's attach preflight with it), not from a compiled runtime-type table.
 func (r *SubstrateRuntime) SupportsAttach() bool { return false }
 
 var _ AttachCapableRuntime = (*SubstrateRuntime)(nil)
@@ -541,7 +541,7 @@ func (r *SubstrateRuntime) Run(ctx context.Context, cfg RunConfig) (string, erro
 			// actor and its egress policy so nothing keeps running under
 			// config it never should have received, and fail loudly. See
 			// errBootstrapHijacked's doc comment for the threat model.
-			runtimeLog.Error("substrate: bootstrap hijack detected, deleting actor as a precaution",
+			runtimeLog().Error("substrate: bootstrap hijack detected, deleting actor as a precaution",
 				"atespace", atespace, "actor", actorName)
 			cleanup()
 			return "", fmt.Errorf("substrate: actor %s was bootstrapped by another caller before this broker's request reached it; deleted as a precaution", id)
@@ -561,7 +561,7 @@ func (r *SubstrateRuntime) Run(ctx context.Context, cfg RunConfig) (string, erro
 			// the way it is for bootstrapPathRejectedError.Error()'s plain
 			// fmt.Sprintf (substrate_bootstrap.go), which has no such
 			// built-in quoting.
-			runtimeLog.Error("substrate: bootstrap rejected a file path",
+			runtimeLog().Error("substrate: bootstrap rejected a file path",
 				"atespace", atespace, "actor", actorName, "code", pathErr.code, "path", pathErr.path)
 		}
 		cleanup()
@@ -1297,8 +1297,41 @@ func (r *SubstrateRuntime) redactExecErr(id string, err error) error {
 	if !ok {
 		return err
 	}
+	// Keep doExec's command exit typed, including when a caller wrapped it
+	// (ExecWithStdin's stdin probe does), so callers can still tell a
+	// command result from a runtime failure. Its Output was already
+	// redacted before truncation in doExec; redacting the fields again is
+	// idempotent.
+	var exitErr *CommandExitError
+	if errors.As(err, &exitErr) {
+		redacted := &CommandExitError{
+			Runtime: exitErr.Runtime,
+			Target:  redactEnvValues(exitErr.Target, secrets),
+			Code:    exitErr.Code,
+			Output:  redactEnvValues(exitErr.Output, secrets),
+		}
+		if error(exitErr) == err {
+			return redacted
+		}
+		// Wrapped: keep the wrapper's context, redacted as a whole exactly
+		// like the untyped path below, and unwrap only to the redacted
+		// copy, never to the original chain.
+		return &redactedExecError{msg: redactEnvValues(err.Error(), secrets), cause: redacted}
+	}
 	return errors.New(redactEnvValues(err.Error(), secrets))
 }
+
+// redactedExecError is a redacted error message that still unwraps to the
+// redacted CommandExitError it wraps, so errors.As keeps working after
+// redactExecErr.
+type redactedExecError struct {
+	msg   string
+	cause *CommandExitError
+}
+
+func (e *redactedExecError) Error() string { return e.msg }
+
+func (e *redactedExecError) Unwrap() error { return e.cause }
 
 // execRedactor returns the redaction doExec applies to control-server output
 // for id before truncating it: the same substrateExecSecrets lookup
@@ -1382,7 +1415,7 @@ func splitSubstrateID(id string) (atespace, actorName string, err error) {
 // PID 1 does: no TTY, so it polls the tmux session's liveness rather than
 // attaching.
 func buildSubstrateStartCmd(cfg RunConfig) (string, error) {
-	cmdLine, ok := harnessCmdLine(cfg)
+	cmdLine, ok := harnessCmdLine(cfg, harnessCmdLineOptions{})
 	if !ok {
 		return "", fmt.Errorf("substrate: no harness provided")
 	}

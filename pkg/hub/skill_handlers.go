@@ -594,7 +594,17 @@ func (s *Server) createSkill(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "User authentication required for user-scoped skills", nil)
 			return
 		}
+		if !requireProfileWriter(w, r) {
+			return
+		}
 		req.ScopeID = userIdent.ID()
+		// A user-scope skill is a new record in the caller's user scope: a
+		// user access token needs skill:create on a hub boundary.
+		decision := s.authzService.CheckAccess(ctx, userIdent, skillUserScopeResource(userIdent), ActionCreate)
+		if !decision.Allowed {
+			writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to create skills in your user scope", nil)
+			return
+		}
 	}
 
 	slug := api.Slugify(req.Name)
@@ -685,6 +695,9 @@ func (s *Server) updateSkill(w http.ResponseWriter, r *http.Request, id string) 
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
 		return
 	}
+	if !requireSkillProfileWriter(w, r, existing) {
+		return
+	}
 	decision := s.authzService.CheckAccess(ctx, identity, skillResource(existing), ActionUpdate)
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to update this skill", nil)
@@ -733,6 +746,9 @@ func (s *Server) deleteSkill(w http.ResponseWriter, r *http.Request, id string) 
 	identity := GetIdentityFromContext(ctx)
 	if identity == nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+		return
+	}
+	if !requireSkillProfileWriter(w, r, existing) {
 		return
 	}
 	decision := s.authzService.CheckAccess(ctx, identity, skillResource(existing), ActionDelete)
@@ -862,6 +878,9 @@ func (s *Server) deprecateSkillVersion(w http.ResponseWriter, r *http.Request, s
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
 		return
 	}
+	if !requireSkillProfileWriter(w, r, skill) {
+		return
+	}
 	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), ActionUpdate)
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to deprecate versions of this skill", nil)
@@ -919,6 +938,9 @@ func (s *Server) publishSkillVersion(w http.ResponseWriter, r *http.Request, ski
 	identity := GetIdentityFromContext(ctx)
 	if identity == nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+		return
+	}
+	if !requireSkillProfileWriter(w, r, skill) {
 		return
 	}
 	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), ActionUpdate)
@@ -1247,6 +1269,9 @@ func (s *Server) handleSkillUpload(w http.ResponseWriter, r *http.Request, skill
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
 		return
 	}
+	if !requireSkillProfileWriter(w, r, skill) {
+		return
+	}
 	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), ActionUpdate)
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to upload files for this skill", nil)
@@ -1322,6 +1347,9 @@ func (s *Server) handleSkillFinalize(w http.ResponseWriter, r *http.Request, ski
 	identity := GetIdentityFromContext(ctx)
 	if identity == nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
+		return
+	}
+	if !requireSkillProfileWriter(w, r, skill) {
 		return
 	}
 	decision := s.authzService.CheckAccess(ctx, identity, skillResource(skill), ActionUpdate)
@@ -1805,6 +1833,16 @@ func skillScopeResource(scope, scopeID string) Resource {
 	if scope == store.SkillScopeUser {
 		r.ScopeUserID = scopeID
 	}
+	return r
+}
+
+// skillUserScopeResource builds the "skill" Resource for a new skill in
+// the caller's own user scope. Like templateUserScopeResource, it takes the
+// authenticated UserIdentity, so the owner and scope user always name the
+// caller and never a request field.
+func skillUserScopeResource(userIdent UserIdentity) Resource {
+	r := skillScopeResource(store.SkillScopeUser, userIdent.ID())
+	r.OwnerID = userIdent.ID()
 	return r
 }
 

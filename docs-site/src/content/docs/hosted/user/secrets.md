@@ -33,6 +33,14 @@ runtime_broker  <  hub  <  project  <  user
 ```
 Therefore, user-scoped settings have the highest priority and will override project, hub, and broker-scoped variables or secrets of the same name. Template `env` blocks and CLI `--env` flags are layered on top of resolved secrets.
 
+### Reserved Names
+
+Names beginning with `SCION_` or `GCE_METADATA_` (case-sensitive prefix match) are reserved for Scion's own control-plane variables. The Hub rejects with a validation error any environment variable, or `environment`-type secret, whose key or target uses one of these prefixes. `file` and `variable` secrets are not affected.
+
+Values stored under a reserved name before this check existed are not deleted, but they are never used: the Hub drops them at dispatch and the Runtime Broker drops them again before injection. If a variable or secret collides with a value the runtime sets itself, the runtime's value wins.
+
+`SCION_METADATA_MODE` is always set by the Hub. It comes from the agent's GCP identity configuration and defaults to `block`. A Runtime Broker only accepts an elevated mode (anything other than `block`) when the Hub's dispatch includes its source marker. Otherwise the Runtime Broker downgrades it, so a stored value or an older Hub cannot turn on metadata access.
+
 ---
 ## Injection Modes
 
@@ -83,6 +91,8 @@ Enabling progeny propagation dynamically registers implicit access policies (e.g
 ## Managing Environment Variables
 
 Use the `scion hub env` command suite to manage non-sensitive configuration. Each agent environment variable carries **provenance metadata** (hub-injected, user-defined, or runtime-derived) to help you audit and debug the origin of specific values.
+
+Hub-scope variables are listed with `scope=hub` on `GET /api/v1/env`. Besides super-admins, a user who holds `hub.env_vars.read` (for example through the `hub-admin` role) can list them. That list is read-only and leaves out secrets; reading a single Hub-scope variable, writing one, and every secret endpoint still need a super-admin.
 
 ### Setting Variables
 ```bash
@@ -143,6 +153,13 @@ Secrets can be projected into the agent container in three ways:
 1.  **Environment** (Default): Injected as a standard environment variable.
 2.  **File**: Written to a specific path on the agent's filesystem.
 3.  **Variable**: Added to a JSON file at `~/.scion/secrets.json` for programmatic access by the harness.
+
+On the Cloud Run runtimes, secrets are delivered to the agent container as environment values, with these limits:
+
+- **File and variable secrets** are sent together in one environment value, capped at 32 KiB on Cloud Run Instances and at a 128 KiB entry on `cloudrun-sandbox`. File secrets are base64-encoded inside that base64 value and variable secrets are not, so the total room for them is about 18-24 KiB on Cloud Run Instances and about 72-96 KiB on `cloudrun-sandbox`, depending on the mix. A larger set fails agent start with an error naming the largest secret.
+- **Environment secrets** are limited to a 32 KiB value each on Cloud Run Instances and a 128 KiB `KEY=VALUE` entry each on `cloudrun-sandbox`. A larger one fails agent start with an error naming it.
+- **Reserved keys:** environment secrets cannot set `SCION_STAGED_SECRETS` or `SCION_OTEL_GCP_CREDENTIALS` on either runtime. On Cloud Run Instances they also cannot override `SCION_HOST_UID` or `SCION_HOST_GID`; on `cloudrun-sandbox` they also cannot override `SCION_HOST_UID`, `SCION_HOST_GID`, `SCION_WORKSPACE_PATH`, `HOME`, `USER` or `LOGNAME`. The runtime sets these itself.
+- **Existing keys:** a key that is already in the agent environment takes precedence over an environment secret with the same name, and the secret is not applied.
 
 ### Updating Secret Metadata
 
@@ -241,7 +258,7 @@ Under the hood, `sciontool` interacts with the Hub's agent-specific secrets API:
 #### Security & Audit Logging
 *   **Authentication**: API access is restricted to the running agent container. The agent must include its unique Hub-issued JWT (loaded from `SCION_HUB_TOKEN`) in the `Authorization: Bearer <token>` header of every request.
 *   **Authorization**: Agents are strictly bounded to their own project's secrets. They can also access user-scoped (personal) secrets belonging to their originating user (the user who kicked off the agent chain), which are resolved on the Hub via the agent JWT's `OriginUserID` (the user who originally started the agent chain). Agents cannot access secrets in other projects, other users' secrets, or global Hub secrets unless explicitly shared via progeny policies (descendant access).
-*   **Fail-Closed Reads**: Every runtime secret read goes through one check sequence: project permission, then an originating user who is still active and either an active member of the project (any active project role binding counts, built-in or custom, direct or through a group) or holds system-level authority for the exact `secret.use` permission, then progeny sharing. Membership alone does not grant reads: the project permission check (`project.secret_read`) still applies. A value is fetched only for the version recorded in the secret's metadata. If a value cannot be retrieved, that key is reported as unavailable in the response rather than returned as an empty value; other keys in the same request are unaffected.
+*   **Fail-Closed Reads**: Every runtime secret read goes through one check sequence: project permission, then an originating user who is still active and either an active member of the project (any active project role binding counts, built-in or custom, direct or through a group, except `project-visitor`) or holds system-level authority for the exact `secret.use` permission, then progeny sharing. Membership alone does not grant reads: the project permission check (`project.secret_read`) still applies. A value is fetched only for the version recorded in the secret's metadata. If a value cannot be retrieved, that key is reported as unavailable in the response rather than returned as an empty value; other keys in the same request are unaffected. When the Hub itself cannot resolve an agent's secrets, or cannot read its stored environment settings, create, start, restart, resume and waking an agent for a direct message answer `503` (`agent secrets could not be resolved; the agent was not started`, `... not created` for a create, or the environment settings equivalent) instead of starting the agent without them: a start leaves the agent as it was, a restart (which stops the agent first) leaves it stopped, and a failed create is rolled back. A provision-only create still succeeds, and the agent's later start fails closed. A reincarnation answers `202` and then fails at its start leg; it is recorded as failed with the same message and the previous config is restored. The message names no secret or value. Having no secrets or settings is not an error.
 *   **Audit Trail**: To ensure accountability, every runtime read and write operation is fully audited on the Hub. Each retrieval request logs one audit event (`agent_secret_read`) identifying the calling agent, the requested keys, and the outcome.
 
 ---
@@ -261,7 +278,7 @@ Create a project secret with one of these naming patterns:
 | `GH_{OWNER}__{REPO}` | One specific repo | `GH_ACME_CORP__PRIVATE_SKILLS` |
 | `GH_{OWNER}` | All repos under an owner/org | `GH_ACME_CORP` |
 
-**Normalization rules:** uppercase the name, replace hyphens (`-`) and dots (`.`) with underscores (`_`). The double underscore (`__`) separates owner from repo. *Note: Because of this normalization, names that differ only by hyphens, dots, or underscores (e.g., `acme-corp` and `acme_corp`) will resolve to the same secret name.*
+**Normalization rules:** uppercase the name, replace hyphens (`-`) and dots (`.`) with underscores (`_`). The double underscore (`__`) separates owner from repo. *Note: Because of this normalization, names that differ only by hyphens, dots, or underscores (e.g., `acme-corp` and `acme_corp`) will resolve to the same secret name.* A trailing `.git` on the repository name is dropped, so `acme-corp/templates.git` uses `GH_ACME_CORP__TEMPLATES`.
 
 **Examples:**
 
@@ -305,6 +322,34 @@ When resolving a `gh://owner/repo/...` URI, Scion checks credentials in this ord
 The first match wins. If no convention secret exists, behavior is identical to the default single-token resolution.
 
 *Note: Credentials resolved for private `gh://` URIs are preserved end-to-end through the entire download sequence, preventing unauthenticated fallback or 404 errors during multi-file resolution.*
+
+### Template and Harness-Config Imports
+
+The same secret names authenticate remote imports into a project. This covers importing templates and harness-configs from a GitHub URL with project scope, and scanning a GitHub directory for skills. For a `https://github.com/{owner}/{repo}/...` folder URL, the Hub checks credentials in this order:
+
+| Priority | Source | Description |
+| :--- | :--- | :--- |
+| 1 | `GH_{OWNER}__{REPO}` | Repo-specific convention secret |
+| 2 | `GH_{OWNER}` | Owner-level convention secret |
+| 3 | GitHub App installation token | Only if the Hub has the GitHub App configured and the project has an installation; if minting the token fails, the next option is tried |
+| 4 | `GITHUB_TOKEN` | Project secret |
+| 5 | Unauthenticated | No credential found; works for public repos only |
+
+For example, with a `GH_ACME_CORP` project secret, a project-scope import from `https://github.com/acme-corp/templates/tree/main/.scion/templates` uses that credential.
+
+Other scopes use the same names, read from their own credentials only:
+
+| Import | Where the Hub or CLI looks, in order |
+| :--- | :--- |
+| Global scope (Hub-level) | Hub-scope `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN`. There is no GitHub App step: App installations belong to projects. |
+| User scope | Your own user-scope `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN`. An import uses them only when you are the user it imports for, never for another user. |
+| `scion harness-config install` and `scion templates import` | The `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN` environment variables of the shell running the CLI. The CLI fetches the source itself. |
+
+In every scope the first match wins, and with no match the fetch is unauthenticated, which works for public repos only. A global or user-scope import never reads project credentials.
+
+Reimporting an existing template (`POST /api/v1/templates/{id}/reimport`) uses the same lookup order for the template's own scope: a project template's project credentials and App token, a global template's Hub credentials, and a user template's credentials only when you are that user. With a credential, the Hub requests the archive from `api.github.com` and sends the credential only there.
+
+Only GitHub folder URLs use a credential. Archive URLs (`.tar.gz`, `.tgz`, `.zip`, including `github.com/.../archive/...` links), rclone sources and other hosts are always fetched without one.
 
 ### Injection Mode Behavior
 
@@ -411,7 +456,7 @@ Run `--delete-legacy` itself only after **every** replica of this hub is running
 
 Secrets created before this hub-prefixed scheme existed keep resolving under their original (legacy) name until migrated — existing secrets keep resolving through their stored reference until an administrator (or, for the built-in signing keys, the hub itself at boot) rewrites it to the prefixed name. An administrator can migrate legacy names forward with `scion hub secret migrate-names` (see `--help` for `--dry-run` and `--delete-legacy`); it is safe to run repeatedly, so a plain run followed later by a separate `--delete-legacy` run is the expected two-step workflow. Until that command's `--delete-legacy` step has run for a given secret, both the legacy and least-privilege-scoped IAM grants should remain in place.
 
-On a Cloud Run hub deployed with the hub-cloudrun Terraform module (private-IP Cloud SQL, Direct VPC egress, an explicit `hub_id`), run this command via the one-off Cloud Run job in [`docs/deploy/migrate-names-cloudrun.md`](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/migrate-names-cloudrun.md); no workstation ever runs it directly against that hub's database. Hubs deployed with the manual [Deploy on GCP](/scion/hosted/ha/setup-gcp/) guide are not covered by that runbook — see that guide's "Secret Name Migration" section and [ptone/scion#2395](https://github.com/ptone/scion/issues/2395) for the tracked gap.
+On a Cloud Run hub deployed with the hub-cloudrun Terraform module (private-IP Cloud SQL, Direct VPC egress, an explicit `hub_id`), run this command via the one-off Cloud Run job in [`docs/deploy/migrate-names-cloudrun.md`](https://github.com/GoogleCloudPlatform/scion/blob/main/docs/deploy/migrate-names-cloudrun.md); no workstation ever runs it directly against that hub's database. Hubs deployed with the manual [Deploy on GCP](/scion/hosted/ha/setup-gcp/) guide (public-IP Cloud SQL) use the same kind of job, described in §9 of that runbook; see that guide's [Secret Name Migration](/scion/hosted/ha/setup-gcp/#7b-secret-name-migration) section.
 
 ---
 

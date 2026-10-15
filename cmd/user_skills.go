@@ -113,12 +113,9 @@ func init() {
 
 // resolveUserSkillsService returns an InjectedSkillsService for the current user.
 func resolveUserSkillsService() (hubclient.InjectedSkillsService, error) {
-	hubCtx, err := CheckHubAvailabilityWithOptions(projectPath, true)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return nil, fmt.Errorf("hub connection required: %w", err)
-	}
-	if hubCtx == nil {
-		return nil, fmt.Errorf("hub is not enabled; configure hub.endpoint to use user skills")
 	}
 	return hubCtx.Client.UserInjectedSkills(), nil
 }
@@ -251,14 +248,10 @@ func runUserSkillsFromDirectory(cmd *cobra.Command, dirURL string) error {
 	}
 
 	// Fix 4: Split nil-error check.
-	hubCtx, err := CheckHubAvailabilityWithOptions(projectPath, true)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return fmt.Errorf("hub connection required: %w", err)
 	}
-	if hubCtx == nil {
-		return fmt.Errorf("hub is not enabled; configure hub.endpoint to use user skills")
-	}
-
 	// Fix 3: Separate context for discover phase (30s).
 	parentCtx := cmd.Context()
 	if parentCtx == nil {
@@ -288,11 +281,11 @@ func runUserSkillsFromDirectory(cmd *cobra.Command, dirURL string) error {
 	}
 
 	if isInteractiveTerminal() && !autoConfirm {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Add all %d skill(s)? [Y/n] ", len(result.Skills))
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Add all %d skill(s)? [Y/n] ", len(result.Skills))
 		var answer string
 		_, _ = fmt.Fscanln(cmd.InOrStdin(), &answer)
 		if answer != "" && strings.ToLower(answer) != "y" && strings.ToLower(answer) != "yes" {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Aborted.")
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Aborted.")
 			return nil
 		}
 	}

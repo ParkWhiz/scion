@@ -34,9 +34,13 @@ import (
 // --- resourceEqual must be a true whole-Resource compare -------------
 
 // TestResourceEqual_MutationCoversEveryField is the required proof:
-// reflection-fill a Resource, mutate each exported field one at a
-// time, and assert resourceEqual returns false every time. A future
-// Resource field is then covered automatically, because this test iterates
+// reflection-fill a Resource, mutate each field one at a time, and
+// assert resourceEqual returns false every time. Exported fields are
+// mutated through reflection by kind. Reflection cannot set unexported
+// fields, so each one is assigned directly by name (launchedTarget gets
+// a pointer to a store.Agent with ID x), and any other unexported field
+// fails the test until it is added here. A future exported Resource
+// field is then covered automatically, because this test iterates
 // reflect.TypeOf(Resource{}).NumField() rather than naming fields by hand --
 // exactly the property the old hand-written field list lacked (it already
 // silently omitted ScopeUserID).
@@ -61,19 +65,30 @@ func TestResourceEqual_MutationCoversEveryField(t *testing.T) {
 		field := typ.Field(i)
 		t.Run(field.Name, func(t *testing.T) {
 			mutated := base
-			v := reflect.ValueOf(&mutated).Elem().Field(i)
-			switch v.Kind() {
-			case reflect.String:
-				v.SetString(v.String() + "-mutated")
-			case reflect.Map:
-				m := reflect.MakeMap(v.Type())
-				m.SetMapIndex(reflect.ValueOf("different-key"), reflect.ValueOf("different-value"))
-				v.Set(m)
-			case reflect.Slice:
-				v.Set(reflect.AppendSlice(reflect.MakeSlice(v.Type(), 0, 0), v))
-				v.Set(reflect.Append(v, reflect.ValueOf("different-element")))
-			default:
-				t.Fatalf("unhandled Resource field kind %s for field %s; extend this test", v.Kind(), field.Name)
+			if !field.IsExported() {
+				// Reflection cannot set an unexported field, so assign it
+				// directly by name.
+				switch field.Name {
+				case "launchedTarget":
+					mutated.launchedTarget = &store.Agent{ID: "x"}
+				default:
+					t.Fatalf("unhandled unexported Resource field %s; extend this test", field.Name)
+				}
+			} else {
+				v := reflect.ValueOf(&mutated).Elem().Field(i)
+				switch v.Kind() {
+				case reflect.String:
+					v.SetString(v.String() + "-mutated")
+				case reflect.Map:
+					m := reflect.MakeMap(v.Type())
+					m.SetMapIndex(reflect.ValueOf("different-key"), reflect.ValueOf("different-value"))
+					v.Set(m)
+				case reflect.Slice:
+					v.Set(reflect.AppendSlice(reflect.MakeSlice(v.Type(), 0, 0), v))
+					v.Set(reflect.Append(v, reflect.ValueOf("different-element")))
+				default:
+					t.Fatalf("unhandled Resource field kind %s for field %s; extend this test", v.Kind(), field.Name)
+				}
 			}
 			require.NotEqual(t, base, mutated, "mutation must actually change the struct (test bug if not)")
 			require.False(t, resourceEqual(base, mutated),
@@ -101,7 +116,7 @@ func TestResourceEqual_NilVsEmptyStillNormalizes(t *testing.T) {
 //
 // The fields below are deliberately left at their zero value, each for a
 // documented, store-enforced reason rather than an oversight:
-//   - Project, RuntimeBrokerName, HarnessConfig, HarnessAuth: "Enriched
+//   - Project, ProjectSlug, RuntimeBrokerName, HarnessConfig, HarnessAuth: "Enriched
 //     fields (populated by Hub when returning data, not persisted)" per
 //     store.Agent's own field comment (pkg/store/models.go) -- no store
 //     write path can ever make these non-zero after a read-back, and
@@ -118,7 +133,8 @@ func TestResourceEqual_NilVsEmptyStillNormalizes(t *testing.T) {
 //     TestListProjectAgentsSorted_Race_MissingRow.
 //   - The Launch* bookkeeping fields (LaunchAsyncOptIn, LaunchID,
 //     LaunchState, LaunchEndReason, LaunchKind, LaunchDeadline,
-//     LaunchLastReportAt, LaunchOwner, LaunchSeq, LaunchStep, LaunchError):
+//     LaunchLastReportAt, LaunchOwner, LaunchSeq, LaunchStep, LaunchError,
+//     LaunchCause):
 //     per agent_store.go's own doc comment, "UpdateAgent never sets any of
 //     these from the caller's struct: they are absent from its Ent builder
 //     chain entirely" -- only BeginLaunch/MarkLaunchAccepted/EndLaunch/
@@ -153,12 +169,12 @@ func TestResourceEqual_NilVsEmptyStillNormalizes(t *testing.T) {
 // independently-stated list cannot recur silently, because
 // assertNonSkippedFieldsNonZero fails closed on every field not in this map.
 var reflectFillStoreAgentSkipFields = map[string]bool{
-	"Project": true, "RuntimeBrokerName": true, "HarnessConfig": true, "HarnessAuth": true,
+	"Project": true, "ProjectSlug": true, "RuntimeBrokerName": true, "HarnessConfig": true, "HarnessAuth": true,
 	"DeletedAt":        true,
 	"LaunchAsyncOptIn": true, "LaunchID": true, "LaunchState": true,
 	"LaunchEndReason": true, "LaunchKind": true, "LaunchDeadline": true,
 	"LaunchLastReportAt": true, "LaunchOwner": true, "LaunchSeq": true,
-	"LaunchStep": true, "LaunchError": true,
+	"LaunchStep": true, "LaunchError": true, "LaunchCause": true,
 	"Launch": true,
 	// Deletion marker columns are written only through UpdateAgentDeletion
 	// (never by CreateAgent/UpdateAgent), and Deletion is computed.
@@ -175,17 +191,31 @@ var reflectFillStoreAgentSkipFields = map[string]bool{
 	// previous_run_ids: the same writers and the same reasons
 	// (ptone/scion#3097).
 	"PreviousRunIDs": true,
+	// run_id_updated_at: written only with run_id by the same writers
+	// (ptone/scion#3661).
+	"RunIDUpdatedAt": true,
+	// ssh_host_key and ssh_host_key_run_id are written only through
+	// SetAgentSSHHostKey; CreateAgent and UpdateAgent never write them.
+	"SSHHostKey":      true,
+	"SSHHostKeyRunID": true,
 	// workspace_placement is written only through SetAgentWorkspacePlacement
 	// (ptone/scion#2727): CreateAgent and UpdateAgent never write it, so it
 	// cannot round-trip here. It is not an authz input.
 	"WorkspacePlacement": true,
 	// Run intent columns are written only through SetRunIntent and
 	// RevertRunIntent (never by CreateAgent/UpdateAgent).
-	"RunIntent": true, "RunIntentAt": true,
+	"RunIntent": true, "RunIntentAt": true, "RunIntentMarkedAt": true,
 	// ProvisionedOnly is computed by the hub at response time from Phase,
 	// RunIntent and the launch/deletion columns (ptone/scion#2929); it is
 	// not stored.
 	"ProvisionedOnly": true,
+	// PinnedRuntimeTarget is a computed, read-only response view of the
+	// pinned placement columns (ComputeAgentPinnedRuntimeTarget), filled
+	// only by agent enrichment; it is not stored and not an authz input.
+	"PinnedRuntimeTarget": true,
+	// Suspension is computed by the hub at response time from the agent's
+	// active holds (ptone/scion#3433); it is not stored.
+	"Suspension": true,
 	// Start claim columns are written only through the start-claim store
 	// methods (never by CreateAgent/UpdateAgent).
 	"StartClaimID": true, "StartClaimKind": true, "StartClaimState": true,
@@ -222,6 +252,11 @@ func reflectFillStoreAgent(t *testing.T, projectID string) *store.Agent {
 			}}))
 		},
 	}
+	// A pin must name the agent's own Runtime Broker (CreateAgent rejects
+	// any other pin), so both columns get the same value.
+	brokerID := uuid.New().String()
+	special["RuntimeBrokerID"] = func(f reflect.Value) { f.SetString(brokerID) }
+	special["PinnedRuntimeBrokerID"] = func(f reflect.Value) { f.SetString(brokerID) }
 
 	seq := 0
 	for i := 0; i < typ.NumField(); i++ {
@@ -269,6 +304,11 @@ func fillGenericNonZero(t *testing.T, f reflect.Value, name string, seq int) {
 	case reflect.Struct:
 		if f.Type() == reflect.TypeOf(time.Time{}) {
 			f.Set(reflect.ValueOf(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(seq) * time.Hour)))
+			return
+		}
+		if f.Type() == reflect.TypeOf(store.FixtureProvenance{}) {
+			// The store writes the stamp only as two valid UUIDs.
+			f.Set(reflect.ValueOf(store.FixtureProvenance{RootID: uuid.New().String(), IssuerID: uuid.New().String()}))
 			return
 		}
 		t.Fatalf("fillGenericNonZero: unhandled struct type for field %s; extend this helper", name)
@@ -352,6 +392,16 @@ func TestListProjectAgentsSorted_MemberProjectionEquality(t *testing.T) {
 	// must actually have round-tripped non-zero, or this test's deep-equal
 	// below would be silently blind to it.
 	assertNonSkippedFieldsNonZero(t, rereadFull)
+
+	// The creation-time provenance stamp is not an authorization input:
+	// the member projection deliberately does not carry it, and the full
+	// row's stamp must not change the resource either.
+	_, memberHasFixture := reflect.TypeOf(store.AgentMember{}).FieldByName("Fixture")
+	require.False(t, memberHasFixture, "store.AgentMember must not carry the fixture provenance stamp")
+	unstamped := *rereadFull
+	unstamped.Fixture = store.FixtureProvenance{}
+	require.True(t, reflect.DeepEqual(agentResource(&unstamped), agentResource(rereadFull)),
+		"agentResource must not read the fixture provenance stamp")
 
 	require.True(t, reflect.DeepEqual(memberResource(member), agentResource(rereadFull)),
 		"memberResource(ListAgentMembers row) must deep-equal agentResource(GetAgentsByIDs row) for a fully reflection-filled agent;\nmember resource: %#v\nfull resource:   %#v",

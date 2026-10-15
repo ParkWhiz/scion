@@ -20,7 +20,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"sync"
 	"testing"
 	"time"
 
@@ -35,40 +34,6 @@ import (
 // dispatch sends, including the previous runs' (ptone/scion#3097): each
 // carries the engine's notAfter, and the broker refusing a late one as
 // stale is not acted on.
-
-// fenceRecordingClient records each delete's options and refuses the
-// delete of staleRun with 409 stale_dispatch.
-type fenceRecordingClient struct {
-	*mockRuntimeBrokerClient
-	staleRun string
-
-	mu      sync.Mutex
-	deletes []DeleteAgentOptions
-}
-
-func (c *fenceRecordingClient) DeleteAgent(_ context.Context, _, _, _, _ string, opts DeleteAgentOptions) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.deletes = append(c.deletes, opts)
-	if c.staleRun != "" && opts.RunID == c.staleRun {
-		return staleDispatchErr()
-	}
-	return nil
-}
-
-func (c *fenceRecordingClient) sent() []DeleteAgentOptions {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]DeleteAgentOptions(nil), c.deletes...)
-}
-
-func runsOf(opts []DeleteAgentOptions) []string {
-	runs := make([]string, 0, len(opts))
-	for _, o := range opts {
-		runs = append(runs, o.RunID)
-	}
-	return runs
-}
 
 // The engine's delete of an agent with a previous run sends notAfter on
 // the previous run's delete as on the current run's, and a late
@@ -86,9 +51,9 @@ func TestDeleteFence_PreviousRunDeleteCarriesNotAfter(t *testing.T) {
 			srv.SetDispatcher(NewHTTPAgentDispatcherWithClient(s, client, false, slog.Default()))
 			agent := setupBrokerAgentInPhase(t, s, "fence-prev-"+map[bool]string{false: "ok", true: "late"}[late], state.PhaseRunning)
 			ctx := context.Background()
-			_, err := s.SetAgentRunID(ctx, agent.ID, "run-1")
+			_, err := s.SetAgentRunID(ctx, agent.ID, "run-1", nil)
 			require.NoError(t, err)
-			_, err = s.SetAgentRunID(ctx, agent.ID, "run-2")
+			_, err = s.SetAgentRunID(ctx, agent.ID, "run-2", nil)
 			require.NoError(t, err)
 			require.Equal(t, []string{"run-1"}, mustGetAgent(t, s, agent.ID).PreviousRunIDs)
 
@@ -128,7 +93,7 @@ func TestDeleteFence_ExecDeferredDeletePreviousRunsFenced(t *testing.T) {
 			client := &fenceRecordingClient{mockRuntimeBrokerClient: &mockRuntimeBrokerClient{}}
 			srv.SetDispatcher(NewHTTPAgentDispatcherWithClient(s, client, false, slog.Default()))
 			agent := setupBrokerAgentInPhase(t, s, "fence-exec-prev", state.PhaseRunning)
-			_, err := s.SetAgentRunID(ctx, agent.ID, "run-cur")
+			_, err := s.SetAgentRunID(ctx, agent.ID, "run-cur", nil)
 			require.NoError(t, err)
 			seedAgentDeletion(t, s, agent.ID, seedLiveDeleting)
 			var claimAdj int64

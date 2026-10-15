@@ -29,10 +29,11 @@ import (
 // TestScheduledDispatch_WritesSlugIdentityKey mirrors
 // TestCreateAgentInProject_WritesSlugIdentityKey for the scheduler's
 // dispatch_agent create path: it must go through the same
-// createAgentWithIdentityKey helper as the HTTP create path, so a
+// commitAgentCreate transaction as the HTTP create path, so a
 // successful dispatch also writes an identity-key row for the new agent's
 // Slug.
 func TestScheduledDispatch_WritesSlugIdentityKey(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 	ctx := context.Background()
 
@@ -53,6 +54,7 @@ func TestScheduledDispatch_WritesSlugIdentityKey(t *testing.T) {
 // failure must specifically be the display-name validation, not some other
 // error the dispatch path happens to also produce.
 func TestScheduledDispatch_RejectsReservedSlug(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 	ctx := context.Background()
 
@@ -73,6 +75,7 @@ func TestScheduledDispatch_RejectsReservedSlug(t *testing.T) {
 // failure must specifically be the identity-key conflict, not some other
 // error the dispatch path happens to also produce.
 func TestScheduledDispatch_OrderingCollisionIsRejected(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 	ctx := context.Background()
 

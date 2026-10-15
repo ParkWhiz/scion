@@ -17,11 +17,9 @@
 package hub
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,85 +27,9 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// createTxFaultStore injects failures into the writes of the agent-create
-// transaction and its compensation, including inside WithTx.
-type createTxFaultStore struct {
-	store.Store
-	// auditErrFor fails CreateMutationAudit for records of this mutation
-	// type.
-	auditErrFor string
-	subErr      error
-	deactErr    error
-	// outerDeleteErr fails DeleteAgent outside a transaction only.
-	outerDeleteErr error
-}
-
-func (s *createTxFaultStore) wrap(tx store.Store) *createTxFaultStore {
-	c := *s
-	c.Store = tx
-	c.outerDeleteErr = nil
-	return &c
-}
-
-func (s *createTxFaultStore) WithTx(ctx context.Context, fn func(tx store.Store) error) error {
-	return s.Store.WithTx(ctx, func(tx store.Store) error { return fn(s.wrap(tx)) })
-}
-
-func (s *createTxFaultStore) CreateMutationAudit(ctx context.Context, r *store.MutationAuditRecord) error {
-	if s.auditErrFor != "" && r.MutationType == s.auditErrFor {
-		return errors.New("injected mutation audit write fault")
-	}
-	return s.Store.CreateMutationAudit(ctx, r)
-}
-
-func (s *createTxFaultStore) DeleteAgent(ctx context.Context, id string) error {
-	if s.outerDeleteErr != nil {
-		return s.outerDeleteErr
-	}
-	return s.Store.DeleteAgent(ctx, id)
-}
-
-func (s *createTxFaultStore) CreateNotificationSubscription(ctx context.Context, sub *store.NotificationSubscription) error {
-	if s.subErr != nil {
-		return s.subErr
-	}
-	return s.Store.CreateNotificationSubscription(ctx, sub)
-}
-
-func (s *createTxFaultStore) DeactivateDelegationEdgesForDelegate(ctx context.Context, delegateType, delegateID string, d store.Deactivation) (int, error) {
-	if s.deactErr != nil {
-		return 0, s.deactErr
-	}
-	return s.Store.DeactivateDelegationEdgesForDelegate(ctx, delegateType, delegateID, d)
-}
-
-// agentAudits returns the mutation audit records of type for agentID.
-func agentAudits(t *testing.T, s store.Store, mutationType, agentID string) []*store.MutationAuditRecord {
-	t.Helper()
-	recs, _, err := s.ListMutationAudits(context.Background(), store.MutationAuditFilter{TargetType: "agent", MutationType: mutationType})
-	require.NoError(t, err)
-	var out []*store.MutationAuditRecord
-	for _, r := range recs {
-		if r.TargetID == agentID {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// compensationSummary is the AfterSummary of an agent_create_dispatch_failed
-// record.
-type compensationSummary struct {
-	OriginalAuditID string `json:"original_audit_id"`
-	OpID            string `json:"op_id"`
-	Stage           string `json:"stage"`
-	Error           string `json:"error"`
-}
 
 // An injected failure of the create's audit write rolls back the whole
 // create: no agent row, no edge, no subscription.
@@ -150,40 +72,6 @@ func TestCreateSubscriptionFailureRollsBack(t *testing.T) {
 	assert.Equal(t, agent.ID, subs[0].AgentID)
 	assert.Equal(t, f.creator.ID, subs[0].SubscriberID)
 	assert.Len(t, agentAudits(t, real, mutationTypeAgentDelegation, agent.ID), 1)
-}
-
-// assertCompensated asserts that agentID was rolled back by compensation:
-// no agent row, no active edge, a create_compensation deactivation under
-// the op ID the agent_create_dispatch_failed record names, and that record
-// referencing the create's own audit record.
-func assertCompensated(t *testing.T, s store.Store, agentID string) compensationSummary {
-	t.Helper()
-	ctx := context.Background()
-	_, err := s.GetAgent(ctx, agentID)
-	require.ErrorIs(t, err, store.ErrNotFound, "agent row deleted")
-	assert.Empty(t, activeEdgesFor(t, s, agentID), "no active edge")
-
-	created := agentAudits(t, s, mutationTypeAgentDelegation, agentID)
-	require.Len(t, created, 1, "the create's audit record is kept")
-	failed := agentAudits(t, s, mutationTypeAgentCreateDispatchFailed, agentID)
-	require.Len(t, failed, 1)
-	var sum compensationSummary
-	require.NoError(t, json.Unmarshal([]byte(failed[0].AfterSummary), &sum))
-	assert.Equal(t, created[0].ID, sum.OriginalAuditID)
-	require.NotEmpty(t, sum.OpID)
-	assert.NotEmpty(t, failed[0].ActorPrincipalKind)
-
-	// The edge was deactivated with cause create_compensation under that op
-	// ID: reactivating exactly that (cause, op ID) finds one edge. Undo it
-	// afterwards so the caller sees the compensated state.
-	n, err := s.ReactivateDelegationEdgesForDelegate(ctx, store.DelegationPrincipalAgent, agentID,
-		store.EdgeDeactivationCreateCompensation, sum.OpID)
-	require.NoError(t, err)
-	require.Equal(t, 1, n, "one edge deactivated with cause create_compensation")
-	_, err = s.DeactivateDelegationEdgesForDelegate(ctx, store.DelegationPrincipalAgent, agentID,
-		store.Deactivation{Cause: store.EdgeDeactivationCreateCompensation, OpID: sum.OpID})
-	require.NoError(t, err)
-	return sum
 }
 
 // A dispatch failure after the create committed calls the broker delete,
@@ -245,55 +133,6 @@ func TestSessionDispatchFailureCompensates(t *testing.T) {
 	assert.Empty(t, subs, "the compensation removes the notification subscription")
 }
 
-// compensationFailureLog is the ERROR record logCompensationFailure writes.
-type compensationFailureLog struct {
-	Msg           string `json:"msg"`
-	AgentID       string `json:"agent_id"`
-	CorrelationID string `json:"correlation_id"`
-	OpID          string `json:"op_id"`
-}
-
-// createWithRequestID issues the fixture's create with request metadata
-// carrying requestID, as the request-log middleware installs it, and
-// returns the response and the compensation-failure records logged while
-// it ran.
-func (f *uatCreateFixture) createWithRequestID(t *testing.T, requestID string, req CreateAgentRequest) (*httptest.ResponseRecorder, []compensationFailureLog) {
-	t.Helper()
-	body, err := json.Marshal(req)
-	require.NoError(t, err)
-	r := httptest.NewRequest(http.MethodPost, f.path, bytes.NewReader(body))
-	r.Header.Set("Content-Type", "application/json")
-	user := authUser(f.creator)
-	ctx := contextWithIdentity(r.Context(), user)
-	ctx = context.WithValue(ctx, userContextKey{}, user)
-	return serveWithRequestID(t, f.srv.mux, r.WithContext(ctx), requestID)
-}
-
-// serveWithRequestID serves r with request metadata carrying requestID, as
-// the request-log middleware installs it, and returns the response and the
-// compensation-failure records logged while it ran.
-func serveWithRequestID(t *testing.T, h http.Handler, r *http.Request, requestID string) (*httptest.ResponseRecorder, []compensationFailureLog) {
-	t.Helper()
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-
-	ctx := logging.ContextWithRequestMeta(r.Context(), &logging.RequestMeta{RequestID: requestID})
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, r.WithContext(ctx))
-	slog.SetDefault(prev)
-
-	var logs []compensationFailureLog
-	for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
-		var l compensationFailureLog
-		if json.Unmarshal(line, &l) == nil && l.Msg == "agent create compensation failed" {
-			logs = append(logs, l)
-		}
-	}
-	return rec, logs
-}
-
 // assertCompensationFailureResponse asserts a 500 whose correlation ID is
 // requestID and returns the single ERROR record logged for agentID, which
 // carries the same correlation ID.
@@ -311,10 +150,11 @@ func assertCompensationFailureResponse(t *testing.T, rec *httptest.ResponseRecor
 	return logs[0]
 }
 
-// When the compensation transaction and the fallback edge deactivation both
-// fail, the response is a 500 carrying the request ID as its correlation
-// ID, and the agent row is removed on its own. The edge stays active with a
-// deleted delegate: the documented residual state of this path.
+// When the compensation transaction and every fallback attempt fail on the
+// edge deactivation, the response is a 500 carrying the request ID as its
+// correlation ID, and the fallback row delete rolls back with the
+// deactivation: the row is kept in phase error together with its active
+// edge.
 func TestDispatchCompensationFailureReportsCorrelationID(t *testing.T) {
 	f := newUATCreateFixture(t, "comp-fail")
 	client := f.withDispatcher(t)
@@ -327,18 +167,21 @@ func TestDispatchCompensationFailureReportsCorrelationID(t *testing.T) {
 	agentID := client.lastCreateReq.ID
 	assertCompensationFailureResponse(t, rec, logs, "req-comp-fail", agentID)
 
-	_, err := real.GetAgent(context.Background(), agentID)
-	assert.ErrorIs(t, err, store.ErrNotFound, "the fallback removes the agent row")
+	row, err := real.GetAgent(context.Background(), agentID)
+	require.NoError(t, err, "the row is kept when the deactivation in its delete transaction fails")
+	assert.True(t, row.DeletedAt.IsZero())
+	assert.Equal(t, string(state.PhaseError), row.Phase)
+	assert.Equal(t, createRowRemoveFailedMessage, row.Message)
 	assert.Empty(t, agentAudits(t, real, mutationTypeAgentCreateDispatchFailed, agentID),
 		"the failed compensation wrote no record")
 	edges := activeEdgesFor(t, real, agentID)
-	require.Len(t, edges, 1, "the edge stays active when its deactivation fails")
+	require.Len(t, edges, 1, "the kept row keeps its active edge")
 	assert.Equal(t, agentID, edges[0].DelegateID)
 }
 
 // When the compensation transaction fails on its audit insert, the fallback
-// deactivates the edge on its own with cause create_compensation under the
-// op ID the ERROR record names, and removes the agent row.
+// removes the agent row and, in the same transaction, deactivates the edge
+// with cause create_compensation under the op ID the ERROR record names.
 func TestDispatchCompensationAuditFailureDeactivatesEdge(t *testing.T) {
 	f := newUATCreateFixture(t, "comp-audit-fail")
 	client := f.withDispatcher(t)
@@ -364,7 +207,7 @@ func TestDispatchCompensationAuditFailureDeactivatesEdge(t *testing.T) {
 
 // When the compensation transaction and the fallback row delete both fail,
 // the agent row keeps its active edge: the fallback deactivates the edge
-// only after the row is gone.
+// only in the transaction that removes the row.
 func TestDispatchCompensationDeleteFailureKeepsRowAndEdge(t *testing.T) {
 	f := newUATCreateFixture(t, "comp-delete-fail")
 	client := f.withDispatcher(t)
@@ -388,7 +231,9 @@ func TestDispatchCompensationDeleteFailureKeepsRowAndEdge(t *testing.T) {
 }
 
 // A second compensation of the same create changes nothing and writes no
-// second audit record.
+// second audit record. The row is gone, so the conditional row delete
+// (createRowHeldCheck) reports it as owned by a delete
+// (errCreateRowDeleteHeld) rather than succeeding.
 func TestCompensateAgentCreateIsIdempotent(t *testing.T) {
 	f := newUATCreateFixture(t, "comp-twice")
 	f.srv.SetDispatcher(nil)
@@ -399,7 +244,8 @@ func TestCompensateAgentCreateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	c := createCompensation{Agent: agent, OriginalAuditID: created[0].ID, Stage: createStageDispatch, Cause: errors.New("broker unavailable")}
 	require.NoError(t, f.srv.compensateAgentCreate(ctx, c))
-	require.NoError(t, f.srv.compensateAgentCreate(ctx, c))
+	require.ErrorIs(t, f.srv.compensateAgentCreate(ctx, c), errCreateRowDeleteHeld,
+		"a second compensation finds the row gone and writes nothing")
 
 	sum := assertCompensated(t, f.store, agent.ID)
 	assert.Equal(t, createStageDispatch, sum.Stage)

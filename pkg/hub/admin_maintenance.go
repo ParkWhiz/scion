@@ -18,10 +18,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -156,13 +159,14 @@ func (s *Server) executeMigration(w http.ResponseWriter, r *http.Request, key st
 		return
 	}
 
-	// Parse request body for params.
-	var body map[string]interface{}
-	if r.Body != nil {
-		defer func() { _ = r.Body.Close() }()
-		_ = json.NewDecoder(r.Body).Decode(&body)
+	// Parse request body for params. dryRun is honored in every form a
+	// caller is likely to send; one that cannot be read is rejected rather
+	// than silently starting a real run (ptone/scion#1976).
+	params, err := parseMigrationRunRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error(), nil)
+		return
 	}
-	params := parseMigrationParams(body)
 
 	// A dry run of a completed (rerunnable) migration is rejected: its
 	// outcome would overwrite the completed record (a dry run resets the
@@ -255,6 +259,68 @@ func (s *Server) executeMigration(w http.ResponseWriter, r *http.Request, key st
 	})
 }
 
+// parseMigrationRunRequest reads the parameters of a migration run request.
+// The documented form is {"params": {"dryRun": true, ...}}, but a dry run is
+// also accepted as a top-level "dryRun" body field, as the dryRun query
+// parameter, and with a string value ("true"/"false"). Before this, any form
+// other than a boolean under "params" was dropped and a REAL run started, so
+// a malformed body or an unreadable dryRun value is now a 400 instead.
+func parseMigrationRunRequest(r *http.Request) (map[string]string, error) {
+	var body map[string]interface{}
+	if r.Body != nil {
+		defer func() { _ = r.Body.Close() }()
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid request body: %v", err)
+		}
+	}
+	params := parseMigrationParams(body)
+	delete(params, "dryRun")
+
+	dryRun := false
+	apply := func(where string, v interface{}) error {
+		var b bool
+		switch val := v.(type) {
+		case bool:
+			b = val
+		case string:
+			parsed, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return fmt.Errorf("%s must be a boolean, got %q", where, val)
+			}
+			b = parsed
+		default:
+			return fmt.Errorf("%s must be a boolean", where)
+		}
+		dryRun = dryRun || b
+		return nil
+	}
+	if q := r.URL.Query(); q.Has("dryRun") {
+		if err := apply("dryRun query parameter", q.Get("dryRun")); err != nil {
+			return nil, err
+		}
+	}
+	if v, ok := body["dryRun"]; ok {
+		if err := apply("dryRun", v); err != nil {
+			return nil, err
+		}
+	}
+	if raw, ok := body["params"]; ok {
+		m, isMap := raw.(map[string]interface{})
+		if !isMap {
+			return nil, fmt.Errorf("params must be an object")
+		}
+		if v, ok := m["dryRun"]; ok {
+			if err := apply("params.dryRun", v); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if dryRun {
+		params["dryRun"] = "true"
+	}
+	return params, nil
+}
+
 // resolveMaintenanceExecutor returns the executor for a given operation key.
 func (s *Server) resolveMaintenanceExecutor(key string) (MaintenanceExecutor, error) {
 	mc := s.config.MaintenanceConfig
@@ -266,10 +332,7 @@ func (s *Server) resolveMaintenanceExecutor(key string) (MaintenanceExecutor, er
 		if backend == nil {
 			return nil, fmt.Errorf("no secret backend configured; cannot run secret migration")
 		}
-		return &SecretMigrationExecutor{
-			store:         s.store,
-			secretBackend: backend,
-		}, nil
+		return NewSecretMigrationExecutor(s.store, backend), nil
 	case "applied-config-env-cleanup":
 		return &AppliedConfigEnvCleanupExecutor{
 			Store:         s.store,
@@ -282,58 +345,58 @@ func (s *Server) resolveMaintenanceExecutor(key string) (MaintenanceExecutor, er
 	case entadapter.UTCTimestampNormalizeKey:
 		db, dbDialect := s.storeDB()
 		return &UTCTimestampNormalizeExecutor{DB: db, Dialect: dbDialect}, nil
+	case entadapter.TemplateBlobGCKey:
+		return &TemplateBlobGCExecutor{srv: s}, nil
 	case "pull-images":
 		log.Debug("Resolved pull-images executor",
 			"runtime_bin", mc.RuntimeBin, "registry", mc.ImageRegistry,
 			"tag", mc.ImageTag, "harnesses", fmt.Sprint(mc.Harnesses))
-		return &PullImagesExecutor{
-			runtimeBin: mc.RuntimeBin,
-			registry:   mc.ImageRegistry,
-			tag:        mc.ImageTag,
-			harnesses:  mc.Harnesses,
-		}, nil
+		return NewPullImagesExecutor(PullImagesOptions{
+			RuntimeBin: mc.RuntimeBin,
+			Registry:   mc.ImageRegistry,
+			Tag:        mc.ImageTag,
+			Harnesses:  mc.Harnesses,
+		}), nil
 	case "rebuild-server":
 		log.Debug("Resolved rebuild-server executor",
 			"repo_path", mc.RepoPath, "branch", mc.RepoBranch,
 			"binary_dest", mc.BinaryDest, "service_name", mc.ServiceName)
-		return &RebuildServerExecutor{
-			repoPath:    mc.RepoPath,
-			repoBranch:  mc.RepoBranch,
-			binaryDest:  mc.BinaryDest,
-			serviceName: mc.ServiceName,
-		}, nil
+		return NewRebuildServerExecutor(RebuildServerOptions{
+			RepoPath:    mc.RepoPath,
+			RepoBranch:  mc.RepoBranch,
+			BinaryDest:  mc.BinaryDest,
+			ServiceName: mc.ServiceName,
+		}), nil
 	case "rebuild-web":
 		log.Debug("Resolved rebuild-web executor", "repo_path", mc.RepoPath, "branch", mc.RepoBranch)
-		return &RebuildWebExecutor{
-			repoPath:   mc.RepoPath,
-			repoBranch: mc.RepoBranch,
-		}, nil
+		return NewRebuildWebExecutor(RebuildWebOptions{
+			RepoPath:   mc.RepoPath,
+			RepoBranch: mc.RepoBranch,
+		}), nil
 	case "rebuild-container-binaries":
 		log.Debug("Resolved rebuild-container-binaries executor", "repo_path", mc.RepoPath)
-		return &RebuildContainerBinariesExecutor{
-			repoPath: mc.RepoPath,
-		}, nil
+		return NewRebuildContainerBinariesExecutor(mc.RepoPath), nil
 	case "build-harness-config-image":
 		log.Debug("Resolved build-harness-config-image executor",
 			"runtime_bin", mc.RuntimeBin, "registry", mc.ImageRegistry, "tag", mc.ImageTag)
-		return &BuildHarnessConfigImageExecutor{
-			store:      s.store,
-			storage:    s.GetStorage(),
-			runtimeBin: mc.RuntimeBin,
-			registry:   mc.ImageRegistry,
-			tag:        mc.ImageTag,
-			gcpProject: s.config.GCPProjectID,
-		}, nil
+		return NewBuildHarnessConfigImageExecutor(BuildHarnessConfigImageOptions{
+			Store:      s.store,
+			Storage:    s.GetStorage(),
+			RuntimeBin: mc.RuntimeBin,
+			Registry:   mc.ImageRegistry,
+			Tag:        mc.ImageTag,
+			GCPProject: s.config.GCPProjectID,
+		}), nil
 	case "update-binary":
 		log.Debug("Resolved update-binary executor",
 			"service_name", mc.ServiceName, "github_repo", mc.GitHubRepo,
 			"release_channel", mc.ReleaseChannel)
-		return &BinaryUpdateExecutor{
-			serviceName: mc.ServiceName,
-			githubRepo:  mc.GitHubRepo,
-			channel:     mc.ReleaseChannel,
-			store:       s.store,
-		}, nil
+		return NewBinaryUpdateExecutor(BinaryUpdateOptions{
+			ServiceName: mc.ServiceName,
+			GitHubRepo:  mc.GitHubRepo,
+			Channel:     mc.ReleaseChannel,
+			Store:       s.store,
+		}), nil
 	default:
 		return nil, fmt.Errorf("no executor registered for operation %q", key)
 	}

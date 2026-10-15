@@ -15,7 +15,6 @@
 package hub
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -258,6 +257,15 @@ func (s *Server) handleAdminServerConfigSectionReset(w http.ResponseWriter, r *h
 			"Section name is required", nil)
 		return
 	}
+	if s.rejectTestAdminSettingsWrite(w, r, []string{sectionName}, nil) {
+		return
+	}
+
+	// A user access token resets only a section with no refused key.
+	if !serverConfigSectionTokenResettable(sectionName) &&
+		writeTokenRefusedSettingsKeys(w, r.Context(), []string{sectionName}) {
+		return
+	}
 
 	// The "experiments" section has its own compare-and-set reset with a
 	// per-name audit log (DELETE /api/v1/admin/experiments), gated on
@@ -270,6 +278,13 @@ func (s *Server) handleAdminServerConfigSectionReset(w http.ResponseWriter, r *h
 			"use DELETE /api/v1/admin/experiments", nil)
 		return
 	}
+	// While the test admin tier is on, federation settings are refused on
+	// every write path, resets included (G8).
+	if sectionName == "federation" && s.testAdminTierOn() {
+		writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError,
+			errTestAdminFederationRefused.Error(), map[string]interface{}{"keys": []string{"federation"}})
+		return
+	}
 
 	sec := opsettings.SectionByName(sectionName)
 	if sec == nil {
@@ -278,7 +293,60 @@ func (s *Server) handleAdminServerConfigSectionReset(w http.ResponseWriter, r *h
 		return
 	}
 
-	if err := ops.DeleteSection(r.Context(), sectionName); err != nil {
+	// Resetting the GCP permission-check section returns both keys to their
+	// deploy-time values: the same transition rule and audit record as a
+	// PUT apply.
+	var gcpIAMCur, gcpIAMNext gcpIAMSettings
+	gcpIAMChange := false
+	if sectionName == gcpIAMSection {
+		if !s.requireGCPIAMHubAdmin(w, r.Context()) {
+			return
+		}
+		gcpIAMCur = s.currentGCPIAMSettings()
+		gcpIAMNext = s.gcpIAMEffectiveFor(nil)
+		if gcpIAMChange = gcpIAMCur != gcpIAMNext; gcpIAMChange {
+			if err := s.checkGCPIAMTransition(r.Context(), gcpIAMCur, gcpIAMNext, false); err != nil {
+				writeGCPIAMTransitionError(w, err)
+				return
+			}
+			if err := s.auditGCPIAMChange(r.Context(), gcpIAMSurfaceReset, gcpIAMCur, gcpIAMNext); err != nil {
+				slog.Error("Failed to record GCP permission-check change", "error", err)
+				writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to reset section", nil)
+				return
+			}
+			s.approveGCPIAMTransition(gcpIAMTransition{From: gcpIAMCur, To: gcpIAMNext})
+		}
+	}
+
+	// Resetting the endpoints section clears a saved public URL: recorded
+	// before the reset like a GCP permission-check change, and the reset is
+	// not made if the record cannot be written. A seeded row holds no saved
+	// value, so resetting it records nothing.
+	publicURLBefore := ""
+	if sectionName == "endpoints" {
+		if publicURLBefore = storedManagedPublicURL(ops); publicURLBefore != "" {
+			if err := s.auditPublicURLChange(r.Context(), gcpIAMSurfaceReset, publicURLBefore, ""); err != nil {
+				slog.Error("Failed to record public URL change", "error", err)
+				writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to reset section", nil)
+				return
+			}
+		}
+	}
+
+	err := ops.DeleteSection(r.Context(), sectionName)
+	if publicURLBefore != "" && err != nil {
+		s.auditPublicURLNotApplied(r.Context(), gcpIAMSurfaceReset, publicURLBefore, "", err)
+	}
+	if gcpIAMChange {
+		// The approval covers only this reset's own self-apply.
+		s.clearGCPIAMApproval()
+		if err != nil {
+			s.auditGCPIAMNotApplied(r.Context(), gcpIAMCur, gcpIAMNext, err)
+		}
+	}
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, ErrCodeNotFound,
 				"Section not found in database: "+sectionName, nil)
@@ -299,10 +367,26 @@ func (s *Server) handleAdminServerConfigSectionReset(w http.ResponseWriter, r *h
 
 // handleGetServerConfig reads and returns the global settings.yaml.
 func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
+	resp, err := buildServerConfigFileResponse()
+	if err != nil {
+		var ue *serverConfigReadError
+		if errors.As(err, &ue) {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, ue.userMsg, nil)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to read settings", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// buildServerConfigFileResponse builds the file-mode GET
+// /api/v1/admin/server-config body (sensitive fields masked). The file-mode
+// PUT also uses it as the reference view for echo detection.
+func buildServerConfigFileResponse() (*ServerConfigResponse, error) {
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to resolve settings directory", nil)
-		return
+		return nil, &serverConfigReadError{"Failed to resolve settings directory", err}
 	}
 
 	settingsPath := filepath.Join(globalDir, "settings.yaml")
@@ -321,17 +405,14 @@ func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 				sort.Strings(envOverrides)
 				resp.EnvOverrides = envOverrides
 			}
-			writeJSON(w, http.StatusOK, resp)
-			return
+			return &resp, nil
 		}
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to read settings file", nil)
-		return
+		return nil, &serverConfigReadError{"Failed to read settings file", err}
 	}
 
 	var vs config.VersionedSettings
 	if err := yamlv3.Unmarshal(data, &vs); err != nil {
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to parse settings file", nil)
-		return
+		return nil, &serverConfigReadError{"Failed to parse settings file", err}
 	}
 
 	// Mask sensitive fields before sending to the client
@@ -374,6 +455,19 @@ func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 	if vs.Server != nil && vs.Server.Federation != nil {
 		resp.Federation = vs.Server.Federation
 	}
+	// server.hub.class and server.hub.test_identities are never
+	// API-writable, so they are not shown either: a client that echoes
+	// this body back must not send them.
+	if resp.Server != nil && resp.Server.Hub != nil {
+		resp.Server.Hub.HubClass = ""
+		resp.Server.Hub.TestIdentities = nil
+		// Nor is the relay-peer secret, which is never returned.
+		if c := resp.Server.Hub.Conduit; c != nil {
+			c.PeerSecret = ""
+		}
+	}
+	// Likewise the proxy driver settings (WS2).
+	hideNeverAPIWritableProxyKeys(resp.Server)
 
 	// Env overrides — detect SCION_SERVER_* env vars so the admin UI can
 	// show env-pinned fields in file mode too (H1).
@@ -384,7 +478,7 @@ func (s *Server) handleGetServerConfig(w http.ResponseWriter) {
 	}
 
 	maskSensitiveFields(&resp)
-	writeJSON(w, http.StatusOK, resp)
+	return &resp, nil
 }
 
 // validateDefaultTimezone checks an agent_defaults.default_timezone
@@ -414,14 +508,55 @@ func (s *Server) handlePutServerConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "Invalid request body", nil)
 		return
 	}
+	if rejectRepeatedJSONMembers(w, rawBody) {
+		return
+	}
+	// Gate-protected keys (server.hub.class always; federation while the
+	// test admin tier is on) are refused before anything is decoded.
+	// An empty relay-peer secret is ignored; any other value is refused.
+	rawBody = dropEmptyPeerSecret(rawBody)
+	if s.rejectGateProtectedSettingsKeys(w, rawBody) {
+		return
+	}
+	// Test identities with admin roles write no settings (test-admin
+	// policy; settings.yaml has no write guard of its own).
+	if s.rejectTestAdminSettingsWrite(w, r, settingsBodyKeys(rawBody), nil) {
+		return
+	}
 	var req ServerConfigUpdateRequest
-	if err := json.NewDecoder(bytes.NewReader(rawBody)).Decode(&req); err != nil {
+	if err := json.Unmarshal(rawBody, &req); err != nil {
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "Invalid request body", nil)
 		return
 	}
 	// The typed decode above silently drops a removed profiles.<name>.timezone
 	// key, so check the raw body before settings.yaml is touched.
 	if rejectRemovedProfileTimezone(w, rawBody) {
+		return
+	}
+	// Likewise the retired server.hub.async_agent_launch (ptone/scion#4991).
+	if rejectRetiredAsyncAgentLaunch(w, rawBody) {
+		return
+	}
+	// A user access token writes configuration keys only.
+	if writeTokenRefusedSettingsKeys(w, r.Context(), tokenRefusedServerConfigKeys(rawBody)) {
+		return
+	}
+	// server.broker.instances: presence comes from the raw body (the typed
+	// decode cannot tell an absent key from []); an explicit value is
+	// validated before anything is written.
+	instancesPresent, instances, err := brokerInstancesInBody(rawBody)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error(), nil)
+		return
+	}
+	// Any other key the typed decode drops (unknown, misspelt, or a flat
+	// dotted "server.hub.x" key) is rejected with 422 before anything is
+	// written, unless it echoes the GET view (ptone/scion#3463). A key
+	// inside server.broker.instances was already decoded strictly above.
+	if rejectUnknownFileConfigKeys(w, rawBody) {
+		return
+	}
+	if rejectInvalidThinkingLevel(w, req.DefaultThinkingLevel) {
 		return
 	}
 
@@ -438,6 +573,12 @@ func (s *Server) handlePutServerConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Server.Hub.AgentEndpoint = normalized
+	}
+
+	// The monitoring dashboard link must be an absolute http(s) URL; the
+	// same check as the DB path.
+	if !validateMonitoringDashboardURLRequest(w, &req) {
+		return
 	}
 
 	// server.auth.default_user_role must be one of the schema enum values
@@ -562,9 +703,58 @@ func (s *Server) handlePutServerConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// telemetry.cloud.headers values are masked in GET too: a masked echo
+	// keeps the stored header.
+	if len(maskedTelemetryHeaderNames(req.Telemetry)) > 0 {
+		stored, err := telemetryConfigFromRaw(raw)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to parse existing settings", nil)
+			return
+		}
+		unchanged := telemetryCloudUnchangedFile(raw, req.Telemetry, rawRequestObject(rawBody, "Telemetry"), stored)
+		if err := restoreMaskedTelemetryHeaders(req.Telemetry, stored, unchanged); err != nil {
+			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error(), nil)
+			return
+		}
+	}
 
-	// Apply updates by marshaling the request fields and merging
-	applySettingsUpdates(raw, &req)
+	// Apply updates by marshaling the request fields and merging. The raw
+	// server object tells the merge which server fields were sent.
+	// server.broker.instances is kept unless the body set it explicitly.
+	storedInstances := storedBrokerInstances(raw)
+	rawServer := rawServerObject(rawBody)
+	applySettingsUpdatesFromBody(raw, &req, rawBody)
+	carryOverBrokerInstances(raw, storedInstances, instancesPresent, instances)
+	// default_thinking_level is cleared by an explicit null, which the typed
+	// decode leaves as a nil pointer (indistinguishable from an omitted key).
+	if top, err := parseFieldPresence(rawBody); err == nil {
+		if v, sent := top.sentFold("default_thinking_level"); sent && isJSONNull(v) {
+			delete(raw, "default_thinking_level")
+		}
+	}
+
+	// The server section is deep-merged, so a section the request changes
+	// only in part is validated again as merged with the stored fields.
+	if req.Server != nil {
+		if err := validateMergedServerSections(raw, rawServer); err != nil {
+			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error(), nil)
+			return
+		}
+	}
+
+	// telemetry.cloud.tls unit rule, same as the DB-mode handler: checked
+	// only when the save sends tls (telemetryTLSTouched). A save replaces
+	// telemetry whole, so the file never keeps a tls the request left out.
+	if req.Telemetry != nil && telemetryTLSTouched(rawBody) {
+		var tls *config.V1TelemetryTLSConfig
+		if req.Telemetry.Cloud != nil {
+			tls = req.Telemetry.Cloud.TLS
+		}
+		if err := config.ValidateV1TelemetryTLS(tls); err != nil {
+			writeError(w, http.StatusBadRequest, ErrCodeValidationError, err.Error(), nil)
+			return
+		}
+	}
 
 	// Validate the effective hub default GCP identity (the merged result, so
 	// a PUT that changes only one of the pair is checked against the other's
@@ -667,7 +857,7 @@ func (s *Server) reloadSettings() map[string]interface{} {
 		"requires_restart": []string{},
 	}
 
-	gc, err := config.LoadGlobalConfig("")
+	gc, err := config.LoadGlobalConfig(s.config.ConfigPath)
 	if err != nil {
 		slog.Error("Failed to reload global config", "error", err)
 		results["error"] = err.Error()
@@ -677,10 +867,12 @@ func (s *Server) reloadSettings() map[string]interface{} {
 	snap := BuildLayer1SnapshotFromFile(gc)
 	results = ApplySnapshot(s, snap)
 
-	// Log level is a Layer-0 setting (per design §3.1) — only applied in
-	// file mode via reloadSettings, not through OperationalSettings.
+	// Log level is a Layer-0 setting (per design §3.1): the server applies
+	// it at startup, and live changes come only in file mode via
+	// reloadSettings, not through OperationalSettings. It is applied even
+	// when empty so that clearing it reverts to the default.
+	applySnapshotLogLevel(gc.LogLevel)
 	if gc.LogLevel != "" {
-		applySnapshotLogLevel(gc.LogLevel)
 		applied := results["applied"].([]string)
 		applied = append(applied, "log_level")
 		results["applied"] = applied
@@ -719,7 +911,24 @@ func setOrDeleteString(raw map[string]interface{}, key string, v *string) {
 }
 
 // applySettingsUpdates merges the update request into the raw settings map.
+// It is used only by tests of the non-server settings; the PUT handler
+// uses applySettingsUpdatesFromBody. The two differ for the server
+// section: here it is deep-merged from the typed request alone, so a zero
+// value in req.Server cannot be told apart from an omitted field and keeps
+// the stored value, while the PUT handler passes the request body so that
+// an explicit null, or the zero value of a non-pointer field, clears a
+// server field (see mergeServerSettings). Tests that
+// assert on server fields must use applySettingsUpdatesFromBody with a
+// real body.
 func applySettingsUpdates(raw map[string]interface{}, req *ServerConfigUpdateRequest) {
+	applySettingsUpdatesFromBody(raw, req, nil)
+}
+
+// applySettingsUpdatesFromBody is applySettingsUpdates with the raw PUT
+// body, whose "server" and "telemetry" objects tell mergeServerSettings
+// and mergeSettingsSection which fields the client sent. A nil rawBody
+// derives that from req.Server and req.Telemetry.
+func applySettingsUpdatesFromBody(raw map[string]interface{}, req *ServerConfigUpdateRequest, rawBody []byte) {
 	if req.SchemaVersion != nil {
 		raw["schema_version"] = *req.SchemaVersion
 	}
@@ -732,23 +941,13 @@ func applySettingsUpdates(raw map[string]interface{}, req *ServerConfigUpdateReq
 	setOrDeleteString(raw, "workspace_path", req.WorkspacePath)
 
 	if req.Server != nil {
-		newServer := marshalToMap(req.Server)
-		// Merge into existing server section to preserve keys not present in the
-		// update (e.g. github_app managed via its own endpoint).
-		if existing, ok := raw["server"]; ok {
-			if existingMap, ok := existing.(map[string]interface{}); ok {
-				if newMap, ok := newServer.(map[string]interface{}); ok {
-					for k, v := range newMap {
-						existingMap[k] = v
-					}
-					newServer = existingMap
-				}
-			}
-		}
-		raw["server"] = newServer
+		mergeServerSettings(raw, req.Server, rawServerObject(rawBody))
 	}
+	// telemetry is deep-merged, as in DB mode (ptone/scion#4047): clients
+	// send only part of it (the settings page leaves out filter, resource
+	// and cloud headers, tls and batch), and the rest must be kept.
 	if req.Telemetry != nil {
-		raw["telemetry"] = marshalToMap(req.Telemetry)
+		mergeSettingsSection(raw, "telemetry", req.Telemetry, rawRequestObject(rawBody, "Telemetry"))
 	}
 	if req.Runtimes != nil {
 		raw["runtimes"] = marshalToMap(req.Runtimes)
@@ -791,12 +990,11 @@ func applySettingsUpdates(raw map[string]interface{}, req *ServerConfigUpdateReq
 			delete(raw, "default_model")
 		}
 	}
+	// An explicit null clears default_thinking_level (handlePutServerConfig
+	// sees it in the body); 0 is rejected before this runs
+	// (rejectInvalidThinkingLevel), so it is never a silent clear.
 	if req.DefaultThinkingLevel != nil {
-		if *req.DefaultThinkingLevel > 0 {
-			raw["default_thinking_level"] = *req.DefaultThinkingLevel
-		} else {
-			delete(raw, "default_thinking_level")
-		}
+		raw["default_thinking_level"] = *req.DefaultThinkingLevel
 	}
 	setOrDeleteString(raw, "default_max_agent_role", req.DefaultMaxAgentRole)
 	setOrDeleteString(raw, "default_agent_role", req.DefaultAgentRole)
@@ -887,4 +1085,19 @@ func user(u UserIdentity) string {
 		return "unknown"
 	}
 	return u.Email()
+}
+
+// rejectInvalidThinkingLevel writes a 422 and returns true when a PUT sends
+// a default_thinking_level outside 1-100 (the settings schema range). An
+// explicit null, not 0, clears the level; 0 is rejected rather than treated
+// as a clear, so a client that sends 0 for "unset" learns of it instead of
+// clearing the value by accident (ptone/scion#3898). Shared by the DB-backed
+// and file-mode server-config PUT handlers.
+func rejectInvalidThinkingLevel(w http.ResponseWriter, level *int) bool {
+	if level == nil || (*level >= 1 && *level <= 100) {
+		return false
+	}
+	writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError,
+		fmt.Sprintf("invalid default_thinking_level %d: must be between 1 and 100; send null to clear it", *level), nil)
+	return true
 }

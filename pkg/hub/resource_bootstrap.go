@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -41,8 +42,30 @@ func (s *Server) BootstrapBundledResources(ctx context.Context, opts BootstrapOp
 		return nil
 	}
 
+	// The seeded-built-ins ledger (ptone/scion#3544) keeps a built-in the
+	// user deleted from being re-created. The policy lives here, not in
+	// BootstrapSource, so the generic ResourceStore stays policy-free.
+	ledger, err := s.loadBuiltinSeedLedger(ctx)
+	if err != nil {
+		return fmt.Errorf("bundled resource bootstrap: %w", err)
+	}
+
 	var errs []error
 	for _, r := range resources.BuiltinResources() {
+		slug := api.Slugify(r.Name)
+		exists, err := s.builtinRowExists(ctx, r.Kind, slug)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("bootstrap %s %q: %w", r.Kind, r.Name, err))
+			continue
+		}
+		if exists {
+			ledger.Mark(r.Kind, slug)
+		} else if ledger.Seen(r.Kind, slug) {
+			s.resourceLog.Info("built-in previously deleted; not re-seeding",
+				"kind", r.Kind, "name", r.Name)
+			continue
+		}
+
 		src := NewFSResourceSource(r)
 
 		var rs *ResourceStore
@@ -66,6 +89,9 @@ func (s *Server) BootstrapBundledResources(ctx context.Context, opts BootstrapOp
 			errs = append(errs, fmt.Errorf("bootstrap %s %q: %w", r.Kind, r.Name, err))
 			continue
 		}
+		if result.Created > 0 {
+			ledger.Mark(r.Kind, slug)
+		}
 
 		s.resourceLog.Info("bootstrapped bundled resource",
 			"kind", r.Kind, "name", r.Name,
@@ -74,11 +100,37 @@ func (s *Server) BootstrapBundledResources(ctx context.Context, opts BootstrapOp
 			"failed", result.Failed)
 	}
 
+	if err := s.saveBuiltinSeedLedger(ctx, ledger); err != nil {
+		errs = append(errs, fmt.Errorf("bundled resource bootstrap: %w", err))
+	}
+
 	if err := s.ArchiveObsoleteBundledHarnessConfigs(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("archive obsolete bundled harness-configs: %w", err))
 	}
 
 	return errors.Join(errs...)
+}
+
+// builtinRowExists reports whether a global row of the given kind and slug
+// exists, whatever its status. It uses the same slug lookup BootstrapSource
+// does.
+func (s *Server) builtinRowExists(ctx context.Context, kind storage.ResourceKind, slug string) (bool, error) {
+	var err error
+	switch kind {
+	case storage.ResourceKindTemplate:
+		_, err = s.store.GetTemplateBySlug(ctx, slug, string(store.TemplateScopeGlobal), "")
+	case storage.ResourceKindHarnessConfig:
+		_, err = s.store.GetHarnessConfigBySlug(ctx, slug, store.HarnessConfigScopeGlobal, "")
+	default:
+		return false, fmt.Errorf("unsupported resource kind %q", kind)
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // resolveHarnessType reads config.yaml from a bundled harness-config resource's
@@ -133,8 +185,12 @@ func (s *Server) ArchiveObsoleteBundledHarnessConfigs(ctx context.Context) error
 			continue
 		}
 
+		// Status is a content column (ptone/scion#4219): it is written
+		// through the compare-and-swap with the row as read, so a
+		// concurrent commit is never reverted; a lost race is logged and
+		// skipped (the next startup retries).
 		hc.Status = store.HarnessConfigStatusArchived
-		if err := s.store.UpdateHarnessConfig(ctx, &hc); err != nil {
+		if err := s.store.UpdateHarnessConfigContent(ctx, &hc, store.HarnessConfigContentPrecondition{ContentHash: hc.ContentHash}); err != nil {
 			s.resourceLog.Warn("failed to archive obsolete bundled harness-config",
 				"name", hc.Name, "id", hc.ID, "error", err)
 			continue

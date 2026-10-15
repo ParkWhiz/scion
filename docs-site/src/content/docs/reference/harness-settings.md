@@ -11,15 +11,29 @@ While Scion manages the orchestration and execution of containers, the tools run
 Each agent has a dedicated "Home" directory that is mounted into the container. Harness-specific settings are typically found in a hidden subdirectory:
 - **Gemini**: `/home/gemini/.gemini/settings.json`
 - **Claude**: `/home/claude/.claude.json` (or similar)
-- **Opencode**: `/home/opencode/opencode.json`
+- **Opencode**: `/home/scion/.config/opencode/opencode.json` (opencode 1.x does not read the old `.opencode.json` name)
 
 ## Seeding from Harness-Configs & Templates
 When an agent is created, Scion composes its home directory by layering files from multiple sources:
-1.  **Harness-Config**: Base settings for the specific LLM tool (from `~/.scion/harness-configs/<name>/home/`).
+1.  **Harness-Config**: Base settings for the specific LLM tool (from `~/.scion/harness-configs/<name>/home/`, or another [harness-config location](#managing-harness-configs)).
 2.  **Template**: Role-specific prompts and configuration (from `.scion/templates/<name>/home/`).
 3.  **Common Files**: Shared dotfiles like `.tmux.conf` and `.zshrc`.
 
 This multi-layered approach allows you to define a "base" Gemini configuration once, and then overlay different "roles" (like Code Reviewer or Security Auditor) on top of it.
+
+### When harness-config changes reach an agent
+
+A harness-config has two parts that reach an agent at different times:
+
+- **`home/` files** (for example `home/.claude/settings.json`, which registers the Claude Code hooks) are copied into the agent home only when the agent is provisioned: when it is created, and when it is [reincarnated](/scion/local/agent-lifecycle/#reincarnating-an-agent). Starting an existing agent reuses its agent home and does not copy them again.
+- **The provisioning bundle** (`config.yaml` and the provisioner scripts) is cleared and staged again from the harness-config on every start.
+
+So after you change a harness-config's `home/` files, an existing agent keeps its old copies through stops and starts. Reincarnate or recreate the agent to pick up the change.
+
+Where the start reads the harness-config from depends on the mode:
+
+- **Workstation:** a local agent uses the harness-config on disk (template-bundled, then project, then global). When the workstation server starts, it syncs the global harness-configs (`~/.scion/harness-configs/`) to the Hub: it imports each one the Hub does not have yet (except a built-in that was deleted on the Hub) and re-uploads each one whose content hash changed.
+- **Hosted:** the Hub stores each harness-config as a record plus its files in storage, written by `scion harness-config sync` (alias `push`) or re-imported by `scion harness-config update`. When the Runtime Broker creates, starts or restarts an agent, it fetches the Hub's current version of the agent's harness-config (cached on the broker by content hash), not the version the agent was created with. A start still keeps the agent's existing `home/` files.
 
 ## Managing Harness-Configs
 
@@ -28,7 +42,11 @@ A **harness-config** is a named, versioned bundle that defines a harness: its `c
 (the `home/` directory, `provision.py`, `dialect.yaml`, `capture_auth.py`, and the shared
 `scion_harness.py` library). Bundles live in `~/.scion/harness-configs/<name>/` (global) or
 `.scion/harness-configs/<name>/` (project-level); project-level configs override global ones with
-the same name.
+the same name. A template can also bundle harness-configs in its own `harness-configs/<name>/`
+directories, and these take precedence over both project and global configs of the same name (any
+directory that fails to load is skipped and the next one is tried). When a Hub dispatch names a
+Hub harness-config, the Hub's copy is used instead of any of these directories; if the Runtime
+Broker cannot fetch it, the start fails rather than falling back to them.
 
 Since all harnesses are now provisioned via container-script (see
 [Supported Agent Harnesses](/scion/supported-harnesses/)), harness-configs are the unit you
@@ -64,8 +82,12 @@ are separate configs, so check the printed scope to see which one you changed.
 
 ### Source-URL tracking and "Refresh from Source"
 
-When a config is installed from a remote source, the Hub records the **`sourceUrl`** it came
-from. You can later re-import (refresh) the config from that source:
+When a config is imported from a URL through the Hub (the import box in the web UI, or
+`POST /api/v1/resources/import`), or installed from a remote source (a URL or rclone URI) with
+`scion harness-config install` in whichever scope it installs to, the Hub records the
+**`sourceUrl`** it came from as metadata. A config installed from a local path or `file://` URL
+records no source URL; to attach one, run `scion harness-config update <name> --url <url>`. You
+can re-import (refresh) a config from its stored source:
 
 ```bash
 # Re-import a single config from its stored source URL
@@ -165,6 +187,40 @@ The force paths still replace the whole config, and they write through symlinks.
 To customize a provisioner, publish it as your own harness-config under a different name. Do
 not edit the bundled scripts in place.
 
+### Changing a harness config affects new agents only
+
+By design, an agent keeps the harness setup it was created with. Its home directory is composed
+once, when the agent is created (see [Seeding from Harness-Configs &
+Templates](#seeding-from-harness-configs--templates)). That directory holds the harness-config's
+`home/` dotfiles, such as Claude's `.claude/settings.json` with its hook registrations, and the
+agent's skills. The skills come from the template chain (including skill references it declares)
+and the platform skills, not from the harness-config. Stopping and starting the agent does not
+copy them again. For a harness that uses container-script provisioning, each start re-stages the
+provisioner bundle (for example `config.yaml`, `provision.py`, `scion_harness.py`,
+`dialect.yaml` and the capture-auth assets) and the hook wrapper script, and then runs
+`provision.py`. Changes to `home/` dotfiles, including hook registrations kept there, therefore
+reach new agents only. Harnesses whose provisioner writes its hook configuration at start (for
+example Copilot, Antigravity and Grok Build) pick up changes to the provisioner on the agent's
+next start.
+
+To give an existing agent the new setup:
+
+1. **Update the harness-config.**
+   - Agents use the Hub's copy. `scion harness-config upgrade <name>` changes only the local copy
+     in `~/.scion/harness-configs/<name>/` (add `--force` to take every new default file, discarding
+     your edits to them), not the Hub's copy. The
+     Hub refreshes its copy of a built-in harness-config from the binary's defaults when it
+     restarts. In Workstation mode, that restart also resets the bundled configs in
+     `~/.scion/harness-configs/` to the defaults. Publish a harness-config you changed yourself
+     with `scion harness-config sync <name>`.
+2. **Rebuild the agent's home.**
+   - Run [`scion reincarnate <agent>`](/scion/reference/cli/#scion-reincarnate).
+     It keeps the agent's identity and workspace and copies the harness-config's home files, the
+     skills from the template chain (including skill references it declares) and the platform
+     skills in again. It overlays files: files that the new version no longer has stay in place.
+   - **In a worktree-per-agent project** (where reincarnate is not available):
+     save the agent's work, then delete the agent with `scion delete` and start it again.
+
 ### Deleting
 
 ```bash
@@ -176,6 +232,62 @@ your local on-disk files. In the web UI, the delete dialog offers an **"Also del
 checkbox to remove the Hub-stored files as well. To remove a local directory, delete it from the
 filesystem or reinstall with `--force`.
 
+### Recovering a deleted built-in
+
+A built-in harness config (such as `claude`) that you delete from the Hub stays deleted. A Hub
+restart or upgrade does not re-create it, and the same applies to built-ins left unselected in
+the setup wizard. To bring one back, re-import it as a **global** harness config from its
+canonical URL:
+
+```text
+https://github.com/GoogleCloudPlatform/scion/harnesses/<name>
+```
+
+In the web UI, open the Hub's **Settings** page, go to the **Harness Configs** tab, and import
+that URL. From the CLI, run
+`scion harness-config install --global https://github.com/GoogleCloudPlatform/scion/harnesses/<name>`.
+With the API, send a global import (Hub admins only):
+
+```bash
+curl -X POST "$HUB_ENDPOINT/api/v1/resources/import" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"kind": "harness-config", "scope": "global",
+       "sourceUrl": "https://github.com/GoogleCloudPlatform/scion/harnesses/claude"}'
+```
+
+The URL fetches the repository's main branch. A config re-imported this way counts as a
+built-in again: at its next start the Hub brings it to the version bundled in the Hub binary,
+and later upgrades keep updating it.
+
+Use exactly that URL form. On a **hosted** Hub, a copy from any other URL for the same config,
+such as a `/tree/<ref>/` URL
+(`https://github.com/GoogleCloudPlatform/scion/tree/main/harnesses/claude`), or from a local path,
+is usable but **user-managed**, so it never receives the content bundled with later releases.
+This applies whether you import or install it.
+
+To turn such a copy back into an updating built-in, re-import the canonical URL over it, either
+through the web UI or API import above, with
+`scion harness-config install --global --force <canonical URL>`, or with
+`scion harness-config update <name> --url https://github.com/GoogleCloudPlatform/scion/harnesses/<name>`.
+This updates the existing config in place and records the canonical source URL, so later
+upgrades update it again. You do not need to delete it first.
+
+**Workstation** Hubs re-sync built-ins from `~/.scion/harness-configs` at every start, so a
+re-imported config is updated whichever way you imported it.
+
+The same applies to the built-in `default` template: you can re-import it as a global template
+(`"kind": "template"`, or the **Templates** tab) from
+`https://github.com/GoogleCloudPlatform/scion/resources/templates/default`. On a hosted Hub the
+result is always user-managed and does not receive later bundled updates. Workstation Hubs keep
+it updated.
+
+The Hub must be able to reach GitHub to fetch the URL. An air-gapped Hub needs another source it
+can reach, for example a mirror given as an rclone URI in `sourceUrl` (`:gcs:bucket/path`), or a
+project workspace import (`POST /api/v1/projects/{id}/import-harness-configs` with
+`workspacePath`), which creates a project-scoped config. On a hosted Hub, both give a
+user-managed copy.
+
 ## Configuration (`config.yaml`)
 
 The `config.yaml` file at the root of a harness-config bundle defines its runtime parameters. Beyond basic fields like `image`, `harness` type, and `model_aliases`, it includes capabilities and launch configurations.
@@ -183,15 +295,20 @@ The `config.yaml` file at the root of a harness-config bundle defines its runtim
 `image` and `image_pull_policy` (the latter is Kubernetes-only; values `Always`, `IfNotPresent`,
 `Never`) can also be set — and, since ptone/scion#2156, overridden by an operator — via Hub
 settings `harness_configs.<name>.image` / `.image_pull_policy`, without editing the bundle. An
-explicit `image` or `kubernetes.imagePullPolicy` in a template or agent config still outranks the
-Hub setting, which in turn outranks this file's own default. See [Settings
+explicit `image` or `kubernetes.imagePullPolicy` in an agent config still outranks the
+Hub setting, which in turn outranks this file's own default; in a template both keys are ignored. An *explicitly set*
+`profiles.<p>.harness_overrides.<name>.image` (and that override's `image_pull_policy`) is the exception:
+since ptone/scion#1799 it outranks an inline (agent config) value too, and only the user's explicit
+`--image` (or explicit pull policy) ranks above it. See [Settings
 Precedence](/scion/reference/settings-precedence/#container-image-and-kubernetes-image-pull-policy--a-separate-chain-from-b1)
 for the full chain.
 
 ### Thinking Level Map (`thinking`)
 
 Scion carries the thinking level as a harness-agnostic integer from 0 to 100 (`--thinking-level` on
-`scion start`, Hub agent defaults, templates). Inside the container it arrives as
+`scion start`, Hub agent defaults, templates). `--thinking-level` also accepts the shorthands
+`low` (25), `medium` (50), `high` (75) and `max` (100), case-insensitive; they are stored as those
+integers. Inside the container it arrives as
 `SCION_THINKING_LEVEL`. A harness that honours it declares a `thinking:` block in its
 `config.yaml`, next to `model_aliases`. The block maps level ranges to the harness's native tier
 strings:
@@ -234,6 +351,66 @@ their tables. If you maintain a customized `config.yaml` for one of these harnes
 merges missing top-level keys such as `thinking:` without overwriting your values. Without the
 block, the provisioner writes no thinking setting, so the CLI's own default applies. codex logs
 a warning on every start; antigravity and claude log one when a thinking level was requested.
+
+### Readiness (`ready`)
+
+A newly started harness needs a moment before it reads its terminal input. A message sent to the
+agent in that window is held and pasted once the harness is ready. The `ready` block says how
+"ready" is decided:
+
+```yaml
+ready:
+  strategy: hook   # hook | delay (default delay)
+  settle: 1.5s     # 0s to 60s; default 8s for delay, 1.5s for hook
+  timeout: 90s     # hook only, 10s to 10m; default 90s
+```
+
+There is one rule: the harness is ready at *signal time + `settle`*.
+
+- `hook`: the signal is a ready marker that the harness's first session-start hook (or any later
+  hook event) writes for the current run. A session-start from `/clear` or `/compact` does not
+  count. Use `hook` only when the harness fires a hook at startup, before any user input. If no
+  marker appears, the agent is reported as working `timeout` after the launch, and a held
+  message is pasted anyway at most `timeout` after its delivery began.
+- `delay`: the signal is the creation of the agent's tmux session. Use it when the harness has no
+  early hook. `timeout` is not allowed with `delay`.
+
+Rules (checked when the harness-config is loaded; a violation fails the load): the units are
+those of Go durations (`ns`, `us`, `ms`, `s`, `m`, `h`), a zero must be written `0s`, and no other
+keys are allowed.
+
+**How the value travels.** The broker resolves the harness-config, including project, template
+and Hub overrides (an override replaces the whole `ready` block), and passes the resolved spec to
+the container in `SCION_HARNESS_READY`. `sciontool init` records it in the container's readiness
+file, and both readers use those values: `sciontool init`, which reports the agent as working
+when it is ready, and the broker, which waits before pasting a held message. A
+`SCION_HARNESS_READY` value in a caller's `env` cannot override it (a template cannot set `SCION_*` keys).
+
+The built-in bundles use `hook` (settle 1.5s, timeout 90s) for claude, gemini-cli, copilot and
+grok-build, and `delay` 8s for every other harness. A harness-config without the block (for
+example one installed before the block existed) uses the block of the built-in bundle for its
+`harness` type, so an older claude config keeps `hook`; a harness with no built-in bundle uses
+`delay` 8s.
+
+A harness-config without a provisioner that declares a `ready` or `delivery` block, in
+`config.yaml` or in an override, is treated like a harness-config with `command` or
+`config_dir`: its `ready` block is used, its `instructions_file`, `system_prompt_file` and
+`system_prompt_mode` (or the declarative defaults for instructions and system prompts) apply when
+the agent is provisioned, and the harness reports its `harness` type as its name instead of
+`generic`. A `ready` block taken from the built-in bundle does not have this effect. Message
+delivery and interrupts still use the built-in bundle for the `harness` type (the defaults for a
+type with no bundle), so a custom `delivery` block, `interrupt_key` and `interrupt_sequence` do
+not yet change how messages are submitted or interrupted.
+
+**Version skew.**
+
+- Upgrade brokers with or before the Hub. A broker older than the `ready` block rejects a
+  harness-config that has one, so agent launch fails on that broker.
+- A broker older than this reader, starting a newer image, does not pass the spec. The
+  container then uses `delay` 8s for every harness (logged at Info), so hook harnesses lose
+  marker gating until the broker is upgraded.
+- A newer broker with an older image finds no spec in the readiness file and uses the built-in
+  timings, as before.
 
 ### Command Execution (`command`)
 

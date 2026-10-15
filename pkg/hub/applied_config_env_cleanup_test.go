@@ -29,55 +29,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// cleanupTestSecretBackend is a minimal secret.SecretBackend fake whose List
-// method returns caller-supplied metadata per scope, for testing
-// AppliedConfigEnvCleanupExecutor's reachableSecretNames matching without
-// pulling in a full secret store.
-type cleanupTestSecretBackend struct {
-	byScope map[string][]secret.SecretMeta // key: scope+"/"+scopeID
-
-	// listCalls counts List invocations per scope key, for tests asserting
-	// the cleanup's per-scope caching (each scope should be listed at most
-	// once per sweep, not once per agent). nil is fine: a nil map is never
-	// written to by tests that don't care about this.
-	listCalls map[string]int
-}
-
-func (b *cleanupTestSecretBackend) key(scope, scopeID string) string { return scope + "/" + scopeID }
-
-func (b *cleanupTestSecretBackend) Get(ctx context.Context, name, scope, scopeID string) (*secret.SecretWithValue, error) {
-	return nil, nil
-}
-func (b *cleanupTestSecretBackend) Set(ctx context.Context, input *secret.SetSecretInput) (bool, *secret.SecretMeta, error) {
-	return false, nil, nil
-}
-func (b *cleanupTestSecretBackend) Delete(ctx context.Context, name, scope, scopeID string) error {
-	return nil
-}
-func (b *cleanupTestSecretBackend) List(ctx context.Context, filter secret.Filter) ([]secret.SecretMeta, error) {
-	if b.listCalls != nil {
-		b.listCalls[b.key(filter.Scope, filter.ScopeID)]++
-	}
-	return b.byScope[b.key(filter.Scope, filter.ScopeID)], nil
-}
-func (b *cleanupTestSecretBackend) GetMeta(ctx context.Context, name, scope, scopeID string) (*secret.SecretMeta, error) {
-	return nil, nil
-}
-func (b *cleanupTestSecretBackend) UpdateMeta(ctx context.Context, input *secret.UpdateMetaInput) (*secret.SecretMeta, error) {
-	return nil, nil
-}
-func (b *cleanupTestSecretBackend) Resolve(ctx context.Context, userID, projectID, brokerID string, opts *secret.ResolveOpts) ([]secret.SecretWithValue, error) {
-	return nil, nil
-}
-func (b *cleanupTestSecretBackend) HubID() string { return "test-hub" }
-func (b *cleanupTestSecretBackend) FetchValues(ctx context.Context, metas []secret.SecretMeta) (map[string]secret.FetchResult, error) {
-	results := make(map[string]secret.FetchResult, len(metas))
-	for _, meta := range metas {
-		results[meta.ID] = secret.FetchResult{Err: store.ErrNotFound}
-	}
-	return results, nil
-}
-
 // TestAppliedConfigEnvCleanupStripsGitHubTokenAndKnownSecrets is a
 // mutation-resistant check of the cleanup's per-key decision: GITHUB_TOKEN is
 // always removed; a key matching a secret-flagged EnvVar or a secret-store
@@ -352,6 +303,138 @@ func TestAppliedConfigEnvCleanupStripsHubScopeSecret(t *testing.T) {
 	}
 	if _, ok := updated.AppliedConfig.Env["HUB_SCOPED_SECRET"]; ok {
 		t.Error("expected HUB_SCOPED_SECRET (a hub-scope secret match) to be stripped, but it remains")
+	}
+}
+
+// TestAppliedConfigEnvCleanupHubScopeEnvVarFilter pins the hub scope in
+// envVarScopeFilters (ptone/scion#1976). Each assertion depends on the hub
+// scope being queried and on nothing else: a hub-scope plain EnvVar is the
+// only live source of HUB_PLAIN_VAR (so it is kept only if the hub scope is
+// seen), and a hub-scope Secret==true EnvVar is the only reason to strip
+// HUB_SECRET_ENVVAR from InlineConfig.Env (the narrow rule strips only known
+// secrets, so it would survive if the hub scope were dropped). Stripping by
+// default (TestAppliedConfigEnvCleanupStripsHubScopeSecret) cannot pin this,
+// because the allowlist strips an unrecognized key anyway.
+func TestAppliedConfigEnvCleanupHubScopeEnvVarFilter(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	project := &store.Project{ID: tid("project-hubenv"), Name: "Hub Env Project", Slug: "hubenv-project"}
+	if err := memStore.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	// cleanupTestSecretBackend.HubID() is "test-hub", the ScopeID
+	// envVarScopeFilters queries under store.ScopeHub.
+	for _, v := range []*store.EnvVar{
+		{ID: tid("envvar-hub-plain"), Key: "HUB_PLAIN_VAR", Value: "hub-plain-value",
+			Scope: store.ScopeHub, ScopeID: "test-hub", Secret: false},
+		{ID: tid("envvar-hub-secret"), Key: "HUB_SECRET_ENVVAR", Value: "hub-secret-value",
+			Scope: store.ScopeHub, ScopeID: "test-hub", Secret: true},
+	} {
+		if err := memStore.CreateEnvVar(ctx, v); err != nil {
+			t.Fatalf("failed to create hub env var %s: %v", v.Key, err)
+		}
+	}
+
+	agent := &store.Agent{
+		ID:        tid("agent-hubenv"),
+		Slug:      "agent-hubenv",
+		Name:      "Hub Env Agent",
+		ProjectID: project.ID,
+		OwnerID:   tid("owner-hubenv"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			Env: map[string]string{"HUB_PLAIN_VAR": "hub-plain-value"},
+			InlineConfig: &api.ScionConfig{
+				Env: map[string]string{"HUB_SECRET_ENVVAR": "value-must-not-appear-in-log"},
+			},
+		},
+	}
+	if err := memStore.CreateAgent(ctx, agent); err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	exec := &AppliedConfigEnvCleanupExecutor{Store: memStore, SecretBackend: &cleanupTestSecretBackend{}}
+	var buf bytes.Buffer
+	if err := exec.Run(ctx, &buf, nil); err != nil {
+		t.Fatalf("cleanup Run failed: %v", err)
+	}
+
+	updated, err := memStore.GetAgent(ctx, agent.ID)
+	if err != nil {
+		t.Fatalf("failed to reload agent: %v", err)
+	}
+	if got := updated.AppliedConfig.Env["HUB_PLAIN_VAR"]; got != "hub-plain-value" {
+		t.Errorf("expected HUB_PLAIN_VAR (matches a hub-scope plain EnvVar) to be kept, got %q", got)
+	}
+	require.NotNil(t, updated.AppliedConfig.InlineConfig)
+	if _, ok := updated.AppliedConfig.InlineConfig.Env["HUB_SECRET_ENVVAR"]; ok {
+		t.Error("expected InlineConfig.Env[HUB_SECRET_ENVVAR] (a hub-scope Secret==true EnvVar) to be stripped, but it remains")
+	}
+}
+
+// TestAppliedConfigEnvCleanupHubScopeSecretFilter pins the hub scope in
+// secretScopeFilters (ptone/scion#1976). A hub-scope secret name is the only
+// reason to strip either key here: HUB_SECRET_INLINE sits in
+// InlineConfig.Env, where the narrow rule strips only known secrets, and
+// HUB_SECRET_APPLIED's persisted value matches a live plain source (the
+// agent's own InlineConfig), which the allowlist would keep. Dropping the hub
+// scope from secretScopeFilters leaves both in place and fails this test.
+func TestAppliedConfigEnvCleanupHubScopeSecretFilter(t *testing.T) {
+	ctx := context.Background()
+	memStore := createTestStore(t)
+
+	project := &store.Project{ID: tid("project-hubsecret"), Name: "Hub Secret Project", Slug: "hubsecret-project"}
+	if err := memStore.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	secretBackend := &cleanupTestSecretBackend{
+		byScope: map[string][]secret.SecretMeta{
+			"hub/test-hub": {
+				{Name: "HUB_SECRET_INLINE", SecretType: "variable"},
+				{Name: "HUB_SECRET_APPLIED", SecretType: "variable"},
+			},
+		},
+	}
+
+	agent := &store.Agent{
+		ID:        tid("agent-hubsecret"),
+		Slug:      "agent-hubsecret",
+		Name:      "Hub Secret Agent",
+		ProjectID: project.ID,
+		OwnerID:   tid("owner-hubsecret"),
+		AppliedConfig: &store.AgentAppliedConfig{
+			Env: map[string]string{"HUB_SECRET_APPLIED": "same-value"},
+			InlineConfig: &api.ScionConfig{
+				Env: map[string]string{
+					"HUB_SECRET_INLINE":  "value-must-not-appear-in-log",
+					"HUB_SECRET_APPLIED": "same-value",
+				},
+			},
+		},
+	}
+	if err := memStore.CreateAgent(ctx, agent); err != nil {
+		t.Fatalf("failed to create agent: %v", err)
+	}
+
+	exec := &AppliedConfigEnvCleanupExecutor{Store: memStore, SecretBackend: secretBackend}
+	var buf bytes.Buffer
+	if err := exec.Run(ctx, &buf, nil); err != nil {
+		t.Fatalf("cleanup Run failed: %v", err)
+	}
+
+	updated, err := memStore.GetAgent(ctx, agent.ID)
+	if err != nil {
+		t.Fatalf("failed to reload agent: %v", err)
+	}
+	if _, ok := updated.AppliedConfig.Env["HUB_SECRET_APPLIED"]; ok {
+		t.Error("expected Env[HUB_SECRET_APPLIED] (a hub-scope secret name) to be stripped despite matching a plain source, but it remains")
+	}
+	require.NotNil(t, updated.AppliedConfig.InlineConfig)
+	for _, k := range []string{"HUB_SECRET_INLINE", "HUB_SECRET_APPLIED"} {
+		if _, ok := updated.AppliedConfig.InlineConfig.Env[k]; ok {
+			t.Errorf("expected InlineConfig.Env[%s] (a hub-scope secret name) to be stripped, but it remains", k)
+		}
 	}
 }
 

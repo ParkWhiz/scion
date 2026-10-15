@@ -21,8 +21,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -327,6 +329,291 @@ func TestHarnessConfigPatch(t *testing.T) {
 	}
 }
 
+// createHarnessConfigWithContent stores a harness config whose content hash
+// and file manifest were set by the server.
+func createHarnessConfigWithContent(t *testing.T, s store.Store, id string) *store.HarnessConfig {
+	t.Helper()
+	hc := &store.HarnessConfig{
+		ID:          tid(id),
+		Slug:        id,
+		Name:        "Content Test",
+		Description: "original description",
+		Harness:     "claude",
+		Config:      &store.HarnessConfigData{Harness: "claude", Image: "original-image:1"},
+		Scope:       "global",
+		Status:      store.HarnessConfigStatusActive,
+		ContentHash: "sha256:server-computed",
+		Files: []store.TemplateFile{
+			{Path: "config.yaml", Size: 42, Hash: "sha256:config", Mode: "0644"},
+			{Path: "home/.bashrc", Size: 7, Hash: "sha256:bashrc", Mode: "0644"},
+		},
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateHarnessConfig(context.Background(), hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+	return hc
+}
+
+func assertHarnessConfigContentEqual(t *testing.T, label string, want, got *store.HarnessConfig) {
+	t.Helper()
+	if got.ContentHash != want.ContentHash {
+		t.Errorf("%s content hash = %q, want %q", label, got.ContentHash, want.ContentHash)
+	}
+	if len(got.Files) != len(want.Files) {
+		t.Fatalf("%s files = %+v, want %+v", label, got.Files, want.Files)
+	}
+	for i := range want.Files {
+		if got.Files[i] != want.Files[i] {
+			t.Errorf("%s files[%d] = %+v, want %+v", label, i, got.Files[i], want.Files[i])
+		}
+	}
+}
+
+// TestHarnessConfigUpdate_PreservesContentHashAndFiles verifies that the
+// update handler keeps the server-computed content hash and file list from
+// the existing record when the request body carries different values.
+func TestHarnessConfigUpdate_PreservesContentHashAndFiles(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+	hc := createHarnessConfigWithContent(t, s, "hc-update-content")
+
+	body := store.HarnessConfig{
+		Name:        hc.Name,
+		Slug:        hc.Slug,
+		Harness:     hc.Harness,
+		Status:      hc.Status,
+		ContentHash: "sha256:request-body",
+		Files: []store.TemplateFile{
+			{Path: "other.yaml", Size: 1, Hash: "sha256:other", Mode: "0600"},
+		},
+	}
+	rec := doRequest(t, srv, http.MethodPut, "/api/v1/harness-configs/"+hc.ID, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var returned store.HarnessConfig
+	if err := json.Unmarshal(rec.Body.Bytes(), &returned); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	assertHarnessConfigContentEqual(t, "returned", hc, &returned)
+
+	stored, err := s.GetHarnessConfig(ctx, hc.ID)
+	if err != nil {
+		t.Fatalf("failed to get harness config: %v", err)
+	}
+	assertHarnessConfigContentEqual(t, "stored", hc, stored)
+}
+
+// TestHarnessConfigUpdate_AppliesUpdatableFields verifies that the metadata
+// fields update through the update handler while config and harness, which
+// are derived from config.yaml, keep their stored values: a PUT is
+// metadata-only and silently pins everything else (ptone/scion#4219).
+func TestHarnessConfigUpdate_AppliesUpdatableFields(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+	hc := createHarnessConfigWithContent(t, s, "hc-update-fields")
+
+	body := store.HarnessConfig{
+		Name:        "Renamed Config",
+		Slug:        hc.Slug,
+		DisplayName: "Renamed Display",
+		Description: "updated description",
+		Harness:     "gemini",
+		Config:      &store.HarnessConfigData{Harness: "claude", Image: "updated-image:2"},
+		Status:      hc.Status,
+	}
+	rec := doRequest(t, srv, http.MethodPut, "/api/v1/harness-configs/"+hc.ID, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	stored, err := s.GetHarnessConfig(ctx, hc.ID)
+	if err != nil {
+		t.Fatalf("failed to get harness config: %v", err)
+	}
+	if stored.Name != "Renamed Config" {
+		t.Errorf("name = %q, want %q", stored.Name, "Renamed Config")
+	}
+	if stored.DisplayName != "Renamed Display" {
+		t.Errorf("display name = %q, want %q", stored.DisplayName, "Renamed Display")
+	}
+	if stored.Description != "updated description" {
+		t.Errorf("description = %q, want %q", stored.Description, "updated description")
+	}
+	if !reflect.DeepEqual(stored.Config, hc.Config) {
+		t.Errorf("config = %+v, want the stored %+v (pinned)", stored.Config, hc.Config)
+	}
+	if stored.Harness != hc.Harness {
+		t.Errorf("harness = %q, want the stored %q (pinned)", stored.Harness, hc.Harness)
+	}
+	assertHarnessConfigContentEqual(t, "stored", hc, stored)
+}
+
+// putHarnessConfig sends an update body and returns the stored record.
+func putHarnessConfig(t *testing.T, srv *Server, s store.Store, id string, body store.HarnessConfig) *store.HarnessConfig {
+	t.Helper()
+	rec := doRequest(t, srv, http.MethodPut, "/api/v1/harness-configs/"+id, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	stored, err := s.GetHarnessConfig(context.Background(), id)
+	if err != nil {
+		t.Fatalf("failed to get harness config: %v", err)
+	}
+	return stored
+}
+
+// TestHarnessConfigUpdate_PreservesStatus verifies that the update handler
+// keeps the stored lifecycle status of a pending harness config.
+func TestHarnessConfigUpdate_PreservesStatus(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	hc := &store.HarnessConfig{
+		ID:      tid("hc-update-status"),
+		Slug:    "hc-update-status",
+		Name:    "Status Test",
+		Harness: "claude",
+		Scope:   "global",
+		Status:  store.HarnessConfigStatusPending,
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+
+	stored := putHarnessConfig(t, srv, s, hc.ID, store.HarnessConfig{
+		Name:        hc.Name,
+		Slug:        hc.Slug,
+		Harness:     hc.Harness,
+		Description: "updated description",
+		Status:      store.HarnessConfigStatusActive,
+	})
+	if stored.Status != store.HarnessConfigStatusPending {
+		t.Errorf("status = %q, want %q", stored.Status, store.HarnessConfigStatusPending)
+	}
+	if stored.Description != "updated description" {
+		t.Errorf("description = %q, want %q", stored.Description, "updated description")
+	}
+}
+
+// TestHarnessConfigUpdate_PreservesImageStatus verifies that the update
+// handler keeps the stored image status and its check timestamp.
+func TestHarnessConfigUpdate_PreservesImageStatus(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	checkedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	hc := &store.HarnessConfig{
+		ID:      tid("hc-update-image-status"),
+		Slug:    "hc-update-image-status",
+		Name:    "Image Status Test",
+		Harness: "claude",
+		Scope:   "global",
+		Status:  store.HarnessConfigStatusActive,
+		Created: time.Now(),
+		Updated: time.Now(),
+	}
+	if err := s.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+	if err := s.UpdateHarnessConfigImageStatus(ctx, hc.ID, store.HarnessConfigImageStatusInvalid, checkedAt); err != nil {
+		t.Fatalf("failed to set image status: %v", err)
+	}
+
+	requestCheckedAt := time.Date(2030, 6, 7, 8, 9, 10, 0, time.UTC)
+	stored := putHarnessConfig(t, srv, s, hc.ID, store.HarnessConfig{
+		Name:                 hc.Name,
+		Slug:                 hc.Slug,
+		Harness:              hc.Harness,
+		Status:               hc.Status,
+		ImageStatus:          store.HarnessConfigImageStatusValid,
+		ImageStatusCheckedAt: &requestCheckedAt,
+	})
+	if stored.ImageStatus != store.HarnessConfigImageStatusInvalid {
+		t.Errorf("image status = %q, want %q", stored.ImageStatus, store.HarnessConfigImageStatusInvalid)
+	}
+	if stored.ImageStatusCheckedAt == nil || !stored.ImageStatusCheckedAt.Equal(checkedAt) {
+		t.Errorf("image status checked at = %v, want %v", stored.ImageStatusCheckedAt, checkedAt)
+	}
+}
+
+// TestHarnessConfigUpdate_RequiresIdentity verifies that the update handler
+// responds 401 and leaves the stored record unchanged when the request
+// context carries no identity.
+func TestHarnessConfigUpdate_RequiresIdentity(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+	hc := createHarnessConfigWithContent(t, s, "hc-update-identity")
+
+	body, err := json.Marshal(store.HarnessConfig{
+		Name:        "Renamed Without Identity",
+		Slug:        hc.Slug,
+		Harness:     hc.Harness,
+		Description: "updated without identity",
+		Status:      hc.Status,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/harness-configs/"+hc.ID, strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.updateHarnessConfig(rec, req, hc)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	stored, err := s.GetHarnessConfig(ctx, hc.ID)
+	if err != nil {
+		t.Fatalf("failed to get harness config: %v", err)
+	}
+	if stored.Name != hc.Name {
+		t.Errorf("name = %q, want %q", stored.Name, hc.Name)
+	}
+	if stored.Description != hc.Description {
+		t.Errorf("description = %q, want %q", stored.Description, hc.Description)
+	}
+}
+
+// TestHarnessConfigUpdate_RecordsAuthenticatedUpdater verifies that the
+// update handler records the authenticated caller as the updater.
+func TestHarnessConfigUpdate_RecordsAuthenticatedUpdater(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	hc := &store.HarnessConfig{
+		ID:        tid("hc-update-updater"),
+		Slug:      "hc-update-updater",
+		Name:      "Updater Test",
+		Harness:   "claude",
+		Scope:     "global",
+		Status:    store.HarnessConfigStatusActive,
+		UpdatedBy: "previous-updater",
+		Created:   time.Now(),
+		Updated:   time.Now(),
+	}
+	if err := s.CreateHarnessConfig(ctx, hc); err != nil {
+		t.Fatalf("failed to create harness config: %v", err)
+	}
+
+	stored := putHarnessConfig(t, srv, s, hc.ID, store.HarnessConfig{
+		Name:      hc.Name,
+		Slug:      hc.Slug,
+		Harness:   hc.Harness,
+		Status:    hc.Status,
+		UpdatedBy: "request-body-updater",
+	})
+	if stored.UpdatedBy != DevUserID {
+		t.Errorf("updated by = %q, want authenticated caller %q", stored.UpdatedBy, DevUserID)
+	}
+}
+
 // TestHandleHarnessConfigFinalize_PersistsModelAliases is a regression test
 // for ptone/scion#2365 review round 1 (R2): the production record that
 // triggered the bug was written through the push/finalize path
@@ -437,46 +724,6 @@ func TestHandleHarnessConfigFinalize_KeepsObjectsNotInPreviousRecord(t *testing.
 	}
 }
 
-// localStorageHarnessConfig sets up a server backed by real local storage
-// (rooted at a bucket directory below root) and a harness-config record whose
-// file list is recordPaths. Every path in storedPaths is written to storage
-// below the config's storage path. Local storage resolves object paths with
-// filepath.Join, so it shows what a path really points at on disk.
-func localStorageHarnessConfig(t *testing.T, recordPaths, storedPaths []string) (srv *Server, s store.Store, hc *store.HarnessConfig, root string) {
-	t.Helper()
-	srv, s, _ = testHarnessConfigFileServer(t)
-	root = t.TempDir()
-	stor, err := storage.NewLocal(storage.Config{Provider: storage.ProviderLocal, Bucket: "b", LocalPath: root})
-	if err != nil {
-		t.Fatalf("NewLocal: %v", err)
-	}
-	srv.SetStorage(stor)
-
-	hc = &store.HarnessConfig{
-		ID:            tid("hc-local-paths"),
-		Name:          "test-hc",
-		Slug:          "test-hc",
-		Harness:       "claude",
-		Scope:         store.HarnessConfigScopeGlobal,
-		Status:        store.HarnessConfigStatusActive,
-		StoragePath:   "harness-configs/global/test-hc",
-		StorageBucket: "b",
-	}
-	for _, p := range storedPaths {
-		if _, err := stor.Upload(context.Background(), hc.StoragePath+"/"+p, strings.NewReader("x\n"), storage.UploadOptions{}); err != nil {
-			t.Fatalf("upload %s: %v", p, err)
-		}
-	}
-	for _, p := range recordPaths {
-		hc.Files = append(hc.Files, store.TemplateFile{Path: p, Size: 2, Hash: "sha256:placeholder"})
-	}
-	hc.ContentHash = computeContentHash(hc.Files)
-	if err := s.CreateHarnessConfig(context.Background(), hc); err != nil {
-		t.Fatalf("CreateHarnessConfig: %v", err)
-	}
-	return srv, s, hc, root
-}
-
 func finalizeHarnessConfigRequest(t *testing.T, srv *Server, hcID string, paths ...string) int {
 	t.Helper()
 	files := make([]map[string]interface{}, 0, len(paths))
@@ -485,19 +732,6 @@ func finalizeHarnessConfigRequest(t *testing.T, srv *Server, hcID string, paths 
 	}
 	body := map[string]interface{}{"manifest": map[string]interface{}{"files": files}}
 	return doRequest(t, srv, http.MethodPost, "/api/v1/harness-configs/"+hcID+"/finalize", body).Code
-}
-
-// outsidePath is four levels up from harness-configs/global/test-hc in bucket
-// "b", i.e. the storage root's parent directory, outside the bucket.
-const outsidePath = "../../../../outside.txt"
-
-func writeOutsideFile(t *testing.T, root string) string {
-	t.Helper()
-	outside := filepath.Join(root, "outside.txt")
-	if err := os.WriteFile(outside, []byte("keep\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	return outside
 }
 
 // TestHandleHarnessConfigFinalize_RejectsNonCanonicalPaths verifies that

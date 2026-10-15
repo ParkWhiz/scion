@@ -7,7 +7,8 @@ Table-driven tests covering:
   - Instruction projection (compose, strip, legacy markers, unclosed guard)
   - TOML helpers (escape, inline table, string array, strip sections)
   - Secret whitespace policy
-  - read_json_skipping_comment_lines
+  - read_json_skipping_comment_lines (errors name the file, no content)
+  - drop_json_comment_lines / HOST_SPACE parity with the host's rule
   - capture_auth_main
   - run() scaffold
   - Thinking level resolution (parse/map/resolve_thinking)
@@ -62,7 +63,8 @@ def _make_ctx(
 
     manifest: dict[str, Any] = {
         "harness_bundle_dir": bundle,
-        "agent_workspace": "/workspace",
+        # A scratch path, never the real /workspace (ptone/scion#2993).
+        "agent_workspace": os.path.join(bundle, "workspace"),
         "harness_config": harness_config or {},
     }
     return sh.ProvisionContext(harness, manifest)
@@ -294,6 +296,82 @@ class TestAuthFileMethod(unittest.TestCase):
             self.assertEqual(result.method, "auth-file")
         finally:
             os.unlink(tmp_path)
+
+
+class TestAuthFileMethodPresentCheck(unittest.TestCase):
+    """present_check gates only a file already in the container at the path."""
+
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "creds.json")
+        with open(self.path, "w") as f:
+            f.write('{"setting": "placeholder"}')
+        self.calls: list[str] = []
+
+    def _reject(self, path: str) -> bool:
+        self.calls.append(path)
+        return False
+
+    def _spec(self, present_check=None) -> sh.AuthSpec:
+        return sh.AuthSpec("test", [
+            sh.file_method("auth-file", path=self.path, secret_key="TEST_AUTH",
+                           present_check=present_check),
+        ])
+
+    def test_rejected_file_on_disk_does_not_satisfy(self):
+        ctx = _make_ctx(candidates={"schema_version": 1})
+        with self.assertRaises(sh.ProvisionError):
+            ctx.select_auth(self._spec(self._reject))
+        self.assertEqual(self.calls, [self.path])
+
+    def test_rejected_file_on_disk_explicit_type_errors(self):
+        ctx = _make_ctx(candidates={"explicit_type": "auth-file"})
+        with self.assertRaisesRegex(sh.ProvisionError,
+                                    "no auth file found.*exists there but holds no credential"):
+            ctx.select_auth(self._spec(self._reject))
+
+    def test_absent_file_explicit_type_error_has_no_exists_detail(self):
+        os.unlink(self.path)
+        ctx = _make_ctx(candidates={"explicit_type": "auth-file"})
+        with self.assertRaises(sh.ProvisionError) as cm:
+            ctx.select_auth(self._spec(self._reject))
+        self.assertIn("no auth file found", str(cm.exception))
+        self.assertNotIn("exists there", str(cm.exception))
+
+    def test_rejected_file_falls_back_to_none_with_no_auth(self):
+        spec = sh.AuthSpec("test", [
+            sh.file_method("auth-file", path=self.path, present_check=self._reject),
+        ], fallback_to_none_on_error=True)
+        ctx = _make_ctx(candidates={"schema_version": 1},
+                        harness_config={"no_auth": {"behavior": "drop-to-shell"}})
+        self.assertEqual(ctx.select_auth(spec).method, "none")
+
+    def test_accepted_file_on_disk_satisfies(self):
+        ctx = _make_ctx(candidates={"schema_version": 1})
+        result = ctx.select_auth(self._spec(lambda p: True))
+        self.assertEqual(result.method, "auth-file")
+
+    def test_no_present_check_keeps_existence_rule(self):
+        ctx = _make_ctx(candidates={"schema_version": 1})
+        self.assertEqual(ctx.select_auth(self._spec()).method, "auth-file")
+
+    def test_staged_file_secret_satisfies_despite_rejection(self):
+        ctx = _make_ctx(candidates={
+            "file_secret_files": {"TEST_AUTH": "$HOME/.scion/harness/secrets/TEST_AUTH"},
+        })
+        self.assertEqual(ctx.select_auth(self._spec(self._reject)).method, "auth-file")
+
+    def test_candidate_file_mapping_satisfies_despite_rejection(self):
+        ctx = _make_ctx(candidates={"files": [{"container_path": self.path}]})
+        self.assertEqual(ctx.select_auth(self._spec(self._reject)).method, "auth-file")
+        self.assertEqual(self.calls, [])
+
+    def test_absent_file_not_passed_to_present_check(self):
+        os.unlink(self.path)
+        ctx = _make_ctx(candidates={"schema_version": 1})
+        with self.assertRaises(sh.ProvisionError):
+            ctx.select_auth(self._spec(self._reject))
+        self.assertEqual(self.calls, [])
 
 
 class TestAuthEnvFallback(unittest.TestCase):
@@ -1285,7 +1363,9 @@ class TestTomlEditPreserves(unittest.TestCase):
 
 class TestWriteTomlIfPreserves(unittest.TestCase):
     def _ctx(self) -> tuple["sh.ProvisionContext", list[str]]:
-        ctx = sh.ProvisionContext("test", {})
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        ctx = sh.ProvisionContext("test", {"agent_workspace": workspace.name})
         warnings: list[str] = []
         ctx.warn = warnings.append  # type: ignore[method-assign]
         return ctx, warnings
@@ -1604,6 +1684,110 @@ class TestReadJsonSkippingComments(unittest.TestCase):
         result = sh.read_json_skipping_comment_lines(path)
         self.assertEqual(result, {"key": "value"})
 
+    # --- malformed content becomes ProvisionError (ptone/scion#4665) -------
+
+    MARKER = "placeholder-marker-4665"
+
+    def _write_raw(self, raw: bytes) -> str:
+        path = os.path.join(tempfile.mkdtemp(), "config.json")
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path
+
+    def _assert_provision_error(self, raw: bytes, kind: str) -> None:
+        path = self._write_raw(raw)
+        with self.assertRaises(sh.ProvisionError) as cm:
+            sh.read_json_skipping_comment_lines(path)
+        msg = str(cm.exception)
+        self.assertIn(path, msg)
+        self.assertIn(kind, msg)
+        self.assertNotIn(self.MARKER, msg)
+        self.assertIsNone(cm.exception.__cause__)
+        self.assertTrue(cm.exception.__suppress_context__)
+
+    def test_non_utf8_raises_provision_error(self):
+        raw = ('{"key": "' + self.MARKER + '"}').encode() + b"\xff\n"
+        self._assert_provision_error(raw, "not valid UTF-8")
+
+    def test_long_int_raises_provision_error(self):
+        raw = ('{"key": "' + self.MARKER + '", "n": ' + "1" * 5000 + "}").encode()
+        self._assert_provision_error(raw, "cannot be converted")
+
+    def test_invalid_json_raises_provision_error(self):
+        raw = ('{"key": "' + self.MARKER + '",}').encode()
+        self._assert_provision_error(raw, "not valid JSON")
+
+    def test_too_deep_raises_provision_error(self):
+        raw = ('{"key": "' + self.MARKER + '", "n": ' + "[" * 100000
+               + "]" * 100000 + "}").encode()
+        self._assert_provision_error(raw, "nested too deeply")
+
+    def test_missing_file_raises_os_error(self):
+        with self.assertRaises(FileNotFoundError):
+            sh.read_json_skipping_comment_lines(
+                os.path.join(tempfile.mkdtemp(), "missing.json"))
+
+
+# Characters on which Python's str.splitlines()/str.strip() and the host's
+# strings.Split(s, "\n")/strings.TrimSpace disagree (ptone/scion#4665).
+PARITY_CHARS = ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\u2028", "\u2029")
+
+
+def parity_cases() -> list[tuple[str, str, Any]]:
+    """(name, content, expected) per character, by the host's rule; expected
+    is the parsed value, or None when the host cannot parse the content."""
+    cases: list[tuple[str, str, Any]] = []
+    for ch in PARITY_CHARS:
+        name = f"U+{ord(ch):04X}"
+        # Inside a string: JSON allows any character there except a control
+        # character (below U+0020).
+        cases.append((f"{name} in string", '{"k": "a' + ch + 'b"}',
+                      {"k": "a" + ch + "b"} if ord(ch) >= 0x20 else None))
+        # Leading a // line: trimmed, so the line is a comment, only if the
+        # host counts it as whitespace.
+        cases.append((f"{name} before comment line", '{"k": 1}\n' + ch + "// note\n",
+                      {"k": 1} if ch in sh.HOST_SPACE else None))
+        # Not a line break for the host, so "// note" is not a comment line.
+        cases.append((f"{name} as line break", '{"k": 1}' + ch + "// note\n", None))
+    return cases
+
+
+class TestJsonCommentLineHostParity(unittest.TestCase):
+    def test_host_space_is_go_unicode_is_space(self):
+        # Go's unicode.IsSpace is Python's str.isspace() minus U+001C..U+001F.
+        expected = {chr(c) for c in range(sys.maxunicode + 1) if chr(c).isspace()}
+        expected -= {"\x1c", "\x1d", "\x1e", "\x1f"}
+        self.assertEqual(set(sh.HOST_SPACE), expected)
+        self.assertEqual(len(sh.HOST_SPACE), len(expected))
+
+    def test_read_json_skipping_comment_lines_matches_host(self):
+        d = tempfile.mkdtemp()
+        cases = parity_cases()
+        self.assertEqual(len(cases), 3 * len(PARITY_CHARS))
+        for i, (name, content, expected) in enumerate(cases):
+            with self.subTest(name):
+                path = os.path.join(d, f"config-{i}.json")
+                with open(path, "wb") as f:
+                    f.write(content.encode("utf-8"))
+                if expected is None:
+                    with self.assertRaises(sh.ProvisionError):
+                        sh.read_json_skipping_comment_lines(path)
+                else:
+                    self.assertEqual(sh.read_json_skipping_comment_lines(path), expected)
+
+    def test_lone_carriage_return_is_not_a_line_break(self):
+        path = os.path.join(tempfile.mkdtemp(), "config.json")
+        with open(path, "wb") as f:
+            f.write(b'{"k": 1}\r// note\n')
+        with self.assertRaises(sh.ProvisionError):
+            sh.read_json_skipping_comment_lines(path)
+
+    def test_crlf_comment_lines_are_dropped(self):
+        path = os.path.join(tempfile.mkdtemp(), "config.json")
+        with open(path, "wb") as f:
+            f.write(b'// note\r\n{"k": 1}\r\n  // more\r\n')
+        self.assertEqual(sh.read_json_skipping_comment_lines(path), {"k": 1})
+
 
 # ---------------------------------------------------------------------------
 # MCP translation helper
@@ -1674,7 +1858,11 @@ class TestRunScaffold(unittest.TestCase):
         bundle = tempfile.mkdtemp()
         manifest_path = os.path.join(bundle, "manifest.json")
         with open(manifest_path, "w") as f:
-            json.dump({"command": "provision", "harness_bundle_dir": bundle}, f)
+            json.dump({
+                "command": "provision",
+                "harness_bundle_dir": bundle,
+                "agent_workspace": os.path.join(bundle, "workspace"),
+            }, f)
 
         called = []
 
@@ -1702,7 +1890,11 @@ class TestRunScaffold(unittest.TestCase):
         bundle = tempfile.mkdtemp()
         manifest_path = os.path.join(bundle, "manifest.json")
         with open(manifest_path, "w") as f:
-            json.dump({"command": "provision", "harness_bundle_dir": bundle}, f)
+            json.dump({
+                "command": "provision",
+                "harness_bundle_dir": bundle,
+                "agent_workspace": os.path.join(bundle, "workspace"),
+            }, f)
 
         def bad_provision(ctx):
             raise sh.ProvisionError("something broke")
@@ -1720,7 +1912,9 @@ class TestRunScaffold(unittest.TestCase):
 
 class TestProvisionContext(unittest.TestCase):
     def test_workspace_default(self):
-        ctx = _make_ctx()
+        # No agent_workspace in the manifest: the product default applies.
+        # Only the string is checked; nothing is written there.
+        ctx = sh.ProvisionContext("test", {"harness_bundle_dir": "/tmp"})
         self.assertEqual(ctx.workspace, "/workspace")
 
     def test_workspace_from_manifest(self):
@@ -1939,7 +2133,9 @@ class TestMapThinkingLevel(unittest.TestCase):
 
 class TestResolveThinking(unittest.TestCase):
     def _ctx(self, harness_config: dict[str, Any] | None) -> tuple["sh.ProvisionContext", list[str], list[str]]:
-        manifest: dict[str, Any] = {}
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        manifest: dict[str, Any] = {"agent_workspace": workspace.name}
         if harness_config is not None:
             manifest["harness_config"] = harness_config
         ctx = sh.ProvisionContext("test", manifest)
@@ -2039,7 +2235,10 @@ class TestResolveThinking(unittest.TestCase):
             self.assertEqual(sh.resolve_thinking(ctx), "medium")
 
     def test_reads_block_from_manifest_json(self):
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
         manifest = json.loads(json.dumps({"harness_config": {"thinking": _CODEX_THINKING}}))
+        manifest["agent_workspace"] = workspace.name
         ctx = sh.ProvisionContext("test", manifest)
         ctx.info = lambda _m: None  # type: ignore[method-assign]
         self.assertEqual(sh.resolve_thinking(ctx, "76"), "xhigh")
@@ -2246,6 +2445,475 @@ class TestAtomicWriteJsonSymlinkGuards(unittest.TestCase):
         self.assertTrue(first.startswith(".out.json.tmp-"))
         self.assertTrue(second.startswith(".out.json.tmp-"))
 
+
+class VertexLocationPrecedenceTest(unittest.TestCase):
+    """GOOGLE_CLOUD_LOCATION > GOOGLE_CLOUD_REGION > CLOUD_ML_REGION (ptone/scion#4719)."""
+
+    def _resolve(self, env: dict[str, str], **kwargs: Any) -> tuple[tuple[str, str], list[str]]:
+        warnings: list[str] = []
+        got = sh.resolve_vertex_location(lambda k: env.get(k, ""), warn_fn=warnings.append, **kwargs)
+        return got, warnings
+
+    def test_key_order(self) -> None:
+        self.assertEqual(
+            sh.vertex_location_keys(),
+            ("GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_REGION", "CLOUD_ML_REGION"),
+        )
+        self.assertEqual(
+            sh.vertex_location_keys(preferred=("P",), include_ml_region=False, fallback=("F",)),
+            ("P", "GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_REGION", "F"),
+        )
+
+    def test_only_region(self) -> None:
+        self.assertEqual(
+            self._resolve({"GOOGLE_CLOUD_REGION": "us-central1"}),
+            (("GOOGLE_CLOUD_REGION", "us-central1"), []),
+        )
+
+    def test_only_location(self) -> None:
+        self.assertEqual(
+            self._resolve({"GOOGLE_CLOUD_LOCATION": "us-east5"}),
+            (("GOOGLE_CLOUD_LOCATION", "us-east5"), []),
+        )
+
+    def test_both_equal(self) -> None:
+        self.assertEqual(
+            self._resolve({"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-east5"}),
+            (("GOOGLE_CLOUD_LOCATION", "us-east5"), []),
+        )
+
+    def test_both_differ_location_wins_with_one_warning(self) -> None:
+        got, warnings = self._resolve({"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-central1"})
+        self.assertEqual(got, ("GOOGLE_CLOUD_LOCATION", "us-east5"))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("GOOGLE_CLOUD_LOCATION='us-east5'", warnings[0])
+        self.assertIn("GOOGLE_CLOUD_REGION='us-central1'", warnings[0])
+
+    def test_conflict_compares_raw_values(self) -> None:
+        # Same rule as the Go resolver: values are compared untrimmed.
+        got, warnings = self._resolve({"GOOGLE_CLOUD_LOCATION": "us-east5 ", "GOOGLE_CLOUD_REGION": "us-east5"})
+        self.assertEqual(got, ("GOOGLE_CLOUD_LOCATION", "us-east5 "))
+        self.assertEqual(len(warnings), 1)
+
+    def test_neither(self) -> None:
+        self.assertEqual(self._resolve({}), (("", ""), []))
+
+    def test_cloud_ml_region_is_last_fallback(self) -> None:
+        self.assertEqual(
+            self._resolve({"CLOUD_ML_REGION": "europe-west4"}),
+            (("CLOUD_ML_REGION", "europe-west4"), []),
+        )
+        self.assertEqual(
+            self._resolve({"CLOUD_ML_REGION": "europe-west4"}, include_ml_region=False),
+            (("", ""), []),
+        )
+        self.assertEqual(
+            self._resolve({"GOOGLE_CLOUD_REGION": "us-central1", "CLOUD_ML_REGION": "europe-west4"})[0],
+            ("GOOGLE_CLOUD_REGION", "us-central1"),
+        )
+
+    def test_preferred_key_wins_without_warning(self) -> None:
+        got, warnings = self._resolve(
+            {"VERTEX_REGION": "asia-east1", "GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-central1"},
+            preferred=("VERTEX_REGION",),
+        )
+        self.assertEqual(got, ("VERTEX_REGION", "asia-east1"))
+        self.assertEqual(warnings, [])
+
+    def test_no_warn_fn_is_silent(self) -> None:
+        env = {"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-central1"}
+        self.assertEqual(sh.resolve_vertex_location(env.get), ("GOOGLE_CLOUD_LOCATION", "us-east5"))
+
+
+# ---------------------------------------------------------------------------
+# Agent Plugins reconcile
+# ---------------------------------------------------------------------------
+
+
+class _PluginEnv:
+    """A temp HOME plus a staged bundle with inputs/plugins.json."""
+
+    def __init__(self, test: unittest.TestCase):
+        self.tmp = tempfile.TemporaryDirectory(prefix="agent-plugins-test-")
+        test.addCleanup(self.tmp.cleanup)
+        self.home = os.path.join(self.tmp.name, "home")
+        os.makedirs(self.home)
+        patcher = mock.patch.dict(os.environ, {"HOME": self.home})
+        patcher.start()
+        test.addCleanup(patcher.stop)
+        self.bundle = os.path.join(self.home, ".scion", "harness")
+        self.inputs = os.path.join(self.bundle, "inputs")
+        os.makedirs(self.inputs)
+        self.ctx = sh.ProvisionContext("fake", {
+            "harness_bundle_dir": self.bundle,
+            "agent_workspace": os.path.join(self.tmp.name, "workspace"),
+        })
+
+    def stage(self, plugins: dict[str, str], extra: dict[str, Any] | None = None) -> None:
+        """plugins: name -> digest; each gets a staged bundle dir."""
+        import shutil
+        shutil.rmtree(os.path.join(self.inputs, "plugins"), ignore_errors=True)
+        entries = []
+        for name, digest in plugins.items():
+            d = os.path.join(self.inputs, "plugins", name)
+            os.makedirs(os.path.join(d, "skills", "s"))
+            with open(os.path.join(d, "plugin.json"), "w") as f:
+                f.write(json.dumps({"name": name, "digest": digest}))
+            entry = {"name": name, "version": "1.0.0", "dir": f"plugins/{name}", "digest": digest,
+                     "skills": ["s"], "skills_dir_conflict": False, "mcp": None}
+            entry.update((extra or {}).get(name, {}))
+            entries.append(entry)
+        with open(os.path.join(self.inputs, "plugins.json"), "w") as f:
+            json.dump({"schema_version": 1, "spec_version": "1.0.0", "plugins": entries}, f)
+
+    def unstage(self) -> None:
+        os.unlink(os.path.join(self.inputs, "plugins.json"))
+
+    def state(self) -> dict[str, Any]:
+        with open(os.path.join(self.home, ".scion", "agent-plugins", "state-fake.json")) as f:
+            return json.load(f)["plugins"]
+
+    def status(self) -> dict[str, Any]:
+        with open(os.path.join(self.home, ".scion", "agent-plugins", "status-fake.json")) as f:
+            return json.load(f)
+
+
+class _FakeInstaller(sh.PluginInstaller):
+    harness = "fake"
+    cli = "fakecli"
+    min_version = (1, 0, 0)
+
+    def __init__(self, version=(1, 2, 3)):
+        self.version = version
+        self.calls: list[tuple[str, str]] = []
+        self.present: set[str] = set()
+        self.fail_install: set[str] = set()
+        self.fail_uninstall: set[str] = set()
+        self.raise_in: str = ""
+
+    def detect_version(self):
+        self.calls.append(("version", ""))
+        return self.version
+
+    def prepare(self, desired):
+        self.calls.append(("prepare", ",".join(p.name for p in desired)))
+
+    def install(self, plugin, bundle_dir):
+        self.calls.append(("install", plugin.name))
+        if self.raise_in == "install":
+            raise Exception("boom")
+        if plugin.name in self.fail_install:
+            raise sh.PluginInstallError("fakecli exit 1: nope")
+        assert os.path.isfile(os.path.join(bundle_dir, "plugin.json"))
+        self.present.add(plugin.name)
+        return {"path": f"/native/{plugin.name}"}
+
+    def uninstall(self, name, native_ref):
+        self.calls.append(("uninstall", name))
+        if name in self.fail_uninstall:
+            raise sh.PluginInstallError("fakecli exit 1: busy")
+        self.present.discard(name)
+
+    def is_present(self, name, native_ref):
+        return name in self.present
+
+
+class TestAgentPluginsReconcile(unittest.TestCase):
+    def setUp(self):
+        self.env = _PluginEnv(self)
+
+    def kinds(self, inst):
+        return [c for c in inst.calls if c[0] in ("install", "uninstall", "version")]
+
+    def test_read_agent_plugins_absent_and_malformed(self):
+        self.assertEqual(sh.read_agent_plugins(self.env.ctx), [])
+        path = os.path.join(self.env.inputs, "plugins.json")
+        for bad in ("{", "[]", '{"schema_version": 2, "plugins": []}',
+                    '{"schema_version": 1, "plugins": [{"name": "../x", "dir": "plugins/../x", "digest": "d"}]}',
+                    '{"schema_version": 1, "plugins": [{"name": "gone", "dir": "plugins/gone", "digest": "d"}]}'):
+            with open(path, "w") as f:
+                f.write(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                sh.read_agent_plugins(self.env.ctx)
+        self.env.stage({"a.b": "sha256:1"}, {"a.b": {"mcp": {"servers": {"s": {"type": "sse", "url": "https://x"}}}}})
+        [p] = sh.read_agent_plugins(self.env.ctx)
+        self.assertEqual((p.name, p.digest, p.skills), ("a.b", "sha256:1", ["s"]))
+        self.assertEqual(p.staged_dir, os.path.join(self.env.inputs, "plugins", "a.b"))
+        self.assertEqual(p.mcp_servers, {"s": {"type": "sse", "url": "https://x"}})
+
+    def test_malformed_index_changes_nothing(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        with open(os.path.join(self.env.inputs, "plugins.json"), "w") as f:
+            f.write("{")
+        inst.calls.clear()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(inst.calls, [])
+        self.assertIn("a", self.env.state())
+
+    def test_never_used_makes_no_files_or_calls(self):
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(inst.calls, [])
+        self.assertFalse(os.path.exists(os.path.join(self.env.home, ".scion", "agent-plugins")))
+
+    def test_install_then_fast_path(self):
+        self.env.stage({"a": "d1", "b": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(self.kinds(inst), [("version", ""), ("install", "a"), ("install", "b")])
+        self.assertEqual(set(self.env.state()), {"a", "b"})
+        self.assertEqual(self.env.state()["a"]["native_ref"], {"path": "/native/a"})
+        self.assertTrue(os.path.isfile(os.path.join(self.env.home, ".scion", "agent-plugins", "bundles", "a", "plugin.json")))
+        self.assertEqual(self.env.status()["installed"], ["a", "b"])
+
+        inst.calls.clear()
+        with mock.patch.object(sh, "run_cli", side_effect=AssertionError("CLI called")):
+            sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(inst.calls, [], "fast path must make no installer calls")
+
+    def test_version_too_old_changes_nothing(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller(version=(0, 9, 0))
+        with mock.patch.object(self.env.ctx, "warn") as warn:
+            sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(self.kinds(inst), [("version", "")])
+        self.assertIn("fakecli 0.9.0 is older than 1.0.0", warn.call_args[0][0])
+        self.assertFalse(os.path.exists(os.path.join(self.env.home, ".scion", "agent-plugins", "state-fake.json")))
+        self.assertEqual(self.env.status()["skipped"][0]["name"], "a")
+        inst.version = None
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertNotIn(("install", "a"), inst.calls)
+
+    def test_removal_before_install(self):
+        self.env.stage({"old": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.env.stage({"new": "d1"})
+        inst.calls.clear()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(self.kinds(inst), [("version", ""), ("uninstall", "old"), ("install", "new")])
+        self.assertEqual(set(self.env.state()), {"new"})
+        self.assertEqual(self.env.status()["removed"], ["old"])
+        self.assertFalse(os.path.exists(os.path.join(self.env.home, ".scion", "agent-plugins", "bundles", "old")))
+        # prepare sees the desired set before removals.
+        self.assertEqual(inst.calls[1], ("prepare", "new"))
+
+    def test_experiment_off_removes_all(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.env.unstage()
+        inst.calls.clear()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(self.kinds(inst), [("version", ""), ("uninstall", "a")])
+        self.assertEqual(self.env.state(), {})
+
+    def test_digest_change_uninstalls_then_installs(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.env.stage({"a": "d2"})
+        inst.calls.clear()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(self.kinds(inst), [("version", ""), ("uninstall", "a"), ("install", "a")])
+        self.assertEqual(self.env.state()["a"]["digest"], "d2")
+
+    def test_digest_change_uninstall_failure_keeps_ownership(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.env.stage({"a": "d2"})
+        inst.fail_uninstall = {"a"}
+        inst.fail_install = {"a"}
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        # Still owned, with the old digest: pending, not forgotten.
+        self.assertEqual(self.env.state()["a"]["digest"], "d1")
+        # The template drops it: Scion removes the install it owns.
+        self.env.unstage()
+        inst.fail_uninstall = set()
+        inst.calls.clear()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertIn(("uninstall", "a"), inst.calls)
+        self.assertEqual(self.env.state(), {})
+
+    def test_digest_change_uninstall_failure_then_install_success(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.env.stage({"a": "d2"})
+        inst.fail_uninstall = {"a"}
+        with mock.patch.object(self.env.ctx, "warn") as warn:
+            sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertIn("removing the previous version failed", warn.call_args_list[0][0][0])
+        self.assertEqual(self.env.state()["a"]["digest"], "d2")
+
+    def test_status_separates_stale_versions(self):
+        self.env.stage({"a": "d1", "b": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual((self.env.status()["installed"], self.env.status()["stale"]), (["a", "b"], []))
+        # a's upgrade fails entirely: the old version stays, reported stale.
+        self.env.stage({"a": "d2", "b": "d1"})
+        inst.fail_uninstall = {"a"}
+        inst.fail_install = {"a"}
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        st = self.env.status()
+        self.assertEqual(st["installed"], ["b"])
+        self.assertEqual(st["stale"], ["a"])
+        self.assertEqual([s["name"] for s in st["skipped"]], ["a"])
+
+    def test_missing_native_install_is_reinstalled(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        inst.present.clear()
+        inst.calls.clear()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(self.kinds(inst), [("version", ""), ("install", "a")])
+
+    def test_install_failure_not_recorded_and_retried(self):
+        self.env.stage({"a": "d1", "b": "d1"})
+        inst = _FakeInstaller()
+        inst.fail_install = {"a"}
+        with mock.patch.object(self.env.ctx, "warn") as warn:
+            sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(set(self.env.state()), {"b"})
+        self.assertIn("agent plugin a: install failed (fakecli exit 1: nope); will retry next start", warn.call_args[0][0])
+        self.assertEqual(self.env.status()["skipped"], [{"name": "a", "reason": "fakecli exit 1: nope"}])
+        inst.fail_install = set()
+        inst.calls.clear()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(self.kinds(inst), [("version", ""), ("install", "a")])
+
+    def test_uninstall_failure_kept_in_state(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.env.unstage()
+        inst.fail_uninstall = {"a"}
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertIn("a", self.env.state())
+
+    def test_budget_exhaustion(self):
+        self.env.stage({"a": "d1", "b": "d1", "c": "d1"})
+        inst = _FakeInstaller()
+        ticks = iter([0.0, 1.0, 25.0, 26.0, 27.0])
+        with mock.patch.object(self.env.ctx, "warn") as warn:
+            sh.reconcile_agent_plugins(self.env.ctx, inst, budget_s=20.0, clock=lambda: next(ticks))
+        self.assertEqual([c for c in inst.calls if c[0] == "install"], [("install", "a")])
+        self.assertIn("time budget reached; 2 plugin(s) deferred to next start", warn.call_args[0][0])
+        self.assertEqual(set(self.env.state()), {"a"})
+
+    def test_budget_defers_removals(self):
+        self.env.stage({"a": "d1", "b": "d1"})
+        inst = _FakeInstaller()
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.env.unstage()
+        inst.calls.clear()
+        ticks = iter([0.0, 1.0, 25.0, 26.0, 27.0])
+        with mock.patch.object(self.env.ctx, "warn") as warn:
+            sh.reconcile_agent_plugins(self.env.ctx, inst, budget_s=20.0, clock=lambda: next(ticks))
+        self.assertEqual([c for c in inst.calls if c[0] == "uninstall"], [("uninstall", "a")])
+        self.assertIn("time budget reached; 1 removal(s) deferred to next start", warn.call_args[0][0])
+        self.assertEqual(set(self.env.state()), {"b"})
+
+    def test_cli_timeout_capped_to_deadline(self):
+        inst = _FakeInstaller()
+        self.assertEqual(inst.cli_timeout(15.0), 15.0)
+        now = [100.0]
+        inst.clock = lambda: now[0]
+        inst.deadline = 112.0
+        self.assertEqual(inst.cli_timeout(15.0), 12.0)
+        self.assertEqual(inst.cli_timeout(10.0), 10.0)
+        now[0] = 130.0
+        self.assertEqual(inst.cli_timeout(15.0), 1.0)
+
+    def test_corrupt_state_file_treated_as_empty(self):
+        self.env.stage({"a": "d1"})
+        d = os.path.join(self.env.home, ".scion", "agent-plugins")
+        os.makedirs(d)
+        with open(os.path.join(d, "state-fake.json"), "w") as f:
+            f.write("not json")
+        inst = _FakeInstaller()
+        with mock.patch.object(self.env.ctx, "warn") as warn:
+            sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertTrue(any("unreadable state file" in c[0][0] for c in warn.call_args_list))
+        self.assertEqual(set(self.env.state()), {"a"})
+
+    def test_state_saved_after_each_success(self):
+        self.env.stage({"a": "d1", "b": "d1"})
+        inst = _FakeInstaller()
+        seen: list[set[str]] = []
+        orig = inst.install
+
+        def install(p, b):
+            path = os.path.join(self.env.home, ".scion", "agent-plugins", "state-fake.json")
+            if os.path.exists(path):
+                with open(path) as f:
+                    seen.append(set(json.load(f)["plugins"]))
+            else:
+                seen.append(set())
+            return orig(p, b)
+
+        inst.install = install
+        sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertEqual(seen, [set(), {"a"}])
+
+    def test_never_raises(self):
+        self.env.stage({"a": "d1"})
+        inst = _FakeInstaller()
+        inst.raise_in = "install"
+        sh.reconcile_agent_plugins(self.env.ctx, inst)  # must not raise
+        inst.detect_version = mock.Mock(side_effect=RuntimeError("bad"))
+        with mock.patch.object(self.env.ctx, "warn") as warn:
+            sh.reconcile_agent_plugins(self.env.ctx, inst)
+        self.assertIn("reconcile failed", warn.call_args[0][0])
+
+    def test_mirror_bundle_atomic_replace(self):
+        self.env.stage({"a": "d1"})
+        [p] = sh.read_agent_plugins(self.env.ctx)
+        path = sh.mirror_bundle(p)
+        self.assertTrue(os.path.isfile(os.path.join(path, "plugin.json")))
+        with open(os.path.join(path, "marker"), "w") as f:
+            f.write("same digest keeps the copy")
+        self.assertEqual(sh.mirror_bundle(p), path)
+        self.assertTrue(os.path.exists(os.path.join(path, "marker")))
+        self.env.stage({"a": "d2"})
+        [p2] = sh.read_agent_plugins(self.env.ctx)
+        sh.mirror_bundle(p2)
+        self.assertFalse(os.path.exists(os.path.join(path, "marker")))
+        with open(os.path.join(path, "plugin.json")) as f:
+            self.assertEqual(json.load(f)["digest"], "d2")
+        bundles = os.path.dirname(path)
+        self.assertEqual(sorted(e for e in os.listdir(bundles) if "tmp" in e), [])
+
+    def test_run_cli(self):
+        ok = sh.run_cli([sys.executable, "-c", "import sys; print(sys.stdin.read()=='')"], timeout=10)
+        self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "True"))
+        missing = sh.run_cli(["/nonexistent/cli-xyz"], timeout=5)
+        self.assertEqual(missing.returncode, 127)
+        slow = sh.run_cli([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2)
+        self.assertEqual(slow.returncode, 124)
+
+    def test_parse_semver(self):
+        cases = {"codex-cli 0.162.1": (0, 162, 1), "v2.1.270": (2, 1, 270),
+                 "2.1.270 (Claude Code)": (2, 1, 270), "1.4.6-R6000.1": (1, 4, 6),
+                 "": None, "none": None, "1.2": None}
+        for text, want in cases.items():
+            self.assertEqual(sh.parse_semver(text), want, text)
+
+    def test_skill_sections_skip_plugin_dirs(self):
+        root = os.path.join(self.env.home, ".claude", "skills")
+        for name, files in {"real": ["SKILL.md"], "plug": ["SKILL.md", "plugin.json"]}.items():
+            os.makedirs(os.path.join(root, name))
+            for fn in files:
+                with open(os.path.join(root, name, fn), "w") as f:
+                    f.write(f"{name} {fn}")
+        sections = sh._skill_sections(self.env.home, ".claude/skills")
+        self.assertEqual(len(sections), 1)
+        self.assertIn("## real", sections[0])
 
 if __name__ == "__main__":
     unittest.main()

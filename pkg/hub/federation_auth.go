@@ -32,10 +32,10 @@ import (
 const FederationTokenHeader = "X-Scion-Federation-Token"
 
 // DefaultFederationScopes is the scope set granted to federated agents when
-// no per-issuer default_scopes are configured.
+// no per-issuer default_scopes are configured. agent:log:append is not in
+// it: agent.log_append is Reserved, since no handler checks it.
 var DefaultFederationScopes = []AgentTokenScope{
 	ScopeAgentStatusUpdate,
-	ScopeAgentLogAppend,
 }
 
 // FederationAuthenticator validates OIDC identity tokens from trusted external issuers.
@@ -70,7 +70,7 @@ type federationClaims struct {
 	Ancestry      []string `json:"ancestry,omitempty"`
 	RootUser      string   `json:"root_user,omitempty"`
 	Email         string   `json:"email,omitempty"`
-	EmailVerified bool     `json:"email_verified,omitempty"`
+	EmailVerified *bool    `json:"email_verified,omitempty"` // nil when the token has no email_verified claim
 	Name          string   `json:"name,omitempty"`
 }
 
@@ -416,9 +416,11 @@ func extractUserClaims(claims *federationClaims,
 	if role == "" || role == "admin" {
 		role = "viewer"
 	}
-	return NewFederatedUserIdentity(
+	identity := NewFederatedUserIdentity(
 		claims.Issuer, claims.Subject, claims.Email, claims.Name, role, scopes,
-	), nil
+	)
+	identity.emailVerified = claims.EmailVerified
+	return identity, nil
 }
 
 // matchesAllowedEmails checks if an email matches any pattern in the allowed list.

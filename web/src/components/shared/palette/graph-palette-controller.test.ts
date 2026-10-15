@@ -173,6 +173,15 @@ describe('buildGraphAgentCandidates', () => {
     expect(rows[0].secondaryLabel).toBe('P2');
   });
 
+  it("names the project by the row's slug", () => {
+    const rows = buildGraphAgentCandidates([
+      { ...agent('a', 'Twin', 'One'), projectSlug: 'one' },
+      { ...agent('b', 'Twin', 'Two'), projectSlug: 'two' },
+    ]);
+    expect(rows.map((r) => r.secondaryLabel)).toEqual(['one', 'two']);
+    expect(rows[0].searchFields).toEqual(expect.arrayContaining(['one', 'One']));
+  });
+
   it('skips an agent without an id', () => {
     const rows = buildGraphAgentCandidates([agent('', 'Nameless'), agent('a', 'Alpha')]);
     expect(rows.map((r) => r.id)).toEqual([JSON.stringify(['agent', 'a'])]);
@@ -198,6 +207,31 @@ describe('GraphPaletteController', () => {
     expect(close.defaultPrevented).toBe(true);
 
     pressShortcut({ ctrlKey: true });
+    await waitForOpenPalette();
+  });
+
+  it('on a Mac, leaves Ctrl+K typed in a text field to the field', async () => {
+    vi.spyOn(navigator, 'platform', 'get').mockReturnValue('MacIntel');
+    const input = document.createElement('input');
+    page.renderRoot.append(input);
+    const pressIn = (init: KeyboardEventInit): KeyboardEvent => {
+      const e = new KeyboardEvent('keydown', {
+        key: 'k',
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+        ...init,
+      });
+      input.dispatchEvent(e);
+      return e;
+    };
+
+    expect(pressIn({ ctrlKey: true }).defaultPrevented).toBe(false);
+    await nextTask();
+    expect(page.palette.isOpen).toBe(false);
+    expect(paletteEl()).toBeNull();
+
+    expect(pressIn({ metaKey: true }).defaultPrevented).toBe(true);
     await waitForOpenPalette();
   });
 

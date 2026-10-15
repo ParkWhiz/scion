@@ -42,16 +42,6 @@ import (
 // in authorized_list_cursor_opacity_test.go; this file exercises the
 // primitive directly.
 
-func mustNewListCursorSealer(t *testing.T) *listCursorSealer {
-	t.Helper()
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	require.NoError(t, err)
-	sealer, err := newListCursorSealer(key)
-	require.NoError(t, err)
-	return sealer
-}
-
 func TestListCursorSealer_RoundTrip(t *testing.T) {
 	sealer := mustNewListCursorSealer(t)
 	inner := authorizedListCursor(time.Now(), "11111111-1111-1111-1111-111111111111", "binding-x")
@@ -173,36 +163,6 @@ func TestListCursorSealer_AADBindingAloneIsAuthenticated(t *testing.T) {
 	_, err = sealer.Open(sealed, bindingEmbeddedInInner)
 	assert.ErrorIs(t, err, errInvalidCursor,
 		"a cursor sealed under binding A must not open when asked for binding B, even though the inner plaintext embeds B")
-}
-
-// assertNoRecoverableCursorPayload asserts that sealed's raw bytes (the
-// version prefix stripped, then base64-decoded) contain no recoverable trace
-// of the position it carries: neither the encoded inner cursor itself, nor
-// that encoding's own decoded "created,id,binding" payload, nor the item ID
-// or binding as bare substrings. This is stronger than tamper-evidence: an
-// authenticated-but-unencrypted (signature-only) cursor format is
-// tamper-evident and key-dependent, but still fails this check, because the
-// payload sits in the clear. Confidentiality, not just authentication, is
-// the property under test.
-func assertNoRecoverableCursorPayload(t *testing.T, sealed, inner string) {
-	t.Helper()
-	require.True(t, strings.HasPrefix(sealed, listCursorPrefix), "sealed cursor %q must start with %q", sealed, listCursorPrefix)
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(sealed, listCursorPrefix))
-	require.NoError(t, err)
-	rawStr := string(raw)
-
-	assert.NotContains(t, rawStr, inner, "raw cursor bytes must not contain the encoded inner cursor")
-
-	decodedInner, err := base64.URLEncoding.DecodeString(inner)
-	require.NoError(t, err)
-	parts := strings.SplitN(string(decodedInner), ",", 3)
-	require.Len(t, parts, 3, "inner must decode to created,id,binding")
-	created, id, binding := parts[0], parts[1], parts[2]
-
-	assert.NotContains(t, rawStr, string(decodedInner), "raw cursor bytes must not contain the decoded created,id,binding payload")
-	assert.NotContains(t, rawStr, id, "raw cursor bytes must not contain the item ID")
-	assert.NotContains(t, rawStr, created, "raw cursor bytes must not contain the created time")
-	assert.NotContains(t, rawStr, binding, "raw cursor bytes must not contain the binding")
 }
 
 // The sealed cursor must never contain the item's ID, created time, or
@@ -493,22 +453,19 @@ func TestListCursorKey_SharedSigningSecretDerivesConsistentKeyNameSeparatedFromD
 	const sharedSecret = "list-cursor-shared-signing-secret-test"
 
 	newSrv := func(hubID string) *Server {
-		s, err := newTestStore(":memory:")
+		s, err := newTestStore(t, ":memory:")
 		if err != nil {
 			if strings.Contains(err.Error(), "sqlite driver not registered") {
 				t.Skip("Skipping test because sqlite driver is not registered (build with -tags sqlite to enable)")
 			}
 			t.Fatalf("failed to create test store: %v", err)
 		}
-		require.NoError(t, s.Migrate(context.Background()))
-		t.Cleanup(func() { _ = s.Close() })
 
 		cfg := DefaultServerConfig()
 		cfg.HubID = hubID
 		cfg.SharedSigningSecret = sharedSecret
-		srv, err := New(cfg, s)
+		srv, err := newTestHubServer(t, cfg, s)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 		return srv
 	}
 
@@ -581,23 +538,20 @@ func TestListCursorKey_PersistsAcrossSealerInstances(t *testing.T) {
 // end to end: the same store, same hub ID, and a second server picks up the
 // identical key on "restart" (a second New() against the same store).
 func TestListCursorKey_PersistsAcrossServerRestart(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		if strings.Contains(err.Error(), "sqlite driver not registered") {
 			t.Skip("Skipping test because sqlite driver is not registered (build with -tags sqlite to enable)")
 		}
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	require.NoError(t, s.Migrate(context.Background()))
-	t.Cleanup(func() { _ = s.Close() })
 
 	const hubID = "list-cursor-persist-hub"
 	newSrv := func() *Server {
 		cfg := DefaultServerConfig()
 		cfg.HubID = hubID
-		srv, err := New(cfg, s)
+		srv, err := newTestHubServer(t, cfg, s)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 		return srv
 	}
 

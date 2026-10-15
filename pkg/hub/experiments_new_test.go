@@ -17,7 +17,6 @@
 package hub
 
 import (
-	"context"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
@@ -29,23 +28,19 @@ import (
 // other test in this package builds &Server{experiments: ...} by struct
 // literal, which never runs this line.
 func TestNew_StoresServerConfigExperimentsRegistry(t *testing.T) {
-	st, err := newTestStore(":memory:")
+	st, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("newTestStore: %v", err)
-	}
-	if err := st.Migrate(context.Background()); err != nil {
-		t.Fatalf("Migrate: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() }) // Release in-memory SQLite database to avoid OOM across many tests.
 
 	reg := testRegistry(t)
 	cfg := DefaultServerConfig()
 	cfg.Experiments = reg
-	srv, err := New(cfg, st)
+	srv, err := newTestHubServer(t, cfg, st)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 
 	if srv.experimentRegistry() != reg {
 		t.Fatal("New() did not carry cfg.Experiments into s.experiments; experimentRegistry() returned a different registry")
@@ -55,11 +50,10 @@ func TestNew_StoresServerConfigExperimentsRegistry(t *testing.T) {
 	}
 
 	// A server built without cfg.Experiments falls back to experiments.Default().
-	srv2, err := New(DefaultServerConfig(), st)
+	srv2, err := newTestHubServer(t, DefaultServerConfig(), st)
 	if err != nil {
 		t.Fatalf("New (no Experiments): %v", err)
 	}
-	t.Cleanup(func() { _ = srv2.Shutdown(context.Background()) })
 	if srv2.experimentRegistry() != experiments.Default() {
 		t.Error("New() without cfg.Experiments should fall back to experiments.Default()")
 	}

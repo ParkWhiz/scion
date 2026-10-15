@@ -7,6 +7,7 @@
  * context has changed.
  */
 import { test, expect, type Page } from '@playwright/test';
+import { installEventSourceStub } from '../event-source-stub.js';
 
 const agentA = '11111111-1111-4111-8111-111111111111';
 const agentB = '22222222-2222-4222-8222-222222222222';
@@ -42,17 +43,7 @@ async function setup(
   let attaches = 0;
   let closes = 0;
   const attachedAgentIds: string[] = [];
-  await page.addInitScript(() => {
-    window.__SCION_FEATURES__ = { 'web.terminal_workspace': true };
-    window.EventSource = class extends EventTarget {
-      onopen: (() => void) | null = null;
-      constructor() {
-        super();
-        queueMicrotask(() => this.onopen?.());
-      }
-      close(): void {}
-    } as unknown as typeof EventSource;
-  });
+  await installEventSourceStub(page);
   await page.route('**/auth/me', (route) =>
     route.fulfill({ json: { id: 'fixture-user', email: 'fixture@example.test' } })
   );
@@ -113,6 +104,9 @@ test('navigation away during URL restoration aborts later agent opens', async ({
   // First, navigate to / so the SPA router is initialized
   await page.goto('/');
   await expect(page).toHaveURL('/');
+  // The router listens for nav-click only once app init has rendered the
+  // first route; dispatching earlier drops the event.
+  await expect(page.locator('scion-page-home')).toBeVisible();
 
   // Record initial attaches
   const initialAttaches = socket.attaches;
@@ -140,7 +134,7 @@ test('navigation away during URL restoration aborts later agent opens', async ({
 
   // The terminal workspace should not be visible (we navigated away)
   const terminalWorkspaceVisible = await page.evaluate(() => {
-    const tw = document.querySelector('#terminal-workspace') as HTMLElement | null;
+    const tw = document.querySelector<HTMLElement>('#terminal-workspace');
     return tw ? !tw.hidden : false;
   });
   expect(terminalWorkspaceVisible).toBe(false);
@@ -186,7 +180,7 @@ test('navigate away after URL restoration preserves already-opened sessions', as
 
   // The terminal workspace should not be visible
   const terminalWorkspaceVisible = await page.evaluate(() => {
-    const tw = document.querySelector('#terminal-workspace') as HTMLElement | null;
+    const tw = document.querySelector<HTMLElement>('#terminal-workspace');
     return tw ? !tw.hidden : false;
   });
   expect(terminalWorkspaceVisible).toBe(false);

@@ -70,36 +70,62 @@ func TestRegisterRoutesOnServeMux(t *testing.T) {
 	}
 }
 
-func TestServiceAnswers404ForEverything(t *testing.T) {
+func TestUnconfiguredServiceRoutes(t *testing.T) {
 	h := NewService(nil).Handler()
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodGet, "/api/v1/artifacts"},
-		{http.MethodPost, "/api/v1/artifacts"},
-		{http.MethodGet, "/api/v1/artifacts/abc"},
-		{http.MethodDelete, "/api/v1/artifacts/abc"},
-		{http.MethodGet, "/api/v1/artifacts/shared/token"},
+	for _, tc := range []struct {
+		method, path string
+		status       int
+	}{
+		{http.MethodGet, "/api/v1/artifacts/shared/token", http.StatusNotFound},
+		{http.MethodGet, "/api/v1/artifacts/abc/unknown", http.StatusNotFound},
+		{http.MethodGet, "/api/v1/artifacts", http.StatusBadRequest},
+		{http.MethodGet, "/api/v1/artifacts?mine=1", http.StatusServiceUnavailable},
+		{http.MethodPut, "/api/v1/artifacts", http.StatusMethodNotAllowed},
+		{http.MethodPut, "/api/v1/artifacts/00000000-0000-4000-8000-000000000001", http.StatusMethodNotAllowed},
+		{http.MethodDelete, "/api/v1/artifacts/00000000-0000-4000-8000-000000000001", http.StatusServiceUnavailable},
+		{http.MethodDelete, "/api/v1/artifacts/abc", http.StatusNotFound},
 	} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("%s %s: status %d, want 404", tc.method, tc.path, rec.Code)
+		if rec.Code != tc.status {
+			t.Errorf("%s %s: status %d, want %d", tc.method, tc.path, rec.Code, tc.status)
 		}
 		var body errorResponse
-		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error.Code != "not_found" {
-			t.Errorf("%s %s: body %q, want not_found JSON error", tc.method, tc.path, rec.Body.String())
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error.Code == "" {
+			t.Errorf("%s %s: body %q, want a JSON error", tc.method, tc.path, rec.Body.String())
 		}
 	}
 }
 
 // TestHostIsStringOnly pins the string-only contract: every Host method
-// takes a context plus strings and returns strings and bools only, so it can
-// be served remotely.
+// takes a context plus strings and returns strings, string slices, bools
+// and errors only, so it can be served remotely.
 func TestHostIsStringOnly(t *testing.T) {
-	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
 	host := reflect.TypeOf((*Host)(nil)).Elem()
-	if host.NumMethod() != 3 {
-		t.Fatalf("Host has %d methods, want 3 (Principal, Authorize, Permits)", host.NumMethod())
+	if host.NumMethod() != 6 {
+		t.Fatalf("Host has %d methods, want 6 (Principal, Authorize, Permits, MemberScopes, SealCursor, OpenCursor)", host.NumMethod())
 	}
+	assertStringOnly(t, host)
+	assertStringOnly(t, reflect.TypeOf((*ScopeExplainer)(nil)).Elem())
+	assertStringOnly(t, reflect.TypeOf((*ScopeAdministrator)(nil)).Elem())
+	// The batch lookups take a list of string ids and answer a map from
+	// id to bool: still strings and bools only.
+	for _, ext := range []reflect.Type{reflect.TypeOf((*PrincipalChecker)(nil)).Elem(), reflect.TypeOf((*ScopeChecker)(nil)).Elem()} {
+		if ext.NumMethod() != 1 {
+			t.Fatalf("%s has %d methods, want 1", ext.Name(), ext.NumMethod())
+		}
+		m := ext.Method(0).Type
+		want := reflect.TypeOf(func(context.Context, []string) (map[string]bool, error) { return nil, nil })
+		if m != want {
+			t.Errorf("%s.%s is %v, want %v", ext.Name(), ext.Method(0).Name, m, want)
+		}
+	}
+}
+
+func assertStringOnly(t *testing.T, host reflect.Type) {
+	t.Helper()
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	errType := reflect.TypeOf((*error)(nil)).Elem()
 	for i := 0; i < host.NumMethod(); i++ {
 		m := host.Method(i)
 		if m.Type.NumIn() == 0 || m.Type.In(0) != ctxType {
@@ -111,8 +137,12 @@ func TestHostIsStringOnly(t *testing.T) {
 			}
 		}
 		for j := 0; j < m.Type.NumOut(); j++ {
-			if k := m.Type.Out(j).Kind(); k != reflect.String && k != reflect.Bool {
-				t.Errorf("%s: result %d is %v, want string or bool", m.Name, j, m.Type.Out(j))
+			out := m.Type.Out(j)
+			switch {
+			case out.Kind() == reflect.String, out.Kind() == reflect.Bool, out == errType:
+			case out.Kind() == reflect.Slice && out.Elem().Kind() == reflect.String:
+			default:
+				t.Errorf("%s: result %d is %v, want string, []string, bool or error", m.Name, j, out)
 			}
 		}
 	}
@@ -143,6 +173,36 @@ func TestNoHubImports(t *testing.T) {
 				strings.HasPrefix(path, "github.com/GoogleCloudPlatform/scion/pkg/ent") {
 				t.Errorf("%s imports %s; pkg/artifacts must not depend on hub packages", name, path)
 			}
+		}
+	}
+}
+
+// TestWriteMethodNotAllowedSetsAllow pins the helper every 405 in the
+// service goes through: the status, the exact Allow list in call order, and
+// the JSON error code (ptone/scion#4057).
+func TestWriteMethodNotAllowedSetsAllow(t *testing.T) {
+	for _, tc := range []struct {
+		methods []string
+		allow   string
+	}{
+		{[]string{http.MethodDelete}, "DELETE"},
+		{[]string{http.MethodGet, http.MethodHead}, "GET, HEAD"},
+		{[]string{http.MethodGet, http.MethodHead, http.MethodPost}, "GET, HEAD, POST"},
+	} {
+		rec := httptest.NewRecorder()
+		writeMethodNotAllowed(rec, tc.methods[0], tc.methods[1:]...)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%v: status %d, want 405", tc.methods, rec.Code)
+		}
+		if got := rec.Header().Get("Allow"); got != tc.allow {
+			t.Errorf("%v: Allow %q, want %q", tc.methods, got, tc.allow)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%v: body not JSON: %v", tc.methods, err)
+		}
+		if !strings.Contains(rec.Body.String(), "method_not_allowed") {
+			t.Errorf("%v: body %s lacks method_not_allowed", tc.methods, rec.Body.String())
 		}
 	}
 }

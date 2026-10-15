@@ -16,9 +16,11 @@ package hub
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 // handleAdminProjectDefaults handles GET/PUT /api/v1/admin/project-defaults.
@@ -26,7 +28,9 @@ import (
 // GET returns the current project defaults (merged with compiled defaults).
 // PUT accepts a partial update to the project_defaults opsettings section.
 //
-// Both endpoints are admin-gated (same auth check as handleAdminMaintenance).
+// The route guard checks hub.project_defaults.read; writes also require
+// hub.project_defaults.update. A user access token needs both selectors, and
+// writes only the keys projectDefaultsTokenKeys classifies as configuration.
 // The section follows the maintenance pattern: DB-only, no settings.yaml
 // representation, with a dedicated admin API endpoint.
 func (s *Server) handleAdminProjectDefaults(w http.ResponseWriter, r *http.Request) {
@@ -81,13 +85,27 @@ func (s *Server) handleGetProjectDefaults(w http.ResponseWriter) {
 }
 
 // handlePutProjectDefaults accepts a partial update to the project_defaults
-// section. It writes the section via OperationalSettings.Update() (which
-// handles validation, persistence, and cross-replica propagation) or falls
-// back to a 501 when the hub has no OperationalSettings.
+// section: a key the body omits keeps its stored value, and an explicit
+// null clears it (mergeSectionOnCurrent). It writes the section via
+// OperationalSettings.Update() (which handles validation, persistence, and
+// cross-replica propagation) or falls back to a 501 when the hub has no
+// OperationalSettings.
 func (s *Server) handlePutProjectDefaults(w http.ResponseWriter, r *http.Request) {
-	var body opsettings.ProjectDefaultsSettings
-	if err := readJSON(r, &body); err != nil {
+	rawBody, err := readRawBody(w, r)
+	if err != nil {
 		BadRequest(w, "Invalid request body: "+err.Error())
+		return
+	}
+	if rejectRepeatedJSONMembers(w, rawBody) {
+		return
+	}
+	var body opsettings.ProjectDefaultsSettings
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		BadRequest(w, "Invalid request body: "+err.Error())
+		return
+	}
+	// A user access token writes configuration keys only.
+	if writeTokenRefusedSettingsKeys(w, r.Context(), tokenRefusedProjectDefaultsKeys(rawBody)) {
 		return
 	}
 
@@ -115,11 +133,38 @@ func (s *Server) handlePutProjectDefaults(w http.ResponseWriter, r *http.Request
 			updatedBy = caller.Email()
 		}
 
-		// last-writer-wins (-1) — no CAS needed for this endpoint.
-		if _, err := ops.Update(r.Context(), "project_defaults", doc, updatedBy, -1, "managed"); err != nil {
+		// Merged on the current row: a key the body omits keeps its stored
+		// value and an explicit null clears it; the row revision read is
+		// the CAS base, so a concurrent write is a 409 (ptone/scion#3720).
+		fp, err := parseFieldPresence(rawBody)
+		if err != nil {
+			BadRequest(w, "Invalid request body: "+err.Error())
+			return
+		}
+		merged, baseRev, err := mergeSectionOnCurrent(r.Context(), ops, "project_defaults", doc, fp)
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
 				"Failed to update project defaults: "+err.Error(), nil)
 			return
+		}
+		if errs := opsettings.Validate("project_defaults", merged); len(errs) > 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"error":  "validation_failed",
+				"errors": errs,
+			})
+			return
+		}
+		if _, same := unchangedManagedRow(r.Context(), ops, "project_defaults", merged, baseRev); !same {
+			if _, err := ops.Update(r.Context(), "project_defaults", merged, updatedBy, baseRev, "managed"); err != nil {
+				if errors.Is(err, store.ErrRevisionConflict) {
+					writeError(w, http.StatusConflict, ErrCodeConflict,
+						"Project defaults changed concurrently; retry", nil)
+					return
+				}
+				writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+					"Failed to update project defaults: "+err.Error(), nil)
+				return
+			}
 		}
 
 		// Read back the applied state.

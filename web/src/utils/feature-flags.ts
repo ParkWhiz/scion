@@ -46,7 +46,7 @@ declare global {
  * Go-side consistency test extracts this set with a regex that only sees
  * literals.
  */
-const DEFAULT_ON_FLAGS = new Set(['web.native_chat', 'web.terminal_workspace']);
+const DEFAULT_ON_FLAGS = new Set(['web.native_chat']);
 
 /**
  * Snapshot of `window.__SCION_FEATURES__` taken the first time
@@ -161,9 +161,7 @@ export function setFeatureFlag(name: string, enabled: boolean): void {
 }
 
 /**
- * Persistent terminal workspace flag (ptone/scion#1662, ptone/scion#2217).
- * Default ON. Controlled hub-wide from Admin → Server Config →
- * Experiments; a per-browser localStorage opt-out only applies when the
- * experiments fetch fails or on a signed-out page load.
+ * Edit agent page (ptone/scion#3952): the Edit button on the agent page and
+ * the /agents/{id}/edit route. Default OFF.
  */
-export const TERMINAL_WORKSPACE_FLAG = 'web.terminal_workspace';
+export const AGENT_EDIT_FLAG = 'web.agent_edit';

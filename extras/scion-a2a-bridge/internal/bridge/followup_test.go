@@ -55,8 +55,9 @@ func boolPtr(b bool) *bool { return &b }
 
 // mockAgentService implements hubclient.AgentService for testing.
 type mockAgentService struct {
-	sendFn func(ctx context.Context, agentID string, msg *messages.StructuredMessage, interrupt, notify, wake bool) (*hubclient.MessageResponse, error)
-	listFn func(ctx context.Context, opts *hubclient.ListAgentsOptions) (*hubclient.ListAgentsResponse, error)
+	sendFn   func(ctx context.Context, agentID string, msg *messages.StructuredMessage, interrupt, notify, wake bool) (*hubclient.MessageResponse, error)
+	listFn   func(ctx context.Context, opts *hubclient.ListAgentsOptions) (*hubclient.ListAgentsResponse, error)
+	createFn func(ctx context.Context, req *hubclient.CreateAgentRequest) (*hubclient.CreateAgentResponse, error)
 }
 
 func (m *mockAgentService) SendStructuredMessage(ctx context.Context, agentID string, msg *messages.StructuredMessage, interrupt, notify, wake bool) (*hubclient.MessageResponse, error) {
@@ -84,6 +85,9 @@ func (m *mockAgentService) Get(ctx context.Context, agentID string) (*hubclient.
 	return nil, fmt.Errorf("not implemented")
 }
 func (m *mockAgentService) Create(ctx context.Context, req *hubclient.CreateAgentRequest) (*hubclient.CreateAgentResponse, error) {
+	if m.createFn != nil {
+		return m.createFn(ctx, req)
+	}
 	return nil, fmt.Errorf("not implemented")
 }
 func (m *mockAgentService) Update(ctx context.Context, agentID string, req *hubclient.UpdateAgentRequest) (*hubclient.Agent, error) {
@@ -172,6 +176,7 @@ func (m *mockHubClient) Schedules(string) hubclient.ScheduleService             
 func (m *mockHubClient) GCPServiceAccounts() hubclient.GCPServiceAccountService       { return nil }
 func (m *mockHubClient) Messages() hubclient.MessageService                           { return nil }
 func (m *mockHubClient) Conversations() hubclient.ConversationService                 { return nil }
+func (m *mockHubClient) ThreadGroups() hubclient.ThreadGroupService                   { return nil }
 func (m *mockHubClient) AllowList() hubclient.AllowListService                        { return nil }
 func (m *mockHubClient) Invites() hubclient.InviteService                             { return nil }
 func (m *mockHubClient) Messaging() hubclient.MessagingService                        { return nil }
@@ -184,9 +189,20 @@ func (m *mockHubClient) UserInjectedSkills() hubclient.InjectedSkillsService { r
 func (m *mockHubClient) ProjectPreStartHooks(projectID string) hubclient.ProjectPreStartHookService {
 	return nil
 }
+func (m *mockHubClient) ProjectVisitors(projectID string) hubclient.ProjectVisitorService {
+	return nil
+}
 func (m *mockHubClient) HubPreStartHooks() hubclient.HubPreStartHookService { return nil }
+func (m *mockHubClient) Artifacts() hubclient.ArtifactService               { return nil }
+func (m *mockHubClient) TestIdentities() hubclient.TestIdentityService      { return nil }
+func (m *mockHubClient) TestIdentityDelegations() hubclient.TestIdentityDelegationService {
+	return nil
+}
 func (m *mockHubClient) Health(ctx context.Context) (*hubclient.HealthResponse, error) {
 	return &hubclient.HealthResponse{}, nil
+}
+func (m *mockHubClient) HealthSummary(ctx context.Context) (*hubclient.HealthSummary, error) {
+	return nil, nil
 }
 func (m *mockHubClient) DiscoverSkillsDirectory(ctx context.Context, req hubclient.DiscoverSkillsDirectoryRequest) (*hubclient.DiscoverSkillsDirectoryResponse, error) {
 	return nil, nil

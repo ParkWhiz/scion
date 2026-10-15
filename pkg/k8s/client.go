@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/GoogleCloudPlatform/scion/pkg/k8s/api/v1alpha1"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 var (
@@ -51,6 +53,12 @@ type Client struct {
 	Clientset      kubernetes.Interface
 	Config         *rest.Config
 	CurrentContext string
+
+	// explicitFile is set for a client built from exactly one kubeconfig
+	// file (NewClientFromKubeconfigFile): the file selects the credential
+	// source too, so Verify never substitutes Application Default
+	// Credentials when the file's exec credential plugin fails.
+	explicitFile bool
 }
 
 // NewClient creates a Kubernetes client using the default or specified kubeconfig.
@@ -67,6 +75,118 @@ func NewClientWithContext(kubeconfigPath, contextName string) (*Client, error) {
 		contextName,
 		loadClientConfig,
 		rest.InClusterConfig,
+		newDynamicForConfig,
+		newClientsetForConfig,
+	)
+}
+
+// errInClusterDisabled is the in-cluster leg's error for
+// NewClientWithContextNoInCluster.
+var errInClusterDisabled = errors.New("in-cluster config disabled for this client")
+
+// NewClientWithContextNoInCluster is NewClientWithContext without any
+// in-cluster fallback: only the default loading rules (KUBECONFIG, including
+// a path list, and ~/.kube/config) or kubeconfigPath. It is for callers, such
+// as tests, that must never use the service account of the pod they run in.
+// When no kubeconfig yields a configuration, the error wraps
+// errInClusterDisabled.
+func NewClientWithContextNoInCluster(kubeconfigPath, contextName string) (*Client, error) {
+	return newClientWithContext(
+		kubeconfigPath,
+		contextName,
+		loadClientConfigNoInCluster,
+		func() (*rest.Config, error) { return nil, errInClusterDisabled },
+		newDynamicForConfig,
+		newClientsetForConfig,
+	)
+}
+
+// newDynamicForConfig and newClientsetForConfig are the API client
+// constructors NewClientWithContext and NewClientWithContextNoInCluster
+// share.
+func newDynamicForConfig(config *rest.Config) (dynamic.Interface, error) {
+	return dynamic.NewForConfig(config)
+}
+
+func newClientsetForConfig(config *rest.Config) (kubernetes.Interface, error) {
+	return kubernetes.NewForConfig(config)
+}
+
+// NewClientFromKubeconfigFile creates a client from exactly one kubeconfig
+// file, for a caller that must never use another source: no default loading
+// rules, no KUBECONFIG, and no in-cluster fallback (the deferred loader can
+// fall back to in-cluster credentials when the explicit file yields an
+// empty configuration). An empty file, a file with no usable context, or a
+// context it does not define is an error. If contextName is empty, the
+// file's current context is used.
+func NewClientFromKubeconfigFile(path, contextName string) (*Client, error) {
+	cfg, err := clientcmd.LoadFromFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+	// Relative paths in the file (certificates, keys, token files, exec
+	// commands) stay relative to the file, as the loading rules resolve them.
+	if err := clientcmd.ResolveLocalPaths(cfg); err != nil {
+		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+	restCfg, err := newExplicitClientConfig(cfg, contextName).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+	current := contextName
+	if current == "" {
+		current = cfg.CurrentContext
+	}
+	c, err := newClientFromConfig(restCfg, current,
+		func(config *rest.Config) (dynamic.Interface, error) { return dynamic.NewForConfig(config) },
+		func(config *rest.Config) (kubernetes.Interface, error) { return kubernetes.NewForConfig(config) })
+	if err != nil {
+		return nil, err
+	}
+	c.explicitFile = true
+	return c, nil
+}
+
+// newExplicitClientConfig is the configuration constructor
+// NewClientFromKubeconfigFile uses (explicitFileClientConfig); a variable
+// so a test can observe that the explicit path goes through it.
+var newExplicitClientConfig = explicitFileClientConfig
+
+// explicitFileClientConfig is the client configuration of one loaded
+// kubeconfig file: a direct configuration with no loading rules and no
+// in-cluster leg (unlike the deferred loader, which falls back to
+// in-cluster credentials when its sources yield an empty configuration).
+func explicitFileClientConfig(cfg *clientcmdapi.Config, contextName string) clientcmd.ClientConfig {
+	return clientcmd.NewNonInteractiveClientConfig(*cfg, contextName,
+		&clientcmd.ConfigOverrides{CurrentContext: contextName}, nil)
+}
+
+// NewClientWithContextTimeout is NewClientWithContext with every request
+// of the client bounded by timeout (rest.Config.Timeout). That includes
+// Verify, and the Application Default Credentials fallback Verify may
+// switch to, since the fallback copies the client's config.
+func NewClientWithContextTimeout(kubeconfigPath, contextName string, timeout time.Duration) (*Client, error) {
+	withTimeout := func(config *rest.Config) *rest.Config {
+		config.Timeout = timeout
+		return config
+	}
+	return newClientWithContext(
+		kubeconfigPath,
+		contextName,
+		func(path, name string) (*rest.Config, string, error) {
+			config, current, err := loadClientConfig(path, name)
+			if err != nil {
+				return nil, "", err
+			}
+			return withTimeout(config), current, nil
+		},
+		func() (*rest.Config, error) {
+			config, err := rest.InClusterConfig()
+			if err != nil {
+				return nil, err
+			}
+			return withTimeout(config), nil
+		},
 		func(config *rest.Config) (dynamic.Interface, error) {
 			return dynamic.NewForConfig(config)
 		},
@@ -139,6 +259,40 @@ func loadClientConfig(kubeconfigPath, contextName string) (*rest.Config, string,
 	return config, currentContext, nil
 }
 
+// loadClientConfigNoInCluster is loadClientConfig with no in-cluster leg;
+// the two differ only there. loadClientConfig uses client-go's deferred
+// loader, whose ClientConfig (clientcmd.DeferredLoadingClientConfig) returns
+// the in-cluster configuration itself when the kubeconfig sources yield an
+// empty or default configuration and an in-cluster config is possible (the
+// service variables and token file of a pod). This loads the same sources,
+// with the same loading rules and overrides, and builds a direct client
+// configuration from them, which has no in-cluster leg by construction. An
+// empty configuration, or a context the merged configuration does not
+// define, is an error.
+func loadClientConfigNoInCluster(kubeconfigPath, contextName string) (*rest.Config, string, error) {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if kubeconfigPath != "" {
+		loadingRules.ExplicitPath = kubeconfigPath
+	}
+	raw, err := loadingRules.Load()
+	if err != nil {
+		return nil, "", err
+	}
+	overrides := &clientcmd.ConfigOverrides{}
+	if contextName != "" {
+		overrides.CurrentContext = contextName
+	}
+	config, err := clientcmd.NewNonInteractiveClientConfig(*raw, contextName, overrides, loadingRules).ClientConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	currentContext := contextName
+	if currentContext == "" {
+		currentContext = raw.CurrentContext
+	}
+	return config, currentContext, nil
+}
+
 func newClientFromConfig(
 	config *rest.Config,
 	currentContext string,
@@ -181,6 +335,14 @@ func (c *Client) Verify() error {
 		return fmt.Errorf("failed to connect to Kubernetes cluster: %w", err)
 	}
 
+	// A client built from one explicit kubeconfig file uses only the
+	// credential source that file selects: no Application Default
+	// Credentials substitution.
+	if c.explicitFile {
+		return fmt.Errorf("the exec credential plugin of the explicit kubeconfig failed (no other credential source is used for this kubeconfig). %s — underlying error: %w",
+			credentialPluginHint(errMsg), err)
+	}
+
 	// On GCE, transparently fall back to Application Default Credentials
 	// instead of requiring gcloud/exec plugins to be configured in the
 	// process env.
@@ -193,6 +355,12 @@ func (c *Client) Verify() error {
 		return nil
 	}
 
+	return fmt.Errorf("%s — underlying error: %w", credentialPluginHint(errMsg), err)
+}
+
+// credentialPluginHint is the operator hint for a failed exec credential
+// plugin.
+func credentialPluginHint(errMsg string) string {
 	hint := "Kubernetes credential plugin failed. "
 	if strings.Contains(errMsg, "gke-gcloud-auth-plugin") {
 		hint += "The gke-gcloud-auth-plugin could not obtain credentials. " +
@@ -204,7 +372,7 @@ func (c *Client) Verify() error {
 		hint += "Ensure the credential plugin is installed and the process environment " +
 			"includes the necessary variables (HOME, PATH, cloud SDK config)."
 	}
-	return fmt.Errorf("%s — underlying error: %w", hint, err)
+	return hint
 }
 
 // gceFallbackAuthScopes are the OAuth2 scopes requested from Application

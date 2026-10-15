@@ -17,8 +17,10 @@ package hub
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -148,8 +150,10 @@ func (s *Server) handleGetRuntime(w http.ResponseWriter, r *http.Request) {
 	allRuntimes := config.DetectAllLocalRuntimes()
 
 	var configured string
-	globalDir, err := config.GetGlobalDir()
-	if err == nil {
+	if ops := s.GetOperationalSettings(); ops != nil {
+		// The DB profiles section is authoritative (see handlePutRuntime).
+		configured = ops.Snapshot().Profiles[activeProfileName()].Runtime
+	} else if globalDir, err := config.GetGlobalDir(); err == nil {
 		if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
 			activeProfile := vs.ActiveProfile
 			if activeProfile == "" {
@@ -183,6 +187,32 @@ func (s *Server) handlePutRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Profiles are a Layer-1 section. With OperationalSettings the DB row
+	// (merged over disk through the settings overlay) is authoritative, so a
+	// settings.yaml write would have no effect; write the section instead.
+	if ops := s.GetOperationalSettings(); ops != nil {
+		if err := s.putRuntimeProfileToDB(r.Context(), ops, activeProfileName(), req.Runtime, updatedByFromRequest(r)); err != nil {
+			if errors.Is(err, store.ErrRevisionConflict) {
+				writeError(w, http.StatusConflict, ErrCodeConflict, "runtime setting changed concurrently; retry", nil)
+				return
+			}
+			if errors.Is(err, ErrSectionValidation) {
+				ValidationError(w, fmt.Sprintf("runtime setting rejected: %v", err), nil)
+				return
+			}
+			slog.Error("PUT system/runtime: failed to update profiles section", "error", err)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save runtime setting", nil)
+			return
+		}
+		s.applyRuntimeChange()
+		writeJSON(w, http.StatusOK, systemRuntimeResponse{
+			Detected:   req.Runtime,
+			Configured: req.Runtime,
+			Available:  true,
+		})
+		return
+	}
+
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "cannot determine config directory", nil)
@@ -194,10 +224,7 @@ func (s *Server) handlePutRuntime(w http.ResponseWriter, r *http.Request) {
 	// single-file load doesn't merge embedded defaults, so ActiveProfile may
 	// be empty there; update the same profile the server reads at startup
 	// (e.g. "local" from defaults).
-	effectiveActive := "default"
-	if effective, _, eErr := config.LoadEffectiveSettings(""); eErr == nil && effective != nil && effective.ActiveProfile != "" {
-		effectiveActive = effective.ActiveProfile
-	}
+	effectiveActive := activeProfileName()
 
 	// Load, modify and save under the settings-file lock so a concurrent
 	// writer (server-config PUT, broker token) is not reverted.
@@ -219,8 +246,19 @@ func (s *Server) handlePutRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update the image checker and co-located broker runtime so they use
-	// the newly selected runtime instead of the previously configured one.
+	s.applyRuntimeChange()
+
+	writeJSON(w, http.StatusOK, systemRuntimeResponse{
+		Detected:   req.Runtime,
+		Configured: req.Runtime,
+		Available:  true,
+	})
+}
+
+// applyRuntimeChange updates the image checker and co-located broker runtime
+// so they use the newly selected runtime instead of the previously
+// configured one.
+func (s *Server) applyRuntimeChange() {
 	rt := runtime.GetRuntime("", "")
 	s.SetLocalImageChecker(rt)
 
@@ -230,12 +268,69 @@ func (s *Server) handlePutRuntime(w http.ResponseWriter, r *http.Request) {
 	if reloadFn != nil {
 		reloadFn()
 	}
+}
 
-	writeJSON(w, http.StatusOK, systemRuntimeResponse{
-		Detected:   req.Runtime,
-		Configured: req.Runtime,
-		Available:  true,
-	})
+// activeProfileName returns the profile the server resolves at startup:
+// the effective settings' configured active profile, or "default". It reads
+// ConfiguredActiveProfile, not ActiveProfile, so the settings overlay's
+// single-stored-profile fallback never redirects the system-runtime GET or
+// PUT onto the only stored profile.
+func activeProfileName() string {
+	if effective, _, err := config.LoadEffectiveSettings(""); err == nil && effective != nil {
+		if active := effective.ConfiguredActiveProfile(); active != "" {
+			return active
+		}
+	}
+	return "default"
+}
+
+// putRuntimeProfileToDB sets the runtime of the profile named by active in
+// the DB-owned profiles section. The base is the current row, or with no row
+// the effective profiles (bootstrap material), so other profiles and the
+// active profile's other fields are kept. The write is CAS on the base
+// revision.
+func (s *Server) putRuntimeProfileToDB(ctx context.Context, ops *OperationalSettings, active, rt, updatedBy string) error {
+	profiles := map[string]config.V1ProfileConfig{}
+	var baseRev int64 // 0 = create-only when there is no row yet
+	row, err := ops.store.GetHubSetting(ctx, "profiles")
+	switch {
+	case err == nil:
+		if len(row.Value) > 0 {
+			if err := json.Unmarshal(row.Value, &profiles); err != nil {
+				return fmt.Errorf("decoding current profiles row: %w", err)
+			}
+			if profiles == nil {
+				profiles = map[string]config.V1ProfileConfig{}
+			}
+		}
+		baseRev = row.Revision
+	case errors.Is(err, store.ErrNotFound):
+		for name, p := range ops.Snapshot().Profiles {
+			profiles[name] = p
+		}
+	default:
+		return fmt.Errorf("reading current profiles row: %w", err)
+	}
+
+	profile := profiles[active]
+	profile.Runtime = rt
+	profiles[active] = profile
+
+	doc, err := json.Marshal(profiles)
+	if err != nil {
+		return fmt.Errorf("encoding profiles section: %w", err)
+	}
+	_, err = ops.Update(ctx, "profiles", doc, updatedBy, baseRev, "managed")
+	return err
+}
+
+// updatedByFromRequest returns the caller's email for settings audit
+// fields, or "" when the request carries no identity.
+func updatedByFromRequest(r *http.Request) string {
+	if user := GetUserIdentityFromContext(r.Context()); user != nil {
+		return user.Email()
+	}
+	return ""
 }
 
 // --- 2.2b: Registry PUT ---
@@ -270,6 +365,53 @@ func (s *Server) handleSystemRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// image_registry is a Layer-1 key (endpoints section). With
+	// OperationalSettings the DB row is authoritative and a settings.yaml
+	// write would have no effect, so write the section instead.
+	if ops := s.GetOperationalSettings(); ops != nil {
+		// Merged on the current endpoints row: only image_registry
+		// changes, and the row revision read is the CAS base.
+		value, err := json.Marshal(req.ImageRegistry)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
+			return
+		}
+		sent := map[string]json.RawMessage{"image_registry": value}
+		reqDoc, err := json.Marshal(sent)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
+			return
+		}
+		doc, baseRev, err := mergeSectionOnCurrentWith(r.Context(), ops, "endpoints", reqDoc,
+			&fieldPresence{raw: sent}, bodyMergeOptions("endpoints"))
+		if err != nil {
+			slog.Error("PUT system/registry: failed to build endpoints document", "error", err)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
+			return
+		}
+		// A write that would leave a managed row as it is is skipped, as
+		// in the server-config PUT (unchangedManagedRow).
+		if _, same := unchangedManagedRow(r.Context(), ops, "endpoints", doc, baseRev); same {
+			writeJSON(w, http.StatusOK, putRegistryResponse(req))
+			return
+		}
+		if _, err := ops.Update(r.Context(), "endpoints", doc, updatedByFromRequest(r), baseRev, "managed"); err != nil {
+			if errors.Is(err, store.ErrRevisionConflict) {
+				writeError(w, http.StatusConflict, ErrCodeConflict, "image registry setting changed concurrently; retry", nil)
+				return
+			}
+			if errors.Is(err, ErrSectionValidation) {
+				ValidationError(w, fmt.Sprintf("image registry setting rejected: %v", err), nil)
+				return
+			}
+			slog.Error("PUT system/registry: failed to update endpoints section", "error", err)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
+			return
+		}
+		writeJSON(w, http.StatusOK, putRegistryResponse(req))
+		return
+	}
+
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "cannot determine config directory", nil)
@@ -299,7 +441,6 @@ type OnboardingStatus struct {
 	IdentitySet         bool   `json:"identitySet"`
 	RuntimeOK           bool   `json:"runtimeOK"`
 	HarnessesSeeded     bool   `json:"harnessesSeeded"`
-	ImagesPresent       bool   `json:"imagesPresent"`
 	HasWorkspace        bool   `json:"hasWorkspace"`
 	Complete            bool   `json:"complete"`
 	EmbeddedBrokerID    string `json:"embeddedBrokerID,omitempty"`
@@ -351,9 +492,6 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 		}
 	}
 
-	// ImagesPresent: best-effort check — skip for now (optional per spec)
-	status.ImagesPresent = false
-
 	// HasWorkspace: at least one project in the store
 	if s.store != nil {
 		result, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 1})
@@ -362,7 +500,7 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 		}
 	}
 
-	// Complete: all required steps done (ImagesPresent is optional)
+	// Complete: all required steps done
 	status.Complete = status.Initialized && status.IdentitySet && status.RuntimeOK && status.HarnessesSeeded
 
 	status.EmbeddedBrokerID = s.GetEmbeddedBrokerID()
@@ -657,11 +795,13 @@ func (s *Server) syncImageStatusAfterPull(ctx context.Context, harnesses []strin
 			slog.Error("syncImageStatusAfterPull: list failed", "harness", h, "error", err)
 			continue
 		}
-		for _, hc := range configs.Items {
-			if hc.Config == nil || hc.Config.Image == "" {
+		for i := range configs.Items {
+			hc := &configs.Items[i]
+			image := effectiveHarnessConfigImage(hc)
+			if image == "" {
 				continue
 			}
-			s.checkAndUpdateImageStatus(ctx, hc.ID, hc.Config.Image)
+			s.checkAndUpdateImageStatus(ctx, hc.ID, image)
 		}
 	}
 }
@@ -675,6 +815,72 @@ type imageBuildRequest struct {
 type imageBuildLogEvent struct {
 	Type string `json:"type"` // "log"
 	Line string `json:"line"`
+}
+
+// imageBuildLogMaxLine caps how many bytes of a single build-log line are
+// published. Longer lines are truncated, not fatal: the rest of the line is
+// read and discarded so the build keeps running.
+const imageBuildLogMaxLine = 1 << 20
+
+// imageBuildLogTruncatedFmt is appended (with imageBuildLogMaxLine) to a
+// build-log line that was cut at imageBuildLogMaxLine bytes.
+const imageBuildLogTruncatedFmt = " ... [line truncated at %d bytes]"
+
+// imageBuildLogReadBuf is the bufio.Reader size streamBuildLog reads with;
+// lines longer than this arrive from ReadLine in several fragments.
+const imageBuildLogReadBuf = 4096
+
+// streamBuildLog reads r line by line and calls emit for each line, without
+// the "\n" or "\r\n" terminator (a lone trailing "\r" on a final line with
+// no "\n" is kept). A line longer than imageBuildLogMaxLine is cut at that
+// length and marked as truncated. streamBuildLog reads r until EOF so that a
+// child process writing to r never blocks on a full pipe. On any other read
+// error it emits the pending partial line, makes a best-effort attempt to
+// discard what is left (a reader that keeps failing ends this at once; for a
+// pipe the realistic case is os.ErrClosed) and returns the error.
+func streamBuildLog(r io.Reader, emit func(string)) error {
+	br := bufio.NewReaderSize(r, imageBuildLogReadBuf)
+	var line []byte
+	truncated := false
+	flush := func() {
+		text := string(line)
+		if truncated {
+			text += fmt.Sprintf(imageBuildLogTruncatedFmt, imageBuildLogMaxLine)
+		}
+		emit(text)
+		line = line[:0]
+		truncated = false
+	}
+	for {
+		frag, isPrefix, err := br.ReadLine()
+		if err != nil {
+			if len(line) > 0 || truncated {
+				flush()
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			_, _ = io.Copy(io.Discard, br)
+			return err
+		}
+		if room := imageBuildLogMaxLine - len(line); len(frag) > room {
+			frag = frag[:room]
+			truncated = true
+		}
+		line = append(line, frag...)
+		if !isPrefix {
+			flush()
+		}
+	}
+}
+
+// imageBuildSubject returns the event subject for an image build's output.
+// Build output is delivered on the requesting user's own subject
+// (user.<userID>.images.<jobID>) rather than a shared system.* subject, so
+// only the session that started the build can subscribe to it: SSE
+// authorization admits user.<id>.* subjects only for that same user.
+func imageBuildSubject(userID, jobID string) string {
+	return "user." + userID + ".images." + jobID
 }
 
 func resolveBuildScript() string {
@@ -701,6 +907,14 @@ func (s *Server) handleSystemImagesBuild(w http.ResponseWriter, r *http.Request)
 
 	if err := assertLoopback(r); err != nil {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil)
+		return
+	}
+
+	// Build output is scoped to the requesting user's subject, so a build
+	// needs a user identity to address it to.
+	requester := GetUserIdentityFromContext(r.Context())
+	if requester == nil || requester.ID() == "" {
+		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "a user session is required to start an image build", nil)
 		return
 	}
 
@@ -748,50 +962,56 @@ func (s *Server) handleSystemImagesBuild(w http.ResponseWriter, r *http.Request)
 
 	buildStarted = true
 	jobID := api.NewUUID()
-	subject := "system.images." + jobID
+	subject := imageBuildSubject(requester.ID(), jobID)
 	requestedHarnesses := req.Harnesses
 
 	go func() {
 		defer s.imageBuildActive.Store(false)
-		cmd := exec.CommandContext(s.ctx, buildScript, "--target", "harnesses")
-		cmd.Dir = filepath.Dir(buildScript)
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			slog.Error("build: stdout pipe failed", "error", err)
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error: " + err.Error()})
-			return
-		}
-		cmd.Stderr = cmd.Stdout
-
-		if err := cmd.Start(); err != nil {
-			slog.Error("build: start failed", "error", err)
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error: " + err.Error()})
-			return
-		}
-
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: scanner.Text()})
-		}
-		if err := scanner.Err(); err != nil {
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error reading build log: " + err.Error()})
-		}
-
-		if err := cmd.Wait(); err != nil {
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build failed: " + err.Error()})
-		} else {
-			for _, h := range requestedHarnesses {
-				s.events.PublishRaw(subject, map[string]string{
-					"image":  "scion-" + h + ":latest",
-					"status": "done",
-				})
-			}
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build complete"})
-		}
+		s.runImageBuild(s.ctx, subject, buildScript, requestedHarnesses)
 	}()
 
 	writeJSON(w, http.StatusOK, imagePullResponse{JobID: jobID})
+}
+
+// runImageBuild runs the build script and publishes its output, line by line,
+// followed by per-image completion events, on subject. It blocks until the
+// script exits.
+func (s *Server) runImageBuild(ctx context.Context, subject, buildScript string, harnesses []string) {
+	cmd := exec.CommandContext(ctx, buildScript, "--target", "harnesses")
+	cmd.Dir = filepath.Dir(buildScript)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slog.Error("build: stdout pipe failed", "error", err)
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error: " + err.Error()})
+		return
+	}
+	cmd.Stderr = cmd.Stdout
+
+	if err := cmd.Start(); err != nil {
+		slog.Error("build: start failed", "error", err)
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error: " + err.Error()})
+		return
+	}
+
+	if err := streamBuildLog(stdout, func(line string) {
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: line})
+	}); err != nil {
+		slog.Error("build: reading build log failed", "error", err)
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error reading build log: " + err.Error()})
+	}
+
+	if err := cmd.Wait(); err != nil {
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build failed: " + err.Error()})
+	} else {
+		for _, h := range harnesses {
+			s.events.PublishRaw(subject, map[string]string{
+				"image":  "scion-" + h + ":latest",
+				"status": "done",
+			})
+		}
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build complete"})
+	}
 }
 
 // --- 5.2: Filesystem Endpoints ---
@@ -1079,7 +1299,6 @@ type workstationSettingsRequest struct {
 }
 
 // handleWorkstationSettings handles PATCH /api/v1/system/workstation-settings.
-// It allows toggling workstation-level settings without requiring admin role.
 func (s *Server) handleWorkstationSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPatch {
 		MethodNotAllowed(w, http.MethodPatch)

@@ -121,6 +121,8 @@ func TestRecordedRuntime_DispatchSendsSignedParamOverHTTP(t *testing.T) {
 			d := NewHTTPAgentDispatcherWithClient(s, NewAuthenticatedBrokerClient(s, false), false, slog.Default())
 			d.SetTokenGenerator(staticTokenGenerator{token: "test-token"})
 			agent := &store.Agent{ID: tid("rr-agent"), Name: "w", Slug: "w", ProjectID: project.ID, RuntimeBrokerID: broker.ID, Runtime: tc.runtime}
+			// DispatchAgentKeys loads the agent row for its placement backstop.
+			require.NoError(t, s.CreateAgent(ctx, agent))
 
 			require.NoError(t, d.DispatchAgentStop(ctx, agent))
 			require.NoError(t, d.DispatchAgentRestart(ctx, agent))
@@ -233,8 +235,6 @@ func TestRecordedRuntime_ControlChannelSendsSignedParam(t *testing.T) {
 	}
 }
 
-const brokerRuntimeUnavailableBody = `{"error":{"code":"runtime_unavailable","message":"runtime \"kubernetes\" is not available on this broker; retry later or check the broker's runtime configuration"}}`
-
 func TestRecordedRuntime_ControlChannelKeepsRetryAfter(t *testing.T) {
 	tunnel := &mockControlChannelTunnel{
 		connected: true,
@@ -273,10 +273,6 @@ func setupRuntimeUnavailableAgent(t *testing.T, suffix string, brokerErr error) 
 	d.SetTokenGenerator(staticTokenGenerator{token: "test-token"})
 	srv.SetDispatcher(d)
 	return srv, s, agent, mockClient
-}
-
-func runtimeUnavailableErr() error {
-	return &brokerStatusError{StatusCode: http.StatusServiceUnavailable, Body: brokerRuntimeUnavailableBody, RetryAfter: "30"}
 }
 
 func requireRelayed503(t *testing.T, rec *httptest.ResponseRecorder) {
@@ -343,8 +339,10 @@ func TestRecordedRuntime_BulkResetAuthMarksRuntimeUnavailable(t *testing.T) {
 			ID   string `json:"id"`
 			Code string `json:"code"`
 		} `json:"failed"`
+		FailedByCode map[string]int `json:"failed_by_code"`
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body), rec.Body.String())
+	require.Equal(t, map[string]int{brokerCodeRuntimeUnavailable: 1}, body.FailedByCode)
 	var found bool
 	for _, f := range body.Failed {
 		if f.ID == agent.ID {
@@ -353,18 +351,6 @@ func TestRecordedRuntime_BulkResetAuthMarksRuntimeUnavailable(t *testing.T) {
 		}
 	}
 	require.True(t, found, "agent missing from failed entries: %s", rec.Body.String())
-}
-
-// startErrClient is mockRuntimeBrokerClient with StartAgent failing and
-// every other call succeeding.
-type startErrClient struct {
-	*mockRuntimeBrokerClient
-	startErr error
-}
-
-func (c startErrClient) StartAgent(context.Context, string, string, string, string, string, string, string, string, string, string, map[string]string, []ResolvedSecret, *api.ScionConfig, []api.SharedDir, bool, bool, StartExtras) (*RemoteAgentResponse, error) {
-	c.startCalled = true
-	return nil, c.startErr
 }
 
 // TestRecordedRuntime_RestartStartLegFailureRecordsStopped pins that when a
@@ -431,7 +417,7 @@ func TestRecordedRuntime_DeleteRuntimeUnavailableRollsBack(t *testing.T) {
 
 	// A joiner of that delete answers the same 503 and Retry-After.
 	joined := httptest.NewRecorder()
-	require.True(t, srv.resolveJoinFromRow(joined, ctx, agent.ID, got.DeletionClaim))
+	require.True(t, srv.resolveJoinFromRow(joined, ctx, agent.ID, got.DeletionClaim, true))
 	require.Equal(t, http.StatusServiceUnavailable, joined.Code, joined.Body.String())
 	require.Equal(t, "7", joined.Header().Get("Retry-After"))
 	require.Contains(t, joined.Body.String(), brokerCodeRuntimeUnavailable)
@@ -444,7 +430,7 @@ func TestRecordedRuntime_DeleteRuntimeUnavailableRollsBack(t *testing.T) {
 	// remembered value and sends the default.
 	deletionRetryAfter.Delete(agent.ID)
 	joined = httptest.NewRecorder()
-	require.True(t, srv.resolveJoinFromRow(joined, ctx, agent.ID, got.DeletionClaim))
+	require.True(t, srv.resolveJoinFromRow(joined, ctx, agent.ID, got.DeletionClaim, true))
 	require.Equal(t, http.StatusServiceUnavailable, joined.Code, joined.Body.String())
 	require.Equal(t, defaultBrokerRuntimeRetryAfter, joined.Header().Get("Retry-After"))
 

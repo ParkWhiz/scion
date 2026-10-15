@@ -18,7 +18,6 @@ package hub
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -66,6 +65,9 @@ func newDeletedUserTokenFixture(t *testing.T, name string) *deletedUserTokenFixt
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
 	srv.seedProjectCreatorMembership(ctx, project)
+	// The member's owner relationship on its agent requires active project
+	// access (ptone/scion#2141); the binding grants no permission itself.
+	grantProjectAccessOnly(t, s, user.ID, project.ID)
 
 	agentID := tid(name + "-agent")
 	createCredTestAgent(t, s, agentID, project.ID, user.ID)
@@ -88,13 +90,6 @@ func (f *deletedUserTokenFixture) get(t *testing.T, path string) *httptest.Respo
 	return rec
 }
 
-func errorCodeOf(t *testing.T, rec *httptest.ResponseRecorder) string {
-	t.Helper()
-	var errResp ErrorResponse
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp), "body: %s", rec.Body.String())
-	return errResp.Error.Code
-}
-
 // TestJWTAuth_TokenStopsWorkingAfterUserDelete covers the full flow: a CLI
 // token works for its user (including the user's own agent), the user is
 // deleted through the admin API, and the same unexpired token is then
@@ -108,6 +103,14 @@ func TestJWTAuth_TokenStopsWorkingAfterUserDelete(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, "auth/me before delete: %s", rec.Body.String())
 	rec = f.get(t, agentPath)
 	require.Equal(t, http.StatusOK, rec.Code, "own agent before delete: %s", rec.Body.String())
+
+	// A user who owns agents cannot be deleted (ptone/scion#2769), so
+	// soft-delete the agent first. Its row stays, so the agent path below
+	// still shows the token is refused before any handler runs.
+	now := time.Now()
+	_, err := f.store.UpdateAgentDeletion(context.Background(), f.agentID, store.DeletionPredicate{},
+		store.DeletionFields{DeletedAt: &now})
+	require.NoError(t, err)
 
 	// Delete the user through the admin API.
 	del := doRequest(t, f.srv, http.MethodDelete, "/api/v1/users/"+f.user.ID, nil)

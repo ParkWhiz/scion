@@ -44,7 +44,7 @@ type runSwapStopDispatcher struct {
 
 func (d *runSwapStopDispatcher) DispatchAgentStop(ctx context.Context, agent *store.Agent) error {
 	d.stopCount.Add(1)
-	if _, err := d.s.SetAgentRunID(ctx, agent.ID, "run-new"); err != nil {
+	if _, err := d.s.SetAgentRunID(ctx, agent.ID, "run-new", nil); err != nil {
 		return err
 	}
 	return d.s.UpdateAgentStatus(ctx, agent.ID, store.AgentStatusUpdate{Phase: string(state.PhaseRunning), ContainerStatus: "running"})
@@ -59,7 +59,7 @@ func runSwapQuotaAgent(t *testing.T, name string) (*Server, store.Store, *store.
 	broker, project := newQuotaTestBrokerAndProject(t, s, name)
 	a := newQuotaTestAgent(t, s, broker, project, name, state.PhaseRunning)
 	reserveBrokerSlot(t, s, broker, a.ID)
-	if _, err := s.SetAgentRunID(context.Background(), a.ID, "run-old"); err != nil {
+	if _, err := s.SetAgentRunID(context.Background(), a.ID, "run-old", nil); err != nil {
 		t.Fatal(err)
 	}
 	a.RunID = "run-old"
@@ -145,6 +145,7 @@ func TestStopMissLeavesNewerRun_NoWriteNoQuotaNoPublish(t *testing.T) {
 	})
 	t.Run("auto-suspend", func(t *testing.T) {
 		srv, s, broker, a, ep := runSwapQuotaAgent(t, "miss-autosusp")
+		markAgentStalled(t, s, a.ID)
 		srv.autoSuspendStalledAgents(context.Background(), []store.Agent{*a})
 		assertNewerRunUntouched(t, s, broker, a, ep)
 	})
@@ -173,29 +174,10 @@ type runLandingStartClient struct {
 
 func (c runLandingStartClient) StartAgent(ctx context.Context, _, _, _, _, _, _, _, _, _, _ string, _ map[string]string, _ []ResolvedSecret, _ *api.ScionConfig, _ []api.SharedDir, _, _ bool, _ StartExtras) (*RemoteAgentResponse, error) {
 	c.startCalled = true
-	if _, err := c.s.SetAgentRunID(ctx, c.agentID, "run-other"); err != nil {
+	if _, err := c.s.SetAgentRunID(ctx, c.agentID, "run-other", nil); err != nil {
 		return nil, err
 	}
 	return nil, errors.New("connection reset by peer")
-}
-
-// restartQuotaAgent is a running agent on run-x holding one broker
-// reservation.
-func restartQuotaAgent(t *testing.T, name string) (*Server, store.Store, *store.Agent) {
-	t.Helper()
-	ctx := context.Background()
-	srv, s := testServer(t)
-	setBrokerAgentCeiling(t, s, 5)
-	agent := setupBrokerAgentInPhase(t, s, name, state.PhaseRunning)
-	broker, err := s.GetRuntimeBroker(ctx, agent.RuntimeBrokerID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reserveBrokerSlot(t, s, broker, agent.ID)
-	if _, err := s.SetAgentRunID(ctx, agent.ID, "run-x"); err != nil {
-		t.Fatal(err)
-	}
-	return srv, s, agent
 }
 
 // A restart whose stop leg succeeds and whose start leg fails while
@@ -275,7 +257,7 @@ type failSuspendWriteStore struct {
 func (f *failSuspendWriteStore) UpdateAgentStatus(ctx context.Context, id string, upd store.AgentStatusUpdate) error {
 	if upd.Phase == string(state.PhaseSuspended) {
 		if f.swapRun {
-			if _, err := f.SetAgentRunID(ctx, id, "run-new"); err != nil {
+			if _, err := f.SetAgentRunID(ctx, id, "run-new", nil); err != nil {
 				return err
 			}
 		}

@@ -29,34 +29,8 @@ import (
 // same creator attribution and project-default GCP identity as agents created
 // through the agent-create API.
 
-func fireScheduledDispatchAsOwner(t *testing.T, f *bypassAgentsFixture, agentName string) error {
-	t.Helper()
-	ctx := context.Background()
-	f.srv.seedProjectCreatorMembership(ctx, f.proj)
-	require.NoError(t, f.srv.createProjectOwnerRoleBinding(ctx, f.proj.ID, f.owner.ID))
-	return f.srv.dispatchAgentEventHandler()(ctx, store.ScheduledEvent{
-		ID:        "evt-" + agentName,
-		ProjectID: f.proj.ID,
-		EventType: "dispatch_agent",
-		Payload:   `{"agentName":"` + agentName + `","task":"scheduled work"}`,
-		CreatedBy: f.owner.ID,
-	})
-}
-
-func setProjectDefaultSAAnnotations(t *testing.T, f *bypassAgentsFixture, saID string) {
-	t.Helper()
-	ctx := context.Background()
-	proj, err := f.store.GetProject(ctx, f.proj.ID)
-	require.NoError(t, err)
-	if proj.Annotations == nil {
-		proj.Annotations = map[string]string{}
-	}
-	proj.Annotations[projectSettingDefaultGCPIdentityMode] = store.GCPMetadataModeAssign
-	proj.Annotations[projectSettingDefaultGCPIdentitySAID] = saID
-	require.NoError(t, f.store.UpdateProject(ctx, proj))
-}
-
 func TestScheduledDispatch_UserCreatorSetsCreatorName(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 
 	require.NoError(t, fireScheduledDispatchAsOwner(t, f, "sched-creator-name"))
@@ -70,6 +44,7 @@ func TestScheduledDispatch_UserCreatorSetsCreatorName(t *testing.T) {
 }
 
 func TestScheduledDispatch_NoProjectDefaultLeavesGCPIdentityUnchanged(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 
 	require.NoError(t, fireScheduledDispatchAsOwner(t, f, "sched-no-sa"))
@@ -82,6 +57,7 @@ func TestScheduledDispatch_NoProjectDefaultLeavesGCPIdentityUnchanged(t *testing
 }
 
 func TestScheduledDispatch_ProjectDefaultSAAssigned(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 	sa := bypassAgentsCreateSA(t, f, f.proj.ID, true)
 	setProjectDefaultSAAnnotations(t, f, sa.ID)
@@ -100,6 +76,7 @@ func TestScheduledDispatch_ProjectDefaultSAAssigned(t *testing.T) {
 }
 
 func TestScheduledDispatch_ProjectDefaultSADeniedFailsDispatch(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 	sa := bypassAgentsCreateSA(t, f, f.proj.ID, true)
 	setProjectDefaultSAAnnotations(t, f, sa.ID)
@@ -114,6 +91,7 @@ func TestScheduledDispatch_ProjectDefaultSADeniedFailsDispatch(t *testing.T) {
 }
 
 func TestScheduledDispatch_UnverifiedProjectDefaultSAFailsDispatch(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 	sa := bypassAgentsCreateSA(t, f, f.proj.ID, false)
 	setProjectDefaultSAAnnotations(t, f, sa.ID)
@@ -129,12 +107,14 @@ func TestScheduledDispatch_UnverifiedProjectDefaultSAFailsDispatch(t *testing.T)
 // site calls the same logAuthzDenial with the same r, so the direct test
 // covers it; it is not independently reachable past the policy layer.
 func TestEvaluateSAAssignment_NilRequestLogAuthzDenial(t *testing.T) {
+	t.Parallel()
 	assert.NotPanics(t, func() {
 		logAuthzDenial(nil, nil, Resource{Type: "gcp_service_account"}, ActionAssign, "test")
 	})
 }
 
 func TestEvaluateSAAssignment_NilRequestPolicyDenial(t *testing.T) {
+	t.Parallel()
 	f := bypassAgentsSetup(t)
 	sa := bypassAgentsCreateSA(t, f, f.proj.ID, true)
 
@@ -145,7 +125,7 @@ func TestEvaluateSAAssignment_NilRequestPolicyDenial(t *testing.T) {
 
 	var denial *saAssignDenial
 	require.NotPanics(t, func() {
-		denial = f.srv.evaluateSAAssignment(ctx, nil, sa, SurfaceProjectDefault)
+		denial = f.srv.evaluateSAAssignment(ctx, nil, sa, sa.ScopeID, SurfaceProjectDefault)
 	})
 	require.NotNil(t, denial, "a stranger must be denied")
 	assert.Equal(t, saAssignDenyForbiddenStructured, denial.kind)

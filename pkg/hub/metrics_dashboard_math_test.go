@@ -30,13 +30,6 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func intPoint(start, end time.Time, value int64) *monitoringpb.Point {
-	return &monitoringpb.Point{
-		Interval: &monitoringpb.TimeInterval{StartTime: timestamppb.New(start), EndTime: timestamppb.New(end)},
-		Value:    &monitoringpb.TypedValue{Value: &monitoringpb.TypedValue_Int64Value{Int64Value: value}},
-	}
-}
-
 func doublePoint(start, end time.Time, value float64) *monitoringpb.Point {
 	return &monitoringpb.Point{
 		Interval: &monitoringpb.TimeInterval{StartTime: timestamppb.New(start), EndTime: timestamppb.New(end)},
@@ -179,7 +172,7 @@ func TestQueryDailyTimeSeriesBucketsByEndDay(t *testing.T) {
 		},
 	}}
 
-	points, err := svc.queryDailyTimeSeries(context.Background(), telemetrycontract.MetricAPICalls, day1.Add(-2*time.Hour), day2.Add(time.Hour), nil)
+	points, err := svc.queryDailyTimeSeries(context.Background(), telemetrycontract.MetricAPICalls, day1.Add(-2*time.Hour), day2.Add(time.Hour), nil, time.UTC)
 	require.NoError(t, err)
 	byDay := map[string]int64{}
 	for _, p := range points {
@@ -215,7 +208,7 @@ func TestDailyBucketsAreUTCDays(t *testing.T) {
 			name:   "queryDailyTimeSeries",
 			metric: telemetrycontract.MetricAPICalls,
 			query: func(svc *MetricsDashboardService, metric string) (map[string]int64, error) {
-				points, err := svc.queryDailyTimeSeries(ctx, metric, queryStart, queryEnd, nil)
+				points, err := svc.queryDailyTimeSeries(ctx, metric, queryStart, queryEnd, nil, time.UTC)
 				return pointsByDay(points), err
 			},
 		},
@@ -224,7 +217,7 @@ func TestDailyBucketsAreUTCDays(t *testing.T) {
 			metric: telemetrycontract.MetricAPICalls,
 			labels: map[string]string{telemetrycontract.ModelLabel: "m1"},
 			query: func(svc *MetricsDashboardService, metric string) (map[string]int64, error) {
-				series, err := svc.queryGroupedTimeSeries(ctx, metric, "metric.labels."+telemetrycontract.ModelLabel, queryStart, queryEnd, nil)
+				series, err := svc.queryGroupedTimeSeries(ctx, metric, "metric.labels."+telemetrycontract.ModelLabel, queryStart, queryEnd, nil, time.UTC)
 				if err != nil {
 					return nil, err
 				}
@@ -239,7 +232,7 @@ func TestDailyBucketsAreUTCDays(t *testing.T) {
 			metric: telemetrycontract.MetricSessionCount,
 			labels: map[string]string{telemetrycontract.AgentLabel: "agent-1"},
 			query: func(svc *MetricsDashboardService, metric string) (map[string]int64, error) {
-				points, err := svc.queryDailyUniqueCount(ctx, metric, "metric.labels."+telemetrycontract.AgentLabel, queryStart, queryEnd, nil)
+				points, err := svc.queryDailyUniqueCount(ctx, metric, "metric.labels."+telemetrycontract.AgentLabel, queryStart, queryEnd, nil, time.UTC)
 				return pointsByDay(points), err
 			},
 		},
@@ -261,14 +254,6 @@ func TestDailyBucketsAreUTCDays(t *testing.T) {
 			assert.Positive(t, byDay["2026-03-10"])
 		})
 	}
-}
-
-func pointsByDay(points []TimeSeriesPoint) map[string]int64 {
-	byDay := make(map[string]int64, len(points))
-	for _, p := range points {
-		byDay[p.Timestamp] = p.Value
-	}
-	return byDay
 }
 
 // TestQuerySumTreatsNotFoundAsZero pins the "NotFound-as-zero" rule at the

@@ -44,7 +44,7 @@ var catalogResourceOperations = []OperationSpec{
 	{
 		ID:          "skill.create",
 		Domain:      "skill",
-		Description: "Create a new skill definition",
+		Description: "Create a new skill definition. A user-scope skill refuses a federated caller (requireProfileWriter)",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/skills", Method: "POST"},
 		},
@@ -56,12 +56,15 @@ var catalogResourceOperations = []OperationSpec{
 		DelegationKind:   DelegationNone,
 		AuthorityEval:    AuthorityEvalNone,
 		DenialCodes:      []DenialCode{DenialForbidden},
-		TestRefs:         []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestUserSkillWrites_FederatedUserRefused"},
+		},
 	},
 	{
 		ID:          "skill.update",
 		Domain:      "skill",
-		Description: "Update an existing skill definition",
+		Description: "Update an existing skill definition. A user-scope skill refuses a federated caller (requireProfileWriter)",
 		EntryPoints: []EntryPoint{
 			// handleSkillByID (skill_handlers.go) dispatches on r.Method:
 			// PATCH, not PUT.
@@ -75,13 +78,16 @@ var catalogResourceOperations = []OperationSpec{
 		DelegationKind:   DelegationNone,
 		AuthorityEval:    AuthorityEvalNone,
 		DenialCodes:      []DenialCode{DenialForbidden},
-		TestRefs:         []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
-		Bearer:           AdmitOn(BearerTargetCatalogRecord, BearerBoundaryProject, BearerBoundaryHub),
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestUserSkillWrites_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryProject, BearerBoundaryHub),
 	},
 	{
 		ID:          "skill.delete",
 		Domain:      "skill",
-		Description: "Delete a skill definition",
+		Description: "Delete a skill definition. A user-scope skill refuses a federated caller (requireProfileWriter)",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/skills/{id}", Method: "DELETE"},
 		},
@@ -99,8 +105,11 @@ var catalogResourceOperations = []OperationSpec{
 			Atomic:        true,
 		},
 		DenialCodes: []DenialCode{DenialForbidden},
-		TestRefs:    []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
-		Bearer:      AdmitOn(BearerTargetCatalogRecord, BearerBoundaryProject, BearerBoundaryHub),
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestUserSkillWrites_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryProject, BearerBoundaryHub),
 	},
 	{
 		ID:          "skill.register",
@@ -157,7 +166,7 @@ var catalogResourceOperations = []OperationSpec{
 	{
 		ID:          "template.create",
 		Domain:      "template",
-		Description: "Create a new template or import resources",
+		Description: "Create a new template or import resources. A user-scope create through /api/v1/templates or /api/v1/resources/import refuses a federated caller (requireProfileWriter)",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/templates", Method: "POST"},
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/resources/import", Method: "POST"},
@@ -170,12 +179,16 @@ var catalogResourceOperations = []OperationSpec{
 		DelegationKind:   DelegationNone,
 		AuthorityEval:    AuthorityEvalNone,
 		DenialCodes:      []DenialCode{DenialForbidden},
-		TestRefs:         []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestGenericUserTemplateWrites_FederatedUserRefused"},
+			{Package: "pkg/hub", Function: "TestUserResourceImport_FederatedUserRefused"},
+		},
 	},
 	{
 		ID:          "template.update",
 		Domain:      "template",
-		Description: "Update an existing template definition",
+		Description: "Update an existing template definition. A user-scope template refuses a federated caller (requireProfileWriter)",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/templates/{id}", Method: "PUT"},
 		},
@@ -187,13 +200,16 @@ var catalogResourceOperations = []OperationSpec{
 		DelegationKind:   DelegationNone,
 		AuthorityEval:    AuthorityEvalNone,
 		DenialCodes:      []DenialCode{DenialForbidden},
-		TestRefs:         []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
-		Bearer:           AdmitOn(BearerTargetCatalogRecord, BearerBoundaryProject, BearerBoundaryHub),
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestGenericUserTemplateWrites_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryProject, BearerBoundaryHub),
 	},
 	{
 		ID:          "template.delete",
 		Domain:      "template",
-		Description: "Delete a template definition",
+		Description: "Delete a template definition. A user-scope template refuses a federated caller (requireProfileWriter)",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/templates/{id}", Method: "DELETE"},
 		},
@@ -211,7 +227,10 @@ var catalogResourceOperations = []OperationSpec{
 			Atomic:        true,
 		},
 		DenialCodes: []DenialCode{DenialForbidden},
-		TestRefs:    []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestGenericUserTemplateWrites_FederatedUserRefused"},
+		},
 	},
 
 	// =====================================================================
@@ -239,7 +258,7 @@ var catalogResourceOperations = []OperationSpec{
 	{
 		ID:          "harnessconfig.create",
 		Domain:      "harnessconfig",
-		Description: "Create a new harness configuration",
+		Description: "Create a new harness configuration. A user-scope harness config refuses a federated caller (requireProfileWriter)",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/harness-configs", Method: "POST"},
 		},
@@ -251,12 +270,15 @@ var catalogResourceOperations = []OperationSpec{
 		DelegationKind:   DelegationNone,
 		AuthorityEval:    AuthorityEvalNone,
 		DenialCodes:      []DenialCode{DenialForbidden},
-		TestRefs:         []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestUserHarnessConfigWrites_FederatedUserRefused"},
+		},
 	},
 	{
 		ID:          "harnessconfig.update",
 		Domain:      "harnessconfig",
-		Description: "Update a harness configuration",
+		Description: "Update a harness configuration. On a user-scope harness config the existing route gate (authorizeHarnessConfigRoute) already refuses a federated caller, with requireProfileWriter behind it",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/harness-configs/{id}", Method: "PUT"},
 		},
@@ -268,13 +290,16 @@ var catalogResourceOperations = []OperationSpec{
 		DelegationKind:   DelegationNone,
 		AuthorityEval:    AuthorityEvalNone,
 		DenialCodes:      []DenialCode{DenialForbidden},
-		TestRefs:         []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
-		Bearer:           AdmitOn(BearerTargetCatalogRecord, BearerBoundaryProject, BearerBoundaryHub),
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestUserHarnessConfigWrites_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryProject, BearerBoundaryHub),
 	},
 	{
 		ID:          "harnessconfig.delete",
 		Domain:      "harnessconfig",
-		Description: "Delete a harness configuration",
+		Description: "Delete a harness configuration. On a user-scope harness config the existing route gate (authorizeHarnessConfigRoute) already refuses a federated caller, with requireProfileWriter behind it",
 		EntryPoints: []EntryPoint{
 			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/harness-configs/{id}", Method: "DELETE"},
 		},
@@ -292,6 +317,189 @@ var catalogResourceOperations = []OperationSpec{
 			Atomic:        true,
 		},
 		DenialCodes: []DenialCode{DenialForbidden},
-		TestRefs:    []TestRef{{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"}},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub/authzop", Function: "TestCatalogValidation"},
+			{Package: "pkg/hub", Function: "TestUserHarnessConfigWrites_FederatedUserRefused"},
+		},
+	},
+
+	// =====================================================================
+	// User-scope branches: records in the caller's own user scope. Each
+	// branch is selected by the record's scope or by the request's scope
+	// (and kind), and admits a user access token with the permission's
+	// selector on a hub boundary. The other branches of the same routes
+	// are separate operations.
+	// =====================================================================
+
+	{
+		ID:          "template.user.clone",
+		Domain:      "template",
+		Description: "Clone a readable template into the caller's own user scope. The source needs template:read; a user access token needs template:create on a hub boundary for the destination",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/templates/{id}/clone", Method: "POST", Variant: "scope=user"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "template.create",
+		Effects:          []SecurityEffect{EffectCreateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestCloneToUserScope_RequiresCreateOnDestination"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "template.user.reimport",
+		Domain:      "template",
+		Description: "Reimport one of the caller's own user-scope templates from its source. The read gate needs template:read and the reimport needs template:update on the record, on a hub boundary for a user access token",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/templates/{id}/reimport", Method: "POST", Variant: "scope=user"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "template.update",
+		Effects:          []SecurityEffect{EffectUpdateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestTemplateUserReimport_RequiresUpdateAction"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "skill.user.create",
+		Domain:      "skill",
+		Description: "Create a skill in the caller's own user scope; the scope and owner are the caller. A user access token needs skill:create on a hub boundary",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/skills", Method: "POST", Variant: "scope=user"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "skill.create",
+		Effects:          []SecurityEffect{EffectCreateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserScopeSkillCreate_RequiresSkillCreate"},
+			{Package: "pkg/hub", Function: "TestUserSkillWrites_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "harnessconfig.user.clone",
+		Domain:      "harnessconfig",
+		Description: "Clone a readable harness configuration into the caller's own user scope. The source needs harness_config:read; a user access token needs harness_config:create on a hub boundary for the destination",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/harness-configs/{id}/clone", Method: "POST", Variant: "scope=user"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "harness_config.create",
+		Effects:          []SecurityEffect{EffectCreateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestCloneToUserScope_RequiresCreateOnDestination"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "harnessconfig.user.delete",
+		Domain:      "harnessconfig",
+		Description: "Delete one of the caller's own user-scope harness configurations. The route gate needs harness_config:read and the delete needs harness_config:delete, on a hub boundary for a user access token",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/harness-configs/{id}", Method: "DELETE", Variant: "scope=user"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "harness_config.delete",
+		Effects:          []SecurityEffect{EffectDeleteResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		AuditObligation: &AuditObligation{
+			EventType:     "harnessconfig.delete",
+			ContextFields: []string{"actor_id"},
+			BeforeFields:  []string{"config_id", "config_name"},
+			Atomic:        true,
+		},
+		DenialCodes: []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestHarnessUserDelete_RequiresDeleteAction"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "harnessconfig.user.reimport",
+		Domain:      "harnessconfig",
+		Description: "Reimport one of the caller's own user-scope harness configurations from its source. The route gate needs harness_config:read and the reimport needs harness_config:update, on a hub boundary for a user access token",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/harness-configs/{id}/reimport", Method: "POST", Variant: "scope=user"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "harness_config.update",
+		Effects:          []SecurityEffect{EffectUpdateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestHarnessUserReimport_RequiresUpdateAction"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "template.user.import",
+		Domain:      "template",
+		Description: "Import or discover templates for the caller's own user scope. A user access token needs template:create on a hub boundary",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/resources/import", Method: "POST", Variant: "scope=user,kind=template"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/resources/discover", Method: "POST", Variant: "scope=user,kind=template"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "template.create",
+		Effects:          []SecurityEffect{EffectCreateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserScopeImport_RequiresCreateSelector"},
+			{Package: "pkg/hub", Function: "TestUserResourceImport_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
+	},
+	{
+		ID:          "harnessconfig.user.import",
+		Domain:      "harnessconfig",
+		Description: "Import or discover harness configurations for the caller's own user scope. A user access token needs harness_config:create on a hub boundary",
+		EntryPoints: []EntryPoint{
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/resources/import", Method: "POST", Variant: "scope=user,kind=harness-config"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/resources/discover", Method: "POST", Variant: "scope=user,kind=harness-config"},
+		},
+		Principals:       []PrincipalKind{PrincipalUser},
+		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
+		ResourceResolver: "self-principal",
+		BasePermission:   "harness_config.create",
+		Effects:          []SecurityEffect{EffectCreateResource},
+		DelegationKind:   DelegationNone,
+		AuthorityEval:    AuthorityEvalNone,
+		DenialCodes:      []DenialCode{DenialForbidden},
+		TestRefs: []TestRef{
+			{Package: "pkg/hub", Function: "TestUserScopeImport_RequiresCreateSelector"},
+			{Package: "pkg/hub", Function: "TestUserResourceImport_FederatedUserRefused"},
+		},
+		Bearer: AdmitOn(BearerTargetCatalogRecord, BearerBoundaryHub),
 	},
 }

@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import importlib.util
+import re
 import tempfile
 import tomllib
 import unittest
@@ -40,10 +42,31 @@ LEGACY_BEGIN = "<!-- BEGIN SCION MANAGED CODEX INSTRUCTIONS -->"
 LEGACY_END = "<!-- END SCION MANAGED CODEX INSTRUCTIONS -->"
 
 
+# A scratch workspace for _test_ctx, so a context never falls back to the
+# real /workspace (ptone/scion#2993). Created in setUpModule and removed in
+# tearDownModule.
+_scratch_workspace: tempfile.TemporaryDirectory[str] | None = None
+
+
+def setUpModule() -> None:
+    global _scratch_workspace
+    _scratch_workspace = tempfile.TemporaryDirectory(prefix="codex-provision-test-")
+
+
+def tearDownModule() -> None:
+    global _scratch_workspace
+    if _scratch_workspace is not None:
+        _scratch_workspace.cleanup()
+        _scratch_workspace = None
+
+
 def _test_ctx() -> "scion_harness.ProvisionContext":
     """A minimal ProvisionContext for calling _reconcile_codex_toml directly
     in tests that don't otherwise need a full provision() manifest."""
-    return scion_harness.ProvisionContext("codex", {})
+    assert _scratch_workspace is not None, "setUpModule did not run"
+    return scion_harness.ProvisionContext("codex", {
+        "agent_workspace": os.path.join(_scratch_workspace.name, "workspace"),
+    })
 
 
 @contextmanager
@@ -77,7 +100,7 @@ def temporary_env(name: str, value: str | None):
 
 
 # Mirrors harnesses/codex/config.yaml's `thinking:` block exactly. The Go
-# test TestEmbeddedHarnessThinkingBlocks (harnesses/thinking_config_test.go)
+# test TestEmbeddedHarnessThinkingBlocks (pkg/harness/embedded_thinking_config_test.go)
 # pins the yaml side to the same literal table, so the two cannot drift.
 CODEX_THINKING = {
     "levels": [
@@ -119,6 +142,7 @@ def _invoke_provision(
             ctx = scion_harness.ProvisionContext("codex", {
                 "harness_bundle_dir": bundle,
                 "harness_config": harness_config,
+                "agent_workspace": os.path.join(tmp, "workspace"),
             })
             ctx.select_auth = lambda _: scion_harness.ResolvedAuth("none")
             ctx.warn = warnings.append  # type: ignore[method-assign]
@@ -214,6 +238,7 @@ class CodexProvisionTest(unittest.TestCase):
 
             manifest = {
                 "harness_bundle_dir": bundle,
+                "agent_workspace": os.path.join(tmp, "workspace"),
                 "harness_config": {
                     "instructions_file": ".codex/AGENTS.md",
                     "skills_dir": ".codex/skills",
@@ -258,6 +283,7 @@ class CodexProvisionTest(unittest.TestCase):
 
             manifest = {
                 "harness_bundle_dir": bundle,
+                "agent_workspace": os.path.join(tmp, "workspace"),
                 "harness_config": {
                     "instructions_file": ".codex/AGENTS.md",
                     "skills_dir": ".codex/skills",
@@ -293,6 +319,7 @@ class CodexProvisionTest(unittest.TestCase):
 
             manifest = {
                 "harness_bundle_dir": bundle,
+                "agent_workspace": os.path.join(tmp, "workspace"),
                 "harness_config": {
                     "instructions_file": ".codex/AGENTS.md",
                     "skills_dir": ".codex/skills",
@@ -1383,6 +1410,507 @@ class CodexProvisionTest(unittest.TestCase):
         self.assertEqual(after, original, "file must be left untouched when the edit doesn't preserve content")
         self.assertEqual(len(warnings), 1)
 
+
+class CodexShippedHookConfigTest(unittest.TestCase):
+    """The shipped home/.codex/config.toml wires every hook event Scion maps.
+
+    ptone/scion#4461: SessionStart, SessionEnd and SubagentStop were handled
+    by scion_notify.sh and dialect.yaml but never registered, so codex never
+    sent them. Verified against @openai/codex 0.162.1 (rust-v0.162.1).
+    """
+
+    HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
+    CONFIG_PATH = os.path.join(HARNESS_DIR, "home", ".codex", "config.toml")
+    NOTIFY_PATH = os.path.join(HARNESS_DIR, "home", ".codex", "scion_notify.sh")
+    DIALECT_PATH = os.path.join(HARNESS_DIR, "dialect.yaml")
+    NOTIFY_COMMAND = "sh /home/scion/.codex/scion_notify.sh"
+
+    # Every hook event the shipped config must register.
+    REQUIRED_EVENTS = (
+        "SessionStart",
+        "SessionEnd",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "SubagentStop",
+    )
+
+    # Hook event names codex 0.162.1 accepts (codex-rs/config/src/
+    # hook_config.rs HookEventsToml). Anything else is a typo codex rejects.
+    CODEX_EVENTS = frozenset(
+        REQUIRED_EVENTS
+        + ("PermissionRequest", "PreCompact", "PostCompact", "SubagentStart", "Interrupt")
+    )
+
+    # SessionStart sources codex 0.162.1 sends (codex-rs/hooks/src/events/
+    # session_start.rs). compact is left out on purpose: it fires after a
+    # mid-turn auto-compaction and would reset blocked/waiting/completed
+    # status to working.
+    SESSION_START_SOURCES = ("startup", "resume", "clear", "fork")
+    SESSION_START_EXCLUDED = ("compact",)
+
+    @staticmethod
+    def _codex_matcher_matches(pattern: str, value: str) -> bool:
+        # Mirrors HookMatcher in codex-rs/hooks/src/engine/matcher.rs at
+        # rust-v0.162.1: "" and "*" match all; a pattern of only
+        # [A-Za-z0-9_|] is an exact match on any |-separated name; anything
+        # else is a regex search.
+        if pattern in ("", "*"):
+            return True
+        if all(ch.isascii() and (ch.isalnum() or ch in "_|") for ch in pattern):
+            return value in pattern.split("|")
+        return re.search(pattern, value) is not None
+
+    def _load_config(self) -> dict[str, Any]:
+        with open(self.CONFIG_PATH, "rb") as f:
+            return tomllib.load(f)
+
+    def _notify_forwarded_events(self) -> set[str]:
+        # The case arm in scion_notify.sh that pipes to sciontool hook.
+        with open(self.NOTIFY_PATH, encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.endswith(")") and "UserPromptSubmit" in stripped:
+                    return {ev.strip() for ev in stripped[:-1].split("|")}
+        self.fail("no hook-forwarding case arm found in scion_notify.sh")
+
+    def _dialect_mapped_events(self) -> set[str]:
+        # Top-level keys under `mappings:` in dialect.yaml (two-space indent).
+        mapped: set[str] = set()
+        in_mappings = False
+        with open(self.DIALECT_PATH, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("mappings:"):
+                    in_mappings = True
+                    continue
+                if in_mappings and line and not line[0].isspace() and not line.startswith("#"):
+                    break
+                if in_mappings and line.startswith("  ") and not line.startswith("   "):
+                    key = line.strip()
+                    if key.endswith(":") and not key.startswith("#"):
+                        mapped.add(key[:-1])
+        return mapped
+
+    def test_hooks_feature_enabled(self) -> None:
+        self.assertIs(self._load_config()["features"]["hooks"], True)
+
+    def test_required_hook_events_are_registered(self) -> None:
+        hooks = self._load_config().get("hooks", {})
+        for event in self.REQUIRED_EVENTS:
+            with self.subTest(event=event):
+                groups = hooks.get(event)
+                self.assertTrue(groups, f"{event} is not registered in config.toml")
+                commands = [
+                    h.get("command")
+                    for g in groups
+                    for h in g.get("hooks", [])
+                    if h.get("type") == "command"
+                ]
+                self.assertIn(self.NOTIFY_COMMAND, commands)
+                if event == "SessionStart":
+                    continue  # Narrowed matcher; see test_session_start_matcher_*.
+                # Every other matcher must match all inputs: "" and "*" are
+                # codex's match-all forms, ".*" is the match-all regex the
+                # tool events use.
+                self.assertTrue(all(g.get("matcher", "") in ("", "*", ".*") for g in groups))
+
+    def test_session_start_matcher_covers_sources_and_excludes_compact(self) -> None:
+        groups = self._load_config()["hooks"]["SessionStart"]
+        matchers = [g.get("matcher", "") for g in groups]
+
+        def fires(source: str) -> bool:
+            return any(self._codex_matcher_matches(m, source) for m in matchers)
+
+        for source in self.SESSION_START_SOURCES:
+            with self.subTest(source=source):
+                self.assertTrue(fires(source), f"SessionStart hook does not fire for source={source}")
+        for source in self.SESSION_START_EXCLUDED:
+            with self.subTest(source=source):
+                self.assertFalse(fires(source), f"SessionStart hook must not fire for source={source}")
+
+    def test_session_start_matcher_is_exact_source_list(self) -> None:
+        # The matcher must stay in codex's exact-match form (no regex
+        # characters) and name exactly the intended sources.
+        groups = self._load_config()["hooks"]["SessionStart"]
+        self.assertEqual(len(groups), 1)
+        matcher = groups[0].get("matcher", "")
+        self.assertRegex(matcher, r"^[A-Za-z0-9_|]+$")
+        self.assertEqual(set(matcher.split("|")), set(self.SESSION_START_SOURCES))
+
+    def test_codex_matcher_emulation(self) -> None:
+        # Guards the emulation itself. The Edit|Write and Bash/BashOutput
+        # cases are copied from codex's matcher tests in
+        # codex-rs/hooks/src/events/common.rs (rust-v0.162.1); the others
+        # are our own edge cases.
+        m = self._codex_matcher_matches
+        self.assertTrue(m("", "compact"))
+        self.assertTrue(m("*", "compact"))
+        self.assertTrue(m("Edit|Write", "Write"))
+        self.assertFalse(m("Edit|Write", "Bash"))
+        self.assertFalse(m("Bash", "BashOutput"))
+        self.assertTrue(m("^Bash", "BashOutput"))
+        self.assertFalse(m("startup|resume", "startup_x"))
+        self.assertTrue(m("^auto$", "auto"))
+
+    def test_registered_events_are_known_to_codex(self) -> None:
+        unknown = set(self._load_config().get("hooks", {})) - self.CODEX_EVENTS
+        self.assertEqual(unknown, set(), "config.toml registers hook events codex 0.162.1 does not accept")
+
+    def test_registered_events_are_forwarded_and_mapped(self) -> None:
+        registered = set(self._load_config().get("hooks", {}))
+        forwarded = self._notify_forwarded_events()
+        mapped = self._dialect_mapped_events()
+        self.assertEqual(registered - forwarded, set(), "registered but not forwarded by scion_notify.sh")
+        self.assertEqual(registered - mapped, set(), "registered but not mapped in dialect.yaml")
+
+    def test_reconcile_keeps_hook_registrations(self) -> None:
+        # provision.py rewrites config.toml at every start; the hook tables
+        # must survive it.
+        with open(self.CONFIG_PATH, encoding="utf-8") as f:
+            real_config = f.read()
+        with tempfile.TemporaryDirectory() as tmp:
+            with temporary_home(tmp):
+                codex_dir = os.path.join(tmp, ".codex")
+                os.makedirs(codex_dir)
+                config_path = os.path.join(codex_dir, "config.toml")
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(real_config)
+                provision._reconcile_codex_toml(_test_ctx(), None, None, model="gpt-6.1-sol", reasoning_effort="high")
+                with open(config_path, "rb") as f:
+                    data = tomllib.load(f)
+        self.assertEqual(data["hooks"], self._load_config()["hooks"])
+
+
+class _FakeCodexCLI:
+    """Stands in for scion_harness.run_cli: records argv and CODEX_HOME and
+    simulates the codex plugin CLI against a temp CODEX_HOME."""
+
+    def __init__(self, version: str = "codex-cli 0.162.1"):
+        self.version = version
+        self.calls: list[list[str]] = []
+        self.codex_homes: list[str] = []
+        self.fail_add = False
+        self.omit_installed_path = False
+        self.remove_rc = 0
+        self.remove_keeps_entry = False
+        self.timeouts: list[float | None] = []
+
+    def _append_config(self, codex_home: str, text: str) -> None:
+        os.makedirs(codex_home, exist_ok=True)
+        with open(os.path.join(codex_home, "config.toml"), "a", encoding="utf-8") as f:
+            f.write(text)
+
+    def __call__(self, argv, *, timeout=None, env=None):
+        import subprocess
+        self.calls.append(list(argv))
+        codex_home = (env or {}).get("CODEX_HOME", "")
+        self.codex_homes.append(codex_home)
+        args = argv[1:]
+        if args == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, self.version + "\n", "")
+        if args[:3] == ["plugin", "marketplace", "add"]:
+            self._append_config(codex_home, f'\n[marketplaces.scion-agent-plugins]\nsource_type = "local"\nsource = "{args[3]}"\n')
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if args[:2] == ["plugin", "add"]:
+            if self.fail_add:
+                return subprocess.CompletedProcess(argv, 1, "", "error: marketplace unavailable")
+            name, market = args[2].split("@")
+            path = os.path.join(codex_home, "plugins", "cache", market, name, "0.1.0")
+            os.makedirs(path, exist_ok=True)
+            self._append_config(codex_home, f'\n[plugins."{args[2]}"]\nenabled = true\n')
+            # The shape codex 0.162.1 prints (smoke run, C3).
+            out = {"pluginId": args[2], "name": name, "marketplaceName": market, "version": "0.1.0",
+                   "installedPath": path, "authPolicy": "ON_INSTALL"}
+            if self.omit_installed_path:
+                out.pop("installedPath")
+            self.timeouts.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(out, indent=2), "")
+        if args[:2] == ["plugin", "remove"]:
+            # codex 0.162.1: idempotent, exit 0 even for an unknown plugin;
+            # drops the cache dir and the [plugins."<key>"] table.
+            name, market = args[2].split("@")
+            if self.remove_rc != 0 and self.remove_keeps_entry:
+                return subprocess.CompletedProcess(argv, self.remove_rc, "", "error: busy")
+            if not self.remove_keeps_entry:
+                import shutil
+                shutil.rmtree(os.path.join(codex_home, "plugins", "cache", market, name), ignore_errors=True)
+                cfg = os.path.join(codex_home, "config.toml")
+                if os.path.exists(cfg):
+                    with open(cfg, encoding="utf-8") as f:
+                        text = f.read()
+                    text = text.replace(f'\n[plugins."{args[2]}"]\nenabled = true\n', "")
+                    with open(cfg, "w", encoding="utf-8") as f:
+                        f.write(text)
+            out = json.dumps({"pluginId": args[2], "name": name, "marketplaceName": market}, indent=2)
+            return subprocess.CompletedProcess(argv, self.remove_rc, out, "")
+        return subprocess.CompletedProcess(argv, 2, "", "unexpected")
+
+
+class TestCodexAgentPlugins(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="codex-plugins-test-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.home = os.path.join(self.tmp, "home")
+        self.bundle = os.path.join(self.home, ".scion", "harness")
+        self.inputs = os.path.join(self.bundle, "inputs")
+        os.makedirs(self.inputs)
+        patcher = mock.patch.dict(os.environ, {"HOME": self.home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cli = _FakeCodexCLI()
+        p = mock.patch.object(scion_harness, "run_cli", self.cli)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def stage(self, names: dict[str, str], sse: bool = False) -> None:
+        import shutil
+        shutil.rmtree(os.path.join(self.inputs, "plugins"), ignore_errors=True)
+        entries = []
+        for name, digest in names.items():
+            d = os.path.join(self.inputs, "plugins", name)
+            os.makedirs(os.path.join(d, "skills", "hello"))
+            with open(os.path.join(d, "plugin.json"), "w") as f:
+                json.dump({"$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", "name": name}, f)
+            servers = {"old": {"type": "sse", "url": "https://x.example/sse"}} if sse else {}
+            entries.append({"name": name, "version": "0.1.0", "dir": f"plugins/{name}", "digest": digest,
+                            "skills": ["hello"], "skills_dir_conflict": False,
+                            "mcp": {"servers": servers} if sse else None})
+        with open(os.path.join(self.inputs, "plugins.json"), "w") as f:
+            json.dump({"schema_version": 1, "spec_version": "1.0.0", "plugins": entries}, f)
+
+    def ctx(self, warnings: list[str] | None = None) -> "scion_harness.ProvisionContext":
+        ctx = scion_harness.ProvisionContext("codex", {
+            "harness_bundle_dir": self.bundle,
+            "harness_config": _DEFAULT_HARNESS_CONFIG,
+            "agent_workspace": os.path.join(self.tmp, "workspace"),
+        })
+        ctx.select_auth = lambda _: scion_harness.ResolvedAuth("none")
+        if warnings is not None:
+            ctx.warn = warnings.append  # type: ignore[method-assign]
+        return ctx
+
+    def config(self) -> dict[str, Any]:
+        with open(os.path.join(self.home, ".codex", "config.toml"), "rb") as f:
+            return tomllib.load(f)
+
+    def marketplace(self) -> dict[str, Any]:
+        path = os.path.join(self.home, ".scion", "agent-plugins", ".agents", "plugins", "marketplace.json")
+        with open(path) as f:
+            return json.load(f)
+
+    def test_install_writes_marketplace_and_runs_cli(self) -> None:
+        self.stage({"scion-smoke": "sha256:1", "acme.tools": "sha256:2"})
+        warnings: list[str] = []
+        scion_harness.reconcile_agent_plugins(self.ctx(warnings), provision.CodexPluginInstaller(self.ctx()))
+        self.assertEqual(warnings, [])
+        self.assertEqual(self.marketplace(), {
+            "name": "scion-agent-plugins",
+            "plugins": [
+                {"name": "acme.tools", "source": {"source": "local", "path": "./bundles/acme.tools"}},
+                {"name": "scion-smoke", "source": {"source": "local", "path": "./bundles/scion-smoke"}},
+            ],
+        })
+        root = os.path.join(self.home, ".scion", "agent-plugins")
+        self.assertEqual(self.cli.calls, [
+            ["codex", "--version"],
+            ["codex", "plugin", "marketplace", "add", root],
+            ["codex", "plugin", "add", "scion-smoke@scion-agent-plugins", "--json"],
+            ["codex", "plugin", "add", "acme.tools@scion-agent-plugins", "--json"],
+        ])
+        self.assertEqual(set(self.cli.codex_homes), {os.path.join(self.home, ".codex")})
+        self.assertTrue(os.path.isfile(os.path.join(root, "bundles", "scion-smoke", "plugin.json")))
+        with open(os.path.join(root, "state-codex.json")) as f:
+            state = json.load(f)["plugins"]
+        self.assertEqual(state["scion-smoke"]["native_ref"]["key"], "scion-smoke@scion-agent-plugins")
+        self.assertTrue(os.path.isdir(state["scion-smoke"]["native_ref"]["installed_path"]))
+
+        # Steady state: no CLI call at all.
+        self.cli.calls.clear()
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        self.assertEqual(self.cli.calls, [])
+
+    def test_prepare_creates_codex_home(self) -> None:
+        # Real codex 0.162.1 exits 1 ("failed to resolve CODEX_HOME") when
+        # CODEX_HOME does not exist yet.
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".codex")))
+        provision.CodexPluginInstaller(self.ctx()).prepare([])
+        self.assertTrue(os.path.isdir(os.path.join(self.home, ".codex")))
+        self.assertEqual(self.cli.calls, [])
+
+    def test_marketplace_add_only_when_not_registered(self) -> None:
+        os.makedirs(os.path.join(self.home, ".codex"))
+        with open(os.path.join(self.home, ".codex", "config.toml"), "w") as f:
+            f.write('[marketplaces.scion-agent-plugins]\nsource_type = "local"\nsource = "/x"\n')
+        self.stage({"p": "d1"})
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        self.assertNotIn("marketplace", [c[2] for c in self.cli.calls if len(c) > 2])
+
+    def test_remove_and_digest_change(self) -> None:
+        self.stage({"a": "d1", "b": "d1"})
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        self.stage({"b": "d2"})
+        self.cli.calls.clear()
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        self.assertEqual(self.cli.calls, [
+            ["codex", "--version"],
+            ["codex", "plugin", "remove", "a@scion-agent-plugins", "--json"],
+            ["codex", "plugin", "remove", "b@scion-agent-plugins", "--json"],
+            ["codex", "plugin", "add", "b@scion-agent-plugins", "--json"],
+        ])
+        self.assertEqual([p["name"] for p in self.marketplace()["plugins"]], ["b"])
+
+    def test_uninstall_judged_by_config_registration(self) -> None:
+        self.stage({"a": "d1"})
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        inst = provision.CodexPluginInstaller(self.ctx())
+        # exit 0 but still enabled: not a success.
+        self.cli.remove_keeps_entry = True
+        with self.assertRaises(scion_harness.PluginInstallError):
+            inst.uninstall("a", {})
+        # non-zero and still enabled: the CLI error.
+        self.cli.remove_rc = 1
+        with self.assertRaisesRegex(scion_harness.PluginInstallError, "codex plugin remove exit 1"):
+            inst.uninstall("a", {})
+        # non-zero but no longer registered: the removal took effect.
+        self.cli.remove_keeps_entry = False
+        inst.uninstall("a", {})
+        self.assertFalse(inst.plugin_enabled("a"))
+        # Unknown plugin, exit 0 (codex is idempotent): success.
+        self.cli.remove_rc = 0
+        inst.uninstall("never-installed", {})
+
+    def test_install_failure_warns_with_stderr(self) -> None:
+        self.stage({"a": "d1"})
+        self.cli.fail_add = True
+        warnings: list[str] = []
+        scion_harness.reconcile_agent_plugins(self.ctx(warnings), provision.CodexPluginInstaller(self.ctx()))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("agent plugin a: install failed (codex plugin add exit 1: error: marketplace unavailable); will retry next start", warnings[0])
+
+    def test_old_codex_skips(self) -> None:
+        self.cli.version = "codex-cli 0.146.9"
+        self.stage({"a": "d1"})
+        warnings: list[str] = []
+        scion_harness.reconcile_agent_plugins(self.ctx(warnings), provision.CodexPluginInstaller(self.ctx()))
+        self.assertEqual(self.cli.calls, [["codex", "--version"]])
+        self.assertIn("codex 0.146.9 is older than 0.147.0", warnings[0])
+
+    def test_sse_servers_reported(self) -> None:
+        self.stage({"a": "d1"}, sse=True)
+        warnings: list[str] = []
+        ctx = self.ctx(warnings)
+        scion_harness.reconcile_agent_plugins(ctx, provision.CodexPluginInstaller(ctx))
+        self.assertIn("agent plugin a: codex skips sse server(s): old", warnings)
+
+    def test_reprovision_reset_config_reinstalls(self) -> None:
+        # Regression (round 1, finding 1): a re-provision recopies the
+        # harness-config home/ tree, resetting ~/.codex/config.toml while the
+        # plugin cache and Scion's state survive. The next start must
+        # re-register the marketplace and re-add the plugin.
+        self.stage({"scion-smoke": "d1"})
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        self.assertIn("scion-agent-plugins", self.config().get("marketplaces", {}))
+        shipped = os.path.join(os.path.dirname(os.path.abspath(provision.__file__)), "home", ".codex", "config.toml")
+        with open(shipped, "rb") as src, open(os.path.join(self.home, ".codex", "config.toml"), "wb") as dst:
+            dst.write(src.read())
+        self.assertTrue(os.path.isdir(
+            os.path.join(self.home, ".codex", "plugins", "cache", "scion-agent-plugins", "scion-smoke", "0.1.0")))
+
+        self.cli.calls.clear()
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        root = os.path.join(self.home, ".scion", "agent-plugins")
+        self.assertEqual(self.cli.calls, [
+            ["codex", "--version"],
+            ["codex", "plugin", "marketplace", "add", root],
+            ["codex", "plugin", "add", "scion-smoke@scion-agent-plugins", "--json"],
+        ])
+        data = self.config()
+        self.assertIn("scion-agent-plugins", data["marketplaces"])
+        self.assertTrue(data["plugins"]["scion-smoke@scion-agent-plugins"]["enabled"])
+        # The shipped settings survive the CLI's edits.
+        self.assertEqual(data["approval_policy"], "never")
+
+        # And the following start is the fast path again.
+        self.cli.calls.clear()
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        self.assertEqual(self.cli.calls, [])
+
+    def test_is_present_requires_enabled_registration(self) -> None:
+        self.stage({"a": "d1"})
+        scion_harness.reconcile_agent_plugins(self.ctx(), provision.CodexPluginInstaller(self.ctx()))
+        inst = provision.CodexPluginInstaller(self.ctx())
+        with open(os.path.join(self.home, ".scion", "agent-plugins", "state-codex.json")) as f:
+            ref = json.load(f)["plugins"]["a"]["native_ref"]
+        self.assertTrue(inst.is_present("a", ref))
+        path = os.path.join(self.home, ".codex", "config.toml")
+        with open(path) as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(text.replace("enabled = true", "enabled = false"))
+        self.assertFalse(inst.is_present("a", ref))
+        with open(path, "w") as f:
+            f.write(text)
+        self.assertTrue(inst.is_present("a", ref))
+        self.assertFalse(inst.is_present("a", {**ref, "installed_path": os.path.join(self.tmp, "gone")}))
+
+    def test_missing_installed_path_warns_and_uses_config(self) -> None:
+        self.cli.omit_installed_path = True
+        self.stage({"a": "d1"})
+        warnings: list[str] = []
+        ctx = self.ctx(warnings)
+        scion_harness.reconcile_agent_plugins(ctx, provision.CodexPluginInstaller(ctx))
+        with open(os.path.join(self.home, ".scion", "agent-plugins", "state-codex.json")) as f:
+            ref = json.load(f)["plugins"]["a"]["native_ref"]
+        # The plugin's cache dir exists, so it is used as the fallback path.
+        self.assertEqual(ref["installed_path"],
+                         os.path.join(self.home, ".codex", "plugins", "cache", "scion-agent-plugins", "a"))
+        self.assertEqual(warnings, [])
+        self.cli.calls.clear()
+        scion_harness.reconcile_agent_plugins(ctx, provision.CodexPluginInstaller(ctx))
+        self.assertEqual(self.cli.calls, [], "fast path holds without installedPath")
+
+    def test_missing_installed_path_and_cache_dir_warns(self) -> None:
+        self.stage({"a": "d1"})
+        warnings: list[str] = []
+        ctx = self.ctx(warnings)
+        inst = provision.CodexPluginInstaller(ctx)
+        import subprocess
+        with mock.patch.object(scion_harness, "run_cli",
+                               lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "{}", "")):
+            [p] = scion_harness.read_agent_plugins(ctx)
+            ref = inst.install(p, p.staged_dir)
+        self.assertEqual(ref["installed_path"], "")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("reported no installedPath", warnings[0])
+
+    def test_cli_timeouts_capped_by_budget(self) -> None:
+        self.stage({"a": "d1"})
+        ticks = iter([0.0] + [17.0] * 50)
+        scion_harness.reconcile_agent_plugins(
+            self.ctx(), provision.CodexPluginInstaller(self.ctx()), budget_s=20.0, clock=lambda: next(ticks))
+        # plugin add ran with 20 - 17 = 3s left, not the 15s default.
+        self.assertEqual(self.cli.timeouts, [3.0])
+
+    def test_provision_reconciles_after_mcp_write(self) -> None:
+        with open(os.path.join(self.inputs, "mcp-servers.json"), "w") as f:
+            json.dump({"mcp_servers": {"srv": {"transport": "stdio", "command": "echo"}}}, f)
+        self.stage({"scion-smoke": "d1"})
+        provision.provision(self.ctx())
+        data = self.config()
+        self.assertIn("srv", data.get("mcp_servers", {}))
+        self.assertIn("scion-agent-plugins", data.get("marketplaces", {}))
+        self.assertTrue(data["plugins"]["scion-smoke@scion-agent-plugins"]["enabled"])
+
+        # A second start (fast path) keeps the CLI-written tables.
+        self.cli.calls.clear()
+        provision.provision(self.ctx())
+        self.assertEqual([c for c in self.cli.calls if c[1] == "plugin"], [])
+        data = self.config()
+        self.assertIn("scion-agent-plugins", data.get("marketplaces", {}))
+        self.assertTrue(data["plugins"]["scion-smoke@scion-agent-plugins"]["enabled"])
+        self.assertIn("srv", data.get("mcp_servers", {}))
 
 if __name__ == "__main__":
     unittest.main()

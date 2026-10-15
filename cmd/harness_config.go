@@ -16,13 +16,16 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
@@ -82,7 +85,7 @@ var harnessConfigListCmd = &cobra.Command{
 
 		// Include Hub results if requested or when running in hub context (agent containers)
 		if includeHub {
-			hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
+			hubCtx, err := requireHub(gp)
 			if err == nil && hubCtx != nil {
 				hubResp, err := hubCtx.Client.HarnessConfigs().List(context.Background(), &hubclient.ListHarnessConfigsOptions{
 					Status: "active",
@@ -244,6 +247,7 @@ By default this does not activate container-script provisioning. Use
 		}
 
 		plans := make([]*config.HarnessConfigUpgradePlan, 0, len(names))
+		var skipped []string
 		for _, name := range names {
 			targetDir := filepath.Join(parentDir, name)
 			hcDir, err := config.LoadHarnessConfigDir(targetDir)
@@ -258,7 +262,13 @@ By default this does not activate container-script provisioning. Use
 				HarnessesFS:    harness.HarnessesFS(),
 			})
 			if err != nil {
-				return err
+				// With no name given, a custom harness type with no
+				// bundled source is skipped rather than aborting the loop.
+				if len(args) == 0 && errors.Is(err, config.ErrHarnessConfigNotBundled) {
+					skipped = append(skipped, name)
+					continue
+				}
+				return fmt.Errorf("harness-config %q: %w", name, err)
 			}
 			plans = append(plans, plan)
 		}
@@ -267,7 +277,7 @@ By default this does not activate container-script provisioning. Use
 			return outputJSON(plans)
 		}
 
-		if len(plans) == 0 {
+		if len(plans) == 0 && len(skipped) == 0 {
 			fmt.Println("No harness configurations found.")
 			return nil
 		}
@@ -278,6 +288,9 @@ By default this does not activate container-script provisioning. Use
 					fmt.Printf("  backup: %s\n", backup)
 				}
 			}
+		}
+		for _, name := range skipped {
+			fmt.Printf("%s: skipped (not bundled)\n", name)
 		}
 		return nil
 	},
@@ -314,14 +327,10 @@ the local directory: files deleted locally are removed from the Hub.`,
 			return fmt.Errorf("harness-config %q not found: %w", name, err)
 		}
 
-		hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
+		hubCtx, err := requireHub(gp)
 		if err != nil {
 			return err
 		}
-		if hubCtx == nil {
-			return fmt.Errorf("hub integration is not enabled, configure via 'scion config set hub.enabled true' and 'scion config set hub.endpoint <url>'")
-		}
-
 		PrintUsingHub(hubCtx.Endpoint)
 
 		hubName, _ := cmd.Flags().GetString("name")
@@ -357,14 +366,10 @@ var harnessConfigPullCmd = &cobra.Command{
 			gp = projectDir
 		}
 
-		hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
+		hubCtx, err := requireHub(gp)
 		if err != nil {
 			return err
 		}
-		if hubCtx == nil {
-			return fmt.Errorf("hub integration is not enabled, configure via 'scion config set hub.enabled true' and 'scion config set hub.endpoint <url>'")
-		}
-
 		PrintUsingHub(hubCtx.Endpoint)
 
 		// Find the harness-config on the Hub
@@ -434,7 +439,7 @@ var harnessConfigShowCmd = &cobra.Command{
 		}
 
 		// Try Hub
-		hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
+		hubCtx, err := requireHub(gp)
 		if err != nil {
 			return fmt.Errorf("harness-config %q not found locally and Hub unavailable: %w", name, err)
 		}
@@ -491,14 +496,10 @@ var harnessConfigDeleteCmd = &cobra.Command{
 			gp = projectDir
 		}
 
-		hubCtx, err := CheckHubAvailabilityWithOptions(gp, true)
+		hubCtx, err := requireHub(gp)
 		if err != nil {
 			return err
 		}
-		if hubCtx == nil {
-			return fmt.Errorf("hub integration is not enabled, configure via 'scion config set hub.enabled true' and 'scion config set hub.endpoint <url>'")
-		}
-
 		PrintUsingHub(hubCtx.Endpoint)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -554,7 +555,7 @@ func syncLocalHarnessConfigToHub(hubCtx *HubContext, name, localPath, harnessTyp
 	if err != nil {
 		return err
 	}
-	return syncHarnessConfigToHub(hubCtx, name, localPath, scope, scopeID, harnessType)
+	return syncHarnessConfigToHub(hubCtx, name, localPath, scope, scopeID, harnessType, "")
 }
 
 // harnessConfigHubScope picks the Hub scope for harness-config sync, push and
@@ -608,7 +609,9 @@ func findHubHarnessConfig(ctx context.Context, hubCtx *HubContext, name, scope, 
 }
 
 // syncHarnessConfigToHub creates or updates a harness config in the Hub.
-func syncHarnessConfigToHub(hubCtx *HubContext, name, localPath, scope, scopeID, harnessType string) error {
+// sourceURL, when non-empty, is recorded as the config's source URL
+// (metadata) at finalize; when empty, the stored source URL is left as is.
+func syncHarnessConfigToHub(hubCtx *HubContext, name, localPath, scope, scopeID, harnessType, sourceURL string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -698,7 +701,10 @@ func syncHarnessConfigToHub(hubCtx *HubContext, name, localPath, scope, scopeID,
 			}
 			sort.Strings(removed)
 
-			if len(filesToUpload) == 0 && len(removed) == 0 {
+			// A new source URL still needs a finalize to record it, even
+			// when no file changed.
+			sourceChanged := sourceURL != "" && sourceURL != existing.SourceURL
+			if len(filesToUpload) == 0 && len(removed) == 0 && !sourceChanged {
 				fmt.Printf("Harness-config '%s' is already up to date.\n", name)
 				fmt.Printf("  Scope: %s\n", harnessConfigScopeLabel(scope, scopeID))
 				fmt.Printf("  ID: %s\n", hcID)
@@ -768,7 +774,15 @@ func syncHarnessConfigToHub(hubCtx *HubContext, name, localPath, scope, scopeID,
 
 	// Finalize
 	fmt.Println("Finalizing harness-config...")
-	hc, err := hubCtx.Client.HarnessConfigs().Finalize(ctx, hcID, manifest)
+	hc, err := hubCtx.Client.HarnessConfigs().Finalize(ctx, hcID, manifest, sourceURL)
+	if isHarnessConfigConflictError(err) {
+		// Another commit changed the harness-config between the Hub's read
+		// and its write (409 harness_config_conflict). The local directory
+		// is the source of truth for a sync, so finalize once more against
+		// the Hub's fresh row (ptone/scion#4219).
+		fmt.Println("Harness-config was changed by another commit during finalize; retrying once...")
+		hc, err = hubCtx.Client.HarnessConfigs().Finalize(ctx, hcID, manifest, sourceURL)
+	}
 	if err != nil {
 		if !isHarnessConfigMissingFileError(err) {
 			return fmt.Errorf("failed to finalize: %w", err)
@@ -790,7 +804,7 @@ func syncHarnessConfigToHub(hubCtx *HubContext, name, localPath, scope, scopeID,
 			}
 			fmt.Printf("  Re-uploaded: %s\n", fileInfo.Path)
 		}
-		hc, err = hubCtx.Client.HarnessConfigs().Finalize(ctx, hcID, manifest)
+		hc, err = hubCtx.Client.HarnessConfigs().Finalize(ctx, hcID, manifest, sourceURL)
 		if err != nil {
 			return fmt.Errorf("failed to finalize after retry: %w", err)
 		}
@@ -827,6 +841,17 @@ func isHarnessConfigNoFilesError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "harness config has no files")
+}
+
+// harnessConfigConflictErrorCode is the error code of a harness-config
+// finalize that lost the Hub's compare-and-swap (ptone/scion#4219).
+const harnessConfigConflictErrorCode = "harness_config_conflict"
+
+// isHarnessConfigConflictError reports whether err is the Hub refusing a
+// harness-config finalize with 409 harness_config_conflict.
+func isHarnessConfigConflictError(err error) bool {
+	var apiErr *apiclient.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict && apiErr.Code == harnessConfigConflictErrorCode
 }
 
 func isHarnessConfigMissingFileError(err error) bool {

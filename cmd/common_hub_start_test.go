@@ -34,15 +34,16 @@ import (
 // agent create POST (whose raw JSON body it captures, even when the create
 // fails).
 type hubStartStub struct {
-	server        *httptest.Server
-	createBody    map[string]interface{}
-	createCalls   int
-	existingPhase string // "" → existing-agent GET returns 404
-	project       map[string]interface{}
-	createStatus  int      // non-zero → the create POST fails with this status
-	createErrCode string   // error code for a failed create ("" → "conflict")
-	createErrMsg  string   // error message for a failed create ("" → "refused by hub")
-	afterCreate   []string // "METHOD path" of every request after the first create
+	server           *httptest.Server
+	createBody       map[string]interface{}
+	createCalls      int
+	existingPhase    string // "" → existing-agent GET returns 404
+	project          map[string]interface{}
+	createStatus     int                    // non-zero → the create POST fails with this status
+	createErrCode    string                 // error code for a failed create ("" → "conflict")
+	createErrMsg     string                 // error message for a failed create ("" → "refused by hub")
+	createErrDetails map[string]interface{} // error details for a failed create (nil → none)
+	afterCreate      []string               // "METHOD path" of every request after the first create
 }
 
 func newHubStartStub(t *testing.T, projectID, agentName, existingPhase string) *hubStartStub {
@@ -95,10 +96,12 @@ func newHubStartStub(t *testing.T, projectID, agentName, existingPhase string) *
 				if msg == "" {
 					msg = "refused by hub"
 				}
+				errBody := map[string]interface{}{"code": code, "message": msg}
+				if stub.createErrDetails != nil {
+					errBody["details"] = stub.createErrDetails
+				}
 				w.WriteHeader(stub.createStatus)
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"error": map[string]interface{}{"code": code, "message": msg},
-				})
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": errBody})
 				return
 			}
 			_ = json.NewEncoder(w).Encode(&hubclient.CreateAgentResponse{
@@ -456,23 +459,40 @@ func TestCreateAgentWithBrokerResolution_NoRuntimeBroker(t *testing.T) {
 		noneMsg    = "No runtime brokers available for this project that you have permission to use"
 		defaultMsg = "Default runtime broker is unavailable; specify an alternative"
 	)
+	one := []map[string]interface{}{{"id": "b1", "name": "one", "status": "online"}}
+	two := []map[string]interface{}{{"id": "b1", "name": "one", "status": "online"}, {"id": "b2", "name": "two", "status": "online"}}
+	const (
+		oneErr = `Default runtime broker is unavailable: runtime broker "one" is available, retry with --broker "one"`
+		twoErr = `Default runtime broker is unavailable: multiple runtime brokers available ("one", "two"), specify a broker with --broker <name>`
+	)
 	for _, tc := range []struct {
-		name      string
-		hubMsg    string
-		brokers   []map[string]interface{}
-		wantInErr string
+		name        string
+		hubMsg      string
+		brokers     []map[string]interface{}
+		autoConfirm bool
+		wantInErr   string
 	}{
-		{"empty list", noneMsg, []map[string]interface{}{}, noneMsg},
-		{"missing list", noneMsg, nil, noneMsg},
-		{"single usable broker, autoConfirm", defaultMsg, []map[string]interface{}{{"id": "b1", "name": "one", "status": "online"}}, `Default runtime broker is unavailable: runtime broker "one" is available, retry with --broker "one"`},
-		{"several usable brokers, autoConfirm", defaultMsg, []map[string]interface{}{{"id": "b1", "name": "one", "status": "online"}, {"id": "b2", "name": "two", "status": "online"}}, `Default runtime broker is unavailable: multiple runtime brokers available ("one", "two"), specify a broker with --broker <name>`},
+		{"empty list", noneMsg, []map[string]interface{}{}, true, noneMsg},
+		{"missing list", noneMsg, nil, true, noneMsg},
+		{"single usable broker, autoConfirm", defaultMsg, one, true, oneErr},
+		{"several usable brokers, autoConfirm", defaultMsg, two, true, twoErr},
+		// Without a terminal and without --yes the picker must not read
+		// stdin (an answer is piped in to prove it is ignored).
+		{"single usable broker, no terminal", defaultMsg, one, false, oneErr},
+		{"several usable brokers, no terminal", defaultMsg, two, false, twoErr},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Never prompt, whatever stdin is: autoConfirm skips the
-			// interactive picker even on a TTY.
-			origAutoConfirm := autoConfirm
-			autoConfirm = true
-			t.Cleanup(func() { autoConfirm = origAutoConfirm })
+			// interactive picker even on a TTY, and without a terminal
+			// stdin is not read.
+			origAutoConfirm, origIsTerminal := autoConfirm, isInteractiveTerminal
+			autoConfirm = tc.autoConfirm
+			// The autoConfirm cases run on a simulated TTY, the others
+			// without one.
+			onTTY := tc.autoConfirm
+			isInteractiveTerminal = func() bool { return onTTY }
+			t.Cleanup(func() { autoConfirm, isInteractiveTerminal = origAutoConfirm, origIsTerminal })
+			withStdin(t, "1\ny\n")
 			calls := 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls++
@@ -494,7 +514,7 @@ func TestCreateAgentWithBrokerResolution_NoRuntimeBroker(t *testing.T) {
 			hubCtx := &HubContext{Client: client, Endpoint: srv.URL, ProjectID: projectID}
 
 			var resp *hubclient.CreateAgentResponse
-			stdout, _ := captureStdIO(t, func() {
+			stdout, stderr := captureStdIO(t, func() {
 				resp, err = createAgentWithBrokerResolution(context.Background(), hubCtx, projectID,
 					&hubclient.CreateAgentRequest{Name: "a"})
 			})
@@ -505,6 +525,9 @@ func TestCreateAgentWithBrokerResolution_NoRuntimeBroker(t *testing.T) {
 			assert.Equal(t, 1, calls, "must not retry")
 			assert.NotContains(t, stdout, "Select a broker")
 			assert.NotContains(t, stdout, "Use runtime broker")
+			assert.NotContains(t, stderr, "Select a broker")
+			assert.NotContains(t, stderr, "Use runtime broker")
+			assert.NotContains(t, err.Error(), "operation cancelled")
 		})
 	}
 }

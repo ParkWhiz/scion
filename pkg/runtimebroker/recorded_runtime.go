@@ -132,7 +132,8 @@ func runtimeAllowed(ctx context.Context, rt scionrt.Runtime) bool {
 // defaultRuntimeAllowed reports whether the broker's default runtime may hold
 // the agent of a request carrying ctx.
 func (s *Server) defaultRuntimeAllowed(ctx context.Context) bool {
-	return runtimeAllowed(ctx, s.runtime)
+	defRT := s.currentRuntime()
+	return runtimeAllowed(ctx, defRT)
 }
 
 // sortedAuxiliaryRuntimesFor is sortedAuxiliaryRuntimes restricted to the
@@ -240,14 +241,14 @@ func writeRuntimeNotRegistered(w http.ResponseWriter, recorded string) {
 // recorded-runtime check to action before dispatching it: the bare GET and
 // DELETE (action ""), and every handleAgentAction action except start (which
 // resolves its runtime from settings, ptone/scion#2709), keys (which applies
-// the check itself so it can answer in its own result shape) and stats (a
-// placeholder that reads no runtime).
+// the check itself so it can answer in its own result shape) and stats
+// (which answers 501 without reading any runtime).
 // Unknown actions are left to handleAgentAction's 404.
 func isExistingAgentRequest(action string) bool {
 	if action == "" {
 		return true
 	}
-	// Stats is a placeholder that reads no runtime, so the check would only
+	// Stats answers 501 without reading any runtime, so the check would only
 	// add List calls.
 	if action == api.AgentActionStart || action == api.AgentActionKeys || action == api.AgentActionStats {
 		return false

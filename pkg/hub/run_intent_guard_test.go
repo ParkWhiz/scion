@@ -63,15 +63,15 @@ type lifecycleDispatchRule struct {
 var lifecycleDispatchCallers = map[string]lifecycleDispatchRule{
 	"Server.handleAgentLifecycle":          {kind: intentRecorded},
 	"Server.suspendAgent":                  {kind: intentRecorded},
+	"Server.stopHeldAgent":                 {kind: intentRecorded},
 	"Server.handleStopAllAgents":           {kind: intentRecorded},
-	"Server.autoSuspendStalledAgents":      {kind: intentRecorded},
-	"Server.dispatchAgentEventHandler":     {kind: intentRecorded},
-	"Server.wakeAgentForDM":                {kind: intentRecorded},
+	"Server.autoSuspendStalledAgent":       {kind: intentRecorded},
+	"Server.dispatchAgentEventHandler":     {kind: intentRecorded, recordedBy: "Server.withStartClaim"},
 	"Server.handleExistingAgent":           {kind: intentRecorded},
 	"Server.createAgentInProject":          {kind: intentRecorded},
 	"deletionEngine.dispatch":              {kind: intentRecorded},
 	"Server.dispatchAgentDeletions":        {kind: intentRecorded},
-	"Server.handleWorkspaceSyncToFinalize": {kind: intentRecorded},
+	"Server.handleWorkspaceSyncToFinalize": {kind: intentRecorded, recordedBy: "Server.withStartClaim"},
 	"dispatchDeleteFailedCreate":           {kind: intentRecorded, recordedBy: "Server.cleanupFailedCreate"},
 
 	"Server.execDispatchStart":   {kind: intentExecutor},
@@ -91,10 +91,17 @@ var lifecycleDispatchCallers = map[string]lifecycleDispatchRule{
 	// The start-claim reaper stops a container an unconfirmed start left
 	// running past its hold; the agent's intent is left as it is.
 	"Server.stopUnconfirmedStart": {kind: intentUnchanged},
+	// The backstop stops an agent whose intent is already stopped.
+	"Server.stopForStoppedIntent": {kind: intentUnchanged},
 	// Removes a run that landed after its agent was deleted or a delete
 	// claimed it: the row is gone, or the delete engine records the stopped
 	// intent itself (ptone/scion#3055).
 	"HTTPAgentDispatcher.compensateLandedRun": {kind: intentUnchanged},
+	// The retained-files purge sends a delete for a soft-deleted agent,
+	// then purges the record right after. It is not a run transition: a
+	// soft-deleted row cannot take a running intent, and the readers of
+	// run intent skip soft-deleted rows (ptone/scion#4744).
+	"Server.settleRetainedFiles": {kind: intentUnchanged},
 }
 
 // funcDeclKey names a function declaration as Recv.Name, or Name for a
@@ -138,7 +145,13 @@ func selectorCallNames(fd *ast.FuncDecl) map[string]int {
 func parseHubFuncs(t *testing.T) map[string]map[string]int {
 	t.Helper()
 	fset := token.NewFileSet()
-	files, err := filepath.Glob("*.go")
+	// pkgmove:scan-covers pkg/hub/apierr
+	// scanned through guardScanSubdirs; guards DispatchAgent lifecycle callers.
+	// pkgmove:scan-covers pkg/hub/internal/principal
+	// scanned through guardScanSubdirs; guards DispatchAgent lifecycle callers.
+	// pkgmove:scan-covers pkg/hub/maintenance
+	// scanned through guardScanSubdirs once it exists; guards DispatchAgent lifecycle callers.
+	files, err := globGuardScanDirs(".", "*.go")
 	if err != nil {
 		t.Fatalf("list package files: %v", err)
 	}
@@ -151,15 +164,23 @@ func parseHubFuncs(t *testing.T) map[string]map[string]int {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		if f.Name.Name != "hub" {
+		rel := filepath.Dir(name)
+		if f.Name.Name != guardScanPackage(rel) {
 			continue
+		}
+		// Functions of a guardScanSubdirs package are keyed by its slash
+		// path ("maintenance/Name"), so they cannot shadow a pkg/hub
+		// function of the same name.
+		prefix := ""
+		if rel != "." {
+			prefix = filepath.ToSlash(rel) + "/"
 		}
 		for _, decl := range f.Decls {
 			fd, ok := decl.(*ast.FuncDecl)
 			if !ok {
 				continue
 			}
-			funcs[funcDeclKey(fd)] = selectorCallNames(fd)
+			funcs[prefix+funcDeclKey(fd)] = selectorCallNames(fd)
 		}
 	}
 	if len(funcs) == 0 {

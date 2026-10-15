@@ -70,6 +70,9 @@ func (a *admitter) Admit(ctx context.Context, hello *conduitv1.Hello) (*conduitv
 		return nil, reject(conduit.CloseForbidden, ReasonForbidden, "hello principal does not match the authenticated principal")
 	}
 	caps := hello.GetCapabilities()
+	if err := checkTokenRun(p, caps.GetEndpointIncarnation()); err != nil {
+		return nil, err
+	}
 	inc, err := admitIncarnation(p, caps.GetEndpointIncarnation())
 	if err != nil {
 		if IsSupersededIncarnation(err) {
@@ -93,14 +96,21 @@ func (a *admitter) Admit(ctx context.Context, hello *conduitv1.Hello) (*conduitv
 	}
 	// Keys before the insert: a target that cannot verify grants is
 	// useless, and failing here consumes no epoch.
-	keys, err := r.cfg.GrantKeys(ctx)
+	keys, err := p.GrantKeys, error(nil)
+	if keys == nil {
+		keys, err = r.cfg.GrantKeys(ctx)
+	}
 	if err != nil {
 		r.log.Warn("Conduit admission refused: grant keys unavailable", "error", err)
 		return nil, reject(conduit.CloseRelayTimeout, ReasonGrantKeysUnavailable, "")
 	}
 
+	sessionID := p.SessionID
+	if sessionID == "" {
+		sessionID = r.cfg.NewSessionID()
+	}
 	rec := registry.SessionRecord{
-		SessionID:           r.cfg.NewSessionID(),
+		SessionID:           sessionID,
 		PrincipalKind:       p.Kind,
 		PrincipalID:         p.ID,
 		ProjectID:           p.ProjectID,
@@ -150,8 +160,8 @@ func (a *admitter) Admit(ctx context.Context, hello *conduitv1.Hello) (*conduitv
 		GrantKeys:           keys,
 		EndpointIncarnation: inc.Value,
 	}
-	if r.cfg.LifetimeHint > 0 {
-		w.LifetimeHintS = uint32(r.cfg.LifetimeHint.Seconds())
+	if h := r.lifetimeHint(a.e); h > 0 {
+		w.LifetimeHintS = uint32(h.Seconds())
 	}
 	return w, nil
 }
@@ -232,7 +242,8 @@ func (a *admitter) Refresh(ctx context.Context, ar *conduitv1.AuthRefresh) error
 	if a.r.cfg.Refresh == nil {
 		return reject(conduit.CloseUnauthenticated, ReasonUnauthenticated, "auth refresh not supported")
 	}
-	return a.r.cfg.Refresh(ctx, a.p, ar)
+	rec, _, _ := a.admitted()
+	return a.r.cfg.Refresh(ctx, a.p, RefreshSession{SessionID: rec.SessionID, EndpointIncarnation: rec.EndpointIncarnation}, ar)
 }
 
 func (a *admitter) admitted() (registry.SessionRecord, string, bool) {
@@ -265,4 +276,21 @@ func capabilitiesFromProto(c *conduitv1.Capabilities, inc Incarnation, execScope
 			IdleTimeoutS: int64(c.GetTransportLimits().GetIdleTimeoutS()),
 		},
 	}
+}
+
+// checkTokenRun applies p.TokenRun: an agent Hello whose endpoint
+// incarnation differs from the credential's run is reported, and refused
+// with 4401 when the binding is enforced.
+func checkTokenRun(p Principal, presented string) error {
+	b := p.TokenRun
+	if b == nil || p.Kind != registry.PrincipalAgent || presented == b.RunID {
+		return nil
+	}
+	if b.OnMismatch != nil {
+		b.OnMismatch(presented)
+	}
+	if !b.Enforce {
+		return nil
+	}
+	return reject(conduit.CloseUnauthenticated, ReasonUnauthenticated, "")
 }

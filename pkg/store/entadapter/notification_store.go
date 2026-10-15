@@ -134,6 +134,9 @@ func entNotifToStore(e *ent.Notification) *store.Notification {
 		Dispatched:     e.Dispatched,
 		Acknowledged:   e.Acknowledged,
 		CreatedAt:      e.Created,
+
+		DispatchAttempts: e.DispatchAttempts,
+		DispatchOutcome:  e.DispatchOutcome,
 	}
 }
 
@@ -408,6 +411,8 @@ func (s *NotificationStore) CreateNotification(ctx context.Context, notif *store
 		SetDispatched(notif.Dispatched).
 		SetAcknowledged(notif.Acknowledged).
 		SetCreated(notif.CreatedAt).
+		SetDispatchAttempts(notif.DispatchAttempts).
+		SetDispatchOutcome(notif.DispatchOutcome).
 		Save(ctx)
 	if err != nil {
 		return mapError(err)
@@ -608,18 +613,154 @@ func (s *NotificationStore) ClaimNotificationForDispatch(ctx context.Context, id
 }
 
 // UnmarkNotificationDispatched reverts a notification's dispatched flag to false
-// so a future sweep can retry delivery.
-func (s *NotificationStore) UnmarkNotificationDispatched(ctx context.Context, id string) error {
+// so a future sweep can retry delivery. The empty dispatch_outcome predicate
+// keeps a row whose outcome another caller has already recorded dispatched
+// (ptone/scion#5030): reverting it would leave dispatched=false with an
+// outcome set, and the sweep would deliver it again. Returns false (no error)
+// when the row has an outcome or does not exist.
+func (s *NotificationStore) UnmarkNotificationDispatched(ctx context.Context, id string) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+
+	affected, err := s.client.Notification.Update().
+		Where(
+			notification.IDEQ(uid),
+			notification.DispatchOutcomeEQ(""),
+		).
+		SetDispatched(false).
+		Save(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	return affected > 0, nil
+}
+
+// RecordNotificationDispatchAttempt atomically increments a notification's
+// dispatch_attempts by one (UPDATE ... SET dispatch_attempts =
+// dispatch_attempts + 1), so concurrent recorders never lose a count.
+func (s *NotificationStore) RecordNotificationDispatchAttempt(ctx context.Context, id string) error {
 	uid, err := parseUUID(id)
 	if err != nil {
 		return err
 	}
-
-	_, err = s.client.Notification.Update().
-		Where(notification.IDEQ(uid)).
-		SetDispatched(false).
+	_, err = s.client.Notification.UpdateOneID(uid).
+		AddDispatchAttempts(1).
 		Save(ctx)
 	return mapError(err)
+}
+
+// SetNotificationDispatchOutcome records a terminal dispatch outcome and sets
+// dispatched=true so the sweep stops considering the notification. The update
+// is conditional so racing writers keep the most informative outcome
+// (ptone/scion#5030): delivered is a fact (the broker accepted the message)
+// and failed is a verdict reached by a caller that did not see it, so a
+// delivered write applies unless the row is already delivered (it replaces
+// failed), and a failed write applies only while no outcome is recorded.
+// Returns false (no error) when the write is refused, and ErrNotFound when
+// the row does not exist.
+func (s *NotificationStore) SetNotificationDispatchOutcome(ctx context.Context, id string, outcome string) (bool, error) {
+	if outcome != store.NotificationOutcomeDelivered && outcome != store.NotificationOutcomeFailed {
+		return false, store.ErrInvalidInput
+	}
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	// failed only over no outcome; delivered over no outcome or failed, never
+	// re-applied over delivered.
+	pred := notification.DispatchOutcomeEQ("")
+	if outcome == store.NotificationOutcomeDelivered {
+		pred = notification.DispatchOutcomeNEQ(store.NotificationOutcomeDelivered)
+	}
+	affected, err := s.client.Notification.Update().
+		Where(
+			notification.IDEQ(uid),
+			pred,
+		).
+		SetDispatched(true).
+		SetDispatchOutcome(outcome).
+		Save(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	if affected > 0 {
+		return true, nil
+	}
+	exists, err := s.client.Notification.Query().
+		Where(notification.IDEQ(uid)).
+		Exist(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	if !exists {
+		return false, store.ErrNotFound
+	}
+	return false, nil
+}
+
+// orphanPurgeBatchSize caps how many rows one purge statement deletes so a
+// large backlog is removed in short statements instead of one long one.
+var orphanPurgeBatchSize = 1000
+
+// PurgeOrphanedNotifications deletes acknowledged notifications whose agent
+// and subscription rows are both gone (for example DELETED notifications
+// persisted after an agent's hard delete), and returns how many it deleted.
+// Unacknowledged notifications are kept until acknowledged. Rows are deleted
+// in batches of orphanPurgeBatchSize until a batch comes back short.
+func (s *NotificationStore) PurgeOrphanedNotifications(ctx context.Context) (int, error) {
+	total := 0
+	for {
+		ids, err := s.client.Notification.Query().
+			Where(
+				notification.AcknowledgedEQ(true),
+				func(sel *entsql.Selector) {
+					sel.Where(entsql.And(
+						noRowWithID(sel, agent.Table, agent.FieldID, notification.FieldAgentID),
+						noRowWithID(sel, notificationsubscription.Table, notificationsubscription.FieldID, notification.FieldSubscriptionID),
+					))
+				},
+			).
+			Order(ent.Asc(notification.FieldID)).
+			Limit(orphanPurgeBatchSize).
+			IDs(ctx)
+		if err != nil {
+			return total, mapError(err)
+		}
+		if len(ids) == 0 {
+			return total, nil
+		}
+		n, err := s.client.Notification.Delete().
+			Where(notification.IDIn(ids...)).
+			Exec(ctx)
+		total += n
+		if err != nil {
+			return total, mapError(err)
+		}
+		if n == 0 || len(ids) < orphanPurgeBatchSize {
+			// A short batch is the last one. A batch that removed nothing
+			// would select the same rows again, so stop there as well.
+			return total, nil
+		}
+	}
+}
+
+// noRowWithID builds "NOT EXISTS (SELECT 1 FROM table WHERE table.idCol =
+// <sel>.refCol)".
+func noRowWithID(sel *entsql.Selector, table, idCol, refCol string) *entsql.Predicate {
+	ref := sel.C(refCol)
+	return entsql.P(func(b *entsql.Builder) {
+		b.WriteString("NOT EXISTS (SELECT 1 FROM ")
+		b.Ident(table)
+		b.WriteString(" WHERE ")
+		b.Ident(table)
+		b.WriteString(".")
+		b.Ident(idCol)
+		b.WriteString(" = ")
+		b.WriteString(ref)
+		b.WriteString(")")
+	})
 }
 
 // undispatchedGracePeriod is the minimum age of an undispatched notification

@@ -64,7 +64,7 @@ A `RoleBinding` contains the following fields:
 * **Principal ID**: The identifier of the specific principal.
 * **Scope Type**: The scope bounds, either `system` (global permissions) or `project` (project-restricted permissions).
 * **Scope ID**: Empty for `system` scope, or the specific project ID for `project` scope.
-* **Activation Window (`not_before` / `expires_at`)**: Optional time bounds during which the binding is active.
+* **Activation Window (`not_before` / `expires_at`)**: Optional time bounds during which the binding is active. Outside its window a binding grants nothing, and membership checks (for example who counts as a project member for access and messaging) count only bindings inside their window. The project members list still shows bindings outside their window, so they can be managed.
 
 ### Agent Synthetic RoleBindings
 At runtime, agents do not require static RoleBindings to be manually created. Instead, the authorization engine dynamically extracts the agent's JWT claims and scopes and constructs **synthetic project-scoped role bindings** so that agent actions can be evaluated through the unified authorization pipeline.
@@ -118,6 +118,26 @@ Whenever an API request is made, the Hub's `Decide` endpoint processes the autho
 4. **Load Applicable AccessConstraints**: The engine queries all active, non-disabled AccessConstraints that match the principal (by principal ID, group closure, or `all_principals`) within the targeted scope.
 5. **Intersect Permissions**: The effective permission set is calculated as the intersection of the positive set and the maximum permitted ceilings.
 6. **Verdict**: If the requested permission is present in the final intersection set, access is **Allowed**. If it is missing from the positive set, or excluded by an active AccessConstraint, access is **Denied** (fail-closed).
+
+---
+
+## Adding Permissions (Developer Conventions)
+
+Permission IDs are defined in one registry, `pkg/hub/permissions/registry.go`. Follow these rules when you add a row or change an agent scope bundle:
+
+* **Every row is enforced or reserved.** A row must either record where code checks it (`Enforcement` for a route or handler check, `NonRouteUse` for any other consumer) or set `Reserved` to the reason nothing checks it yet. It cannot do both. To wire up a reserved permission:
+  1. Audit existing custom role definitions for the permission. The hub rejects reserved permissions when a custom role is created, updated, copied or imported, but roles created before the permission was reserved may still carry it. Once you un-reserve the row, those roles grant it.
+  2. Decide whether agent chains with no recorded delegation ceiling may hold it. While a row is reserved, such chains are denied it. If they must stay denied after you un-reserve it, cover it with a ceiling-optional agent scope or add it to `legacyChainExcludedPermissions` explicitly.
+  3. Add the check, clear `Reserved`, and record the check in `Enforcement`.
+
+  Once `Reserved` is cleared, the permission goes back to super-admin automatically, because super-admin's role is built from every registry row that isn't reserved. Adding it to any other role, agent scope bundle or token scope list is a separate, deliberate change.
+* **Nothing grants a reserved permission.** Don't put a reserved permission in any role, agent scope bundle or token scope list. The hub leaves reserved permissions out of manage aliases and out of the scopes it offers when you create a token. The token scope for a reserved permission is still accepted, so existing tokens that carry it keep working. `TestPermissionRegistryRowsEnforcedOrReserved` fails a row that is neither enforced nor reserved, and fails any role, agent scope bundle, manage alias or token scope picker that carries a reserved permission.
+* **Point `Enforcement` at the real check.** If several permissions go through one shared function (for example, the artifact service's `Authorize`), that function alone doesn't show that a given permission is checked. Also name the call site that passes the permission. For artifact rows, `TestArtifactPermissionsConsumedUnlessReserved` requires each non-reserved row to be used in `pkg/artifacts` or `pkg/hub` (through its `pkg/artifacts` constant or its ID as a string), and each reserved row to be unused.
+* **New agent scopes in an existing bundle are ceiling-optional.** If you add a new agent scope to an existing agent role bundle (`ScopesForRole`), list it in `ceilingOptionalRoleScopes`. The exception is a scope already within the authority of the principal that creates the agent. A ceiling-optional scope never decides whether a role fits a creator's ceiling. A mint drops the scope when the source ceiling lacks its permission. This way, a token that fit a role before the scope was added still fits it.
+
+### Last constraint admin protection
+
+The Hub refuses to suspend or delete a user when that would leave a scope with no active user holding `access_constraint.admin`, now or once scheduled constraints activate. The refusal is `409` with code `constraint_admin_lockout`; grant the permission to another user first. Only active users count as constraint admins, so a suspended user never keeps a scope administrable. The same check refuses deleting or downgrading a role binding, and removing a project member or changing their role, when that would leave the scope with no active constraint admin (`409` `constraint_admin_lockout`).
 
 ---
 

@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,25 +32,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// captureListStdout redirects os.Stdout to a pipe for the duration of fn and
-// discards everything written to it, draining concurrently so fn can never
-// block on a full pipe buffer.
-func captureListStdout(fn func()) {
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-	done := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, r)
-		close(done)
-	}()
-	fn()
-	_ = w.Close()
-	os.Stdout = oldStdout
-	<-done
-	_ = r.Close()
-}
 
 func TestFormatLastActivity(t *testing.T) {
 	now := time.Now()
@@ -70,6 +50,8 @@ func TestFormatLastActivity(t *testing.T) {
 		{"clock skew: activity minutes ahead", "", now.Add(5 * time.Minute), "just now"},
 		{"activity with zero time", "running", time.Time{}, "running"},
 		{"empty status with zero time", "", time.Time{}, "-"},
+		{"initializing shown as starting", "initializing", now.Add(-30 * time.Second), "starting, just now"},
+		{"initializing with zero time", "initializing", time.Time{}, "starting"},
 	}
 
 	for _, tt := range tests {
@@ -468,11 +450,49 @@ func TestHubAgentToAgentInfo_HarnessConfigFallbackToAppliedConfig(t *testing.T) 
 	}
 }
 
+func TestHaltedPhaseLabel(t *testing.T) {
+	assert.Equal(t, "halted (preempted)", haltedPhaseLabel("halted", "preempted"))
+	assert.Equal(t, "halted (out of memory)", haltedPhaseLabel("halted", "oom_killed"))
+	assert.Equal(t, "halted (unknown)", haltedPhaseLabel("halted", "evil\x1b[2J"), "only fixed labels are shown")
+	assert.Equal(t, "halted (unknown)", haltedPhaseLabel("halted", ""))
+	assert.Equal(t, "stopped", haltedPhaseLabel("stopped", "preempted"), "only halted shows its reason")
+}
+
+func TestDisplayAgents_HubHaltedShowsReason(t *testing.T) {
+	prev := outputFormat
+	outputFormat = ""
+	t.Cleanup(func() { outputFormat = prev })
+
+	code := 143
+	info := hubAgentToAgentInfo(hubclient.Agent{Slug: "halted-agent", Phase: "halted", ExitReason: "preempted", ExitCode: &code})
+	assert.Equal(t, "preempted", info.ExitReason)
+	require.NotNil(t, info.ExitCode)
+	assert.Equal(t, 143, *info.ExitCode)
+
+	var err error
+	out := captureStdout(t, func() { err = displayAgents([]api.AgentInfo{info}, false, true) })
+	require.NoError(t, err)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	require.Len(t, lines, 2, out)
+	assert.Contains(t, lines[1], "halted (preempted)")
+}
+
+func TestHaltedPhaseDecisions(t *testing.T) {
+	assert.True(t, hubStartImpliesResume("halted"))
+	assert.True(t, hubCreateReusesExistingAgent("halted", true, false))
+	assert.False(t, hubCreateReusesExistingAgent("halted", false, false))
+	assert.Equal(t, "Restarting", hubStartActionWord("halted", true, false))
+	done, err := launchOutcome("a", &hubclient.Agent{Phase: "halted"})
+	assert.True(t, done)
+	assert.Error(t, err, "a launch that ends halted failed")
+}
+
 func TestFilterRunningAgents(t *testing.T) {
 	agents := []api.AgentInfo{
 		{Name: "running-agent", Phase: "running"},
 		{Name: "stopped-agent", Phase: "stopped"},
 		{Name: "error-agent", Phase: "error"},
+		{Name: "halted-agent", Phase: "halted"},
 		{Name: "starting-agent", Phase: "starting"},
 		{Name: "created-agent", Phase: "created"},
 		{Name: "provisioning-agent", Phase: "provisioning"},
@@ -482,7 +502,7 @@ func TestFilterRunningAgents(t *testing.T) {
 
 	filtered := filterRunningAgents(agents)
 
-	// Should exclude stopped and error, keep everything else
+	// Should exclude stopped, error and halted, keep everything else
 	expected := map[string]bool{
 		"running-agent":      true,
 		"starting-agent":     true,
@@ -546,6 +566,89 @@ func TestDisplayAgentsRunningFlag(t *testing.T) {
 	}
 	if strings.Contains(output, "stopped-agent") {
 		t.Errorf("output should NOT contain stopped agent 'stopped-agent': %s", output)
+	}
+}
+
+// TestDisplayAgentsStartingPhase (ptone/scion#4756): an agent whose runtime
+// reports Phase and ContainerStatus "starting" is shown as starting in both
+// the local table and the hub table (via hubAgentToAgentInfo), and --running
+// keeps it.
+func TestDisplayAgentsStartingPhase(t *testing.T) {
+	local := api.AgentInfo{
+		Name:            "starting-local",
+		Template:        "default",
+		Runtime:         "cloudrun-sandbox",
+		Project:         "my-project",
+		Phase:           "starting",
+		ContainerStatus: "starting",
+	}
+	hub := hubAgentToAgentInfo(hubclient.Agent{
+		ID:              "agent-starting-hub",
+		Name:            "starting-hub",
+		Template:        "default",
+		Phase:           "starting",
+		ContainerStatus: "starting",
+	})
+	if hub.Phase != "starting" || hub.Activity != "" {
+		t.Fatalf("hubAgentToAgentInfo phase/activity = %q/%q, want starting/empty", hub.Phase, hub.Activity)
+	}
+	// Fill the columns left of CONTAINER so the row splits into fields
+	// that line up with the header.
+	hub.Runtime = "cloudrun-sandbox"
+	hub.Project = "my-project"
+	hub.RuntimeBrokerName = "broker-1"
+
+	listRunning = true
+	defer func() { listRunning = false }()
+
+	for _, tc := range []struct {
+		name    string
+		agent   api.AgentInfo
+		hubMode bool
+	}{
+		{name: "local", agent: local, hubMode: false},
+		{name: "hub", agent: hub, hubMode: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+
+			err := displayAgents([]api.AgentInfo{tc.agent}, false, tc.hubMode)
+			_ = w.Close()
+			os.Stdout = old
+			if err != nil {
+				t.Fatalf("displayAgents returned error: %v", err)
+			}
+
+			var buf bytes.Buffer
+			_, _ = buf.ReadFrom(r)
+			lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("expected header + 1 agent row, got %d lines: %s", len(lines), buf.String())
+			}
+			header, row := strings.Fields(lines[0]), strings.Fields(lines[1])
+			// col maps header words to row fields by position: every column
+			// up to CONTAINER is one non-empty word; LAST ACTIVITY is
+			// multi-word and must stay last.
+			col := func(name string) string {
+				for i, h := range header {
+					if h == name && i < len(row) {
+						return row[i]
+					}
+				}
+				return ""
+			}
+			if row[0] != tc.agent.Name {
+				t.Errorf("NAME = %q, want %q: %s", row[0], tc.agent.Name, lines[1])
+			}
+			if got := col("PHASE"); got != "starting" {
+				t.Errorf("PHASE = %q, want starting: %s", got, lines[1])
+			}
+			if got := col("CONTAINER"); got != "starting" {
+				t.Errorf("CONTAINER = %q, want starting: %s", got, lines[1])
+			}
+		})
 	}
 }
 
@@ -928,46 +1031,6 @@ func TestValidateListFlagsNegativeCount(t *testing.T) {
 	}
 }
 
-// TestRejectHubOnlyFiltersInLocalMode covers: a Hub-only filter set while
-// listing locally must error rather
-// than silently listing everything (a narrowing filter that narrows nothing
-// makes the output wider than asked for, with no indication anything was
-// ignored).
-func TestRejectHubOnlyFiltersInLocalMode(t *testing.T) {
-	reset := func() {
-		filterOwner, filterBroker, filterHarness = "", "", ""
-		filterDescendants, filterAncestors, filterLineage = "", "", ""
-	}
-	defer reset()
-
-	t.Run("no Hub-only filters set: no error", func(t *testing.T) {
-		reset()
-		assert.NoError(t, rejectHubOnlyFiltersInLocalMode())
-	})
-
-	tests := []struct {
-		flagName string
-		set      func()
-	}{
-		{"owner", func() { filterOwner = "alice" }},
-		{"broker", func() { filterBroker = "my-broker" }},
-		{"harness", func() { filterHarness = "claude" }},
-		{"descendants", func() { filterDescendants = "agent-a" }},
-		{"ancestors", func() { filterAncestors = "agent-a" }},
-		{"lineage", func() { filterLineage = "agent-a" }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.flagName, func(t *testing.T) {
-			reset()
-			tt.set()
-			err := rejectHubOnlyFiltersInLocalMode()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), "--"+tt.flagName)
-			assert.Contains(t, err.Error(), "Hub mode")
-		})
-	}
-}
-
 // TestListCmd_Args_RejectsPositionalArguments covers: `scion list
 // --descendants foo` (space, not "=") must not silently drop "foo" as an
 // ignored positional argument. Because
@@ -1265,12 +1328,6 @@ func TestResolveRelationshipReference(t *testing.T) {
 			name:       "bare flag in human mode resolves to the calling user",
 			flagValue:  scopeInferSentinel,
 			cliMode:    "",
-			wantUserID: meID,
-		},
-		{
-			name:       "bare flag in assistant mode resolves to the calling user",
-			flagValue:  scopeInferSentinel,
-			cliMode:    "assistant",
 			wantUserID: meID,
 		},
 	}
@@ -1797,7 +1854,7 @@ func TestListAgentsViaHub_AttributeFilterQueryParams(t *testing.T) {
 			oldListAll, oldOwner, oldBroker, oldHarness, oldPhase, oldOutputFormat
 	}()
 
-	captureListStdout(func() {
+	_ = captureStdout(t, func() {
 		err = listAgentsViaHub(hubCtx)
 	})
 
@@ -1847,7 +1904,7 @@ func TestListAgentsViaHub_DescendantsFlag(t *testing.T) {
 		listAll, filterDescendants, outputFormat = oldListAll, oldDescendants, oldOutputFormat
 	}()
 
-	captureListStdout(func() {
+	_ = captureStdout(t, func() {
 		err = listAgentsViaHub(hubCtx)
 	})
 
@@ -1900,7 +1957,7 @@ func TestListAgentsViaHub_AncestorsFlag(t *testing.T) {
 		filterAncestors = refID
 
 		var err error
-		captureListStdout(func() {
+		_ = captureStdout(t, func() {
 			err = listAgentsViaHub(hubCtx)
 		})
 
@@ -1914,7 +1971,7 @@ func TestListAgentsViaHub_AncestorsFlag(t *testing.T) {
 		filterAncestors = emptyRefID
 
 		var err error
-		captureListStdout(func() {
+		_ = captureStdout(t, func() {
 			err = listAgentsViaHub(hubCtx)
 		})
 
@@ -1987,7 +2044,7 @@ func TestListAgentsViaHub_LineageFlag(t *testing.T) {
 	run := func() {
 		t.Helper()
 		var err error
-		captureListStdout(func() {
+		_ = captureStdout(t, func() {
 			err = listAgentsViaHub(hubCtx)
 		})
 		require.NoError(t, err)
@@ -2143,7 +2200,7 @@ func TestListAgentsViaHub_AllMode_AgentModeWithOAuthCredential_NotBlocked(t *tes
 		listAll, filterDescendants, outputFormat = oldListAll, oldDescendants, oldOutputFormat
 	}()
 
-	captureListStdout(func() {
+	_ = captureStdout(t, func() {
 		err = listAgentsViaHub(hubCtx)
 	})
 
@@ -2186,7 +2243,7 @@ func TestListAgentsViaHub_AllMode_AgentModeWithDevAuthCredential_NotBlocked(t *t
 		listAll, filterDescendants, outputFormat = oldListAll, oldDescendants, oldOutputFormat
 	}()
 
-	captureListStdout(func() {
+	_ = captureStdout(t, func() {
 		err = listAgentsViaHub(hubCtx)
 	})
 
@@ -2194,16 +2251,16 @@ func TestListAgentsViaHub_AllMode_AgentModeWithDevAuthCredential_NotBlocked(t *t
 	assert.True(t, listCalled)
 }
 
-// TestListAgentsViaHub_AllMode_AssistantModeWithRelationshipFlag_NotBlocked
+// TestListAgentsViaHub_AllMode_NoAgentTokenWithRelationshipFlag_NotBlocked
 // covers: the --all guard must NOT fire for a HubContext with no agent-token
 // CredentialKind set (this test's HubContext leaves it at its zero value,
-// hubsync.CredentialKindUnknown). SCION_CLI_MODE=assistant is still set here
-// for realism, although the guard does not read it. Human mode is
+// hubsync.CredentialKindUnknown). SCION_CLI_MODE is left unset (human
+// mode); the guard does not read it. A human cross-project reference is
 // covered by TestListAgentsViaHub_AllMode_HumanCrossProjectReference;
 // agent mode with a non-agent-token credential is covered by
 // TestListAgentsViaHub_AllMode_AgentModeWithOAuthCredential_NotBlocked and
 // its dev-auth sibling, immediately above.
-func TestListAgentsViaHub_AllMode_AssistantModeWithRelationshipFlag_NotBlocked(t *testing.T) {
+func TestListAgentsViaHub_AllMode_NoAgentTokenWithRelationshipFlag_NotBlocked(t *testing.T) {
 	const refID = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
 	var listCalled bool
 
@@ -2228,23 +2285,23 @@ func TestListAgentsViaHub_AllMode_AssistantModeWithRelationshipFlag_NotBlocked(t
 	listAll = true
 	filterDescendants = refID
 	outputFormat = "json"
-	t.Setenv("SCION_CLI_MODE", "assistant")
+	t.Setenv("SCION_CLI_MODE", "")
 	defer func() {
 		listAll, filterDescendants, outputFormat = oldListAll, oldDescendants, oldOutputFormat
 	}()
 
-	captureListStdout(func() {
+	_ = captureStdout(t, func() {
 		err = listAgentsViaHub(hubCtx)
 	})
 
-	require.NoError(t, err, "assistant mode must not trip the agent-mode --all guard")
+	require.NoError(t, err, "a caller without an agent token must not trip the agent-mode --all guard")
 	assert.True(t, listCalled)
 }
 
 // TestListAgentsViaHub_AllMode_HumanCrossProjectReference covers: under
 // --all, a HUMAN caller must still be able to name a reference agent in a
 // *different* project than the one linked in the current directory.
-// Reference resolution for a human/assistant caller under --all goes
+// Reference resolution for a human caller under --all goes
 // through the same global endpoint the final listing uses, never the
 // current directory's project.
 func TestListAgentsViaHub_AllMode_HumanCrossProjectReference(t *testing.T) {
@@ -2288,7 +2345,7 @@ func TestListAgentsViaHub_AllMode_HumanCrossProjectReference(t *testing.T) {
 		listAll, filterDescendants, outputFormat = oldListAll, oldDescendants, oldOutputFormat
 	}()
 
-	captureListStdout(func() {
+	_ = captureStdout(t, func() {
 		err = listAgentsViaHub(hubCtx)
 	})
 
@@ -2299,8 +2356,8 @@ func TestListAgentsViaHub_AllMode_HumanCrossProjectReference(t *testing.T) {
 
 // TestListAgentsViaHub_BareRelationshipFlag_ModeDefaults covers
 // ptone/scion#2146 Q2: a bare relationship flag is never an error. In agent
-// mode it resolves to the calling agent (unchanged); in human/assistant mode
-// it resolves to the calling user, with --ancestors correctly reporting the
+// mode it resolves to the calling agent (unchanged); in human mode it
+// resolves to the calling user, with --ancestors correctly reporting the
 // user-has-no-ancestry case as an empty list rather than an error.
 func TestListAgentsViaHub_BareRelationshipFlag_ModeDefaults(t *testing.T) {
 	const callingUserID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
@@ -2352,7 +2409,7 @@ func TestListAgentsViaHub_BareRelationshipFlag_ModeDefaults(t *testing.T) {
 	run := func(ctx *HubContext) error {
 		t.Helper()
 		var err error
-		captureListStdout(func() {
+		_ = captureStdout(t, func() {
 			err = listAgentsViaHub(ctx)
 		})
 		return err
@@ -2388,15 +2445,6 @@ func TestListAgentsViaHub_BareRelationshipFlag_ModeDefaults(t *testing.T) {
 		require.NoError(t, run(hubCtx))
 		assert.Equal(t, callingUserID, gotAncestorID,
 			"Ancestry records the creator user directly, so ancestorId=<user> works unchanged")
-	})
-
-	t.Run("assistant mode: bare --descendants resolves to the calling user, not an error", func(t *testing.T) {
-		reset()
-		t.Setenv("SCION_CLI_MODE", "assistant")
-		filterDescendants = scopeInferSentinel
-
-		require.NoError(t, run(hubCtx))
-		assert.Equal(t, callingUserID, gotAncestorID)
 	})
 
 	t.Run("human mode: bare --ancestors returns an empty list (a user has no ancestry), not an error", func(t *testing.T) {

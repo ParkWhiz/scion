@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -61,18 +60,6 @@ func preClaim(a *store.Agent) *store.Agent {
 	c.DeletionState = ""
 	c.DeletionLeaseAt = nil
 	return &c
-}
-
-// requireIntentDeleteInProgress asserts the delete_in_progress answer of a
-// refused running-intent write, in the shape every delete_in_progress
-// answer has: details.agentId names the agent (round 6 n1).
-func requireIntentDeleteInProgress(t *testing.T, rec *httptest.ResponseRecorder, agentID string) {
-	t.Helper()
-	requireDeleteInProgress(t, rec)
-	var body ErrorResponse
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
-	assert.Equal(t, ErrCodeDeleteInProgress, body.Error.Code)
-	assert.Equal(t, agentID, body.Error.Details["agentId"], "details.agentId")
 }
 
 // A delete that claims the row after the start gate passed refuses the
@@ -313,6 +300,13 @@ func (s claimOnRunningIntentStore) SwapRunIntent(ctx context.Context, agentID st
 		seedAgentDeletion(s.t, s.Store, agentID, seedLiveDeleting)
 	}
 	return s.Store.SwapRunIntent(ctx, agentID, intent)
+}
+
+// ClaimAgentStart is the running-intent write of a start that runs under a
+// start claim.
+func (s claimOnRunningIntentStore) ClaimAgentStart(ctx context.Context, agentID, owner string, kind store.StartClaimKind, target string, ttl time.Duration) (store.StartClaim, error) {
+	seedAgentDeletion(s.t, s.Store, agentID, seedLiveDeleting)
+	return s.Store.ClaimAgentStart(ctx, agentID, owner, kind, target, ttl)
 }
 
 // A fresh create whose running-intent write meets a delete claim answers

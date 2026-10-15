@@ -13,22 +13,32 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks"
 	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/hooks/dialects"
+	"github.com/GoogleCloudPlatform/scion/pkg/testutil"
 )
 
-// scrubHubEnv clears all Hub-related environment variables for the
-// duration of the test, preventing accidental communication with a
-// real Hub when tests run inside an agent container. See issue #123.
+// agentIdentityEnvKeys lists the agent identity variables scrubHubEnv clears
+// in addition to testutil.HubEnvKeys(). SCION_HARNESS, SCION_PROJECT and
+// SCION_PROJECT_ID are values the container sets ambiently; handlers stamp
+// some of them onto telemetry, so leaving them set would make results depend
+// on where the tests run.
+var agentIdentityEnvKeys = []string{
+	"SCION_HARNESS",
+	"SCION_PROJECT",
+	projectkeys.EnvProjectID,
+}
+
+// scrubHubEnv clears all Hub-related and agent identity environment
+// variables for the duration of the test, preventing accidental
+// communication with a real Hub, and leakage of the ambient agent's
+// identity into results, when tests run inside an agent container.
+// See issue #123.
 func scrubHubEnv(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{
-		"SCION_HUB_ENDPOINT",
-		"SCION_HUB_URL",
-		"SCION_AUTH_TOKEN",
-		"SCION_AGENT_ID",
-		"SCION_AGENT_MODE",
-	} {
+	testutil.ScrubHubEnv(t)
+	for _, key := range agentIdentityEnvKeys {
 		t.Setenv(key, "")
 	}
 }
@@ -741,6 +751,9 @@ func TestTruncateMessage(t *testing.T) {
 		{"exactly10!", 10, "exactly10!"},
 		{"this is a longer message", 10, "this is..."},
 		{"", 10, ""},
+		// "é" is two bytes; a byte cut at 7 would split it.
+		{"abcdefé-tail", 10, "abcdef..."},
+		{"日本語のメッセージ", 10, "日本..."},
 	}
 
 	for _, tt := range tests {
@@ -749,4 +762,124 @@ func TestTruncateMessage(t *testing.T) {
 			t.Errorf("truncateMessage(%q, %d) = %q, want %q", tt.input, tt.maxLen, result, tt.expected)
 		}
 	}
+}
+
+// TestHubHandler_WaitingDefaultMessage checks the default status message
+// sent for waiting_for_input, which the web UI shows as "Waiting on
+// Parent". Only the display text is asserted here; the activity value
+// stays waiting_for_input.
+func TestHubHandler_WaitingDefaultMessage(t *testing.T) {
+	tests := []struct {
+		name        string
+		event       hooks.Event
+		wantMessage string
+	}{
+		{
+			name:        "notification without message",
+			event:       hooks.Event{Name: hooks.EventNotification},
+			wantMessage: "Waiting on parent",
+		},
+		{
+			name: "notification with message keeps detail",
+			event: hooks.Event{
+				Name: hooks.EventNotification,
+				Data: hooks.EventData{Message: "What should I do?"},
+			},
+			wantMessage: "What should I do?",
+		},
+		{
+			name: "claude AskUserQuestion",
+			event: hooks.Event{
+				Name:    hooks.EventToolStart,
+				Dialect: "claude",
+				Data:    hooks.EventData{ToolName: "AskUserQuestion"},
+			},
+			wantMessage: "Waiting on parent",
+		},
+		{
+			name: "claude ExitPlanMode",
+			event: hooks.Event{
+				Name:    hooks.EventToolStart,
+				Dialect: "claude",
+				Data:    hooks.EventData{ToolName: "ExitPlanMode"},
+			},
+			wantMessage: "Waiting for plan approval",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+
+			var payload map[string]interface{}
+			var mu sync.Mutex
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				_ = json.NewDecoder(r.Body).Decode(&payload)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer server.Close()
+
+			scrubHubEnv(t)
+			t.Setenv("SCION_HUB_ENDPOINT", server.URL)
+			t.Setenv("SCION_AUTH_TOKEN", "test-token")
+			t.Setenv("SCION_AGENT_ID", "test-agent-id")
+
+			handler := NewHubHandler()
+			if handler == nil {
+				t.Fatal("Expected handler to be created")
+			}
+			event := tt.event
+			if err := handler.Handle(&event); err != nil {
+				t.Fatalf("Handle returned error: %v", err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if payload["activity"] != "waiting_for_input" {
+				t.Errorf("activity = %v, want waiting_for_input", payload["activity"])
+			}
+			if payload["message"] != tt.wantMessage {
+				t.Errorf("message = %v, want %q", payload["message"], tt.wantMessage)
+			}
+		})
+	}
+}
+
+// claudeSessionStart parses a claude SessionStart hook payload with source
+// through the real dialect. An empty source leaves the field out.
+func claudeSessionStart(t *testing.T, source string) *hooks.Event {
+	t.Helper()
+	raw := map[string]interface{}{
+		"hook_event_name": "SessionStart",
+		"session_id":      "sess-123",
+	}
+	if source != "" {
+		raw["source"] = source
+	}
+	event, err := dialects.NewClaudeDialect().Parse(raw)
+	if err != nil {
+		t.Fatalf("dialect.Parse: %v", err)
+	}
+	if event.Name != hooks.EventSessionStart || event.Data.Source != source {
+		t.Fatalf("dialect.Parse = %q source %q, want %q source %q", event.Name, event.Data.Source, hooks.EventSessionStart, source)
+	}
+	return event
+}
+
+// sessionStartStep runs one event through the StatusHandler and then the
+// HubHandler (the hook process order) and returns the Hub updates this
+// event sent and the local agent-info.json afterwards.
+func sessionStartStep(t *testing.T, sh *StatusHandler, hh *HubHandler, sent func() []hubReport, event *hooks.Event) ([]hubReport, map[string]interface{}) {
+	t.Helper()
+	before := len(sent())
+	if err := sh.Handle(event); err != nil {
+		t.Fatalf("StatusHandler.Handle: %v", err)
+	}
+	if err := hh.Handle(event); err != nil {
+		t.Fatalf("HubHandler.Handle: %v", err)
+	}
+	return sent()[before:], readAgentInfoMap(t, sh.StatusPath)
 }

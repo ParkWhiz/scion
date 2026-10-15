@@ -53,7 +53,8 @@ func TestHandleAuthScopes_Authenticated(t *testing.T) {
 		t.Fatal("expected non-empty scopes list")
 	}
 
-	// Verify every scope follows resource:action format
+	// Every selector follows the format selectorForPermissionID derives
+	// from its permission ID and ends in ":" plus the permission's action.
 	for _, scope := range resp.Scopes {
 		if !strings.Contains(scope.ID, ":") {
 			t.Errorf("scope %q does not follow resource:action format", scope.ID)
@@ -67,10 +68,11 @@ func TestHandleAuthScopes_Authenticated(t *testing.T) {
 		if scope.Description == "" {
 			t.Errorf("scope %q has empty description", scope.ID)
 		}
-		// Verify the ID is resource:action
-		expected := scope.Resource + ":" + scope.Action
-		if scope.ID != expected {
-			t.Errorf("scope ID %q does not match resource:action %q", scope.ID, expected)
+		if !strings.HasSuffix(scope.ID, ":"+scope.Action) {
+			t.Errorf("scope ID %q does not end in the action %q", scope.ID, ":"+scope.Action)
+		}
+		if expected := selectorForPermissionID(scope.PermissionID); scope.ID != expected {
+			t.Errorf("scope ID %q of permission %q does not match the derived selector %q", scope.ID, scope.PermissionID, expected)
 		}
 	}
 
@@ -208,7 +210,7 @@ func TestHandleAuthScopes_ContainsNewScopes(t *testing.T) {
 		"template:read", "template:create", "template:list", "template:update", "template:delete",
 		"harness_config:read", "harness_config:create", "harness_config:list", "harness_config:update", "harness_config:delete",
 		"group:read", "group:create", "group:list", "group:update", "group:delete", "group:addMember", "group:removeMember",
-		"user:read", "user:list",
+		"user:read",
 		"broker:read", "broker:list",
 		"gcp_service_account:read", "gcp_service_account:list", "gcp_service_account:verify", "gcp_service_account:assign",
 	}
@@ -217,6 +219,11 @@ func TestHandleAuthScopes_ContainsNewScopes(t *testing.T) {
 		if !scopeIDs[scope] {
 			t.Errorf("expected scope %q not found in response", scope)
 		}
+	}
+
+	// user.list is Reserved, so its scope is not offered.
+	if scopeIDs["user:list"] {
+		t.Errorf("scope %q of a Reserved permission is offered", "user:list")
 	}
 
 	// Verify existing agent/project scopes still present
@@ -290,14 +297,33 @@ func TestUATScopes_ValidScopesIncludeNewResourceTypes(t *testing.T) {
 	}
 }
 
-// TestUATScopes_FormatConsistency verifies all scopes follow resource:action format.
+// selectorForPermissionID derives the token selector of a permission from
+// its ID: every dot-separated segment but the last joined with "_", then
+// ":" and the last segment. agent.create gives agent:create and
+// hub.config.read gives hub_config:read, so permissions that share a
+// resource and action (hub.config.read and hub.settings.read) still get
+// distinct selectors.
+func selectorForPermissionID(id string) string {
+	segments := strings.Split(id, ".")
+	if len(segments) < 2 {
+		return ""
+	}
+	last := len(segments) - 1
+	return strings.Join(segments[:last], "_") + ":" + segments[last]
+}
+
+// TestUATScopes_FormatConsistency requires every selector to equal the one
+// selectorForPermissionID derives from its permission ID and to end in ":"
+// plus the permission's action.
 func TestUATScopes_FormatConsistency(t *testing.T) {
 	for _, perm := range permissions.Registry {
 		if perm.UATScope == "" {
 			continue
 		}
-		expected := perm.Resource + ":" + perm.Action
-		if perm.UATScope != expected {
+		if !strings.HasSuffix(perm.UATScope, ":"+perm.Action) {
+			t.Errorf("permission %q has UATScope %q, which does not end in %q", perm.ID, perm.UATScope, ":"+perm.Action)
+		}
+		if expected := selectorForPermissionID(perm.ID); perm.UATScope != expected {
 			t.Errorf("permission %q has UATScope %q, expected %q", perm.ID, perm.UATScope, expected)
 		}
 	}

@@ -251,7 +251,7 @@ var resolvedSettingDescriptors = map[string]resolvedSettingDescriptor{
 	projectSettingDefaultThinkingLevel: {
 		source:            hubSourceAgentDefaults,
 		path:              []string{"default_thinking_level"},
-		absentWhenMissing: true, // *int with omitempty; 0 is the clear sentinel and deletes the key, so absence is unambiguous
+		absentWhenMissing: true, // *int with omitempty; a clear (null) deletes the key and 0 is rejected, so absence is unambiguous
 	},
 	projectSettingTelemetryEnabled: {
 		source: hubSourceTelemetryDefault,
@@ -290,6 +290,11 @@ var resolvedSettingDescriptors = map[string]resolvedSettingDescriptor{
 		source:            hubSourceAgentDefaults,
 		path:              []string{"default_gcp_identity_service_account_id"},
 		absentWhenMissing: false, // string, "" dropped by omitempty
+	},
+	// No hub-level per-profile default exists; the hub default is the
+	// single default_gcp_identity_service_account_id above.
+	projectSettingDefaultGCPIdentitySAIDByProfile: {
+		source: hubSourceNone,
 	},
 
 	// Default resource spec. The registry's five flat annotation keys face a

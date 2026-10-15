@@ -24,7 +24,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sync"
 	"testing"
 	"time"
 
@@ -51,225 +50,6 @@ import (
 //         and tested.
 //   AC-5: Same-project native and legacy group publication still works.
 // ---------------------------------------------------------------------------
-
-// spyBrokerBus records all published messages for inspection.
-type spyBrokerBus struct {
-	mu     sync.Mutex
-	events []spyBrokerEvent
-}
-
-type spyBrokerEvent struct {
-	topic string
-	msg   *messages.StructuredMessage
-}
-
-func (b *spyBrokerBus) Publish(_ context.Context, topic string, msg *messages.StructuredMessage) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	// Deep copy the message to prevent mutation after capture.
-	cp := *msg
-	if msg.Metadata != nil {
-		cp.Metadata = make(map[string]string, len(msg.Metadata))
-		for k, v := range msg.Metadata {
-			cp.Metadata[k] = v
-		}
-	}
-	if msg.Attachments != nil {
-		cp.Attachments = make([]string, len(msg.Attachments))
-		copy(cp.Attachments, msg.Attachments)
-	}
-	b.events = append(b.events, spyBrokerEvent{topic: topic, msg: &cp})
-	return nil
-}
-
-func (b *spyBrokerBus) Subscribe(_ string, _ eventbus.EventHandler) (eventbus.Subscription, error) {
-	return &spyNoopSub{}, nil
-}
-
-func (b *spyBrokerBus) Close() error { return nil }
-
-func (b *spyBrokerBus) getEvents() []spyBrokerEvent {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	result := make([]spyBrokerEvent, len(b.events))
-	copy(result, b.events)
-	return result
-}
-
-type spyNoopSub struct{}
-
-func (s *spyNoopSub) Unsubscribe() error { return nil }
-
-// foreignAttachSetup creates two projects, two agents (one per project),
-// a DM conversation between them, and enables cross-project messaging.
-func foreignAttachSetup(t *testing.T) (
-	srv *Server, s store.Store,
-	projectA, projectB *store.Project,
-	agentA, agentB *store.Agent,
-	convID string, dispatcher *recordingDispatcher,
-	spyBus *spyBrokerBus,
-) {
-	t.Helper()
-	srv, s = testServer(t)
-	ctx := context.Background()
-
-	owner := &store.User{
-		ID:      tid("fa-owner"),
-		Email:   "fa-owner@test.example",
-		Role:    store.UserRoleMember,
-		Status:  "active",
-		Created: time.Now(),
-	}
-	require.NoError(t, s.CreateUser(ctx, owner))
-	ensureHubMembership(ctx, s, owner.ID)
-
-	projectA = &store.Project{
-		ID:        tid("fa-project-a"),
-		Name:      "fa-project-a",
-		Slug:      "fa-project-a",
-		OwnerID:   owner.ID,
-		CreatedBy: owner.ID,
-	}
-	require.NoError(t, s.CreateProject(ctx, projectA))
-
-	projectB = &store.Project{
-		ID:   tid("fa-project-b"),
-		Name: "fa-project-b",
-		Slug: "fa-project-b",
-	}
-	require.NoError(t, s.CreateProject(ctx, projectB))
-	_, err := s.UpdateProjectMessagingPolicy(ctx, projectB.ID, store.CrossProjectInboundAny, 1)
-	require.NoError(t, err)
-
-	brokerID := tid("fa-broker")
-	require.NoError(t, s.CreateRuntimeBroker(ctx, &store.RuntimeBroker{
-		ID:     brokerID,
-		Name:   "fa-broker",
-		Slug:   "fa-broker",
-		Status: store.BrokerStatusOnline,
-	}))
-
-	agentA = &store.Agent{
-		ID:              tid("fa-agent-a"),
-		Name:            "fa-agent-a",
-		Slug:            "fa-agent-a",
-		ProjectID:       projectA.ID,
-		Phase:           "running",
-		RuntimeBrokerID: brokerID,
-		MessageMode:     store.MessageModeHub,
-		Ancestry:        []string{owner.ID},
-	}
-	require.NoError(t, s.CreateAgent(ctx, agentA))
-
-	agentB = &store.Agent{
-		ID:              tid("fa-agent-b"),
-		Name:            "fa-agent-b",
-		Slug:            "fa-agent-b",
-		ProjectID:       projectB.ID,
-		Phase:           "running",
-		RuntimeBrokerID: brokerID,
-		MessageMode:     store.MessageModeHub,
-		Ancestry:        []string{owner.ID},
-	}
-	require.NoError(t, s.CreateAgent(ctx, agentB))
-
-	// Create DM conversation between the agents.
-	dmKey, err := messages.DMConversationKey("agent", agentA.ID, "agent", agentB.ID)
-	require.NoError(t, err)
-	conv, err := s.UpsertConversationByExternalRef(ctx, &store.Conversation{
-		Kind:        "direct",
-		Surface:     "native",
-		ExternalRef: dmKey,
-		DriftState:  "active",
-	})
-	require.NoError(t, err)
-	convID = conv.ID
-
-	dispatcher = &recordingDispatcher{}
-	srv.SetDispatcher(dispatcher)
-
-	// Set up a spy broker bus so we can capture observer publications.
-	spyBus = &spyBrokerBus{}
-	inproc := eventbus.NewInProcessEventBus(slog.Default())
-	fanout := eventbus.NewFanOutEventBus([]eventbus.NamedEventBus{
-		{Name: eventbus.InProcessBusName, Bus: inproc},
-		{Name: "spy", Bus: spyBus},
-	}, slog.Default())
-	events := NewChannelEventPublisher()
-	t.Cleanup(events.Close)
-	proxy := NewMessageBrokerProxy(fanout, s, events,
-		func() AgentDispatcher { return dispatcher }, slog.Default())
-	proxy.Start()
-	t.Cleanup(proxy.Stop)
-	srv.SetMessageBrokerProxy(proxy)
-
-	enableCPM(t, srv, s)
-
-	return srv, s, projectA, projectB, agentA, agentB, convID, dispatcher, spyBus
-}
-
-// sendOutboundDMWithAttachments sends an outbound message with optional attachments.
-func sendOutboundDMWithAttachments(t *testing.T, srv *Server, sender *store.Agent, convID, projectID, msgText string, attachments []string) *httptest.ResponseRecorder {
-	t.Helper()
-
-	reqBody, err := json.Marshal(OutboundMessageRequest{
-		ConversationRef: "conv:" + convID,
-		Msg:             msgText,
-		Type:            "instruction",
-		Attachments:     attachments,
-	})
-	require.NoError(t, err)
-
-	req := httptest.NewRequest(http.MethodPost,
-		"/api/v1/projects/"+projectID+"/agents/"+sender.ID+"/outbound-message",
-		bytes.NewReader(reqBody))
-	req.Header.Set("Content-Type", "application/json")
-	req = req.WithContext(contextWithIdentity(req.Context(), &agentIdentityWrapper{&AgentTokenClaims{
-		Claims:    jwt.Claims{Subject: sender.ID},
-		ProjectID: projectID,
-		Ancestry:  sender.Ancestry,
-	}}))
-
-	rr := httptest.NewRecorder()
-	srv.handleAgentOutboundMessage(rr, req, sender.ID)
-	return rr
-}
-
-// sendInboundAgentMessage sends a message through the inbound handleAgentMessage path.
-func sendInboundAgentMessage(t *testing.T, srv *Server, senderAgent, targetAgent *store.Agent, msgText string, attachments []string) *httptest.ResponseRecorder {
-	t.Helper()
-
-	sm := &messages.StructuredMessage{
-		Version:     messages.Version,
-		Timestamp:   time.Now().UTC().Format(time.RFC3339),
-		Type:        messages.TypeInstruction,
-		Sender:      "agent:" + senderAgent.Slug,
-		SenderID:    senderAgent.ID,
-		Recipient:   "agent:" + targetAgent.Slug,
-		RecipientID: targetAgent.ID,
-		Msg:         msgText,
-		Attachments: attachments,
-	}
-
-	reqBody, err := json.Marshal(MessageRequest{
-		StructuredMessage: sm,
-	})
-	require.NoError(t, err)
-
-	req := httptest.NewRequest(http.MethodPost,
-		"/api/v1/projects/"+targetAgent.ProjectID+"/agents/"+targetAgent.ID+"/message",
-		bytes.NewReader(reqBody))
-	req.Header.Set("Content-Type", "application/json")
-	req = req.WithContext(contextWithIdentity(req.Context(), &agentIdentityWrapper{&AgentTokenClaims{
-		Claims:    jwt.Claims{Subject: senderAgent.ID},
-		ProjectID: senderAgent.ProjectID,
-		Ancestry:  senderAgent.Ancestry,
-	}}))
-
-	rr := httptest.NewRecorder()
-	srv.handleAgentMessage(rr, req, targetAgent.ID)
-	return rr
-}
 
 // ---------------------------------------------------------------------------
 // AC-1: Foreign attachment sends denied before side effects
@@ -945,4 +725,128 @@ func TestForeignAttach_EmptyAttachmentList_Allowed(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code,
 		"empty attachment list must not trigger rejection; body: %s", rr.Body.String())
+}
+
+// TestInteragentView_LegacyViewParticipantGate pins participant gating
+// for legacy view rows whose provenance stamps name different projects:
+// the body is shown only when the viewer's participation in the row's
+// conversation can be verified. A row with no conversation ID cannot be
+// verified, so its body is cleared. Same-project rows are unchanged.
+func TestInteragentView_LegacyViewParticipantGate(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	projectA := &store.Project{
+		ID: tid("pg-proj-a"), Name: "pg-proj-a", Slug: "pg-proj-a",
+		OwnerID: DevUserID, CreatedBy: DevUserID,
+	}
+	require.NoError(t, s.CreateProject(ctx, projectA))
+	projectB := &store.Project{ID: tid("pg-proj-b"), Name: "pg-proj-b", Slug: "pg-proj-b"}
+	require.NoError(t, s.CreateProject(ctx, projectB))
+
+	newAgent := func(name, projectID string) *store.Agent {
+		a := &store.Agent{
+			ID: tid(name), Name: name, Slug: name, ProjectID: projectID,
+			Phase: "running", MessageMode: store.MessageModeHub,
+		}
+		require.NoError(t, s.CreateAgent(ctx, a))
+		return a
+	}
+	agentA := newAgent("pg-agent-a", projectA.ID)
+	agentA2 := newAgent("pg-agent-a2", projectA.ID)
+	agentB := newAgent("pg-agent-b", projectB.ID)
+	agentB2 := newAgent("pg-agent-b2", projectB.ID)
+
+	// A direct conversation names exactly its two agents, so the case
+	// with the viewer as a member uses a group conversation instead.
+	newConv := func(peer *store.Agent, extraUser string) string {
+		kind := "direct"
+		key, err := messages.DMConversationKey("agent", agentA.ID, "agent", peer.ID)
+		require.NoError(t, err)
+		if extraUser != "" {
+			kind, key = "group", "test-group:"+tid("pg-group-"+peer.Slug)
+		}
+		conv, err := s.UpsertConversationByExternalRef(ctx, &store.Conversation{
+			Kind: kind, Surface: "native", ExternalRef: key, DriftState: "active",
+		})
+		require.NoError(t, err)
+		for _, id := range []string{agentA.ID, peer.ID} {
+			require.NoError(t, s.EnsureParticipant(ctx, &store.ConversationParticipant{
+				ConversationID: conv.ID, PrincipalKind: "agent", PrincipalID: id, Role: "member",
+			}))
+		}
+		if extraUser != "" {
+			require.NoError(t, s.EnsureParticipant(ctx, &store.ConversationParticipant{
+				ConversationID: conv.ID, PrincipalKind: "user", PrincipalID: extraUser, Role: "member",
+			}))
+		}
+		return conv.ID
+	}
+	nonParticipantConv := newConv(agentB, "")
+	participantConv := newConv(agentB2, DevUserID)
+	sameProjConv := newConv(agentA2, "")
+
+	newMsg := func(id string, peer *store.Agent, convID, body string) *store.Message {
+		senderProj, recipientProj := agentA.ProjectID, peer.ProjectID
+		m := &store.Message{
+			ID: tid(id), ProjectID: peer.ProjectID,
+			Sender: "agent:" + agentA.Slug, SenderID: agentA.ID,
+			Recipient: "agent:" + peer.Slug, RecipientID: peer.ID,
+			Msg: body, Type: "instruction", AgentID: agentA.ID,
+			ConversationID:  convID,
+			SenderProjectID: &senderProj, RecipientProjectID: &recipientProj,
+			CreatedAt: time.Now(),
+		}
+		require.NoError(t, s.CreateMessage(ctx, m))
+		return m
+	}
+	noConv := newMsg("pg-msg-no-conv", agentB, "", "row without conversation")
+	nonParticipant := newMsg("pg-msg-non-participant", agentB, nonParticipantConv, "non-participant row")
+	participant := newMsg("pg-msg-participant", agentB2, participantConv, "participant row")
+	sameProj := newMsg("pg-msg-same", agentA2, sameProjConv, "same-project row")
+
+	// Rows without a conversation ID whose stamps do not name two
+	// different projects keep the previous behaviour: body shown.
+	newUnpairedMsg := func(id string, senderProj *string, body string) *store.Message {
+		m := &store.Message{
+			ID: tid(id), ProjectID: agentB.ProjectID,
+			Sender: "agent:" + agentA.Slug, SenderID: agentA.ID,
+			Recipient: "agent:" + agentB.Slug, RecipientID: agentB.ID,
+			Msg: body, Type: "instruction", AgentID: agentA.ID,
+			SenderProjectID: senderProj, CreatedAt: time.Now(),
+		}
+		require.NoError(t, s.CreateMessage(ctx, m))
+		return m
+	}
+	oneStamp := newUnpairedMsg("pg-msg-one-stamp", &agentA.ProjectID, "one-stamp row")
+	noStamp := newUnpairedMsg("pg-msg-no-stamp", nil, "unstamped row")
+
+	enableCPM(t, srv, s)
+
+	userDMKey, err := messages.DMConversationKey("user", DevUserID, "agent", agentA.ID)
+	require.NoError(t, err)
+	endpoint := "/api/v1/chat/conversations/" + url.PathEscape(userDMKey) + "/interagent"
+	rr := doRequest(t, srv, http.MethodGet, endpoint, nil)
+	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+
+	var iaResp interagentResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &iaResp))
+	got := make(map[string]string, len(iaResp.Messages))
+	for _, m := range iaResp.Messages {
+		got[m.ID] = m.Msg
+	}
+
+	want := map[string]string{
+		noConv.ID:         "", // no conversation to verify: cleared
+		nonParticipant.ID: "", // viewer not a participant: cleared
+		participant.ID:    "participant row",
+		sameProj.ID:       "same-project row",
+		oneStamp.ID:       "one-stamp row",
+		noStamp.ID:        "unstamped row",
+	}
+	for id, body := range want {
+		gotBody, ok := got[id]
+		require.True(t, ok, "row %s must be listed (only the body is cleared)", id)
+		assert.Equal(t, body, gotBody, "row %s body", id)
+	}
 }

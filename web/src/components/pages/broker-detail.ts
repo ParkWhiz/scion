@@ -39,6 +39,7 @@ import { brokerTypeBadgeStyles } from '../shared/resource-styles.js';
 import { showConfirm } from '../shared/confirm-dialog.js';
 import { showToast } from '../../utils/toast.js';
 import '../shared/status-badge.js';
+import '../shared/detail-header.js';
 import { formatInstantWithZone, formatRelative } from '../../utils/time.js';
 import { DisplayZoneController } from '../../utils/display-zone-controller.js';
 
@@ -103,58 +104,6 @@ export class ScionPageBrokerDetail extends LitElement {
     css`
       :host {
         display: block;
-      }
-
-      .back-link {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        color: var(--scion-text-muted, #64748b);
-        text-decoration: none;
-        font-size: 0.875rem;
-        margin-bottom: 1rem;
-      }
-
-      .back-link:hover {
-        color: var(--scion-primary, #3b82f6);
-      }
-
-      .header {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        margin-bottom: 1.5rem;
-        gap: 1rem;
-      }
-
-      .header-info {
-        flex: 1;
-      }
-
-      .header-title {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        margin-bottom: 0.5rem;
-      }
-
-      .header-title sl-icon {
-        color: var(--scion-primary, #3b82f6);
-        font-size: 1.5rem;
-      }
-
-      .header h1 {
-        font-size: 1.5rem;
-        font-weight: 700;
-        color: var(--scion-text, #1e293b);
-        margin: 0;
-      }
-
-      .header-actions {
-        display: flex;
-        align-items: flex-start;
-        gap: 0.5rem;
-        flex-shrink: 0;
       }
 
       .header-subtitle {
@@ -348,7 +297,7 @@ export class ScionPageBrokerDetail extends LitElement {
       }
 
       /* Full-width basis so the status badge always wraps to its own row. A
-         wide label like "Waiting_for_input" would otherwise crush the name to
+         wide label like "waiting on parent" would otherwise crush the name to
          a few characters — it is the badge's width that matters, not how many
          there are. */
       .agent-header > div {
@@ -502,17 +451,14 @@ export class ScionPageBrokerDetail extends LitElement {
       stateManager.setScope({ type: 'broker-detail', brokerId: this.brokerId });
     }
 
-    stateManager.addEventListener('brokers-updated', this.boundOnBrokersUpdated as EventListener);
+    stateManager.addEventListener('brokers-updated', this.boundOnBrokersUpdated);
 
     this.relativeTimeInterval = setInterval(() => this.requestUpdate(), 15_000);
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
-    stateManager.removeEventListener(
-      'brokers-updated',
-      this.boundOnBrokersUpdated as EventListener
-    );
+    stateManager.removeEventListener('brokers-updated', this.boundOnBrokersUpdated);
     if (this.relativeTimeInterval) {
       clearInterval(this.relativeTimeInterval);
       this.relativeTimeInterval = null;
@@ -680,30 +626,21 @@ export class ScionPageBrokerDetail extends LitElement {
     if (this.broker.endpoint) subtitleParts.push(this.broker.endpoint);
 
     return html`
-      <a href="/brokers" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        Back to Brokers
-      </a>
-
-      <div class="header">
-        <div class="header-info">
-          <div class="header-title">
-            <sl-icon name="hdd-rack"></sl-icon>
-            <h1>${this.broker.name}</h1>
-            ${this.renderBrokerTypeBadge()}
-            <scion-status-badge
-              status=${this.getBrokerStatusVariant(this.broker.status)}
-              label=${this.broker.status}
-              size="small"
-            ></scion-status-badge>
-          </div>
-          ${subtitleParts.length > 0
-            ? html`<div class="header-subtitle">${subtitleParts.join(' · ')}</div>`
-            : ''}
-        </div>
+      <scion-detail-header heading=${this.broker.name}>
+        <scion-back-link slot="back" href="/brokers">Back to Brokers</scion-back-link>
+        <sl-icon slot="icon" name="hdd-rack"></sl-icon>
+        ${this.renderBrokerTypeBadge()}
+        <scion-status-badge
+          status=${this.getBrokerStatusVariant(this.broker.status)}
+          label=${this.broker.status}
+          size="small"
+        ></scion-status-badge>
+        ${subtitleParts.length > 0
+          ? html`<div slot="meta" class="header-subtitle">${subtitleParts.join(' · ')}</div>`
+          : ''}
         ${this.isAdmin
           ? html`
-              <div class="header-actions">
+              <div slot="actions" class="header-actions">
                 <sl-button
                   variant="danger"
                   size="small"
@@ -717,7 +654,7 @@ export class ScionPageBrokerDetail extends LitElement {
               </div>
             `
           : ''}
-      </div>
+      </scion-detail-header>
 
       <div class="stats-row">
         <div class="stat">
@@ -1003,7 +940,7 @@ export class ScionPageBrokerDetail extends LitElement {
           <h2>Capabilities</h2>
         </div>
         <div class="capabilities-row">
-          <span class="capability-tag ${capabilities.webPTY ? 'enabled' : ''}">WebPTY</span>
+          <span class="capability-tag ${capabilities.webPty ? 'enabled' : ''}">WebPTY</span>
           <span class="capability-tag ${capabilities.sync ? 'enabled' : ''}">Sync</span>
           <span class="capability-tag ${capabilities.attach ? 'enabled' : ''}">Attach</span>
         </div>
@@ -1111,10 +1048,7 @@ export class ScionPageBrokerDetail extends LitElement {
 
   private renderError() {
     return html`
-      <a href="/brokers" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        Back to Brokers
-      </a>
+      <scion-back-link href="/brokers">Back to Brokers</scion-back-link>
 
       <div class="error-state">
         <sl-icon name="exclamation-triangle"></sl-icon>

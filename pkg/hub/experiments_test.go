@@ -28,39 +28,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
-// testExperiment returns a minimally valid experiment for registry
-// construction in tests.
-func testExperiment(name string, def bool, layers ...experiments.Layer) experiments.Experiment {
-	return experiments.Experiment{
-		Name:        name,
-		Title:       "Test experiment",
-		Description: "Used only in pkg/hub tests.",
-		Default:     def,
-		Layers:      layers,
-		Stage:       experiments.StageBeta,
-		Issue:       "ptone/scion#2217",
-		Owner:       "test",
-		ReviewBy:    "2026-12-31",
-	}
-}
-
-// testRegistry returns a registry with hub.test_gate (server+web, default
-// on), web.only_thing (web-only, default on), and hub.server_only
-// (server-only, default on, so a test asserting web-layer filtering has a
-// name that must NOT appear in a web-facing result), per ptone/scion#2217.
-func testRegistry(t *testing.T) *experiments.Registry {
-	t.Helper()
-	reg, err := experiments.NewRegistry([]experiments.Experiment{
-		testExperiment("hub.test_gate", true, experiments.LayerServer, experiments.LayerWeb),
-		testExperiment("web.only_thing", true, experiments.LayerWeb),
-		testExperiment("hub.server_only", true, experiments.LayerServer),
-	}, nil)
-	if err != nil {
-		t.Fatalf("NewRegistry: %v", err)
-	}
-	return reg
-}
-
 // serverWithExperimentsDoc builds a Server wired to a test registry and an
 // OperationalSettings instance whose "experiments" row is raw (skip seeding
 // when raw == "").
@@ -84,10 +51,12 @@ func TestExperimentRegistry_ZeroValueServerFallsBackToDefault(t *testing.T) {
 	if srv.experimentRegistry() != experiments.Default() {
 		t.Error("experimentRegistry() on a zero-value Server must return experiments.Default()")
 	}
-	// ptone/scion#2217: a zero-value &Server{} (no New()) must resolve
-	// web.terminal_workspace to its compiled default without panicking.
-	if !srv.experimentEnabled("web.terminal_workspace") {
-		t.Error("zero-value Server: web.terminal_workspace should resolve to its default (true)")
+	// ptone/scion#2217: a zero-value &Server{} (no New()) must resolve every
+	// compiled experiment to its default without panicking.
+	for _, exp := range experiments.Default().All() {
+		if got := srv.experimentEnabled(exp.Name); got != exp.Default {
+			t.Errorf("zero-value Server: %s = %v, want its default %v", exp.Name, got, exp.Default)
+		}
 	}
 }
 

@@ -34,6 +34,15 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
+// logQuerier is the subset of LogQueryService used by the hub handlers.
+// Handler tests substitute a fake to record the options they build.
+type logQuerier interface {
+	Query(ctx context.Context, opts LogQueryOptions) (*LogQueryResult, error)
+	Tail(ctx context.Context, opts LogQueryOptions) (<-chan CloudLogEntry, func(), error)
+	GCPProjectID() string
+	Close() error
+}
+
 // LogQueryService queries Google Cloud Logging for structured log entries.
 type LogQueryService struct {
 	client     *logadmin.Client
@@ -111,6 +120,9 @@ func NewLogQueryService(ctx context.Context, projectID string) (*LogQueryService
 	}, nil
 }
 
+// GCPProjectID returns the GCP project the service queries.
+func (s *LogQueryService) GCPProjectID() string { return s.projectID }
+
 // Close releases resources held by the LogQueryService.
 func (s *LogQueryService) Close() error {
 	var firstErr error
@@ -159,6 +171,16 @@ func (s *LogQueryService) Query(ctx context.Context, opts LogQueryOptions) (*Log
 	}, nil
 }
 
+// messageRecordFilter restricts message log queries to message records:
+// entries tagged log_kind=event (lifecycle and delivery acknowledgement
+// lines) are left out, as are entries with neither a sender nor a
+// recipient label (older lifecycle lines written before the tag).
+// "NOT x = v" also matches entries without the label; "x:*" tests that
+// the label is present.
+var messageRecordFilter = fmt.Sprintf(
+	`NOT labels.%s = %q AND (labels.%s:* OR labels.%s:*)`,
+	logging.AttrLogKind, logging.LogKindEvent, logging.AttrSender, logging.AttrRecipient)
+
 // BuildLogFilter constructs a Cloud Logging filter string from the options.
 // When projectID is provided and opts.LogID is set, a logName filter is added
 // to restrict results to the specific Cloud Logging log.
@@ -186,6 +208,9 @@ func BuildLogFilter(opts LogQueryOptions, projectID ...string) string {
 			opts.AgentID, opts.AgentID))
 	} else if opts.AgentID != "" {
 		parts = append(parts, fmt.Sprintf(`labels.agent_id = %q`, opts.AgentID))
+	}
+	if opts.LogID == logging.MessageLogID {
+		parts = append(parts, messageRecordFilter)
 	}
 	// DEF-128b: participant scoping. When ParticipantID is set, restrict
 	// results to entries where that user is either the sender or the

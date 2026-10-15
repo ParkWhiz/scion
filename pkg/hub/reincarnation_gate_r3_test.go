@@ -43,24 +43,6 @@ import (
 // R1: chat v2 secondary persist-failure branch (mentionPersisted == false)
 // ---------------------------------------------------------------------------
 
-// failCreateMessageForAgentStore wraps a real store and fails CreateMessage
-// only for messages addressed to one specific agent, leaving every other
-// persist (e.g. the primary's, or any other secondary's) unaffected. Needed
-// because createMessageFailStore fails universally, which trips the chat v2
-// primary's own persist check (:1496-1500, per p2a-r3 review) before the
-// secondary loop is ever reached.
-type failCreateMessageForAgentStore struct {
-	store.Store
-	agentID string
-}
-
-func (s *failCreateMessageForAgentStore) CreateMessage(ctx context.Context, msg *store.Message) error {
-	if msg.AgentID == s.agentID {
-		return errors.New("injected CreateMessage failure for target agent")
-	}
-	return s.Store.CreateMessage(ctx, msg)
-}
-
 // TestSendAgentRouted_R1_MigratingSecondaryPersistFailureIsErrorNotDeferred
 // is the p2a-r3 review's R1 finding: chat v2's secondary/mention fan-out
 // loop has a "persist failed -> error, never deferred" branch
@@ -70,7 +52,11 @@ func (s *failCreateMessageForAgentStore) CreateMessage(ctx context.Context, msg 
 // first, never reaching this branch — this test isolates the secondary's
 // persist failure instead.
 func TestSendAgentRouted_R1_MigratingSecondaryPersistFailureIsErrorNotDeferred(t *testing.T) {
-	srv, s := testServer(t)
+	// Installed before createProjectOwnerRoleBinding below, whose mutation
+	// audit goroutine reads srv.store (ptone/scion#3184).
+	srv, s, failing, fault := testServerWithStoreFault(t, func(inner store.Store, f *storeFaultSwitch) *failCreateMessageForAgentStore {
+		return &failCreateMessageForAgentStore{Store: inner, fault: f}
+	})
 	ctx := context.Background()
 	seedRoleDefinitions(ctx, s)
 	broker := &store.RuntimeBroker{ID: tid("r1-b"), Name: "b", Slug: "b", Endpoint: "http://localhost:9800", Status: store.BrokerStatusOnline}
@@ -95,14 +81,15 @@ func TestSendAgentRouted_R1_MigratingSecondaryPersistFailureIsErrorNotDeferred(t
 	// Fail CreateMessage only for the migrating secondary; the primary's
 	// own persist (checked first, per the review) must still succeed so
 	// execution actually reaches the secondary loop.
-	srv.store = &failCreateMessageForAgentStore{Store: s, agentID: second.ID}
+	failing.agentID = second.ID
+	fault.Arm()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/conversations/topic:"+project.ID+"/messages", nil)
 	req = req.WithContext(contextWithIdentity(req.Context(), owner))
 	rr := httptest.NewRecorder()
 	mentionResults := []messages.MentionResult{{Slug: "r1-second", Status: "delivered"}}
-	msgID := srv.sendAgentRouted(rr, req, "topic:"+project.ID, project.ID, owner,
-		"hello @r1-second", "Owner", []*store.Agent{primary, second}, []string{"r1-second"}, mentionResults, nil, time.Now(), "", nil, chatSendOptions{})
+	msgID := writeChatSendOutcome(rr)(srv.sendAgentRouted(req.Context(), "topic:"+project.ID, project.ID, owner,
+		"hello @r1-second", "Owner", []*store.Agent{primary, second}, []string{"r1-second"}, mentionResults, nil, time.Now(), "", nil, chatSendOptions{}))
 
 	require.NotEmpty(t, msgID, "the primary's own message must still be persisted; response: %d %s", rr.Code, rr.Body.String())
 

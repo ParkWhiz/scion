@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { installEventSourceStub } from '../event-source-stub.js';
 
 const agent = '11111111-1111-4111-8111-111111111111';
 const agentB = '22222222-2222-4222-8222-222222222222';
@@ -18,7 +19,6 @@ interface AgentFixture {
 
 async function setup(
   page: Page,
-  enabled = true,
   locks = true,
   agents: Record<string, AgentFixture> = {
     [agent]: {
@@ -43,9 +43,9 @@ async function setup(
     close: (options?: { code?: number; reason?: string }) => void;
     send: (data: string | Buffer) => void;
   }> = [];
+  await installEventSourceStub(page);
   await page.addInitScript(
-    ({ enabled, locks }) => {
-      window.__SCION_FEATURES__ = { 'web.terminal_workspace': enabled };
+    ({ locks }) => {
       if (!locks) Object.defineProperty(navigator, 'locks', { value: undefined });
       void customElements.whenDefined('scion-terminal-pane').then(() => {
         const instrumented = window as typeof window & { terminalInitializers?: number };
@@ -58,16 +58,8 @@ async function setup(
           return initialize.apply(this, args);
         };
       });
-      window.EventSource = class extends EventTarget {
-        onopen: (() => void) | null = null;
-        constructor() {
-          super();
-          queueMicrotask(() => this.onopen?.());
-        }
-        close(): void {}
-      } as unknown as typeof EventSource;
     },
-    { enabled, locks }
+    { locks }
   );
   await page.route('**/auth/me', (route) =>
     route.fulfill({ json: { id: 'fixture-user', email: 'fixture@example.test' } })
@@ -251,7 +243,7 @@ test('repeated pending and connected opens reuse one pane; a duplicate pane is r
 test('rail selection reuses sessions and disambiguates repeated agent names by project', async ({
   page,
 }) => {
-  const socket = await setup(page, true, true, {
+  const socket = await setup(page, true, {
     [agent]: { id: agent, name: 'worker', phase: 'running', projectId: 'alpha-project' },
     [agentB]: { id: agentB, name: 'worker', phase: 'running', projectId: 'beta-project' },
   });
@@ -275,7 +267,7 @@ test('rail selection reuses sessions and disambiguates repeated agent names by p
 test('rail list preserves valid semantics and real browser arrow key navigation', async ({
   page,
 }) => {
-  const socket = await setup(page, true, true, {
+  const socket = await setup(page, true, {
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'project-a' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'project-b' },
   });
@@ -296,24 +288,78 @@ test('rail list preserves valid semantics and real browser arrow key navigation'
   await page.getByRole('button', { name: /alpha in project-a/ }).focus();
   await expect
     .poll(() => focusedRailControlLabel(page))
-    .toBe('Show terminal for alpha in project-a');
+    .toMatch(/^Show terminal for alpha in project-a(,|$)/);
 
   await page.keyboard.press('ArrowDown');
   await expect
     .poll(() => focusedRailControlLabel(page))
-    .toBe('Show terminal for beta in project-b');
+    .toMatch(/^Show terminal for beta in project-b(,|$)/);
   await page.keyboard.press('ArrowUp');
   await expect
     .poll(() => focusedRailControlLabel(page))
-    .toBe('Show terminal for alpha in project-a');
+    .toMatch(/^Show terminal for alpha in project-a(,|$)/);
   await page.keyboard.press('End');
   await expect
     .poll(() => focusedRailControlLabel(page))
-    .toBe('Show terminal for beta in project-b');
+    .toMatch(/^Show terminal for beta in project-b(,|$)/);
   await page.keyboard.press('Home');
   await expect
     .poll(() => focusedRailControlLabel(page))
-    .toBe('Show terminal for alpha in project-a');
+    .toMatch(/^Show terminal for alpha in project-a(,|$)/);
+});
+
+test('Enter and Space on a rail item focus its terminal without typing the key into it (ptone/scion#2900)', async ({
+  page,
+}) => {
+  const socket = await setup(page, true, {
+    [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'project-a' },
+    [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'project-b' },
+  });
+  await page.goto(`/terminals/${agent}`);
+  await expect.poll(() => socket.attaches).toBe(1);
+  await navigateToTerminal(page, agentB);
+  await expect.poll(() => socket.attaches).toBe(2);
+  for (const index of [0, 1]) {
+    socket.sendToSocket(
+      index,
+      JSON.stringify({ type: 'data', data: Buffer.from('$ ').toString('base64') })
+    );
+  }
+
+  /** Agent ID of the pane whose xterm input has keyboard focus. */
+  const focusedTerminal = (): Promise<string | null> =>
+    page.evaluate(() => {
+      const pane = document.activeElement as
+        | (HTMLElement & { session?: { state: { agentId: string } } | null })
+        | null;
+      if (pane?.tagName !== 'SCION-TERMINAL-PANE') return null;
+      return pane.shadowRoot?.activeElement?.classList.contains('xterm-helper-textarea')
+        ? (pane.session?.state.agentId ?? null)
+        : null;
+    });
+  const typed = (): string[] =>
+    socket.sent
+      .map((raw) => JSON.parse(raw) as { type?: string; data?: string })
+      .filter((frame) => frame.type === 'data')
+      .map((frame) => Buffer.from(frame.data ?? '', 'base64').toString());
+
+  // Enter on the pane already in front: the browser activates the button
+  // on keypress, after keydown, and focus moves then; the key must not
+  // follow it into the terminal.
+  await page.getByRole('button', { name: /beta in project-b/ }).focus();
+  await page.keyboard.press('Enter');
+  await expect.poll(focusedTerminal).toBe(agentB);
+
+  // Space on a hidden pane: activation happens on keyup.
+  await page.getByRole('button', { name: /alpha in project-a/ }).focus();
+  await page.keyboard.press(' ');
+  await expect(page).toHaveURL(`/terminals/${agent}`);
+  await expect.poll(focusedTerminal).toBe(agent);
+
+  // Neither key reached a terminal; the next key goes to the focused one.
+  expect(typed()).toEqual([]);
+  await page.keyboard.press('x');
+  await expect.poll(typed).toEqual(['x']);
 });
 
 test('metadata-only rail updates preserve focused control', async ({ page }) => {
@@ -325,7 +371,7 @@ test('metadata-only rail updates preserve focused control', async ({ page }) => 
       projectId: 'fixture-project',
     },
   };
-  await setup(page, true, true, agents);
+  await setup(page, true, agents);
   await page.goto(`/terminals/${agent}`);
   await expect(page.getByRole('button', { name: 'Close isolated-agent' })).toBeVisible();
 
@@ -354,7 +400,7 @@ test('metadata-only rail updates preserve focused control', async ({ page }) => 
 });
 
 test('close removes only that retained client and leaves peers connected', async ({ page }) => {
-  const socket = await setup(page, true, true, {
+  const socket = await setup(page, true, {
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'same-project' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'same-project' },
   });
@@ -365,6 +411,16 @@ test('close removes only that retained client and leaves peers connected', async
     `/terminals/${agentB}`
   );
   await expect.poll(() => socket.attaches).toBe(2);
+  // The detach keystroke is only sent on a connected session, and a session
+  // connects on its first inbound data frame (tmux's redraw on attach).
+  const redraw = JSON.stringify({ type: 'data', data: '' });
+  socket.sendToSocket(0, redraw);
+  socket.sendToSocket(1, redraw);
+  await expect(
+    page.locator('#terminal-workspace scion-terminal-pane .status-indicator', {
+      hasText: /^\s*Connected\s*$/,
+    })
+  ).toHaveCount(2);
   await page.getByRole('button', { name: 'Close alpha' }).click();
   await expect(page.getByRole('button', { name: 'Terminals (1)' })).toBeVisible();
   await expect(page.getByRole('button', { name: /beta in same-project/ })).toBeVisible();
@@ -387,7 +443,7 @@ test('disconnected entries persist until explicit reconnect or close', async ({ 
 });
 
 test('empty workspace and chat-disabled header keep Terminals available', async ({ page }) => {
-  await setup(page, true, true, undefined, false);
+  await setup(page, true, undefined, false);
   await page.goto('/terminals');
   await expect(page.locator('#terminal-workspace')).toContainText('No terminals are open.');
   await expect(page.getByRole('button', { name: 'Dashboard' })).toBeVisible();
@@ -449,7 +505,9 @@ test('a second tab selects through the owner without attaching locally', async (
   await owner.goto(`/terminals/${agent}`);
   await expect.poll(() => ownerSocket.attaches).toBe(1);
   await other.goto(`/terminals/${agent}`);
-  await expect(other.locator('#terminal-workspace')).toContainText('owning tab');
+  await expect(other.locator('#terminal-workspace')).toContainText(
+    'Terminals open in another window'
+  );
   expect(otherSocket.attaches).toBe(0);
   expect(await other.locator('#terminal-workspace scion-terminal-pane').count()).toBe(0);
   await expect
@@ -483,41 +541,8 @@ test('a superseded local terminal navigation cannot reveal or focus its pane', a
   ).toBe(true);
 });
 
-test('flag-off legacy route stays on the disposable pane adapter', async ({ page }) => {
-  const socket = await setup(page, false);
-  await page.goto(`/agents/${agent}/terminal`);
-  await expect.poll(() => socket.attaches).toBe(1);
-  expect(await page.locator('#terminal-workspace').count()).toBe(0);
-  await page.evaluate(() =>
-    document.dispatchEvent(new CustomEvent('nav-click', { detail: { path: '/' } }))
-  );
-  await expect.poll(() => socket.closes).toBe(1);
-  expect(socket.sent.some((frame) => frame.includes('AmQ='))).toBe(false);
-});
-
-test('changing the flag after bootstrap keeps an active retained session', async ({ page }) => {
-  const socket = await setup(page);
-  await page.goto(`/terminals/${agent}`);
-  await expect.poll(() => socket.attaches).toBe(1);
-  await identity(page);
-  await page.evaluate(() => {
-    window.__SCION_FEATURES__!['web.terminal_workspace'] = false;
-    document.dispatchEvent(new CustomEvent('nav-click', { detail: { path: '/' } }));
-  });
-  await expect(page).toHaveURL('/');
-  await page.evaluate(
-    (path) => document.dispatchEvent(new CustomEvent('nav-click', { detail: { path } })),
-    `/terminals/${agent}`
-  );
-  await expect
-    .poll(() => identity(page))
-    .toEqual({ host: true, pane: true, terminal: true, count: 1 });
-  expect(socket.attaches).toBe(1);
-  expect(socket.closes).toBe(0);
-});
-
 test('unsupported coordination does not create a local pane or attach', async ({ page }) => {
-  const socket = await setup(page, true, false);
+  const socket = await setup(page, false);
   await page.goto(`/terminals/${agent}`);
   await expect(page.locator('#terminal-workspace')).toContainText('unavailable');
   expect(await page.locator('#terminal-workspace scion-terminal-pane').count()).toBe(0);
@@ -580,7 +605,7 @@ test('preset rendering shows correct number of pane slots for each preset', asyn
     [agentC]: { id: agentC, name: 'a3', phase: 'running', projectId: 'proj' },
     [agentD]: { id: agentD, name: 'a4', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, fourAgents);
+  const socket = await setup(page, true, fourAgents);
 
   // Open first agent
   await page.goto(`/terminals/${agent}`);
@@ -630,6 +655,82 @@ test('preset rendering shows correct number of pane slots for each preset', asyn
   expect(singleVisible + singlePH).toBe(1);
 });
 
+/**
+ * Drop a session on whatever element is topmost at the centre of a slot's
+ * placeholder, the way a real drag would hit it. Returns false without
+ * dropping when the placeholder is missing or something else covers it.
+ */
+async function dropAtPlaceholderCentre(
+  page: Page,
+  sessionKey: string,
+  slotIndex: number
+): Promise<boolean> {
+  return page.evaluate(
+    ({ key, slot }) => {
+      const ph = document.querySelector<HTMLElement>(
+        `#terminal-workspace .terminal-slot-placeholder[data-slot-index="${slot}"]`
+      );
+      if (!ph || ph.hidden) return false;
+      const rect = ph.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (!(hit instanceof HTMLElement) || !ph.contains(hit)) return false;
+      const dt = new DataTransfer();
+      dt.setData('application/x-scion-terminal', key);
+      const drop = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt });
+      Object.defineProperty(drop, 'dataTransfer', { value: dt });
+      hit.dispatchEvent(drop);
+      return true;
+    },
+    { key: sessionKey, slot: slotIndex }
+  );
+}
+
+/** The slot index of a session's pane when it is shown, else null. */
+async function paneSlotIndex(page: Page, sessionKey: string): Promise<string | null> {
+  return page.evaluate((key) => {
+    const panes = document.querySelectorAll<
+      HTMLElement & { session: { state: { key: string } } | null }
+    >('#terminal-workspace scion-terminal-pane');
+    for (const p of panes) {
+      if (p.session?.state.key === key && p.style.display !== 'none') {
+        return p.dataset.slotIndex ?? null;
+      }
+    }
+    return null;
+  }, sessionKey);
+}
+
+test('multi-pane placeholders are visible drop targets before any slot is filled', async ({
+  page,
+}) => {
+  const socket = await setup(page);
+  await page.goto(`/terminals/${agent}`);
+  await expect.poll(() => socket.attaches).toBe(1);
+  const [sessionKey] = await getPaneSessionKeys(page);
+  expect(sessionKey).toBeTruthy();
+
+  for (const [preset, count] of [
+    ['two-columns', 2],
+    ['two-rows', 2],
+    ['four', 4],
+  ] as const) {
+    await clickPreset(page, preset);
+    await expect.poll(() => activePreset(page)).toBe(preset);
+    await expect.poll(() => visiblePaneCount(page)).toBe(0);
+    await expect.poll(() => placeholderCount(page)).toBe(count);
+    await expect(page.locator('#terminal-workspace .terminal-status')).toBeHidden();
+    await expect(page.locator('#terminal-workspace .terminal-empty')).toBeHidden();
+
+    // Moving the one session through the slots leaves every other slot
+    // empty, so each slot is tested as a placeholder in turn.
+    for (let slot = 0; slot < count; slot++) {
+      expect(await dropAtPlaceholderCentre(page, sessionKey, slot)).toBe(true);
+      await expect.poll(() => paneSlotIndex(page, sessionKey)).toBe(String(slot));
+      await expect.poll(() => placeholderCount(page)).toBe(count - 1);
+    }
+  }
+});
+
 test('fifth-agent open overflows to single when four-pane at capacity; four restores grid', async ({
   page,
 }) => {
@@ -640,7 +741,7 @@ test('fifth-agent open overflows to single when four-pane at capacity; four rest
     [agentD]: { id: agentD, name: 'a4', phase: 'running', projectId: 'proj' },
     [agentE]: { id: agentE, name: 'a5', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, fiveAgents);
+  const socket = await setup(page, true, fiveAgents);
 
   // Open 4 agents
   await page.goto(`/terminals/${agent}`);
@@ -687,7 +788,7 @@ test('open with empty four-pane slots does not overflow and places agent in visi
     [agent]: { id: agent, name: 'a1', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'a2', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open first agent — active is single, so open → select branch
   await page.goto(`/terminals/${agent}`);
@@ -743,7 +844,7 @@ test('open with available slot places agent in visible slot (full flow)', async 
     [agentB]: { id: agentB, name: 'a2', phase: 'running', projectId: 'proj' },
     [agentC]: { id: agentC, name: 'a3', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, threeAgents);
+  const socket = await setup(page, true, threeAgents);
 
   // Open first agent
   await page.goto(`/terminals/${agent}`);
@@ -819,7 +920,7 @@ test('navigating existing agent while multi active preserves preset (#1701)', as
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -943,7 +1044,7 @@ test('close clears session from layout slots', async ({ page }) => {
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -971,7 +1072,7 @@ test('focus isolation: only focused pane xterm receives typed input', async ({ p
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -1097,7 +1198,7 @@ test('populated two-columns renders two distinct terminals side by side', async 
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents (both go to single[0] via open())
   await page.goto(`/terminals/${agent}`);
@@ -1143,7 +1244,7 @@ test('populated four-grid renders four distinct terminals with identity', async 
     [agentC]: { id: agentC, name: 'a3', phase: 'running', projectId: 'proj' },
     [agentD]: { id: agentD, name: 'a4', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, fourAgents);
+  const socket = await setup(page, true, fourAgents);
 
   // Open all 4 agents
   await page.goto(`/terminals/${agent}`);
@@ -1214,7 +1315,7 @@ test('populated two-rows rendering with toolbar reachability', async ({ page }) 
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -1269,7 +1370,7 @@ test('narrow screen shows single pane; wide restores full populated layout', asy
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -1355,7 +1456,7 @@ async function simulateDragDrop(
         if (el.dataset.railFocusId === `${key}:select`) {
           const item = el.closest('.terminal-rail-item');
           if (item) {
-            dragHandle = item.querySelector('.terminal-drag-handle') as HTMLElement;
+            dragHandle = item.querySelector<HTMLElement>('.terminal-drag-handle');
             break;
           }
         }
@@ -1473,7 +1574,7 @@ test('drag rail entry to empty slot places session in correct grid position', as
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -1511,7 +1612,7 @@ test('drag rail entry to occupied slot performs swap', async ({ page }) => {
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both
   await page.goto(`/terminals/${agent}`);
@@ -1660,7 +1761,7 @@ test('keyboard "Place in pane" action places session without drag gesture', asyn
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both
   await page.goto(`/terminals/${agent}`);
@@ -1704,20 +1805,21 @@ test('keyboard "Place in pane" action places session without drag gesture', asyn
   expect(pos!.visible).toBe(true);
   expect(pos!.col).toBe('1');
 
-  // Aria-live should announce the placement
-  const announcement = await page.evaluate(() => {
-    return document.querySelector('.terminal-aria-live')?.textContent ?? '';
-  });
-  expect(announcement).toContain('Placed');
-  expect(announcement).toContain('alpha');
-  expect(announcement).toContain('slot 1');
+  // Aria-live should announce the placement. Scope to the polite status
+  // region: the bulk-action reason spans reuse the visually-hidden
+  // .terminal-aria-live class and come first in DOM order.
+  await expect(page.locator('#terminal-workspace .terminal-aria-live[role="status"]')).toHaveText(
+    'Placed alpha in slot 1'
+  );
 
   // No new sockets
   expect(socket.attaches).toBe(2);
   expect(socket.closes).toBe(0);
 });
 
-test('ordinary rail click preserves active preset, does not place (#1701)', async ({ page }) => {
+test('rail click keeps the active preset and fills the next free slot (#1701, ptone/scion#4324)', async ({
+  page,
+}) => {
   const socket = await setup(page);
 
   await page.goto(`/terminals/${agent}`);
@@ -1734,18 +1836,24 @@ test('ordinary rail click preserves active preset, does not place (#1701)', asyn
   // open() no longer clobbers the preset — stays in two-columns (#1701)
   await expect.poll(() => activePreset(page)).toBe('two-columns');
 
-  // Two-columns should still have empty slots (not affected by rail click)
-  const twoColSlots = await page.evaluate(() => {
+  // The rail click puts the terminal in the first free slot (ptone/scion#4324)
+  const slots = await page.evaluate((agentId) => {
     type WorkspaceEl = HTMLElement & {
       workspaceRoot?: {
         layoutManager: { getState: () => { twoColumns: (string | null)[] } };
+        findSessionKeyByAgentId: (id: string) => string | null;
       };
     };
     const host = document.querySelector('#terminal-workspace') as WorkspaceEl;
-    return host.workspaceRoot!.layoutManager.getState().twoColumns;
-  });
-  expect(twoColSlots).toEqual([null, null]);
+    return {
+      twoColumns: host.workspaceRoot!.layoutManager.getState().twoColumns,
+      key: host.workspaceRoot!.findSessionKeyByAgentId(agentId),
+    };
+  }, agent);
+  expect(slots.key).not.toBeNull();
+  expect(slots.twoColumns).toEqual([slots.key, null]);
 
+  // The same session: no new connection
   expect(socket.attaches).toBe(1);
 });
 
@@ -1758,7 +1866,7 @@ test('cross-preset independence: placing in two-columns does not change four-gri
     [agentC]: { id: agentC, name: 'a3', phase: 'running', projectId: 'proj' },
     [agentD]: { id: agentD, name: 'a4', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, fourAgents);
+  const socket = await setup(page, true, fourAgents);
 
   // Open all four agents
   await page.goto(`/terminals/${agent}`);
@@ -1849,7 +1957,7 @@ test('graph button hidden when agent has no projectId', async ({ page }) => {
       projectId: '',
     },
   };
-  const socket = await setup(page, true, true, noProjectAgents);
+  const socket = await setup(page, true, noProjectAgents);
   await page.goto(`/terminals/${agent}`);
   await expect.poll(() => socket.attaches).toBe(1);
 
@@ -1882,7 +1990,7 @@ test('chat button navigates to DM route with full dm key', async ({ page }) => {
 });
 
 test('chat button hidden when native chat is disabled', async ({ page }) => {
-  const socket = await setup(page, true, true, undefined, false);
+  const socket = await setup(page, true, undefined, false);
   await page.goto(`/terminals/${agent}`);
   await expect.poll(() => socket.attaches).toBe(1);
 
@@ -1962,7 +2070,7 @@ test('each pane buttons target its own agent in multi-pane layout', async ({ pag
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj-a' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj-b' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -2051,7 +2159,9 @@ test('non-owner logout broadcasts teardown, owner disposes', async ({ context })
 
   // Other tab navigates to terminals (becomes non-owner)
   await other.goto(`/terminals/${agent}`);
-  await expect(other.locator('#terminal-workspace')).toContainText('owning tab');
+  await expect(other.locator('#terminal-workspace')).toContainText(
+    'Terminals open in another window'
+  );
 
   // Non-owner fires teardown
   await other.evaluate(() => {
@@ -2219,29 +2329,10 @@ test('SSE auth-expiry check triggers teardown before login redirect', async ({ p
   //   checkAuthAndReconnect → fetch('/auth/me') → 401 →
   //   dispatchTeardown('auth-expired')
   await page.evaluate(async () => {
-    // Replace EventSource with one that fires onerror without opening,
-    // simulating a rejected SSE handshake after session invalidation.
-    window.EventSource = class extends EventTarget {
-      static CONNECTING = 0;
-      static OPEN = 1;
-      static CLOSED = 2;
-      readyState = 0;
-      onerror: (() => void) | null = null;
-      onopen: (() => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      constructor() {
-        super();
-        // Fire error on next microtask without opening first — the SSE
-        // client sees wasOpen=false and calls checkAuthAndReconnect().
-        queueMicrotask(() => {
-          this.readyState = 2;
-          this.onerror?.();
-        });
-      }
-      close(): void {
-        this.readyState = 2;
-      }
-    } as unknown as typeof EventSource;
+    // New streams from the shared stub now fire error without opening,
+    // simulating a rejected SSE handshake after session invalidation: the
+    // SSE client sees wasOpen=false and calls checkAuthAndReconnect().
+    window.__eventSourceStub.handshake = 'error';
 
     // Import the actual SSE client module and trigger the auth-check path.
     // This goes through the real SSEClient code: openConnection creates the
@@ -2438,7 +2529,7 @@ test.describe('combined regression journey', () => {
       [agentD]: { id: agentD, name: 'a4', phase: 'running', projectId: 'project-delta' },
       [agentE]: { id: agentE, name: 'a5', phase: 'running', projectId: 'project-epsilon' },
     };
-    const socket = await setup(page, true, true, fiveAgents);
+    const socket = await setup(page, true, fiveAgents);
 
     // ---------------------------------------------------------------
     // Step 1: Open 4 agents using three entry mechanisms.
@@ -2911,7 +3002,7 @@ test.describe('>12 retained sessions', () => {
       };
     }
 
-    const socket = await setup(page, true, true, agentFixtures);
+    const socket = await setup(page, true, agentFixtures);
 
     // Open first agent via direct navigation
     await page.goto(`/terminals/${agentUUIDs[0]}`);
@@ -2964,7 +3055,7 @@ test.describe('>12 retained sessions', () => {
 // - The grid icon is included in the USED_ICONS list in copy-shoelace-icons.mjs
 //   (verified by code audit below)
 // - The "Terminals" mode label renders in the header
-// - Production titles are correct in both flag-on and flag-off states
+// - Production titles are correct
 //
 // Icon packaging audit:
 // - web/scripts/copy-shoelace-icons.mjs USED_ICONS includes 'grid' (line 129)
@@ -2975,7 +3066,7 @@ test.describe('>12 retained sessions', () => {
 // ---------------------------------------------------------------------------
 
 test.describe('production icon and title verification', () => {
-  test('Terminals mode label renders in header when flag is on', async ({ page }) => {
+  test('Terminals mode label renders in header', async ({ page }) => {
     const socket = await setup(page);
     await page.goto(`/terminals/${agent}`);
     await expect.poll(() => socket.attaches).toBe(1);
@@ -2983,12 +3074,12 @@ test.describe('production icon and title verification', () => {
     // The header must show the "Terminals" mode button with session count
     await expect(page.getByRole('button', { name: 'Terminals (1)' })).toBeVisible();
 
-    // The header icon-button should use the "terminal" icon name
+    // The header mode button should use the "terminal" icon name
     const iconName = await page.evaluate(() => {
-      const btn = document
+      const icon = document
         .querySelector('scion-header')
-        ?.shadowRoot?.querySelector('sl-icon-button[label*="Terminals"]');
-      return btn?.getAttribute('name');
+        ?.shadowRoot?.querySelector('.mode-switch button[aria-label^="Terminals"] sl-icon');
+      return icon?.getAttribute('name');
     });
     expect(iconName).toBe('terminal');
   });
@@ -3055,23 +3146,6 @@ test.describe('production icon and title verification', () => {
     await expect.poll(() => page.title()).not.toContain('Terminals');
   });
 
-  test('flag-off: legacy terminal page renders standalone without workspace header', async ({
-    page,
-  }) => {
-    const socket = await setup(page, false);
-    await page.goto(`/agents/${agent}/terminal`);
-    await expect.poll(() => socket.attaches).toBe(1);
-
-    // No terminal workspace element present
-    expect(await page.locator('#terminal-workspace').count()).toBe(0);
-
-    // The page title should be set by the standalone terminal page, not "Terminals"
-    // (standalone page sets its own title via the standard page-title mechanism)
-    const title = await page.title();
-    // Legacy terminal does NOT use the workspace title "Terminals — Scion"
-    expect(title).not.toMatch(/^Terminals — Scion$/);
-  });
-
   test('grid icon is registered in USED_ICONS and renders SVG content', async ({ page }) => {
     // Verifies the grid icon actually renders (SVG loaded into shadow DOM),
     // not just that the sl-icon element exists. The original #1677 defect was
@@ -3082,7 +3156,7 @@ test.describe('production icon and title verification', () => {
       [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
       [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
     };
-    const socket = await setup(page, true, true, twoAgents);
+    const socket = await setup(page, true, twoAgents);
     await page.goto(`/terminals/${agent}`);
     await expect.poll(() => socket.attaches).toBe(1);
     await navigateToTerminal(page, agentB);
@@ -3229,7 +3303,7 @@ test('terminal drag does not trigger file upload overlay on pane', async ({ page
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -3322,7 +3396,7 @@ test('terminal drag does not trigger file upload overlay on pane', async ({ page
 
 test('empty multi-pane layout shows dotted placeholders for all slots', async ({ page }) => {
   // Start with zero agents assigned, just the empty workspace
-  await setup(page, true, true, {});
+  await setup(page, true, {});
   await page.goto('/terminals');
 
   // Wait for the workspace to render
@@ -3364,7 +3438,7 @@ test('multi-pane preset with zero terminals survives agent navigation (#1701)', 
   page,
 }) => {
   // Start with one available agent but zero terminals open
-  await setup(page, true, true, {
+  await setup(page, true, {
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
   });
   await page.goto('/terminals');
@@ -3401,7 +3475,7 @@ test('placeholders render in all multi-pane presets before any terminal is added
   page,
 }) => {
   // Zero agents available
-  await setup(page, true, true, {});
+  await setup(page, true, {});
   await page.goto('/terminals');
   await expect(page.locator('#terminal-workspace')).toBeVisible();
 
@@ -3424,7 +3498,7 @@ test('placeholders render in all multi-pane presets before any terminal is added
 
 test('explicit single-mode selection works after multi-pane preset (#1701)', async ({ page }) => {
   // Start with one agent
-  const socket = await setup(page, true, true, {
+  const socket = await setup(page, true, {
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
   });
   await page.goto(`/terminals/${agent}`);
@@ -3450,7 +3524,7 @@ test('selecting agent in multi-pane mode does not collapse to single (#1701)', a
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -3485,7 +3559,7 @@ test('focused pane has data-focused attribute in multi-pane view', async ({ page
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   // Open both agents
   await page.goto(`/terminals/${agent}`);
@@ -3595,7 +3669,7 @@ test('pane borders are visible in multi-pane layout', async ({ page }) => {
     [agent]: { id: agent, name: 'alpha', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'beta', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, twoAgents);
+  const socket = await setup(page, true, twoAgents);
 
   await page.goto(`/terminals/${agent}`);
   await expect.poll(() => socket.attaches).toBe(1);
@@ -3692,7 +3766,7 @@ test('default sort is "Added" and entries appear in creation order', async ({ pa
     [agentB]: { id: agentB, name: 'Alpha', phase: 'running', projectId: 'proj' },
     [agentC]: { id: agentC, name: 'Mu', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, agents);
+  const socket = await setup(page, true, agents);
 
   // Open agents in order: Zeta, Alpha, Mu
   await page.goto(`/terminals/${agent}`);
@@ -3715,7 +3789,7 @@ test('alphabetical sort reorders entries by agent name', async ({ page }) => {
     [agentB]: { id: agentB, name: 'Alpha', phase: 'running', projectId: 'proj' },
     [agentC]: { id: agentC, name: 'Mu', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, agents);
+  const socket = await setup(page, true, agents);
 
   await page.goto(`/terminals/${agent}`);
   await expect.poll(() => socket.attaches).toBe(1);
@@ -3758,7 +3832,7 @@ test('activity sort reorders entries by most recent activity first', async ({ pa
       lastActivityEvent: '2026-06-15T06:00:00Z',
     },
   };
-  const socket = await setup(page, true, true, agents);
+  const socket = await setup(page, true, agents);
 
   await page.goto(`/terminals/${agent}`);
   await expect.poll(() => socket.attaches).toBe(1);
@@ -3804,7 +3878,7 @@ test('activity sort handles mixed-precision ISO timestamps correctly', async ({ 
       // No lastActivityEvent — should sort last (oldest)
     },
   };
-  const socket = await setup(page, true, true, agents);
+  const socket = await setup(page, true, agents);
 
   await page.goto(`/terminals/${agent}`);
   await expect.poll(() => socket.attaches).toBe(1);
@@ -3827,7 +3901,7 @@ test('sort preserves active rail selection', async ({ page }) => {
     [agentB]: { id: agentB, name: 'Alpha', phase: 'running', projectId: 'proj' },
     [agentC]: { id: agentC, name: 'Mu', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, agents);
+  const socket = await setup(page, true, agents);
 
   // Open all agents; last opened (Mu) becomes selected
   await page.goto(`/terminals/${agent}`);
@@ -3866,7 +3940,7 @@ test('sort preserves layout preset slot assignments', async ({ page }) => {
     [agent]: { id: agent, name: 'Zeta', phase: 'running', projectId: 'proj' },
     [agentB]: { id: agentB, name: 'Alpha', phase: 'running', projectId: 'proj' },
   };
-  const socket = await setup(page, true, true, agents);
+  const socket = await setup(page, true, agents);
 
   await page.goto(`/terminals/${agent}`);
   await expect.poll(() => socket.attaches).toBe(1);
@@ -3925,7 +3999,7 @@ test('deterministic ties: agents with same name sort consistently by session key
     [agentB]: { id: agentB, name: 'twin', phase: 'running', projectId: 'proj-b' },
     [agentC]: { id: agentC, name: 'twin', phase: 'running', projectId: 'proj-c' },
   };
-  const socket = await setup(page, true, true, agents);
+  const socket = await setup(page, true, agents);
 
   await page.goto(`/terminals/${agent}`);
   await expect.poll(() => socket.attaches).toBe(1);

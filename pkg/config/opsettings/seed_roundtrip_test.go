@@ -104,7 +104,7 @@ func TestExperimentsSectionSkippedBySeeding(t *testing.T) {
 
 	k := koanf.New(".")
 	_ = k.Load(confmap.Provider(map[string]interface{}{
-		"web.terminal_workspace": false,
+		"web.sample_flag": false,
 	}, "."), nil)
 
 	raw, err := opsettings.ExtractSectionFromKoanf(k, "experiments")
@@ -117,5 +117,26 @@ func TestExperimentsSectionSkippedBySeeding(t *testing.T) {
 	}
 	if len(doc) != 0 {
 		t.Errorf("expected empty doc (seeding skipped), got %v", doc)
+	}
+}
+
+// SCION_SERVER_FEDERATION_ALGORITHMS is comma-split in bootstrap material, so
+// the extracted federation section carries a list (ptone/scion#3836).
+func TestExtractFederationSection_AlgorithmsFromServerEnv(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SCION_SERVER_FEDERATION_ALGORITHMS", "RS256,ES256")
+
+	doc, err := opsettings.ExtractSectionFromKoanf(config.LoadBootstrapKoanf(), "federation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fed struct {
+		Algorithms []string `json:"algorithms"`
+	}
+	if err := json.Unmarshal(doc, &fed); err != nil {
+		t.Fatalf("federation section %s: %v", doc, err)
+	}
+	if len(fed.Algorithms) != 2 || fed.Algorithms[0] != "RS256" || fed.Algorithms[1] != "ES256" {
+		t.Errorf("federation algorithms = %v, want [RS256 ES256] (doc %s)", fed.Algorithms, doc)
 	}
 }

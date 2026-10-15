@@ -18,7 +18,6 @@ package hub
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -29,72 +28,10 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/google/uuid"
 )
 
 // Tests for the per-run identity the hub mints, persists and sends
 // (ptone/scion#2550 P1).
-
-// runIDFixture is a store with a broker, a project and an agent row, plus a
-// dispatcher over a mock broker client.
-type runIDFixture struct {
-	store      store.Store
-	client     *mockRuntimeBrokerClient
-	dispatcher *HTTPAgentDispatcher
-	agent      *store.Agent
-}
-
-func newRunIDFixture(t *testing.T, name string) *runIDFixture {
-	t.Helper()
-	ctx := context.Background()
-	s := createTestStore(t)
-	if err := s.CreateProject(ctx, &store.Project{ID: tid("project-" + name), Name: name, Slug: name}); err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
-	if err := s.CreateRuntimeBroker(ctx, &store.RuntimeBroker{
-		ID:       tid("broker-" + name),
-		Name:     "broker-" + name,
-		Slug:     "broker-" + name,
-		Endpoint: "http://localhost:9800",
-		Status:   store.BrokerStatusOnline,
-	}); err != nil {
-		t.Fatalf("CreateRuntimeBroker: %v", err)
-	}
-	agent := &store.Agent{
-		ID:              tid("agent-" + name),
-		Name:            name,
-		Slug:            name,
-		ProjectID:       tid("project-" + name),
-		RuntimeBrokerID: tid("broker-" + name),
-		AppliedConfig:   &store.AgentAppliedConfig{HarnessConfig: "claude"},
-	}
-	if err := s.CreateAgent(ctx, agent); err != nil {
-		t.Fatalf("CreateAgent: %v", err)
-	}
-	client := &mockRuntimeBrokerClient{}
-	return &runIDFixture{
-		store:      s,
-		client:     client,
-		dispatcher: NewHTTPAgentDispatcherWithClient(s, client, false, slog.Default()),
-		agent:      agent,
-	}
-}
-
-func (f *runIDFixture) storedRunID(t *testing.T) string {
-	t.Helper()
-	got, err := f.store.GetAgent(context.Background(), f.agent.ID)
-	if err != nil {
-		t.Fatalf("GetAgent: %v", err)
-	}
-	return got.RunID
-}
-
-func requireUUID(t *testing.T, what, s string) {
-	t.Helper()
-	if _, err := uuid.Parse(s); err != nil {
-		t.Fatalf("%s = %q, want a UUID: %v", what, s, err)
-	}
-}
 
 // Create, start and restart each mint a fresh UUID run ID, persist it on
 // the row and send it to the broker. The mock broker reports no run ID (an
@@ -174,7 +111,7 @@ func TestRunID_GatherAndFinalizeMint(t *testing.T) {
 func TestRunID_ProvisionDoesNotMint(t *testing.T) {
 	ctx := context.Background()
 	f := newRunIDFixture(t, "runid-provision")
-	if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, "existing-run"); err != nil {
+	if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, "existing-run", nil); err != nil {
 		t.Fatal(err)
 	}
 	f.agent.RunID = "existing-run"
@@ -195,7 +132,7 @@ func TestRunID_ProvisionDoesNotMint(t *testing.T) {
 func TestRunID_StartOnAlreadyRunningAdoptsExistingLabel(t *testing.T) {
 	ctx := context.Background()
 	f := newRunIDFixture(t, "runid-adopt")
-	if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, "live-run"); err != nil {
+	if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, "live-run", nil); err != nil {
 		t.Fatal(err)
 	}
 	f.agent.RunID = "live-run"
@@ -230,7 +167,7 @@ type staleResponseClient struct {
 
 func (c *staleResponseClient) StartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, task, projectPath, projectSlug, harnessConfig, harnessConfigID, harnessConfigHash string, resolvedEnv map[string]string, resolvedSecrets []ResolvedSecret, inlineConfig *api.ScionConfig, sharedDirs []api.SharedDir, sharedWorkspace, resume bool, extras StartExtras) (*RemoteAgentResponse, error) {
 	c.lastStartExtras = extras
-	if _, err := c.store.SetAgentRunID(ctx, c.agentID, "newer-run"); err != nil {
+	if _, err := c.store.SetAgentRunID(ctx, c.agentID, "newer-run", nil); err != nil {
 		return nil, err
 	}
 	return &RemoteAgentResponse{Agent: &RemoteAgentInfo{
@@ -252,33 +189,6 @@ func TestRunID_StaleBrokerResponseDoesNotOverwriteNewerRun(t *testing.T) {
 	if got := f.storedRunID(t); got != "newer-run" {
 		t.Errorf("stored run_id = %q, want newer-run (the stale response must not win)", got)
 	}
-}
-
-// brokerEnvelope is a broker JSON error response, as runtimebroker's
-// writeError produces.
-func brokerEnvelope(t *testing.T, status int, code string, details map[string]interface{}) *brokerStatusError {
-	t.Helper()
-	body, err := json.Marshal(map[string]interface{}{
-		"error": map[string]interface{}{"code": code, "message": code, "details": details},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &brokerStatusError{StatusCode: status, Body: string(body)}
-}
-
-// startAttempted is the marker a broker sets on a failure from inside
-// Manager.Start.
-func startAttempted(runID string) map[string]interface{} {
-	return map[string]interface{}{api.BrokerErrorDetailStartAttempted: true, api.BrokerErrorDetailRunID: runID}
-}
-
-// startAttemptedAt is the marker plus the run the broker's runtime holds
-// after the failure (api.BrokerErrorDetailCurrentRunID).
-func startAttemptedAt(runID, current string) map[string]interface{} {
-	d := startAttempted(runID)
-	d[api.BrokerErrorDetailCurrentRunID] = current
-	return d
 }
 
 // After a failed start or restart, the hub fixes the row's run ID:
@@ -356,7 +266,7 @@ func TestRunID_FailedStartRevertsOnlyWhenNotActedOn(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRunIDFixture(t, "runid-revert")
-			if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, previous); err != nil {
+			if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, previous, nil); err != nil {
 				t.Fatal(err)
 			}
 			// The caller's struct is stale: the revert must use the
@@ -403,7 +313,7 @@ type concurrentRunClient struct {
 
 func (c *concurrentRunClient) StartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID, task, projectPath, projectSlug, harnessConfig, harnessConfigID, harnessConfigHash string, resolvedEnv map[string]string, resolvedSecrets []ResolvedSecret, inlineConfig *api.ScionConfig, sharedDirs []api.SharedDir, sharedWorkspace, resume bool, extras StartExtras) (*RemoteAgentResponse, error) {
 	c.lastStartExtras = extras
-	if _, err := c.store.SetAgentRunID(ctx, c.agentID, "newer-run"); err != nil {
+	if _, err := c.store.SetAgentRunID(ctx, c.agentID, "newer-run", nil); err != nil {
 		return nil, err
 	}
 	return nil, c.err
@@ -411,7 +321,7 @@ func (c *concurrentRunClient) StartAgent(ctx context.Context, brokerID, brokerEn
 
 func (c *concurrentRunClient) RestartAgent(ctx context.Context, brokerID, brokerEndpoint, agentID, projectID string, resolvedEnv map[string]string, extras StartExtras) (*RemoteAgentResponse, error) {
 	c.lastRestartExtras = extras
-	if _, err := c.store.SetAgentRunID(ctx, c.agentID, "newer-run"); err != nil {
+	if _, err := c.store.SetAgentRunID(ctx, c.agentID, "newer-run", nil); err != nil {
 		return nil, err
 	}
 	return nil, c.err
@@ -440,7 +350,7 @@ func TestRunID_RevertDoesNotOverwriteNewerRun(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			f := newRunIDFixture(t, "runid-revert-cas")
-			if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, "previous-run"); err != nil {
+			if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, "previous-run", nil); err != nil {
 				t.Fatal(err)
 			}
 			client := &concurrentRunClient{
@@ -472,7 +382,7 @@ func TestRunID_RevertDoesNotOverwriteNewerRun(t *testing.T) {
 func TestRunID_RestartAdoptsBrokerRunID(t *testing.T) {
 	ctx := context.Background()
 	f := newRunIDFixture(t, "runid-restart-adopt")
-	if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, "live-run"); err != nil {
+	if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, "live-run", nil); err != nil {
 		t.Fatal(err)
 	}
 	f.client.restartReturnResp = &RemoteAgentResponse{Agent: &RemoteAgentInfo{
@@ -503,7 +413,7 @@ func TestRunID_RestartAdoptsBrokerRunID(t *testing.T) {
 // failingRunIDStore fails the run ID write as a database outage would.
 type failingRunIDStore struct{ store.Store }
 
-func (failingRunIDStore) SetAgentRunID(context.Context, string, string) (string, error) {
+func (failingRunIDStore) SetAgentRunID(context.Context, string, string, *store.AgentCredential) (string, error) {
 	return "", errors.New("database is unavailable")
 }
 
@@ -850,7 +760,7 @@ func TestRunID_SkillResolutionFailureSettlesLikeStartFailure(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRunIDFixture(t, "runid-skill")
-			if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, previous); err != nil {
+			if _, err := f.store.SetAgentRunID(ctx, f.agent.ID, previous, nil); err != nil {
 				t.Fatal(err)
 			}
 			f.client.returnErr = brokerEnvelope(t, http.StatusNotFound, skillResolutionErrorCode, tc.details)

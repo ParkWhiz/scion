@@ -92,6 +92,22 @@ func (m ProjectMarker) DirName() string {
 	return fmt.Sprintf("%s__%s", slug, m.ShortUUID())
 }
 
+// projectDirSlugPattern is the grammar api.Slugify produces: lowercase
+// letters, digits and inner dashes, at most api.MaxSlugLength characters.
+var projectDirSlugPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// projectShortIDPattern is the grammar of ShortUUID for a valid project ID:
+// up to eight letters or digits.
+var projectShortIDPattern = regexp.MustCompile(`^[A-Za-z0-9]{1,8}$`)
+
+// HasCanonicalDirName reports whether DirName is built from a slug in the
+// api.Slugify grammar and the short form of a valid project ID. Callers
+// that derive a project's external config dir from trusted inputs use
+// only such a name as a path component.
+func (m ProjectMarker) HasCanonicalDirName() bool {
+	return projectDirSlugPattern.MatchString(m.ProjectSlug) && projectShortIDPattern.MatchString(m.ShortUUID())
+}
+
 // ExternalProjectPath returns the absolute path to the external project config
 // directory: ~/.scion/project-configs/<project-slug>__<short-uuid>/.scion/
 // It returns an error if the project ID does not match the project ID format.
@@ -142,8 +158,18 @@ func ReadProjectMarker(path string) (*ProjectMarker, error) {
 	return &marker, nil
 }
 
+// ErrEmptyProjectSlug is returned by WriteProjectMarker for a marker without
+// a project slug. ReadProjectMarker rejects such a marker, and its external
+// project path would be named only by the project ID.
+var ErrEmptyProjectSlug = errors.New("project marker requires a non-empty project-slug")
+
 // WriteProjectMarker writes a ProjectMarker to the given path as a YAML file.
+// A marker with an empty ProjectSlug is refused with ErrEmptyProjectSlug and
+// nothing is written.
 func WriteProjectMarker(path string, marker *ProjectMarker) error {
+	if marker == nil || marker.ProjectSlug == "" {
+		return fmt.Errorf("refusing to write project marker at %s: %w", path, ErrEmptyProjectSlug)
+	}
 	data, err := yaml.Marshal(marker)
 	if err != nil {
 		return fmt.Errorf("failed to marshal project marker: %w", err)
@@ -241,27 +267,27 @@ func ExtractSlugFromExternalDir(dirName string) string {
 }
 
 // ReadProjectID reads the project-id file from a git project's .scion
-// directory. A legacy .scion/grove-id file is migrated to project-id as a
-// side effect on every call (see MigrateLegacyProject; each migration event
-// is reported at most once per process, but the filesystem is always
-// re-checked, so a project-id removed later or a grove-id that appears
-// later are both handled correctly): when the rewrite cannot happen (e.g. a
-// read-only filesystem), the legacy value is used for this call only.
-// A value that does not match the project ID format (see ValidateProjectID)
-// is reported as an error wrapping ErrInvalidProjectID.
+// directory. A value that does not match the project ID format (see
+// ValidateProjectID) is reported as an error wrapping ErrInvalidProjectID.
+// A project-id entry that is a symbolic link is followed; callers that must
+// stay inside projectDir (project setup) use readProjectIDInDir instead.
 func ReadProjectID(projectDir string) (string, error) {
-	overrides := MigrateLegacyProject(projectDir, currentProjectMigrationReporter())
-
 	path := filepath.Join(projectDir, projectkeys.ProjectIDFile)
 	data, err := os.ReadFile(path)
 	if err == nil {
 		return checkedProjectID(path, strings.TrimSpace(string(data)))
 	}
-	if !os.IsNotExist(err) {
-		return "", err
-	}
-	if overrides.ProjectID != "" {
-		return checkedProjectID(path, overrides.ProjectID)
+	return "", err
+}
+
+// readProjectIDInDir is ReadProjectID for project setup: the file is read
+// through an os.Root opened on projectDir, so a project-id entry that is a
+// symbolic link leading out of projectDir is refused with an error rather
+// than followed.
+func readProjectIDInDir(projectDir string) (string, error) {
+	data, err := readFileInDir(projectDir, projectkeys.ProjectIDFile)
+	if err == nil {
+		return checkedProjectID(filepath.Join(projectDir, projectkeys.ProjectIDFile), strings.TrimSpace(string(data)))
 	}
 	return "", err
 }
@@ -309,6 +335,44 @@ func mkdirUnderProjectConfigs(dir string, perm os.FileMode) error {
 // WriteProjectID writes a project-id file to a git project's .scion directory.
 func WriteProjectID(projectDir string, projectID string) error {
 	return os.WriteFile(filepath.Join(projectDir, projectkeys.ProjectIDFile), []byte(projectID+"\n"), 0644)
+}
+
+// writeProjectIDInDir is WriteProjectID for project setup: the file is
+// written through an os.Root opened on projectDir, so a project-id entry
+// that is a symbolic link leading out of projectDir is refused rather than
+// followed.
+func writeProjectIDInDir(projectDir string, projectID string) error {
+	root, err := os.OpenRoot(projectDir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.WriteFile(projectkeys.ProjectIDFile, []byte(projectID+"\n"), 0644)
+}
+
+// readFileInDir reads the file name inside dir through an os.Root opened on
+// dir, so an entry that is a symbolic link leading out of dir is refused
+// rather than followed. A missing dir or file reports an error for which
+// os.IsNotExist is true.
+func readFileInDir(dir, name string) ([]byte, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	return root.ReadFile(name)
+}
+
+// mkdirAllInDir creates the directory name, and any missing parents, inside
+// dir through an os.Root opened on dir, so an existing entry that is a
+// symbolic link leading out of dir is refused rather than followed.
+func mkdirAllInDir(dir, name string, perm os.FileMode) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.MkdirAll(name, perm)
 }
 
 // GetGitProjectExternalConfigDir returns the external config directory for a git project.
@@ -430,4 +494,106 @@ func ResolveAgentDir(projectDir, agentName string) string {
 		}
 	}
 	return filepath.Join(projectDir, "agents", agentName)
+}
+
+// HarnessInputsRecordDirName is the directory, inside an agent's directory
+// (config.ResolveAgentDir / GetAgentDir), where the control plane records
+// the per-agent inputs it stages for a container-script harness. It sits
+// outside every container mount scion computes for the agent; see
+// pkg/runtime's TestHarnessInputsRecordOutsideScionMounts.
+const HarnessInputsRecordDirName = "harness-inputs"
+
+// HarnessSecretsRecordDirName is the directory, inside an agent's directory
+// next to HarnessInputsRecordDirName, where the control plane records the
+// secret files it staged for a container-script harness (mode 0700, files
+// 0600), so they can be restored on later starts. It sits outside every
+// container mount scion computes for the agent; see pkg/runtime's
+// TestHarnessInputsRecordOutsideScionMounts.
+const HarnessSecretsRecordDirName = "harness-secrets"
+
+// ImageProvenanceFileName is the broker-side file, inside an agent's
+// directory next to scion-agent.json, where ProvisionAgent records each image
+// input it saw (pkg/agent's image provenance). It sits outside every
+// container mount scion computes for the agent; see pkg/runtime's
+// TestHarnessInputsRecordOutsideScionMounts.
+const ImageProvenanceFileName = "image-provenance.json"
+
+// ErrAgentStateDirUnavailable reports that an agent's broker-side state
+// directory cannot be used for a shared-workspace agent: the external agents
+// root cannot be determined (no Hub project ID and no project-id marker), or
+// (wrapped by callers) the external agent dir a restart needs is absent.
+// Agent state for such a project is never placed in, or read from, the
+// in-project agents root, which sits inside the shared workspace mount.
+// Brokers map it to 409 (re-provision); see IsAgentStateConflict.
+var ErrAgentStateDirUnavailable = errors.New("agent state directory unavailable")
+
+// ErrAgentStateConflict reports that an agent's broker-side state exists but
+// cannot be used as recorded (for example an unusable image-provenance
+// record). Like ErrAgentStateDirUnavailable, the remedy is to re-provision the
+// agent, and brokers map it to 409; IsAgentStateConflict matches both.
+var ErrAgentStateConflict = errors.New("agent state conflict")
+
+// IsAgentStateConflict reports whether err is one of the agent-state errors a
+// broker answers with 409 (re-provision): ErrAgentStateDirUnavailable or
+// ErrAgentStateConflict.
+func IsAgentStateConflict(err error) bool {
+	return errors.Is(err, ErrAgentStateDirUnavailable) || errors.Is(err, ErrAgentStateConflict)
+}
+
+// AgentsRootForProject returns the agents root a start, restart or provision
+// addresses an agent's broker-side state under:
+//
+//   - not shared: <projectDir>/agents;
+//   - shared, with a Hub-supplied project ID: the external root
+//     ~/.scion/project-configs/<slug>__<id>/.scion/agents derived from that ID
+//     (the same naming GetGitProjectExternalAgentsDir uses); the project-id
+//     marker inside projectDir does not affect it;
+//   - shared, without a Hub project ID (a local CLI start): the external root
+//     from the project-id marker, as GetGitProjectExternalAgentsDir;
+//   - shared, but no external root can be determined: ErrAgentStateDirUnavailable,
+//     never <projectDir>/agents.
+//
+// It does not check existence; callers decide whether the agent's dir must
+// already exist.
+func AgentsRootForProject(projectDir string, sharedWorkspace bool, hubProjectID string) (string, error) {
+	if !sharedWorkspace {
+		return filepath.Join(projectDir, "agents"), nil
+	}
+	if hubProjectID != "" {
+		projectName := GetProjectName(projectDir)
+		marker := &ProjectMarker{
+			ProjectID:   hubProjectID,
+			ProjectName: projectName,
+			ProjectSlug: api.Slugify(projectName),
+		}
+		extPath, err := marker.ExternalProjectPath()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(extPath, "agents"), nil
+	}
+	ext, err := GetGitProjectExternalAgentsDir(projectDir)
+	if err != nil {
+		return "", err
+	}
+	if ext == "" {
+		return "", fmt.Errorf("%w: shared-workspace project has no external agents root", ErrAgentStateDirUnavailable)
+	}
+	return ext, nil
+}
+
+// AgentDirForProject is filepath.Join(AgentsRootForProject(...), agentName),
+// after checking that agentName is a single clean path element under that
+// root.
+func AgentDirForProject(projectDir, agentName string, sharedWorkspace bool, hubProjectID string) (string, error) {
+	root, err := AgentsRootForProject(projectDir, sharedWorkspace, hubProjectID)
+	if err != nil {
+		return "", err
+	}
+	root = filepath.Clean(root)
+	dir := filepath.Clean(filepath.Join(root, agentName))
+	if filepath.Dir(dir) != root || filepath.Base(dir) != agentName {
+		return "", fmt.Errorf("agent %q is not a single path element under %s", agentName, root)
+	}
+	return dir, nil
 }

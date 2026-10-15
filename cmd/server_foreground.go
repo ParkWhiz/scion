@@ -32,6 +32,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	policytroubleshooteriam "cloud.google.com/go/policytroubleshooter/iam/apiv3"
@@ -42,6 +44,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
 	"github.com/GoogleCloudPlatform/scion/pkg/brokercredentials"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
@@ -52,12 +55,14 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/hub"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dbmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/dispatchmetrics"
+	"github.com/GoogleCloudPlatform/scion/pkg/observability/hubexport"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/hubmetrics"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/hubtracing"
 	"github.com/GoogleCloudPlatform/scion/pkg/observability/reapermetrics"
 	scionplugin "github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin/grpcbroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	cloudrunruntime "github.com/GoogleCloudPlatform/scion/pkg/runtime/cloudrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtimebroker"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/secretmigration"
@@ -66,6 +71,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth/adcsource"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/asyncwrite"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/cloudrunenv"
 	gcputil "github.com/GoogleCloudPlatform/scion/pkg/util/gcp"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/GoogleCloudPlatform/scion/web"
@@ -125,13 +132,20 @@ func chdirHomeIfAtFilesystemRoot() {
 // by this comment.
 var pinProcessUTC = util.PinProcessUTC
 
+// Seams for tests that drive runServerStart up to a failed hub
+// initialization. Production uses the real functions.
+var (
+	initServerLoggingFn = initServerLogging
+	initHubServerFn     = initHubServer
+)
+
 func runServerStart(cmd *cobra.Command, args []string) error {
 	// Pin the process to UTC before anything else runs (log timestamps, cron
 	// parsing, ent's Default(time.Now), etc. all read time.Local).
 	pinProcessUTC()
 
 	// 1. Initialize logging
-	logCleanups, requestLogger, messageLogger, err := initServerLogging(cmd)
+	logCleanups, requestLogger, messageLogger, err := initServerLoggingFn(cmd)
 	if err != nil {
 		return err
 	}
@@ -144,7 +158,35 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateServerRole(serverRole); err != nil {
+		return err
+	}
+	if serverRole == serverRoleRelay {
+		// A separate conduit relay: no hub, Runtime Broker or web.
+		if err := validateRelayRoleFlags(cmd.Flags()); err != nil {
+			return err
+		}
+		applyServerLogLevelSetting(cfg.LogLevel)
+		ctx := cmd.Context()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		return runRelayRole(ctx, cfg)
+	}
+	// Server secrets are now in memory; remove them from the process env
+	// before anything below can start a child process. Two earlier
+	// spawns remain: on macOS the container runtime probe during logging
+	// setup, and the legacy settings migration's git ls-files during
+	// config load (pkg/config gitTracked), which runs with these names
+	// filtered out of its env.
+	scrubServerSecretEnv()
+	// Apply server.log_level (settings or SCION_SERVER_LOGLEVEL) at setting
+	// precedence. The level filter and the cloud, request and message
+	// handlers built by initServerLogging follow the shared level state, so
+	// this takes effect for every later record.
+	applyServerLogLevelSetting(cfg.LogLevel)
 	if enableHub {
+		warnRetiredServerSettings(slog.Default(), serverConfigPath)
 		if err := validateHubWorkspaceStorage(cfg); err != nil {
 			return err
 		}
@@ -208,12 +250,32 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	if projectDir, ok := config.FindProjectRoot(); ok {
 		if projectDir != globalDir {
 			parentDir := filepath.Dir(projectDir)
-			fmt.Fprintf(os.Stderr, "\n%s%s WARNING: Server is running from a project directory context (%s)%s\n",
-				util.Bold, util.Yellow, parentDir, util.Reset)
-			fmt.Fprintf(os.Stderr, "%s%s          The runtime broker will use this project's templates and settings.%s\n",
-				util.Bold, util.Yellow, util.Reset)
-			fmt.Fprintf(os.Stderr, "%s%s          For machine-wide operation, run the server from outside any project directory.%s\n\n",
-				util.Bold, util.Yellow, util.Reset)
+			fmt.Fprint(os.Stderr, util.ColorFor(os.Stderr, fmt.Sprintf("\n%s%s WARNING: Server is running from a project directory context (%s)%s\n",
+				util.Bold, util.Yellow, parentDir, util.Reset)))
+			fmt.Fprint(os.Stderr, util.ColorFor(os.Stderr, fmt.Sprintf("%s%s          The runtime broker will use this project's templates and settings.%s\n",
+				util.Bold, util.Yellow, util.Reset)))
+			fmt.Fprint(os.Stderr, util.ColorFor(os.Stderr, fmt.Sprintf("%s%s          For machine-wide operation, run the server from outside any project directory.%s\n\n",
+				util.Bold, util.Yellow, util.Reset)))
+		}
+	}
+
+	// 4b. Workstation mode only: without an image registry the co-located
+	// broker cannot pull agent images. Rather than exiting, start the hub
+	// and web without the broker so the onboarding wizard (which sets the
+	// registry) is reachable. This runs before the hub is created so the
+	// broker is never marked as expected (ExpectEmbeddedBroker), which
+	// would leave /healthz degraded. Hosted mode keeps failing fast at
+	// broker start (step 13). The broker cannot be started in place later,
+	// so the fix is a restart.
+	if !hostedMode {
+		disableBroker, err := workstationBrokerRegistryDegrade(cfg.RuntimeBroker.Enabled, enableHub || enableWeb, requireImageRegistryForBroker)
+		if err != nil {
+			return err
+		}
+		if disableBroker {
+			slog.Warn("image_registry is not configured; starting without the runtime broker. Set the registry in the setup wizard or with 'scion config set --global image_registry <registry>', then run 'scion server restart'.")
+			fmt.Fprintln(os.Stderr, "Warning: "+brokerSkippedNotice)
+			cfg.RuntimeBroker.Enabled = false
 		}
 	}
 
@@ -250,14 +312,11 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
-
-	go func() {
-		sig := <-sigCh
-		log.Printf("Received signal %v, shutting down...", sig)
-		cancel()
-	}()
+	// The returned done channel is for tests only: do not wait on it here
+	// (architect ruling R11b). The goroutine may be inside the shutdown's
+	// synchronous log write, and joining it would make this return depend
+	// on the logger.
+	_ = installServerShutdownSignals(ctx, signal.Notify, cancel)
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 3)
@@ -279,7 +338,7 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	// `server start` invocation regardless of which components it enables.
 	// On-disk layout migration is expected to run at this same hook point.
 	config.WarnRemovedLegacyEnvOnce(os.Getenv, config.NewSlogReporter())
-	// Per-project migration (config.ReadProjectID, as projects load) reports
+	// Legacy settings and marker key migration (as projects load) reports
 	// through slog here too. This is already the default, but set it
 	// explicitly so all three boot hooks (CLI, hub, broker) are visible at
 	// their call sites.
@@ -289,6 +348,9 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	config.MigrateLegacyGlobalLayoutOnce(globalDir, config.NewSlogReporter())
 
 	// 8. Initialize store
+	if err := validateTestModeRequiresHub(enableHub); err != nil {
+		return err
+	}
 	var s store.Store
 	var entClient *ent.Client
 	if enableHub {
@@ -319,8 +381,17 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 10. Resolve hub endpoint
-	hubEndpoint := resolveHubEndpoint(cfg, brokerSettings)
+	// 10. Resolve hub endpoint: the operator endpoint (environment, flags,
+	// settings.yaml and fallbacks), then the endpoint in effect, which a
+	// server.hub.public_url saved in the settings database can replace
+	// unless an operator setting pins it (ptone/scion#3905). Resolved before
+	// the hub is constructed so every derivation sees the same value.
+	operatorEndpoint, operatorEndpointSrc := resolveServerHubEndpoint(cfg, brokerSettings)
+	hubEndpoints, err := resolveHubEndpoints(ctx, s, operatorHubEndpoint{URL: operatorEndpoint, Source: operatorEndpointSrc})
+	if err != nil {
+		return err
+	}
+	hubEndpoint, hubEndpointSrc := effectiveHubEndpoint(hubEndpoints, operatorEndpointSrc)
 
 	// Parse admin emails
 	adminEmailList := parseAdminEmails(cfg)
@@ -348,6 +419,11 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	// 10b. Initialize plugin manager
 	pluginMgr := initPluginManager(ctx, secretBackend, s)
 	defer pluginMgr.Shutdown()
+	// From the shutdown signal on, plugin process exits are expected: the
+	// service manager's SIGTERM can reach the plugins before Shutdown
+	// above runs (ptone/scion#4869).
+	stopPluginShutdownMark := context.AfterFunc(ctx, pluginMgr.BeginShutdown)
+	defer stopPluginShutdownMark()
 
 	// 11. Start Hub
 	var hubSrv *hub.Server
@@ -355,10 +431,38 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	if enableHub {
 
 		var hubInitErr error
-		hubSrv, hubInitErr = initHubServer(ctx, cfg, s, entClient, hubEndpoint, devAuthToken, adminEmailList, adminMode, maintenanceMessage, requestLogger, messageLogger, globalDir, pluginMgr, secretBackend)
+		hubSrv, hubInitErr = initHubServerFn(ctx, cfg, s, entClient, hubEndpoints, devAuthToken, adminEmailList, adminMode, maintenanceMessage, requestLogger, messageLogger, globalDir, pluginMgr, secretBackend)
 		if hubInitErr != nil {
-			log.Fatalf("Hub server failed to start: %v", hubInitErr)
+			// Return rather than log.Fatalf so the deferred cleanups (store
+			// close, plugin shutdown, log flush including Cloud Logging) run.
+			// Startup stays fail-closed: nothing is serving yet. The exit
+			// status is still 1 (exitCodeFor).
+			log.Printf("Hub server failed to start: %v", hubInitErr)
+			return fmt.Errorf("hub server failed to start: %w", hubInitErr)
 		}
+
+		// Flush telemetry providers before the store closes on exit.
+		exit := &hubExitSequence{}
+		defer exit.run()
+
+		// Close the decision-log audit writer on EVERY return from here on
+		// (architect ruling R5), including the startup-failure returns in
+		// steps 11-13 that can happen after the Hub API (step 11) or the
+		// web server (step 12) is already serving. Bounded by the writer's
+		// own drain timeout; idempotent with the step-16 close in
+		// awaitServerExit and with Server.Shutdown's close. Defers run LIFO:
+		// this runs before exit.run (registered just above, so telemetry
+		// flushes after the writer's final counts) and before the log
+		// cleanups deferred at step 1.
+		defer func() {
+			closeCtx, cancelClose := context.WithTimeout(context.Background(), asyncwrite.DefaultDrainTimeout)
+			defer cancelClose()
+			_ = hubSrv.CloseAuditWriter(closeCtx)
+		}()
+
+		// /healthz cloud_logging: present only when initServerLogging
+		// configured a Cloud Logging handler (P2).
+		wireCloudLoggingHealth(hubSrv, serverCloudWriter())
 
 		// The co-located broker registers (startRuntimeBroker, step 13)
 		// only after the Hub API is serving. Mark it as expected now, under
@@ -369,38 +473,34 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 			hubSrv.ExpectEmbeddedBroker()
 		}
 
+		// Metrics and traces share one resolved identity. initHubServerFn
+		// has applied the operational settings, so the hub name is the
+		// applied one (ptone/scion#4903).
+		telemetryID := newHubTelemetryIdentity(hubSrv)
+
+		// Decide the hub's own exporters once, from the observability
+		// switches and the export project (ptone/scion#4914). Each
+		// exporter logs one line saying whether it runs and why.
+		obs := hubObservabilityExport(cfg, hubSrv)
+
 		// Wire hub OTel tracing export to Cloud Trace.
-		if parseBoolEnv("SCION_TRACING_ENABLED") && cfg.Hub.GCPProjectID != "" {
-			tp, tpErr := hubtracing.NewTracerProvider(ctx, cfg.Hub.GCPProjectID,
-				hubtracing.WithHubID(hubSrv.HubID()),
-				hubtracing.WithHubName(cfg.Hub.ResolveHubName()),
-			)
+		if obs.Tracing.Enabled {
+			tp, tpErr := hubtracing.NewTracerProvider(ctx, obs.Tracing.Project.ID, telemetryID.tracingOptions()...)
 			if tpErr != nil {
-				log.Printf("WARNING: hub tracing export disabled: %v", tpErr)
+				obs.Tracing = obs.Tracing.Failed(tpErr)
 			} else {
-				defer func() {
-					shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					defer cancel()
-					_ = tp.Shutdown(shutdownCtx)
-				}()
-				log.Printf("Hub OTel tracing enabled (project: %s)", cfg.Hub.GCPProjectID)
+				exit.addFlush(tp.Shutdown)
 			}
 		}
+		log.Print(obs.Tracing.LogLine())
 
 		// Wire hub OTel metrics export to Cloud Monitoring.
-		if cfg.Hub.GCPProjectID != "" {
-			mp, mpErr := hubmetrics.NewMeterProvider(ctx, cfg.Hub.GCPProjectID,
-				hubmetrics.WithHubID(hubSrv.HubID()),
-				hubmetrics.WithHubName(cfg.Hub.ResolveHubName()),
-			)
+		if obs.Metrics.Enabled {
+			mp, mpErr := hubmetrics.NewMeterProvider(ctx, obs.Metrics.Project.ID, telemetryID.metricsOptions()...)
 			if mpErr != nil {
-				log.Printf("WARNING: hub metrics export disabled: %v", mpErr)
+				obs.Metrics = obs.Metrics.Failed(mpErr)
 			} else {
-				defer func() {
-					shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					defer cancel()
-					_ = mp.Shutdown(shutdownCtx)
-				}()
+				exit.addFlush(mp.Shutdown)
 
 				hubDBRec = wireHubCoreMetrics(hubSrv, mp)
 
@@ -428,10 +528,10 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 					hubSrv.SetGoogleValidatorCacheMetrics(otelExtBearer)
 					hubSrv.SetGEExchangeMetrics(otelExtBearer)
 				}
-
-				log.Printf("Hub OTel metrics export enabled (project: %s)", cfg.Hub.GCPProjectID)
 			}
 		}
+		log.Print(obs.Metrics.LogLine())
+		hubSrv.SetObservabilityExportStatus(obs)
 
 		// Wire command bus for cross-node dispatch (B2-4).
 		cmdBus, err := newCommandBus(ctx, cfg, hubSrv)
@@ -443,7 +543,7 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		// Conduit relay (hub.conduit): after operational settings are
 		// loaded (initHubServer) and before the background services start,
 		// which register the registry singleton only when a relay runs.
-		if err := startConduit(ctx, cfg, hubSrv, hubEndpoint, &wg, errCh); err != nil {
+		if err := startConduit(ctx, cancel, cfg, hubSrv, hubEndpoints.For(hub.HubEndpointForConduitCheck), &wg, errCh); err != nil {
 			return err
 		}
 
@@ -473,7 +573,9 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 			go func() {
 				defer wg.Done()
 				<-ctx.Done()
-				_ = hubSrv.CleanupResources(context.Background())
+				// Background teardown only: the audit writer closes
+				// after every server has drained (awaitServerExit).
+				_ = hubSrv.CleanupBackgroundResources(context.Background())
 			}()
 		}
 	}
@@ -513,11 +615,14 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// 13. Start Broker
+	// On a Cloud Run service host, warn once that async launches need CPU
+	// allocated outside requests (ptone/scion#4763). No-op elsewhere.
+	cloudrunruntime.WarnCPUAllocationIfNeeded(slog.Default(), os.Getenv, cfg.RuntimeBroker.Enabled)
 	if cfg.RuntimeBroker.Enabled {
 		if err := requireImageRegistryForBroker(); err != nil {
 			return err
 		}
-		if err := startRuntimeBroker(ctx, cmd, cfg, hubSrv, webSrv, s, hubEndpoint, devAuthToken, brokerSettings, brokerDefaultProfile, globalDir, requestLogger, messageLogger, &wg, errCh); err != nil {
+		if err := startRuntimeBroker(ctx, cmd, cfg, hubSrv, webSrv, s, hubEndpoint, hubEndpointSrc, devAuthToken, brokerSettings, brokerDefaultProfile, globalDir, requestLogger, messageLogger, &wg, errCh); err != nil {
 			return err
 		}
 	}
@@ -554,6 +659,17 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		var webStore hub.WebChatStore
 		if dbProvider, ok := s.(interface{ DB() *sql.DB }); ok {
 			if rawDB := dbProvider.DB(); rawDB != nil {
+				// Artifact store: creates the artifact_* tables (outside
+				// the Ent migration graph, design D3) on every start,
+				// whether or not the hub.artifacts experiment is on.
+				as := artifacts.NewStore(rawDB, cfg.Database.Driver)
+				if err := as.Init(ctx); err != nil {
+					log.Printf("Warning: failed to initialize artifact store: %v", err)
+				} else {
+					hubSrv.SetArtifactStore(as)
+					log.Printf("Artifact store initialized")
+				}
+
 				ws := hub.NewWebChatStore(rawDB, cfg.Database.Driver)
 				if err := ws.Init(); err != nil {
 					log.Printf("Warning: failed to initialize webchat store: %v", err)
@@ -685,12 +801,16 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 									log.Printf("Warning: failed to register broker entity for plugin %q: %v", bt, createErr)
 								}
 							}
+							// The hub provisions this record in-process: the test
+							// admin tier admits it by this id, never by a stored
+							// attribute.
+							hubSrv.RegisterInProcessPluginBroker(brokerID)
 							secretKey, secretErr := authSvc.GenerateAndStoreSecret(ctx, brokerID)
 							if secretErr != nil {
 								log.Printf("Warning: failed to generate secret for broker plugin %q: %v", bt, secretErr)
 							} else {
 								hubCreds := map[string]string{
-									"hub_url":     hubEndpoint,
+									"hub_url":     hubSrv.HubEndpointFor(hub.HubEndpointForPluginBrokers),
 									"hmac_key":    secretKey,
 									"broker_id":   brokerID,
 									"plugin_name": bt,
@@ -770,34 +890,115 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 					pluginMgr.SetBrokerHostCallbacks(proxy)
 				}
 			}
+		} else if err != nil {
+			log.Printf("Warning: failed to load settings; message broker is not started: %v", err)
 		}
 
 		hubSrv.StartNotificationDispatcher()
 		hubSrv.InitPresenceManager()
 	}
 
-	// 15. Print startup banner
-	if !hostedMode {
-		log.Println("Scion server ready (workstation mode)")
-		if enableWeb {
-			displayHost := cfg.Hub.Host
-			if displayHost == "0.0.0.0" || displayHost == "" {
-				displayHost = "127.0.0.1"
-			}
-			log.Printf("Web UI: http://%s:%d", displayHost, webPort)
-		}
-		if devAuthToken != "" {
-			log.Printf("Developer token: export SCION_DEV_TOKEN=%s", devAuthToken)
+	// 14a. Test admin tier broker check: once the co-located broker (step
+	// 13) and the hub's in-process plugin broker records (step 14) are
+	// known, no other runtime broker may be registered and active.
+	// Registration and broker authentication of any other broker are
+	// refused from hub construction on, so this closes the startup window.
+	if enableHub && hubSrv != nil {
+		if err := hubSrv.VerifyTestAdminBrokerSet(ctx); err != nil {
+			return err
 		}
 	}
 
+	// 15. Print startup banner
+	if !hostedMode {
+		logWorkstationReadyBanner(cfg, globalDir, enableWeb, webPort, devAuthToken)
+	}
+
 	// 16. Wait for either an error or context cancellation
+	var closeAudit func(context.Context) error
+	if hubSrv != nil {
+		closeAudit = hubSrv.CloseAuditWriter
+	}
+	return awaitServerExit(ctx, errCh, cancel, wg.Wait, closeAudit)
+}
+
+// serverShutdown is the run-once graceful shutdown that
+// installServerShutdownSignals publishes once the process is subscribed to
+// SIGINT and SIGTERM (runServerStart step 7). Nil until then. The foreground
+// broker's SIGTERM handler calls it directly (see handleBrokerSIGTERM).
+var serverShutdown atomic.Pointer[func(os.Signal)]
+
+// installServerShutdownSignals is step 7 of runServerStart: SIGINT
+// (Ctrl+C) and SIGTERM (systemd, Kubernetes, container stop) both start the
+// graceful shutdown, which logs "Received signal ..." and calls cancel, once.
+// Only the first signal is acted on; the subscription is never stopped, so a
+// second signal is ignored rather than killing the process mid-drain.
+// Orchestrators that escalate to SIGKILL after their grace period still
+// terminate the process immediately. notify is signal.Notify in production
+// and injectable in tests.
+//
+// The signal goroutine also exits when ctx is done (runServerStart cancels
+// ctx on every return), unless it is inside the shutdown's synchronous log
+// line, in which case it exits when that write returns. A signal arriving
+// after that is still swallowed by the subscription, without a log line,
+// unless the foreground broker's SIGTERM handler calls the published
+// shutdown, which then logs once (and cancels a no-op), as on base.
+// The returned done channel is closed as the goroutine's last action; it
+// exists for tests, and production must not wait on it.
+//
+// The run-once shutdown is published in serverShutdown strictly after
+// notify returns, so a caller that finds it unpublished knows the server
+// may not be subscribed yet.
+func installServerShutdownSignals(ctx context.Context, notify func(chan<- os.Signal, ...os.Signal), cancel context.CancelFunc) (done <-chan struct{}) {
+	var once sync.Once
+	shutdown := func(sig os.Signal) {
+		once.Do(func() {
+			log.Printf("Received signal %v, shutting down...", sig)
+			cancel()
+		})
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		select {
+		case sig := <-sigCh:
+			if ctx.Err() == nil {
+				shutdown(sig)
+			}
+		case <-ctx.Done():
+		}
+	}()
+
+	serverShutdown.Store(&shutdown)
+	return exited
+}
+
+// awaitServerExit is step 16 of runServerStart. On cancellation it calls
+// wait (production: the server WaitGroup's Wait; each server's Start
+// returns only after its shutdown and HTTP drain), then closes the hub
+// audit writer, so records
+// emitted by draining requests are written; this runs before
+// runServerStart's deferred log cleanups. On a server error it cancels and
+// closes the writer without waiting: requests still draining then have
+// their audit records counted as closed. closeAudit may be nil (no hub);
+// the close is bounded by the writer's own drain timeout.
+func awaitServerExit(ctx context.Context, errCh <-chan error, cancel context.CancelFunc, wait func(), closeAudit func(context.Context) error) error {
 	select {
 	case err := <-errCh:
 		cancel()
+		if closeAudit != nil {
+			_ = closeAudit(context.Background())
+		}
 		return err
 	case <-ctx.Done():
-		wg.Wait()
+		wait()
+		if closeAudit != nil {
+			_ = closeAudit(context.Background())
+		}
 		return nil
 	}
 }
@@ -837,7 +1038,7 @@ func warnShadowedBrokerEnv(ctx context.Context, w brokerEnvShadowWarner) {
 // initServerLogging initializes all logging subsystems and returns cleanup functions.
 func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *slog.Logger, messageLogger *slog.Logger, err error) {
 	useGCP := parseBoolEnv("SCION_LOG_GCP")
-	if os.Getenv("K_SERVICE") != "" {
+	if cloudrunenv.IsService() {
 		useGCP = true
 	}
 	if !hostedMode && os.Getenv("SCION_LOG_GCP") == "" {
@@ -885,7 +1086,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	}
 	var cloudHandler slog.Handler
 	if cloudLoggingEnabled {
-		logLevel := logging.ResolveLogLevel(enableDebug)
+		logLevel := logging.ResolveLogLeveler(enableDebug)
 		logCfg := logging.CloudLoggingConfig{
 			Component: component,
 			HubName:   hubName,
@@ -916,7 +1117,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 		HubID:      hubID,
 		UseGCP:     useGCP,
 		Foreground: serverStartForeground,
-		Level:      logging.ResolveLogLevel(enableDebug),
+		Level:      logging.ResolveLogLeveler(enableDebug),
 	}
 	if ch, ok := cloudHandler.(*logging.ResilientCloudHandler); ok && ch != nil {
 		reqLogCfg.CloudClient = ch.Client()
@@ -938,7 +1139,7 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 		HubName:   hubName,
 		HubID:     hubID,
 		UseGCP:    useGCP,
-		Level:     logging.ResolveLogLevel(enableDebug),
+		Level:     logging.ResolveLogLeveler(enableDebug),
 	}
 	if ch, ok := cloudHandler.(*logging.ResilientCloudHandler); ok && ch != nil {
 		msgLogCfg.CloudClient = ch.Client()
@@ -956,6 +1157,53 @@ func initServerLogging(cmd *cobra.Command) (cleanups []func(), requestLogger *sl
 	return cleanups, requestLogger, messageLogger, nil
 }
 
+// applyServerLogLevelSetting applies the server.log_level setting to the
+// shared level state and logs the resolved level and its source. Precedence
+// is the --debug flag, then SCION_LOG_LEVEL (or SCION_DEBUG), then
+// server.log_level, then the default (info).
+func applyServerLogLevelSetting(level string) {
+	logging.ApplyLogLevelSetting("server.log_level", level)
+	logging.LogResolvedLevel(slog.Default())
+}
+
+// applyServerListenHosts applies the listen-host rules for the hub/web
+// listener (cfg.Hub.Host) and the runtime broker listener
+// (cfg.RuntimeBroker.Host). hostSet and host are the --host flag state.
+//
+//   - --host sets only the hub and web listen address, in every mode.
+//   - Workstation mode: the hub defaults to loopback when --host is not set.
+//     The co-located broker stays on loopback unless the broker host is set
+//     explicitly (server.broker.host); --host does not move it.
+//   - Hosted mode: a standalone broker (broker enabled, hub disabled) defaults
+//     to loopback when --host is not set, so that `scion broker register` can
+//     reach it locally before HMAC keys exist. Otherwise the broker keeps its
+//     configured host.
+func applyServerListenHosts(cfg *config.GlobalConfig, hosted, hostSet bool, host string, hubEnabled bool) {
+	if !hosted {
+		if !hostSet {
+			cfg.Hub.Host = "127.0.0.1"
+		}
+		if !brokerHostExplicit(cfg) {
+			cfg.RuntimeBroker.Host = "127.0.0.1"
+		}
+	} else if !hostSet && cfg.RuntimeBroker.Enabled && !hubEnabled {
+		cfg.RuntimeBroker.Host = "127.0.0.1"
+	}
+	if hostSet {
+		cfg.Hub.Host = host
+	}
+}
+
+// brokerHostExplicit reports whether the loaded settings set the broker host
+// to something other than the built-in default. The loaded config does not
+// record which keys came from a file or the environment, so a value equal to
+// the default (config.DefaultBrokerHost) cannot be told apart from an unset
+// one and counts as not explicit.
+func brokerHostExplicit(cfg *config.GlobalConfig) bool {
+	h := cfg.RuntimeBroker.Host
+	return h != "" && h != config.DefaultBrokerHost
+}
+
 // validateHubWorkspaceStorage fails hub startup when server.workspace_storage
 // cannot be used: an unknown backend, nfs without shares, a volume backend
 // without volume_name, or an invalid subpath_root. Without it the hub would
@@ -970,9 +1218,21 @@ func validateHubWorkspaceStorage(cfg *config.GlobalConfig) error {
 	// idempotent and keeps this check independent of the load path.
 	cfg.WorkspaceStorage.ApplyWorkspaceStorageDefaults()
 	if err := cfg.WorkspaceStorage.ValidateWorkspaceStorage(); err != nil {
-		return fmt.Errorf("invalid server.workspace_storage: %w", err)
+		// The wrapped error already names the key (for example
+		// server.workspace_storage.nfs.uid), so do not repeat it here.
+		return fmt.Errorf("invalid workspace storage settings: %w", err)
 	}
 	return nil
+}
+
+// warnRetiredServerSettings logs one warning for each retired server setting
+// still set in the server config or environment. The loader ignores them, so
+// without this a hub would silently change behaviour after an upgrade
+// (ptone/scion#4991).
+func warnRetiredServerSettings(logger *slog.Logger, configPath string) {
+	for _, w := range config.RetiredServerSettingWarnings(configPath) {
+		logger.Warn(w)
+	}
 }
 
 // loadAndReconcileConfig loads the server configuration file and reconciles
@@ -996,15 +1256,20 @@ func loadAndReconcileConfig(cmd *cobra.Command) (*config.GlobalConfig, error) {
 		}
 	}
 
+	if err := validateDebugEndpoints(hostedMode, enableDebugEndpoints); err != nil {
+		return nil, err
+	}
+	// Test mode: the flag-only checks (removed flags, G3, G5) run before
+	// anything else is reconciled; the full gate runs at hub construction.
+	if err := validateTestModeFlagsEarly(cmd); err != nil {
+		return nil, err
+	}
+
 	// Apply workstation defaults
 	if !hostedMode {
 		applyWorkstationDefaults(cmd)
 		cfg.RuntimeBroker.Enabled = enableRuntimeBroker
 		cfg.Auth.Enabled = enableDevAuth
-		if !cmd.Flags().Changed("host") {
-			cfg.Hub.Host = "127.0.0.1"
-			cfg.RuntimeBroker.Host = "127.0.0.1"
-		}
 		if !cmd.Flags().Changed("storage-bucket") {
 			cfg.Storage.Provider = "local"
 		}
@@ -1029,9 +1294,6 @@ func loadAndReconcileConfig(cmd *cobra.Command) (*config.GlobalConfig, error) {
 	if cmd.Flags().Changed("port") {
 		cfg.Hub.Port = hubPort
 	}
-	if cmd.Flags().Changed("host") {
-		cfg.Hub.Host = hubHost
-	}
 	if cmd.Flags().Changed("db") {
 		cfg.Database.URL = dbURL
 	}
@@ -1052,12 +1314,7 @@ func loadAndReconcileConfig(cmd *cobra.Command) (*config.GlobalConfig, error) {
 	}
 	applyConduitFlagOverrides(cmd, cfg)
 
-	// Standalone broker in hosted mode: default to loopback when host
-	// is not explicitly set. The broker needs to start on loopback so that
-	// `scion broker register` can reach it locally before HMAC keys exist.
-	if hostedMode && !cmd.Flags().Changed("host") && cfg.RuntimeBroker.Enabled && !enableHub {
-		cfg.RuntimeBroker.Host = "127.0.0.1"
-	}
+	applyServerListenHosts(cfg, hostedMode, cmd.Flags().Changed("host"), hubHost, enableHub)
 
 	// Fallback to legacy environment variable
 	if cfg.Storage.Bucket == "" && hostedMode {
@@ -1086,7 +1343,7 @@ func hostedHAGuardsRequired(cfg *config.GlobalConfig) bool {
 // isHADeployment returns true when the configuration indicates a multi-instance
 // (Cloud Run / HA) deployment rather than a single-instance GCE VM.
 func isHADeployment(cfg *config.GlobalConfig) bool {
-	if os.Getenv("K_SERVICE") != "" {
+	if cloudrunenv.IsService() {
 		return true
 	}
 	if strings.EqualFold(cfg.Database.Driver, "postgres") {
@@ -1098,10 +1355,21 @@ func isHADeployment(cfg *config.GlobalConfig) bool {
 	return false
 }
 
+// validateDebugEndpoints refuses --enable-debug-endpoints in hosted mode.
+// Diagnostic endpoints are for local development only.
+func validateDebugEndpoints(hosted, enabled bool) error {
+	if hosted && enabled {
+		return fmt.Errorf("--enable-debug-endpoints is not allowed in hosted mode; diagnostic endpoints are for local development only")
+	}
+	return nil
+}
+
 // validateHostedBasic runs lightweight checks that apply to all --hosted
-// deployments (both single-instance VMs and Cloud Run HA).
+// deployments (both single-instance VMs and Cloud Run HA). The session
+// secret backs hub JWT signing and web sessions only, so a broker-only
+// process (runtime-broker start) does not warn about it (#3605).
 func validateHostedBasic(cfg *config.GlobalConfig) {
-	if !hostedMode || cfg == nil {
+	if !hostedMode || cfg == nil || (!enableHub && !enableWeb) {
 		return
 	}
 	if strings.TrimSpace(resolveSessionSecret()) == "" {
@@ -1227,7 +1495,42 @@ func validateServerPreflight(cfg *config.GlobalConfig) error {
 	if err := cfg.Hub.Conduit.Validate(); err != nil {
 		return err
 	}
+	if err := cfg.Hub.PortProxy.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.Relay.Validate(); err != nil {
+		return err
+	}
+	if err := validateConduitPeerSecret(cfg.Hub.Conduit, false, sessionSecretValue()); err != nil {
+		return err
+	}
+	if _, err := hub.ParseAgentRunScope(cfg.Auth.AgentRunScope, cfg.Auth.AgentRunScopeLegacyUntil); err != nil {
+		return err
+	}
 	return nil
+}
+
+// portProxyResponseHeaderTimeoutSetting returns the configured bound on
+// the wait for an agent port's response headers (default 60s).
+// validateServerPreflight has already rejected a malformed or
+// out-of-range value.
+func portProxyResponseHeaderTimeoutSetting(cfg *config.GlobalConfig) time.Duration {
+	d, err := cfg.Hub.PortProxy.ResponseHeaderTimeoutDuration()
+	if err != nil {
+		return config.PortProxyDefaultResponseHeaderTimeout
+	}
+	return d
+}
+
+// agentRunScopeSetting returns the parsed agent run-scope setting.
+// validateServerPreflight has already rejected an invalid value, so an
+// error here falls back to the default (off).
+func agentRunScopeSetting(cfg *config.GlobalConfig) hub.AgentRunScope {
+	s, err := hub.ParseAgentRunScope(cfg.Auth.AgentRunScope, cfg.Auth.AgentRunScopeLegacyUntil)
+	if err != nil {
+		return hub.AgentRunScope{}
+	}
+	return s
 }
 
 // isSupportedIAPAudience returns true when audience is a recognised IAP
@@ -1395,9 +1698,21 @@ func initStore(ctx context.Context, cfg *config.GlobalConfig) (store.Store, *ent
 	// Postgres and on a store with nothing to repair.
 	tsRepair := repairUnreadableTimestamps(ctx, s)
 
+	// On Postgres, refuse to migrate when the search_path would build a
+	// fresh table set that shadows existing hub tables in a later schema,
+	// unless server.database.allow_shadowed_schema is set. Only hub startup
+	// enables this check.
+	s.EnableSchemaShadowGuard(cfg.Database.AllowShadowedSchema)
+
+	// On SQLite, snapshot the database when the migration (after
+	// PreMigrate) is about to apply declared ON DELETE actions to orphaned
+	// rows. A snapshot that is needed but fails stops startup before the
+	// reconcile changes any rows.
+	s.SetBeforeFKReconcile(snapshotBeforeFKReconcile)
+
 	// Migrate runs Ent's schema migration and seeds built-in maintenance
 	// operations (parity with the former raw-SQL store).
-	if err := migrateStore(ctx, cfg, s); err != nil {
+	if err := migrateStore(ctx, s); err != nil {
 		_ = s.Close()
 		return nil, nil, fmt.Errorf("failed to run migrations: %w", err)
 	}
@@ -1413,42 +1728,13 @@ func initStore(ctx context.Context, cfg *config.GlobalConfig) (store.Store, *ent
 	return s, entClient, nil
 }
 
-func migrateStore(ctx context.Context, cfg *config.GlobalConfig, s *entadapter.CompositeStore) error {
-	if !strings.EqualFold(cfg.Database.Driver, "postgres") {
-		return s.Migrate(ctx)
-	}
-
-	db := s.DB()
-	if db == nil {
-		return fmt.Errorf("postgres store does not expose a database connection")
-	}
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("acquiring migration lock connection: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", int64(store.LockSchemaMigration)); err != nil {
-		return fmt.Errorf("acquiring migration advisory lock: %w", err)
-	}
-	locked := true
-	defer func() {
-		if locked {
-			if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", int64(store.LockSchemaMigration)); err != nil {
-				slog.Error("Failed to release migration advisory lock", "error", err)
-			}
-		}
-	}()
-
-	if err := s.Migrate(ctx); err != nil {
-		return err
-	}
-
-	if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", int64(store.LockSchemaMigration)); err != nil {
-		return fmt.Errorf("releasing migration advisory lock: %w", err)
-	}
-	locked = false
-	return nil
+// migrateStore runs the schema migration and seed data. On Postgres it is
+// serialized across Hub replicas by the store.LockSchemaMigration advisory
+// lock; see CompositeStore.MigrateWithSchemaLock, which owns the locked path
+// so its Postgres integration test exercises the same code
+// (ptone/scion#1078).
+func migrateStore(ctx context.Context, s *entadapter.CompositeStore) error {
+	return s.MigrateWithSchemaLock(ctx)
 }
 
 // runWithAdvisoryLock runs fn under a TryAdvisoryLock if the store implements
@@ -1464,7 +1750,9 @@ func migrateStore(ctx context.Context, cfg *config.GlobalConfig, s *entadapter.C
 // per-resource OverwritePolicy checks, secretmigration.MigratePluginSecrets
 // checks for existing secret values)
 // and no-ops if so. The winning replica does the work; the others skip it
-// here and will see the completed state on their next access.
+// here and will see the completed state on their next access. Exception:
+// the workstation resource bootstrap imports per-replica disk content; see
+// bootstrapWorkstationResources.
 func runWithAdvisoryLock(ctx context.Context, s store.Store, key store.AdvisoryLockKey, label string, fn func()) {
 	if s == nil {
 		fn()
@@ -1489,6 +1777,42 @@ func runWithAdvisoryLock(ctx context.Context, s store.Store, key store.AdvisoryL
 	}
 	defer func() { _ = release() }()
 	fn()
+}
+
+// workstationResourceBootstrapper is the subset of *hub.Server used by the
+// workstation (non-hosted) resource bootstrap; an interface so the lock
+// routing can be unit-tested without a full hub.
+type workstationResourceBootstrapper interface {
+	BootstrapTemplatesFromDir(ctx context.Context, dir string) error
+	BootstrapHarnessConfigsFromDir(ctx context.Context, dir string) error
+}
+
+// bootstrapWorkstationResources imports templates and harness-configs from
+// the local ~/.scion directories into the hub (non-hosted mode). Both imports
+// run under one advisory lock (ptone/scion#1079): ResourceStore.Bootstrap is
+// GetBySlug-then-Create with no ErrAlreadyExists recovery, so two replicas
+// sharing a Postgres store would race. The key is shared with the hosted
+// bundled-resource bootstrap; the two branches are mutually exclusive.
+//
+// Caveats:
+//   - In non-hosted mode each replica imports its OWN ~/.scion, so when the
+//     lock is held the loser skips and the winner's disk content defines the
+//     hub records.
+//   - A lock-acquire error (Postgres only, e.g. pool exhaustion) skips the
+//     import for this boot, logged at ERROR by runWithAdvisoryLock. Before
+//     the lock the import always ran; this matches the hosted branch.
+//   - On SQLite the lock is a no-op and both imports always run.
+func bootstrapWorkstationResources(ctx context.Context, s store.Store, b workstationResourceBootstrapper, globalDir string) {
+	runWithAdvisoryLock(ctx, s, store.LockBundledResources, "workstation resource bootstrap", func() {
+		globalTemplatesDir := filepath.Join(globalDir, "templates")
+		if err := b.BootstrapTemplatesFromDir(ctx, globalTemplatesDir); err != nil {
+			log.Printf("Warning: template bootstrap failed: %v", err)
+		}
+		globalHarnessConfigsDir := filepath.Join(globalDir, "harness-configs")
+		if err := b.BootstrapHarnessConfigsFromDir(ctx, globalHarnessConfigsDir); err != nil {
+			log.Printf("Warning: harness config bootstrap failed: %v", err)
+		}
+	})
 }
 
 // maybeMigrateLegacySQLite detects a legacy raw-SQL hub.db at path and, unless
@@ -1536,7 +1860,7 @@ func initDevAuth(cfg *config.GlobalConfig, globalDir string) (string, error) {
 	devAuthCfg := apiclient.DevAuthConfig{
 		Enabled:   cfg.Auth.Enabled,
 		Token:     cfg.Auth.Token,
-		TokenFile: cfg.Auth.TokenFile,
+		TokenFile: devTokenFilePath(cfg.Auth.TokenFile, globalDir),
 	}
 
 	devAuthToken, err := apiclient.InitDevAuth(devAuthCfg, globalDir)
@@ -1547,11 +1871,77 @@ func initDevAuth(cfg *config.GlobalConfig, globalDir string) (string, error) {
 	_ = os.Setenv("SCION_DEV_TOKEN", devAuthToken)
 	_ = os.Setenv("SCION_AUTH_TOKEN", devAuthToken)
 
-	log.Printf("Developer token: %s", devAuthToken)
-	log.Printf("To authenticate CLI commands, run:")
-	log.Printf("  export SCION_DEV_TOKEN=%s", devAuthToken)
+	if cfg.Auth.Token != "" {
+		// A token set in the settings has no file, so there is no command
+		// to print: say where it is set, never its value.
+		log.Printf("Developer token: %s", devTokenStartupHint(cfg, globalDir))
+		log.Printf("To authenticate CLI commands, export that same value as SCION_DEV_TOKEN.")
+	} else {
+		log.Printf("To authenticate CLI commands, run:")
+		log.Printf("  %s", devTokenStartupHint(cfg, globalDir))
+	}
 
 	return devAuthToken, nil
+}
+
+// logWorkstationReadyBanner logs the workstation-mode startup banner. The
+// dev token line shows its file path, not its value.
+func logWorkstationReadyBanner(cfg *config.GlobalConfig, globalDir string, webEnabled bool, port int, devAuthToken string) {
+	log.Println("Scion server ready (workstation mode)")
+	if webEnabled {
+		displayHost := cfg.Hub.Host
+		if displayHost == "0.0.0.0" || displayHost == "" {
+			displayHost = "127.0.0.1"
+		}
+		log.Printf("Web UI: http://%s:%d", displayHost, port)
+	}
+	if devAuthToken != "" {
+		log.Printf("Developer token: %s", devTokenStartupHint(cfg, globalDir))
+	}
+}
+
+// devTokenStartupHint returns what startup output shows for the dev token:
+// the command that loads it from its file, so the output prints the dev
+// token file path instead of its value. A token set directly in the server
+// settings has no file, so the hint is a plain message naming where it is
+// set (not a command).
+func devTokenStartupHint(cfg *config.GlobalConfig, globalDir string) string {
+	if cfg.Auth.Token != "" {
+		return "set in the server settings (server.auth.dev_token, or the SCION_SERVER_AUTH_DEVTOKEN environment variable); the value is not printed"
+	}
+	return devTokenExportHint(devTokenFilePath(cfg.Auth.TokenFile, globalDir))
+}
+
+// devTokenFilePath returns the file the server keeps its dev token in: the
+// configured token file, or <globalDir>/dev-token by default. A relative
+// configured path is resolved against globalDir, so it names the same file
+// however the server was started (foreground, background or --global) and
+// whatever the working directory is.
+func devTokenFilePath(configured, globalDir string) string {
+	if configured == "" {
+		return filepath.Join(globalDir, "dev-token")
+	}
+	if !filepath.IsAbs(configured) {
+		return filepath.Join(globalDir, configured)
+	}
+	return configured
+}
+
+// devTokenExportHint returns the shell command that exports the dev token
+// stored at path. The path is single-quoted, so it may contain spaces or
+// shell metacharacters. The command substitution needs no outer double
+// quotes (an assignment is not field-split), and leaving them out keeps the
+// line free of characters the server's JSON log encoding would escape, so
+// it can be copied from the log as is.
+func devTokenExportHint(path string) string {
+	return "export SCION_DEV_TOKEN=$(cat " + shellSingleQuote(path) + ")"
+}
+
+// shellSingleQuote quotes s for a POSIX shell: it is wrapped in single
+// quotes, and each single quote inside it is written as an escaped quote
+// between two quoted parts.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // loadServerSettings loads the settings the server's hub and broker use,
@@ -1569,44 +1959,211 @@ func loadServerSettings(path string) (*config.Settings, *string) {
 	return settings, brokerHeartbeatDefaultProfile(settings, loaded)
 }
 
+// hubEndpointSource identifies which input resolveHubEndpointWithSource
+// took the hub's public endpoint from. Callers that need to know whether
+// the URL is really served by this host (rather than derived from IAP
+// configuration) branch on it; the URL itself is the same either way.
+type hubEndpointSource string
+
+const (
+	hubEndpointSourceNone           hubEndpointSource = ""
+	hubEndpointSourceConfig         hubEndpointSource = "config"
+	hubEndpointSourceBrokerSettings hubEndpointSource = "broker-settings"
+	hubEndpointSourceBaseURLFlag    hubEndpointSource = "base-url-flag"
+	hubEndpointSourceBaseURLEnv     hubEndpointSource = "base-url-env"
+	hubEndpointSourceSettings       hubEndpointSource = "settings"
+	// hubEndpointSourceIAPAudience means the URL was derived from the IAP
+	// audience (a Cloud Run IAP front end). This host does not serve it,
+	// so colocated agents must not be routed to it.
+	hubEndpointSourceIAPAudience hubEndpointSource = "iap-audience"
+	hubEndpointSourceLocalhost   hubEndpointSource = "localhost"
+)
+
+// operatorHubEndpoint is the hub's operator endpoint, as resolved by
+// resolveHubEndpointWithSource, and where it came from. The settings
+// database is never consulted for it (ptone/scion#3905).
+type operatorHubEndpoint struct {
+	URL    string
+	Source hubEndpointSource
+}
+
+// sourceLabel names the source of the operator endpoint for logging and the
+// admin settings view: "env", "flag" or "file" for an explicitly configured
+// value, otherwise the fallback that produced it.
+func (e operatorHubEndpoint) sourceLabel() string {
+	switch e.Source {
+	case hubEndpointSourceConfig:
+		if os.Getenv(hubEndpointEnvVar) != "" {
+			return "env"
+		}
+		return "file"
+	case hubEndpointSourceBaseURLFlag:
+		return "flag"
+	case hubEndpointSourceBaseURLEnv:
+		return "env"
+	case hubEndpointSourceBrokerSettings, hubEndpointSourceSettings:
+		return "settings"
+	default:
+		return string(e.Source)
+	}
+}
+
+// hubEndpointEnvVar is the environment variable that sets
+// server.hub.public_url (GlobalConfig hub.endpoint).
+const hubEndpointEnvVar = "SCION_SERVER_HUB_ENDPOINT"
+
+// hubEndpointPin returns the operator setting that pins the hub's public
+// endpoint, or "" when none is set. Any of SCION_SERVER_HUB_ENDPOINT,
+// --base-url and SCION_SERVER_BASE_URL pins it: the hub then uses its
+// operator endpoint and ignores a server.hub.public_url saved in the
+// settings database (ptone/scion#3905).
+func hubEndpointPin() string {
+	switch {
+	case os.Getenv(hubEndpointEnvVar) != "":
+		return hubEndpointEnvVar
+	case webBaseURL != "":
+		return "--base-url"
+	case os.Getenv("SCION_SERVER_BASE_URL") != "":
+		return "SCION_SERVER_BASE_URL"
+	}
+	return ""
+}
+
+// resolveHubEndpoints reads the server.hub.public_url saved in the settings
+// database (hub processes only) and resolves the hub's endpoints from it and
+// the operator endpoint (hub.ResolveHubEndpoints), logging the result.
+func resolveHubEndpoints(ctx context.Context, s store.Store, operator operatorHubEndpoint) (hub.HubEndpoints, error) {
+	base := hub.HubEndpoints{
+		Operator:       operator.URL,
+		OperatorSource: operator.sourceLabel(),
+		Pin:            hubEndpointPin(),
+	}
+	if !enableHub {
+		base.Public, base.PublicSource = base.Operator, base.OperatorSource
+		return base, nil
+	}
+	var dbValue string
+	if st, ok := s.(store.HubSettingStore); ok {
+		v, err := hub.StoredPublicURL(ctx, st)
+		if err != nil {
+			return hub.HubEndpoints{}, err
+		}
+		dbValue = v
+	}
+	return hub.ResolveHubEndpoints(base, dbValue, slog.Default()), nil
+}
+
+// effectiveHubEndpoint returns the hub endpoint in effect for the
+// derivations made in this package (hub.HubEndpointForAgents decides), and
+// the source to report for it. A value that differs from the operator
+// endpoint came from the settings database and counts as explicitly
+// configured.
+func effectiveHubEndpoint(e hub.HubEndpoints, operatorSrc hubEndpointSource) (string, hubEndpointSource) {
+	ep := e.For(hub.HubEndpointForAgents)
+	if ep == e.Operator {
+		return ep, operatorSrc
+	}
+	return ep, hubEndpointSourceConfig
+}
+
 // resolveHubEndpoint determines the Hub's public endpoint URL.
 func resolveHubEndpoint(cfg *config.GlobalConfig, brokerSettings *config.Settings) string {
+	endpoint, _ := resolveHubEndpointWithSource(cfg, brokerSettings)
+	return endpoint
+}
+
+// resolveHubEndpointWithSource determines the Hub's public endpoint URL and
+// reports which input it came from.
+func resolveHubEndpointWithSource(cfg *config.GlobalConfig, brokerSettings *config.Settings) (string, hubEndpointSource) {
+	return resolveHubEndpointFrom(cfg, currentServerEndpointMode(), brokerSettings.GetHubEndpoint(), log.Printf)
+}
+
+// serverEndpointMode is the part of the server's mode that decides how its
+// hub endpoints resolve. currentServerEndpointMode fills it from the
+// 'server start' flags; 'scion doctor' builds it without them.
+type serverEndpointMode struct {
+	hubEnabled    bool
+	brokerEnabled bool
+	webEnabled    bool
+	hosted        bool
+	webPort       int
+	baseURLFlag   string // --base-url
+	debug         bool
+}
+
+// currentServerEndpointMode returns the mode of the running 'server start'.
+func currentServerEndpointMode() serverEndpointMode {
+	return serverEndpointMode{
+		hubEnabled:    enableHub,
+		brokerEnabled: enableRuntimeBroker,
+		webEnabled:    enableWeb,
+		hosted:        hostedMode,
+		webPort:       webPort,
+		baseURLFlag:   webBaseURL,
+		debug:         enableDebug,
+	}
+}
+
+// hubListenPort is the port the hub is served on in mode m: the web port
+// when the web frontend is enabled, else the hub's own port, and 0 when the
+// hub is not enabled. See resolveHubListenPort.
+func (m serverEndpointMode) hubListenPort(cfg *config.GlobalConfig) int {
+	if !m.hubEnabled {
+		return 0
+	}
+	if m.webEnabled {
+		return m.webPort
+	}
+	return cfg.Hub.Port
+}
+
+// resolveHubEndpointFrom is resolveHubEndpointWithSource for an explicit
+// mode. legacyEndpoint is the settings hub.endpoint (which koanf also fills
+// from SCION_HUB_ENDPOINT); passing "" resolves as if that fallback were
+// gone. logf receives the resolution log lines; nil discards them.
+func resolveHubEndpointFrom(cfg *config.GlobalConfig, m serverEndpointMode, legacyEndpoint string, logf func(string, ...any)) (string, hubEndpointSource) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	if cfg.Hub.Endpoint != "" {
-		return cfg.Hub.Endpoint
+		return cfg.Hub.Endpoint, hubEndpointSourceConfig
 	}
 
-	if !enableHub {
-		hubEndpoint := brokerSettings.GetHubEndpoint()
-		if hubEndpoint != "" && enableDebug {
-			log.Printf("Hub endpoint resolved from project settings: %s", hubEndpoint)
+	if !m.hubEnabled {
+		hubEndpoint := legacyEndpoint
+		if hubEndpoint != "" && m.debug {
+			logf("Hub endpoint resolved from project settings: %s", hubEndpoint)
 		}
-		return hubEndpoint
+		if hubEndpoint == "" {
+			return "", hubEndpointSourceNone
+		}
+		return hubEndpoint, hubEndpointSourceBrokerSettings
 	}
 
-	if webBaseURL != "" {
-		hubEndpoint := strings.TrimRight(webBaseURL, "/")
-		if enableDebug {
-			log.Printf("Hub endpoint resolved from --base-url flag: %s", hubEndpoint)
+	if m.baseURLFlag != "" {
+		hubEndpoint := strings.TrimRight(m.baseURLFlag, "/")
+		if m.debug {
+			logf("Hub endpoint resolved from --base-url flag: %s", hubEndpoint)
 		}
-		return hubEndpoint
+		return hubEndpoint, hubEndpointSourceBaseURLFlag
 	}
 
 	if baseURL := os.Getenv("SCION_SERVER_BASE_URL"); baseURL != "" {
 		hubEndpoint := strings.TrimRight(baseURL, "/")
-		if enableDebug {
-			log.Printf("Hub endpoint resolved from SCION_SERVER_BASE_URL: %s", hubEndpoint)
+		if m.debug {
+			logf("Hub endpoint resolved from SCION_SERVER_BASE_URL: %s", hubEndpoint)
 		}
-		return hubEndpoint
+		return hubEndpoint, hubEndpointSourceBaseURLEnv
 	}
 
 	// Check settings (e.g. SCION_HUB_ENDPOINT env var) before falling back
 	// to localhost. On combo servers the settings-level endpoint is typically
 	// the public URL and should be used for agent dispatch.
-	if hubEndpoint := brokerSettings.GetHubEndpoint(); hubEndpoint != "" {
-		if enableDebug {
-			log.Printf("Hub endpoint resolved from settings (SCION_HUB_ENDPOINT): %s", hubEndpoint)
+	if hubEndpoint := legacyEndpoint; hubEndpoint != "" {
+		if m.debug {
+			logf("Hub endpoint resolved from settings (SCION_HUB_ENDPOINT): %s", hubEndpoint)
 		}
-		return hubEndpoint
+		return hubEndpoint, hubEndpointSourceSettings
 	}
 
 	// In hosted mode with IAP authentication, derive the Cloud Run URL from
@@ -1614,30 +2171,26 @@ func resolveHubEndpoint(cfg *config.GlobalConfig, brokerSettings *config.Setting
 	// unreachable from GKE-dispatched agents. GCLB/GKE audiences carry no
 	// routing information and cannot be converted to a URL, so they fall
 	// through to the HA warning below.
-	if hostedMode && cfg.Auth.Proxy != nil && cfg.Auth.Proxy.IAP != nil && cfg.Auth.Proxy.IAP.Audience != "" {
+	if m.hosted && cfg.Auth.Proxy != nil && cfg.Auth.Proxy.IAP != nil && cfg.Auth.Proxy.IAP.Audience != "" {
 		if cloudRunURL := iapAudienceToCloudRunURL(cfg.Auth.Proxy.IAP.Audience); cloudRunURL != "" {
-			log.Printf("Hub endpoint derived from IAP audience: %s", cloudRunURL)
-			return cloudRunURL
+			logf("Hub endpoint derived from IAP audience: %s", cloudRunURL)
+			return cloudRunURL, hubEndpointSourceIAPAudience
 		}
 	}
 
-	port := cfg.Hub.Port
-	if enableWeb {
-		port = webPort
-	}
-	hubEndpoint := fmt.Sprintf("http://localhost:%d", port)
+	hubEndpoint := fmt.Sprintf("http://localhost:%d", m.hubListenPort(cfg))
 	// Any hosted multi-instance deployment reaching this fallback has no
 	// usable public URL: dispatched agents would resolve the loopback address
 	// inside their own container. This is not specific to IAP — a GCLB
 	// audience cannot be converted to a URL, and a hub doing its own
 	// OAuth/OIDC has no audience to derive one from at all.
-	if hostedHAGuardsRequired(cfg) {
-		log.Printf("Warning: hosted HA deployment has no explicit hub base URL; falling back to %s, which is unreachable from dispatched agents. Set SCION_SERVER_BASE_URL or server.hub.public_url.", hubEndpoint)
+	if m.hosted && m.hubEnabled && isHADeployment(cfg) {
+		logf("Warning: hosted HA deployment has no explicit hub base URL; falling back to %s, which is unreachable from dispatched agents. Set SCION_SERVER_BASE_URL or server.hub.public_url.", hubEndpoint)
 	}
-	if enableDebug {
-		log.Printf("Auto-computed hub endpoint for combo mode: %s", hubEndpoint)
+	if m.debug {
+		logf("Auto-computed hub endpoint for combo mode: %s", hubEndpoint)
 	}
-	return hubEndpoint
+	return hubEndpoint, hubEndpointSourceLocalhost
 }
 
 // iapAudienceToCloudRunURL converts a Cloud Run native IAP audience path
@@ -1713,22 +2266,88 @@ func resolveHubNameFromEnv() string {
 }
 
 // resolveSessionSecret resolves the deployment-wide session secret from the
-// --session-secret flag, falling back to the SCION_SERVER_SESSION_SECRET env
-// var (then SESSION_SECRET for compatibility). The same value backs both the
-// web session cookie store and the hub JWT signing keys so that all replicas
-// behind the load balancer agree.
+// --session-secret flag, falling back to the value scrubServerSecretEnv read
+// at startup, then to the SCION_SERVER_SESSION_SECRET env var (then the
+// deprecated SESSION_SECRET). The same value backs both the web session cookie
+// store and the hub JWT signing keys so that all replicas behind the load
+// balancer agree.
 func resolveSessionSecret() string {
 	secret := webSessionSecret
 	if secret == "" {
-		secret = os.Getenv("SCION_SERVER_SESSION_SECRET")
+		secret = capturedSessionSecret
 	}
 	if secret == "" {
-		secret = os.Getenv("SESSION_SECRET")
+		secret = sessionSecretFromEnv()
 	}
 	if secret == "" && hostedMode {
 		slog.Warn("No session secret configured in hosted mode! Replicas will not be able to share sessions or agree on JWT signing keys, leading to login loops.")
 	}
 	return secret
+}
+
+// sessionSecretValue is the configured session secret, or "": the
+// --session-secret flag, else the value scrubServerSecretEnv read at
+// startup, else SCION_SERVER_SESSION_SECRET, then SESSION_SECRET. It only
+// reads: no deprecation or hosted-mode warning (resolveSessionSecret adds
+// the hosted-mode one).
+func sessionSecretValue() string {
+	if webSessionSecret != "" {
+		return webSessionSecret
+	}
+	if capturedSessionSecret != "" {
+		return capturedSessionSecret
+	}
+	if s := os.Getenv(sessionSecretEnv); s != "" {
+		return s
+	}
+	return os.Getenv(legacySessionSecretEnv)
+}
+
+// hubObservabilityExport decides at startup whether the hub's own metrics
+// and trace exporters run, and their export project (ptone/scion#4914).
+// See decideHubObservabilityExport for the inputs.
+func hubObservabilityExport(cfg *config.GlobalConfig, hubSrv *hub.Server) hubexport.Status {
+	return decideHubObservabilityExport(cfg, hubSrv.GetOperationalSettings(), hubObservabilityInputs{
+		getenv: os.Getenv,
+		// Relies on the earlier Policy Troubleshooter probe in
+		// initHubServer (ResolveGCPProjectID) for caching: the metadata
+		// client caches OnGCE and a resolved project ID.
+		metadata:   func() (string, error) { return hub.ResolveGCPProjectID("") },
+		tracingEnv: parseBoolEnv(hubexport.TracingEnv),
+	})
+}
+
+// hubObservabilityInputs are the process inputs of
+// decideHubObservabilityExport, passed in so the selection is testable.
+type hubObservabilityInputs struct {
+	getenv     func(string) string
+	metadata   func() (string, error)
+	tracingEnv bool
+}
+
+// decideHubObservabilityExport selects the inputs of the export decision.
+// The switches come from the Layer-1 snapshot, where a managed DB row wins
+// over the settings file and the environment; a hub without the
+// operational settings service (ops nil) reads them from the loaded
+// config. The export project is server.hub.gcp_project_id, else the
+// metadata-server project, resolved as for service-account minting
+// (ResolveGCPProjectID, which skips the lookup off GCP).
+func decideHubObservabilityExport(cfg *config.GlobalConfig, ops *hub.OperationalSettings, in hubObservabilityInputs) hubexport.Status {
+	metrics, tracing := cfg.Hub.Observability.MetricsEnabled, cfg.Hub.Observability.TracingEnabled
+	if ops != nil {
+		snap := ops.Snapshot()
+		metrics, tracing = snap.HubMetricsEnabled, snap.HubTracingEnabled
+	}
+	project := hubexport.ResolveProject(hubexport.ProjectInputs{
+		Configured: cfg.Hub.GCPProjectID,
+		EnvValue:   in.getenv(hubexport.ProjectIDEnv),
+		Metadata:   in.metadata,
+	})
+	return hubexport.Status{
+		Project: project,
+		Metrics: hubexport.DecideMetrics(metrics, project),
+		Tracing: hubexport.DecideTracing(tracing, in.tracingEnv, project),
+	}
 }
 
 // parseBoolEnv reports whether the named environment variable is set to a
@@ -1858,11 +2477,16 @@ func buildHubServerConfig(cfg *config.GlobalConfig, hubEndpoint, devAuthToken st
 		MissingAgentGrace:            cfg.Hub.MissingAgentGrace,
 		SoftDeleteRetention:          cfg.Hub.SoftDeleteRetention,
 		SoftDeleteRetainFiles:        cfg.Hub.SoftDeleteRetainFiles,
-		AsyncAgentLaunch:             cfg.Hub.AsyncAgentLaunch,
+		PerfTrace:                    cfg.Hub.PerfTrace,
+		MembershipSweepReportOnly:    cfg.Hub.MembershipSweepReportOnly,
 		LaunchTimeout:                cfg.Hub.LaunchTimeout,
 		LaunchKeepaliveSeconds:       cfg.Hub.LaunchKeepaliveSeconds,
 		ConduitTCPAllowedPorts:       append([]int(nil), cfg.Hub.Conduit.TCPAllowedPorts...),
 		ConduitGrantKeyActivation:    conduitGrantKeyActivationSetting(cfg),
+		ConduitAuthzRecheckInterval:  conduitAuthzRecheckIntervalSetting(cfg),
+		ConduitUserStreamAuthzMax:    conduitUserStreamAuthzMaxSetting(cfg),
+		ConduitProxySessionMaxAge:    conduitProxySessionMaxAgeSetting(cfg),
+		AgentRunScope:                agentRunScopeSetting(cfg),
 		AdminMode:                    adminMode,
 		MaintenanceMessage:           maintenanceMessage,
 		SchedulerIntervalSeconds:     cfg.Scheduler.IntervalSeconds,
@@ -1929,12 +2553,18 @@ func buildHubServerConfig(cfg *config.GlobalConfig, hubEndpoint, devAuthToken st
 		GCPIAMCheckMode:         cfg.Hub.GCPIAMCheckMode,
 		GCPIAMDenyUnknownPolicy: cfg.Hub.GCPIAMDenyUnknownPolicy,
 		GCPProjectID:            cfg.Hub.GCPProjectID,
+		// Startup value for a hub without OperationalSettings; with them,
+		// ApplySnapshot replaces it from the endpoints section.
+		MonitoringDashboardURL: config.MonitoringDashboardURLOrEmpty(cfg.Hub.MonitoringDashboardURL),
 		// Derive the agent/user JWT signing keys from the same shared session
 		// secret the web cookie store uses, so every replica behind the load
 		// balancer agrees on the signing key regardless of its host-derived
 		// HubID. Without this, a JWT minted by one replica fails validation on
 		// another (cross-replica "session_expired" login loop).
 		SharedSigningSecret: resolveSessionSecret(),
+		// The web session cookie key comes from the same secret
+		// (initWebServer); its source label feeds the test admin gate (G7).
+		WebSessionKeySource: webSessionKeySource(resolveSessionSecret()),
 		// When SCION_REQUIRE_STABLE_SIGNING_KEY is truthy, the hub refuses to
 		// start rather than silently mint a new signing key it cannot resolve
 		// (which would invalidate every live token after, e.g., a redeploy onto a
@@ -1947,6 +2577,8 @@ func buildHubServerConfig(cfg *config.GlobalConfig, hubEndpoint, devAuthToken st
 		WorkspaceStorageConfig:  cfg.WorkspaceStorage,
 		// nil (no server.native_chat section) means enabled — chat is default-on.
 		NativeChatEnabled: cfg.NativeChat.EnabledSetting(),
+		// server.hub.port_proxy.response_header_timeout (validated at startup).
+		PortProxyResponseHeaderTimeout: portProxyResponseHeaderTimeoutSetting(cfg),
 	}
 }
 
@@ -1998,11 +2630,82 @@ func wireHubCoreMetrics(hubSrv *hub.Server, mp metric.MeterProvider) dbmetrics.R
 		hubSrv.SetReaperMetrics(reaperRec)
 	}
 
+	if authzRec, err := hub.NewOTelConduitStreamAuthzMetrics(mp); err != nil {
+		log.Printf("WARNING: hub conduit stream authz metrics disabled: %v", err)
+	} else {
+		hubSrv.SetConduitStreamAuthzMetrics(authzRec)
+	}
+
+	if err := hubSrv.RegisterConduitRelayReadinessGauge(mp); err != nil {
+		log.Printf("WARNING: hub conduit relay readiness gauge disabled: %v", err)
+	}
+
+	if refreshRec, err := hub.NewOTelConduitAgentRefreshMetrics(mp); err != nil {
+		log.Printf("WARNING: hub conduit agent refresh metrics disabled: %v", err)
+	} else {
+		hubSrv.SetConduitAgentRefreshMetrics(refreshRec)
+	}
+
+	if conflictRec, err := hub.NewOTelQuotaScopeConflictMetrics(mp); err != nil {
+		log.Printf("WARNING: hub quota scope conflict metrics disabled: %v", err)
+	} else {
+		hubSrv.SetQuotaScopeConflictMetrics(conflictRec)
+	}
+
+	if portProxyRec, err := hub.NewOTelPortProxyMetrics(mp); err != nil {
+		log.Printf("WARNING: hub port proxy metrics disabled: %v", err)
+	} else {
+		hubSrv.SetPortProxyMetrics(portProxyRec)
+	}
+
+	runScopeRec, runScopeErr := hub.NewOTelAgentRunScopeMetrics(mp)
+	if runScopeErr != nil {
+		log.Printf("WARNING: hub agent run-scope metrics disabled: %v", runScopeErr)
+	} else {
+		hubSrv.SetAgentRunScopeMetrics(runScopeRec)
+	}
+
+	// Decision logging (remaining-audit P1): the audit writer's
+	// scion.logging.* series and the decision-log disposition counter.
+	// The same instruments carry writer=cloud (P2): the Cloud Logging
+	// counters are process atomics read at collection, so counts recorded
+	// before this MeterProvider existed are exported too. Without a Cloud
+	// handler they stay zero and export no series.
+	if writeRec, err := logging.NewWriteMetrics(mp); err != nil {
+		log.Printf("WARNING: hub audit log writer metrics disabled: %v", err)
+	} else {
+		hubSrv.SetAuditWriterMetrics(writeRec)
+		writeRec.ObserveCloud(serverCloudWriter())
+	}
+	if decisionRec, err := hub.NewOTelDecisionAuditMetrics(mp); err != nil {
+		log.Printf("WARNING: hub decision audit metrics disabled: %v", err)
+	} else {
+		hubSrv.SetDecisionAuditMetrics(decisionRec)
+	}
+
 	return hubDBRec
 }
 
-func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store, entClient *ent.Client, hubEndpoint, devAuthToken string, adminEmailList []string, adminMode bool, maintenanceMessage string, requestLogger, messageLogger *slog.Logger, globalDir string, pluginMgr *scionplugin.Manager, secretBackend secret.SecretBackend) (*hub.Server, error) {
-	hubCfg := buildHubServerConfig(cfg, hubEndpoint, devAuthToken, adminEmailList, adminMode, maintenanceMessage, secretBackend)
+// serverCloudWriter returns the writer=cloud counters the server exports
+// and reports on /healthz: logging.CloudWriter() in production. A var so
+// cmd tests can substitute standalone counters instead of the process-wide
+// ones.
+var serverCloudWriter = logging.CloudWriter
+
+// wireCloudLoggingHealth injects the cloud_logging /healthz provider when a
+// Cloud Logging handler is configured (its circuit breaker registered with
+// cs). Without one the key stays absent. The key is non-critical: it can
+// only degrade /healthz.
+func wireCloudLoggingHealth(hubSrv *hub.Server, cs *logging.CloudWriteStats) {
+	if hubSrv == nil || cs == nil || !cs.Configured() {
+		return
+	}
+	hubSrv.SetCloudLoggingHealth(func() string { return cs.HealthStatus(time.Now()) })
+}
+
+func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store, entClient *ent.Client, endpoints hub.HubEndpoints, devAuthToken string, adminEmailList []string, adminMode bool, maintenanceMessage string, requestLogger, messageLogger *slog.Logger, globalDir string, pluginMgr *scionplugin.Manager, secretBackend secret.SecretBackend) (*hub.Server, error) {
+	hubCfg := buildHubServerConfig(cfg, endpoints.Operator, devAuthToken, adminEmailList, adminMode, maintenanceMessage, secretBackend)
+	hubCfg.HubEndpoints = &endpoints
 	warnNonConformingHubName(cfg.Hub.HubName)
 
 	// In hosted mode every replica must share the same session secret for
@@ -2057,12 +2760,24 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		}
 	}
 
+	// Proxy driver principals (auth.proxy.driverPrincipals, test identities
+	// phase WS2): exact emails, proxy auth mode only. A non-empty list on a
+	// hub that is not in proxy mode refuses startup; hub.New re-checks it.
+	proxyDrivers, driversErr := config.ValidateProxyDriverConfig(cfg.Auth.Mode, cfg.Auth.Proxy.ProxyDriverPrincipals())
+	if driversErr != nil {
+		return nil, driversErr
+	}
+	hubCfg.ProxyDriverPrincipals = proxyDrivers
+	if len(proxyDrivers) > 0 {
+		log.Printf("Proxy driver principals configured: %d (test identity web session drivers; they never get a hub account)", len(proxyDrivers))
+	}
+
 	// Construct transport token minter when auth.transport is configured
 	if cfg.Auth.Transport != nil && cfg.Auth.Transport.Mode != "" && cfg.Auth.Transport.Mode != "none" {
 		if cfg.Auth.Transport.PlatformAuthSA == "" {
 			return nil, fmt.Errorf("auth.transport.platformAuthSA is required when auth.transport.mode=%q", cfg.Auth.Transport.Mode)
 		}
-		audience := resolveTransportAudience(cfg.Auth.Transport.OIDCAudience, cfg.Auth.Transport.Mode, hubEndpoint)
+		audience := resolveTransportAudience(cfg.Auth.Transport.OIDCAudience, cfg.Auth.Transport.Mode, endpoints.For(hub.HubEndpointForTransportAudience))
 		if audience == "" {
 			return nil, fmt.Errorf("auth.transport.oidcAudience is required when auth.transport.mode=%q", cfg.Auth.Transport.Mode)
 		}
@@ -2073,6 +2788,40 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		log.Printf("Transport auth configured: mode=%s, audience=%s, sa=%s",
 			cfg.Auth.Transport.Mode, audience, cfg.Auth.Transport.PlatformAuthSA)
 	}
+
+	// Hub-issued test identities (--test-mode, off by default): every
+	// precondition of the requested level is checked here and any unmet one
+	// refuses startup with a named error. hub.New re-checks the result and
+	// verifies the signing key sources (G7) before capturing the immutable
+	// gate, and writes the resolved level through the test admin audit
+	// sink.
+	testMode, err := resolveTestMode(testModeInputsFor(ctx, cfg, hubCfg, s != nil, entClient))
+	if err != nil {
+		return nil, err
+	}
+	hubCfg.EnableTestIdentities = testMode.EnableTestIdentities
+	hubCfg.TestAdminGate = testMode.TestAdminGate
+	hubCfg.TestMode = testMode.TestMode
+	if testMode.EnableTestIdentities {
+		slog.Warn("Test identity issuance is ENABLED (--test-mode). Holders of test_identity.issue can create short-lived synthetic users on this hub. Use on test hubs only; MUST NOT be enabled in production!",
+			"test_mode", string(testMode.TestMode.Level), "preconditions", testMode.TestMode.Preconditions)
+	}
+	// Workload issuer allowlist (server.hub.test_identities.workload_issuers,
+	// phase X2): startup config only. A malformed list or an admin-tier
+	// entry refuses startup; hub.New re-checks it with the issuer audience
+	// cross-checks.
+	if issuers := cfg.Hub.TestIdentityWorkloadIssuers(); len(issuers) > 0 {
+		if err := config.ValidateTestIdentityWorkloadIssuers(issuers); err != nil {
+			return nil, err
+		}
+		hubCfg.TestIdentityWorkloadIssuers = issuers
+		log.Printf("Test identity workload issuers configured: %d (accepted only with --test-mode=member or above)", len(issuers))
+	}
+
+	// Test identity web sessions (WS1): the hub-local key from the test
+	// infrastructure marker. A missing or unusable key only leaves web
+	// sessions unavailable; it never stops startup.
+	hubCfg.TestIdentityWebSessionKey = loadTestIdentityWebSessionKey(ctx, entClient, hubCfg.HubID, hubCfg.EnableTestIdentities)
 
 	hubSrv, err := hub.New(hubCfg, s)
 	if err != nil {
@@ -2085,20 +2834,15 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 		hubSrv.SetMessageLogger(messageLogger)
 	}
 
-	// Load notification channels from versioned settings
+	// Load notification channels from versioned settings. With operational
+	// settings (any DB driver), ApplySnapshot rebuilds the registry from the
+	// notifications section at startup and on every change.
 	if vs, err := config.LoadVersionedSettings(""); err == nil && vs.Server != nil && len(vs.Server.NotificationChannels) > 0 {
-		channelConfigs := make([]hub.ChannelConfig, len(vs.Server.NotificationChannels))
-		for i, c := range vs.Server.NotificationChannels {
-			channelConfigs[i] = hub.ChannelConfig{
-				Type:             c.Type,
-				Params:           c.Params,
-				FilterTypes:      c.FilterTypes,
-				FilterUrgentOnly: c.FilterUrgentOnly,
-			}
-		}
-		registry := hub.NewChannelRegistry(channelConfigs, logging.Subsystem("hub.notification-channels"))
+		registry := hub.NewChannelRegistryFromSettings(vs.Server.NotificationChannels)
 		hubSrv.SetChannelRegistry(registry)
 		log.Printf("Notification channels configured: %d channel(s) registered", registry.Len())
+	} else if err != nil {
+		log.Printf("Warning: failed to load settings; notification channels are not configured: %v", err)
 	}
 
 	// NOTE: Message broker initialization is deferred to the main startup
@@ -2182,6 +2926,11 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 				hubSAEmail = gcpGen.ServiceAccountEmail()
 			}
 			checker := hub.NewPolicyTroubleshooterChecker(ptClient, hubSAEmail, hubSrv.DenyUnknownFailOpen())
+			// Follow reloads of the deny-unknown fallback policy.
+			checker.SetDenyUnknownPolicySource(hubSrv.DenyUnknownFailOpen)
+			// Report real API calls, not cached results, to the admin
+			// diagnostic for the assignment check.
+			checker.SetCallObserver(hubSrv.NoteSAAssignCheckCall)
 			cached := hub.NewCachedCallerPermissionChecker(checker,
 				60*time.Second, // allowTTL
 				10*time.Second, // denyTTL
@@ -2210,14 +2959,7 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 	} else {
 		// Workstation mode: import from local ~/.scion directories. These were
 		// refreshed from embeds earlier in the startup sequence.
-		globalTemplatesDir := filepath.Join(globalDir, "templates")
-		if err := hubSrv.BootstrapTemplatesFromDir(ctx, globalTemplatesDir); err != nil {
-			log.Printf("Warning: template bootstrap failed: %v", err)
-		}
-		globalHarnessConfigsDir := filepath.Join(globalDir, "harness-configs")
-		if err := hubSrv.BootstrapHarnessConfigsFromDir(ctx, globalHarnessConfigsDir); err != nil {
-			log.Printf("Warning: harness config bootstrap failed: %v", err)
-		}
+		bootstrapWorkstationResources(ctx, s, hubSrv, globalDir)
 	}
 
 	// On first boot with hub-namespaced paths, copy legacy GCS objects to
@@ -2250,7 +2992,7 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 	// traffic, because a DB-persisted admin_mode=true would be invisible to this
 	// process. Retry with exponential backoff to tolerate transient DB issues,
 	// then fail the hub startup if all attempts are exhausted.
-	// NOTE: this call and its error-return-to-log.Fatalf chain is what makes
+	// NOTE: this call and its error-return chain (up to runServerStart) is what makes
 	// settings init fail-closed. Do NOT revert to the old log-and-continue
 	// pattern — that would let the server accept traffic without authoritative
 	// settings, silently bypassing a DB-persisted admin_mode=true.
@@ -2258,6 +3000,11 @@ func initHubServer(ctx context.Context, cfg *config.GlobalConfig, s store.Store,
 	if err := initOperationalSettingsWithRetry(ctx, cfg, hubSrv, s, globalDir); err != nil {
 		return nil, fmt.Errorf("operational settings init failed after retries (driver=%s): %w",
 			cfg.Database.Driver, err)
+	}
+	// Test admin tier G8, second half: no federation in the stored
+	// operational settings either.
+	if err := hubSrv.VerifyTestAdminFederationOff(); err != nil {
+		return nil, err
 	}
 
 	// ptone/scion#1316 fault 3: confirm the hub's own agent_defaults resolve
@@ -2331,10 +3078,9 @@ func initOperationalSettings(ctx context.Context, cfg *config.GlobalConfig, hubS
 
 	// Build koanf instances.
 	envKoanf := config.LoadEnvKoanf()
-	bootstrapKoanf := config.LoadBootstrapKoanf()
 	// Seed material never carries the removed key, so the every-boot sync
 	// cannot write it back into a seeded profiles row.
-	config.DeleteLegacyProfileTimezones(bootstrapKoanf, tzScan.ProfileTimezones)
+	bootstrapKoanf := config.LoadServerBootstrapKoanf(serverConfigPath, tzScan.ProfileTimezones)
 
 	// Log deprecation warnings for SCION_SERVER_* env vars that overlap
 	// Layer-1 settings (these should use SCION_SEED_* instead).
@@ -2366,6 +3112,12 @@ func initOperationalSettings(ctx context.Context, cfg *config.GlobalConfig, hubS
 
 	// --- Create OperationalSettings, Refresh, and apply ---
 	ops := hub.NewOperationalSettings(settingStore, bootstrapKoanf, envKoanf)
+	// The admin view shows a public URL from the layers startup's endpoint
+	// resolution reads, not a seed value (ptone/scion#4826).
+	ops.SetUnseededBootstrap(config.LoadUnseededBootstrapKoanfWithConfigPath(serverConfigPath))
+	// It attributes a superseded key that only the coded defaults set to
+	// them, not to settings.yaml (ptone/scion#4983).
+	ops.SetAboveSeedBootstrap(config.LoadAboveSeedBootstrapKoanfWithConfigPath(serverConfigPath))
 
 	changed, err := ops.Refresh(ctx)
 	if err != nil {
@@ -2419,7 +3171,9 @@ func startSettingsPropagation(ctx context.Context, hubSrv *hub.Server, eventPub 
 // syncHubSettings performs every-boot re-sync of hub_settings from bootstrap
 // material. For each registered section:
 //   - If the row is absent or origin=="seeded": write the bootstrap doc
-//     (skip-write-on-equality to avoid revision bumps and event churn).
+//     (skip-write-on-equality to avoid revision bumps and event churn),
+//     except that an absent catalog section (runtimes, profiles,
+//     harness_configs) with an empty bootstrap doc stays absent.
 //   - If origin=="managed": skip — admin owns this section.
 //
 // Also runs BackfillOrigin for pre-origin rows and writes the _meta sentinel.
@@ -2447,29 +3201,47 @@ func syncHubSettings(ctx context.Context, s store.HubSettingStore, bootstrapKoan
 			return fmt.Errorf("checking section %q: %w", sec.Name, err)
 		}
 
+		// The decision is opsettings.SyncedSection, shared with the rebuild
+		// preflight. BackfillOrigin has already run, so the stored origin is
+		// the effective one and UpdatedBy is not passed.
+		var row *opsettings.SectionRow
+		if existing != nil {
+			row = &opsettings.SectionRow{Origin: existing.Origin, Value: existing.Value}
+		}
+		doc, present := opsettings.SyncedSection(sec.Name, row, bootstrapDoc)
+
 		if existing == nil {
+			// An empty catalog section is left absent: an empty stored
+			// runtimes, profiles or harness_configs map means "not managed
+			// in the hub", and absent says so without a row
+			// (ptone/scion#5007).
+			if !present {
+				slog.Debug("Empty catalog section not seeded", "section", sec.Name)
+				continue
+			}
 			// No row — create with bootstrap material.
-			if _, err := s.UpsertHubSetting(ctx, sec.Name, bootstrapDoc, "seed", -1, "seeded"); err != nil {
+			if _, err := s.UpsertHubSetting(ctx, sec.Name, doc, "seed", -1, "seeded"); err != nil {
 				return fmt.Errorf("seeding section %q: %w", sec.Name, err)
 			}
 			log.Printf("  Seeded section: %s (new)", sec.Name)
 			continue
 		}
 
-		if existing.Origin == "managed" {
-			slog.Debug("Skipping managed section", "section", sec.Name)
-			continue
-		}
-
-		// Origin is "seeded" — update only if content differs.
-		// Compare semantically (not byte-for-byte) because Postgres jsonb
+		// Write only when SyncedSection's document differs from the row, so
+		// the write set comes from the shared rule alone: a managed row's
+		// document is its own value and is never rewritten. Compare
+		// semantically (not byte-for-byte) because Postgres jsonb
 		// re-serializes values, changing whitespace and key ordering.
-		if jsonEqual(existing.Value, bootstrapDoc) {
-			slog.Debug("Seeded section unchanged; skipping write", "section", sec.Name)
+		if jsonEqual(existing.Value, doc) {
+			if existing.Origin == opsettings.OriginManaged {
+				slog.Debug("Skipping managed section", "section", sec.Name)
+			} else {
+				slog.Debug("Seeded section unchanged; skipping write", "section", sec.Name)
+			}
 			continue
 		}
 
-		if _, err := s.UpsertHubSetting(ctx, sec.Name, bootstrapDoc, "seed", -1, "seeded"); err != nil {
+		if _, err := s.UpsertHubSetting(ctx, sec.Name, doc, "seed", -1, "seeded"); err != nil {
 			return fmt.Errorf("re-syncing section %q: %w", sec.Name, err)
 		}
 		log.Printf("  Re-synced section: %s (content changed)", sec.Name)
@@ -2698,11 +3470,17 @@ func initWebServer(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Se
 		webPlatformAuthSA = cfg.Auth.Transport.PlatformAuthSA
 	}
 
+	// The same proxy driver principals the hub gets (WS2), checked the same
+	// way, so the web server never runs with a list the hub would refuse.
+	webProxyDrivers, webDriversErr := config.ValidateProxyDriverConfig(cfg.Auth.Mode, cfg.Auth.Proxy.ProxyDriverPrincipals())
+	if webDriversErr != nil {
+		return nil, webDriversErr
+	}
+
 	webCfg := hub.WebServerConfig{
 		Port:                 webPort,
 		Host:                 webHost,
 		AssetsDir:            webAssetsDir,
-		Debug:                enableDebug,
 		SessionSecret:        sessionSecret,
 		BaseURL:              baseURL,
 		DevAuthToken:         devAuthToken,
@@ -2710,9 +3488,17 @@ func initWebServer(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Se
 		AdminMode:            adminMode,
 		MaintenanceMessage:   maintenanceMessage,
 		EnableTestLogin:      enableTestLogin,
+		EnableDebugEndpoints: enableDebugEndpoints,
 		ProxyAuthenticator:   webProxyAuth,
 		PlatformAuthSA:       webPlatformAuthSA,
 		SlowRequestThreshold: cfg.SlowRequestThreshold,
+		PerfTrace:            cfg.Hub.PerfTrace,
+
+		ProxyDriverPrincipals:    webProxyDrivers,
+		ProxyDriverTokenAudience: cfg.Auth.Proxy.ProxyDriverTokenAudience(),
+	}
+	if enableDebugEndpoints {
+		slog.Warn("Diagnostic endpoints are enabled (--enable-debug-endpoints). Use for local development only.")
 	}
 	if enableTestLogin {
 		slog.Warn("Test login endpoint is enabled (--enable-test-login). This allows bypass of authentication and MUST NOT be used in production!")
@@ -2732,13 +3518,15 @@ func initWebServer(ctx context.Context, cfg *config.GlobalConfig, hubSrv *hub.Se
 		hubSrv.SetEventPublisher(eventPub)
 		startSettingsPropagation(ctx, hubSrv, eventPub)
 		webSrv.SetAccessSettingsProvider(hubSrv)
+		webSrv.SetProfilingSettingsProvider(hubSrv)
 		webSrv.SetOAuthService(hubSrv.GetOAuthService())
 		webSrv.SetStore(hubSrv.GetStore())
 		webSrv.SetUserTokenService(hubSrv.GetUserTokenService())
 		webSrv.SetMaintenanceState(hubSrv.GetMaintenanceState())
 		webSrv.SetDemotionSafe(hubSrv.GetDemotionSafe())
 		webSrv.SetAuthzService(hubSrv.GetAuthzService())
-		webSrv.MountHubAPI(hubSrv.Handler(), hubSrv.CleanupResources)
+		webSrv.SetTestIdentityWebSessions(hubSrv)
+		webSrv.MountHubAPI(hubSrv.Handler(), hubSrv.CleanupBackgroundResources)
 
 		localHubSrv := hubSrv
 		webSrv.SetHubHealthProvider(func(ctx context.Context) interface{} {
@@ -2845,7 +3633,12 @@ func logHomeStorageStartup(gs *config.VersionedSettings, logf func(format string
 
 // logSharedDirStorageOverridesStartup logs one line per profile whose
 // shared-dir storage backend comes from a profile or runtime entry
-// shared_dir_storage_backend override, and a warning per invalid override.
+// shared_dir_storage_backend override, one per flat Runtime Broker
+// instance whose backend comes from its runtime_target, and a warning per
+// invalid override and per instance whose backend differs from the one
+// plugins resolve (config.VersionedSettings.FlatInstanceSharedDirStorageReport).
+// An instance that selects nfs without a complete nfs block is refused when
+// the instances are loaded (config.LoadRuntimeBrokerInstances).
 // It checks configuration only and never touches the filesystem: an nfs
 // override whose export is not mounted on this host is reported when an
 // agent using it starts, not here, so a missing mount never affects startup
@@ -2904,6 +3697,16 @@ func logSharedDirStorageOverridesStartup(gs *config.VersionedSettings, logf func
 			}
 			logf("shared_dir_storage for profile %s, shared dir %s: backend=%s (from %s)", name, dir, backend, source)
 		}
+	}
+	// Flat Runtime Broker instances: their runtime_target overrides, and a
+	// warning for each instance whose backend differs from the one plugins
+	// resolve from the global settings.
+	lines, warnings := gs.FlatInstanceSharedDirStorageReport()
+	for _, w := range warnings {
+		logf("Warning: %s", w)
+	}
+	for _, line := range lines {
+		logf("%s", line)
 	}
 }
 
@@ -2972,15 +3775,15 @@ func colocatedBrokerRegisters(cfg *config.GlobalConfig, s store.Store) bool {
 // substrate runtime whose construct-time dependencies failed (building the
 // Kubernetes client, or substrate.Dial's trust-bundle/CA load and API dial,
 // e.g. on an API-server blip at boot) — refusing on those would turn a
-// transient outage into a boot crash loop. The broker starts degraded
-// instead, but that degraded state is not self-healing: the default runtime
-// is resolved once here and is not rebuilt until the broker process
-// restarts, and /healthz still reports healthy (the "error" runtime counts
-// as an available runtime in the health check), so nothing restarts the
-// broker automatically. Operators must alert on the logged degraded "error"
-// runtime line and restart the broker to rebuild the runtime. It also
-// includes, for example, a Kubernetes client that fails Verify at startup,
-// or a missing container CLI.
+// transient outage into a boot crash loop. It also includes, for example, a
+// Kubernetes client that fails Verify at startup, or a missing container
+// CLI. The broker starts degraded instead, but that degraded state is not
+// self-healing: the default runtime is resolved once here and is not
+// rebuilt until the broker process restarts. /healthz reports status
+// "degraded" with checks["runtime"] = "unavailable" but still answers 200,
+// so a liveness probe does not restart the broker; /readyz returns 503, and
+// the Broker /healthz and /readyz uptime checks alert. Operators restart the
+// broker to rebuild the runtime once the cause is fixed.
 //
 // Named profiles other than the default are unaffected: those are resolved
 // lazily, per request, and this check only ever sees the one runtime
@@ -3011,7 +3814,31 @@ func resolveBrokerDefaultRuntime(getRuntime func(projectPath, profileName string
 	return rt, nil
 }
 
-func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.GlobalConfig, hubSrv *hub.Server, webSrv *hub.WebServer, s store.Store, hubEndpoint, devAuthToken string, brokerSettings *config.Settings, brokerDefaultProfile *string, globalDir string, requestLogger, messageLogger *slog.Logger, wg *sync.WaitGroup, errCh chan error) error {
+func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.GlobalConfig, hubSrv *hub.Server, webSrv *hub.WebServer, s store.Store, hubEndpoint string, hubEndpointSrc hubEndpointSource, devAuthToken string, brokerSettings *config.Settings, brokerDefaultProfile *string, globalDir string, requestLogger, messageLogger *slog.Logger, wg *sync.WaitGroup, errCh chan error) error {
+	// Flat Runtime Broker instances (server.broker.instances), strictly
+	// loaded. A process with instances hosts them through the flat host
+	// (co-located with the Hub, or remote with instance-scoped credentials
+	// validated on every start) and never the legacy identity.
+	flatInstances, err := loadServerRuntimeBrokerInstances(cfg, serverConfigPath)
+	if err != nil {
+		return err
+	}
+	if len(flatInstances) > 0 {
+		autoProvide := serverAutoProvide
+		if enableHub && !cmd.Flags().Changed("auto-provide") {
+			autoProvide = true
+			if vs, _, vsErr := config.LoadEffectiveSettings(""); vsErr == nil && vs != nil && vs.Server != nil && vs.Server.Broker != nil && vs.Server.Broker.AutoProvide != nil {
+				autoProvide = *vs.Server.Broker.AutoProvide
+			}
+		}
+		return startFlatRuntimeBrokerHost(ctx, flatHostParams{
+			cfg: cfg, hubSrv: hubSrv, webSrv: webSrv, store: s, instances: flatInstances,
+			hubEndpoint: hubEndpoint, hubEndpointSrc: hubEndpointSrc, devAuthToken: devAuthToken,
+			settings: brokerSettings, globalDir: globalDir, autoProvide: autoProvide,
+			requestLogger: requestLogger, messageLogger: messageLogger, wg: wg, errCh: errCh,
+		})
+	}
+	warnUnhostedFlatIdentities(globalDir)
 	rt, err := resolveBrokerDefaultRuntime(runtime.GetRuntime, log.Printf)
 	if err != nil {
 		return err
@@ -3024,7 +3851,9 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 	// Try loading versioned settings to get broker identity from server.broker
 	versionedSettings, _, vsErr := config.LoadEffectiveSettings("")
 	var vsBroker *config.V1BrokerConfig
-	if vsErr == nil && versionedSettings != nil && versionedSettings.Server != nil {
+	if vsErr != nil {
+		log.Printf("Warning: failed to load settings; broker identity from server.broker is not applied: %v", vsErr)
+	} else if versionedSettings != nil && versionedSettings.Server != nil {
 		vsBroker = versionedSettings.Server.Broker
 	}
 
@@ -3038,7 +3867,6 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		}
 	}
 	brokerID := resolveBrokerID(ctx, cfg, settings, vsBroker, globalDir, defaultBrokerID, s)
-
 	// Resolve broker name
 	brokerName := resolveBrokerName(cfg, settings, vsBroker)
 
@@ -3074,7 +3902,7 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 			rhEndpoint = fmt.Sprintf("http://localhost:%d", cfg.RuntimeBroker.Port)
 		}
 
-		effectiveID, regErr := registerGlobalProjectAndBroker(ctx, s, brokerID, brokerName, rhEndpoint, rt, serverAutoProvide, brokerSettings, loadBrokerRegistrationWorkspaceStorage())
+		effectiveID, regErr := registerGlobalProjectAndBroker(ctx, s, brokerID, brokerName, rhEndpoint, rt, serverAutoProvide, brokerSettings, loadBrokerRegistrationWorkspaceStorage(), loadBrokerProfileTypeSettings())
 		if regErr != nil {
 			// ERROR, not a warning: the co-located broker is how this process
 			// runs agents. Losing it silently left the Hub reporting healthy
@@ -3131,49 +3959,22 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		}
 	}
 
-	// Auto-compute ContainerHubEndpoint.
-	//
-	// For colocated Docker agents we prefer to route them at the public domain
-	// (served by Caddy) so each agent runs in its own network namespace under
-	// bridge networking. This avoids the host-global metadata-server (:18380)
-	// and telemetry (:4317) port collisions that --network=host causes for
-	// concurrent agents. We fall back to the legacy host.docker.internal (host
-	// networking) path when:
-	//   - the escape hatch SCION_FORCE_HOST_NETWORK is set,
-	//   - the Docker daemon lacks host-gateway support, or
-	//   - no public domain is configured (can't reach Caddy without one).
-	containerHubEndpoint := cfg.RuntimeBroker.ContainerHubEndpoint
-	if containerHubEndpoint == "" && enableHub && hubEndpointForRH != "" && rt != nil {
-		forceHost := os.Getenv(runtime.ForceHostNetworkEnvVar) != ""
-		isDocker := rt.Name() == "docker"
-		publicDomain := ""
-		if hubEndpoint != "" && !isLocalhostURL(hubEndpoint) {
-			publicDomain = strings.TrimRight(hubEndpoint, "/")
-		}
-
-		if isDocker && !forceHost && !runtime.DockerSupportsHostGateway(ctx, "") {
-			log.Printf("WARNING: Docker daemon lacks host-gateway support; colocated agents will use host networking (re-introduces metadata-server port contention for concurrent agents). Upgrade Docker Engine to >= 20.10 to enable per-agent bridge networking.")
-			forceHost = true
-		}
-
-		switch {
-		case isDocker && !forceHost && publicDomain != "":
-			// Route agents to the public domain so they reach the hub via Caddy
-			// under bridge networking (colocatedExtraHosts maps the domain to
-			// host-gateway). applyContainerBridgeOverride returns it wholesale.
-			containerHubEndpoint = publicDomain
-			log.Printf("Colocated %s agents routed via public domain %s (bridge networking)", rt.Name(), containerHubEndpoint)
-		default:
-			if computed := containerBridgeEndpoint(hubEndpointForRH, rt.Name()); computed != "" {
-				containerHubEndpoint = computed
-				if isDocker && !forceHost {
-					// publicDomain == "" here: no domain configured to reach Caddy.
-					log.Printf("WARNING: no public domain configured for colocated Docker agents; falling back to host networking. Set SCION_SERVER_BASE_URL=https://<domain> to enable per-agent bridge networking.")
-				}
-				log.Printf("Auto-computed ContainerHubEndpoint for %s runtime: %s", rt.Name(), containerHubEndpoint)
-			}
-		}
+	// Auto-compute ContainerHubEndpoint (see computeContainerHubEndpoint).
+	// We fall back to the legacy host.docker.internal (host networking) path
+	// when the escape hatch SCION_FORCE_HOST_NETWORK is set or the Docker
+	// daemon lacks host-gateway support.
+	rtName := ""
+	if rt != nil {
+		rtName = rt.Name()
 	}
+	chRes := brokerContainerHubConfig(cfg, brokerContainerHubParams{
+		RuntimeName:             rtName,
+		BrokerHubEndpoint:       hubEndpointForRH,
+		PublicHubEndpoint:       hubEndpoint,
+		PublicHubEndpointSource: hubEndpointSrc,
+		HostGatewayProbe:        func() bool { return runtime.DockerSupportsHostGateway(ctx, "") },
+	}, log.Printf)
+	containerHubEndpoint := chRes.Endpoint
 
 	if rt != nil && rt.Name() == "container" && containerHubEndpoint != "" {
 		exists, checkErr := runtime.AppleDNSRuleExists(ctx, runtime.AppleDNSHostname)
@@ -3217,8 +4018,6 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		ReadTimeout:                   cfg.RuntimeBroker.ReadTimeout,
 		WriteTimeout:                  cfg.RuntimeBroker.WriteTimeout,
 		HubEndpoint:                   hubEndpointForRH,
-		ContainerHubEndpoint:          containerHubEndpoint,
-		HubListenPort:                 resolveHubListenPort(cfg),
 		BrokerID:                      brokerID,
 		BrokerName:                    brokerName,
 		CORSEnabled:                   cfg.RuntimeBroker.CORSEnabled,
@@ -3228,6 +4027,7 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		CORSMaxAge:                    cfg.RuntimeBroker.CORSMaxAge,
 		AllowContainerScriptHarnesses: cfg.RuntimeBroker.AllowContainerScriptHarnesses,
 		NFSConfig:                     brokerNFS,
+		StorageBucket:                 brokerStorageBucket(cfg.Storage),
 		WorkspaceStorageBackend:       workspaceStorageBackend,
 		DefaultProfile:                brokerDefaultProfile,
 		Debug:                         enableDebug,
@@ -3235,6 +4035,8 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 
 		HubEnabled:           hubEndpointForRH != "",
 		HubToken:             devAuthToken,
+		HostCredentials:      config.HostCredentialsEligible(hostedMode, devAuthToken != ""),
+		WorkstationMode:      !hostedMode,
 		TemplateCacheDir:     templateCacheDir,
 		TemplateCacheMaxSize: templateCacheMax,
 
@@ -3245,6 +4047,7 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		BrokerAuthEnabled:    true,
 		BrokerAuthStrictMode: true,
 	}
+	chRes.applyTo(&rhCfg)
 
 	// In co-located mode, hand the broker the Hub's storage backend so that a
 	// local filesystem backend is read directly (zero-copy) instead of being
@@ -3253,26 +4056,14 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 		rhCfg.ColocatedStorage = hubSrv.GetStorage()
 	}
 
-	// In co-located mode, install a global settings overlay so that the
-	// broker's config.LoadEffectiveSettings() calls pick up DB-backed
-	// runtimes, profiles, and harness_configs. Without this, the broker
-	// always reads from the ephemeral settings.yaml file and never sees
-	// changes made through the admin UI (issue #985).
-	if hubSrv != nil && cfg.Database.Driver == "postgres" {
-		overlay := config.NewSettingsOverlay()
-		config.SetGlobalSettingsOverlay(overlay)
-		// Seed the overlay from the current operational settings snapshot
-		// so that DB values are available from the first agent dispatch,
-		// not only after the next LISTEN/NOTIFY propagation.
-		if ops := hubSrv.GetOperationalSettings(); ops != nil {
-			snap := ops.Snapshot()
-			overlay.Update(snap.Runtimes, snap.Profiles, snap.HarnessConfigs, snap.ImageRegistry)
-			log.Printf("Settings overlay installed for co-located broker (runtimes=%d, profiles=%d, harness_configs=%d)",
-				len(snap.Runtimes), len(snap.Profiles), len(snap.HarnessConfigs))
-		} else {
-			log.Printf("Settings overlay installed for co-located broker (operational settings not yet available)")
-		}
-	}
+	// In co-located mode on any DB-backed Hub, install the global settings
+	// overlay so the broker sees the Hub's stored runtimes, profiles,
+	// harness_configs and image_registry (see installColocatedSettingsOverlay).
+	// Ordering invariant: the broker's default runtime (rt, from
+	// resolveBrokerDefaultRuntime) is resolved above, before the overlay
+	// exists, so it comes from the settings file and startup never sees an
+	// overlay-only active_profile error.
+	installColocatedSettingsOverlay(cfg, hubSrv)
 
 	rhSrv := runtimebroker.New(rhCfg, mgr, rt)
 	rhSrv.SetRequestLogger(requestLogger)
@@ -3411,7 +4202,11 @@ func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend, 
 	mgr.NewGRPCBrokerAdapter = grpcbroker.NewAdapterFromEntry
 
 	vs, err := config.LoadVersionedSettings("")
-	if err != nil || vs == nil || vs.Server == nil || vs.Server.Plugins == nil {
+	if err != nil {
+		log.Printf("Warning: failed to load settings; plugins are not loaded: %v", err)
+		return mgr
+	}
+	if vs == nil || vs.Server == nil || vs.Server.Plugins == nil {
 		return mgr
 	}
 
@@ -3616,21 +4411,16 @@ func resolveBrokerName(cfg *config.GlobalConfig, settings *config.Settings, vsBr
 // in standalone hub mode it is --port. Returns 0 when the hub is not
 // co-located (enableHub false).
 //
-// This is the single source of truth for the hub's listen port. Two callers
-// depend on it: resolveHubEndpointForBroker (which formats it into a
-// localhost URL for the broker's own hub communication) and the broker config's
+// serverEndpointMode.hubListenPort is the single source of truth for the
+// hub's listen port. Its callers: resolveBrokerHubEndpointFrom and the
+// hub's localhost fallback in resolveHubEndpointFrom (which format it into a
+// localhost URL), and, through this function, the broker config's
 // HubListenPort (which cloudrunSandboxHubEndpoint uses to construct the
-// link-local endpoint for sandboxes). Keeping the derivation here rather
+// link-local endpoint for sandboxes). Keeping the derivation there rather
 // than duplicating it prevents one caller from drifting when the other is
 // updated — a failure whose symptom is agents that start but never register.
 func resolveHubListenPort(cfg *config.GlobalConfig) int {
-	if !enableHub {
-		return 0
-	}
-	if enableWeb {
-		return webPort
-	}
-	return cfg.Hub.Port
+	return currentServerEndpointMode().hubListenPort(cfg)
 }
 
 // resolveHubEndpointForBroker determines the Hub endpoint URL for the
@@ -3638,15 +4428,21 @@ func resolveHubListenPort(cfg *config.GlobalConfig) int {
 // In co-located mode (enableHub true), this always resolves to localhost
 // so the broker never routes through the external public URL.
 func resolveHubEndpointForBroker(cfg *config.GlobalConfig, settings *config.Settings) string {
+	return resolveBrokerHubEndpointFrom(cfg, currentServerEndpointMode(), settings.GetHubEndpoint(), log.Printf)
+}
+
+// resolveBrokerHubEndpointFrom is resolveHubEndpointForBroker for an
+// explicit mode. legacyEndpoint is the settings hub.endpoint; passing ""
+// resolves as if that fallback were gone. logf may be nil.
+func resolveBrokerHubEndpointFrom(cfg *config.GlobalConfig, m serverEndpointMode, legacyEndpoint string, logf func(string, ...any)) string {
 	hubEndpointForRH := cfg.RuntimeBroker.HubEndpoint
-	if hubEndpointForRH == "" && enableHub {
-		port := resolveHubListenPort(cfg)
-		hubEndpointForRH = fmt.Sprintf("http://localhost:%d", port)
-		if enableDebug {
-			log.Printf("Co-located Hub detected: using %s for heartbeat and template hydration", hubEndpointForRH)
+	if hubEndpointForRH == "" && m.hubEnabled {
+		hubEndpointForRH = fmt.Sprintf("http://localhost:%d", m.hubListenPort(cfg))
+		if m.debug && logf != nil {
+			logf("Co-located Hub detected: using %s for heartbeat and template hydration", hubEndpointForRH)
 		}
-	} else if hubEndpointForRH == "" && settings.Hub != nil {
-		hubEndpointForRH = settings.Hub.Endpoint
+	} else if hubEndpointForRH == "" {
+		hubEndpointForRH = legacyEndpoint
 	}
 	return hubEndpointForRH
 }
@@ -3691,6 +4487,8 @@ func resolveMaintenanceConfig(cfg *config.GlobalConfig) hub.MaintenanceConfig {
 				mc.GitHubRepo = m.GitHubRepo
 			}
 		}
+	} else {
+		log.Printf("Warning: failed to load settings; maintenance settings from the settings file are not applied: %v", err)
 	}
 
 	// Environment variable overrides.
@@ -3759,13 +4557,20 @@ func resolveMaintenanceConfig(cfg *config.GlobalConfig) hub.MaintenanceConfig {
 //  2. SCION_MAINTENANCE_IMAGE_REGISTRY env var
 //  3. image_registry in versioned settings (settings.yaml)
 func requireImageRegistryForBroker() error {
+	return requireImageRegistryForBrokerAt("")
+}
+
+// requireImageRegistryForBrokerAt is requireImageRegistryForBroker with the
+// settings resolved for projectPath (see config.LoadEffectiveSettings) instead
+// of the project found from the working directory.
+func requireImageRegistryForBrokerAt(projectPath string) error {
 	if v := os.Getenv("SCION_IMAGE_REGISTRY"); v != "" {
 		return nil
 	}
 	if v := os.Getenv("SCION_MAINTENANCE_IMAGE_REGISTRY"); v != "" {
 		return nil
 	}
-	vs, _, err := config.LoadEffectiveSettings("")
+	vs, _, err := config.LoadEffectiveSettings(projectPath)
 	if err != nil {
 		slog.Debug("Failed to load settings while checking image registry", "error", err)
 	}
@@ -3873,4 +4678,23 @@ func telemetryGCPProjectFromSecret(ctx context.Context, sb secret.SecretBackend,
 		return ""
 	}
 	return gcputil.ParseProjectID([]byte(sw.Value))
+}
+
+// hubExitSequence flushes telemetry providers in reverse registration order.
+type hubExitSequence struct {
+	flushes []func(context.Context) error
+}
+
+func (h *hubExitSequence) addFlush(f func(context.Context) error) {
+	h.flushes = append(h.flushes, f)
+}
+
+func (h *hubExitSequence) run() {
+	for i := len(h.flushes) - 1; i >= 0; i-- {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := h.flushes[i](ctx); err != nil {
+			log.Printf("WARNING: hub OTel flush on exit: %v", err)
+		}
+		cancel()
+	}
 }

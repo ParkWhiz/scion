@@ -57,6 +57,12 @@ type Notification struct {
 	Dispatched     bool      `json:"dispatched"`
 	Acknowledged   bool      `json:"acknowledged"`
 	CreatedAt      time.Time `json:"createdAt"`
+	// DispatchAttempts counts delivery attempts to a subscriber agent (0 for
+	// rows stored before attempts were recorded).
+	DispatchAttempts int `json:"dispatchAttempts"`
+	// DispatchOutcome is "delivered", "failed", or empty when no outcome is
+	// recorded.
+	DispatchOutcome string `json:"dispatchOutcome"`
 }
 
 // List returns notifications for the current user.
@@ -163,7 +169,7 @@ func (s *subscriptionService) Create(ctx context.Context, req *CreateSubscriptio
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Subscription](resp)
+	return apiclient.DecodeRequired[Subscription](resp)
 }
 
 // List returns subscriptions for the current user.
@@ -201,7 +207,7 @@ func (s *subscriptionService) Update(ctx context.Context, id string, req *Update
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Subscription](resp)
+	return apiclient.DecodeRequired[Subscription](resp)
 }
 
 // Delete removes a subscription by ID.
@@ -270,7 +276,7 @@ func (s *subscriptionTemplateService) Create(ctx context.Context, req *CreateSub
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[SubscriptionTemplate](resp)
+	return apiclient.DecodeRequired[SubscriptionTemplate](resp)
 }
 
 // List returns subscription templates, optionally filtered by project.
@@ -311,7 +317,7 @@ func (s *subscriptionService) BulkDelete(ctx context.Context, ids []string) (int
 	if err != nil {
 		return 0, err
 	}
-	result, err := apiclient.DecodeResponse[struct {
+	result, err := apiclient.DecodeRequired[struct {
 		Deleted int `json:"deleted"`
 	}](resp)
 	if err != nil {

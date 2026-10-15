@@ -13,6 +13,8 @@ import (
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"entgo.io/ent/schema/field"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agenthold"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerreportedrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/groupmembership"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
@@ -26,6 +28,34 @@ type AgentCreate struct {
 	mutation *AgentMutation
 	hooks    []Hook
 	conflict []sql.ConflictOption
+}
+
+// SetFixtureRootID sets the "fixture_root_id" field.
+func (_c *AgentCreate) SetFixtureRootID(v uuid.UUID) *AgentCreate {
+	_c.mutation.SetFixtureRootID(v)
+	return _c
+}
+
+// SetNillableFixtureRootID sets the "fixture_root_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableFixtureRootID(v *uuid.UUID) *AgentCreate {
+	if v != nil {
+		_c.SetFixtureRootID(*v)
+	}
+	return _c
+}
+
+// SetFixtureIssuerID sets the "fixture_issuer_id" field.
+func (_c *AgentCreate) SetFixtureIssuerID(v uuid.UUID) *AgentCreate {
+	_c.mutation.SetFixtureIssuerID(v)
+	return _c
+}
+
+// SetNillableFixtureIssuerID sets the "fixture_issuer_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableFixtureIssuerID(v *uuid.UUID) *AgentCreate {
+	if v != nil {
+		_c.SetFixtureIssuerID(*v)
+	}
+	return _c
 }
 
 // SetSlug sets the "slug" field.
@@ -366,6 +396,48 @@ func (_c *AgentCreate) SetNillableWorkspacePlacement(v *string) *AgentCreate {
 	return _c
 }
 
+// SetPinnedRuntimeBrokerID sets the "pinned_runtime_broker_id" field.
+func (_c *AgentCreate) SetPinnedRuntimeBrokerID(v string) *AgentCreate {
+	_c.mutation.SetPinnedRuntimeBrokerID(v)
+	return _c
+}
+
+// SetNillablePinnedRuntimeBrokerID sets the "pinned_runtime_broker_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillablePinnedRuntimeBrokerID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetPinnedRuntimeBrokerID(*v)
+	}
+	return _c
+}
+
+// SetPinnedRuntimeTargetID sets the "pinned_runtime_target_id" field.
+func (_c *AgentCreate) SetPinnedRuntimeTargetID(v string) *AgentCreate {
+	_c.mutation.SetPinnedRuntimeTargetID(v)
+	return _c
+}
+
+// SetNillablePinnedRuntimeTargetID sets the "pinned_runtime_target_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillablePinnedRuntimeTargetID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetPinnedRuntimeTargetID(*v)
+	}
+	return _c
+}
+
+// SetPinnedRuntimeTargetType sets the "pinned_runtime_target_type" field.
+func (_c *AgentCreate) SetPinnedRuntimeTargetType(v string) *AgentCreate {
+	_c.mutation.SetPinnedRuntimeTargetType(v)
+	return _c
+}
+
+// SetNillablePinnedRuntimeTargetType sets the "pinned_runtime_target_type" field if the given value is not nil.
+func (_c *AgentCreate) SetNillablePinnedRuntimeTargetType(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetPinnedRuntimeTargetType(*v)
+	}
+	return _c
+}
+
 // SetWebPtyEnabled sets the "web_pty_enabled" field.
 func (_c *AgentCreate) SetWebPtyEnabled(v bool) *AgentCreate {
 	_c.mutation.SetWebPtyEnabled(v)
@@ -636,6 +708,48 @@ func (_c *AgentCreate) SetPreviousRunIds(v []string) *AgentCreate {
 	return _c
 }
 
+// SetRunIDUpdatedAt sets the "run_id_updated_at" field.
+func (_c *AgentCreate) SetRunIDUpdatedAt(v time.Time) *AgentCreate {
+	_c.mutation.SetRunIDUpdatedAt(v)
+	return _c
+}
+
+// SetNillableRunIDUpdatedAt sets the "run_id_updated_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableRunIDUpdatedAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetRunIDUpdatedAt(*v)
+	}
+	return _c
+}
+
+// SetSSHHostKey sets the "ssh_host_key" field.
+func (_c *AgentCreate) SetSSHHostKey(v string) *AgentCreate {
+	_c.mutation.SetSSHHostKey(v)
+	return _c
+}
+
+// SetNillableSSHHostKey sets the "ssh_host_key" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableSSHHostKey(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetSSHHostKey(*v)
+	}
+	return _c
+}
+
+// SetSSHHostKeyRunID sets the "ssh_host_key_run_id" field.
+func (_c *AgentCreate) SetSSHHostKeyRunID(v string) *AgentCreate {
+	_c.mutation.SetSSHHostKeyRunID(v)
+	return _c
+}
+
+// SetNillableSSHHostKeyRunID sets the "ssh_host_key_run_id" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableSSHHostKeyRunID(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetSSHHostKeyRunID(*v)
+	}
+	return _c
+}
+
 // SetLaunchState sets the "launch_state" field.
 func (_c *AgentCreate) SetLaunchState(v string) *AgentCreate {
 	_c.mutation.SetLaunchState(v)
@@ -758,6 +872,20 @@ func (_c *AgentCreate) SetLaunchError(v string) *AgentCreate {
 func (_c *AgentCreate) SetNillableLaunchError(v *string) *AgentCreate {
 	if v != nil {
 		_c.SetLaunchError(*v)
+	}
+	return _c
+}
+
+// SetLaunchCause sets the "launch_cause" field.
+func (_c *AgentCreate) SetLaunchCause(v string) *AgentCreate {
+	_c.mutation.SetLaunchCause(v)
+	return _c
+}
+
+// SetNillableLaunchCause sets the "launch_cause" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableLaunchCause(v *string) *AgentCreate {
+	if v != nil {
+		_c.SetLaunchCause(*v)
 	}
 	return _c
 }
@@ -912,6 +1040,20 @@ func (_c *AgentCreate) SetRunIntentAt(v time.Time) *AgentCreate {
 func (_c *AgentCreate) SetNillableRunIntentAt(v *time.Time) *AgentCreate {
 	if v != nil {
 		_c.SetRunIntentAt(*v)
+	}
+	return _c
+}
+
+// SetRunIntentMarkedAt sets the "run_intent_marked_at" field.
+func (_c *AgentCreate) SetRunIntentMarkedAt(v time.Time) *AgentCreate {
+	_c.mutation.SetRunIntentMarkedAt(v)
+	return _c
+}
+
+// SetNillableRunIntentMarkedAt sets the "run_intent_marked_at" field if the given value is not nil.
+func (_c *AgentCreate) SetNillableRunIntentMarkedAt(v *time.Time) *AgentCreate {
+	if v != nil {
+		_c.SetRunIntentMarkedAt(*v)
 	}
 	return _c
 }
@@ -1119,6 +1261,36 @@ func (_c *AgentCreate) AddPolicyBindings(v ...*PolicyBinding) *AgentCreate {
 	return _c.AddPolicyBindingIDs(ids...)
 }
 
+// AddHoldIDs adds the "holds" edge to the AgentHold entity by IDs.
+func (_c *AgentCreate) AddHoldIDs(ids ...uuid.UUID) *AgentCreate {
+	_c.mutation.AddHoldIDs(ids...)
+	return _c
+}
+
+// AddHolds adds the "holds" edges to the AgentHold entity.
+func (_c *AgentCreate) AddHolds(v ...*AgentHold) *AgentCreate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddHoldIDs(ids...)
+}
+
+// AddReportedRunIDs adds the "reported_runs" edge to the BrokerReportedRun entity by IDs.
+func (_c *AgentCreate) AddReportedRunIDs(ids ...uuid.UUID) *AgentCreate {
+	_c.mutation.AddReportedRunIDs(ids...)
+	return _c
+}
+
+// AddReportedRuns adds the "reported_runs" edges to the BrokerReportedRun entity.
+func (_c *AgentCreate) AddReportedRuns(v ...*BrokerReportedRun) *AgentCreate {
+	ids := make([]uuid.UUID, len(v))
+	for i := range v {
+		ids[i] = v[i].ID
+	}
+	return _c.AddReportedRunIDs(ids...)
+}
+
 // Mutation returns the AgentMutation object of the builder.
 func (_c *AgentCreate) Mutation() *AgentMutation {
 	return _c.mutation
@@ -1181,6 +1353,10 @@ func (_c *AgentCreate) defaults() {
 	if _, ok := _c.mutation.WorkspacePlacement(); !ok {
 		v := agent.DefaultWorkspacePlacement
 		_c.mutation.SetWorkspacePlacement(v)
+	}
+	if _, ok := _c.mutation.PinnedRuntimeTargetType(); !ok {
+		v := agent.DefaultPinnedRuntimeTargetType
+		_c.mutation.SetPinnedRuntimeTargetType(v)
 	}
 	if _, ok := _c.mutation.WebPtyEnabled(); !ok {
 		v := agent.DefaultWebPtyEnabled
@@ -1245,6 +1421,10 @@ func (_c *AgentCreate) defaults() {
 	if _, ok := _c.mutation.LaunchError(); !ok {
 		v := agent.DefaultLaunchError
 		_c.mutation.SetLaunchError(v)
+	}
+	if _, ok := _c.mutation.LaunchCause(); !ok {
+		v := agent.DefaultLaunchCause
+		_c.mutation.SetLaunchCause(v)
 	}
 	if _, ok := _c.mutation.DeletionState(); !ok {
 		v := agent.DefaultDeletionState
@@ -1408,6 +1588,14 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 		_node.ID = id
 		_spec.ID.Value = &id
 	}
+	if value, ok := _c.mutation.FixtureRootID(); ok {
+		_spec.SetField(agent.FieldFixtureRootID, field.TypeUUID, value)
+		_node.FixtureRootID = &value
+	}
+	if value, ok := _c.mutation.FixtureIssuerID(); ok {
+		_spec.SetField(agent.FieldFixtureIssuerID, field.TypeUUID, value)
+		_node.FixtureIssuerID = &value
+	}
 	if value, ok := _c.mutation.Slug(); ok {
 		_spec.SetField(agent.FieldSlug, field.TypeString, value)
 		_node.Slug = value
@@ -1512,6 +1700,18 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 		_spec.SetField(agent.FieldWorkspacePlacement, field.TypeString, value)
 		_node.WorkspacePlacement = value
 	}
+	if value, ok := _c.mutation.PinnedRuntimeBrokerID(); ok {
+		_spec.SetField(agent.FieldPinnedRuntimeBrokerID, field.TypeString, value)
+		_node.PinnedRuntimeBrokerID = &value
+	}
+	if value, ok := _c.mutation.PinnedRuntimeTargetID(); ok {
+		_spec.SetField(agent.FieldPinnedRuntimeTargetID, field.TypeString, value)
+		_node.PinnedRuntimeTargetID = &value
+	}
+	if value, ok := _c.mutation.PinnedRuntimeTargetType(); ok {
+		_spec.SetField(agent.FieldPinnedRuntimeTargetType, field.TypeString, value)
+		_node.PinnedRuntimeTargetType = value
+	}
 	if value, ok := _c.mutation.WebPtyEnabled(); ok {
 		_spec.SetField(agent.FieldWebPtyEnabled, field.TypeBool, value)
 		_node.WebPtyEnabled = value
@@ -1596,6 +1796,18 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 		_spec.SetField(agent.FieldPreviousRunIds, field.TypeJSON, value)
 		_node.PreviousRunIds = value
 	}
+	if value, ok := _c.mutation.RunIDUpdatedAt(); ok {
+		_spec.SetField(agent.FieldRunIDUpdatedAt, field.TypeTime, value)
+		_node.RunIDUpdatedAt = &value
+	}
+	if value, ok := _c.mutation.SSHHostKey(); ok {
+		_spec.SetField(agent.FieldSSHHostKey, field.TypeString, value)
+		_node.SSHHostKey = value
+	}
+	if value, ok := _c.mutation.SSHHostKeyRunID(); ok {
+		_spec.SetField(agent.FieldSSHHostKeyRunID, field.TypeString, value)
+		_node.SSHHostKeyRunID = value
+	}
 	if value, ok := _c.mutation.LaunchState(); ok {
 		_spec.SetField(agent.FieldLaunchState, field.TypeString, value)
 		_node.LaunchState = value
@@ -1631,6 +1843,10 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.LaunchError(); ok {
 		_spec.SetField(agent.FieldLaunchError, field.TypeString, value)
 		_node.LaunchError = value
+	}
+	if value, ok := _c.mutation.LaunchCause(); ok {
+		_spec.SetField(agent.FieldLaunchCause, field.TypeString, value)
+		_node.LaunchCause = value
 	}
 	if value, ok := _c.mutation.DeletionState(); ok {
 		_spec.SetField(agent.FieldDeletionState, field.TypeString, value)
@@ -1675,6 +1891,10 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.RunIntentAt(); ok {
 		_spec.SetField(agent.FieldRunIntentAt, field.TypeTime, value)
 		_node.RunIntentAt = &value
+	}
+	if value, ok := _c.mutation.RunIntentMarkedAt(); ok {
+		_spec.SetField(agent.FieldRunIntentMarkedAt, field.TypeTime, value)
+		_node.RunIntentMarkedAt = &value
 	}
 	if value, ok := _c.mutation.StartClaimID(); ok {
 		_spec.SetField(agent.FieldStartClaimID, field.TypeString, value)
@@ -1769,6 +1989,38 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 		}
 		_spec.Edges = append(_spec.Edges, edge)
 	}
+	if nodes := _c.mutation.HoldsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   agent.HoldsTable,
+			Columns: []string{agent.HoldsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(agenthold.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
+	if nodes := _c.mutation.ReportedRunsIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2M,
+			Inverse: false,
+			Table:   agent.ReportedRunsTable,
+			Columns: []string{agent.ReportedRunsColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(brokerreportedrun.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges = append(_spec.Edges, edge)
+	}
 	return _node, _spec
 }
 
@@ -1776,7 +2028,7 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 // of the `INSERT` statement. For example:
 //
 //	client.Agent.Create().
-//		SetSlug(v).
+//		SetFixtureRootID(v).
 //		OnConflict(
 //			// Update the row with the new values
 //			// the was proposed for insertion.
@@ -1785,7 +2037,7 @@ func (_c *AgentCreate) createSpec() (*Agent, *sqlgraph.CreateSpec) {
 //		// Override some of the fields with custom
 //		// update values.
 //		Update(func(u *ent.AgentUpsert) {
-//			SetSlug(v+v).
+//			SetFixtureRootID(v+v).
 //		}).
 //		Exec(ctx)
 func (_c *AgentCreate) OnConflict(opts ...sql.ConflictOption) *AgentUpsertOne {
@@ -1884,24 +2136,6 @@ func (u *AgentUpsert) SetStatus(v agent.Status) *AgentUpsert {
 // UpdateStatus sets the "status" field to the value that was provided on create.
 func (u *AgentUpsert) UpdateStatus() *AgentUpsert {
 	u.SetExcluded(agent.FieldStatus)
-	return u
-}
-
-// SetCreatedBy sets the "created_by" field.
-func (u *AgentUpsert) SetCreatedBy(v uuid.UUID) *AgentUpsert {
-	u.Set(agent.FieldCreatedBy, v)
-	return u
-}
-
-// UpdateCreatedBy sets the "created_by" field to the value that was provided on create.
-func (u *AgentUpsert) UpdateCreatedBy() *AgentUpsert {
-	u.SetExcluded(agent.FieldCreatedBy)
-	return u
-}
-
-// ClearCreatedBy clears the value of the "created_by" field.
-func (u *AgentUpsert) ClearCreatedBy() *AgentUpsert {
-	u.SetNull(agent.FieldCreatedBy)
 	return u
 }
 
@@ -2271,6 +2505,60 @@ func (u *AgentUpsert) ClearWorkspacePlacement() *AgentUpsert {
 	return u
 }
 
+// SetPinnedRuntimeBrokerID sets the "pinned_runtime_broker_id" field.
+func (u *AgentUpsert) SetPinnedRuntimeBrokerID(v string) *AgentUpsert {
+	u.Set(agent.FieldPinnedRuntimeBrokerID, v)
+	return u
+}
+
+// UpdatePinnedRuntimeBrokerID sets the "pinned_runtime_broker_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdatePinnedRuntimeBrokerID() *AgentUpsert {
+	u.SetExcluded(agent.FieldPinnedRuntimeBrokerID)
+	return u
+}
+
+// ClearPinnedRuntimeBrokerID clears the value of the "pinned_runtime_broker_id" field.
+func (u *AgentUpsert) ClearPinnedRuntimeBrokerID() *AgentUpsert {
+	u.SetNull(agent.FieldPinnedRuntimeBrokerID)
+	return u
+}
+
+// SetPinnedRuntimeTargetID sets the "pinned_runtime_target_id" field.
+func (u *AgentUpsert) SetPinnedRuntimeTargetID(v string) *AgentUpsert {
+	u.Set(agent.FieldPinnedRuntimeTargetID, v)
+	return u
+}
+
+// UpdatePinnedRuntimeTargetID sets the "pinned_runtime_target_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdatePinnedRuntimeTargetID() *AgentUpsert {
+	u.SetExcluded(agent.FieldPinnedRuntimeTargetID)
+	return u
+}
+
+// ClearPinnedRuntimeTargetID clears the value of the "pinned_runtime_target_id" field.
+func (u *AgentUpsert) ClearPinnedRuntimeTargetID() *AgentUpsert {
+	u.SetNull(agent.FieldPinnedRuntimeTargetID)
+	return u
+}
+
+// SetPinnedRuntimeTargetType sets the "pinned_runtime_target_type" field.
+func (u *AgentUpsert) SetPinnedRuntimeTargetType(v string) *AgentUpsert {
+	u.Set(agent.FieldPinnedRuntimeTargetType, v)
+	return u
+}
+
+// UpdatePinnedRuntimeTargetType sets the "pinned_runtime_target_type" field to the value that was provided on create.
+func (u *AgentUpsert) UpdatePinnedRuntimeTargetType() *AgentUpsert {
+	u.SetExcluded(agent.FieldPinnedRuntimeTargetType)
+	return u
+}
+
+// ClearPinnedRuntimeTargetType clears the value of the "pinned_runtime_target_type" field.
+func (u *AgentUpsert) ClearPinnedRuntimeTargetType() *AgentUpsert {
+	u.SetNull(agent.FieldPinnedRuntimeTargetType)
+	return u
+}
+
 // SetWebPtyEnabled sets the "web_pty_enabled" field.
 func (u *AgentUpsert) SetWebPtyEnabled(v bool) *AgentUpsert {
 	u.Set(agent.FieldWebPtyEnabled, v)
@@ -2370,24 +2658,6 @@ func (u *AgentUpsert) UpdateHarnessConfig() *AgentUpsert {
 // ClearHarnessConfig clears the value of the "harness_config" field.
 func (u *AgentUpsert) ClearHarnessConfig() *AgentUpsert {
 	u.SetNull(agent.FieldHarnessConfig)
-	return u
-}
-
-// SetAncestry sets the "ancestry" field.
-func (u *AgentUpsert) SetAncestry(v []string) *AgentUpsert {
-	u.Set(agent.FieldAncestry, v)
-	return u
-}
-
-// UpdateAncestry sets the "ancestry" field to the value that was provided on create.
-func (u *AgentUpsert) UpdateAncestry() *AgentUpsert {
-	u.SetExcluded(agent.FieldAncestry)
-	return u
-}
-
-// ClearAncestry clears the value of the "ancestry" field.
-func (u *AgentUpsert) ClearAncestry() *AgentUpsert {
-	u.SetNull(agent.FieldAncestry)
 	return u
 }
 
@@ -2613,6 +2883,60 @@ func (u *AgentUpsert) ClearPreviousRunIds() *AgentUpsert {
 	return u
 }
 
+// SetRunIDUpdatedAt sets the "run_id_updated_at" field.
+func (u *AgentUpsert) SetRunIDUpdatedAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldRunIDUpdatedAt, v)
+	return u
+}
+
+// UpdateRunIDUpdatedAt sets the "run_id_updated_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateRunIDUpdatedAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldRunIDUpdatedAt)
+	return u
+}
+
+// ClearRunIDUpdatedAt clears the value of the "run_id_updated_at" field.
+func (u *AgentUpsert) ClearRunIDUpdatedAt() *AgentUpsert {
+	u.SetNull(agent.FieldRunIDUpdatedAt)
+	return u
+}
+
+// SetSSHHostKey sets the "ssh_host_key" field.
+func (u *AgentUpsert) SetSSHHostKey(v string) *AgentUpsert {
+	u.Set(agent.FieldSSHHostKey, v)
+	return u
+}
+
+// UpdateSSHHostKey sets the "ssh_host_key" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateSSHHostKey() *AgentUpsert {
+	u.SetExcluded(agent.FieldSSHHostKey)
+	return u
+}
+
+// ClearSSHHostKey clears the value of the "ssh_host_key" field.
+func (u *AgentUpsert) ClearSSHHostKey() *AgentUpsert {
+	u.SetNull(agent.FieldSSHHostKey)
+	return u
+}
+
+// SetSSHHostKeyRunID sets the "ssh_host_key_run_id" field.
+func (u *AgentUpsert) SetSSHHostKeyRunID(v string) *AgentUpsert {
+	u.Set(agent.FieldSSHHostKeyRunID, v)
+	return u
+}
+
+// UpdateSSHHostKeyRunID sets the "ssh_host_key_run_id" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateSSHHostKeyRunID() *AgentUpsert {
+	u.SetExcluded(agent.FieldSSHHostKeyRunID)
+	return u
+}
+
+// ClearSSHHostKeyRunID clears the value of the "ssh_host_key_run_id" field.
+func (u *AgentUpsert) ClearSSHHostKeyRunID() *AgentUpsert {
+	u.SetNull(agent.FieldSSHHostKeyRunID)
+	return u
+}
+
 // SetLaunchState sets the "launch_state" field.
 func (u *AgentUpsert) SetLaunchState(v string) *AgentUpsert {
 	u.Set(agent.FieldLaunchState, v)
@@ -2772,6 +3096,24 @@ func (u *AgentUpsert) UpdateLaunchError() *AgentUpsert {
 // ClearLaunchError clears the value of the "launch_error" field.
 func (u *AgentUpsert) ClearLaunchError() *AgentUpsert {
 	u.SetNull(agent.FieldLaunchError)
+	return u
+}
+
+// SetLaunchCause sets the "launch_cause" field.
+func (u *AgentUpsert) SetLaunchCause(v string) *AgentUpsert {
+	u.Set(agent.FieldLaunchCause, v)
+	return u
+}
+
+// UpdateLaunchCause sets the "launch_cause" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateLaunchCause() *AgentUpsert {
+	u.SetExcluded(agent.FieldLaunchCause)
+	return u
+}
+
+// ClearLaunchCause clears the value of the "launch_cause" field.
+func (u *AgentUpsert) ClearLaunchCause() *AgentUpsert {
+	u.SetNull(agent.FieldLaunchCause)
 	return u
 }
 
@@ -2970,6 +3312,24 @@ func (u *AgentUpsert) UpdateRunIntentAt() *AgentUpsert {
 // ClearRunIntentAt clears the value of the "run_intent_at" field.
 func (u *AgentUpsert) ClearRunIntentAt() *AgentUpsert {
 	u.SetNull(agent.FieldRunIntentAt)
+	return u
+}
+
+// SetRunIntentMarkedAt sets the "run_intent_marked_at" field.
+func (u *AgentUpsert) SetRunIntentMarkedAt(v time.Time) *AgentUpsert {
+	u.Set(agent.FieldRunIntentMarkedAt, v)
+	return u
+}
+
+// UpdateRunIntentMarkedAt sets the "run_intent_marked_at" field to the value that was provided on create.
+func (u *AgentUpsert) UpdateRunIntentMarkedAt() *AgentUpsert {
+	u.SetExcluded(agent.FieldRunIntentMarkedAt)
+	return u
+}
+
+// ClearRunIntentMarkedAt clears the value of the "run_intent_marked_at" field.
+func (u *AgentUpsert) ClearRunIntentMarkedAt() *AgentUpsert {
+	u.SetNull(agent.FieldRunIntentMarkedAt)
 	return u
 }
 
@@ -3188,6 +3548,18 @@ func (u *AgentUpsertOne) UpdateNewValues() *AgentUpsertOne {
 		if _, exists := u.create.mutation.ID(); exists {
 			s.SetIgnore(agent.FieldID)
 		}
+		if _, exists := u.create.mutation.FixtureRootID(); exists {
+			s.SetIgnore(agent.FieldFixtureRootID)
+		}
+		if _, exists := u.create.mutation.FixtureIssuerID(); exists {
+			s.SetIgnore(agent.FieldFixtureIssuerID)
+		}
+		if _, exists := u.create.mutation.CreatedBy(); exists {
+			s.SetIgnore(agent.FieldCreatedBy)
+		}
+		if _, exists := u.create.mutation.Ancestry(); exists {
+			s.SetIgnore(agent.FieldAncestry)
+		}
 		if _, exists := u.create.mutation.Created(); exists {
 			s.SetIgnore(agent.FieldCreated)
 		}
@@ -3296,27 +3668,6 @@ func (u *AgentUpsertOne) SetStatus(v agent.Status) *AgentUpsertOne {
 func (u *AgentUpsertOne) UpdateStatus() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.UpdateStatus()
-	})
-}
-
-// SetCreatedBy sets the "created_by" field.
-func (u *AgentUpsertOne) SetCreatedBy(v uuid.UUID) *AgentUpsertOne {
-	return u.Update(func(s *AgentUpsert) {
-		s.SetCreatedBy(v)
-	})
-}
-
-// UpdateCreatedBy sets the "created_by" field to the value that was provided on create.
-func (u *AgentUpsertOne) UpdateCreatedBy() *AgentUpsertOne {
-	return u.Update(func(s *AgentUpsert) {
-		s.UpdateCreatedBy()
-	})
-}
-
-// ClearCreatedBy clears the value of the "created_by" field.
-func (u *AgentUpsertOne) ClearCreatedBy() *AgentUpsertOne {
-	return u.Update(func(s *AgentUpsert) {
-		s.ClearCreatedBy()
 	})
 }
 
@@ -3747,6 +4098,69 @@ func (u *AgentUpsertOne) ClearWorkspacePlacement() *AgentUpsertOne {
 	})
 }
 
+// SetPinnedRuntimeBrokerID sets the "pinned_runtime_broker_id" field.
+func (u *AgentUpsertOne) SetPinnedRuntimeBrokerID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetPinnedRuntimeBrokerID(v)
+	})
+}
+
+// UpdatePinnedRuntimeBrokerID sets the "pinned_runtime_broker_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdatePinnedRuntimeBrokerID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdatePinnedRuntimeBrokerID()
+	})
+}
+
+// ClearPinnedRuntimeBrokerID clears the value of the "pinned_runtime_broker_id" field.
+func (u *AgentUpsertOne) ClearPinnedRuntimeBrokerID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearPinnedRuntimeBrokerID()
+	})
+}
+
+// SetPinnedRuntimeTargetID sets the "pinned_runtime_target_id" field.
+func (u *AgentUpsertOne) SetPinnedRuntimeTargetID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetPinnedRuntimeTargetID(v)
+	})
+}
+
+// UpdatePinnedRuntimeTargetID sets the "pinned_runtime_target_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdatePinnedRuntimeTargetID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdatePinnedRuntimeTargetID()
+	})
+}
+
+// ClearPinnedRuntimeTargetID clears the value of the "pinned_runtime_target_id" field.
+func (u *AgentUpsertOne) ClearPinnedRuntimeTargetID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearPinnedRuntimeTargetID()
+	})
+}
+
+// SetPinnedRuntimeTargetType sets the "pinned_runtime_target_type" field.
+func (u *AgentUpsertOne) SetPinnedRuntimeTargetType(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetPinnedRuntimeTargetType(v)
+	})
+}
+
+// UpdatePinnedRuntimeTargetType sets the "pinned_runtime_target_type" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdatePinnedRuntimeTargetType() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdatePinnedRuntimeTargetType()
+	})
+}
+
+// ClearPinnedRuntimeTargetType clears the value of the "pinned_runtime_target_type" field.
+func (u *AgentUpsertOne) ClearPinnedRuntimeTargetType() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearPinnedRuntimeTargetType()
+	})
+}
+
 // SetWebPtyEnabled sets the "web_pty_enabled" field.
 func (u *AgentUpsertOne) SetWebPtyEnabled(v bool) *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
@@ -3863,27 +4277,6 @@ func (u *AgentUpsertOne) UpdateHarnessConfig() *AgentUpsertOne {
 func (u *AgentUpsertOne) ClearHarnessConfig() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearHarnessConfig()
-	})
-}
-
-// SetAncestry sets the "ancestry" field.
-func (u *AgentUpsertOne) SetAncestry(v []string) *AgentUpsertOne {
-	return u.Update(func(s *AgentUpsert) {
-		s.SetAncestry(v)
-	})
-}
-
-// UpdateAncestry sets the "ancestry" field to the value that was provided on create.
-func (u *AgentUpsertOne) UpdateAncestry() *AgentUpsertOne {
-	return u.Update(func(s *AgentUpsert) {
-		s.UpdateAncestry()
-	})
-}
-
-// ClearAncestry clears the value of the "ancestry" field.
-func (u *AgentUpsertOne) ClearAncestry() *AgentUpsertOne {
-	return u.Update(func(s *AgentUpsert) {
-		s.ClearAncestry()
 	})
 }
 
@@ -4146,6 +4539,69 @@ func (u *AgentUpsertOne) ClearPreviousRunIds() *AgentUpsertOne {
 	})
 }
 
+// SetRunIDUpdatedAt sets the "run_id_updated_at" field.
+func (u *AgentUpsertOne) SetRunIDUpdatedAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunIDUpdatedAt(v)
+	})
+}
+
+// UpdateRunIDUpdatedAt sets the "run_id_updated_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateRunIDUpdatedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunIDUpdatedAt()
+	})
+}
+
+// ClearRunIDUpdatedAt clears the value of the "run_id_updated_at" field.
+func (u *AgentUpsertOne) ClearRunIDUpdatedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunIDUpdatedAt()
+	})
+}
+
+// SetSSHHostKey sets the "ssh_host_key" field.
+func (u *AgentUpsertOne) SetSSHHostKey(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetSSHHostKey(v)
+	})
+}
+
+// UpdateSSHHostKey sets the "ssh_host_key" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateSSHHostKey() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateSSHHostKey()
+	})
+}
+
+// ClearSSHHostKey clears the value of the "ssh_host_key" field.
+func (u *AgentUpsertOne) ClearSSHHostKey() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearSSHHostKey()
+	})
+}
+
+// SetSSHHostKeyRunID sets the "ssh_host_key_run_id" field.
+func (u *AgentUpsertOne) SetSSHHostKeyRunID(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetSSHHostKeyRunID(v)
+	})
+}
+
+// UpdateSSHHostKeyRunID sets the "ssh_host_key_run_id" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateSSHHostKeyRunID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateSSHHostKeyRunID()
+	})
+}
+
+// ClearSSHHostKeyRunID clears the value of the "ssh_host_key_run_id" field.
+func (u *AgentUpsertOne) ClearSSHHostKeyRunID() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearSSHHostKeyRunID()
+	})
+}
+
 // SetLaunchState sets the "launch_state" field.
 func (u *AgentUpsertOne) SetLaunchState(v string) *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
@@ -4332,6 +4788,27 @@ func (u *AgentUpsertOne) UpdateLaunchError() *AgentUpsertOne {
 func (u *AgentUpsertOne) ClearLaunchError() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearLaunchError()
+	})
+}
+
+// SetLaunchCause sets the "launch_cause" field.
+func (u *AgentUpsertOne) SetLaunchCause(v string) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchCause(v)
+	})
+}
+
+// UpdateLaunchCause sets the "launch_cause" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateLaunchCause() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchCause()
+	})
+}
+
+// ClearLaunchCause clears the value of the "launch_cause" field.
+func (u *AgentUpsertOne) ClearLaunchCause() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchCause()
 	})
 }
 
@@ -4563,6 +5040,27 @@ func (u *AgentUpsertOne) UpdateRunIntentAt() *AgentUpsertOne {
 func (u *AgentUpsertOne) ClearRunIntentAt() *AgentUpsertOne {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearRunIntentAt()
+	})
+}
+
+// SetRunIntentMarkedAt sets the "run_intent_marked_at" field.
+func (u *AgentUpsertOne) SetRunIntentMarkedAt(v time.Time) *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunIntentMarkedAt(v)
+	})
+}
+
+// UpdateRunIntentMarkedAt sets the "run_intent_marked_at" field to the value that was provided on create.
+func (u *AgentUpsertOne) UpdateRunIntentMarkedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunIntentMarkedAt()
+	})
+}
+
+// ClearRunIntentMarkedAt clears the value of the "run_intent_marked_at" field.
+func (u *AgentUpsertOne) ClearRunIntentMarkedAt() *AgentUpsertOne {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunIntentMarkedAt()
 	})
 }
 
@@ -4933,7 +5431,7 @@ func (_c *AgentCreateBulk) ExecX(ctx context.Context) {
 //		// Override some of the fields with custom
 //		// update values.
 //		Update(func(u *ent.AgentUpsert) {
-//			SetSlug(v+v).
+//			SetFixtureRootID(v+v).
 //		}).
 //		Exec(ctx)
 func (_c *AgentCreateBulk) OnConflict(opts ...sql.ConflictOption) *AgentUpsertBulk {
@@ -4979,6 +5477,18 @@ func (u *AgentUpsertBulk) UpdateNewValues() *AgentUpsertBulk {
 		for _, b := range u.create.builders {
 			if _, exists := b.mutation.ID(); exists {
 				s.SetIgnore(agent.FieldID)
+			}
+			if _, exists := b.mutation.FixtureRootID(); exists {
+				s.SetIgnore(agent.FieldFixtureRootID)
+			}
+			if _, exists := b.mutation.FixtureIssuerID(); exists {
+				s.SetIgnore(agent.FieldFixtureIssuerID)
+			}
+			if _, exists := b.mutation.CreatedBy(); exists {
+				s.SetIgnore(agent.FieldCreatedBy)
+			}
+			if _, exists := b.mutation.Ancestry(); exists {
+				s.SetIgnore(agent.FieldAncestry)
 			}
 			if _, exists := b.mutation.Created(); exists {
 				s.SetIgnore(agent.FieldCreated)
@@ -5089,27 +5599,6 @@ func (u *AgentUpsertBulk) SetStatus(v agent.Status) *AgentUpsertBulk {
 func (u *AgentUpsertBulk) UpdateStatus() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.UpdateStatus()
-	})
-}
-
-// SetCreatedBy sets the "created_by" field.
-func (u *AgentUpsertBulk) SetCreatedBy(v uuid.UUID) *AgentUpsertBulk {
-	return u.Update(func(s *AgentUpsert) {
-		s.SetCreatedBy(v)
-	})
-}
-
-// UpdateCreatedBy sets the "created_by" field to the value that was provided on create.
-func (u *AgentUpsertBulk) UpdateCreatedBy() *AgentUpsertBulk {
-	return u.Update(func(s *AgentUpsert) {
-		s.UpdateCreatedBy()
-	})
-}
-
-// ClearCreatedBy clears the value of the "created_by" field.
-func (u *AgentUpsertBulk) ClearCreatedBy() *AgentUpsertBulk {
-	return u.Update(func(s *AgentUpsert) {
-		s.ClearCreatedBy()
 	})
 }
 
@@ -5540,6 +6029,69 @@ func (u *AgentUpsertBulk) ClearWorkspacePlacement() *AgentUpsertBulk {
 	})
 }
 
+// SetPinnedRuntimeBrokerID sets the "pinned_runtime_broker_id" field.
+func (u *AgentUpsertBulk) SetPinnedRuntimeBrokerID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetPinnedRuntimeBrokerID(v)
+	})
+}
+
+// UpdatePinnedRuntimeBrokerID sets the "pinned_runtime_broker_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdatePinnedRuntimeBrokerID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdatePinnedRuntimeBrokerID()
+	})
+}
+
+// ClearPinnedRuntimeBrokerID clears the value of the "pinned_runtime_broker_id" field.
+func (u *AgentUpsertBulk) ClearPinnedRuntimeBrokerID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearPinnedRuntimeBrokerID()
+	})
+}
+
+// SetPinnedRuntimeTargetID sets the "pinned_runtime_target_id" field.
+func (u *AgentUpsertBulk) SetPinnedRuntimeTargetID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetPinnedRuntimeTargetID(v)
+	})
+}
+
+// UpdatePinnedRuntimeTargetID sets the "pinned_runtime_target_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdatePinnedRuntimeTargetID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdatePinnedRuntimeTargetID()
+	})
+}
+
+// ClearPinnedRuntimeTargetID clears the value of the "pinned_runtime_target_id" field.
+func (u *AgentUpsertBulk) ClearPinnedRuntimeTargetID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearPinnedRuntimeTargetID()
+	})
+}
+
+// SetPinnedRuntimeTargetType sets the "pinned_runtime_target_type" field.
+func (u *AgentUpsertBulk) SetPinnedRuntimeTargetType(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetPinnedRuntimeTargetType(v)
+	})
+}
+
+// UpdatePinnedRuntimeTargetType sets the "pinned_runtime_target_type" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdatePinnedRuntimeTargetType() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdatePinnedRuntimeTargetType()
+	})
+}
+
+// ClearPinnedRuntimeTargetType clears the value of the "pinned_runtime_target_type" field.
+func (u *AgentUpsertBulk) ClearPinnedRuntimeTargetType() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearPinnedRuntimeTargetType()
+	})
+}
+
 // SetWebPtyEnabled sets the "web_pty_enabled" field.
 func (u *AgentUpsertBulk) SetWebPtyEnabled(v bool) *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
@@ -5656,27 +6208,6 @@ func (u *AgentUpsertBulk) UpdateHarnessConfig() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearHarnessConfig() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearHarnessConfig()
-	})
-}
-
-// SetAncestry sets the "ancestry" field.
-func (u *AgentUpsertBulk) SetAncestry(v []string) *AgentUpsertBulk {
-	return u.Update(func(s *AgentUpsert) {
-		s.SetAncestry(v)
-	})
-}
-
-// UpdateAncestry sets the "ancestry" field to the value that was provided on create.
-func (u *AgentUpsertBulk) UpdateAncestry() *AgentUpsertBulk {
-	return u.Update(func(s *AgentUpsert) {
-		s.UpdateAncestry()
-	})
-}
-
-// ClearAncestry clears the value of the "ancestry" field.
-func (u *AgentUpsertBulk) ClearAncestry() *AgentUpsertBulk {
-	return u.Update(func(s *AgentUpsert) {
-		s.ClearAncestry()
 	})
 }
 
@@ -5939,6 +6470,69 @@ func (u *AgentUpsertBulk) ClearPreviousRunIds() *AgentUpsertBulk {
 	})
 }
 
+// SetRunIDUpdatedAt sets the "run_id_updated_at" field.
+func (u *AgentUpsertBulk) SetRunIDUpdatedAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunIDUpdatedAt(v)
+	})
+}
+
+// UpdateRunIDUpdatedAt sets the "run_id_updated_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateRunIDUpdatedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunIDUpdatedAt()
+	})
+}
+
+// ClearRunIDUpdatedAt clears the value of the "run_id_updated_at" field.
+func (u *AgentUpsertBulk) ClearRunIDUpdatedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunIDUpdatedAt()
+	})
+}
+
+// SetSSHHostKey sets the "ssh_host_key" field.
+func (u *AgentUpsertBulk) SetSSHHostKey(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetSSHHostKey(v)
+	})
+}
+
+// UpdateSSHHostKey sets the "ssh_host_key" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateSSHHostKey() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateSSHHostKey()
+	})
+}
+
+// ClearSSHHostKey clears the value of the "ssh_host_key" field.
+func (u *AgentUpsertBulk) ClearSSHHostKey() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearSSHHostKey()
+	})
+}
+
+// SetSSHHostKeyRunID sets the "ssh_host_key_run_id" field.
+func (u *AgentUpsertBulk) SetSSHHostKeyRunID(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetSSHHostKeyRunID(v)
+	})
+}
+
+// UpdateSSHHostKeyRunID sets the "ssh_host_key_run_id" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateSSHHostKeyRunID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateSSHHostKeyRunID()
+	})
+}
+
+// ClearSSHHostKeyRunID clears the value of the "ssh_host_key_run_id" field.
+func (u *AgentUpsertBulk) ClearSSHHostKeyRunID() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearSSHHostKeyRunID()
+	})
+}
+
 // SetLaunchState sets the "launch_state" field.
 func (u *AgentUpsertBulk) SetLaunchState(v string) *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
@@ -6125,6 +6719,27 @@ func (u *AgentUpsertBulk) UpdateLaunchError() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearLaunchError() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearLaunchError()
+	})
+}
+
+// SetLaunchCause sets the "launch_cause" field.
+func (u *AgentUpsertBulk) SetLaunchCause(v string) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetLaunchCause(v)
+	})
+}
+
+// UpdateLaunchCause sets the "launch_cause" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateLaunchCause() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateLaunchCause()
+	})
+}
+
+// ClearLaunchCause clears the value of the "launch_cause" field.
+func (u *AgentUpsertBulk) ClearLaunchCause() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearLaunchCause()
 	})
 }
 
@@ -6356,6 +6971,27 @@ func (u *AgentUpsertBulk) UpdateRunIntentAt() *AgentUpsertBulk {
 func (u *AgentUpsertBulk) ClearRunIntentAt() *AgentUpsertBulk {
 	return u.Update(func(s *AgentUpsert) {
 		s.ClearRunIntentAt()
+	})
+}
+
+// SetRunIntentMarkedAt sets the "run_intent_marked_at" field.
+func (u *AgentUpsertBulk) SetRunIntentMarkedAt(v time.Time) *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.SetRunIntentMarkedAt(v)
+	})
+}
+
+// UpdateRunIntentMarkedAt sets the "run_intent_marked_at" field to the value that was provided on create.
+func (u *AgentUpsertBulk) UpdateRunIntentMarkedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.UpdateRunIntentMarkedAt()
+	})
+}
+
+// ClearRunIntentMarkedAt clears the value of the "run_intent_marked_at" field.
+func (u *AgentUpsertBulk) ClearRunIntentMarkedAt() *AgentUpsertBulk {
+	return u.Update(func(s *AgentUpsert) {
+		s.ClearRunIntentMarkedAt()
 	})
 }
 

@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -41,7 +42,13 @@ func setReincarnatePatchFlags(t *testing.T, sa, role, model string, thinking int
 		reincarnateServiceAccount, reincarnateRole, reincarnateModel, reincarnateThinkingLevel, reincarnateHarnessAuth, reincarnateImage = pSA, pRole, pModel, pTL, pAuth, pImage
 		reincarnateBroker, reincarnateDryRun = pBroker, pDryRun
 	})
-	reincarnateServiceAccount, reincarnateRole, reincarnateModel, reincarnateThinkingLevel, reincarnateHarnessAuth, reincarnateImage = sa, role, model, thinking, auth, image
+	// thinking -1 leaves --thinking-level unset; other values are passed as
+	// the flag's string form.
+	tl := ""
+	if thinking != -1 {
+		tl = strconv.Itoa(thinking)
+	}
+	reincarnateServiceAccount, reincarnateRole, reincarnateModel, reincarnateThinkingLevel, reincarnateHarnessAuth, reincarnateImage = sa, role, model, tl, auth, image
 }
 
 func TestValidateReincarnatePatchFlags(t *testing.T) {
@@ -256,7 +263,7 @@ func forbiddenPatchHub(t *testing.T, cred hubsync.CredentialKind) (*HubContext, 
 		calls++
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"error":{"code":"forbidden","message":"Reincarnate patch flags need permission to update the agent (agent.update) in addition to lifecycle; a user access token cannot grant it, so use a signed-in session"}}`))
+		_, _ = w.Write([]byte(`{"error":{"code":"forbidden","message":"Reincarnate patch flags need permission to update the agent (agent.update) in addition to lifecycle; a user access token also needs the agent:update scope"}}`))
 	}))
 	t.Cleanup(srv.Close)
 	client, err := hubclient.New(srv.URL)
@@ -274,7 +281,7 @@ func TestReincarnatePatch_ForbiddenPatchExplainsUAT(t *testing.T) {
 
 	err := reincarnateAgentViaHub(hubCtx, "agent-1", "handoff", false)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "A user access token (UAT) cannot use patch flags")
+	assert.Contains(t, err.Error(), "A user access token (UAT) needs the agent:update scope to use patch flags")
 	assert.Contains(t, err.Error(), "scion hub auth login")
 	assert.Equal(t, 1, *calls, "the refused probe is the only request")
 }
@@ -292,7 +299,7 @@ func TestReincarnatePatch_ForbiddenPatchSessionNeedsUpdate(t *testing.T) {
 			err := reincarnateAgentViaHub(hubCtx, "agent-1", "", false)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "grant you agent.update on this agent")
-			assert.NotContains(t, err.Error(), "A user access token (UAT) cannot use patch flags")
+			assert.NotContains(t, err.Error(), "A user access token (UAT) needs the agent:update scope to use patch flags")
 			assert.NotContains(t, err.Error(), "scion hub auth login")
 			assert.Equal(t, 1, *calls)
 		})

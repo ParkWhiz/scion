@@ -19,8 +19,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -38,6 +41,28 @@ import (
 // unresolvable name as a client-facing 4xx naming the resource, instead of
 // folding it into a generic 5xx (ptone/scion#1316 fault 3).
 var ErrTemplateNotFound = errors.New("template not found")
+
+// TemplateNotFoundError is the typed form of ErrTemplateNotFound
+// (errors.Is(err, ErrTemplateNotFound) still matches). Error() keeps the
+// full diagnostic text, which can name broker filesystem paths; Name is the
+// display-safe template name for client-facing messages (ptone/scion#3113).
+type TemplateNotFoundError struct {
+	// Name is FriendlyTemplateName of the reference that did not resolve:
+	// a plain name, an absolute path's base name, or "" when the only
+	// identifier is a content hash.
+	Name string
+	msg  string
+}
+
+// NewTemplateNotFoundError returns a TemplateNotFoundError for ref whose
+// Error() is msg (the caller's full diagnostic text, without the
+// sentinel's own text, which Error() appends).
+func NewTemplateNotFoundError(ref, msg string) *TemplateNotFoundError {
+	return &TemplateNotFoundError{Name: FriendlyTemplateName(ref), msg: msg}
+}
+
+func (e *TemplateNotFoundError) Error() string { return e.msg + ": " + ErrTemplateNotFound.Error() }
+func (e *TemplateNotFoundError) Unwrap() error { return ErrTemplateNotFound }
 
 type Template struct {
 	Name  string
@@ -132,6 +157,14 @@ func (t *Template) LoadConfig() (*api.ScionConfig, error) {
 
 	if err := api.ValidateMCPServers(cfg.MCPServers); err != nil {
 		return nil, fmt.Errorf("invalid mcp_servers config in %s: %w", configPath, err)
+	}
+
+	if err := cfg.CloneDepth.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config in %s: %w", configPath, err)
+	}
+
+	if err := api.ValidateMessageMode(cfg.MessageMode); err != nil {
+		return nil, fmt.Errorf("invalid config in %s: %w", configPath, err)
 	}
 
 	return &cfg, nil
@@ -282,10 +315,28 @@ func FindTemplateInScope(name, scope string) *Template {
 // hash, which is not a template name, so it yields "".
 func templateNameFromDir(dir string) string {
 	base := filepath.Base(dir)
-	if transfer.IsContentHash(base) {
+	if isTemplateHashName(base) {
 		return ""
 	}
 	return base
+}
+
+// templateHashPattern matches a content hash in any letter case, with or
+// without the "sha256:" prefix. transfer.IsContentHash only accepts the
+// lowercase, prefixed form the cache writes today; this broader match is
+// local to display-name derivation so an unprefixed or uppercase digest (a
+// legacy or externally produced hash) is never shown as a template name
+// either (ptone/scion#3113).
+var templateHashPattern = regexp.MustCompile(`(?i)^(sha256:)?[0-9a-f]{64}$`)
+
+// isTemplateHashName reports whether s is a content hash rather than a
+// template name: the prefixed form cache directories use today, or any
+// other letter case or the bare 64-hex digest (templateHashPattern).
+// transfer.IsContentHash is a strict subset of templateHashPattern; it is
+// kept on purpose, only to tie this check to the cache's canonical hash
+// form, so a change to that form is reflected here too.
+func isTemplateHashName(s string) bool {
+	return transfer.IsContentHash(s) || templateHashPattern.MatchString(s)
 }
 
 // FriendlyTemplateName converts a raw template reference (cache path, URI, or
@@ -303,7 +354,7 @@ func FriendlyTemplateName(ref string) string {
 	if filepath.IsAbs(ref) {
 		return templateNameFromDir(ref)
 	}
-	if transfer.IsContentHash(ref) {
+	if isTemplateHashName(ref) {
 		return ""
 	}
 	return ref
@@ -323,16 +374,33 @@ func DeriveTemplateName(uri string) string {
 		return parts.Repo
 	}
 
-	// For archive URLs, extract filename without extension
-	if isArchiveURL(uri) {
-		base := filepath.Base(uri)
-		// Remove common extensions
-		for _, ext := range []string{".tar.gz", ".tgz", ".zip"} {
-			if len(base) > len(ext) && base[len(base)-len(ext):] == ext {
-				return base[:len(base)-len(ext)]
-			}
+	// For HTTP(S) URLs, use the last element of the URL path only: the
+	// query (e.g. a signed-URL token) and any userinfo never become part of
+	// the name, since it is shown to users (ptone/scion#3113).
+	if strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://") {
+		u, err := url.Parse(uri)
+		if err != nil {
+			return "remote"
 		}
-		return base
+		if u.Path == "" {
+			if host := u.Hostname(); host != "" {
+				return host
+			}
+			return "remote"
+		}
+		// EscapedPath, not Path: the name keeps the reference's own
+		// percent-encoding, so an encoded "/" or control character
+		// (a%2Fb, a%0Ab) is never decoded into the displayed name.
+		base := path.Base(u.EscapedPath())
+		if base == "/" || base == "." || base == ".." {
+			return "remote"
+		}
+		return trimArchiveExt(base)
+	}
+
+	// For archive paths, extract filename without extension
+	if isArchiveURL(uri) {
+		return trimArchiveExt(filepath.Base(uri))
 	}
 
 	// For rclone paths, use the last path component
@@ -350,6 +418,16 @@ func DeriveTemplateName(uri string) string {
 
 	// Fallback: use "remote"
 	return "remote"
+}
+
+// trimArchiveExt removes a .tar.gz, .tgz or .zip extension from base.
+func trimArchiveExt(base string) string {
+	for _, ext := range []string{".tar.gz", ".tgz", ".zip"} {
+		if len(base) > len(ext) && base[len(base)-len(ext):] == ext {
+			return base[:len(base)-len(ext)]
+		}
+	}
+	return base
 }
 
 // GetTemplateChain returns a list of templates in inheritance order (base first).
@@ -395,7 +473,7 @@ func FindTemplateInProjectPath(name, projectPath string) (*Template, error) {
 		if info, err := os.Stat(name); err == nil && info.IsDir() {
 			return &Template{Name: templateNameFromDir(name), Path: name}, nil
 		}
-		return nil, fmt.Errorf("template path %s not found or not a directory: %w", name, ErrTemplateNotFound)
+		return nil, NewTemplateNotFoundError(name, fmt.Sprintf("template path %s not found or not a directory", name))
 	}
 
 	// Check project-specific templates directory (in-repo .scion/templates/ for git projects)
@@ -414,7 +492,7 @@ func FindTemplateInProjectPath(name, projectPath string) (*Template, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("template %s not found: %w", name, ErrTemplateNotFound)
+	return nil, NewTemplateNotFoundError(name, fmt.Sprintf("template %s not found", name))
 }
 
 // findOrHydrateDefaultTemplate resolves the default template, seeding it from the
@@ -834,6 +912,9 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	if override.Model != "" {
 		result.Model = override.Model
 	}
+	if override.MessageMode != "" {
+		result.MessageMode = override.MessageMode
+	}
 	// ThinkingLevel is a *int: nil means "unset", so a nil override never
 	// clobbers a base value. Copy the pointee rather than the pointer — the
 	// merge's shallow copy above already aliases base's fields, and adding a
@@ -877,6 +958,9 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 	}
 	if override.MaxDuration != "" {
 		result.MaxDuration = override.MaxDuration
+	}
+	if override.CloneDepth != "" {
+		result.CloneDepth = override.CloneDepth
 	}
 	if override.Hub != nil {
 		if result.Hub == nil {
@@ -974,7 +1058,45 @@ func MergeScionConfig(base, override *api.ScionConfig) *api.ScionConfig {
 		result.Skills = append(result.Skills, annotated...)
 	}
 
+	// AgentPlugins: append, annotate "template" scope, then dedupe by path
+	// (last one wins). GetAgent re-merges the persisted scion-agent.json over
+	// the template chain, so a plain append would grow the persisted list on
+	// every re-provision. The merged list is informational, not the
+	// effective set: the persisted copy of an entry keeps its old fields
+	// after a template edits them, and entries a template dropped stay in
+	// it. Provisioning resolves each template's own entries against its own
+	// directory.
+	if len(override.AgentPlugins) > 0 {
+		merged := make([]api.AgentPluginReference, 0, len(base.AgentPlugins)+len(override.AgentPlugins))
+		merged = append(merged, base.AgentPlugins...)
+		for _, ref := range override.AgentPlugins {
+			if ref.Scope == "" {
+				ref.Scope = "template"
+			}
+			merged = append(merged, ref)
+		}
+		result.AgentPlugins = dedupeAgentPluginRefs(merged)
+	}
+
 	return &result
+}
+
+// dedupeAgentPluginRefs drops every entry whose path (ignoring a leading
+// "./" and redundant separators) recurs later in refs, so the last
+// declaration of a path wins and keeps its position.
+func dedupeAgentPluginRefs(refs []api.AgentPluginReference) []api.AgentPluginReference {
+	key := func(p string) string { return filepath.Clean(strings.TrimPrefix(p, "./")) }
+	last := make(map[string]int, len(refs))
+	for i, r := range refs {
+		last[key(r.Path)] = i
+	}
+	out := make([]api.AgentPluginReference, 0, len(last))
+	for i, r := range refs {
+		if last[key(r.Path)] == i {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func mergeKubernetesConfig(base, override *api.KubernetesConfig) *api.KubernetesConfig {
@@ -1081,6 +1203,12 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 			}
 			if override.Cloud.TLS.CAFile != "" {
 				result.Cloud.TLS.CAFile = override.Cloud.TLS.CAFile
+			}
+			if override.Cloud.TLS.CertFile != "" {
+				result.Cloud.TLS.CertFile = override.Cloud.TLS.CertFile
+			}
+			if override.Cloud.TLS.KeyFile != "" {
+				result.Cloud.TLS.KeyFile = override.Cloud.TLS.KeyFile
 			}
 		}
 		if override.Cloud.Batch != nil {
@@ -1190,12 +1318,18 @@ func mergeTelemetryConfig(base, override *api.TelemetryConfig) *api.TelemetryCon
 				result.Filter.Sampling.Default = override.Filter.Sampling.Default
 			}
 			if override.Filter.Sampling.Rates != nil {
-				if result.Filter.Sampling.Rates == nil {
-					result.Filter.Sampling.Rates = make(map[string]float64)
+				// Build a fresh map: result.Filter.Sampling is only a
+				// shallow copy of base, so writing into its Rates would
+				// mutate the base config (for example a shared settings or
+				// hub default object) and leak rates between agents.
+				rates := make(map[string]float64, len(result.Filter.Sampling.Rates)+len(override.Filter.Sampling.Rates))
+				for k, v := range result.Filter.Sampling.Rates {
+					rates[k] = v
 				}
 				for k, v := range override.Filter.Sampling.Rates {
-					result.Filter.Sampling.Rates[k] = v
+					rates[k] = v
 				}
+				result.Filter.Sampling.Rates = rates
 			}
 		}
 	}

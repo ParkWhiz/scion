@@ -5,143 +5,15 @@ package commands
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/provision"
 )
-
-func TestProvisionCmd_WaitForSentinel_Found(t *testing.T) {
-	dir := t.TempDir()
-
-	sentinelPath := filepath.Join(dir, ".scion-provisioned")
-	if err := os.WriteFile(sentinelPath, []byte("provisioned_at=test\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	oldWorkspace := provisionWorkspace
-	oldWait := provisionWaitSentinel
-	oldTimeout := provisionTimeout
-	oldInterval := provisionPollInterval
-	defer func() {
-		provisionWorkspace = oldWorkspace
-		provisionWaitSentinel = oldWait
-		provisionTimeout = oldTimeout
-		provisionPollInterval = oldInterval
-	}()
-
-	provisionWorkspace = dir
-	provisionWaitSentinel = true
-	provisionTimeout = 5
-	provisionPollInterval = 1
-
-	if err := runWaitForSentinel(context.Background()); err != nil {
-		t.Fatalf("expected success when sentinel exists, got: %v", err)
-	}
-}
-
-func TestProvisionCmd_WaitForSentinel_Timeout(t *testing.T) {
-	dir := t.TempDir()
-
-	oldWorkspace := provisionWorkspace
-	oldWait := provisionWaitSentinel
-	oldTimeout := provisionTimeout
-	oldInterval := provisionPollInterval
-	defer func() {
-		provisionWorkspace = oldWorkspace
-		provisionWaitSentinel = oldWait
-		provisionTimeout = oldTimeout
-		provisionPollInterval = oldInterval
-	}()
-
-	provisionWorkspace = dir
-	provisionWaitSentinel = true
-	provisionTimeout = 3
-	provisionPollInterval = 1
-
-	start := time.Now()
-	err := runWaitForSentinel(context.Background())
-	elapsed := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected timeout error when sentinel is missing")
-	}
-	if elapsed < 2*time.Second {
-		t.Errorf("should have waited at least 2s, only waited %s", elapsed)
-	}
-}
-
-func TestProvisionCmd_WaitForSentinel_DelayedWrite(t *testing.T) {
-	dir := t.TempDir()
-
-	oldWorkspace := provisionWorkspace
-	oldWait := provisionWaitSentinel
-	oldTimeout := provisionTimeout
-	oldInterval := provisionPollInterval
-	defer func() {
-		provisionWorkspace = oldWorkspace
-		provisionWaitSentinel = oldWait
-		provisionTimeout = oldTimeout
-		provisionPollInterval = oldInterval
-	}()
-
-	provisionWorkspace = dir
-	provisionWaitSentinel = true
-	provisionTimeout = 10
-	provisionPollInterval = 1
-
-	go func() {
-		time.Sleep(2 * time.Second)
-		sentinelPath := filepath.Join(dir, ".scion-provisioned")
-		_ = os.WriteFile(sentinelPath, []byte("provisioned_at=test\n"), 0644)
-	}()
-
-	if err := runWaitForSentinel(context.Background()); err != nil {
-		t.Fatalf("expected success after delayed sentinel write, got: %v", err)
-	}
-}
-
-func TestProvisionCmd_WaitForSentinel_ContextCancel(t *testing.T) {
-	dir := t.TempDir()
-
-	oldWorkspace := provisionWorkspace
-	oldWait := provisionWaitSentinel
-	oldTimeout := provisionTimeout
-	oldInterval := provisionPollInterval
-	defer func() {
-		provisionWorkspace = oldWorkspace
-		provisionWaitSentinel = oldWait
-		provisionTimeout = oldTimeout
-		provisionPollInterval = oldInterval
-	}()
-
-	provisionWorkspace = dir
-	provisionWaitSentinel = true
-	// Long timeout/interval: the loop would block well past the test budget if
-	// cancellation were not honoured.
-	provisionTimeout = 60
-	provisionPollInterval = 30
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		cancel()
-	}()
-
-	start := time.Now()
-	err := runWaitForSentinel(ctx)
-	elapsed := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected error when context is cancelled")
-	}
-	if elapsed > 5*time.Second {
-		t.Errorf("cancellation should interrupt the poll sleep promptly, waited %s", elapsed)
-	}
-}
 
 func TestProvisionCmd_Clone_Idempotent(t *testing.T) {
 	dir := t.TempDir()
@@ -183,6 +55,7 @@ func TestProvisionCmd_Clone_Idempotent(t *testing.T) {
 	t.Setenv("SCION_CLONE_BRANCH", "main")
 	t.Setenv("SCION_WORKSPACE_MODE", "")
 	t.Setenv("SCION_PROJECT_ID", "test-proj")
+	t.Setenv(provision.GitTokenEnv, "") // no ambient git token
 
 	if err := runProvision(context.Background()); err != nil {
 		t.Fatalf("idempotent provision (sentinel exists) should succeed, got: %v", err)
@@ -220,6 +93,7 @@ func TestProvisionCmd_SharedDirPaths_ParsedAndProvisioned(t *testing.T) {
 	t.Setenv("SCION_CLONE_URL", "")
 	t.Setenv("SCION_WORKSPACE_MODE", "")
 	t.Setenv("SCION_PROJECT_ID", "test-proj-shared-dirs")
+	t.Setenv(provision.GitTokenEnv, "") // no ambient git token
 	t.Setenv("SCION_SHARED_DIR_PATHS", "scratchpad="+sharedRootA+",other-scratchpad="+sharedRootB)
 
 	if err := runProvision(context.Background()); err != nil {
@@ -259,6 +133,7 @@ func TestProvisionCmd_Clone_NoURL(t *testing.T) {
 	t.Setenv("SCION_CLONE_BRANCH", "")
 	t.Setenv("SCION_WORKSPACE_MODE", "")
 	t.Setenv("SCION_PROJECT_ID", "test-proj-no-url")
+	t.Setenv(provision.GitTokenEnv, "") // no ambient git token
 
 	if err := runProvision(context.Background()); err != nil {
 		t.Fatalf("provision without clone URL should succeed (non-git project), got: %v", err)
@@ -284,6 +159,7 @@ func runProvisionWithFailingChown(t *testing.T, bestEffortValue *string) (error,
 	t.Setenv("SCION_SHARED_DIR_PATHS", "")
 	t.Setenv("SCION_WORKSPACE_MODE", "")
 	t.Setenv("SCION_PROJECT_ID", "proj-chown")
+	t.Setenv(provision.GitTokenEnv, "") // no ambient git token
 	if bestEffortValue != nil {
 		t.Setenv(provision.ChownBestEffortEnv, *bestEffortValue)
 	} else {
@@ -344,5 +220,79 @@ func TestRunProvision_ChownFailure_BestEffortWhenRequested(t *testing.T) {
 	}
 	if !sentinel {
 		t.Error("sentinel must be written after best-effort provisioning")
+	}
+}
+
+// TestValidateProvisionOwner covers the --uid/--gid range check: 0 keeps
+// meaning "use the default 1000" (provision.resolveUID), so it is accepted;
+// negative values (including -1, which chown reads as "leave unchanged")
+// and values above fsutil.MaxOwnerID are rejected with the flag named.
+func TestValidateProvisionOwner(t *testing.T) {
+	tests := []struct {
+		name     string
+		uid, gid int64
+		wantFlag string
+	}{
+		{"defaults", 1000, 1000, ""},
+		{"zero means default", 0, 0, ""},
+		{"maximum", 4294967294, 4294967294, ""},
+		{"negative one uid", -1, 1000, "--uid"},
+		{"negative one gid", 1000, -1, "--gid"},
+		{"negative uid", -5, 1000, "--uid"},
+		{"unsigned sentinel uid", 4294967295, 1000, "--uid"},
+		{"out of range gid", 1000, 1 << 33, "--gid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A 32-bit int cannot hold ids above math.MaxInt32, so the
+			// int conversions below would wrap and test a different value.
+			if strconv.IntSize < 64 && max(tt.uid, tt.gid) > math.MaxInt32 {
+				t.Skipf("%d/%d does not fit in a %d-bit int", tt.uid, tt.gid, strconv.IntSize)
+			}
+			err := validateProvisionOwner(int(tt.uid), int(tt.gid))
+			if tt.wantFlag == "" {
+				if err != nil {
+					t.Fatalf("validateProvisionOwner(%d, %d) = %v, want nil", tt.uid, tt.gid, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantFlag) {
+				t.Fatalf("validateProvisionOwner(%d, %d) = %v, want an error naming %s", tt.uid, tt.gid, err, tt.wantFlag)
+			}
+		})
+	}
+}
+
+// TestRunProvision_RejectsInvalidOwnerBeforeChanges checks that an invalid
+// --uid stops provisioning before anything is created: no workspace
+// directory and no sentinel.
+func TestRunProvision_RejectsInvalidOwnerBeforeChanges(t *testing.T) {
+	for _, uid := range []int{-1, -1000} {
+		t.Run(strconv.Itoa(uid), func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "workspace")
+			t.Setenv("SCION_CLONE_URL", "")
+			t.Setenv("SCION_SHARED_DIR_PATHS", "")
+			t.Setenv("SCION_WORKSPACE_MODE", "")
+			t.Setenv("SCION_PROVISION_STATE_DIR", "")
+			t.Setenv("SCION_PROJECT_ID", "proj-owner-check")
+			t.Setenv(provision.GitTokenEnv, "") // no ambient git token
+
+			oldWorkspace, oldMode, oldUID, oldGID := provisionWorkspace, provisionMode, provisionUID, provisionGID
+			t.Cleanup(func() {
+				provisionWorkspace, provisionMode, provisionUID, provisionGID = oldWorkspace, oldMode, oldUID, oldGID
+			})
+			provisionWorkspace = workspace
+			provisionMode = "shared-plain"
+			provisionUID = uid
+			provisionGID = os.Getgid()
+
+			err := runProvision(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "--uid") {
+				t.Fatalf("runProvision with --uid %d = %v, want an error naming --uid", uid, err)
+			}
+			if _, statErr := os.Stat(workspace); !os.IsNotExist(statErr) {
+				t.Errorf("workspace %s was created (stat err %v); want no changes", workspace, statErr)
+			}
+		})
 	}
 }

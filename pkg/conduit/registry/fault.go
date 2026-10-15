@@ -28,6 +28,7 @@ const (
 	OpInsertSessionWithNextEpoch       = "InsertSessionWithNextEpoch"
 	OpTouchSession                     = "TouchSession"
 	OpSetSessionDraining               = "SetSessionDraining"
+	OpSetRelaySessionsDraining         = "SetRelaySessionsDraining"
 	OpDeleteSessionCAS                 = "DeleteSessionCAS"
 	OpListPrincipalSessions            = "ListPrincipalSessions"
 	OpListPrincipalSessionsBySession   = "ListPrincipalSessionsBySession"
@@ -35,6 +36,7 @@ const (
 	OpDeleteIdleRelays                 = "DeleteIdleRelays"
 	OpDeleteStaleSessions              = "DeleteStaleSessions"
 	OpDeletePrincipalEpoch             = "DeletePrincipalEpoch"
+	OpListRelays                       = "ListRelays"
 )
 
 // FaultStore wraps a Store with a fault-injection hook for tests and the 1v
@@ -112,6 +114,14 @@ func (f *FaultStore) SetSessionDraining(ctx context.Context, sessionID string) e
 	return f.Inner.SetSessionDraining(ctx, sessionID)
 }
 
+// SetRelaySessionsDraining implements Store.
+func (f *FaultStore) SetRelaySessionsDraining(ctx context.Context, instanceID string, gen int64) (int, error) {
+	if err := f.fault(ctx, OpSetRelaySessionsDraining); err != nil {
+		return 0, err
+	}
+	return f.Inner.SetRelaySessionsDraining(ctx, instanceID, gen)
+}
+
 // DeleteSessionCAS implements Store.
 func (f *FaultStore) DeleteSessionCAS(ctx context.Context, sessionID, relayInstanceID string, relayGen int64) (bool, error) {
 	if err := f.fault(ctx, OpDeleteSessionCAS); err != nil {
@@ -166,4 +176,12 @@ func (f *FaultStore) DeletePrincipalEpoch(ctx context.Context, principalKind, pr
 		return err
 	}
 	return f.Inner.DeletePrincipalEpoch(ctx, principalKind, principalID)
+}
+
+// ListRelays implements Store.
+func (f *FaultStore) ListRelays(ctx context.Context) ([]RelayInstance, error) {
+	if err := f.fault(ctx, OpListRelays); err != nil {
+		return nil, err
+	}
+	return f.Inner.ListRelays(ctx)
 }
