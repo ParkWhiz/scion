@@ -224,7 +224,7 @@ When creating a project through the Hub web UI, Scion includes a default **"scra
 - **The Catch:** GKE Autopilot's default storage class (`standard-rwo`) **only supports `ReadWriteOnce` (RWO)**. Attempting to dispatch an agent will fail with an opaque scheduling error: `VolumeCapabilities is invalid: specified multi writer with mount access type`, and the Hub will output `pods not found`.
 - **The Fix (Option A - Easiest):** If you do not require shared directories, navigate to your project settings in the Hub UI *after* installation and **remove or disable the default shared directory** (e.g., delete the scratchpad entry).
 - **The Fix (Option B - Production):** Set up Google Cloud Filestore or a compatible NFS server, configure the Filestore CSI driver, and define the custom storage class in your GKE runtime profile to support native ReadWriteMany volumes.
-- **The Fix (Option C - Shared NFS export):** Set [`server.shared_dir_storage.backend`](/scion/reference/server-config/#shared-directory-storage-servershared_dir_storage) to `nfs` with a static PVC (`pv_name`) bound to your Filestore or NFS export. Pods then mount shared directories from that single claim by `subPath` instead of requesting a new RWX PVC per directory.
+- **The Fix (Option C - Shared NFS export):** Set [`server.project_storage.backend`](/scion/reference/server-config/#project-storage-serverproject_storage) to `nfs` with a static PVC (`pv_name`) bound to your Filestore or NFS export. This places workspaces on the export too. Pods then mount shared directories from that single claim by `subPath` instead of requesting a new RWX PVC per directory.
 :::
 
 Create the agent namespace:
@@ -421,7 +421,15 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
 
 Without this permission, Policy Troubleshooter checks will return an indeterminate or unknown status (such as ACCESS_STATE_UNKNOWN_INFO_DENIED), which results in a **fail-closed** denial of service account assignment in Scion.
 
-The Hub's identity needs access to run the assignment check for each target service account; until it has that access, service account assignment is denied. If the check cannot run because of the Hub's identity, the admin health summary reports it (see [Hub Identity Access for the Assignment Check](/scion/hosted/ha/permissions/#hub-identity-access-for-the-assignment-check)).
+The Hub's identity needs access to run the assignment check for each target service account; until it has that access, service account assignment is denied. If you assign service accounts from other GCP projects and have not granted the role at the organization level, grant it on each of those projects too (replace `$SA_PROJECT_ID` with the project that holds the service account):
+
+```bash
+gcloud projects add-iam-policy-binding $SA_PROJECT_ID \
+  --member="serviceAccount:$SA_HUB" \
+  --role="roles/iam.securityReviewer"
+```
+
+Without it, assigning a service account from that project is refused with a message that names the project and gives this command. Registering or verifying such an account returns the same message as a warning, so you can grant the role before the first assignment. If the check cannot run because of the Hub's identity, the admin health summary reports it (see [Hub Identity Access for the Assignment Check](/scion/hosted/ha/permissions/#hub-identity-access-for-the-assignment-check)).
 
 ### 2f. Transport SA — IAP Access
 
@@ -707,7 +715,7 @@ gcloud projects get-iam-policy $PROJECT_ID \
 | `scion-hub-runner` | `roles/container.developer` | Project | GKE agent dispatch |
 | `scion-hub-runner` | `roles/iam.serviceAccountTokenCreator` | **On itself** | Generate GCS signed URLs |
 | `scion-hub-runner` | `roles/iam.serviceAccountTokenCreator` | **On `scion-transport` SA** | Mint IAP tokens for agents |
-| `scion-hub-runner` | `roles/iam.securityReviewer` | Project/Org | Policy Troubleshooter (Optional, for SA assignment gates) |
+| `scion-hub-runner` | `roles/iam.securityReviewer` | Project/Org, plus each project that holds an assigned SA | Policy Troubleshooter (required for SA assignment when `gcp_iam_check_mode: enforce`) |
 | `scion-transport` | `roles/iap.httpsResourceAccessor` | Project | Allow IAP access to Hub |
 | `scion-transport` | `roles/run.invoker` | Hub service | Allow Cloud Run invocation |
 | `scion-discord-runner` | `roles/cloudsql.client` | Project | Cloud SQL connections |
@@ -1026,12 +1034,12 @@ deployment is not HA (see [HA overview](/scion/hosted/ha/overview/)).
 
 :::caution[More than one replica requires shared workspace storage]
 The `settings.yaml` above leaves
-[`server.workspace_storage`](/scion/reference/server-config/#workspace-storage-serverworkspace_storage)
+[`server.project_storage`](/scion/reference/server-config/#project-storage-serverproject_storage)
 at its default `local` backend. With that backend each replica keeps
 hub-managed project workspaces on its own container storage, so replicas
 can see different workspace content, and the content is lost when an
 instance is replaced. On Cloud Run the Hub also refuses workspace writes
-(file edits, WebDAV, git clone) with `503 Service Unavailable` while the
+(file edits, git clone) with `503 Service Unavailable` while the
 backend is `local` (see
 [Ephemeral Storage & 503 Safety Gate](/scion/reference/server-config/#ephemeral-storage--503-safety-gate)).
 
@@ -1074,18 +1082,18 @@ mounted.
 
 ```yaml
 server:
-  workspace_storage:
+  project_storage:
     backend: cloudrun-volume
     cloudrun_volume:
       volume_name: VOLUME_NAME       # the volume declared on the service
       subpath_root: projects         # default
 ```
 
-The Hub derives every workspace path from `/mnt/<volume_name>`. If the
+The Hub derives every workspace and shared-directory path from `/mnt/<volume_name>`. If the
 volume is not mounted there, `GET /readyz` returns `503` instead of the
 Hub writing workspaces to container storage. A missing `volume_name`
 stops the Hub at startup. See
-[Workspace Storage](/scion/reference/server-config/#workspace-storage-serverworkspace_storage)
+[Project Storage](/scion/reference/server-config/#project-storage-serverproject_storage)
 for all backends and fields.
 :::
 

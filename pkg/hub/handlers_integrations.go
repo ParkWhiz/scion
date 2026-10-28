@@ -44,6 +44,10 @@ import (
 // and must be carried over during reconfigure (they are not in config files).
 var pluginBrokerNS = uuid.MustParse("5c104390-a1d0-5e9a-9b1e-5c104390a1d0")
 
+// hubKeys lists the hub wiring keys that getPluginHubCreds supplies. It has
+// two uses: resolveIntegrationMergedConfig keeps these keys out of the
+// cached-config carry-over (the live hub values override them), and
+// filterSensitiveConfig omits them from integration settings responses.
 var hubKeys = map[string]bool{
 	"hub_url": true, "broker_id": true, "hmac_key": true,
 	"plugin_name": true, "project_slug_map": true,
@@ -127,9 +131,14 @@ type IntegrationStatus struct {
 }
 
 // IntegrationConfigUpdateRequest is the request body for the PUT config endpoint.
+//
+// Settings is merged key by key into the stored config: a key the body
+// omits keeps its stored value, a key with a string value (including "")
+// replaces it, and a key sent as JSON null is deleted from the stored
+// config, so the plugin's own default applies again (ptone/scion#3913).
 type IntegrationConfigUpdateRequest struct {
-	Settings map[string]string `json:"settings"`
-	Secrets  map[string]string `json:"secrets"`
+	Settings map[string]*string `json:"settings"`
+	Secrets  map[string]string  `json:"secrets"`
 }
 
 // AvailableIntegration represents a plugin that could be installed.
@@ -191,9 +200,6 @@ func lookupKnownPlugin(name string) *KnownPlugin {
 	}
 	return nil
 }
-
-// SettingsWriteMu guards concurrent writes to settings.yaml.
-var SettingsWriteMu sync.Mutex
 
 // pluginBuildMu guards concurrent build operations per plugin name.
 var pluginBuildMu sync.Map
@@ -285,18 +291,18 @@ func (s *Server) handleAdminIntegrationByName(w http.ResponseWriter, r *http.Req
 		}
 		s.handleIntegrationHealth(w, r, name)
 	case "update":
-		if actionSub != "" && r.Method == http.MethodGet {
+		// .../update/{id} is the status lookup and accepts only GET; only a
+		// POST to the bare .../update starts an update (ptone/scion#2422).
+		if actionSub != "" {
+			if r.Method != http.MethodGet {
+				MethodNotAllowed(w, http.MethodGet)
+				return
+			}
 			s.handleGetUpdateStatus(w, r, name, actionSub)
 			return
 		}
 		if r.Method != http.MethodPost {
-			// .../update/{id} also accepts GET (status lookup, handled above);
-			// only the no-actionSub form is POST-only.
-			if actionSub != "" {
-				MethodNotAllowed(w, http.MethodGet, http.MethodPost)
-			} else {
-				MethodNotAllowed(w, http.MethodPost)
-			}
+			MethodNotAllowed(w, http.MethodPost)
 			return
 		}
 		s.handleUpdateIntegration(w, r, name)
@@ -596,14 +602,24 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 			InternalError(w)
 			return
 		}
+		// A stored Postgres row whose config is JSON null loads as a nil
+		// map; start from an empty map so the merge below cannot panic.
+		if existing == nil {
+			existing = make(map[string]string)
+		}
 
 		// Merge new settings into existing, filtering out any secret keys.
+		// A null value deletes the stored key.
 		secretKeys := allSecretConfigKeys(name)
 		for k, v := range req.Settings {
 			if secretKeys[k] {
 				continue
 			}
-			existing[k] = v
+			if v == nil {
+				delete(existing, k)
+				continue
+			}
+			existing[k] = *v
 		}
 
 		if err := provider.Save(ctx, existing); err != nil {
@@ -631,12 +647,10 @@ func (s *Server) handleUpdateIntegrationConfig(w http.ResponseWriter, r *http.Re
 
 	// Ensure the plugin is listed in message_broker.types on disk so it
 	// survives future restarts/rebuilds that re-read settings.yaml.
-	SettingsWriteMu.Lock()
 	if err := config.AddPluginToMessageBrokerTypes(name); err != nil {
 		slog.Warn("Failed to ensure plugin in message_broker.types", "plugin", name, "error", err)
 		// Non-fatal — continue with the config update.
 	}
-	SettingsWriteMu.Unlock()
 
 	// Reconfigure the running integration with updated config.
 	// For HA integrations the DB write + NOTIFY is the reconfigure path —
@@ -682,12 +696,10 @@ func (s *Server) handleRestartIntegration(w http.ResponseWriter, r *http.Request
 
 	// Ensure the plugin is listed in message_broker.types on disk so it
 	// survives future restarts/rebuilds that re-read settings.yaml.
-	SettingsWriteMu.Lock()
 	if err := config.AddPluginToMessageBrokerTypes(name); err != nil {
 		slog.Warn("Failed to ensure plugin in message_broker.types", "plugin", name, "error", err)
 		// Non-fatal — continue with the restart.
 	}
-	SettingsWriteMu.Unlock()
 
 	// Resolve the latest config from file + secrets + hub wiring creds.
 	merged := s.resolveIntegrationMergedConfig(r.Context(), mgr, name)
@@ -807,12 +819,10 @@ func (s *Server) handleUpdateIntegration(w http.ResponseWriter, r *http.Request,
 
 	// Ensure the plugin is listed in message_broker.types on disk so it
 	// survives future restarts/rebuilds that re-read settings.yaml.
-	SettingsWriteMu.Lock()
 	if err := config.AddPluginToMessageBrokerTypes(name); err != nil {
 		slog.Warn("Failed to ensure plugin in message_broker.types", "plugin", name, "error", err)
 		// Non-fatal — continue with the update.
 	}
-	SettingsWriteMu.Unlock()
 
 	if err := mgr.UpdatePlugin(name, repoPath); err != nil {
 		slog.Error("Failed to update integration", "plugin", name, "error", err)
@@ -924,12 +934,10 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 		slog.Info("Plugin config file already exists, preserving", "plugin", name, "path", resolvedConfigPath)
 	}
 
-	SettingsWriteMu.Lock()
 	err = config.AddPluginToSettings(name, configFilePath)
 	if err == nil {
 		err = config.AddPluginToMessageBrokerTypes(name)
 	}
-	SettingsWriteMu.Unlock()
 	if err != nil {
 		slog.Error("Failed to add plugin to settings.yaml", "plugin", name, "error", err)
 		InternalError(w)
@@ -1038,13 +1046,11 @@ func (s *Server) handleInstallSelfManaged(w http.ResponseWriter, r *http.Request
 
 	// 3. Register in settings.yaml with self-managed fields and broker type
 	//    in a single read-modify-write cycle.
-	SettingsWriteMu.Lock()
 	err = config.AddSelfManagedPluginWithBrokerType(config.SelfManagedPluginEntry{
 		Name:       name,
 		Address:    "localhost:9090",
 		ConfigFile: adminConfigPath,
 	})
-	SettingsWriteMu.Unlock()
 	if err != nil {
 		slog.Error("Failed to add self-managed plugin to settings.yaml", "plugin", name, "error", err)
 		InternalError(w)
@@ -1231,12 +1237,10 @@ func (s *Server) handleRebuildSelfManaged(w http.ResponseWriter, _ *http.Request
 
 	// Ensure the plugin is listed in message_broker.types on disk so it
 	// survives future restarts/rebuilds that re-read settings.yaml.
-	SettingsWriteMu.Lock()
 	if err := config.AddPluginToMessageBrokerTypes(kp.Name); err != nil {
 		slog.Warn("Failed to ensure plugin in message_broker.types", "plugin", kp.Name, "error", err)
 		// Non-fatal — continue with the rebuild response.
 	}
-	SettingsWriteMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":      "rebuilt",
@@ -1443,22 +1447,19 @@ func (s *Server) checkIntegrationSecrets(ctx context.Context, name string) map[s
 	return result
 }
 
-// filterSensitiveConfig returns a copy of the config map with secret values
-// and internal runtime keys removed.
+// filterSensitiveConfig returns a copy of the config map with secret values,
+// hub wiring keys (hubKeys) and internal runtime keys removed.
 func filterSensitiveConfig(name string, cfg map[string]string) map[string]string {
 	filtered := make(map[string]string, len(cfg))
 
 	secretKeys := allSecretConfigKeys(name)
 	internalKeys := map[string]bool{
-		"hub_url":     true,
-		"hmac_key":    true,
-		"broker_id":   true,
 		"bot_id":      true,
 		"config_file": true,
 	}
 
 	for k, v := range cfg {
-		if secretKeys[k] || internalKeys[k] {
+		if secretKeys[k] || hubKeys[k] || internalKeys[k] {
 			continue
 		}
 		filtered[k] = v

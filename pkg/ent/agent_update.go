@@ -659,6 +659,26 @@ func (_u *AgentUpdate) ClearAppliedConfig() *AgentUpdate {
 	return _u
 }
 
+// SetPendingConfig sets the "pending_config" field.
+func (_u *AgentUpdate) SetPendingConfig(v string) *AgentUpdate {
+	_u.mutation.SetPendingConfig(v)
+	return _u
+}
+
+// SetNillablePendingConfig sets the "pending_config" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillablePendingConfig(v *string) *AgentUpdate {
+	if v != nil {
+		_u.SetPendingConfig(*v)
+	}
+	return _u
+}
+
+// ClearPendingConfig clears the value of the "pending_config" field.
+func (_u *AgentUpdate) ClearPendingConfig() *AgentUpdate {
+	_u.mutation.ClearPendingConfig()
+	return _u
+}
+
 // SetHarnessConfig sets the "harness_config" field.
 func (_u *AgentUpdate) SetHarnessConfig(v string) *AgentUpdate {
 	_u.mutation.SetHarnessConfig(v)
@@ -1177,6 +1197,60 @@ func (_u *AgentUpdate) SetNillableLaunchCause(v *string) *AgentUpdate {
 // ClearLaunchCause clears the value of the "launch_cause" field.
 func (_u *AgentUpdate) ClearLaunchCause() *AgentUpdate {
 	_u.mutation.ClearLaunchCause()
+	return _u
+}
+
+// SetLaunchPriorPhase sets the "launch_prior_phase" field.
+func (_u *AgentUpdate) SetLaunchPriorPhase(v string) *AgentUpdate {
+	_u.mutation.SetLaunchPriorPhase(v)
+	return _u
+}
+
+// SetNillableLaunchPriorPhase sets the "launch_prior_phase" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableLaunchPriorPhase(v *string) *AgentUpdate {
+	if v != nil {
+		_u.SetLaunchPriorPhase(*v)
+	}
+	return _u
+}
+
+// ClearLaunchPriorPhase clears the value of the "launch_prior_phase" field.
+func (_u *AgentUpdate) ClearLaunchPriorPhase() *AgentUpdate {
+	_u.mutation.ClearLaunchPriorPhase()
+	return _u
+}
+
+// SetLaunchRevokeOnFail sets the "launch_revoke_on_fail" field.
+func (_u *AgentUpdate) SetLaunchRevokeOnFail(v bool) *AgentUpdate {
+	_u.mutation.SetLaunchRevokeOnFail(v)
+	return _u
+}
+
+// SetNillableLaunchRevokeOnFail sets the "launch_revoke_on_fail" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableLaunchRevokeOnFail(v *bool) *AgentUpdate {
+	if v != nil {
+		_u.SetLaunchRevokeOnFail(*v)
+	}
+	return _u
+}
+
+// SetLaunchResumePhase sets the "launch_resume_phase" field.
+func (_u *AgentUpdate) SetLaunchResumePhase(v string) *AgentUpdate {
+	_u.mutation.SetLaunchResumePhase(v)
+	return _u
+}
+
+// SetNillableLaunchResumePhase sets the "launch_resume_phase" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableLaunchResumePhase(v *string) *AgentUpdate {
+	if v != nil {
+		_u.SetLaunchResumePhase(*v)
+	}
+	return _u
+}
+
+// ClearLaunchResumePhase clears the value of the "launch_resume_phase" field.
+func (_u *AgentUpdate) ClearLaunchResumePhase() *AgentUpdate {
+	_u.mutation.ClearLaunchResumePhase()
 	return _u
 }
 
@@ -2071,6 +2145,12 @@ func (_u *AgentUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.AppliedConfigCleared() {
 		_spec.ClearField(agent.FieldAppliedConfig, field.TypeString)
 	}
+	if value, ok := _u.mutation.PendingConfig(); ok {
+		_spec.SetField(agent.FieldPendingConfig, field.TypeString, value)
+	}
+	if _u.mutation.PendingConfigCleared() {
+		_spec.ClearField(agent.FieldPendingConfig, field.TypeString)
+	}
 	if value, ok := _u.mutation.HarnessConfig(); ok {
 		_spec.SetField(agent.FieldHarnessConfig, field.TypeString, value)
 	}
@@ -2234,6 +2314,21 @@ func (_u *AgentUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.LaunchCauseCleared() {
 		_spec.ClearField(agent.FieldLaunchCause, field.TypeString)
+	}
+	if value, ok := _u.mutation.LaunchPriorPhase(); ok {
+		_spec.SetField(agent.FieldLaunchPriorPhase, field.TypeString, value)
+	}
+	if _u.mutation.LaunchPriorPhaseCleared() {
+		_spec.ClearField(agent.FieldLaunchPriorPhase, field.TypeString)
+	}
+	if value, ok := _u.mutation.LaunchRevokeOnFail(); ok {
+		_spec.SetField(agent.FieldLaunchRevokeOnFail, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.LaunchResumePhase(); ok {
+		_spec.SetField(agent.FieldLaunchResumePhase, field.TypeString, value)
+	}
+	if _u.mutation.LaunchResumePhaseCleared() {
+		_spec.ClearField(agent.FieldLaunchResumePhase, field.TypeString)
 	}
 	if value, ok := _u.mutation.DeletionState(); ok {
 		_spec.SetField(agent.FieldDeletionState, field.TypeString, value)
@@ -3225,6 +3320,26 @@ func (_u *AgentUpdateOne) ClearAppliedConfig() *AgentUpdateOne {
 	return _u
 }
 
+// SetPendingConfig sets the "pending_config" field.
+func (_u *AgentUpdateOne) SetPendingConfig(v string) *AgentUpdateOne {
+	_u.mutation.SetPendingConfig(v)
+	return _u
+}
+
+// SetNillablePendingConfig sets the "pending_config" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillablePendingConfig(v *string) *AgentUpdateOne {
+	if v != nil {
+		_u.SetPendingConfig(*v)
+	}
+	return _u
+}
+
+// ClearPendingConfig clears the value of the "pending_config" field.
+func (_u *AgentUpdateOne) ClearPendingConfig() *AgentUpdateOne {
+	_u.mutation.ClearPendingConfig()
+	return _u
+}
+
 // SetHarnessConfig sets the "harness_config" field.
 func (_u *AgentUpdateOne) SetHarnessConfig(v string) *AgentUpdateOne {
 	_u.mutation.SetHarnessConfig(v)
@@ -3743,6 +3858,60 @@ func (_u *AgentUpdateOne) SetNillableLaunchCause(v *string) *AgentUpdateOne {
 // ClearLaunchCause clears the value of the "launch_cause" field.
 func (_u *AgentUpdateOne) ClearLaunchCause() *AgentUpdateOne {
 	_u.mutation.ClearLaunchCause()
+	return _u
+}
+
+// SetLaunchPriorPhase sets the "launch_prior_phase" field.
+func (_u *AgentUpdateOne) SetLaunchPriorPhase(v string) *AgentUpdateOne {
+	_u.mutation.SetLaunchPriorPhase(v)
+	return _u
+}
+
+// SetNillableLaunchPriorPhase sets the "launch_prior_phase" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableLaunchPriorPhase(v *string) *AgentUpdateOne {
+	if v != nil {
+		_u.SetLaunchPriorPhase(*v)
+	}
+	return _u
+}
+
+// ClearLaunchPriorPhase clears the value of the "launch_prior_phase" field.
+func (_u *AgentUpdateOne) ClearLaunchPriorPhase() *AgentUpdateOne {
+	_u.mutation.ClearLaunchPriorPhase()
+	return _u
+}
+
+// SetLaunchRevokeOnFail sets the "launch_revoke_on_fail" field.
+func (_u *AgentUpdateOne) SetLaunchRevokeOnFail(v bool) *AgentUpdateOne {
+	_u.mutation.SetLaunchRevokeOnFail(v)
+	return _u
+}
+
+// SetNillableLaunchRevokeOnFail sets the "launch_revoke_on_fail" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableLaunchRevokeOnFail(v *bool) *AgentUpdateOne {
+	if v != nil {
+		_u.SetLaunchRevokeOnFail(*v)
+	}
+	return _u
+}
+
+// SetLaunchResumePhase sets the "launch_resume_phase" field.
+func (_u *AgentUpdateOne) SetLaunchResumePhase(v string) *AgentUpdateOne {
+	_u.mutation.SetLaunchResumePhase(v)
+	return _u
+}
+
+// SetNillableLaunchResumePhase sets the "launch_resume_phase" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableLaunchResumePhase(v *string) *AgentUpdateOne {
+	if v != nil {
+		_u.SetLaunchResumePhase(*v)
+	}
+	return _u
+}
+
+// ClearLaunchResumePhase clears the value of the "launch_resume_phase" field.
+func (_u *AgentUpdateOne) ClearLaunchResumePhase() *AgentUpdateOne {
+	_u.mutation.ClearLaunchResumePhase()
 	return _u
 }
 
@@ -4667,6 +4836,12 @@ func (_u *AgentUpdateOne) sqlSave(ctx context.Context) (_node *Agent, err error)
 	if _u.mutation.AppliedConfigCleared() {
 		_spec.ClearField(agent.FieldAppliedConfig, field.TypeString)
 	}
+	if value, ok := _u.mutation.PendingConfig(); ok {
+		_spec.SetField(agent.FieldPendingConfig, field.TypeString, value)
+	}
+	if _u.mutation.PendingConfigCleared() {
+		_spec.ClearField(agent.FieldPendingConfig, field.TypeString)
+	}
 	if value, ok := _u.mutation.HarnessConfig(); ok {
 		_spec.SetField(agent.FieldHarnessConfig, field.TypeString, value)
 	}
@@ -4830,6 +5005,21 @@ func (_u *AgentUpdateOne) sqlSave(ctx context.Context) (_node *Agent, err error)
 	}
 	if _u.mutation.LaunchCauseCleared() {
 		_spec.ClearField(agent.FieldLaunchCause, field.TypeString)
+	}
+	if value, ok := _u.mutation.LaunchPriorPhase(); ok {
+		_spec.SetField(agent.FieldLaunchPriorPhase, field.TypeString, value)
+	}
+	if _u.mutation.LaunchPriorPhaseCleared() {
+		_spec.ClearField(agent.FieldLaunchPriorPhase, field.TypeString)
+	}
+	if value, ok := _u.mutation.LaunchRevokeOnFail(); ok {
+		_spec.SetField(agent.FieldLaunchRevokeOnFail, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.LaunchResumePhase(); ok {
+		_spec.SetField(agent.FieldLaunchResumePhase, field.TypeString, value)
+	}
+	if _u.mutation.LaunchResumePhaseCleared() {
+		_spec.ClearField(agent.FieldLaunchResumePhase, field.TypeString)
 	}
 	if value, ok := _u.mutation.DeletionState(); ok {
 		_spec.SetField(agent.FieldDeletionState, field.TypeString, value)

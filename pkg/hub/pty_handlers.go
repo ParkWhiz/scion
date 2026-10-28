@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/wsprotocol"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -99,11 +100,23 @@ func (s *Server) handleAgentPTY(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enforce authorization for every caller kind. A user passes on ActionAttach
-	// against the agent; an agent passes on ScopeAgentLifecycle within its own
-	// project. Attaching a PTY is not read-class, so the agent project read
-	// baseline deliberately does not reach it.
-	if !s.authorizeAgentLifecycle(w, r, agent, ActionAttach) {
+	// An agent delegated credential is decided by its own procedure, on
+	// this handshake only; the established session is not re-checked
+	// (.design/agent-delegation.md §16.6). Every other caller kind keeps
+	// the shared agent-target rule below.
+	if !admitDelegatedAgentHandler(w, r, opAgentAttach, agent) {
+		return
+	}
+	if isDelegatedAgentIdentity(identity) {
+		if !s.authorizeDelegatedAttach(w, r, identity, agent) {
+			return
+		}
+	} else if !s.authorizeAgentLifecycle(w, r, agent, ActionAttach) {
+		// Enforce authorization for every caller kind. A user passes on
+		// ActionAttach against the agent; an agent passes on
+		// ScopeAgentLifecycle within its own project. Attaching a PTY is not
+		// read-class, so the agent project read baseline deliberately does
+		// not reach it.
 		return
 	}
 
@@ -155,6 +168,7 @@ func (s *Server) handleAgentPTY(w http.ResponseWriter, r *http.Request) {
 	up := &brokerPTYUpstream{cc: s.controlChannel, brokerID: agent.RuntimeBrokerID, agentSlug: agent.Slug, projectID: agent.ProjectID}
 	up.open = s.brokerPTYOpener(agent)
 	session := newPTYSessionWithUpstream(ctx, agent.Slug, conn, up, cols, rows)
+	session.credentialCheck = s.ptyTokenCredentialCheck(ctx, agent)
 	defer session.Close()
 
 	logPTYSessionStarted(agentID, agent.Slug, agent.RuntimeBrokerID, identity.ID())
@@ -166,6 +180,25 @@ func (s *Server) handleAgentPTY(w http.ResponseWriter, r *http.Request) {
 
 	code, reason := session.CloseCause()
 	logPTYSessionEnded(agentID, agent.Slug, agent.RuntimeBrokerID, code, reason)
+}
+
+// authorizeDelegatedAttach decides agent.attach on agent for an agent
+// delegated credential at the PTY handshake (and so at every reconnect,
+// which is a new handshake). A denial answers 403 forbidden and never
+// carries the decision's reason (.design/agent-delegation.md §11.4).
+func (s *Server) authorizeDelegatedAttach(w http.ResponseWriter, r *http.Request, identity Identity, agent *store.Agent) bool {
+	decision := s.authzService.Decide(r.Context(), AuthzRequest{
+		Principal:  principalContextForIdentity(identity),
+		Credential: credentialContextForIdentity(identity),
+		Resource:   agentResource(agent),
+		Action:     ActionAttach,
+		Permission: "agent.attach",
+	})
+	if !decision.Allowed {
+		writeError(w, http.StatusForbidden, ErrCodeForbidden, agentTargetDenyMessage, nil)
+		return false
+	}
+	return true
 }
 
 // logPTYSessionStarted logs the start of a PTY session. routedBrokerID is
@@ -229,6 +262,30 @@ type PTYSession struct {
 	closeCode   int
 	closeReason string
 	closeMu     sync.Mutex
+	// credentialCheck, when set, is called every
+	// streamCredentialRecheckInterval while the session runs; a false
+	// result ends the session with errPTYCredentialEnded.
+	credentialCheck func(context.Context) bool
+}
+
+// errPTYCredentialEnded ends a PTY session whose credential stops
+// authorizing it. The client receives 4401 authz_expired, the code and
+// reason of a conduit stream whose authorization fails a re-check.
+var errPTYCredentialEnded = errors.New("pty: the credential does not authorize this session")
+
+// ptyTokenCredentialCheck returns the credential check of a PTY session
+// opened by the request in ctx on agent: for a user access token, the token
+// must still validate and still pass agent.attach on the agent
+// (streamCredentialStillAuthorized). Any other credential gets no check
+// (nil), so a session keeps its terminal.
+func (s *Server) ptyTokenCredentialCheck(ctx context.Context, agent *store.Agent) func(context.Context) bool {
+	if !requestCredentialIsUAT(ctx) {
+		return nil
+	}
+	res := agentResource(agent)
+	return func(checkCtx context.Context) bool {
+		return s.streamCredentialStillAuthorized(checkCtx, res, ActionAttach, "agent.attach")
+	}
 }
 
 // ptyUpstream is the stream a PTYSession bridges the client to. Errors
@@ -327,6 +384,8 @@ func ptyCloseCause(err error) (int, string) {
 	var brokerWrite *ptyBrokerWriteError
 	var streamOpen *ptyStreamOpenError
 	switch {
+	case errors.Is(err, errPTYCredentialEnded):
+		return wsprotocol.ClosePTYAuthRequired, conduitReasonAuthzExpired
 	case errors.As(err, &streamClosed):
 		// Broker StreamClose (already mapped from legacy codes) or broker
 		// connection loss (4503): pass the cause through unchanged.
@@ -366,7 +425,7 @@ func isExpectedPTYEnd(err error) bool {
 	if errors.Is(err, io.EOF) {
 		return true
 	}
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, errPTYCredentialEnded) {
 		return true
 	}
 	var streamClosed *StreamClosedError
@@ -417,8 +476,14 @@ func (s *PTYSession) Run() error {
 		return err
 	}
 
-	// Start goroutines for bidirectional data flow
-	errCh := make(chan error, 2)
+	// Start goroutines for bidirectional data flow, and the credential
+	// re-check when the session has one.
+	errCh := make(chan error, 3)
+	if s.credentialCheck != nil {
+		go func() {
+			errCh <- s.watchCredential()
+		}()
+	}
 
 	// Client -> Broker
 	go func() {
@@ -434,6 +499,27 @@ func (s *PTYSession) Run() error {
 	err := <-errCh
 	s.closeWith(ptyCloseCause(err))
 	return err
+}
+
+// watchCredential re-checks the session's credential every
+// streamCredentialRecheckInterval until the session ends. It returns
+// errPTYCredentialEnded when a check fails while the session is open.
+func (s *PTYSession) watchCredential() error {
+	t := time.NewTicker(streamCredentialRecheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-t.C:
+			if !s.credentialCheck(s.ctx) {
+				if err := s.ctx.Err(); err != nil {
+					return err
+				}
+				return errPTYCredentialEnded
+			}
+		}
+	}
 }
 
 // readFromClient reads messages from the WebSocket client and forwards to

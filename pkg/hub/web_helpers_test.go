@@ -17,13 +17,16 @@ package hub
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/stretchr/testify/require"
@@ -38,6 +41,32 @@ func renderSPAShell(t *testing.T) string {
 	var buf bytes.Buffer
 	require.NoError(t, ws.shellTmpl.Execute(&buf, spaShellData{}))
 	return buf.String()
+}
+
+// fingerprintedAssetsOf reads ws's Vite build manifest and returns the
+// fingerprinted request paths it lists, as NewWebServer does at startup, or
+// nil when there is no usable manifest. Tests call it after swapping the
+// asset source of a server that NewWebServer already built.
+func fingerprintedAssetsOf(ws *WebServer) map[string]bool {
+	manifest, ok := ws.readViteManifest()
+	if !ok {
+		return nil
+	}
+	return fingerprintedAssetsFromManifest(manifest)
+}
+
+// shellInitialData returns the raw fields of the shell's initial data.
+func shellInitialData(t *testing.T, html string) map[string]json.RawMessage {
+	t.Helper()
+	const open = `<script id="__SCION_DATA__" type="application/json">`
+	start := strings.Index(html, open)
+	require.GreaterOrEqual(t, start, 0, "no initial data in the shell")
+	start += len(open)
+	end := strings.Index(html[start:], "</script>")
+	require.Greater(t, end, 0)
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(html[start:start+end]), &fields))
+	return fields
 }
 
 // extractBetween returns the substring from the first occurrence of start up
@@ -156,6 +185,47 @@ func newDevAuthWebServer(t *testing.T, overrides ...func(*WebServerConfig)) *Web
 	return ws
 }
 
+// devSignIn signs a browser in to a dev-auth web server the way a user does:
+// it mints a code at the launch endpoint with the dev token, opens the
+// sign-in link, and returns the session cookies the link set.
+func devSignIn(t *testing.T, ws *WebServer) []*http.Cookie {
+	t.Helper()
+	h := ws.Handler()
+	mint := httptest.NewRequest(http.MethodPost, devLaunchPath, nil)
+	mint.Header.Set("Authorization", "Bearer "+ws.config.DevAuthToken)
+	mintRec := httptest.NewRecorder()
+	h.ServeHTTP(mintRec, mint)
+	require.Equal(t, http.StatusOK, mintRec.Code, mintRec.Body.String())
+	var launch devLaunchResponse
+	require.NoError(t, json.Unmarshal(mintRec.Body.Bytes(), &launch))
+
+	signIn := httptest.NewRequest(http.MethodGet, launch.SignInPath, nil)
+	signInRec := httptest.NewRecorder()
+	h.ServeHTTP(signInRec, signIn)
+	require.Equal(t, http.StatusSeeOther, signInRec.Code, signInRec.Body.String())
+	cookies := signInRec.Result().Cookies()
+	require.NotEmpty(t, cookies, "the sign-in link must set the session cookie")
+	return cookies
+}
+
+// devSignedIn returns a handler for ws that sends every request with the
+// cookies of one dev sign-in (devSignIn), unless the request already
+// carries a session cookie. For tests of signed-in behaviour on a dev-auth
+// server.
+func devSignedIn(t *testing.T, ws *WebServer) http.Handler {
+	t.Helper()
+	cookies := devSignIn(t, ws)
+	h := ws.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := r.Cookie(webSessionName); err != nil {
+			for _, c := range cookies {
+				r.AddCookie(c)
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 // mockOAuthTransport intercepts HTTP requests to Google OAuth endpoints and
 // returns canned responses. This lets us drive handleOAuthCallback through
 // the full handler path without hitting real Google servers.
@@ -185,6 +255,15 @@ func (s *proxyAuthStore) CreateUser(_ context.Context, user *store.User) error {
 
 func (s *proxyAuthStore) UpdateUser(_ context.Context, user *store.User) error {
 	s.users[user.ID] = user
+	return nil
+}
+
+func (s *proxyAuthStore) UpdateUserLastLogin(ctx context.Context, id string, timestamp time.Time) error {
+	u, err := s.GetUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	u.LastLogin = timestamp
 	return nil
 }
 
@@ -288,4 +367,43 @@ func (t *mockOAuthTransport) RoundTrip(req *http.Request) (*http.Response, error
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 	}, nil
+}
+
+// hubPageHeaderNames are the page headers the web server sets on every
+// response besides the page policy and nosniff (securityHeadersMiddleware).
+var hubPageHeaderNames = []string{"X-Frame-Options", "X-XSS-Protection", "Referrer-Policy", "Permissions-Policy"}
+
+// hubPageHeaderValues returns the value securityHeadersMiddleware sets for
+// each of hubPageHeaderNames, read from a response it wrapped.
+func hubPageHeaderValues(t *testing.T) map[string]string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	(&WebServer{}).securityHeadersMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).
+		ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	out := make(map[string]string, len(hubPageHeaderNames))
+	for _, name := range hubPageHeaderNames {
+		v := rec.Header().Get(name)
+		require.NotEmpty(t, v, "securityHeadersMiddleware does not set %s", name)
+		out[name] = v
+	}
+	return out
+}
+
+// proxiedPageHeaderValues is hubPageHeaderValues for a page served from an
+// agent's port: the hub's own values, except that the untrusted-content
+// Permissions-Policy replaces the web pages' one.
+func proxiedPageHeaderValues(t *testing.T) map[string]string {
+	t.Helper()
+	out := hubPageHeaderValues(t)
+	out["Permissions-Policy"] = untrustedContentPermissionsPolicy
+	return out
+}
+
+// agentPageHeaders are the values a proxied app sends for
+// hubPageHeaderNames in the agent port tests; each differs from the hub's.
+var agentPageHeaders = map[string]string{
+	"X-Frame-Options":    "SAMEORIGIN",
+	"X-XSS-Protection":   "0",
+	"Referrer-Policy":    "unsafe-url",
+	"Permissions-Policy": "camera=*",
 }

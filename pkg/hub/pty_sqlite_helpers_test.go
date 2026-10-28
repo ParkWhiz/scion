@@ -67,15 +67,25 @@ type ptyConduitFixture struct {
 	// regFault, while set, fails every conduit registry operation on this
 	// hub node (the relay's and the router's).
 	regFault atomic.Bool
+	// agentClock fires the timers of the sciontool agent started last
+	// (startSciontoolAgent); its time reads f.clock.
+	agentClock *clock.Fake
 }
 
 // newPTYConduitFixture builds the fixture; mods adjust the relay options
 // after the fixture's own (e.g. a lifetime cap).
 func newPTYConduitFixture(t *testing.T, mods ...func(*ConduitRelayOptions)) *ptyConduitFixture {
 	t.Helper()
+	return newPTYConduitFixtureServer(t, nil, mods...)
+}
+
+// newPTYConduitFixtureServer is newPTYConduitFixture with srvMod applied to
+// the server before it starts serving (newRelayFixtureServer).
+func newPTYConduitFixtureServer(t *testing.T, srvMod func(*Server), mods ...func(*ConduitRelayOptions)) *ptyConduitFixture {
+	t.Helper()
 	f := &ptyConduitFixture{peerSecret: make([]byte, 32), spawned: make(chan *fakePTY, 8)}
 	_, _ = rand.Read(f.peerSecret)
-	f.relayFixture = newRelayFixture(t, func(o *ConduitRelayOptions) {
+	f.relayFixture = newRelayFixtureServer(t, srvMod, func(o *ConduitRelayOptions) {
 		auth, err := relay.NewHMACPeerAuthFromSecret(relay.HMACPeerAuthConfig{Secret: f.peerSecret, SelfID: "hub-a"})
 		require.NoError(t, err)
 		o.PeerAuth = auth
@@ -279,7 +289,9 @@ func (f *ptyConduitFixture) startPTYAgent(t *testing.T, hubURL string) {
 }
 
 // startSciontoolAgent runs a sciontool conduit agent for the launched
-// agent against hubURL and returns once its session is admitted. With
+// agent against hubURL and returns once its session is admitted and,
+// unless f.noAgentKeyWait, its first grant-key fetch has installed the
+// hub's current key (waitAgentGrantKeys). With
 // noPTY it serves no pty streams (Options.NoPTY); otherwise it serves
 // pty with a fake spawner that reports each process on f.spawned.
 func (f *ptyConduitFixture) startSciontoolAgent(t *testing.T, hubURL string, noPTY bool) {
@@ -295,9 +307,15 @@ func (f *ptyConduitFixture) startSciontoolAgent(t *testing.T, hubURL string, noP
 		Token:     func() string { return tok },
 		OnSession: func(w *conduitv1.Welcome) { admitted <- w },
 		Backoff:   &conduit.Backoff{Rand: func(int64) int64 { return 0 }},
-		Clock:     fixtureClock{Fake: clock.NewFake(f.clock.Now()), now: f.clock.Now},
 		NoPTY:     noPTY,
 	}
+	f.agentClock = clock.NewFake(f.clock.Now())
+	opts.Clock = fixtureClock{Fake: f.agentClock, now: f.clock.Now}
+	// Keepalive and write timers far out, so a test that advances
+	// f.agentClock fires only the timers under test.
+	opts.Session.PingInterval = time.Hour
+	opts.Session.PongWait = 24 * time.Hour
+	opts.Session.WriteWait = time.Hour
 	if !noPTY {
 		opts.SpawnPTY = func(_ context.Context, req sconduit.PTYRequest) (sconduit.PTYProcess, error) {
 			p := newFakePTY(req)
@@ -325,6 +343,9 @@ func (f *ptyConduitFixture) startSciontoolAgent(t *testing.T, hubURL string, noP
 	case <-admitted:
 	case <-time.After(10 * time.Second):
 		t.Fatal("conduit session not admitted")
+	}
+	if !f.noAgentKeyWait {
+		waitAgentGrantKeys(t, f.srv, a.Keys())
 	}
 }
 

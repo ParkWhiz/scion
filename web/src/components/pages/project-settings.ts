@@ -38,6 +38,7 @@ import type {
   ProjectMessagingPolicy,
 } from '../../shared/types.js';
 import { can, canAny } from '../../shared/types.js';
+import { projectVisitorsVisible } from '../../shared/project-visitors.js';
 import { isBrokerKubernetesOnly } from '../../shared/runtime-kind.js';
 import { KUBERNETES_BLOCK_HINT } from '../../shared/gcp-identity-state.js';
 import { projectServiceAccountListUrl } from '../../shared/gcp-sa-assign-status.js';
@@ -46,12 +47,14 @@ import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-ut
 import type { AccessBoundarySummary } from '../../shared/access-boundaries.js';
 import type { BoundarySummaryGroup } from '../shared/boundary-summary-notice.js';
 import { apiFetch, apiFetchAllPages, extractApiError } from '../../client/api.js';
+import { getPublicSettings } from '../../client/server-feature-flags.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import '../shared/boundary-summary-notice.js';
 import '../shared/env-var-list.js';
 import '../shared/secret-list.js';
 import '../shared/shared-dir-list.js';
 import '../shared/project-members-editor.js';
+import '../shared/project-visitors-editor.js';
 import '../shared/gcp-service-account-list.js';
 import type { SAListChangedDetail } from '../shared/gcp-service-account-list.js';
 import '../shared/scheduled-event-list.js';
@@ -66,6 +69,7 @@ import { showConfirm } from '../shared/confirm-dialog.js';
 import { formatInstantWithZone, formatRelative } from '../../utils/time.js';
 import { DisplayZoneController } from '../../utils/display-zone-controller.js';
 import { navigateTo } from '../../client/navigation.js';
+import { visibleInterval } from '../../client/visible-interval.js';
 
 interface ProjectResourceSpec {
   requests?: { cpu?: string | undefined; memory?: string | undefined };
@@ -160,6 +164,9 @@ export class ScionPageProjectSettings extends LitElement {
 
   @state()
   private activeResourcesTab = 'env-vars';
+
+  @state()
+  private activeMembersTab = 'members';
 
   @state()
   private activeSchedulesTab = 'events';
@@ -316,7 +323,7 @@ export class ScionPageProjectSettings extends LitElement {
   @state()
   private messagingPolicySuccess: string | null = null;
 
-  private brokerRelativeTimeInterval: ReturnType<typeof setInterval> | null = null;
+  private stopBrokerRelativeTimeTick: (() => void) | null = null;
 
   static override styles = css`
     :host {
@@ -882,10 +889,8 @@ export class ScionPageProjectSettings extends LitElement {
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
-    if (this.brokerRelativeTimeInterval) {
-      clearInterval(this.brokerRelativeTimeInterval);
-      this.brokerRelativeTimeInterval = null;
-    }
+    this.stopBrokerRelativeTimeTick?.();
+    this.stopBrokerRelativeTimeTick = null;
   }
 
   private async loadProject(skipGitHubCheck = false): Promise<void> {
@@ -1008,6 +1013,59 @@ export class ScionPageProjectSettings extends LitElement {
     } finally {
       this.messagingPolicySaving = false;
     }
+  }
+
+  /**
+   * Members, and, while the federation.project_visitors experiment is on
+   * and the caller holds project.manage_visitors, a Visitors tab beside it
+   * (ptone/scion#4603). Without the Visitors tab the section is unchanged.
+   */
+  private renderMembersSection() {
+    const project = this.project!;
+    const readOnly = !canAny(project._capabilities, 'update', 'manage');
+    const description =
+      'Users and groups with access to this project. Each member holds at most one built-in tier (owner, admin or member) and may also hold custom project roles.';
+    if (!projectVisitorsVisible(project._capabilities)) {
+      return html`
+        <scion-project-members-editor
+          projectId=${project.id}
+          ?readOnly=${readOnly}
+          compact
+          sectionTitle="Members"
+          sectionDescription=${description}
+        ></scion-project-members-editor>
+      `;
+    }
+    return html`
+      <div class="section" data-members-section>
+        <sl-tab-group
+          @sl-tab-show=${(e: CustomEvent) => {
+            this.activeMembersTab = (e.detail as { name: string }).name;
+          }}
+        >
+          <sl-tab slot="nav" panel="members" ?active=${this.activeMembersTab === 'members'}
+            >Members</sl-tab
+          >
+          <sl-tab slot="nav" panel="visitors" ?active=${this.activeMembersTab === 'visitors'}
+            >Visitors</sl-tab
+          >
+          <sl-tab-panel name="members">
+            <scion-project-members-editor
+              projectId=${project.id}
+              ?readOnly=${readOnly}
+              sectionTitle="Members"
+              sectionDescription=${description}
+            ></scion-project-members-editor>
+          </sl-tab-panel>
+          <sl-tab-panel name="visitors">
+            <scion-project-visitors-editor
+              projectId=${project.id}
+              userId=${this.pageData?.user?.id ?? ''}
+            ></scion-project-visitors-editor>
+          </sl-tab-panel>
+        </sl-tab-group>
+      </div>
+    `;
   }
 
   private renderMessagingPolicySection() {
@@ -1293,7 +1351,10 @@ export class ScionPageProjectSettings extends LitElement {
       } else {
         this.defaultModelSelection = '';
       }
-      this.defaultThinkingLevel = this.settings.defaultThinkingLevel ?? null;
+      // The API accepts 1-100 (null clears); a value outside it is clamped,
+      // so a save never sends one the API refuses.
+      const tl = this.settings.defaultThinkingLevel;
+      this.defaultThinkingLevel = typeof tl === 'number' ? Math.min(100, Math.max(1, tl)) : null;
     } catch (err) {
       console.error('Failed to load project settings:', err);
     } finally {
@@ -1303,14 +1364,9 @@ export class ScionPageProjectSettings extends LitElement {
 
   /** Fallback for loading hub telemetry default when /settings/resolved is unavailable. */
   private async loadHubTelemetryDefaultFallback(): Promise<void> {
-    try {
-      const response = await apiFetch('/api/v1/settings/public');
-      if (response.ok) {
-        const data = (await response.json()) as { telemetryEnabled?: boolean };
-        this.hubTelemetryDefault = data.telemetryEnabled ?? false;
-      }
-    } catch (err) {
-      console.error('Failed to load hub telemetry default:', err);
+    const settings = await getPublicSettings();
+    if (settings) {
+      this.hubTelemetryDefault = settings.telemetryEnabled ?? false;
     }
   }
 
@@ -1694,16 +1750,8 @@ export class ScionPageProjectSettings extends LitElement {
         <h1>${this.project.name} Settings</h1>
       </div>
 
-      ${this.renderConfigSection()}
-      <scion-project-members-editor
-        projectId=${this.project.id}
-        ?readOnly=${!canAny(this.project._capabilities, 'update', 'manage')}
-        compact
-        sectionTitle="Members"
-        sectionDescription="Users and groups with access to this project. Each member holds at most one built-in tier (owner, admin or member) and may also hold custom project roles."
-      ></scion-project-members-editor>
-      ${this.renderResourcesSection()} ${this.renderMessagingPolicySection()}
-      ${this.renderGitHubAppSection()}
+      ${this.renderConfigSection()} ${this.renderMembersSection()} ${this.renderResourcesSection()}
+      ${this.renderMessagingPolicySection()} ${this.renderGitHubAppSection()}
       <scion-boundary-summary-notice
         label="Access constraints affecting this project"
         .groups=${this.boundaryGroups}
@@ -2271,7 +2319,7 @@ export class ScionPageProjectSettings extends LitElement {
                 >
                 <div style="display:flex;align-items:center;gap:0.75rem">
                   <sl-range
-                    min="0"
+                    min="1"
                     max="100"
                     step="1"
                     .value=${this.defaultThinkingLevel ?? 50}
@@ -3028,9 +3076,10 @@ export class ScionPageProjectSettings extends LitElement {
       const data = (await response.json()) as { brokers: RuntimeBrokerWithProvider[] };
       this.brokers = data.brokers || [];
 
-      // Start relative time refresh if we have brokers
-      if (this.brokers.length > 0 && !this.brokerRelativeTimeInterval) {
-        this.brokerRelativeTimeInterval = setInterval(() => this.requestUpdate(), 15_000);
+      // Start relative time refresh if we have brokers. The fetch can resolve
+      // after the page was disconnected; do not start a timer nobody stops.
+      if (this.isConnected && this.brokers.length > 0 && !this.stopBrokerRelativeTimeTick) {
+        this.stopBrokerRelativeTimeTick = visibleInterval(() => this.requestUpdate(), 15_000);
       }
     } catch (err) {
       console.error('Failed to load brokers:', err);

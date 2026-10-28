@@ -86,6 +86,10 @@ type Tx struct {
 	GroupMembership *GroupMembershipClient
 	// HarnessConfig is the client for interacting with the HarnessConfig builders.
 	HarnessConfig *HarnessConfigClient
+	// HubEncryptionMigration is the client for interacting with the HubEncryptionMigration builders.
+	HubEncryptionMigration *HubEncryptionMigrationClient
+	// HubEncryptionPolicy is the client for interacting with the HubEncryptionPolicy builders.
+	HubEncryptionPolicy *HubEncryptionPolicyClient
 	// HubInstance is the client for interacting with the HubInstance builders.
 	HubInstance *HubInstanceClient
 	// HubSetting is the client for interacting with the HubSetting builders.
@@ -132,6 +136,10 @@ type Tx struct {
 	ProjectPreStartHook *ProjectPreStartHookClient
 	// ProjectSyncState is the client for interacting with the ProjectSyncState builders.
 	ProjectSyncState *ProjectSyncStateClient
+	// ProjectVisitorExclusion is the client for interacting with the ProjectVisitorExclusion builders.
+	ProjectVisitorExclusion *ProjectVisitorExclusionClient
+	// ProjectVisitorRule is the client for interacting with the ProjectVisitorRule builders.
+	ProjectVisitorRule *ProjectVisitorRuleClient
 	// RelayInstance is the client for interacting with the RelayInstance builders.
 	RelayInstance *RelayInstanceClient
 	// RoleBinding is the client for interacting with the RoleBinding builders.
@@ -344,6 +352,8 @@ func (tx *Tx) init() {
 	tx.Group = NewGroupClient(tx.config)
 	tx.GroupMembership = NewGroupMembershipClient(tx.config)
 	tx.HarnessConfig = NewHarnessConfigClient(tx.config)
+	tx.HubEncryptionMigration = NewHubEncryptionMigrationClient(tx.config)
+	tx.HubEncryptionPolicy = NewHubEncryptionPolicyClient(tx.config)
 	tx.HubInstance = NewHubInstanceClient(tx.config)
 	tx.HubSetting = NewHubSettingClient(tx.config)
 	tx.IntegrationConfig = NewIntegrationConfigClient(tx.config)
@@ -367,6 +377,8 @@ func (tx *Tx) init() {
 	tx.ProjectContributor = NewProjectContributorClient(tx.config)
 	tx.ProjectPreStartHook = NewProjectPreStartHookClient(tx.config)
 	tx.ProjectSyncState = NewProjectSyncStateClient(tx.config)
+	tx.ProjectVisitorExclusion = NewProjectVisitorExclusionClient(tx.config)
+	tx.ProjectVisitorRule = NewProjectVisitorRuleClient(tx.config)
 	tx.RelayInstance = NewRelayInstanceClient(tx.config)
 	tx.RoleBinding = NewRoleBindingClient(tx.config)
 	tx.RoleDefinition = NewRoleDefinitionClient(tx.config)

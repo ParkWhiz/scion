@@ -35,6 +35,14 @@ const (
 	// error the caller must fix (ptone/scion#3132).
 	BrokerErrCodeHarnessConfigUnusable = "harness_config_unusable"
 
+	// BrokerErrCodeStorageMigrationRequired marks an agent start the broker
+	// refuses (422) because its storage would be placed differently than
+	// configured before server.project_storage: its profile or runtime
+	// entry sets a removed storage override, or its per-agent shared-dir
+	// record pins nfs while the layout is not shared. The message names
+	// the keys and the migration (ptone/scion#6371).
+	BrokerErrCodeStorageMigrationRequired = "storage_migration_required"
+
 	// BrokerErrCodeIdentityNotMapped marks a dispatch in GCP identity mode
 	// "assign" on the Kubernetes runtime whose GCP service account has no
 	// kubernetes_service_account_mappings entry on the selected profile
@@ -95,7 +103,45 @@ const (
 	// (PurgeRetainedQueryParam) is running there (409, with Retry-After).
 	// Nothing was started or written. Retry after the removal ends.
 	BrokerErrCodeRetainedPurgeInProgress = "retained_purge_in_progress"
+
+	// BrokerErrCodeMoveTargetNotFresh marks a forced move's provision
+	// (moved-agent expectation "fresh-agent-dir") the broker refused before
+	// creating anything, because it has files for the agent or cannot
+	// confirm that it has none (409). The message names no host path. The
+	// hub then rolls the move back without removing anything on that
+	// broker: the files there were not created by the move
+	// (ptone/scion#5441).
+	BrokerErrCodeMoveTargetNotFresh = "move_target_not_fresh"
+
+	// BrokerErrCodeMoveMarkerMismatch marks a forced move's rollback delete
+	// (MoveReincarnationIDQueryParam) that removed nothing because an agent
+	// directory on the broker exists without that move's marker: the files
+	// were not created by the move (409). The message names no host path.
+	BrokerErrCodeMoveMarkerMismatch = "move_marker_mismatch"
+
+	// BrokerErrCodeReloadUnconfirmed marks a reset-auth that wrote the new
+	// credential into the agent container but could not deliver the reload
+	// signal to the agent's init process (502), so the running agent did not
+	// confirm the reload. The credential file is in place; the hub relays the
+	// code to the caller.
+	BrokerErrCodeReloadUnconfirmed = "reload_unconfirmed"
+
+	// BrokerErrCodeAgentSlugHeld marks a create, start or restart refused
+	// because the agent's slug is held in the project by another agent of a
+	// flat Runtime Broker instance: this instance, or another instance of the
+	// same host (409). The error details carry "slug", "holderAgentId" (the
+	// holding agent's ID) and "runtimeBrokerId" (the instance holding it). A
+	// slug still held by an unconfirmed delete, or a reservation that cannot
+	// be read, does not use this code.
+	BrokerErrCodeAgentSlugHeld = "agent_slug_held"
 )
+
+// ReloadUnconfirmedMessage is the caller-facing text for
+// BrokerErrCodeReloadUnconfirmed, shared by the broker, the hub and the CLI.
+// It must stay true whether or not the agent also reloads the credential on
+// its own (for example from a credential file watch, where present).
+const ReloadUnconfirmedMessage = "credential issued and written; the running agent did not confirm the reload. " +
+	"If it keeps failing to authenticate, restart the agent"
 
 // BrokerErrDetailReason is the details key of a
 // BrokerErrCodeLocalWorktreeRefused error (the client-facing message, with

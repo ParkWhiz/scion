@@ -783,13 +783,13 @@ func TestCreateAgentStartFailure_CleansUpFiles(t *testing.T) {
 		t.Fatalf("failed to write scion-agent.yaml: %v", err)
 	}
 
-	cfg := DefaultServerConfig()
+	cfg := testServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
 	mgr := &provisionCapturingManager{}
 	mgr.startErr = fmt.Errorf("auth resolution failed: gemini: auth type \"api-key\" selected but no API key found")
 	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
-	srv := New(cfg, mgr, rt)
+	srv := New(cfg, mgr, rt, config.RuntimeBuildRecord{})
 
 	body := fmt.Sprintf(`{
 		"name": "fail-agent",

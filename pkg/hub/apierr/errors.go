@@ -92,6 +92,10 @@ const (
 	// ErrCodeAgentSessionUnavailable is returned (503) when the agent is
 	// running but the conduit session a stream needs is not connected.
 	ErrCodeAgentSessionUnavailable = "agent_session_unavailable"
+	// ErrCodeAgentUpgradeRequired is returned (409) for a user stream open
+	// to an agent session that does not support stream renewal while the
+	// hub requires it (design §3.5, Q14).
+	ErrCodeAgentUpgradeRequired = "agent_upgrade_required"
 	// ErrCodeSendInProgress is returned (409) for a chat send whose
 	// idempotency key belongs to a send that is still running.
 	ErrCodeSendInProgress = "send_in_progress"
@@ -134,12 +138,25 @@ const (
 	// deleteBlocksStart).
 	ErrCodeDeleteInProgress = "delete_in_progress"
 
+	// ErrCodeEncryptionPolicyMismatch is returned (409) when the database
+	// encryption policy refuses a secret payload write from this hub's
+	// encryption keyring (ptone/scion#1530 §6). Nothing was written; there
+	// is no unencrypted fallback.
+	ErrCodeEncryptionPolicyMismatch = "encryption_policy_mismatch"
+
 	// ErrCodeStartOutcomeUnknown is returned (504) by a create or env
 	// submit whose synchronous dispatch to the runtime broker ended without
 	// an answer (the dispatch deadline, or no response to a sent request).
 	// The agent is kept, not rolled back: the broker may still be starting
 	// it. Details carry agentId and phase (ptone/scion#4817).
 	ErrCodeStartOutcomeUnknown = "start_outcome_unknown"
+
+	// ErrCodeOutcomeUnknown is returned (502) by exec when the request was
+	// sent to the runtime broker and its result was not received: the
+	// broker may have executed it. It is never retried. Details carry
+	// operation, broker_id and request_id (contracts §2, "Ambiguous broker
+	// results").
+	ErrCodeOutcomeUnknown = "outcome_unknown"
 
 	// Conversation resolution error codes (Tranche G read-switch)
 
@@ -167,6 +184,10 @@ const (
 	// missing". Without this, the request would silently fall through to the
 	// DM branch and serve wrong data (G3-f).
 	ErrCodeThreadProjectRequired = "thread_project_required"
+
+	// ErrCodeChatPostDenied is returned (403) when the caller may read a
+	// chat thread but its account may not post in it (project.chat_post).
+	ErrCodeChatPostDenied = "chat_post_denied"
 
 	// Addressee resolution error codes (DEF-126).
 
@@ -256,6 +277,13 @@ const (
 	// remove the last direct-user project-owner binding.
 	// D7: normalized from SCREAMING_SNAKE to lower_snake_case (approved breaking change).
 	ErrCodeLastOwner = "last_owner"
+
+	// ErrCodeUserDeleteBlocked is returned with 409 when a user cannot be
+	// deleted because agents or active delegations depend on the user.
+	// details.agents and details.edges list them (each capped) and
+	// details.truncated reports more. GET /api/v1/users/{id}/delete-blockers
+	// returns the same lists without attempting the delete.
+	ErrCodeUserDeleteBlocked = "user_delete_blocked"
 
 	// ErrCodeInvalidCursor is returned for every authorizedList pagination
 	// cursor failure: malformed input, truncation, a tampered byte, a
@@ -353,6 +381,17 @@ type httpStatusError interface {
 // ErrDeleteInProgress) and deleteInProgressRefusal.
 const DeleteInProgressMessage = "a delete is in progress for this agent; wait for it to finish, or force the delete"
 
+// InvalidCursorMessage is the client-facing message of every 400
+// invalid_cursor answer: a cursor that cannot be used, whatever the reason,
+// means "discard it and restart from the first page".
+const InvalidCursorMessage = "invalid cursor: restart pagination from the first page"
+
+// WriteInvalidCursor writes the uniform 400 invalid_cursor answer for a
+// pagination cursor or page token that cannot be used.
+func WriteInvalidCursor(w http.ResponseWriter) {
+	WriteError(w, http.StatusBadRequest, ErrCodeInvalidCursor, InvalidCursorMessage, nil)
+}
+
 // StoreMembersGroupPrincipalMessage is the client-facing message for a store
 // refusal (store.ErrProjectMembersGroupPrincipal), shared by WriteErrorFromErr
 // and storeMembersGroupPrincipalDecision so both routes return the same text.
@@ -392,15 +431,39 @@ func WriteErrorFromErr(w http.ResponseWriter, err error, requestID string) {
 		statusCode = http.StatusConflict
 		code = ErrCodeDeleteInProgress
 		message = DeleteInProgressMessage
+	case errors.Is(err, store.ErrEncryptionPolicyMismatch):
+		statusCode = http.StatusConflict
+		code = ErrCodeEncryptionPolicyMismatch
+		message = "The database encryption policy refused this write: this hub's encryption keyring does not match it. Nothing was stored."
 	case errors.Is(err, store.ErrVersionConflict):
 		statusCode = http.StatusConflict
 		code = ErrCodeVersionConflict
 		message = "Version conflict - resource was modified"
+	case errors.Is(err, store.ErrTestAdminGrantRefused):
+		// Admin tier A3 grant shaping: a grant a test identity with an
+		// admin role may not make. The fixed sentinel text only: the
+		// wrapped error is not shown.
+		statusCode = http.StatusForbidden
+		code = ErrCodeForbidden
+		message = store.ErrTestAdminGrantRefused.Error()
+	case errors.Is(err, store.ErrTestAdminGrantUnshaped):
+		// Admin tier A3 grant shaping, fail-closed: the store could not
+		// bound the grant by the identity's expiry.
+		statusCode = http.StatusForbidden
+		code = ErrCodeForbidden
+		message = store.ErrTestAdminGrantUnshaped.Error()
 	case errors.Is(err, store.ErrProjectMembersGroupPrincipal):
 		// Must precede ErrInvalidInput, which it wraps.
 		statusCode = http.StatusBadRequest
 		code = ErrCodeInvalidRequest
 		message = StoreMembersGroupPrincipalMessage
+	case errors.Is(err, store.ErrInvalidCursor):
+		// Must precede ErrInvalidInput, which it wraps. Every malformed
+		// cursor gets the same answer as an authorizedList cursor failure
+		// (ptone/scion#3062).
+		statusCode = http.StatusBadRequest
+		code = ErrCodeInvalidCursor
+		message = InvalidCursorMessage
 	case errors.Is(err, store.ErrInvalidInput):
 		statusCode = http.StatusBadRequest
 		code = ErrCodeValidationError

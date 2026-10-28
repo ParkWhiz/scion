@@ -90,6 +90,7 @@ type AgentLaunchReport struct {
 	Message    string                 `json:"message,omitempty"`
 	ErrorCode  string                 `json:"errorCode,omitempty"`
 	Cause      string                 `json:"cause,omitempty"` // failed runtime_error only: an api.BrokerRuntimeCause code
+	RunID      string                 `json:"runId,omitempty"` // failed only: the run the launch started
 	Agent      *AgentLaunchReportInfo `json:"agent,omitempty"` // succeeded only
 	At         time.Time              `json:"at,omitzero"`
 }
@@ -182,9 +183,24 @@ type MessageFailure struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// AttachmentOutcome is the outcome of one attachment delivered with a message
+// (ptone/scion#4596): "delivered", or "not_delivered" with the reason the
+// agent was told.
+type AttachmentOutcome struct {
+	MessageID    string `json:"messageId"`
+	AgentID      string `json:"agentId,omitempty"`
+	AttachmentID string `json:"attachmentId,omitempty"`
+	Outcome      string `json:"outcome"`
+	Reason       string `json:"reason,omitempty"`
+}
+
 // MessageFailuresReport is the body of a message-failures report.
 type MessageFailuresReport struct {
 	Failures []MessageFailure `json:"failures"`
+	// AttachmentOutcomes are the per-file outcomes of attachment deliveries
+	// (ptone/scion#4596). The hub logs and counts them; they never change a
+	// message's state.
+	AttachmentOutcomes []AttachmentOutcome `json:"attachmentOutcomes,omitempty"`
 }
 
 // runtimeBrokerService is the implementation of RuntimeBrokerService.
@@ -204,6 +220,10 @@ type ListBrokersOptions struct {
 type ListBrokersResponse struct {
 	Brokers []RuntimeBroker
 	Page    apiclient.PageResult
+	// HubVersion is the fleet hub version each broker's VersionStatus is
+	// compared with: a build token, "mixed", or "" when unknown or when an
+	// older Hub did not send it.
+	HubVersion string
 }
 
 // UpdateBrokerRequest is the request for updating a runtime broker.
@@ -222,6 +242,11 @@ type ListBrokerProjectsResponse struct {
 type BrokerHeartbeat struct {
 	Status   string             `json:"status"`
 	Projects []ProjectHeartbeat `json:"projects,omitempty"`
+	// Version is the broker's build token (version.Short()). The Hub
+	// refreshes the stored broker version from it on a heartbeat the broker
+	// sends itself (ptone/scion#5972). Omitted when empty; an older Hub
+	// ignores it.
+	Version string `json:"version,omitempty"`
 	// Capabilities refreshes the broker's reported capabilities on every
 	// heartbeat (design §3.4 Amendment A2.2(b)). Chosen over a hub->broker live /info query:
 	// no such query path exists today, and adding one would mean a new
@@ -273,6 +298,23 @@ type BrokerHeartbeat struct {
 	// broker's online/offline status. An older broker omits it and the
 	// hub keeps the stored value; an older hub ignores it.
 	Health *api.BrokerHealthReport `json:"health,omitempty"`
+	// RuntimeTargetPresentation is a flat Runtime Broker instance's full
+	// FC4-a presentation (config.PresentInstance), sent on every heartbeat
+	// as a snapshot, so a lost update or a Hub restore is repaired by the
+	// next beat. The Hub stores it read-only, only from the broker's own
+	// credentials, and only when the fence below advances. A legacy broker
+	// and an older broker omit it; the Hub then keeps the stored value.
+	RuntimeTargetPresentation *api.RuntimeTargetPresentation `json:"runtimeTargetPresentation,omitempty"`
+	// PresentationTargetID is the instance's runtime target ID
+	// (RuntimeTargetDescriptor.ID); the Hub stores the presentation only
+	// when it equals the row's stored target.
+	PresentationTargetID string `json:"presentationTargetId,omitempty"`
+	// PresentationEpoch is the reporting process's start time in Unix
+	// nanoseconds, fixed for the process life; PresentationSeq is its
+	// per-process heartbeat counter. Together they fence the write: an
+	// older process can never overwrite a newer one's snapshot.
+	PresentationEpoch int64 `json:"presentationEpoch,omitempty"`
+	PresentationSeq   int64 `json:"presentationSeq,omitempty"`
 }
 
 // StartInFlight identifies one agent start running on a broker.
@@ -338,6 +380,16 @@ type AgentHeartbeat struct {
 	Profile         string `json:"profile,omitempty"`     // Settings profile used
 	ExitCode        *int   `json:"exitCode,omitempty"`    // Structured exit code from runtime (nil = unknown)
 	ExitReason      string `json:"exitReason,omitempty"`  // Terminal reason (see state.ExitReason), e.g. "crashed", "preempted", "oom_killed"
+	// Template, HarnessConfig, HarnessConfigSource, Image and Runtime are
+	// the agent config the runtime resolved for the listed entry (its
+	// labels), the same values a synchronous dispatch answer carries. The
+	// Hub records them only for a create whose dispatch outcome was unknown
+	// (ptone/scion#4987). An older broker omits them.
+	Template            string `json:"template,omitempty"`
+	HarnessConfig       string `json:"harnessConfig,omitempty"`
+	HarnessConfigSource string `json:"harnessConfigSource,omitempty"`
+	Image               string `json:"image,omitempty"`
+	Runtime             string `json:"runtime,omitempty"`
 	// RuntimeTarget is the ID of the inventory target whose listing reported
 	// this agent (see InventoryTarget.ID).
 	RuntimeTarget string `json:"runtimeTarget,omitempty"`
@@ -389,6 +441,35 @@ type CreateBrokerResponse struct {
 	// Reissued is true when an earlier, unused join token for this broker
 	// was replaced and no longer works.
 	Reissued bool `json:"reissued,omitempty"`
+	// KeptSettings lists requested values the Hub did not apply because
+	// the stored value is kept (fields managed through the update API).
+	KeptSettings []KeptSetting `json:"keptSettings,omitempty"`
+}
+
+// KeptSetting is a requested registration value the Hub kept unchanged.
+type KeptSetting struct {
+	// Field is gcpHostServiceAccountEmail, gcpHostProjectId or labels.<key>.
+	Field          string `json:"field"`
+	StoredValue    string `json:"storedValue"`
+	RequestedValue string `json:"requestedValue"`
+	// Reason is "set"; "pinned" for a value cleared through the update
+	// API; or "email_required" for a project sent without a service account.
+	Reason string `json:"reason"`
+}
+
+// Message is the one-line operator message for a kept setting.
+func (k KeptSetting) Message() string {
+	if k.Reason == "email_required" {
+		return fmt.Sprintf("not applied %s=%q: send gcpHostServiceAccountEmail together with the project", k.Field, k.RequestedValue)
+	}
+	return fmt.Sprintf("kept %s=%q (requested %q); change it through the Runtime Broker update API (PATCH /api/v1/runtime-brokers/{id})", k.Field, k.StoredValue, k.RequestedValue)
+}
+
+// PrintKeptSettings writes one Message line per kept setting to w.
+func PrintKeptSettings(w io.Writer, kept []KeptSetting) {
+	for _, k := range kept {
+		_, _ = fmt.Fprintln(w, k.Message())
+	}
 }
 
 // JoinBrokerRequest is the request to complete broker registration.
@@ -462,6 +543,7 @@ func (s *runtimeBrokerService) List(ctx context.Context, opts *ListBrokersOption
 		Brokers    []RuntimeBroker `json:"brokers"`
 		NextCursor string          `json:"nextCursor,omitempty"`
 		TotalCount int             `json:"totalCount,omitempty"`
+		HubVersion string          `json:"hubVersion,omitempty"`
 	}
 
 	result, err := apiclient.DecodeRequired[listResponse](resp)
@@ -475,6 +557,7 @@ func (s *runtimeBrokerService) List(ctx context.Context, opts *ListBrokersOption
 			NextCursor: result.NextCursor,
 			TotalCount: result.TotalCount,
 		},
+		HubVersion: result.HubVersion,
 	}, nil
 }
 

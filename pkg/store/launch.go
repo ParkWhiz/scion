@@ -14,16 +14,34 @@
 
 package store
 
-import "time"
+import (
+	"time"
 
-// LaunchKind values for Agent.LaunchKind / BeginLaunch's kind parameter
-// (design t1-async-create-v11.md §3.3). Only LaunchKindCreate is writable by
-// BeginLaunch in P1a; start/restart land in P6 (§3.13).
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
+)
+
+// LaunchKind values for Agent.LaunchKind (design t1-async-create-v11.md
+// §3.3). BeginLaunch writes LaunchKindCreate; BeginStartLaunch writes
+// LaunchKindStart and LaunchKindRestart (ptone/scion#4669).
 const (
 	LaunchKindCreate  = "create"
 	LaunchKindStart   = "start"
 	LaunchKindRestart = "restart"
 )
+
+// BeginLaunchOptions are the start-kind inputs to BeginStartLaunch
+// (ptone/scion#4669).
+type BeginLaunchOptions struct {
+	// PriorPhase is the effective resting phase (EffectiveRestingPhase)
+	// the start was taken from, read before the start dispatch wrote
+	// starting; for a restart, the phase before the restart. A failed
+	// start-kind launch reads it (launch_prior_phase) to choose its end
+	// phase and resume memory.
+	PriorPhase string
+	// RevokeOnFail records whether a failed end of this start revokes the
+	// credential the start issued (launch_revoke_on_fail).
+	RevokeOnFail bool
+}
 
 // LaunchState values for Agent.LaunchState.
 const (
@@ -42,20 +60,41 @@ const (
 	LaunchEndReasonSuperseded      = "superseded"
 )
 
-// Launch error codes for Agent.LaunchError (design §3.3, §3.9).
+// Launch error codes for Agent.LaunchError (design §3.3, §3.9). They are
+// aliases of the shared pkg/api launch codes (design wave 3 E-a,
+// ptone/scion#4670): the store writes these, and the broker reports the rest.
 const (
-	LaunchErrorLaunchTimeout  = "launch_timeout"
-	LaunchErrorBrokerLost     = "broker_lost"
-	LaunchErrorLaunchStopped  = "launch_stopped"
-	LaunchErrorAgentError     = "agent_error"
-	LaunchErrorHubUnreachable = "hub_unreachable"
+	LaunchErrorLaunchTimeout  = api.LaunchCodeLaunchTimeout
+	LaunchErrorBrokerLost     = api.LaunchCodeBrokerLost
+	LaunchErrorLaunchStopped  = api.LaunchCodeLaunchStopped
+	LaunchErrorAgentError     = api.LaunchCodeAgentError
+	LaunchErrorHubUnreachable = api.LaunchCodeHubUnreachable
 	// LaunchErrorBrokerRestarted: the broker process restarted, or shut
 	// down, while the launch was in flight, and reported the launch failed
 	// itself (from its shutdown drain or, after a crash, from its launch
 	// journal on the next boot; ptone/scion#4668). Broker-confirmed: the
 	// broker reports it only for a launch it ended.
-	LaunchErrorBrokerRestarted = "broker_restarted"
+	LaunchErrorBrokerRestarted = api.LaunchCodeBrokerRestarted
+	// LaunchErrorDispatchFailed: the hub's send of the launch failed with a
+	// known outcome, or the broker acknowledged a different launch; the
+	// dispatcher ends the launch not_launched with this code.
+	LaunchErrorDispatchFailed = api.LaunchCodeDispatchFailed
 )
+
+// IsUnconfirmedLaunchError reports whether launchError is a launch outcome
+// the Hub declared on its own, without the broker confirming how the launch
+// ended (the launch reaper's timeout and lost codes). The agent's runtime
+// state is unknown after such an end, so these codes are kept until a later
+// launch or a running write replaces them: the start claim does not clear
+// them (ptone/scion#5273), and a later start reads them.
+func IsUnconfirmedLaunchError(launchError string) bool {
+	switch launchError {
+	case LaunchErrorLaunchTimeout, LaunchErrorBrokerLost:
+		return true
+	default:
+		return false
+	}
+}
 
 // LaunchReport report-state values (mirrors the broker->Hub wire report's
 // State field, design §3.2 AgentLaunchReport; defined here rather than
@@ -85,6 +124,10 @@ type LaunchReport struct {
 	// failed report's runtime_error, or "" (ptone/scion#4666). The hub
 	// filters it before it gets here; it is stored with ErrorCode.
 	Cause string
+	// RunID is the run the launch started (the hub-minted run ID the broker
+	// echoes); empty when the broker does not send it. The store only
+	// compares it with the row's run ID; it is never stored.
+	RunID string
 
 	// AgentConfig is applied on a succeeded terminal with
 	// ApplyBrokerAgentConfig, the same rules a synchronous dispatch uses

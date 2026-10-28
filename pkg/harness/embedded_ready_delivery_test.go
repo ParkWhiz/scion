@@ -73,7 +73,8 @@ func TestEmbeddedHarnessConfigs_Validate(t *testing.T) {
 
 // TestEmbeddedHarnessConfigs_ValuesMatchLegacyTable pins every bundle's ready
 // and delivery blocks to the behaviour they replace: the hook-mode harnesses
-// of the in-container readiness table use hook, every other bundle uses
+// of the in-container readiness table use hook (except copilot, whose
+// sessionStart fires only on the first prompt), every other bundle uses
 // delay, and every bundle's delivery equals the historical hard-coded Enter
 // x3 at 300ms. The blocks must be written out explicitly, not left to
 // defaults, so authors can see the values.
@@ -81,7 +82,6 @@ func TestEmbeddedHarnessConfigs_ValuesMatchLegacyTable(t *testing.T) {
 	legacyHook := map[string]bool{
 		"claude":     true,
 		"gemini-cli": true,
-		"copilot":    true,
 		"grok-build": true,
 	}
 	wantHook := api.ReadySpec{Strategy: "hook", Settle: 1500 * time.Millisecond, Timeout: 90 * time.Second}
@@ -123,11 +123,17 @@ func TestEmbeddedHarnessConfigs_ValuesMatchLegacyTable(t *testing.T) {
 }
 
 // TestEmbeddedHarnessConfigs_AgentPluginsCapability pins the agent_plugins
-// capability of the bundles that declare it: codex installs natively
-// (partial: sse skipped); the harnesses without native support say no.
+// capability of the bundles, declared in each bundle's agent-plugins.yaml
+// sidecar (config.yaml must not carry it; ptone/scion#5196): codex installs
+// natively (partial: sse skipped), copilot installs natively (yes), muse-code
+// installs natively (partial), claude installs a skills-dir plugin (partial:
+// wrapper and skip rule); the harnesses without native support say no.
 func TestEmbeddedHarnessConfigs_AgentPluginsCapability(t *testing.T) {
 	want := map[string]api.SupportLevel{
 		"codex":       api.SupportPartial,
+		"copilot":     api.SupportYes,
+		"claude":      api.SupportPartial,
+		"muse-code":   api.SupportPartial,
 		"gemini-cli":  api.SupportNo,
 		"grok-build":  api.SupportNo,
 		"antigravity": api.SupportNo,
@@ -136,16 +142,31 @@ func TestEmbeddedHarnessConfigs_AgentPluginsCapability(t *testing.T) {
 	}
 	for name, level := range want {
 		_, entry := loadEmbeddedEntry(t, name)
-		if entry.Capabilities == nil {
-			t.Errorf("%s: no capabilities block", name)
+		if entry.Capabilities != nil && entry.Capabilities.AgentPlugins != (api.CapabilityField{}) {
+			t.Errorf("%s: config.yaml declares capabilities.agent_plugins; it belongs in %s", name, config.AgentPluginsSidecarFile)
+		}
+		// Strict parse: the loaders degrade an invalid sidecar to "no", so
+		// this is what catches a bad bundled file.
+		data, err := fs.ReadFile(harnessesEmbed.FS, name+"/"+config.AgentPluginsSidecarFile)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
 			continue
 		}
-		c := entry.Capabilities.AgentPlugins
+		c, err := config.ParseAgentPluginsSidecar(data)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
 		if c.Support != level {
 			t.Errorf("%s: agent_plugins support = %q, want %q", name, c.Support, level)
 		}
-		if c.Reason == "" {
+		if c.Reason == "" && level != api.SupportYes {
 			t.Errorf("%s: agent_plugins has no reason", name)
+		}
+		// The built-in harness (harness.New, used when no harness-config dir
+		// resolves) reads the same sidecar.
+		if got := New(name).AdvancedCapabilities().AgentPlugins; got != c {
+			t.Errorf("%s: New().AdvancedCapabilities().AgentPlugins = %+v, want %+v", name, got, c)
 		}
 	}
 }

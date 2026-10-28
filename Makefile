@@ -12,11 +12,15 @@ LDFLAGS            := $(shell ./hack/version.sh)
 SCIONTOOL_LDFLAGS  := $(shell ./hack/version.sh github.com/GoogleCloudPlatform/scion/cmd/sciontool/commands)
 CONTAINER_OS  := linux
 CONTAINER_ARCH := $(shell if [ "$$(uname -m)" = "x86_64" ]; then echo amd64; else echo arm64; fi)
-GOLANGCI_LINT := $(shell command -v golangci-lint 2>/dev/null || echo $(shell go env GOPATH)/bin/golangci-lint)
+# golangci-lint built from source with the go-tools#1839 patch, the same
+# binary CI runs (cr-ci/runner/golangci-lint/README.md). Override with
+# GOLANGCI_LINT=/path/to/golangci-lint to use another binary.
+GOLANGCI_LINT_PATCHED := $(BUILD_DIR)/tools/golangci-lint
+GOLANGCI_LINT         ?= $(GOLANGCI_LINT_PATCHED)
 
 .DEFAULT_GOAL := help
 
-.PHONY: all build build-a2a-bridge test-a2a-integration install test test-fast test-hub-sqlite test-sqlite-nonhub test-cmd-sqlite test-fast-ci test-launch-store-postgres test-store-postgres test-store-postgres-others test-store-postgres-env-check test-store-postgres-integrationtest test-store-postgres-entadapter test-store-postgres-tail testpart-selftest test-hub-postgres test-hub-postgres-env-check test-hub-postgres-default test-hub-postgres-integration hub-postgres-integration-shards test-webchat-postgres test-conduit-authz-postgres test-artifacts-postgres test-fixture-coverage hubshard-parity build-hub-shard test-hub-shard test-hub-shards vet-hub-shard vet lint lint-ci vet-integration vet-integration-ci vet-integration-extras compat-literals check-annotation-prefix check-authz-guards check-conversation-upsert-guard check-hub-store-reassign check-security-marker-gates cli-time-zones time-literals check-setenv-guard check-harness-coverage check-authorization-catalog check-route-authz-manifest check-method-not-allowed check-debug-defaults check-sqlite-coverage sqlite-ci-pkgs check-custom golangci-lint web web-typecheck web-lint web-test fmt fmt-check tidy-extras ci ci-full clean help container-sciontool container-scion container-binaries proto proto-check ent-check tidy-check
+.PHONY: all build build-a2a-bridge test-a2a-integration install test test-fast test-hub-sqlite test-sqlite-nonhub test-cmd-sqlite test-fast-ci test-launch-store-postgres test-store-postgres test-store-postgres-others test-store-postgres-env-check test-store-postgres-integrationtest test-store-postgres-entadapter test-store-postgres-tail testpart-selftest hubshard-skip-summary-selftest test-hub-postgres test-hub-postgres-env-check test-hub-postgres-default test-hub-postgres-integration hub-postgres-integration-shards test-webchat-postgres test-conduit-authz-postgres test-artifacts-postgres test-fixture-coverage hubshard-parity build-hub-shard test-hub-shard test-hub-shards vet-hub-shard vet lint lint-ci vet-integration vet-integration-ci vet-integration-extras compat-literals check-annotation-prefix check-authz-guards check-conversation-upsert-guard check-hub-store-reassign check-store-delete-callers check-scan-coverage check-security-marker-gates cli-time-zones time-literals check-setenv-guard check-harness-coverage check-image-go-dirs check-authorization-catalog check-route-authz-manifest check-method-not-allowed check-debug-defaults check-sqlite-coverage sqlite-ci-pkgs check-extras-go-images check-custom golangci-lint golangci-lint-build golangci-lint-split-selftest web web-budget web-typecheck web-lint web-test fmt fmt-check tidy-extras ci ci-full clean help container-sciontool container-scion container-binaries proto proto-check ent-check tidy-check
 
 ## all: Build the web frontend and compile the Go binary (run 'make install' separately to install)
 all: web build
@@ -193,6 +197,10 @@ hubshard-parity:
 testpart-selftest:
 	@./hack/test-testpart.sh
 
+## hubshard-skip-summary-selftest: Test the skipped-tests summary of make test-hub-shard (bash only, a fake test binary; no go)
+hubshard-skip-summary-selftest:
+	@./hack/hubshard/test-skip-summary.sh
+
 ## test-hub-shard: Run pkg/hub test shard SHARD=K (NOSQLITE=1: with -tags no_sqlite; RACE=1: with -race)
 # Generates the shard overlay in a temp dir (the tree is not modified),
 # compiles the shard, checks its test list against hubshard -list, then
@@ -215,7 +223,7 @@ test-hub-shards:
 build-hub-shard:
 	@./hack/hubshard/shard.sh build $(SHARD) $(if $(NOSQLITE),--nosqlite)
 
-## vet-hub-shard: go vet pkg/hub test shard SHARD=K with -tags no_sqlite and -tags 'integration volume_test tzcontract'
+## vet-hub-shard: go vet pkg/hub test shard SHARD=K with -tags no_sqlite and -tags 'integration tzcontract'
 # The shards' vets together cover every pkg/hub file that make lint and
 # make vet-integration cover (hubshard-parity checks it). CI vets pkg/hub
 # this way (lint-ci and vet-integration-ci leave the package out).
@@ -231,10 +239,12 @@ test-fixture-coverage:
 	@echo "Running fixture coverage gate (SQLite-enabled)..."
 	@go test -count=1 $(FIXTURE_PKGS)
 
-# TEST_IDENTITY_POSTGRES_TESTS are the pkg/hub test identity purge
-# concurrency tests (ptone/scion#4240, Phase 3b) run by
-# test-launch-store-postgres (pkg/hub shard Postgres (integration) jobs in CI).
-TEST_IDENTITY_POSTGRES_TESTS := TestFixturePurge_ConcurrentCoOwner_Postgres
+# TEST_IDENTITY_POSTGRES_TESTS are the pkg/hub test identity concurrency
+# tests (ptone/scion#4240: the Phase 3b purge, and the X4 parallel admin-kind
+# mints across workload delegations) run by test-launch-store-postgres
+# (pkg/hub shard Postgres (integration) jobs in CI).
+TEST_IDENTITY_POSTGRES_TESTS := TestFixturePurge_ConcurrentCoOwner_Postgres \
+	TestWorkloadAdminDelegation_ParallelMintsHoldCaps_Postgres
 
 # MEMBERSHIP_LOSS_POSTGRES_TESTS are the pkg/hub membership loss
 # concurrency tests (ptone/scion#3433) run by test-launch-store-postgres.
@@ -486,8 +496,8 @@ test-store-postgres-entadapter: test-store-postgres-env-check
 		fi; \
 	fi
 
-# test-store-postgres-tail: the storetest, pkg/store/enttest, pkg/ent/entc
-# and cmd runs of test-store-postgres (after entadapter). The enttest run
+# test-store-postgres-tail: the storetest, pkg/store/enttest, pkg/ent/entc,
+# pkg/testinfra and cmd runs of test-store-postgres (after entadapter). The enttest run
 # includes TestSchemaSnapshot_MatchesAutoMigrate, which checks that the
 # schema snapshot the harness provisions test schemas from matches
 # entc.AutoMigrate.
@@ -537,9 +547,23 @@ test-store-postgres-tail: test-store-postgres-env-check
 		echo "ERROR: the skill-visibility old-schema Postgres test did not run." >&2; \
 		exit 1; \
 	fi
+	@go test -tags integration -count=1 -timeout 10m -v \
+		-run '^TestDelegate_ConcurrentLiveCapHolds_Postgres$$' \
+		./pkg/testinfra/ > /tmp/test-launch-store-postgres-testinfra.log 2>&1; \
+	status=$$?; \
+	cat /tmp/test-launch-store-postgres-testinfra.log; \
+	if [ $$status -ne 0 ]; then exit $$status; fi; \
+	if grep -qE '^[[:space:]]*--- SKIP' /tmp/test-launch-store-postgres-testinfra.log; then \
+		echo "ERROR: the pkg/testinfra Postgres test was skipped -- see '--- SKIP' lines above." >&2; \
+		exit 1; \
+	fi; \
+	if ! grep -qE '^--- PASS: TestDelegate_ConcurrentLiveCapHolds_Postgres ' /tmp/test-launch-store-postgres-testinfra.log; then \
+		echo "ERROR: the offline delegation live-cap Postgres test did not run." >&2; \
+		exit 1; \
+	fi
 	@st=$$(mktemp) || exit 1; \
 	{ $(HUB_TEST_GOGC) go test -tags integration -count=1 -timeout 20m -v \
-		-run '^TestMaintenanceCommandsSchemaShadowGuard_Postgres$$' \
+		-run '^(TestMaintenanceCommandsSchemaShadowGuard_Postgres|TestServerPreflight_Postgres)$$' \
 		./cmd/ 2>&1; echo $$? > "$$st"; } \
 		| tee /tmp/test-launch-store-postgres-cmd.log; \
 	status=$$(cat "$$st" 2>/dev/null); \
@@ -553,6 +577,10 @@ test-store-postgres-tail: test-store-postgres-env-check
 	if ! grep -qE '^--- PASS: TestMaintenanceCommandsSchemaShadowGuard_Postgres ' /tmp/test-launch-store-postgres-cmd.log; then \
 		echo "ERROR: the maintenance-command search_path guard Postgres test did not run." >&2; \
 		exit 1; \
+	fi; \
+	if ! grep -qE '^--- PASS: TestServerPreflight_Postgres ' /tmp/test-launch-store-postgres-cmd.log; then \
+		echo "ERROR: the server preflight Postgres test did not run." >&2; \
+		exit 1; \
 	fi
 
 ## test-launch-store-postgres: test-store-postgres plus the pkg/hub Postgres tests in HUB_INTEGRATION_POSTGRES_TESTS (every shard holding one)
@@ -563,15 +591,31 @@ test-store-postgres-tail: test-store-postgres-env-check
 test-launch-store-postgres: test-store-postgres
 	@./hack/hubshard/shard.sh postgres all integration $(HUB_INTEGRATION_POSTGRES_TESTS)
 
+# BROKER_RESERVATION_TRANSFER_POSTGRES_TESTS are the Postgres variants of
+# the atomic broker reservation transfer (ptone/scion#5951): the forward
+# move at the source cap, the cap on the target, the target lock held across
+# the transaction (two replicas) and the concurrent soak.
+BROKER_RESERVATION_TRANSFER_POSTGRES_TESTS := TestMoveBrokerQuota_SourceAtCapTargetFull_Postgres \
+	TestTransferBroker_TargetAtCapRefused_Postgres \
+	TestTransferBroker_TargetLockHeldAcrossTransaction_Postgres \
+	TestTransferBroker_ConcurrentReserveSoak_Postgres
+
 # HUB_INTEGRATION_POSTGRES_TESTS are the pkg/hub Postgres tests that need
 # -tags integration (the integration TestMain sets up the ent test
 # database): the project-delete lock-order test, the two-replica scheduled
-# send test, and the membership loss and test identity concurrency tests.
+# send test, the membership loss and test identity concurrency tests, and
+# the broker presence registry test (its conduit registry runs on the ent
+# test database), the agent delegation issuance vs reincarnation claim
+# race, and the broker reservation transfer tests
+# (BROKER_RESERVATION_TRANSFER_POSTGRES_TESTS).
 # Each must print a PASS line, and any skip fails (shard.sh postgres).
 HUB_INTEGRATION_POSTGRES_TESTS := TestProjectDeletionService_LockOrderNoDeadlock \
 	TestScheduledSend_TwoHubReplicasPostgres_OneDelivery \
+	TestBrokerPresence_LiveRegistrySession \
+	TestAgentDelegationIssuanceVsReincarnateClaim_Postgres \
 	$(MEMBERSHIP_LOSS_POSTGRES_TESTS) \
 	$(TEST_IDENTITY_POSTGRES_TESTS) \
+	$(BROKER_RESERVATION_TRANSFER_POSTGRES_TESTS) \
 	TestHubInternal_ReplayAcrossHubReplicas
 
 ## test-hub-postgres: Run the pkg/hub Postgres tests of shard SHARD=K (SHARD=all: every shard holding one)
@@ -630,6 +674,7 @@ WEBCHAT_POSTGRES_TESTS := TestListTopicsByProjects_Postgres \
 	TestC4Fix_Postgres_PreExistingDB_Idempotent \
 	TestUnreadMentionKeys_Postgres \
 	TestScheduledStore_Postgres \
+	TestMessageStarStore_Postgres \
 	TestWebChatStore_Postgres_MessagesInOtherSchema \
 	TestWebChatStore_Postgres_ThreadMigrationsWaitForMessagesTable \
 	TestWebChatStore_Postgres_ThreadMigrationsRunOnce \
@@ -716,11 +761,11 @@ vet:
 lint:
 	@go vet -tags no_sqlite ./...
 
-## vet-integration: Compile-check integration-tagged code (go vet -tags 'integration volume_test tzcontract')
+## vet-integration: Compile-check integration-tagged code (go vet -tags 'integration tzcontract')
 # Catches build breaks in integration-tagged files that other vet/lint
 # targets skip (ptone/scion#2348).
 vet-integration:
-	@go vet -tags 'integration volume_test tzcontract' ./...
+	@go vet -tags 'integration tzcontract' ./...
 
 ## lint-ci: lint without the pkg/hub package itself (CI vets it per shard: vet-hub-shard)
 lint-ci:
@@ -729,8 +774,8 @@ lint-ci:
 
 ## vet-integration-ci: vet-integration without the pkg/hub package itself (CI vets it per shard: vet-hub-shard)
 vet-integration-ci:
-	@pkgs=$$($(call non_hub_pkgs,integration volume_test tzcontract)) || exit 1; \
-	go vet -tags 'integration volume_test tzcontract' $$pkgs
+	@pkgs=$$($(call non_hub_pkgs,integration tzcontract)) || exit 1; \
+	go vet -tags 'integration tzcontract' $$pkgs
 
 ## vet-integration-extras: Compile-check integration-tagged code in every extras/ module that has it
 # vet-integration only covers the root module's ./... tree; extras/*
@@ -795,6 +840,15 @@ check-conversation-upsert-guard:
 check-hub-store-reassign:
 	@./hack/check-hub-store-reassign.sh
 
+## check-store-delete-callers: Flag direct store DeleteAgent/DeleteProject calls outside hack/store-delete-callers-allowlist.txt
+check-store-delete-callers:
+	@./hack/check-store-delete-callers.sh
+
+## check-scan-coverage: Every enumeration call in a pkg/hub source-scanning test needs a pkg/hub-wide scan-covers claim (self-test first)
+check-scan-coverage:
+	@./hack/check-scan-coverage.sh --self-test
+	@./hack/check-scan-coverage.sh
+
 ## check-security-marker-gates: Verify security symbols (authenticatedSender, validateDefaultAgent, ActionAttach) remain in handler code
 check-security-marker-gates:
 	@./hack/check-security-marker-gates.sh
@@ -819,6 +873,14 @@ time-literals:
 # one code. CI invokes the script directly to tell those apart.
 check-harness-coverage:
 	@./image-build/scripts/check-harness-coverage.sh
+
+## check-image-go-dirs: Verify every Dockerfile that builds the root Go module copies all of its top-level Go dirs (ptone/scion#5453)
+# NOTE: same caveat as check-authz-guards above -- make collapses the
+# script's exit 1 (violations) and exit 2 (could not run) into one code.
+# CI invokes the script directly to tell those apart.
+check-image-go-dirs:
+	@./hack/check-image-go-dirs.sh --self-test
+	@./hack/check-image-go-dirs.sh
 
 ## check-authorization-catalog: Validate authorization operation catalog, permission coverage, and generated report
 check-authorization-catalog:
@@ -847,19 +909,32 @@ check-sqlite-coverage:
 	@./hack/check-sqlite-coverage.sh --self-test
 	@./hack/check-sqlite-coverage.sh
 
+## check-extras-go-images: Verify each extras/ Dockerfile's golang image meets its module's go version
+check-extras-go-images:
+	@./hack/check-extras-go-images.sh --self-test
+	@./hack/check-extras-go-images.sh
+
 ## check-custom: Run all custom CI lint checks (see hack/LINT-CONVENTIONS.md)
-check-custom: hubshard-parity testpart-selftest compat-literals check-annotation-prefix check-authz-guards check-setenv-guard check-conversation-upsert-guard check-hub-store-reassign check-security-marker-gates check-authorization-catalog check-route-authz-manifest cli-time-zones time-literals check-method-not-allowed check-debug-defaults check-sqlite-coverage
+check-custom: hubshard-parity hubshard-skip-summary-selftest testpart-selftest compat-literals check-annotation-prefix check-authz-guards check-setenv-guard check-conversation-upsert-guard check-hub-store-reassign check-store-delete-callers check-scan-coverage check-security-marker-gates check-image-go-dirs check-authorization-catalog check-route-authz-manifest cli-time-zones time-literals check-method-not-allowed check-debug-defaults check-sqlite-coverage check-extras-go-images
 	@echo "All custom checks passed."
 
-## golangci-lint: Run golangci-lint on new issues only (install via: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest)
-golangci-lint:
+## golangci-lint-build: Build the patched golangci-lint CI uses into ./build/tools/ (skipped when up to date)
+golangci-lint-build:
+	@./cr-ci/runner/golangci-lint/build.sh $(GOLANGCI_LINT_PATCHED)
+
+## golangci-lint: Run golangci-lint on new issues only (builds the patched binary first, unless GOLANGCI_LINT is set)
+golangci-lint: $(if $(filter $(GOLANGCI_LINT_PATCHED),$(GOLANGCI_LINT)),golangci-lint-build)
 	@if [ ! -x "$(GOLANGCI_LINT)" ]; then \
-		echo "ERROR: golangci-lint not found. Install with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; \
+		echo "ERROR: golangci-lint not found at $(GOLANGCI_LINT)"; \
 		exit 1; \
 	fi
-	@echo "Running golangci-lint (new issues vs main)..."
-	@GOGC=50 $(GOLANGCI_LINT) run --new-from-rev=main ./...
+	@echo "Running golangci-lint (new issues vs main; two passes, see hack/golangci-lint-split.sh)..."
+	@GOLANGCI_LINT=$(GOLANGCI_LINT) ./hack/golangci-lint-split.sh --new-from-rev=main
 	@echo "golangci-lint passed."
+
+## golangci-lint-split-selftest: Test hack/golangci-lint-split.sh (bash only, stubs; no lint)
+golangci-lint-split-selftest:
+	@./hack/test-golangci-lint-split.sh
 
 ## web: Build the web frontend
 web:
@@ -892,6 +967,13 @@ container-binaries: container-sciontool container-scion
 	@echo ""
 	@echo "Dev binaries ready in $(CONTAINER_DIR)/"
 	@echo "Usage: export SCION_DEV_BINARIES=$(CONTAINER_DIR)"
+
+## web-budget: Check the built web bundle against web/bundle-budget.json (run after `make web`)
+web-budget:
+	@echo "Checking web bundle budget..."
+	@cd web && node scripts/check-bundle-budget.mjs
+	@cd web && node --test scripts/check-bundle-budget.test.mjs
+	@echo "Web bundle budget OK."
 
 ## web-typecheck: Run TypeScript type checking on the web frontend
 web-typecheck:
@@ -949,7 +1031,7 @@ ci: fmt-check lint check-custom test-fast build
 	@echo "CI passed."
 
 ## ci-full: Run the full CI pipeline locally (mirrors GitHub Actions, includes web + golangci-lint)
-ci-full: fmt-check web web-typecheck web-lint web-test lint vet-integration vet-integration-extras check-custom golangci-lint test-fast test-fixture-coverage build
+ci-full: fmt-check web web-budget web-typecheck web-lint web-test lint vet-integration vet-integration-extras check-custom golangci-lint-split-selftest golangci-lint test-fast test-fixture-coverage build
 	@echo ""
 	@echo "CI (full) passed."
 

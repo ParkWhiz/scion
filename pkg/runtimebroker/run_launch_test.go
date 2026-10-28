@@ -88,6 +88,15 @@ func TestShouldCleanupAfterFailureReport(t *testing.T) {
 		{"404 agent_launch_unknown", &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusNotFound, Code: hubclient.AgentLaunchReportCodeUnknownLaunch}, true},
 		{"400", &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusBadRequest}, false},
 		{"401", &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusUnauthorized}, false},
+		// The rest of the answer classes: the table must not gain or lose a
+		// row by accident, since the StartFailed mappings live only in
+		// startFailureCleanup (ptone/scion#5368).
+		{"duplicate", &hubclient.AgentLaunchReportResult{Result: hubclient.AgentLaunchReportResultDuplicate}, true},
+		{"409 deleted", &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusConflict, Reason: hubclient.AgentLaunchReportReasonDeleted}, true},
+		{"409 stopped", &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusConflict, Reason: hubclient.AgentLaunchReportReasonStopped}, true},
+		{"409 failed", &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusConflict, Reason: hubclient.AgentLaunchReportReasonFailed}, true},
+		{"409 not_launched", &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusConflict, Reason: hubclient.AgentLaunchReportReasonNotLaunched}, true},
+		{"409 unrecognised reason", &hubclient.AgentLaunchReportResult{HTTPStatus: http.StatusConflict, Reason: "some_future_reason"}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -389,10 +398,10 @@ func TestRunLaunch_AbortRecordedDuringDownload_NoStart(t *testing.T) {
 
 	rec := newLaunchRecord("L-guard-d", "agent-guard-d", store.LaunchKindCreate, "", time.Now().Add(time.Hour), func() {})
 	lc := launchCtx{
-		req:  CreateAgentRequest{LaunchKeepaliveSeconds: 1},
-		opts: api.StartOptions{Name: "agent-guard-d"},
-		mgr:  mgr,
-		key:  launchKey{Slug: "agent-guard-d"},
+		keepalive: time.Second,
+		opts:      api.StartOptions{Name: "agent-guard-d"},
+		mgr:       mgr,
+		key:       launchKey{Slug: "agent-guard-d"},
 		downloadWorkspaceFromGCS: func(ctx context.Context, req CreateAgentRequest, opts api.StartOptions) (api.StartOptions, string, string, error) {
 			downloadStartedOnce.Do(func() { close(downloadStarted) })
 			select {

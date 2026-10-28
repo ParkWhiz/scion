@@ -27,7 +27,22 @@ The relay keeps each session's hub admission token and presents it unchanged. It
 - **Hub decisions.** Admission, RPCs, refreshes and re-checks are decided by a hub. When the hub cannot be reached, the relay admits nothing new and closes nothing on its own, and each stream still ends at the authorization deadline the hub set.
 - **Database access.** The relay reaches the database only for the conduit registry, the `experiments` settings row, and the hub's dedicated `scion_ev_conduit` event channel, which carries identifiers only. Run it under a least-privilege database role. See [Relay database access](/scion/reference/server-config/#relay-settings-serverrelay).
 
+## Hub ingress
+
+Clients, Runtime Brokers and agents dial the hub's own `GET /api/v1/conduit`. The hub tells agents to dial it only while the ingress serves and at least one relay is eligible; an agent started at any other time keeps the port-forward tunnel until its next start. An agent told to dial keeps redialing with backoff while no relay is eligible (the hub answers `503` with reason `conduit_not_serving`) and runs no port-forward tunnel meanwhile; it is admitted once a relay is eligible again. With `server.hub.conduit.ingress: proxy` (the default), the hub passes each dial on to a relay:
+
+- **Selection.** The hub samples two eligible relays (recently seen and not draining) and picks the one holding fewer sessions. If the session count cannot be read, it picks one of the two at random.
+- **The proxied dial.** The hub forwards only the WebSocket upgrade, to the relay's internal listener, authenticated as `relay-peer`. The client's credential headers, path, query and `Host` pass unchanged, so a Runtime Broker's signature verifies as sent. The hub removes any relay-peer or ingress header the client sent, and names itself in an ingress header that the relay trusts only on that authenticated leg.
+- **Session lifetime.** On a proxied dial the hub sends its own `server.hub.conduit.lifetime_cap`, and the relay uses the smaller of that value and its own `lifetime_cap`. The hub's value can only shorten a session. If the value is missing or outside `90s`-`24h`, the relay uses its own cap and logs the cause `ingress_cap_invalid`.
+- **Shutdown.** On SIGTERM a hub stops proxying first, so no conduit dial reaches a relay after that. A Runtime Broker's dial gets `503` with reason `conduit_not_serving`; other dials get the hub's general shutdown `503`. The hub then asks every live relay to send `GoAway` to the sessions it proxied, keeps those sessions' connections open until they close, and closes any that remain at its hold deadline. The hold deadline is the end of the shutdown's conduit drain step, which has the same time limit as the hub's own conduit drain (12s when `server.hub.conduit.shutdown_grace` is unset), or, if earlier, 1s before the hub's HTTP drain must end (with `shutdown_grace: 10s`, 5s after SIGTERM). The drain deadline sent to the relays ends at least 1s before the hold deadline, and a drain only ever shortens a session. Failed calls are counted in `scion.hub.conduit.ingress_drain_failed` and never extend the step. A client whose session is closed reconnects through another hub.
+- **Host binding.** The relay tells the hub how a dial arrived. A dial that came through a hub must name one of the hub's public hosts. A dial made directly to a relay must name that relay's public host. Any other combination is refused with `403`.
+- **Retries.** The hub tries another relay only when the first refused the dial before admission: a connection failure before any answer, a relay that was not the one the leg was signed for, or a relay that is draining or not ready (`503` with reason `relay_not_admitting`). Every other answer reaches the client unchanged. When no relay is left, the dial gets `503` with reason `conduit_not_serving`.
+
+Proxy ingress needs HMAC relay-peer authentication (`server.hub.conduit.peer_auth: hmac`), because on the proxied dial `Authorization` belongs to the client. Under any other resolved peer-auth mode (an explicit `oidc`, or the default `auto`, which resolves to `oidc` on GCP), the hub still starts, but its ingress proxy stays off. Conduit dials then get `503` with reason `conduit_not_serving` and no request reaches a relay. The hub logs a warning once at startup with the cause `ingress_requires_hmac`, and the readiness gauge `scion.hub.conduit.eligible_relays` carries the attribute `cause`. The HTTP readiness endpoint is not affected. To serve dials, set `peer_auth: hmac`. `redirect` is not supported yet; the hub refuses to start with it.
+
 ## Running a relay
+
+**Upgrade order.** Relays never migrate the database; hubs do. Upgrade the hubs before the relays. A relay that starts before the hubs have migrated the schema (for example, the `relay_instances.features` column) fails startup with an error that says so, for example "relay_instances.features missing: upgrade the hubs first". A failed startup does not displace what is serving: on Cloud Run the old revision keeps serving, and a Kubernetes rollout stalls on readiness.
 
 A relay reads its own configuration file, never the hub's. It needs:
 
@@ -46,5 +61,15 @@ scion server start --role relay --config /etc/scion-relay
 The relay refuses to start while `hub.conduit` is off. If the setting cannot be read, it retries for up to a minute and then fails. While it runs, it re-reads the experiment every 15 seconds and on every settings change. Turning the experiment off stops admission and drains the open sessions, but the process keeps running. Turning it back on resumes admission.
 
 At startup the relay logs the configuration files it loaded and its database driver, never the connection string.
+
+### Cloud Run singleton relay (not HA)
+
+Cloud Run instances cannot be addressed one by one, so a relay on Cloud Run runs as a single instance. It is a distinct availability profile, not HA: a restart drops every session, and clients reconnect but their streams do not resume.
+
+- Set `server.relay.singleton: true` and run the service with `max_instances=1`, `min_instances=1` and `cpu_idle=false`. On Cloud Run (`K_SERVICE` set) the relay refuses to start without the setting. Elsewhere the setting is allowed and labels the relay non-HA.
+- The relay lists the feature `singleton` in its `relay_instances` row and logs that it serves as a non-HA singleton.
+- At startup it listens first, then retries its self-check for up to 60 seconds, because during a rollout the service URL still reaches the old instance. It registers once it answers itself; if the minute runs out, startup fails.
+- The relay exports its metrics like a hub, from its own settings: with `server.hub.observability.metrics_enabled` unset, a set export project (`server.hub.gcp_project_id`) turns export on, and only an explicit `false` keeps it off.
+- It never refuses to register because another row has the same internal endpoint. On every heartbeat (15s) it counts the other live, non-draining relays sharing that endpoint and reports the count in the gauge `scion.relay.singleton_endpoint_peers`, with a warning when it goes from 0 to more. A crash-restart overlap clears within about 75 seconds. A count that stays above 0 means two instances are running: alert on it. Hub calls that reach the other instance get `409 relay_target_mismatch` and re-resolve, so an overlap costs availability, never misrouting.
 
 See [Relay Settings](/scion/reference/server-config/#relay-settings-serverrelay) for every setting.

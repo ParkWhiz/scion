@@ -18,6 +18,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -134,7 +135,7 @@ func TestResourceEqual_NilVsEmptyStillNormalizes(t *testing.T) {
 //   - The Launch* bookkeeping fields (LaunchAsyncOptIn, LaunchID,
 //     LaunchState, LaunchEndReason, LaunchKind, LaunchDeadline,
 //     LaunchLastReportAt, LaunchOwner, LaunchSeq, LaunchStep, LaunchError,
-//     LaunchCause):
+//     LaunchCause, LaunchPriorPhase, LaunchRevokeOnFail, LaunchResumePhase):
 //     per agent_store.go's own doc comment, "UpdateAgent never sets any of
 //     these from the caller's struct: they are absent from its Ent builder
 //     chain entirely" -- only BeginLaunch/MarkLaunchAccepted/EndLaunch/
@@ -175,6 +176,7 @@ var reflectFillStoreAgentSkipFields = map[string]bool{
 	"LaunchEndReason": true, "LaunchKind": true, "LaunchDeadline": true,
 	"LaunchLastReportAt": true, "LaunchOwner": true, "LaunchSeq": true,
 	"LaunchStep": true, "LaunchError": true, "LaunchCause": true,
+	"LaunchPriorPhase": true, "LaunchRevokeOnFail": true, "LaunchResumePhase": true,
 	"Launch": true,
 	// Deletion marker columns are written only through UpdateAgentDeletion
 	// (never by CreateAgent/UpdateAgent), and Deletion is computed.
@@ -244,6 +246,12 @@ func reflectFillStoreAgent(t *testing.T, projectID string) *store.Agent {
 		"MessageMode": func(f reflect.Value) { f.SetString("project") },
 		"AppliedConfig": func(f reflect.Value) {
 			f.Set(reflect.ValueOf(&store.AgentAppliedConfig{Image: "reflect-image", Task: "reflect-task"}))
+		},
+		"PendingConfig": func(f reflect.Value) {
+			f.Set(reflect.ValueOf(&store.AgentPendingConfig{
+				Config:  map[string]json.RawMessage{"model": json.RawMessage(`"reflect-model"`)},
+				SavedBy: "user:reflect",
+			}))
 		},
 		"ExposedPorts": func(f reflect.Value) {
 			f.Set(reflect.ValueOf([]store.ExposedPort{{

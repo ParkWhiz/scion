@@ -568,6 +568,9 @@ func (s *Server) handleConvListMessages(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
+	// Catch-up of deferred messages (ptone/scion#4596, D15).
+	s.noteDeferredAttachments(ctx, result.Items)
+
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -1079,10 +1082,25 @@ func (s *Server) handleAddParticipant(w http.ResponseWriter, r *http.Request, id
 			return
 		}
 
+		if agent == nil {
+			writeError(w, http.StatusNotFound, "not_found", "agent not found", nil)
+			return
+		}
+
 		// An agent of another project gets the same answer as an
-		// unknown agent; the reason is logged.
+		// unknown agent; the reason is logged. This runs before the
+		// soft-deleted check, so the reason is logged for a soft-deleted
+		// agent of another project too.
 		if conv.ProjectID != nil && agent.ProjectID != *conv.ProjectID {
 			logReferenceRefused(ctx, logging.RequestPath(r), "agent belongs to another project than the conversation", identity)
+			writeError(w, http.StatusNotFound, "not_found", "agent not found", nil)
+			return
+		}
+
+		// A soft-deleted agent is refused as an unknown agent, as group
+		// create and the default-agent path refuse it
+		// (validateDefaultAgent, handleSetDefaultAgent).
+		if !agent.DeletedAt.IsZero() {
 			writeError(w, http.StatusNotFound, "not_found", "agent not found", nil)
 			return
 		}
@@ -1185,17 +1203,35 @@ func (s *Server) handleLeaveConversation(w http.ResponseWriter, r *http.Request,
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// authorizeTokenConversationRead is the token rule for reading one
-// conversation, applied after the checks every caller passes: a direct
-// conversation needs inbox:read for the peer agent's project (a hub
+// authorizeTokenConversationRead applies the token rule for reading one
+// conversation (tokenMayReadConversation) after the checks every caller
+// passes, and writes 403 (or the store error) on refusal.
+func (s *Server) authorizeTokenConversationRead(w http.ResponseWriter, r *http.Request, token *ScopedUserIdentity, conv *store.Conversation) bool {
+	ok, err := s.tokenMayReadConversation(r.Context(), token, s.newSelfScopeCheck(r.Context(), token, permInboxRead), conv)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return false
+	}
+	if !ok {
+		writeTokenConversationRefusal(w, r, token, permInboxRead)
+		return false
+	}
+	return true
+}
+
+// tokenMayReadConversation is the token rule for reading one conversation,
+// shared by the conversation read routes and the attachment download: a
+// direct conversation needs inbox:read for the peer agent's project (a hub
 // boundary for a direct conversation between users) and agent:read on the
 // peer agent; a group with no project needs inbox:read on a hub boundary.
-// A project group needs only the project:read check it already passed.
-func (s *Server) authorizeTokenConversationRead(w http.ResponseWriter, r *http.Request, token *ScopedUserIdentity, conv *store.Conversation) bool {
+// A project group needs only the project:read check every caller passes.
+// check must be the inbox:read self-scope check of token. A store error is
+// returned.
+func (s *Server) tokenMayReadConversation(ctx context.Context, token *ScopedUserIdentity, check *selfScopeCheck, conv *store.Conversation) (bool, error) {
 	if conv.Kind != "direct" && conv.ProjectID != nil && *conv.ProjectID != "" {
-		return true
+		return true, nil
 	}
-	return s.authorizeTokenConversation(w, r, token, permInboxRead, conv)
+	return s.tokenMayUseConversation(ctx, token, check, conv)
 }
 
 // isConversationParticipant checks whether a principal is an active participant

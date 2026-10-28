@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -72,6 +73,12 @@ const (
 	// ActionManageVisitors covers granting, changing and revoking project
 	// visitor access for federated accounts (project.manage_visitors).
 	ActionManageVisitors Action = "manage_visitors"
+	// ActionChatPost covers posting messages into a project's chat
+	// threads (project.chat_post).
+	ActionChatPost Action = "chat_post"
+	// ActionAdmin covers access constraint administration
+	// (access_constraint.admin).
+	ActionAdmin Action = "admin"
 
 	// Global-catalog write actions — see design doc §3.1.
 	// These distinguish hub-catalog mutation from project-scoped CRUD,
@@ -342,6 +349,14 @@ type Decision struct {
 	// flag. Authorization-neutral: it never changes Allowed or Reason.
 	AlwaysAudit bool `json:"-"`
 
+	// parentProof is the parent authority a resource parent ceiling
+	// checked at step 10 (authz_resource_parent_ceiling.go), set on allow
+	// and on deny as far as known, and nil when the permission has no
+	// parent ceiling. Unexported and untagged: a caller in this package
+	// reads it to compose a check that depends on the recorded source (the
+	// GCP token mint's actAs check). It never changes Allowed.
+	parentProof *ParentProof
+
 	// DenyCause classifies certain deny decisions structurally, so callers
 	// can react to *why* access was denied without parsing or matching
 	// substrings of Reason (which is prose, for logs and explain, and is
@@ -523,6 +538,15 @@ type AuthzService struct {
 	// is cached; a false result is re-queried on every call so that the
 	// latch catches up as soon as the backfill completes.
 	backfillDone atomic.Bool
+
+	// legacyFallbackUses counts uses of the legacy adopted-agent fallback
+	// for owner user secrets (user_secret_legacy_adopted_fallback.go);
+	// legacyFallbackMetrics, when set, exports them; legacyFallbackWarn
+	// rate limits their Warn line, created on first use.
+	legacyFallbackUses     atomic.Int64
+	legacyFallbackMetrics  legacyAdoptedFallbackMetrics
+	legacyFallbackWarn     *hookRefusalLimiter
+	legacyFallbackWarnOnce sync.Once
 
 	// relationshipResolver handles progeny relationship grants. Lazily
 	// initialized on first use.
@@ -788,6 +812,26 @@ func (a *AuthzService) decide(ctx context.Context, request AuthzRequest) Decisio
 			return decorateDecision(d, request, principal, credential, auditPermissionID(request))
 		}
 		permissionID = resolved
+	}
+
+	// ── Account-status gate ──────────────────────────────────────────
+	// A user principal whose account is not active holds no authority from
+	// any binding or relationship. Evaluated before every credential gate
+	// and grant stage so that condition yields one reason
+	// (authz_principal_status.go).
+	if reason, cause := a.principalStatusGate(ctx, principal, credential, permissionID); reason != "" {
+		d := Decision{Allowed: false, Reason: reason, DenyCause: cause}
+		if request.Explain {
+			d.Provenance = &DecisionProvenance{
+				Permission:      permissionID,
+				DenyReasons:     []string{reason},
+				Grants:          []GrantDetail{},
+				InactiveGrants:  []GrantDetail{},
+				Restrictions:    []RestrictionProvenance{},
+				MembershipPaths: []MembershipPathDetail{},
+			}
+		}
+		return decorateDecision(d, request, principal, credential, auditPermissionID(request))
 	}
 
 	// ── Step 0: Delivery credential gate (ptone/scion#2228) ───────────
@@ -1072,6 +1116,24 @@ func (a *AuthzService) decide(ctx context.Context, request AuthzRequest) Decisio
 		}
 	}
 
+	// ── Step 5b4: Offline test-infra delegation grant (ptone/scion#4240,
+	// phase DL) ─────────────────────────────────────────────────────────
+	// A workload request through an offline delegation acts for a reserved
+	// grantor id that has no bindings. offlineDelegationBinding adds a
+	// request-local hub-scope grant of exactly test_identity.issue, only
+	// when the request's workload delegation state says the offline gate
+	// passed for this request and every id agrees (see its doc comment).
+	// The bearer gate (Step 1) and the frozen ceiling still apply. It
+	// shares no state with the agent synthetic bindings above. The
+	// account-status gate admits this principal's missing users row only
+	// for the same request (offlineGrantorStatusExempt).
+	if principal.Kind == PrincipalKindUser {
+		if cb, role := offlineDelegationBinding(ctx, principal, credential, permissionID); cb != nil {
+			candidates = append(candidates, *cb)
+			roleDefs[role.RoleID] = role
+		}
+	}
+
 	// ── Step 5c/5d/5e: Hub-wide catalog scope containment (ptone/scion#1901,
 	// #1916) ───────────────────────────────────────────────────────────
 	// The curated hub-member/hub-viewer roles carry skill/template/
@@ -1223,7 +1285,24 @@ func (a *AuthzService) decide(ctx context.Context, request AuthzRequest) Decisio
 	// the grant source (kernel or relationship grant). The ceiling
 	// evaluates the exact permission resolved above. A failed lookup
 	// denies.
-	if decision.Allowed && isAgentPrincipal(principal.Kind) {
+	//
+	// A permission with a reviewed resource parent ceiling
+	// (ResourceParentCeilingFor) takes that ceiling in place of the chain
+	// check: the recorded source must live-hold the parent permission on
+	// the exact resource, within the recorded effect ceiling. The chain
+	// check would ask whether each delegator holds the decision permission
+	// itself, which no delegator does by design. The chain states the chain
+	// check denies from what was recorded (an unrecorded or sentinel hop,
+	// local development provenance this server does not admit, a missing
+	// edge after the backfill or above the agent) still deny such a
+	// permission first (parentCeilingChainDeny). The parent ceiling is the
+	// only proof for such a permission, so an agent-kind principal whose
+	// identity is not an AgentIdentity denies here instead of passing
+	// unchecked.
+	if m, ok := ResourceParentCeilingFor(permissionID); ok && decision.Allowed && isAgentPrincipal(principal.Kind) {
+		agent, _ := principal.Identity.(AgentIdentity)
+		decision = a.applyResourceParentCeiling(maskAuthzInputs(ctx), m, agent, request.Resource, decision)
+	} else if decision.Allowed && isAgentPrincipal(principal.Kind) {
 		if agent, ok := principal.Identity.(AgentIdentity); ok {
 			if getDelegationCeilingCache(ctx) == nil {
 				ctx = contextWithDelegationCeilingCache(ctx)
@@ -1251,7 +1330,17 @@ func (a *AuthzService) decide(ctx context.Context, request AuthzRequest) Decisio
 			// already run with both memo keys masked) and any future caller
 			// get the same guarantee without relying on this call site.
 			var hopNote unrecordedHopNote
-			ceilingAllowed, ceilingReason, ceilingErr := a.checkDelegationCeiling(maskAuthzInputs(ctx), ceilingReq, permissionID, agent.ID(), nil, &ceilingCause, &hopNote)
+			// For a hub_delivery principal with Explain, the admission
+			// walk's per-hop and provenance-root steps are recorded in
+			// ExplainTrace (ptone/scion#2228 part 2b). Every other
+			// principal is unchanged: no explain steps are collected.
+			var ceilingExplain *[]DecisionStep
+			var ceilingTrace []DecisionStep
+			if _, hd := principal.Identity.(*hubDeliveryIdentity); hd && request.Explain {
+				ceilingExplain = &ceilingTrace
+			}
+			ceilingAllowed, ceilingReason, ceilingErr := a.checkDelegationCeiling(maskAuthzInputs(ctx), ceilingReq, permissionID, agent.ID(), ceilingExplain, &ceilingCause, &hopNote)
+			decision.ExplainTrace = append(decision.ExplainTrace, ceilingTrace...)
 			if ceilingErr != nil {
 				decision.Allowed = false
 				decision.Reason = "delegation ceiling check failed (fail-closed): " + ceilingErr.Error()
@@ -1982,8 +2071,22 @@ func (a *AuthzService) accessConstraintRestrictions(
 	if err != nil {
 		return nil, err
 	}
+	return restrictionsFromConstraints(constraints, closure, resource), nil
+}
+
+// restrictionsFromConstraints is accessConstraintRestrictions after its load:
+// it converts the loaded constraints, keeps those that apply to closure in
+// the scope resource.ProjectID selects (the system scope when it is empty),
+// and returns them as kernel restrictions. It does no I/O, so a caller that
+// evaluates many resources in one request can load the table once and call
+// this per resource.
+func restrictionsFromConstraints(
+	constraints []*store.AccessConstraint,
+	closure map[string]struct{},
+	resource ResourceContext,
+) []Restriction {
 	if len(constraints) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	// Convert store constraints to hub AccessConstraint and filter.
@@ -2042,7 +2145,7 @@ func (a *AuthzService) accessConstraintRestrictions(
 		ri++
 	}
 
-	return restrictions, nil
+	return restrictions
 }
 
 // loadAllAccessConstraints loads all access constraints by paging through

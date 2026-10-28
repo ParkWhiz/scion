@@ -76,6 +76,15 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	query := r.URL.Query()
 
+	// A user access token lists users only with user.list at the hub
+	// collection, and then sees only the users it may read: each row is
+	// checked as a hub-level user record, so the token also needs
+	// user.read.
+	_, isToken := GetIdentityFromContext(ctx).(*ScopedUserIdentity)
+	if isToken && !s.authorizeWithEvidence(w, r, Resource{Type: "user"}, ActionList, hubCollectionEvidence("user.list")) {
+		return
+	}
+
 	filter := store.UserFilter{
 		Role:   query.Get("role"),
 		Status: query.Get("status"),
@@ -98,6 +107,9 @@ func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
 		resources := make([]Resource, len(result.Items))
 		for i := range result.Items {
 			resources[i] = userResource(&result.Items[i])
+			if isToken {
+				resources[i] = hubScopedResource("user", result.Items[i].ID)
+			}
 		}
 		caps := s.authzService.ComputeCapabilitiesBatch(ctx, identity, resources, "user")
 		for i := range result.Items {
@@ -136,13 +148,29 @@ func (s *Server) handleUserByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sub-resource actions
-	if action == "revoke-sessions" {
+	// Sub-resource actions. Only the bare ID and the sub-routes named here
+	// are resources; any other sub-path, including a further segment below
+	// a known sub-route, answers 404 and never reaches the user handlers
+	// below.
+	switch action {
+	case "":
+		// The user itself: handled by the method switch below.
+	case "revoke-sessions":
 		if r.Method != http.MethodPost {
 			MethodNotAllowed(w, http.MethodPost)
 			return
 		}
 		s.revokeUserSessions(w, r, id)
+		return
+	case "delete-blockers":
+		if r.Method != http.MethodGet {
+			MethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		s.getUserDeleteBlockers(w, r, id)
+		return
+	default:
+		NotFound(w, "User resource")
 		return
 	}
 
@@ -224,9 +252,11 @@ func stripPreferencesForViewer(ctx context.Context, u *store.User, cap *Capabili
 // Credential boundary enforcement (R4-C5)
 //
 // User mutation endpoints (PATCH, DELETE) require an interactive session JWT
-// or dev credential. Broker, agent, UAT, and federation credentials are
-// rejected at the boundary by requireSessionCredentialFor
-// (session_only_gate.go), which reports the session-only reason.
+// or dev credential, except that PATCH admits a user access token for the
+// fields updateUserTokenFields allows. Broker, agent and federation
+// credentials, and a token on DELETE, are rejected at the boundary by
+// requireSessionCredentialFor (session_only_gate.go), which reports the
+// session-only reason.
 // ---------------------------------------------------------------------------
 
 // allowedMutationCredentials is the closed set of credential kinds permitted
@@ -247,6 +277,117 @@ func updateUserSessionOnlyReason(ctx context.Context, id string) authzop.Session
 	return authzop.ReasonGovernancePending
 }
 
+// updateUserCredential checks the credential of PATCH /api/v1/users/{id}
+// and returns the acting user (sessionOrUserTokenCredential, with the
+// path's session-only reason). A user access token is returned as token
+// too; updateUserTokenFields checks its fields, and the caller checks its
+// permissions on the hub-level user record.
+func (s *Server) updateUserCredential(w http.ResponseWriter, ctx context.Context, id string) (actor UserIdentity, token *ScopedUserIdentity, ok bool) {
+	return s.sessionOrUserTokenCredential(w, ctx, updateUserSessionOnlyReason(ctx, id))
+}
+
+// sessionOrUserTokenCredential admits an interactive session or dev
+// credential of a user (requireSessionCredentialFor), or a user access
+// token: a token identity whose request carries the user access token
+// credential kind. It returns the acting user, and for a token the token
+// identity too, so the caller can check the token's selectors and
+// boundary. A token identity with any other credential kind, and every
+// other credential kind, is refused with the session-only reason.
+func (s *Server) sessionOrUserTokenCredential(w http.ResponseWriter, ctx context.Context, reason authzop.SessionOnlyReason) (actor UserIdentity, token *ScopedUserIdentity, ok bool) {
+	identity := GetIdentityFromContext(ctx)
+	scoped, isToken := identity.(*ScopedUserIdentity)
+	if !isToken || isNilIdentity(identity) {
+		actor, ok = s.requireSessionCredentialFor(w, ctx, reason)
+		return actor, nil, ok
+	}
+	if s.authzService == nil {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"authorization service unavailable", nil)
+		return nil, nil, false
+	}
+	if kind := requestCredentialKind(ctx, identity); kind != CredentialKindUAT {
+		writeSessionOnlyDenial(w, ErrCodeForbidden,
+			fmt.Sprintf("this operation requires an interactive session; credential kind %q is not allowed", kind),
+			reason)
+		return nil, nil, false
+	}
+	return scoped, scoped, true
+}
+
+// userCrossProfileDenialMessage is the refusal message of a PATCH of
+// another user's profile without user.update.
+const userCrossProfileDenialMessage = "requires user.update permission to modify another user's profile"
+
+// userPatchTokenRefusalMessage is the refusal message of a PATCH of
+// another user by a token that may use neither user.update nor
+// user.suspend on that user.
+const userPatchTokenRefusalMessage = "requires user.update or user.suspend permission to modify another user"
+
+// tokenMayUpdateUser reports whether the token identity actor may use
+// user.update or user.suspend on the hub-level record of user id. Each
+// permission is one authorization decision (Decide, which audits a deny),
+// evaluated on the token identity, so the holder's current authority and
+// the token's selectors and boundary all apply. The decision uses only the
+// path id: it reads no user record and no request body, so its outcome is
+// the same whether or not user id exists.
+func (s *Server) tokenMayUpdateUser(ctx context.Context, actor UserIdentity, id string) bool {
+	target := hubScopedResource("user", id)
+	for _, p := range []struct {
+		action     Action
+		permission string
+	}{
+		{Action("update"), "user.update"},
+		{Action("suspend"), "user.suspend"},
+	} {
+		decision := s.authzService.Decide(ctx, AuthzRequest{
+			Principal:  principalContextForIdentity(actor),
+			Credential: credentialContextForIdentity(actor),
+			Resource:   target,
+			Action:     p.action,
+			Permission: p.permission,
+		})
+		if decision.Allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// writeUserPatchTokenRefusal writes the refusal of PATCH
+// /api/v1/users/{id} for a token that may use neither user.update nor
+// user.suspend on another user's id. Its status, code, message and
+// details are the same for every such token and every id.
+func writeUserPatchTokenRefusal(w http.ResponseWriter) {
+	writeForbiddenStructured(w, userPatchTokenRefusalMessage, "user", Action("update"))
+}
+
+// updateUserTokenFields applies the field rules of PATCH
+// /api/v1/users/{id} for a user access token, before any permission check
+// or write. It writes the refusal and returns false when:
+//   - the body names role: a role change is session-only (GOV_PENDING);
+//   - the path names the token holder's own record and the body names a
+//     profile field, or no status field: the caller's own profile is
+//     session-only (INTERACTIVE_STATE).
+//
+// A status field on the holder's own record passes here and is refused by
+// the self-status guard after its user.suspend check.
+func updateUserTokenFields(w http.ResponseWriter, updates userPatchPayload, prefsPatch *userPreferencesPatch, isSelf bool) bool {
+	if updates.Role != nil {
+		writeSessionOnlyDenial(w, ErrCodeForbidden,
+			"changing a user's role requires an interactive session",
+			authzop.ReasonGovernancePending)
+		return false
+	}
+	profile := updates.DisplayName != nil || prefsPatch != nil || updates.Status == nil
+	if isSelf && profile {
+		writeSessionOnlyDenial(w, ErrCodeForbidden,
+			"changing your own profile requires an interactive session",
+			authzop.ReasonInteractiveState)
+		return false
+	}
+	return true
+}
+
 // ---------------------------------------------------------------------------
 // PATCH /api/v1/users/{id} — per-field permission enforcement (R3/R4)
 //
@@ -254,6 +395,15 @@ func updateUserSessionOnlyReason(ctx context.Context, id string) authzop.Session
 //   - role:                 user.promote + CanDelegate(super-admin)
 //   - status:               user.suspend
 //   - displayName/prefs:    user.update (self-service for own record)
+//
+// A user access token is checked on the hub-level user record
+// (hubScopedResource): status needs user:suspend, another user's profile
+// needs user:update, and a token PATCH that names no status field is
+// checked as a profile update. A token PATCH that names role, or that
+// changes its holder's own profile, is refused (updateUserTokenFields). A
+// token PATCH of another user by a token that may use neither user:update
+// nor user:suspend gets one refusal for every id
+// (writeUserPatchTokenRefusal).
 //
 // A mixed PATCH must hold ALL required permissions before any write.
 // Unknown JSON fields are rejected. ALL mutations (bindings + User record +
@@ -318,8 +468,15 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
 
 	// Credential boundary + identity check (R4-C5).
-	actor, ok := s.requireSessionCredentialFor(w, ctx, updateUserSessionOnlyReason(ctx, id))
+	actor, token, ok := s.updateUserCredential(w, ctx, id)
 	if !ok {
+		return
+	}
+	// A token on another user's id needs user.update or user.suspend on
+	// that user before the record is read; otherwise it gets one fixed
+	// refusal for every id and body.
+	if token != nil && actor.ID() != id && !s.tokenMayUpdateUser(ctx, actor, id) {
+		writeUserPatchTokenRefusal(w)
 		return
 	}
 
@@ -443,6 +600,14 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 		}
 	}
 
+	isSelf := actor.ID() == user.ID
+
+	// Token field rules run before the field values are validated, so a
+	// token's role field is refused whatever its value.
+	if token != nil && !updateUserTokenFields(w, updates, prefsPatch, isSelf) {
+		return
+	}
+
 	// Validate role field eagerly — reject unsupported values even if the
 	// role matches the current value.
 	if updates.Role != nil {
@@ -482,8 +647,19 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 	needsSuspend := updates.Status != nil
 	needsUpdate := updates.DisplayName != nil || prefsPatch != nil
 
-	isSelf := actor.ID() == user.ID
 	needsCrossUserUpdate := needsUpdate && !isSelf
+	// A token PATCH of another user that names no status field is checked
+	// as a profile update, so it needs user:update even with no field set.
+	if token != nil && !isSelf && !needsSuspend {
+		needsCrossUserUpdate = true
+	}
+
+	// The record the field permissions are checked on: a token's selectors
+	// name the hub-level user record; a session keeps the user record.
+	userTarget := Resource{Type: "user", ID: user.ID}
+	if token != nil {
+		userTarget = hubScopedResource("user", user.ID)
+	}
 
 	// Pre-resolve super-admin role definition and canonical binding state
 	// before authorization. Canonical state comes from bindings, not User.Role,
@@ -522,7 +698,7 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 		decision := s.authzService.Decide(ctx, AuthzRequest{
 			Principal:  principalContextForIdentity(actor),
 			Credential: credentialContextForIdentity(actor),
-			Resource:   Resource{Type: "user", ID: user.ID},
+			Resource:   userTarget,
 			Action:     Action("suspend"),
 			Permission: "user.suspend",
 		})
@@ -541,12 +717,12 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 		decision := s.authzService.Decide(ctx, AuthzRequest{
 			Principal:  principalContextForIdentity(actor),
 			Credential: credentialContextForIdentity(actor),
-			Resource:   Resource{Type: "user", ID: user.ID},
+			Resource:   userTarget,
 			Action:     Action("update"),
 			Permission: "user.update",
 		})
 		if !decision.Allowed {
-			writeForbiddenStructured(w, "requires user.update permission to modify another user's profile", "user", Action("update"))
+			writeForbiddenStructured(w, userCrossProfileDenialMessage, "user", Action("update"))
 			return
 		}
 	}
@@ -581,7 +757,11 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 	// Build actor audit metadata outside the transaction.
 	auditActor := s.buildAuditActorFromContext(ctx)
 
+	// suspended is set when the transaction changes the status to
+	// suspended.
+	suspended := false
 	err = s.store.WithTx(ctx, func(tx store.Store) error {
+		suspended = false
 		// Re-read user inside the transaction for consistency.
 		txUser, err := tx.GetUser(ctx, id)
 		if err != nil {
@@ -682,6 +862,7 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 		}
 
 		if needsSuspend && beforeStatus != txUser.Status {
+			suspended = txUser.Status == store.UserStatusSuspended
 			mutationType := "user_suspend"
 			if txUser.Status == "active" {
 				mutationType = "user_reactivate"
@@ -723,10 +904,26 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 	if needsPromote || needsSuspend {
 		s.publishConduitAuthzChanged(conduitAuthzMatch{UserID: user.ID})
 	}
+	// A suspended issuer's agent delegation grants end, best effort:
+	// exchange and use already deny them (.design/agent-delegation.md
+	// §16.3).
+	if suspended {
+		s.revokeAgentDelegationGrantsBestEffort(ctx, store.AgentDelegationGrantFilter{IssuerUserID: user.ID}, revokeReasonIssuerSuspended)
+	}
 
 	// This response applies the same per-viewer preferences visibility rule
 	// as GET (stripPreferencesForViewer; used by getUser and listUsers).
-	cap := s.authzService.ComputeCapabilities(ctx, actor, userResource(user))
+	// A token's capabilities are computed on the hub-scoped user record;
+	// other callers' on the user record. The token branch builds the shape
+	// hubScopedResource builds, written as a literal so the resource-type
+	// guard resolves its type.
+	var cap *Capabilities
+	if token != nil {
+		cap = s.authzService.ComputeCapabilities(ctx, actor,
+			Resource{Type: "user", ID: user.ID, ParentType: "system"})
+	} else {
+		cap = s.authzService.ComputeCapabilities(ctx, actor, userResource(user))
+	}
 	stripPreferencesForViewer(ctx, user, cap)
 
 	writeJSON(w, http.StatusOK, user)
@@ -1134,9 +1331,10 @@ func (s *Server) checkLastSuperAdminTx(
 // Guards: self-deletion and last-active-super-admin are prevented based on
 // bindings (not User.Role). All operations — last-admin check, skill cleanup,
 // user deletion, and audit — execute in a single atomic transaction (R4-C2).
-// A user who still owns agents is refused with 409 (ptone/scion#2769). The
-// user's user-scope secrets and env vars are removed after commit, best
-// effort.
+// A user whom agents or active delegations depend on is refused with
+// 409 user_delete_blocked (ptone/scion#2769, ptone/scion#2143); GET
+// /api/v1/users/{id}/delete-blockers lists the same blockers. The user's
+// user-scope secrets and env vars are removed after commit, best effort.
 // ---------------------------------------------------------------------------
 
 func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request, id string) {
@@ -1240,14 +1438,57 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request, id string) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/users/{id}/delete-blockers — what blocks a user deletion
+//
+// Authorization: the same as DELETE /api/v1/users/{id} (session credential,
+// then user.delete on the user). It returns the lists a plain delete would
+// refuse with (listUserDeleteBlockers): {agents, edges, truncated}, each
+// list capped. It reads outside a transaction, takes no lock and writes
+// nothing, so a delete can find a blocker added after the listing.
+// ---------------------------------------------------------------------------
+
+func (s *Server) getUserDeleteBlockers(w http.ResponseWriter, r *http.Request, id string) {
+	ctx := r.Context()
+
+	actor, ok := s.requireSessionCredentialFor(w, ctx, authzop.ReasonGovernancePending)
+	if !ok {
+		return
+	}
+	decision := s.authzService.Decide(ctx, AuthzRequest{
+		Principal:  principalContextForIdentity(actor),
+		Credential: credentialContextForIdentity(actor),
+		Resource:   Resource{Type: "user", ID: id},
+		Action:     Action("delete"),
+		Permission: "user.delete",
+	})
+	if !decision.Allowed {
+		writeForbiddenStructured(w, "requires user.delete permission", "user", Action("delete"))
+		return
+	}
+
+	user, err := s.store.GetUser(ctx, id)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+	blockers, err := listUserDeleteBlockers(ctx, s.store, user.ID)
+	if err != nil {
+		slog.ErrorContext(ctx, "list user delete blockers failed", "user_id", user.ID, "error", err)
+		InternalError(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, blockers)
+}
+
 // deleteUserRowCascadeTx deletes the user row of userID and what hangs off
 // it, inside the caller's transaction. It is the part of a user deletion
 // shared by DELETE /api/v1/users/{id} and DELETE
 // /api/v1/test-identities/{id}. In order it:
 //
-//   - refuses while the user owns agents (checkUserOwnsNoAgentsTx; returns
-//     *userOwnsAgentsDeleteError, and store.ErrNotFound when the user no
-//     longer exists);
+//   - refuses while agents or active delegations depend on the user
+//     (checkUserDeleteBlockersTx; returns *userDeleteBlockedError, and
+//     store.ErrNotFound when the user does not exist);
 //   - runs the last-project-owner guard and the role-binding cascade
 //     (guardAndCascadeUserRoleBindingsTx);
 //   - deletes the user-scope skill injections and the group memberships;
@@ -1258,8 +1499,9 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request, id string) {
 // errors with writeUserDeleteCascadeError, and calls afterUserDeleted once
 // the transaction commits.
 func deleteUserRowCascadeTx(ctx context.Context, tx store.Store, userID string, now time.Time) error {
-	// Refuse while the user owns agents (ptone/scion#2769).
-	if err := checkUserOwnsNoAgentsTx(ctx, tx, userID); err != nil {
+	// Refuse while agents or active delegations depend on the user
+	// (ptone/scion#2769, ptone/scion#2143).
+	if err := checkUserDeleteBlockersTx(ctx, tx, userID); err != nil {
 		return err
 	}
 
@@ -1292,6 +1534,14 @@ func deleteUserRowCascadeTx(ctx context.Context, tx store.Store, userID string, 
 		return fmt.Errorf("delete group memberships: %w", err)
 	}
 
+	// Deactivate every edge with the user as the delegator that is active
+	// when the sweep runs: after the check passed, only edges that do not
+	// block, or one reactivated after the check read but before the sweep
+	// (deactivateUserDelegatorEdgesTx).
+	if err := deactivateUserDelegatorEdgesTx(ctx, tx, userID); err != nil {
+		return err
+	}
+
 	// Delete the user record.
 	if err := tx.DeleteUser(ctx, userID); err != nil {
 		return fmt.Errorf("delete user: %w", err)
@@ -1305,12 +1555,12 @@ func deleteUserRowCascadeTx(ctx context.Context, tx store.Store, userID string, 
 // any other error, which the caller answers itself.
 func writeUserDeleteCascadeError(w http.ResponseWriter, err error) bool {
 	var lastOwnerErr *lastProjectOwnerDeleteError
-	var ownsAgentsErr *userOwnsAgentsDeleteError
+	var blockedErr *userDeleteBlockedError
 	switch {
 	case errors.As(err, &lastOwnerErr):
 		writeLastProjectOwnerDeleteError(w, lastOwnerErr)
-	case errors.As(err, &ownsAgentsErr):
-		writeUserOwnsAgentsDeleteError(w, ownsAgentsErr)
+	case errors.As(err, &blockedErr):
+		writeUserDeleteBlockedError(w, blockedErr)
 	case errors.Is(err, errUserRoleBindingsChanged):
 		writeUserRoleBindingsChangedError(w)
 	default:
@@ -1321,11 +1571,16 @@ func writeUserDeleteCascadeError(w http.ResponseWriter, err error) bool {
 
 // afterUserDeleted runs once a user deletion has committed: it tells
 // conduit subscribers the user's authorization changed, then removes the
-// user's user-scope secrets and env vars as a best effort
-// (ptone/scion#2769). Failures are logged, not returned.
+// user's user-scope secrets and env vars and revokes the agent delegation
+// grants the user issued, as a best effort (ptone/scion#2769). Failures are
+// logged, not returned.
 func (s *Server) afterUserDeleted(ctx context.Context, userID string) {
 	s.publishConduitAuthzChanged(conduitAuthzMatch{UserID: userID})
 	s.removeUserScopedData(ctx, userID)
+	// The deleted issuer's agent delegation grants end, best effort: a
+	// grant never blocks the delete, and exchange and use deny a missing
+	// issuer (.design/agent-delegation.md §16.3).
+	s.revokeAgentDelegationGrantsBestEffort(ctx, store.AgentDelegationGrantFilter{IssuerUserID: userID}, revokeReasonIssuerDeleted)
 }
 
 // lastOwnerProjectRef identifies a project that deleting a user would leave

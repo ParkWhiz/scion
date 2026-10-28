@@ -39,6 +39,7 @@ import {
   type TerminalDisconnectReason,
 } from '../../client/terminal-sessions.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { getPublicSettings, invalidatePublicSettings } from '../../client/server-feature-flags.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import type { TerminalAgentMetadata } from '../../client/terminal-metadata.js';
 import '../shared/status-badge.js';
@@ -202,7 +203,7 @@ export class ScionTerminalPane extends LitElement {
   @state() private uploadEnabled = false;
   @state() private uploadDisabledReason = '';
   @state() private uploadTargetDir = ''; // shared dir name (e.g. "scratchpad")
-  @state() private uploadBasePath = ''; // container path (e.g. "/scion-volumes/scratchpad")
+  @state() private uploadBasePath = ''; // container path of the target dir, from the hub (SharedDir.target)
   @state() private isDragOver = false;
   @state() private isUploading = false;
   @state() private uploadStatus = ''; // progress/error message in overlay
@@ -1466,13 +1467,14 @@ export class ScionTerminalPane extends LitElement {
       }
       const data = (await resp.json()) as { sharedDirs?: SharedDir[] };
       const dirs = data.sharedDirs ?? [];
-      // Filter: writable, non-in_workspace
-      const candidates = dirs.filter((d) => !d.read_only && !d.in_workspace);
+      // Filter: writable, non-in_workspace, with a container path from the
+      // hub (the layout authority computes it; the UI never builds one).
+      const candidates = dirs.filter((d) => !d.read_only && !d.in_workspace && !!d.target);
       const target = candidates.find((d) => d.name === 'scratchpad') || candidates[0];
-      if (target) {
+      if (target && target.target) {
         this.uploadEnabled = true;
         this.uploadTargetDir = target.name;
-        this.uploadBasePath = `/scion-volumes/${target.name}`;
+        this.uploadBasePath = target.target;
       } else {
         this.uploadEnabled = false;
         this.uploadDisabledReason = 'No writable shared directory available for file upload';
@@ -1809,20 +1811,20 @@ export class ScionTerminalPane extends LitElement {
    * terminal is open takes effect the next time the dialog opens — this is
    * also how the "retry after a rejection" flow picks up a since-changed
    * policy. Fails open (today's dialog, unrestricted) if the fetch fails.
+   *
+   * The fresh read goes through the shared per-page cache
+   * (ptone/scion#5311): dropping it first forces the request, and its result
+   * then refreshes the copy the create and configure pages read.
    */
   private async openCaptureAuthScopeDialog(): Promise<void> {
     this.captureAuthScopeDialogOpen = true;
     this.captureAuthSettingsLoading = true;
     const requestSeq = ++this.captureAuthSettingsRequestSeq;
     let agentSecretsUserScopeOnly = false;
-    try {
-      const response = await fetch('/api/v1/settings/public', { credentials: 'include' });
-      if (response.ok) {
-        const data = (await response.json()) as { agentSecretsUserScopeOnly?: boolean };
-        agentSecretsUserScopeOnly = data.agentSecretsUserScopeOnly ?? false;
-      }
-    } catch (err) {
-      console.error('Failed to fetch public settings for capture auth dialog:', err);
+    invalidatePublicSettings();
+    const settings = await getPublicSettings();
+    if (settings) {
+      agentSecretsUserScopeOnly = settings.agentSecretsUserScopeOnly ?? false;
     }
     // A newer open has since started its own fetch; let that one own the
     // final state instead of overwriting it with this stale result.

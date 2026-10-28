@@ -361,13 +361,8 @@ func TestMintConduitGrant_ViaTunnelRequiresTunnelAction(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, err := f.srv.mintConduitGrant(ctx, conduitGrantRequest{
-				Identity: tc.ident, Agent: f.agent, Stream: grant.StreamHeader{Kind: grant.StreamKindLogs}, Target: f.target(), ViaTunnel: true,
+				Identity: tc.ident, Agent: f.agent, Stream: tcpHeader("3000"), Target: f.target(), Via: grant.ViaTunnel,
 			})
-			if tc.ident == Identity(f.portOnly) {
-				// Logs needs agent.read, which the port-only token lacks.
-				assert.ErrorIs(t, err, errConduitForbidden)
-				return
-			}
 			if tc.want == nil {
 				assert.NoError(t, err)
 			} else {
@@ -375,11 +370,12 @@ func TestMintConduitGrant_ViaTunnelRequiresTunnelAction(t *testing.T) {
 			}
 		})
 	}
-	// Tunnel path for tcp works with the port-only token.
+	// The tunnel origin does not carry logs (design §3.5 origin table):
+	// the request is invalid, whoever asks.
 	_, _, err := f.srv.mintConduitGrant(ctx, conduitGrantRequest{
-		Identity: f.portOnly, Agent: f.agent, Stream: tcpHeader("3000"), Target: f.target(), ViaTunnel: true,
+		Identity: f.owner, Agent: f.agent, Stream: grant.StreamHeader{Kind: grant.StreamKindLogs}, Target: f.target(), Via: grant.ViaTunnel,
 	})
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, errConduitInvalid)
 }
 
 func TestMintConduitGrant_AgentCaller(t *testing.T) {
@@ -479,7 +475,7 @@ func TestMintConduitGrant_AgentReadAndPortSkipKernel(t *testing.T) {
 
 func newTestDBGrantKeyStore(t *testing.T, s store.SecretStore) *dbConduitGrantKeyStore {
 	t.Helper()
-	db, err := newDBConduitGrantKeyStore(s, testGrantEncryptionKey)
+	db, err := newDBConduitGrantKeyStore(s, testGrantCipher)
 	require.NoError(t, err)
 	return db
 }
@@ -529,7 +525,7 @@ func TestConduitGrantKeys_BootstrapKeyIsRandom(t *testing.T) {
 	var seeds [][]byte
 	for range 2 {
 		_, s := testServer(t) // separate databases, same shared secret
-		db, err := newDBConduitGrantKeyStore(s, secret.DeriveLocalEncryptionKey(sharedSecret))
+		db, err := newDBConduitGrantKeyStore(s, secret.NewLegacyValueCipher(sharedSecret))
 		require.NoError(t, err)
 		k := newConduitGrantKeys(db, clock.Now)
 		_, err = k.signer(context.Background())
@@ -552,7 +548,7 @@ func TestConduitGrantKeySet_EphemeralWithoutEncryption(t *testing.T) {
 	require.Error(t, err, "persistence requires an encryption key")
 
 	srv, s := testServer(t)
-	srv.encryptionKey = nil
+	srv.cipher = secret.NewLegacyValueCipher("")
 	setConduitExperiment(t, srv, true)
 	restart := func() {
 		srv.conduitGrantsOnce = sync.Once{}
@@ -580,7 +576,7 @@ func TestConduitGrantKeySet_EphemeralWithoutEncryption(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound, "nothing is written to the secret store")
 
 	// With encryption configured the ring is persisted.
-	srv.encryptionKey = testGrantEncryptionKey
+	srv.cipher = testGrantCipher
 	restart()
 	_, err = srv.ConduitGrantPublicKeys(ctx)
 	require.NoError(t, err)
@@ -604,7 +600,7 @@ func TestConduitGrantKeySet_EphemeralLogs(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, _ := testServer(t)
-			srv.encryptionKey = nil
+			srv.cipher = secret.NewLegacyValueCipher("")
 			srv.config.RequireStableSigningKey = tc.stableKeys
 			srv.conduitGrantsOnce = sync.Once{}
 			srv.conduitGrants = nil
@@ -643,7 +639,7 @@ func TestConduitGrantKeys_UnreadableRingFailsClosedAndLogs(t *testing.T) {
 	_, err := writer.signer(ctx)
 	require.NoError(t, err)
 
-	other, err := newDBConduitGrantKeyStore(s, secret.DeriveLocalEncryptionKey("a-different-secret"))
+	other, err := newDBConduitGrantKeyStore(s, secret.NewLegacyValueCipher("a-different-secret"))
 	require.NoError(t, err)
 	node := newConduitGrantKeys(other, clock.Now)
 	buf := captureSlogDefault(t)

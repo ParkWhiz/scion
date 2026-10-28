@@ -37,6 +37,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,6 +58,7 @@ const (
 func tiaGateServerConfig() ServerConfig {
 	cfg := testServerConfig()
 	cfg.HubID = tiaHubID
+	cfg.HubIDPinned = true
 	cfg.EnableTestIdentities = true
 	cfg.Workstation = false
 	cfg.WebSessionKeySource = signingKeySourceGenerated
@@ -115,7 +117,7 @@ func TestTestAdminGate_NewCapturesImmutableGate(t *testing.T) {
 	// The phase-W status route reads the same gate (unauthenticated).
 	rec := doRequestNoAuth(t, srv, http.MethodGet, "/api/v1/test-infra/status", nil)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, `{"testIdentities":true,"testHubAdmin":true,"testSuperAdmin":false,"testIdentityWebSessions":false,"testIdentityWebSessionsUnavailableReason":"web_session_key_unavailable","testIssuerAudience":""}`, strings.TrimSpace(rec.Body.String()))
+	assert.Equal(t, `{"testIdentities":true,"testHubAdmin":true,"testSuperAdmin":false,"testIdentityWebSessions":false,"testIdentityWebSessionsUnavailableReason":"web_session_key_unavailable","testAdminWebSessions":false,"testIssuerAudience":""}`, strings.TrimSpace(rec.Body.String()))
 }
 
 // Admin tier A2: with a complete test-admin policy classification, New
@@ -133,7 +135,7 @@ func TestTestAdminGate_NewAdmitsSuperAdminWithCompletePolicy(t *testing.T) {
 	assert.True(t, srv.testAdminTierEnabled(testAdminKindSuperAdmin))
 	rec := doRequestNoAuth(t, srv, http.MethodGet, "/api/v1/test-infra/status", nil)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, `{"testIdentities":true,"testHubAdmin":true,"testSuperAdmin":true,"testIdentityWebSessions":false,"testIdentityWebSessionsUnavailableReason":"web_session_key_unavailable","testIssuerAudience":""}`, strings.TrimSpace(rec.Body.String()))
+	assert.Equal(t, `{"testIdentities":true,"testHubAdmin":true,"testSuperAdmin":true,"testIdentityWebSessions":false,"testIdentityWebSessionsUnavailableReason":"web_session_key_unavailable","testAdminWebSessions":false,"testIssuerAudience":""}`, strings.TrimSpace(rec.Body.String()))
 	require.NoError(t, srv.emitTestAdminGateStart())
 	assert.Contains(t, buf.String(), "hub-admin and super-admin authority")
 	assert.Contains(t, buf.String(), `"test_super_admin"`)
@@ -223,7 +225,7 @@ func TestSigningKeySource_EveryClassHubLocalAfterNew(t *testing.T) {
 		src := srv.signingKeySource(c.KeyName)
 		assert.True(t, signingKeySourceIsHubLocal(src), "%s source %q", c.Class, src)
 	}
-	for _, want := range []string{"user_jwt", "agent_token", "oidc", "download_url", "artifact_view_url", "list_cursor", "conduit_grant", "web_session"} {
+	for _, want := range []string{"user_jwt", "agent_token", "oidc", "download_url", "artifact_view_url", "attachment_delivery", "list_cursor", "conduit_grant", "web_session"} {
 		assert.True(t, got[want], "class %s is checked", want)
 	}
 	assert.Len(t, testAdminSigningKeyClasses(false), len(classes)-1, "OIDC is checked only when enabled")
@@ -234,7 +236,7 @@ func TestSigningKeySource_SharedAndPreconfiguredLabels(t *testing.T) {
 	cfg.SharedSigningSecret = "synthetic-test-secret"
 	srv, _, err := tiaNewServer(t, cfg)
 	require.NoError(t, err)
-	for _, k := range []string{SecretKeyUserSigningKey, SecretKeyAgentSigningKey, SecretKeyDownloadSigningKey, SecretKeyArtifactViewKey, SecretKeyListCursorKey} {
+	for _, k := range []string{SecretKeyUserSigningKey, SecretKeyAgentSigningKey, SecretKeyDownloadSigningKey, SecretKeyArtifactViewKey, SecretKeyAttachmentDeliveryKey, SecretKeyListCursorKey} {
 		assert.Equal(t, signingKeySourceSharedSecret, srv.signingKeySource(k), k)
 	}
 	assert.Equal(t, signingKeySourceUnresolved, srv.signingKeySource(SecretKeyOIDCSigningKey), "OIDC off: unresolved")
@@ -254,7 +256,7 @@ func TestSigningKeySource_SharedAndPreconfiguredLabels(t *testing.T) {
 // exists, else memory-only.
 func TestSigningKeySource_ConduitGrantRing(t *testing.T) {
 	assert.Equal(t, signingKeySourceEphemeral, conduitGrantKeySource(nil))
-	assert.Equal(t, signingKeySourceSharedScope, conduitGrantKeySource(bytes.Repeat([]byte{3}, 32)))
+	assert.Equal(t, signingKeySourceSharedScope, conduitGrantKeySource(secret.NewLegacyValueCipher("fake-test-shared-secret")))
 
 	tiaCaptureAudit(t)
 	srv, _, err := tiaNewServer(t, tiaGateServerConfig())
@@ -340,12 +342,8 @@ func TestTestAdminGate_NoExportedMutator(t *testing.T) {
 	// In production code the gate field is assigned exactly once, in New.
 	assignments := 0
 	fset := token.NewFileSet()
-	// pkgmove:scan-covers pkg/hub/apierr
+	// pkgmove:scan-covers guardScanSubdirs
 	// scanned through guardScanSubdirs; guards testAdminGate assignments.
-	// pkgmove:scan-covers pkg/hub/internal/principal
-	// scanned through guardScanSubdirs; guards testAdminGate assignments.
-	// pkgmove:scan-covers pkg/hub/maintenance
-	// scanned through guardScanSubdirs once it exists; guards testAdminGate assignments.
 	files, err := globGuardScanDirs(".", "*.go")
 	require.NoError(t, err)
 	for _, path := range files {
@@ -398,11 +396,15 @@ func TestTestInfraMarker_NoRouteOrHubCodeTouchesIt(t *testing.T) {
 	}
 	// The enforcing half: no production file in pkg/hub (any subpackage) or
 	// pkg/store references the marker's ent entity or the pkg/testinfra
-	// writer, so no handler can reach it. The hub never reads it either: cmd
-	// reads it once at startup and passes the result in ServerConfig.
+	// writers (Mark, Unmark, Delegate), so no handler can reach them. The
+	// one exception is the read-only binding read of the offline delegation
+	// redeem gate (phase DL), pinned below: it may name the entity, and
+	// nothing else may.
+	const bindingReader = "../store/entadapter/test_infra_binding_read.go"
+	sawBindingReader := false
 	for _, dir := range []string{".", "../store"} {
-		// pkgmove:scan-covers pkg/hub/maintenance
-		// recursive walk of "." already includes pkg/hub/maintenance (no SkipDir).
+		// pkgmove:scan-covers pkg/hub/...
+		// recursive walk of pkg/hub (".", no SkipDir; ../store is walked on its own): covers every directory below it.
 		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -415,6 +417,21 @@ func TestTestInfraMarker_NoRouteOrHubCodeTouchesIt(t *testing.T) {
 				return err
 			}
 			src := string(data)
+			// The offline-delegation writer's enum value never appears in
+			// hub or store production code: only pkg/testinfra writes an
+			// offline delegation.
+			assert.False(t, strings.Contains(src, "GrantorKindTestInfraOffline"), "%s references the offline grantor kind enum (only pkg/testinfra writes it)", path)
+			if filepath.ToSlash(path) == bindingReader {
+				sawBindingReader = true
+				// Read-only, and never the web session key or attested
+				// facts (DL advisor condition (b)).
+				for _, banned := range []string{"pkg/testinfra", "WebSessionKey", "Attested", "Create()", "Update()", "UpdateOne", "Delete()", "DeleteOne", "Exec("} {
+					assert.False(t, strings.Contains(src, banned), "%s must stay a read-only binding read; it references %s", path, banned)
+				}
+				assert.Contains(t, src, "Select(testinframarker.FieldHubID, testinframarker.FieldClass, testinframarker.FieldCreatedAt)",
+					"%s selects exactly the hub id, class and creation time", path)
+				return nil
+			}
 			for _, banned := range []string{"TestInfraMarker", "testinframarker", "pkg/testinfra"} {
 				assert.False(t, strings.Contains(src, banned), "%s references %s", path, banned)
 			}
@@ -422,6 +439,7 @@ func TestTestInfraMarker_NoRouteOrHubCodeTouchesIt(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}
+	assert.True(t, sawBindingReader, "the binding reader %s exists and was scanned", bindingReader)
 }
 
 // --- G4 / G8: settings write paths -------------------------------------------
@@ -827,13 +845,14 @@ func TestVerifyTestAdminFederationOff(t *testing.T) {
 
 // tiaSecretKeyClasses classifies every SecretKey* constant in pkg/hub.
 var tiaSecretKeyClasses = map[string]string{
-	"SecretKeyUserSigningKey":     "user_jwt",
-	"SecretKeyAgentSigningKey":    "agent_token",
-	"SecretKeyDownloadSigningKey": "download_url",
-	"SecretKeyArtifactViewKey":    "artifact_view_url",
-	"SecretKeyListCursorKey":      "list_cursor",
-	"SecretKeyOIDCSigningKey":     "oidc",
-	"SecretKeyOIDCKeyset":         "oidc", // the same manager's persisted keyset
+	"SecretKeyUserSigningKey":        "user_jwt",
+	"SecretKeyAgentSigningKey":       "agent_token",
+	"SecretKeyDownloadSigningKey":    "download_url",
+	"SecretKeyArtifactViewKey":       "artifact_view_url",
+	"SecretKeyAttachmentDeliveryKey": "attachment_delivery",
+	"SecretKeyListCursorKey":         "list_cursor",
+	"SecretKeyOIDCSigningKey":        "oidc",
+	"SecretKeyOIDCKeyset":            "oidc", // the same manager's persisted keyset
 }
 
 // tiaKeyMaterialPrimitives are calls that create, load or use signing,
@@ -857,6 +876,9 @@ var tiaKeyMaterialPrimitives = map[string]bool{
 	"github.com/gorilla/sessions.NewCookieStore":                        true,
 	"github.com/gorilla/securecookie.New":                               true,
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/grant.NewRingKey": true,
+	// keyring.CookieCodecs builds the web session cookie codecs (securecookie
+	// keys derived per keyring generation) outside pkg/hub (ptone/scion#1530).
+	"github.com/GoogleCloudPlatform/scion/pkg/keyring.CookieCodecs": true,
 }
 
 // tiaDefaultImportNames are the package names of the primitive import
@@ -869,6 +891,7 @@ var tiaDefaultImportNames = map[string]string{
 	"github.com/gorilla/sessions":                            "sessions",
 	"github.com/gorilla/securecookie":                        "securecookie",
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/grant": "grant",
+	"github.com/GoogleCloudPlatform/scion/pkg/keyring":       "keyring",
 }
 
 // tiaKeyMaterialSites maps "path:function:importpath.Func" (path relative
@@ -878,17 +901,22 @@ var tiaDefaultImportNames = map[string]string{
 var tiaKeyMaterialSites = map[string]string{
 	"agenttoken.go:NewAgentTokenService:github.com/go-jose/go-jose/v4.NewSigner":                    "agent_token",
 	"usertoken.go:NewUserTokenService:github.com/go-jose/go-jose/v4.NewSigner":                      "user_jwt",
+	"agenttoken.go:newRingAgentTokenService:github.com/go-jose/go-jose/v4.NewSigner":                "agent_token",
+	"usertoken.go:newRingUserTokenService:github.com/go-jose/go-jose/v4.NewSigner":                  "user_jwt",
 	"oidckeys.go:NewOIDCKeyManager:github.com/go-jose/go-jose/v4.NewSigner":                         "oidc",
 	"oidckeys.go:RotateKey:github.com/go-jose/go-jose/v4.NewSigner":                                 "oidc",
 	"oidckeys.go:refreshKeysFromDB:github.com/go-jose/go-jose/v4.NewSigner":                         "oidc",
 	"oidckeys.go:generateRSAKeyPair:crypto/rsa.GenerateKey":                                         "oidc",
 	"oidckeys.go:decodePEMPrivateKey:crypto/x509.ParsePKCS8PrivateKey":                              "oidc",
 	"download_signing.go:computeSkillFileHMAC:crypto/hmac.New":                                      "download_url",
-	"authorized_list.go:newListCursorSealer:crypto/aes.NewCipher":                                   "list_cursor",
-	"authorized_list.go:newListCursorSealer:crypto/cipher.NewGCM":                                   "list_cursor",
+	"download_signing.go:computeSkillFileHMACv2:crypto/hmac.New":                                    "download_url",
+	"attachment_delivery.go:deliveryMACv2:crypto/hmac.New":                                          "attachment_delivery",
+	"attachment_delivery.go:deliveryMAC:crypto/hmac.New":                                            "attachment_delivery",
+	"authorized_list.go:listCursorAEAD:crypto/aes.NewCipher":                                        "list_cursor",
+	"authorized_list.go:listCursorAEAD:crypto/cipher.NewGCM":                                        "list_cursor",
 	"conduit_grants.go:bootstrap:github.com/GoogleCloudPlatform/scion/pkg/conduit/grant.NewRingKey": "conduit_grant",
 	"conduit_grants.go:rotate:github.com/GoogleCloudPlatform/scion/pkg/conduit/grant.NewRingKey":    "conduit_grant",
-	"web.go:NewWebServer:github.com/gorilla/sessions.NewCookieStore":                                "web_session",
+	"web.go:NewWebServer:github.com/GoogleCloudPlatform/scion/pkg/keyring.CookieCodecs":             "web_session",
 	"handlers_test_identity_web.go:newTestIdentityWebState:github.com/gorilla/securecookie.New":     "exempt: test identity web session marker key, hub-local by construction (generated at test-infra mark, stored with the DB marker, never derived from any shared secret; DEC-8)",
 	"brokerauth.go:computeHMAC:crypto/hmac.New":                                                     "exempt: per-broker HMAC secret, generated per broker; authenticates a broker to this hub, never a user",
 	"access_constraint_preview.go:issueToken:crypto/hmac.New":                                       "exempt: preview token key, random per process and memory-only",
@@ -922,8 +950,8 @@ func TestSigningKeySource_EveryKeySourceClassified(t *testing.T) {
 	fset := token.NewFileSet()
 	seenConst := map[string]bool{}
 	seenSite := map[string]bool{}
-	// pkgmove:scan-covers pkg/hub/maintenance
-	// recursive walk already includes pkg/hub/maintenance (no SkipDir for it).
+	// pkgmove:scan-covers pkg/hub/...
+	// recursive walk of pkg/hub (".", no SkipDir): covers every directory below it.
 	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -1024,8 +1052,8 @@ func TestSigningKeySource_EveryKeySourceClassified(t *testing.T) {
 // definition names it.
 func TestRegisterInProcessPluginBroker_CalledOnlyFromCmd(t *testing.T) {
 	fset := token.NewFileSet()
-	// pkgmove:scan-covers pkg/hub/maintenance
-	// recursive walk already includes pkg/hub/maintenance (no SkipDir for it).
+	// pkgmove:scan-covers pkg/hub/...
+	// recursive walk of pkg/hub (".", no SkipDir): covers every directory below it.
 	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err

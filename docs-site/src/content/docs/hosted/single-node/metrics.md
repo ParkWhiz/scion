@@ -16,26 +16,26 @@ Scion provides built-in telemetry collection via `sciontool`, which runs as the 
 
 ## Configuration
 
-Telemetry is configured through `settings.yaml` (for global and project-level defaults) and `scion-agent.yaml` (for per-agent overrides; a template's `telemetry` block is ignored with a warning). Environment variables provide the highest-priority override.
+Telemetry is configured through `settings.yaml` (for global and project-level defaults) and the Hub's telemetry configuration. It is part of the agent's environment, not its job, so a template's `telemetry:` block is ignored with a warning. An agent's own inline config can only turn telemetry on or off. Environment variables provide the highest-priority override for `sciontool` inside the container.
 
 ### Configuration Hierarchy
 
-Telemetry settings resolve across scopes using **last-write-wins** semantics:
+Settings files resolve across scopes using **last-write-wins** semantics:
 
 1.  **Global settings** (`~/.scion/settings.yaml`) — Organization-wide defaults.
 2.  **Project settings** (`.scion/settings.yaml`) — Project-level overrides.
-3.  **Hub default telemetry** (for Hub-dispatched agents) — The Hub's agent defaults.
-4.  **Agent config** (`scion-agent.yaml` in agent home) — Per-agent overrides.
-5.  **Environment variables** (`SCION_TELEMETRY_*`, `SCION_OTEL_*`) — Highest priority.
+3.  **Environment variables** (`SCION_TELEMETRY_*`, `SCION_OTEL_*`) — Highest priority.
 
 At each scope, only the fields you specify are overridden; unset fields inherit from the previous scope.
 
+For a Hub-dispatched agent, whether telemetry is on resolves, lowest to highest: the Runtime Broker's settings, the Hub telemetry configuration, the requester's on/off (`--enable-telemetry` / `--disable-telemetry`), then the project's telemetry policy, which beats `SCION_TELEMETRY_ENABLED` as well. Broker settings telemetry is applied at each start and is not stored in the agent's `scion-agent.json`. See the [telemetry ladder](/scion/reference/settings-precedence/#the-telemetry-ladder).
+
 ### Settings File Configuration
 
-The `telemetry` block can appear in any `settings.yaml` (global or project) or an agent's `scion-agent.yaml`:
+The `telemetry` block can appear in any `settings.yaml` (global or project):
 
 ```yaml
-# In settings.yaml or scion-agent.yaml
+# In settings.yaml
 telemetry:
   enabled: true
 
@@ -44,6 +44,8 @@ telemetry:
     # Required when exporting to Google Cloud. The metrics dashboard queries
     # Cloud Monitoring for this project, so without it the export has no
     # destination and the dashboard stays empty with no error shown.
+    # Read at startup. See "Which GCP project the Hub uses" in the server
+    # configuration reference for the dashboard's fallbacks.
     gcp_project_id: "my-gcp-project"
     endpoint: "monitoring.googleapis.com:443"
     protocol: grpc
@@ -201,7 +203,7 @@ When an agent starts, the broker:
 
 Scion includes a native OTel metrics pipeline that captures operational data from agent sessions. This data is recorded as counters and histograms, providing a time-series view of agent performance. 
 
-To enable harness-aware telemetry, Scion injects the `SCION_HARNESS` environment variable into every agent container, and `SCION_MODEL` when the agent's configuration names a model. When a usage source reports no model of its own and `SCION_MODEL` is unset, the `model` label on `gen_ai.api.calls`, `gen_ai.api.duration` and `scion.usage.tokens` is `unknown`.
+To enable harness-aware telemetry, Scion injects the `SCION_HARNESS` environment variable into every agent container, and `SCION_MODEL` when the agent's configuration names a model. `SCION_HARNESS` names the harness the start launched (after a harness-config switch, the new one), and it selects which native usage-parsing rules apply. It sets the `harness` label on `gen_ai.api.calls` and `scion.usage.tokens` (one shared label set, described under the canonical point labels below) and the `harness` field of the `agent.usage` and `telemetry.health` events. When the plain Generic implementation runs, its value is `generic`: no usage rule exists for it, so native usage for that agent stays unknown rather than being parsed with another harness's rules, and with the native usage source `telemetry.health` reports usage collection `disabled` with the reason `no_harness_rule`. An explicit `SCION_HARNESS` in the start request's env or in the settings `harness_configs.<name>.env` still wins (see [settings precedence](/scion/reference/settings-precedence/)). When a usage source reports no model of its own and `SCION_MODEL` is unset, the `model` label on `gen_ai.api.calls`, `gen_ai.api.duration` and `scion.usage.tokens` is `unknown`.
 
 ### Enriched Resource Attributes
 
@@ -224,7 +226,7 @@ In addition to the resource attributes above, every exported metric **point** ca
 - `scion_project_id`
 - `scion_agent_slug` — a display-friendly form of `scion_agent_id`, 1:1 with it, and read straight off the series (no Hub database lookup, so it survives agent deletion)
 
-These are the labels the Hub dashboard filters and groups on (`metric.labels.scion_project_id` for the project view, `metric.labels.scion_agent_id` for agent grouping). A producer that sets one of these three keys itself is rejected. They are distinct from the pre-existing, non-canonical point labels `agent_id` and `project_id` that some hook metrics also carry for historical, descriptor-compatibility reasons; the dashboard does not read those.
+These are the labels the Hub dashboard filters and groups on (`metric.labels.scion_project_id` for the project view, `metric.labels.scion_agent_id` for agent grouping). A producer that sets one of these three keys itself is rejected. They are distinct from the pre-existing, non-canonical point labels `agent_id` and `project_id` that some hook metrics (tool calls and durations) still carry for historical, descriptor-compatibility reasons; the dashboard does not read those. The usage metrics `gen_ai.api.calls` and `scion.usage.tokens` do not carry them: `gen_ai.api.calls` dropped them so both usage metrics share one label set. Filter calls and tokens on `scion_agent_id` and `scion_project_id`; a query or alert on `gen_ai.api.calls` that filters on the unprefixed `agent_id` or `project_id` matches only series written before that change.
 
 ### Native Event Name Normalization
 
@@ -346,7 +348,7 @@ For every significant lifecycle event (session start/end, tool use, model call),
 
 The Scion Hub maintains internal operational metrics for infrastructure monitoring. These are available via the `/api/v1/admin/metrics` endpoint (requires `hub-admin` role) and can be exported to standard monitoring tools.
 
-When Hub metrics export is on ([`server.hub.observability.metrics_enabled`](/scion/reference/server-config/#observability-export-serverhubobservability), or, when that switch is unset, `server.hub.gcp_project_id`), the Hub also exports its database pool, dispatch, notification and launch reaper metrics to Cloud Monitoring. To chart them per Hub instance, import the ready-made [Hub Monitoring Dashboard](/scion/hosted/single-node/hub-monitoring-dashboard/).
+When Hub metrics export is on ([`server.hub.observability.metrics_enabled`](/scion/reference/server-config/#observability-export-serverhubobservability), or, when that switch is unset, `server.hub.gcp_project_id`, set in `settings.yaml` or with `SCION_SERVER_HUB_GCPPROJECTID` and read at startup), the Hub also exports its database pool, dispatch, notification, launch reaper and events stream metrics to Cloud Monitoring. To chart them per Hub instance, import the ready-made [Hub Monitoring Dashboard](/scion/hosted/single-node/hub-monitoring-dashboard/).
 
 ### GCP Token Metrics
 
@@ -372,7 +374,7 @@ Monitors the security and connectivity of Runtime Brokers:
 
 ## Privacy Filtering
 
-By default, sciontool excludes `agent.user.prompt` events to protect user privacy. Filtering is configured via the `telemetry.filter` block in `settings.yaml` or `scion-agent.yaml`, or via environment variables.
+By default, sciontool excludes `agent.user.prompt` events to protect user privacy. Filtering is configured via the `telemetry.filter` block in `settings.yaml`, or via environment variables.
 
 ### Via Settings File
 
@@ -441,6 +443,8 @@ Harness hook events are automatically converted to OTLP spans:
 | `prompt-submit` | `agent.user.prompt` | prompt |
 | `model-start` | `gen_ai.api.request` | model (only when the hook payload names one) |
 | `model-end` | `gen_ai.api.response` | success, model (only when the hook payload names one) |
+
+Each hook event in the table, and the turn, notification, response-complete and container lifecycle (`agent.lifecycle.pre_start`, `agent.lifecycle.post_start`, `agent.lifecycle.pre_stop`) events, is also emitted as a correlated OpenTelemetry log record whose `event.name` is the span name. When the GCP exporter is configured, `sciontool` also writes normalized `agent.usage` events, delivered durably and deduplicated, and periodic `telemetry.health` snapshots of its usage-source selection and delivery diagnostics to the dedicated `scion-analytics` Cloud Logging log. Both carry the launched harness (`SCION_HARNESS`, see [Native Metrics Pipeline](#native-metrics-pipeline)) in their `harness` field, or `unknown` when it is unset.
 
 ### Session Metrics (Gemini)
 

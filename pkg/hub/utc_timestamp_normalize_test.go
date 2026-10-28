@@ -150,7 +150,7 @@ func runNormalize(t *testing.T, db *sql.DB, opts entadapter.TimestampNormalizeOp
 // canonical form, tables that were unreadable become readable, and a second
 // run changes nothing.
 func TestUTCTimestampNormalize_RewritesBothFamilies(t *testing.T) {
-	wcs, s, db := newEntWebChatStore(t)
+	wcs, s, db := hubNewEntWebChatStore(t)
 	ctx := context.Background()
 	proj := normProject(t, s, "norm-families")
 
@@ -218,7 +218,7 @@ func TestUTCTimestampNormalize_RewritesBothFamilies(t *testing.T) {
 // ptone/scion#2473 shape: a fire_at stored from a time with a nameless
 // FixedZone makes ListScheduledEvents fail until the operation runs.
 func TestUTCTimestampNormalize_ScheduledEventFixedZone(t *testing.T) {
-	_, s, db := newEntWebChatStore(t)
+	_, s, db := hubNewEntWebChatStore(t)
 	ctx := context.Background()
 	proj := normProject(t, s, "norm-sched")
 
@@ -248,7 +248,7 @@ func TestUTCTimestampNormalize_ScheduledEventFixedZone(t *testing.T) {
 // same day (including sub-second neighbours) page, search, threshold and
 // list in instant order with no repeats or gaps.
 func TestUTCTimestampNormalize_OrderingOverMigratedAndNewRows(t *testing.T) {
-	wcs, s, db := newEntWebChatStore(t)
+	wcs, s, db := hubNewEntWebChatStore(t)
 	ctx := context.Background()
 	proj := normProject(t, s, "norm-order")
 
@@ -399,7 +399,7 @@ func TestUTCTimestampNormalize_OrderingOverMigratedAndNewRows(t *testing.T) {
 // value no layout parses is reported by table, column and rowid only, and is
 // not changed.
 func TestUTCTimestampNormalize_UnparseableLeftAloneAndNotLogged(t *testing.T) {
-	wcs, s, db := newEntWebChatStore(t)
+	wcs, s, db := hubNewEntWebChatStore(t)
 	ctx := context.Background()
 	proj := normProject(t, s, "norm-bad")
 
@@ -428,7 +428,7 @@ func TestUTCTimestampNormalize_UnparseableLeftAloneAndNotLogged(t *testing.T) {
 // result as one uninterrupted run.
 func TestUTCTimestampNormalize_ResumesAfterInterruption(t *testing.T) {
 	seed := func(t *testing.T) *sql.DB {
-		wcs, s, db := newEntWebChatStore(t)
+		wcs, s, db := hubNewEntWebChatStore(t)
 		ctx := context.Background()
 		proj := normProject(t, s, "norm-resume")
 		for i, c := range legacyEntCases() {
@@ -484,63 +484,6 @@ func (c *cancelOnWrite) Write(p []byte) (int, error) {
 		c.cancel()
 	}
 	return len(p), nil
-}
-
-// TestUTCTimestampNormalize_StartupCheck covers the hub-start probe: it is
-// silent on a canonical store, reports a named-zone row and a numeric-zone
-// row by table, and is silent again after the operation runs.
-func TestUTCTimestampNormalize_StartupCheck(t *testing.T) {
-	cases := []struct {
-		name       string
-		text       string
-		unreadable bool
-	}{
-		{"named-zone", "2026-10-01 13:00:00 +0900 JST", false},
-		{"named-zone-monotonic", "2026-10-01 05:00:00 -0700 PDT m=+0.5", false},
-		{"utc-monotonic", "2026-10-01 04:00:00 +0000 UTC m=+0.5", false},
-		{"numeric-zone", "2026-10-01 09:45:00 +0545 +0545", true},
-		{"nameless-fixed-zone", "2026-10-01 06:00:00 +0200 +0200 m=+1.5", true},
-		{"rfc3339", "2026-10-01T13:00:00+09:00", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			_, s, db := newEntWebChatStore(t)
-			ctx := context.Background()
-			srv := &Server{store: s}
-			proj := normProject(t, s, "norm-startup")
-			id := tid("norm-startup-msg")
-			require.NoError(t, s.CreateMessage(ctx, &store.Message{
-				ID: id, ProjectID: proj.ID, Sender: "user:alice", Recipient: "agent:bot",
-				Msg: "x", Channel: "web", CreatedAt: normBase.Add(123456 * time.Microsecond),
-			}))
-
-			logs := captureSlog(t)
-			srv.checkStoredTimestamps(ctx)
-			assert.NotContains(t, logs.String(), entadapter.UTCTimestampNormalizeKey, "canonical store must not warn")
-
-			execOne(t, db, "UPDATE messages SET created = ? WHERE id = ?", c.text, id)
-			logs.Reset()
-			srv.checkStoredTimestamps(ctx)
-			out := logs.String()
-			assert.Contains(t, out, "level=ERROR")
-			assert.Contains(t, out, entadapter.UTCTimestampNormalizeKey)
-			assert.Contains(t, out, "messages")
-			assert.Equal(t, 1, strings.Count(out, "level=ERROR"), "exactly one error line")
-			assert.Contains(t, out, "repaired automatically at hub start")
-			if c.unreadable {
-				assert.Contains(t, out, "tables_unreadable=[messages]")
-			} else {
-				assert.Contains(t, out, "tables_unreadable=[]")
-			}
-			assert.NotContains(t, out, "level=WARN")
-			assert.NotContains(t, out, c.text, "a stored value reached the log")
-
-			runNormalize(t, db, entadapter.TimestampNormalizeOptions{})
-			logs.Reset()
-			srv.checkStoredTimestamps(ctx)
-			assert.Empty(t, logs.String(), "the check must be silent after the run")
-		})
-	}
 }
 
 // TestUTCTimestampNormalize_ExecutorWiring checks the seed, the executor
@@ -607,25 +550,21 @@ func TestUTCTimestampNormalize_ExecutorWiring(t *testing.T) {
 		Msg: "y", Channel: "web", CreatedAt: normBase,
 	}))
 	execOne(t, db, "UPDATE messages SET created = ? WHERE id = ?", "2026-10-01 13:00:01 +0900 JST m=+0.5", id2)
-	logs := captureSlog(t)
-	srv.checkStoredTimestamps(ctx)
-	assert.Contains(t, logs.String(), "level=ERROR")
 
 	got = run(`{}`)
 	assert.Equal(t, store.MaintenanceStatusCompleted, got.Status, got.Result)
 	assert.Contains(t, got.Result, "rewrote 1 values")
 	assert.Equal(t, "2026-10-01 04:00:01 +0000 UTC", rawText(t, db, "SELECT CAST(created AS TEXT) FROM messages WHERE id = ?", id2))
-	logs.Reset()
+	logs := captureSlog(t)
 	srv.checkStoredTimestamps(ctx)
 	assert.Empty(t, logs.String())
 }
 
 // TestUTCTimestampNormalize_StartupCheckUnparseableOnly checks that when the
 // only non-canonical values left are unparseable, the check points at the
-// run log instead of asking for another run, and that a parseable leftover
-// still asks for a run.
+// run log and starts no run.
 func TestUTCTimestampNormalize_StartupCheckUnparseableOnly(t *testing.T) {
-	_, s, db := newEntWebChatStore(t)
+	_, s, db := hubNewEntWebChatStore(t)
 	ctx := context.Background()
 	srv := &Server{store: s}
 	proj := normProject(t, s, "norm-startup-bad")
@@ -669,15 +608,6 @@ func TestUTCTimestampNormalize_StartupCheckUnparseableOnly(t *testing.T) {
 	assert.Contains(t, out, "run log")
 	assert.Contains(t, out, "tables_unreadable=[messages]")
 	assert.NotContains(t, out, "2026-02-30")
-
-	// A parseable leftover in the same table means the operation has work.
-	mk("jst", "2026-10-01 13:00:00 +0900 JST")
-	logs.Reset()
-	srv.checkStoredTimestamps(ctx)
-	out = logs.String()
-	assert.Equal(t, 1, strings.Count(out, "level=ERROR"))
-	assert.NotContains(t, out, "level=WARN")
-	assert.Contains(t, out, "tables_unreadable=[messages]")
 }
 
 // TestUTCTimestampNormalize_UnreadableProbeMatchesEntReads checks that the
@@ -696,7 +626,7 @@ func TestUTCTimestampNormalize_UnreadableProbeMatchesEntReads(t *testing.T) {
 		"2026-10-01 04:00:00 +0000 UTC",
 	} {
 		t.Run(text, func(t *testing.T) {
-			_, s, db := newEntWebChatStore(t)
+			_, s, db := hubNewEntWebChatStore(t)
 			ctx := context.Background()
 			proj := normProject(t, s, "norm-unreadable")
 			id := tid("norm-unreadable-msg")
@@ -743,11 +673,10 @@ func TestUTCTimestampNormalize_StartupCheckRecoversFromPanic(t *testing.T) {
 }
 
 // TestUTCTimestampNormalize_StartupCheckRunsInBackground checks that the
-// start hook returns at once and the check still logs.
+// start hook returns at once and the check and its run still happen.
 func TestUTCTimestampNormalize_StartupCheckRunsInBackground(t *testing.T) {
-	_, s, db := newEntWebChatStore(t)
+	srv, s, db, _ := newFileNormServer(t)
 	ctx := context.Background()
-	srv := &Server{store: s}
 	proj := normProject(t, s, "norm-startup-bg")
 	id := tid("norm-startup-bg-msg")
 	require.NoError(t, s.CreateMessage(ctx, &store.Message{
@@ -768,8 +697,7 @@ func TestUTCTimestampNormalize_StartupCheckRunsInBackground(t *testing.T) {
 	storedTimestampCheck = func(s *Server, ctx context.Context) {
 		close(started)
 		<-release
-		_, hasDeadline := ctx.Deadline()
-		assert.True(t, hasDeadline, "the background check must have a bounded context")
+		assert.NotNil(t, ctx.Done(), "shutdown must be able to cancel the background check")
 		orig(s, ctx)
 	}
 	t.Cleanup(func() { storedTimestampCheck = orig })
@@ -789,9 +717,74 @@ func TestUTCTimestampNormalize_StartupCheckRunsInBackground(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the check never started")
 	}
-	assert.NotContains(t, logs.String(), "tables_unreadable", "the check ran before it was released")
+	assert.NotContains(t, logs.String(), "timestamp normalize", "the check ran before it was released")
 	close(release)
 	require.Eventually(t, func() bool {
-		return strings.Contains(logs.String(), "tables_unreadable=[messages]")
+		return strings.Contains(logs.String(), "stored timestamps normalized at hub start")
 	}, 10*time.Second, 10*time.Millisecond)
+	srv.stopStoredTimestampCheck()
+	assert.NotContains(t, logs.String(), "level=ERROR")
+}
+
+// TestUTCTimestampNormalize_LeavesStarTimesFixedWidth: the star table's
+// starred_at is fixed-width TEXT (nine fraction digits) that the star store
+// parses strictly and compares lexically. The normalizer must leave it
+// byte-identical, while it still rewrites the other webchat time columns.
+func TestUTCTimestampNormalize_LeavesStarTimesFixedWidth(t *testing.T) {
+	wcs, s, db := hubNewEntWebChatStore(t)
+	stars, ok := wcs.(MessageStarStore)
+	require.True(t, ok, "the webchat store must implement MessageStarStore")
+	ctx := context.Background()
+	proj := normProject(t, s, "norm-stars")
+	topicID := tid("norm-star-topic")
+	require.NoError(t, wcs.CreateTopic(ctx, WebChatTopic{
+		ID: topicID, ProjectID: proj.ID, Name: "stars", CreatedBy: "u1", CreatedAt: normBase,
+	}))
+	sel := StarSelector{ConversationKey: topicID, Channel: "web", ThreadID: topicID}
+
+	// One whole-second and one fractional save time: both are stored with
+	// nine fraction digits, so neither is in the trimmed canonical form.
+	whole := normBase
+	frac := normBase.Add(time.Second + 123456*time.Microsecond)
+	ids := []string{tid("norm-star-whole"), tid("norm-star-frac")}
+	for i, at := range []time.Time{whole, frac} {
+		require.NoError(t, s.CreateMessage(ctx, &store.Message{
+			ID: ids[i], ProjectID: proj.ID, Sender: "user:alice", Recipient: "chat",
+			Msg: fmt.Sprintf("star %d", i), Type: "chat", Channel: "web", ThreadID: topicID, CreatedAt: normBase,
+		}))
+		_, changed, err := stars.AddMessageStar(ctx, "u1", StarTarget{MessageID: ids[i], ProjectID: proj.ID, Selector: sel})
+		require.NoError(t, err)
+		require.True(t, changed)
+		execOne(t, db, "UPDATE webchat_message_star SET starred_at = ? WHERE message_id = ?", sqliteStarTime(at), ids[i])
+	}
+	starsQ := "SELECT group_concat(quote(starred_at), ',') FROM (SELECT starred_at FROM webchat_message_star ORDER BY message_id)"
+	before := rawText(t, db, starsQ)
+	require.Contains(t, before, "'2026-10-01T04:00:00.000000000Z'")
+	require.Contains(t, before, "'2026-10-01T04:00:01.123456000Z'")
+
+	// A non-canonical value in another webchat time column, so the run has
+	// something to rewrite.
+	execOne(t, db, "UPDATE webchat_topic SET created_at = ? WHERE id = ?", "2026-10-01T13:00:03.5+09:00", topicID)
+
+	rep, log := runNormalize(t, db, entadapter.TimestampNormalizeOptions{})
+	assert.Positive(t, rep.Rewritten, log)
+	assert.Equal(t, "'2026-10-01T04:00:03.5Z'", rawText(t, db, "SELECT quote(created_at) FROM webchat_topic WHERE id = ?", topicID),
+		"the other webchat columns are still normalized")
+	assert.Equal(t, before, rawText(t, db, starsQ), "starred_at is left byte-identical")
+	assert.NotContains(t, log, "webchat_message_star")
+
+	// The star store still reads both, in keyset order.
+	rec, err := stars.GetMessageStar(ctx, "u1", ids[1])
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	requireUTCInstant(t, rec.StarredAt, frac)
+	page, err := stars.ListMessageStarCandidates(ctx, StarFilter{UserID: "u1", Selector: sel, Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Items, 2)
+	assert.Equal(t, ids[1], page.Items[0].MessageID, "newest star first")
+	assert.Equal(t, ids[0], page.Items[1].MessageID)
+	requireUTCInstant(t, page.Items[1].StarredAt, whole)
+	// No CheckStoredTimestamps assertion: the startup check examines ent
+	// tables only, so it could never list a webchat table. The run above,
+	// which normalizes webchat columns, is what must leave starred_at alone.
 }

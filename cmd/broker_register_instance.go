@@ -126,7 +126,7 @@ func runBrokerRegisterInstance(cmd *cobra.Command, key string) error {
 
 	creds, err := registerFlatInstance(ctx, client, *inst, id, hubName, brokerregistration.InstanceCredentialsDir(globalDir, key), brokerregistration.Options{
 		Hostname:          hostname,
-		Version:           version.Version,
+		Version:           version.Short(),
 		Capabilities:      runtimebroker.StaticCapabilityNames(rt),
 		AutoProvide:       brokerAutoProvide,
 		Labels:            map[string]string{brokerownership.LabelBrokerRole: "remote"},
@@ -134,6 +134,7 @@ func runBrokerRegisterInstance(cmd *cobra.Command, key string) error {
 		TransportMode:     transportMode,
 		TransportAudience: transportAudience,
 		HubEndpoint:       endpoint,
+		Out:               os.Stdout,
 	})
 	if err != nil {
 		return err

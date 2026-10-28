@@ -30,7 +30,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/shareddirs"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"golang.org/x/sys/unix"
 )
 
 // nfsWorktreeSelection decides whether an agent on the NFS workspace backend
@@ -201,45 +200,6 @@ func nfsSharedCheckoutProvisioned(hostBase, rel string) (bool, error) {
 	return false, nil
 }
 
-// nfsRemovalStateDir returns the provisioning state directory whose lock
-// RemoveNFSWorktree takes after the legacy lock in the workspace, the same
-// order as the provisioning init containers. The path is derived the same
-// way as the runtime's mount (runtime.NFSProvisionStateSubPath) and the
-// directory is created like before a pod starts (ensureNFSLeaf, no symlink
-// following).
-//
-// When the broker is not allowed to create, open or write in the directory
-// (a permission error, or no write and search access to an existing one),
-// it returns "" with a warning: the removal then takes only the legacy lock,
-// which every provisioning init container and broker takes first while
-// legacy support exists, so it still excludes them all. A symlink, a
-// regular file or any other unusable path is an error, and the worktree is
-// left in place.
-//
-// TODO(ptone/scion#2974): when the legacy lock is dropped, this fallback
-// must go: the state-directory lock is then the only lock, and a removal
-// that cannot take it must fail.
-func nfsRemovalStateDir(hostBase, rel, projectID string) (string, error) {
-	stateRel, err := runtime.NFSProvisionStateSubPath(rel, projectID)
-	if err != nil {
-		return "", fmt.Errorf("workspace_storage nfs: %w; left in place", err)
-	}
-	stateDir := filepath.Join(hostBase, stateRel)
-	_, err = ensureNFSLeaf(hostBase, stateRel)
-	if err == nil {
-		err = unix.Access(stateDir, unix.W_OK|unix.X_OK)
-	}
-	if err != nil && isNFSLeafPermissionError(err) {
-		slog.Warn("workspace_storage nfs: the broker cannot use the provisioning state directory; removing the worktree under the legacy provisioning lock only",
-			"path", stateDir, "error", err)
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("workspace_storage nfs: prepare the provisioning state directory %q: %w; left in place", stateRel, err)
-	}
-	return stateDir, nil
-}
-
 // nfsWorktreeSubPath is the export-relative path of an agent's worktree:
 // <workspace>/worktrees/<agent name>, the same layout provision.WorktreePath
 // uses under the shared checkout.
@@ -249,8 +209,8 @@ func nfsWorktreeSubPath(workspaceRel, name string) string {
 
 // nfsWorktreeLockWait bounds how long RemoveNFSWorktree waits for the
 // project's provisioning lock, so a delete is never held up for long. The
-// steps under the lock are quick renames and git worktree prune, and run to
-// completion. A variable so tests can shorten it.
+// steps under the lock are quick renames and the removal of the worktree's
+// own git entry, and run to completion. A variable so tests can shorten it.
 var nfsWorktreeLockWait = 30 * time.Second
 
 // nfsWorktreeBackend selects the workspace backend RemoveNFSWorktree
@@ -304,10 +264,10 @@ func nfsExportWorkspaceOnAnyRuntime(projectPath, projectID, agentName string) (r
 	if err != nil {
 		return "", "", fmt.Errorf("workspace_storage nfs: load settings: %w", err)
 	}
-	if settings == nil || settings.Server == nil || settings.Server.WorkspaceStorage == nil {
+	if settings == nil || settings.Server == nil || settings.Server.EffectiveWorkspaceStorage() == nil {
 		return "", "", nil
 	}
-	backend := nfsWorktreeBackend(settings.Server.WorkspaceStorage, store.SharingModeWorktreePerAgent)
+	backend := nfsWorktreeBackend(settings.Server.EffectiveWorkspaceStorage(), store.SharingModeWorktreePerAgent)
 	if backend.Name() != "nfs" {
 		return "", "", nil
 	}
@@ -376,6 +336,13 @@ func (m *AgentManager) RemoveNFSWorktree(ctx context.Context, projectPath, proje
 	// directory, not a symlink.
 	if real, err := filepath.EvalSymlinks(filepath.Dir(worktree)); err != nil || real != filepath.Dir(worktree) {
 		return worktree, fmt.Errorf("workspace_storage nfs: %s is not a plain directory on the export; left in place", filepath.Dir(worktree))
+	}
+
+	// The worktree is the agent's; the project's shared checkout around it
+	// is never removed (agentFilesGuard). RemoveMountedWorktree removes
+	// the worktree by name under the checkout checked here.
+	if _, err := newAgentFilesGuard(agentName, []string{resolvedHostBase}, []string{worktree}, []string{workspace}).check(worktree); err != nil {
+		return worktree, fmt.Errorf("workspace_storage nfs: %w", err)
 	}
 
 	stateDir, err := nfsRemovalStateDir(resolvedHostBase, rel, projectID)

@@ -41,6 +41,7 @@ const conduitPath = "/api/v1/conduit"
 const (
 	codeAgentNotFound            = "agent_not_found"
 	codeAgentNotRunning          = "agent_not_running"
+	codeAgentUpgradeRequired     = "agent_upgrade_required"
 	codeRateLimited              = "rate_limited"
 	codeRuntimeBrokerUnavailable = "runtime_broker_unavailable"
 	codeAgentSessionUnavailable  = "agent_session_unavailable"
@@ -286,6 +287,11 @@ func classify(resp *conduitv1.RpcResponse) (outcome, *tunnelResponse, string, er
 		if code == codeAgentNotRunning {
 			return fail(ExitAgentNotRunning, "the agent is not running (%s)", code)
 		}
+		if code == codeAgentUpgradeRequired {
+			// The agent session does not support stream renewal, which
+			// the hub requires: final, no retry and no fresh session.
+			return fail(ExitError, "the agent must be restarted on an image whose sciontool supports stream renewal (%s)", code)
+		}
 	case http.StatusTooManyRequests:
 		return fail(ExitCapReached, "too many tunnels on this session (%s)", reasonOr(code, codeRateLimited))
 	case http.StatusBadRequest:
@@ -312,7 +318,7 @@ func (c *client) openTunnel(ctx context.Context) (conduit.Stream, *tunnelEntry, 
 	// two fresh sessions), and one transient retry on the same session.
 	drainUsed, authUsed, transientUsed := false, false, false
 	for {
-		st, entry, out, reason, err := c.tryOpen(ctx, c.current(), body)
+		st, entry, out, reason, err := c.tryOpen(ctx, c.acquireCurrent(), body)
 		switch out {
 		case outOK:
 			return st, entry, nil
@@ -347,11 +353,11 @@ func (c *client) openTunnel(ctx context.Context) (conduit.Stream, *tunnelEntry, 
 	}
 }
 
-// tryOpen makes one tunnel request on s. The session is counted as in use
-// for the request; on success the count passes to the returned tunnel.
+// tryOpen makes one tunnel request on s, which the caller has counted as
+// in use (acquireCurrent); on success the count passes to the returned
+// tunnel, otherwise tryOpen releases it.
 // For outFail the error is final; for a transient fault reason names it.
 func (c *client) tryOpen(ctx context.Context, s *session, body []byte) (conduit.Stream, *tunnelEntry, outcome, string, error) {
-	c.acquire(s)
 	keep := false
 	defer func() {
 		if !keep {

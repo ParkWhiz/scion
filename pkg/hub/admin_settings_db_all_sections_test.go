@@ -67,6 +67,7 @@ var layer1RoundTripSamples = map[string]string{
 	"telemetry.cloud.protocol":                 `"grpc"`,
 	"telemetry.cloud.headers":                  `{"x-api-key":"k1"}`,
 	"telemetry.cloud.provider":                 `"gcp"`,
+	"telemetry.cloud.gcp_project_id":           `"telemetry-project"`,
 	"telemetry.cloud.tls":                      `{"ca_file":"/etc/ca.pem"}`,
 	"telemetry.cloud.tls.enabled":              `true`,
 	"telemetry.cloud.tls.insecure_skip_verify": `false`,
@@ -663,9 +664,9 @@ func TestPutServerConfigDB_UnchangedSeededRowIsAdopted(t *testing.T) {
 }
 
 // An access save on a hub with no access row starts from the effective
-// snapshot values, and endpoints from the effective public_url and
-// image_registry, as their builders did before the move to the shared
-// helper.
+// snapshot values. An endpoints save with no row carries neither the
+// bootstrap public_url nor the bootstrap image_registry (ptone/scion#3905,
+// ptone/scion#3916).
 func TestPutServerConfigDB_AccessNoRowBaseFromSnapshot(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	fake := newFakeHubSettingStore()
@@ -681,7 +682,7 @@ func TestPutServerConfigDB_AccessNoRowBaseFromSnapshot(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 	assert.Equal(t, decodeJSONValue(t, []byte(`{"default_user_role":"viewer","user_access_mode":"invite"}`)),
 		decodeJSONValue(t, storedRow(fake, "access").Value))
-	assert.Equal(t, decodeJSONValue(t, []byte(`{"image_registry":"file.example.com","public_url":"https://hub.example.com"}`)),
+	assert.Equal(t, decodeJSONValue(t, []byte(`{"public_url":"https://hub.example.com"}`)),
 		decodeJSONValue(t, storedRow(fake, "endpoints").Value))
 }
 
@@ -822,7 +823,10 @@ func TestPutServerConfigDB_TelemetryMaskedHeaderNoOpMembers(t *testing.T) {
 		{"empty nested object over a stored one", `{"telemetry":{"cloud":{"tls":{},"headers":{"x-api-key":"********"}}}}`, http.StatusOK},
 		{"null nested object over a stored one", `{"telemetry":{"cloud":{"tls":null,"headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
 		{"empty string over a shown endpoint", `{"telemetry":{"cloud":{"endpoint":"","headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
-		{"false for a member GET omitted", `{"telemetry":{"cloud":{"cloud_logging":false,"headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
+		// cloud_logging false where GET shows none is an echo: it is
+		// dropped before the masked-header check (ptone/scion#5664).
+		{"cloud_logging false for a member GET omitted", `{"telemetry":{"cloud":{"cloud_logging":false,"headers":{"x-api-key":"********"}}}}`, http.StatusOK},
+		{"cloud_logging true for a member GET omitted", `{"telemetry":{"cloud":{"cloud_logging":true,"headers":{"x-api-key":"********"}}}}`, http.StatusUnprocessableEntity},
 		{"case-variant nested clear", `{"telemetry":{"cloud":{"tls":{"CA_FILE":""},"headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
 		{"case-variant nested null", `{"telemetry":{"cloud":{"tls":{"Enabled":null},"headers":{"x-api-key":"********"}}}}`, http.StatusBadRequest},
 		{"case-variant nested no-op", `{"telemetry":{"cloud":{"TLS":{"Ca_File":"/etc/ca.pem"},"headers":{"x-api-key":"********"}}}}`, http.StatusOK},

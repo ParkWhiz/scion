@@ -29,7 +29,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,7 +44,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/fsutil"
-	"golang.org/x/sys/unix"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/urlredact"
 )
 
 // ProvisionSentinelFile is the name of the sentinel file written atomically
@@ -249,6 +248,33 @@ type ProvisionInput struct {
 	// credential (GitTokenCredentialHelper). The token is not added to the
 	// clone URL, the command line or any file.
 	CloneWithToken bool
+
+	// CloneToken, when non-empty, is the git token for the clone, given to
+	// the clone command alone: its environment gets GITHUB_TOKEN set to it
+	// plus the same credential helper CloneWithToken uses, and clone errors
+	// are redacted with it. The calling process's environment is not read
+	// or changed. The hub sets it when it provisions a project's shared
+	// workspace at create (ptone/scion#5813); it takes precedence over
+	// CloneWithToken.
+	CloneToken string
+
+	// CloneTokenRemote, when set with CloneToken, binds the token to the
+	// project's recorded git remote: the clone gets the token only when
+	// GitClone.URL is https and its normalized host and owner/repo equal this
+	// remote, and then only for that host (credential.https://<host>.helper,
+	// constant helper text, the token only in the clone command's
+	// environment). Any other URL is cloned without a token. The hub sets it
+	// to the project's GitRemote for its clone at create.
+	CloneTokenRemote string
+
+	// HostGitHardened runs the clone as host-side git on a project-supplied
+	// URL: with HostCloneGitArgs ahead of the subcommand and
+	// GIT_ALLOW_PROTOCOL limited to HostCloneProtocols, so only the https,
+	// ssh and git transports can be used (no local path, file://, ext:: or
+	// other helper transport) and no hook, fsmonitor or pager runs. The hub
+	// sets it when it clones a project's shared workspace at create; the
+	// caller also checks the URL first (CheckHostCloneURL).
+	HostGitHardened bool
 
 	// NFSUID and NFSGID are the stable NFS ownership values (default 1000:1000).
 	// Used for one-time chown of newly provisioned workspace directories.
@@ -748,8 +774,9 @@ const (
 // name must be an agent slug, and base/worktrees must be a plain
 // directory. Only base/worktrees/<name> is touched, and only when it is a
 // worktree of this checkout (or one git no longer has an entry for): it
-// is renamed to a .removing- name inside worktrees/, git worktree prune
-// drops its entry, and the agent is dropped from the sharer registry. The
+// is renamed to a .removing- name inside worktrees/, git's entry for that
+// one worktree is removed (no repository-wide prune), and the agent is
+// dropped from the sharer registry. The
 // rename is a single step, so a removal that stops partway never leaves a
 // half-deleted worktree at the agent's path. PurgeRemovedWorktrees deletes
 // the renamed directory afterwards. The agent's branch is kept. An empty
@@ -822,10 +849,14 @@ func RemoveMountedWorktree(ctx context.Context, base, stateDir, name string, loc
 	if _, err := moveWorktreeAside(base, name, removedWorktreePrefix); err != nil {
 		return fmt.Errorf("remove worktree %s: %w", path, err)
 	}
-	pruneCtx, cancel := context.WithTimeout(ctx, removalPruneTimeout)
+	// Remove only this worktree's entry from git, now that its directory
+	// has moved aside. A repository-wide prune would also drop the entries
+	// of other agents' worktrees that this process cannot see
+	// (ptone/scion#5071).
+	entryCtx, cancel := context.WithTimeout(ctx, removalEntryTimeout)
 	defer cancel()
-	if out, err := gitInSharedCheckout(pruneCtx, base, path, "worktree", "prune"); err != nil {
-		slog.Warn("remove worktree: git worktree prune failed", "path", base, "error", err, "output", out)
+	if err := util.RemoveWorktreeEntry(entryCtx, path, sharedCheckoutGitCmd(base, path)); err != nil {
+		slog.Warn("remove worktree: could not remove the worktree's git entry", "path", path, "error", err)
 	}
 	if _, err := UnregisterSharerElsewhere(base, name, ""); err != nil {
 		slog.Warn("remove worktree: could not update the sharer registry", "path", base, "error", err)
@@ -833,9 +864,9 @@ func RemoveMountedWorktree(ctx context.Context, base, stateDir, name string, loc
 	return nil
 }
 
-// removalPruneTimeout bounds the git worktree prune RemoveMountedWorktree
-// runs under the lock.
-const removalPruneTimeout = 2 * time.Minute
+// removalEntryTimeout bounds the git worktree entry removal
+// RemoveMountedWorktree runs under the lock.
+const removalEntryTimeout = 2 * time.Minute
 
 // PurgeRemovedWorktrees deletes the directories RemoveMountedWorktree
 // moved aside under base/worktrees, including any left by an earlier
@@ -869,13 +900,33 @@ func moveWorktreeAside(base, name, prefix string) (string, error) {
 	return to, nil
 }
 
-// gitInSharedCheckout runs git in the shared checkout at base. The shared
-// checkout and the agent's worktree belong to the agents' user rather than
-// the caller, so both are listed in safe.directory for this command only.
+// gitInSharedCheckout runs git in the shared checkout at base through
+// util.HostGitCommand. The shared checkout and the agent's worktree belong
+// to the agents' user rather than the caller, so both are listed in
+// safe.directory for this command only.
 func gitInSharedCheckout(ctx context.Context, base, worktree string, args ...string) (string, error) {
-	full := append([]string{"-c", "safe.directory=" + base, "-c", "safe.directory=" + worktree, "-C", base}, args...)
-	out, err := exec.CommandContext(ctx, "git", full...).CombinedOutput()
+	cmd, err := util.HostGitCommand(ctx, base, util.HostGitOptions{
+		Config: []string{"safe.directory=" + base, "safe.directory=" + worktree},
+	}, args...)
+	if err != nil {
+		return "", err
+	}
+	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+// sharedCheckoutGitCmd returns a builder of git commands in the shared
+// checkout at base for util.RemoveWorktreeEntry, which runs "git worktree
+// remove" only once the worktree directory is gone, so no work tree file is
+// read: the fixed host settings (util.HostGitArgs, util.HostGitEnv) are
+// enough. safe.directory lists base and worktree as in gitInSharedCheckout.
+func sharedCheckoutGitCmd(base, worktree string) func(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	return func(ctx context.Context, args ...string) (*exec.Cmd, error) {
+		full := append(util.HostGitArgs(), "-c", "safe.directory="+base, "-c", "safe.directory="+worktree, "-C", base)
+		cmd := exec.CommandContext(ctx, "git", append(full, args...)...)
+		cmd.Env = util.HostGitEnv(os.Environ())
+		return cmd, nil
+	}
 }
 
 // fileLockWait is how long ProvisionShared waits for the file lock:
@@ -2179,28 +2230,18 @@ var ErrCommondirPresent = errors.New("refusing git operation: base .git/commondi
 //     <dir>/.git/commondir exists at all and refuses (ErrCommondirPresent)
 //     if so, since a hub-native base never legitimately has one.
 //
-// It deliberately does NOT disable hooks (core.hooksPath), filters, aliases,
-// or the global/system gitconfig — once the above holds, any hook/filter
-// still configured for the base is host-managed and must keep running (most
-// notably git-lfs: a post-checkout hook + filter.lfs.* smudge/clean driver).
-// Specifically:
-//   - GIT_CONFIG_NOSYSTEM=1 / GIT_CONFIG_GLOBAL=/dev/null were considered and
-//     REJECTED: `git lfs install` writes filter.lfs.* to the global or system
-//     gitconfig (not repo-local), so this would silently break LFS. It would
-//     also strip broker-host config the broker legitimately relies on
-//     (safe.directory, credential.helper, url.insteadOf, http.*,
-//     core.sshCommand for its own auth) for no corresponding benefit.
-//   - core.sshCommand is left alone for the same reason: this wrapper also
-//     covers the base clone/pull paths, which may legitimately depend on the
-//     broker's configured SSH transport.
-//   - Alias neutralization is unnecessary: every caller here invokes an
-//     explicit, hardcoded subcommand, never a user-suppliable one.
-//
-// What it does additionally clear:
-//   - core.fsmonitor (both boolean and hook-path forms): not used by git-lfs
-//     or any other broker operation, so clearing it costs nothing.
-//   - core.pager=cat: purely cosmetic — a pager must never block
-//     non-interactive broker output.
+// The command itself is built by util.HostGitCommand, because agent
+// containers can write the base's .git: it runs without repository hooks
+// (core.hooksPath=/dev/null), without a file-system monitor, with
+// core.pager=cat, and with every filter driver defined in the repository's
+// own config replaced by its global/system definition (or disabled). The
+// global and system gitconfig stay in effect (safe.directory,
+// credential.helper, url.insteadOf, http.*, core.sshCommand for the
+// broker's own auth, and the filter.lfs.* driver `git lfs install` writes
+// there), so LFS content is still checked out. The git-lfs post-checkout
+// hook does not run; it only marks lockable files read-only.
+// Aliases are not a concern: every caller here invokes an explicit,
+// hardcoded subcommand, never a user-suppliable one.
 //
 // dir is the working directory (cmd.Dir) and the base whose common directory
 // is pinned; it must be non-empty. args are the git subcommand and its
@@ -2209,7 +2250,7 @@ var ErrCommondirPresent = errors.New("refusing git operation: base .git/commondi
 // GIT_COMMON_DIR; callers that need to layer additional env (e.g. the
 // GIT_CONFIG_COUNT/KEY_0/VALUE_0 credential-helper technique) must append to
 // cmd.Env rather than replace it, or the pin is lost.
-func SafeGitCommand(ctx context.Context, dir string, args ...string) (*exec.Cmd, error) {
+func SafeGitCommand(ctx context.Context, dir string, args ...string) (*util.HostGitCmd, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("SafeGitCommand: dir is required")
 	}
@@ -2220,16 +2261,11 @@ func SafeGitCommand(ctx context.Context, dir string, args ...string) (*exec.Cmd,
 		return nil, fmt.Errorf("%w: %s", ErrCommondirPresent, commondirFile)
 	}
 
-	safeArgs := []string{
-		"-c", "core.fsmonitor=false",
-		"-c", "core.fsmonitor=",
-		"-c", "core.pager=cat",
-	}
-	fullArgs := append(safeArgs, args...)
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_COMMON_DIR="+filepath.Join(dir, ".git"))
-	return cmd, nil
+	env := append(util.HostGitEnv(os.Environ()), "GIT_COMMON_DIR="+filepath.Join(dir, ".git"))
+	// Managed base: a worktree add checks out files, but agents fetch LFS
+	// objects in-container, so skip the host-side LFS smudge rather than let
+	// git-lfs read a tracked .lfsconfig for its endpoint.
+	return util.HostGitCommand(ctx, dir, util.HostGitOptions{Env: env, SkipLFSSmudge: true}, args...)
 }
 
 // markedWorkspaceNeedsClone reports whether a shared-plain git workspace that
@@ -2805,7 +2841,22 @@ func removeCloneTempDirs(dir string) error {
 // rejected credential.
 func runGitClone(ctx context.Context, in ProvisionInput) error {
 	gc := in.GitClone
-	args := []string{"clone"}
+	var args []string
+	if in.HostGitHardened {
+		args = append(args, HostCloneGitArgs()...)
+	} else {
+		// Non-hardened clones still carry the base host-side git pins unconditionally
+		// (no hooks, no fsmonitor, no pager, restricted ext/file transports, no
+		// submodule recursion, no signature checks): a cloned repository's config
+		// cannot change what this host git invocation does. HostCloneGitArgs (the
+		// hardened path) already includes exactly these base pins (hostGitArgs ==
+		// util.HostGitArgs) plus the clone transport/redirect extras, so the base
+		// pins are present on every clone path. The hardened path intentionally
+		// repeats protocol.file.allow, overriding the base =user with =never (the
+		// last -c wins), so file:// transport is fully denied on that path.
+		args = append(args, util.HostGitArgs()...)
+	}
+	args = append(args, "clone")
 
 	// Depth: nil/omitted = shallow depth 1, 0 = full clone (no --depth), >0 = that depth.
 	depth := 1
@@ -2818,18 +2869,54 @@ func runGitClone(ctx context.Context, in ProvisionInput) error {
 	if gc.Branch != "" {
 		args = append(args, "--branch", gc.Branch)
 	}
-	args = append(args, gc.URL, in.Resolved.HostPath)
+	// "--" ends the options: a URL or path starting with "-" is never read
+	// as one.
+	args = append(args, "--", gc.URL, in.Resolved.HostPath)
 
 	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	if in.CloneWithToken {
-		cmd.Env = append(cmd.Env, TokenCredentialHelperEnv(cmd.Env)...)
+	// Base host-side git environment: GIT_* scrubbed and the scoped-credential
+	// variable dropped (HostGitEnv), interactive prompts off, and the LFS smudge
+	// skipped so git-lfs never contacts an endpoint named in the cloned tracked
+	// .lfsconfig with the host's credentials (agents fetch LFS objects
+	// in-container). This path also runs in the Kubernetes init container (via
+	// `sciontool provision`). The host-side git hardening pins (no hooks, no
+	// pager, restricted transports, no submodule recursion) plus
+	// http.followRedirects=false and the protocol allow list are applied as fixed
+	// args by HostCloneGitArgs when HostGitHardened (the hub project-create clone).
+	env := append(util.HostGitEnv(os.Environ()), "GIT_TERMINAL_PROMPT=0", "GIT_LFS_SKIP_SMUDGE=1")
+	if in.HostGitHardened {
+		env = append(env, "GIT_ALLOW_PROTOCOL="+HostCloneProtocols)
 	}
+	// Decide which token, if any, is offered. A project-supplied CloneToken is
+	// bound to its recorded remote: with a CloneTokenRemote it is used only when
+	// the clone URL resolves to that remote's host and owner/repo
+	// (cloneTokenHost), and is refused on any mismatch. The binding comes from the
+	// project record (CloneTokenRemote), never from the clone URL or a label.
+	withToken, token := in.CloneWithToken, os.Getenv(GitTokenEnv)
+	if in.CloneToken != "" {
+		bound := in.CloneTokenRemote == ""
+		if !bound {
+			_, bound = cloneTokenHost(in.CloneTokenRemote, gc.URL)
+		}
+		if bound {
+			withToken, token = true, in.CloneToken
+		}
+	}
+	if withToken {
+		// Host-scoped credential helper: the token is offered only to the clone
+		// URL's host, carried in the environment and never in argv/URL/config; the
+		// helper first clears any inherited unscoped credential.helper. For a
+		// non-http(s) URL the token is ignored (git uses its own transport auth).
+		if scoped, ok := util.ScopedCredentialHelperEnv(env, gc.URL, token); ok {
+			env = scoped
+		}
+	}
+	cmd.Env = env
 	output, err := cmd.CombinedOutput()
 	if err == nil {
 		return nil
 	}
-	return cloneError(gc.URL, string(output), err, in.CloneWithToken, os.Getenv(GitTokenEnv))
+	return cloneError(gc.URL, string(output), err, withToken, token)
 }
 
 // redactedCredential replaces a credential value in clone error output.
@@ -2845,31 +2932,11 @@ const GitTokenEnv = "GITHUB_TOKEN"
 // workspace provisioning and the agent authenticate the same way.
 const GitTokenCredentialHelper = `!f() { echo "password=${GITHUB_TOKEN}"; echo "username=oauth2"; }; f`
 
-// TokenCredentialHelperEnv returns the GIT_CONFIG_COUNT/KEY/VALUE entries
-// to append to env, the environment of one git command, so that the command
-// uses GitTokenCredentialHelper and no other credential helper: the first
-// entry clears the helpers from git's config files (so none of them stores
-// the credential), the second adds this one. Entries already counted in env
-// are kept. The returned values name the variable, never the token.
-func TokenCredentialHelperEnv(env []string) []string {
-	base := 0
-	for _, e := range env {
-		if v, ok := strings.CutPrefix(e, "GIT_CONFIG_COUNT="); ok {
-			// The last entry is the one exec uses.
-			base = 0
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				base = n
-			}
-		}
-	}
-	return []string{
-		"GIT_CONFIG_COUNT=" + strconv.Itoa(base+2),
-		fmt.Sprintf("GIT_CONFIG_KEY_%d=credential.helper", base),
-		fmt.Sprintf("GIT_CONFIG_VALUE_%d=", base),
-		fmt.Sprintf("GIT_CONFIG_KEY_%d=credential.helper", base+1),
-		fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", base+1, GitTokenCredentialHelper),
-	}
-}
+// Host-side git clones (runGitClone, util.CloneSharedWorkspace) authenticate
+// through util.ScopedCredentialHelperEnv, a credential helper scoped to the
+// clone URL's host, never an unscoped helper or a token embedded in the URL.
+// GitTokenCredentialHelper above remains only for the in-container agent
+// (sciontool init), which authenticates its own clone.
 
 // cloneError builds the error for a failed clone of rawURL. git's output is
 // stripped of the URL's credentials before it is included.
@@ -2912,8 +2979,9 @@ func cloneError(rawURL, output string, runErr error, withToken bool, token strin
 
 // redactCloneURL returns rawURL without userinfo, query string or fragment,
 // any of which can carry a token. For an scp-style URL ("user@host:path")
-// the user is dropped and host and path are kept. An unparseable URL is
-// never echoed.
+// the user is dropped and host and path are kept. A URL that does not
+// parse, or holds an '@' the shared user info rule cannot place
+// (urlredact.HostAndPath), is never echoed.
 func redactCloneURL(rawURL string) string {
 	if !strings.Contains(rawURL, "://") {
 		// scp-style "user@host:path", or a local path: keep host and path,
@@ -2925,13 +2993,10 @@ func redactCloneURL(rawURL string) string {
 			return rawURL
 		}
 	}
-	u, err := url.Parse(rawURL)
-	if err != nil {
+	u, ok := urlredact.HostAndPath(rawURL)
+	if !ok {
 		return "<unparseable clone URL>"
 	}
-	u.User = nil
-	u.RawQuery = ""
-	u.Fragment = ""
 	return u.String()
 }
 
@@ -2952,26 +3017,14 @@ func scpUserEnd(rawURL string) int {
 }
 
 // sanitizeCloneOutput removes rawURL's credentials, query string and
-// fragment from text (git's own output can echo the URL).
+// fragment from text (git's own output can echo the URL), by the shared
+// rule (urlredact.RedactURLIn): every rendering of rawURL is shown as
+// redactCloneURL shows it.
 func sanitizeCloneOutput(text, rawURL string) string {
 	if rawURL == "" || text == "" {
 		return text
 	}
-	out := strings.ReplaceAll(text, rawURL, redactCloneURL(rawURL))
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return out
-	}
-	if u.User != nil && u.User.String() != "" {
-		out = strings.ReplaceAll(out, u.User.String()+"@", "")
-	}
-	if u.RawQuery != "" {
-		out = strings.ReplaceAll(out, "?"+u.RawQuery, "")
-	}
-	if u.Fragment != "" {
-		out = strings.ReplaceAll(out, "#"+u.Fragment, "")
-	}
-	return out
+	return urlredact.RedactURLIn(text, rawURL, redactCloneURL(rawURL), urlredact.Mask)
 }
 
 // moveDirContentsUp moves every entry from src into dest, leaving src with
@@ -3396,7 +3449,7 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 	}
 
 	// 2. Check git worktree list for a prior-run worktree without a registry entry.
-	if existingPath, findErr := findWorktreeForBranch(ctx, base, branchName); findErr == nil && existingPath != "" {
+	if existingPath, _, findErr := findWorktreeForBranch(ctx, base, branchName); findErr == nil && existingPath != "" {
 		if validateJoinCandidate(base, existingPath, in.AgentID, branchName, "git-worktree-list") {
 			if in.MountedWorktree {
 				return worktreeOutcome{}, branchInOtherWorktreeError(in, branchName, existingPath)
@@ -3439,6 +3492,10 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 		return o, err
 	}
 
+	if err := clearOwnStaleWorktreeEntry(ctx, in, base, worktreePath); err != nil {
+		return worktreeOutcome{}, err
+	}
+
 	slog.Info("ProvisionShared: creating worktree",
 		"agent_id", in.AgentID, "branch", branchName, "path", worktreePath)
 
@@ -3459,7 +3516,8 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 		// proactive JOIN checks above — it is not guaranteed safe just because
 		// git reported it.
 		if strings.Contains(outputStr, "already checked out") || strings.Contains(outputStr, "already used by worktree") {
-			if attachPath, findErr := findWorktreeForBranch(ctx, base, branchName); findErr == nil && attachPath != "" &&
+			attachPath, holder, findErr := findWorktreeForBranch(ctx, base, branchName)
+			if findErr == nil && attachPath != "" &&
 				validateJoinCandidate(base, attachPath, in.AgentID, branchName, "git-fallback") {
 				if in.MountedWorktree {
 					return worktreeOutcome{}, branchInOtherWorktreeError(in, branchName, attachPath)
@@ -3467,6 +3525,9 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 				slog.Info("ProvisionShared: attaching to existing worktree (git fallback)",
 					"agent_id", in.AgentID, "branch", branchName, "path", attachPath)
 				return registered(attachPath)
+			}
+			if holder != "" {
+				return worktreeOutcome{}, branchHeldError(in, branchName, holder)
 			}
 			return worktreeOutcome{}, fmt.Errorf("git worktree add: branch %q already checked out but cannot find existing worktree: %s",
 				branchName, outputStr)
@@ -3482,7 +3543,8 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 			if err != nil {
 				reuse := strings.TrimSpace(string(output))
 				if strings.Contains(reuse, "already checked out") || strings.Contains(reuse, "already used by worktree") {
-					if attachPath, findErr := findWorktreeForBranch(ctx, base, branchName); findErr == nil && attachPath != "" &&
+					attachPath, holder, findErr := findWorktreeForBranch(ctx, base, branchName)
+					if findErr == nil && attachPath != "" &&
 						validateJoinCandidate(base, attachPath, in.AgentID, branchName, "reuse-fallback") {
 						if in.MountedWorktree {
 							return worktreeOutcome{}, branchInOtherWorktreeError(in, branchName, attachPath)
@@ -3490,6 +3552,9 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 						slog.Info("ProvisionShared: attaching to existing worktree (reuse fallback)",
 							"agent_id", in.AgentID, "branch", branchName, "path", attachPath)
 						return registered(attachPath)
+					}
+					if holder != "" {
+						return worktreeOutcome{}, branchHeldError(in, branchName, holder)
 					}
 					return worktreeOutcome{}, fmt.Errorf("git worktree add: branch %q already checked out: %s", branchName, reuse)
 				}
@@ -3549,6 +3614,17 @@ func branchInOtherWorktreeError(in ProvisionInput, branch, path string) error {
 		branch, mountedDisplayPath(in, path), rel)
 }
 
+// branchHeldError reports that branch is held by the worktree entry at
+// holder, whose directory this process cannot see. For MountedWorktree the
+// path is shown relative to the shared checkout, as in
+// branchInOtherWorktreeError.
+func branchHeldError(in ProvisionInput, branch, holder string) error {
+	if in.MountedWorktree {
+		return branchInOtherWorktreeError(in, branch, holder)
+	}
+	return fmt.Errorf("ProvisionShared: %w", util.WorktreeBranchHeldError(branch, holder))
+}
+
 // sharedCheckoutRel returns path relative to the shared checkout, or path
 // itself when it is not below it.
 func sharedCheckoutRel(in ProvisionInput, path string) string {
@@ -3581,7 +3657,7 @@ func mountedDisplayPath(in ProvisionInput, path string) string {
 // error status means the name is invalid; git failing to start or to be
 // waited on is returned as an error running git.
 func checkBranchName(ctx context.Context, base, name string) error {
-	out, err := exec.CommandContext(ctx, "git", "-C", base, "check-ref-format", "--branch", name).Output()
+	out, err := exec.CommandContext(ctx, "git", append(util.HostGitArgs(), "-C", base, "check-ref-format", "--branch", name)...).Output()
 	var exitErr *exec.ExitError
 	switch {
 	case errors.As(err, &exitErr):
@@ -3698,8 +3774,8 @@ func reuseMountedWorktree(ctx context.Context, in ProvisionInput, path, branch s
 }
 
 // startBranchFile is the file in a worktree's admin directory that records
-// the branch the agent's worktree was started with. git worktree prune
-// deletes it together with the admin directory.
+// the branch the agent's worktree was started with. Removing the
+// worktree's git entry deletes it together with the admin directory.
 const startBranchFile = "scion-start-branch"
 
 // startBranch returns the branch recorded for the worktree at path, or ""
@@ -3766,7 +3842,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 // currentBranch returns the branch checked out in the repository at
 // repoDir, or "" when HEAD is detached or cannot be read.
 func currentBranch(ctx context.Context, repoDir string) string {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "symbolic-ref", "--quiet", "--short", "HEAD").Output()
+	out, err := exec.CommandContext(ctx, "git", append(util.HostGitArgs(), "-C", repoDir, "symbolic-ref", "--quiet", "--short", "HEAD")...).Output()
 	if err != nil {
 		return ""
 	}
@@ -3785,36 +3861,208 @@ var gitSupportsRelativeWorktrees = func() bool {
 	return util.CompareGitVersion(version, 2, 48) == nil
 }
 
-// findWorktreeForBranch parses 'git worktree list --porcelain' output to find
-// the worktree path for a given branch. Returns "" if no worktree has that
-// branch checked out.
-func findWorktreeForBranch(ctx context.Context, repoDir, branch string) (string, error) {
-	// Prune first so a worktree dir removed on disk (but not unregistered in git)
-	// isn't returned as a stale join target pointing at a non-existent path.
-	if pruneCmd, err := SafeGitCommand(ctx, repoDir, "worktree", "prune"); err == nil {
-		_ = pruneCmd.Run()
-	}
+// worktreeEntry is one entry of 'git worktree list --porcelain'.
+type worktreeEntry struct {
+	path   string
+	branch string // short branch name; "" when detached or bare
+}
+
+// listWorktreeEntries returns the worktree entries git has for repoDir.
+// A quoted path (git quotes paths with unusual characters) is unquoted.
+func listWorktreeEntries(ctx context.Context, repoDir string) ([]worktreeEntry, error) {
 	cmd, err := SafeGitCommand(ctx, repoDir, "worktree", "list", "--porcelain")
 	if err != nil {
-		return "", fmt.Errorf("git worktree list: %w", err)
+		return nil, fmt.Errorf("git worktree list: %w", err)
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("git worktree list: %w", err)
+		return nil, fmt.Errorf("git worktree list: %w", err)
 	}
-	var currentPath string
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.HasPrefix(line, "worktree ") {
-			currentPath = strings.TrimPrefix(line, "worktree ")
-		}
-		if strings.HasPrefix(line, "branch refs/heads/") {
-			b := strings.TrimPrefix(line, "branch refs/heads/")
-			if b == branch {
-				return currentPath, nil
+	return parseWorktreeList(string(output)), nil
+}
+
+// parseWorktreeList parses 'git worktree list --porcelain' output. A path
+// git printed quoted (C-style, with octal escapes) is unquoted; one that
+// cannot be unquoted is kept as printed. Current git prints the path
+// unquoted in this output; the unquote covers git versions or settings
+// that quote it.
+func parseWorktreeList(output string) []worktreeEntry {
+	var entries []worktreeEntry
+	for _, line := range strings.Split(output, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path := strings.TrimPrefix(line, "worktree ")
+			if strings.HasPrefix(path, "\"") {
+				if unquoted, err := strconv.Unquote(path); err == nil {
+					path = unquoted
+				}
 			}
+			entries = append(entries, worktreeEntry{path: path})
+		case strings.HasPrefix(line, "branch refs/heads/") && len(entries) > 0:
+			entries[len(entries)-1].branch = strings.TrimPrefix(line, "branch refs/heads/")
 		}
 	}
-	return "", nil
+	return entries
+}
+
+// findWorktreeForBranch returns the path of the worktree that has branch
+// checked out, or "" if there is none. An entry whose path is missing, or
+// cannot be checked (any Lstat error), is skipped instead of being pruned:
+// it may be another agent's worktree that this process cannot see
+// (ptone/scion#5071). The path of a skipped entry holding the branch is
+// returned as holder, for error messages only; it is never removed.
+func findWorktreeForBranch(ctx context.Context, repoDir, branch string) (path, holder string, err error) {
+	entries, err := listWorktreeEntries(ctx, repoDir)
+	if err != nil {
+		return "", "", err
+	}
+	for _, e := range entries {
+		if e.branch != branch {
+			continue
+		}
+		if _, statErr := os.Lstat(e.path); statErr != nil {
+			if holder == "" {
+				holder = e.path
+			}
+			continue
+		}
+		return e.path, holder, nil
+	}
+	return "", holder, nil
+}
+
+// worktreeRegisteredAt reports whether git has a worktree entry at path,
+// comparing symlink-resolved paths. path must exist.
+func worktreeRegisteredAt(ctx context.Context, repoDir, path string) (bool, error) {
+	want, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false, err
+	}
+	entries, err := listWorktreeEntries(ctx, repoDir)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if got, err := filepath.EvalSymlinks(e.path); err == nil && got == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// clearOwnStaleWorktreeEntry removes a stale git entry at the agent's own
+// worktreePath before a worktree is added there, and no other entry
+// (ptone/scion#5071). Without it, "git worktree add" refuses the path as a
+// registered worktree.
+//
+//   - worktreePath missing: its entry, if any, is removed.
+//   - worktreePath an empty directory (made for the pod mount) that git
+//     still has an entry for: git refuses to remove the entry of a
+//     directory that exists, so the empty directory is removed, the entry
+//     removed, and the directory created again with the same mode
+//     (including setgid and sticky) and owner. The directory's own ACL is
+//     not carried over; the new directory inherits its parent's default
+//     ACL, as a newly made one would.
+//   - Anything else (a non-empty directory, a file, a link, an empty
+//     directory git has no entry for) is left alone.
+//
+// Any failing step returns an error that names the path and what to do,
+// depending on the state the step left behind.
+func clearOwnStaleWorktreeEntry(ctx context.Context, in ProvisionInput, base, worktreePath string) error {
+	// util.RemoveWorktreeEntry runs the command itself, after the worktree
+	// directory is gone; the SafeGitCommand settings and pin stay on it.
+	gitCmd := func(ctx context.Context, args ...string) (*exec.Cmd, error) {
+		cmd, err := SafeGitCommand(ctx, base, args...)
+		if err != nil {
+			return nil, err
+		}
+		return cmd.Cmd, nil
+	}
+	fi, err := os.Lstat(worktreePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := util.RemoveWorktreeEntry(ctx, worktreePath, gitCmd); err != nil {
+			return staleEntryError(in, worktreePath, staleEntryKept, err)
+		}
+		return nil
+	}
+	if err != nil || mountedDirState(worktreePath) != mountedDirEmpty {
+		return nil
+	}
+	registered, err := worktreeRegisteredAt(ctx, base, worktreePath)
+	if err != nil || !registered {
+		return nil
+	}
+	uid, gid, ok := fileOwner(fi)
+	if !ok {
+		return staleEntryError(in, worktreePath, staleEntryDirKept, fmt.Errorf("cannot read the owner of %s", worktreePath))
+	}
+	if err := os.Remove(worktreePath); err != nil {
+		return staleEntryError(in, worktreePath, staleEntryDirKept, err)
+	}
+	mode := fi.Mode() & (fs.ModePerm | fs.ModeSetgid | fs.ModeSticky)
+	if err := util.RemoveWorktreeEntry(ctx, worktreePath, gitCmd); err != nil {
+		if mkErr := recreateEmptyDir(worktreePath, mode, int(uid), int(gid)); mkErr != nil {
+			err = errors.Join(err, mkErr)
+		}
+		return staleEntryError(in, worktreePath, staleEntryDirKept, err)
+	}
+	if err := recreateEmptyDir(worktreePath, mode, int(uid), int(gid)); err != nil {
+		return staleEntryError(in, worktreePath, staleEntryDirNotRecreated, err)
+	}
+	slog.Info("ProvisionShared: removed a stale git entry for the agent's empty worktree directory",
+		"agent_id", in.AgentID, "path", worktreePath)
+	return nil
+}
+
+// staleEntryState is what a failed clearOwnStaleWorktreeEntry step left
+// behind, which decides the advice in its error.
+type staleEntryState int
+
+const (
+	// staleEntryKept: the path is missing and git's entry for it is kept.
+	staleEntryKept staleEntryState = iota
+	// staleEntryDirKept: an empty directory is at the path and git's entry
+	// for it is kept.
+	staleEntryDirKept
+	// staleEntryDirNotRecreated: git's entry was removed, but the empty
+	// directory could not be created again with its owner and mode.
+	staleEntryDirNotRecreated
+)
+
+// staleEntryError reports a failed clearOwnStaleWorktreeEntry step. Paths
+// are shown relative to the shared checkout for MountedWorktree, whose
+// mount paths exist only in the init container.
+func staleEntryError(in ProvisionInput, path string, state staleEntryState, err error) error {
+	shown, gitPath := path, path
+	if in.MountedWorktree {
+		shown, gitPath = mountedDisplayPath(in, path), sharedCheckoutRel(in, path)
+	}
+	switch state {
+	case staleEntryDirKept:
+		return fmt.Errorf("ProvisionShared: %s is an empty directory that git still has a worktree entry for, and the entry could not be removed: %w. "+
+			"Make sure nothing is mounted at it and remove the empty directory, unlock the entry if it is locked (git worktree unlock %s), "+
+			"then run git worktree remove %s in the shared checkout and start the agent again", shown, err, gitPath, gitPath)
+	case staleEntryDirNotRecreated:
+		return fmt.Errorf("ProvisionShared: removed git's stale worktree entry at %s, but could not create its empty directory again with its owner and mode: %w. "+
+			"Check the directory's owner and mode (or remove it), then start the agent again", shown, err)
+	default:
+		return fmt.Errorf("ProvisionShared: git still has a worktree entry at %s, where nothing exists any more, and it could not be removed: %w. "+
+			"Unlock the entry if it is locked (git worktree unlock %s), then run git worktree remove %s in the shared checkout and start the agent again",
+			shown, err, gitPath, gitPath)
+	}
+}
+
+// recreateEmptyDir creates dir with mode and owner. The mode is applied
+// after the owner, since changing the owner can clear setgid. A variable
+// so tests can make it fail.
+var recreateEmptyDir = func(dir string, mode os.FileMode, uid, gid int) error {
+	if err := os.Mkdir(dir, mode.Perm()); err != nil {
+		return err
+	}
+	if err := os.Lchown(dir, uid, gid); err != nil {
+		return err
+	}
+	return os.Chmod(dir, mode)
 }
 
 // prepareBaseForWorktrees configures a freshly cloned base checkout for
@@ -3936,57 +4184,6 @@ func appendGitExclude(hostPath, pattern string) error {
 	}
 	_, err = f.WriteString(pattern + "\n")
 	return err
-}
-
-// openGitExclude opens hostPath/.git/info/exclude for reading and appending
-// without following a symlink at .git, info or exclude: each component is
-// opened with openat relative to its parent's descriptor and O_NOFOLLOW, so
-// none of them can be redirected by a symlink, or swapped for one between
-// a check and the open. info is created if missing; exclude is created if
-// missing and must be a regular file (O_NONBLOCK keeps a FIFO planted there
-// from blocking the open; it is then refused).
-func openGitExclude(hostPath string) (*os.File, error) {
-	const dirFlags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-	rootFd, err := unix.Open(hostPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", hostPath, err)
-	}
-	defer func() { _ = unix.Close(rootFd) }()
-	gitDir := filepath.Join(hostPath, ".git")
-	gitFd, err := unix.Openat(rootFd, ".git", dirFlags, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open %s without following symlinks: %w", gitDir, err)
-	}
-	defer func() { _ = unix.Close(gitFd) }()
-
-	infoDir := filepath.Join(gitDir, "info")
-	infoFd, err := unix.Openat(gitFd, "info", dirFlags, 0)
-	if errors.Is(err, unix.ENOENT) {
-		if mkErr := unix.Mkdirat(gitFd, "info", 0o755); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
-			return nil, fmt.Errorf("mkdir %s: %w", infoDir, mkErr)
-		}
-		infoFd, err = unix.Openat(gitFd, "info", dirFlags, 0)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("open %s without following symlinks: %w", infoDir, err)
-	}
-	defer func() { _ = unix.Close(infoFd) }()
-
-	excludePath := filepath.Join(infoDir, "exclude")
-	fd, err := unix.Openat(infoFd, "exclude", unix.O_RDWR|unix.O_APPEND|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open %s without following symlinks: %w", excludePath, err)
-	}
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("stat %s: %w", excludePath, err)
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("%s is not a regular file", excludePath)
-	}
-	return os.NewFile(uintptr(fd), excludePath), nil
 }
 
 // sanitizeBranchName produces a git-safe branch name from an agent name.
@@ -4170,18 +4367,18 @@ func checkChownEPERM(path string, uid, gid int, lerr error) error {
 	if serr != nil {
 		return fmt.Errorf("lchown %d:%d %s: %w (stat for owner check failed: %v)", uid, gid, path, lerr, serr)
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
+	ownerUID, ownerGID, ok := fileOwner(info)
 	if !ok {
 		return fmt.Errorf("lchown %d:%d %s: %w (owner unknown)", uid, gid, path, lerr)
 	}
 	// -1 means "leave unchanged" to lchown, so it matches any on-disk ID.
-	if (uid == -1 || int(st.Uid) == uid) && (gid == -1 || int(st.Gid) == gid) {
+	if (uid == -1 || int(ownerUID) == uid) && (gid == -1 || int(ownerGID) == gid) {
 		slog.Debug("chown not permitted but ownership already matches, continuing",
 			"path", path, "uid", uid, "gid", gid)
 		return nil
 	}
 	return fmt.Errorf("lchown %d:%d %s: %w (owner is %d:%d, want %d:%d)",
-		uid, gid, path, lerr, st.Uid, st.Gid, uid, gid)
+		uid, gid, path, lerr, ownerUID, ownerGID, uid, gid)
 }
 
 // isLockArtifactPath reports whether path's base name is the file lock's own
@@ -4192,6 +4389,13 @@ func checkChownEPERM(path string, uid, gid int, lerr error) error {
 // provisionFileLockName, and provisionClockProbeFile is defined as
 // provisionFileLockName plus a suffix specifically so this one prefix check
 // catches all of them.
+// IsProvisioningArtifact reports whether name is provisioning bookkeeping
+// rather than workspace content: the provisioning file lock or one of its
+// satellites (isLockArtifactPath), or the provisioning sentinel.
+func IsProvisioningArtifact(name string) bool {
+	return isLockArtifactPath(name) || filepath.Base(name) == ProvisionSentinelFile
+}
+
 func isLockArtifactPath(path string) bool {
 	base := filepath.Base(path)
 	return base == provisionFileLockName || strings.HasPrefix(base, provisionFileLockName+".")
@@ -4214,6 +4418,19 @@ func resolveUID(in ProvisionInput) int {
 // resolveGID returns the NFS GID to use for chown, defaulting to 1000.
 func resolveGID(in ProvisionInput) int {
 	return DefaultOwnerID(in.NFSGID)
+}
+
+// MarkProvisioned writes the provisioning sentinel in sentinelDir (the
+// project state directory, ProjectStateDir, for a shared workspace), so
+// every later provisioner takes the reuse path. The caller holds the
+// provisioning locks (WithWorkspaceProvisionLocks) and has placed the
+// workspace's content first: a broker applying a workspace bootstrap upload
+// into a shared workspace that no provisioner has populated yet.
+func MarkProvisioned(sentinelDir string) error {
+	if sentinelDir == "" || !filepath.IsAbs(sentinelDir) {
+		return errors.New("provision: an absolute sentinel directory is required")
+	}
+	return writeSentinel(filepath.Join(sentinelDir, ProvisionSentinelFile))
 }
 
 // writeSentinel writes the provisioning sentinel file atomically using

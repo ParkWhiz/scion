@@ -20,9 +20,11 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 )
 
@@ -66,6 +68,7 @@ type mockManager struct {
 	lastDeleteRunID        string
 	lastDeleteFiles        bool
 	lastDeleteRemoveBranch bool
+	lastDeleteSharerKey    string
 	lastStopAgentID        string
 	lastStopRunID          string
 	// lastStartCtx captures the context passed to Start, so tests can assert
@@ -79,6 +82,12 @@ type mockManager struct {
 	// control its return value (including the three agentkeys sentinels)
 	// and capture its arguments, without needing a real AgentManager/tmux.
 	sendKeysFunc func(ctx context.Context, projectID, agentSlug, expectedAgentID, keys string) error
+
+	// beforeProvision, when set, runs at the start of Provision (for
+	// example to leave agent files behind before provisionErr).
+	beforeProvision func(opts api.StartOptions)
+	// beforeStart, when set, runs at the start of Start.
+	beforeStart func(opts api.StartOptions)
 
 	// preflightErr, when set, is returned by Preflight (e.g.
 	// config.ErrTemplateNotFound, for the async-create admission 404 case).
@@ -94,6 +103,9 @@ type mockManager struct {
 }
 
 func (m *mockManager) Provision(ctx context.Context, opts api.StartOptions) (*api.ScionConfig, error) {
+	if m.beforeProvision != nil {
+		m.beforeProvision(opts)
+	}
 	if m.provisionErr != nil {
 		return nil, m.provisionErr
 	}
@@ -120,6 +132,9 @@ func (m *mockManager) Reprovision(ctx context.Context, opts api.StartOptions) (*
 }
 
 func (m *mockManager) Start(ctx context.Context, opts api.StartOptions) (*api.AgentInfo, error) {
+	if m.beforeStart != nil {
+		m.beforeStart(opts)
+	}
 	m.mu.Lock()
 	m.startCalls++
 	m.lastStartOpts = opts
@@ -169,7 +184,7 @@ func (m *mockManager) Start(ctx context.Context, opts api.StartOptions) (*api.Ag
 	return agent, nil
 }
 
-func (m *mockManager) Stop(ctx context.Context, agentID, projectPath, runID string) error {
+func (m *mockManager) Stop(ctx context.Context, agentID, projectPath, projectID, runID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopCalls++
@@ -189,7 +204,7 @@ func (m *mockManager) StopTarget(ctx context.Context, ref runtime.RunRef) error 
 	return m.stopErr
 }
 
-func (m *mockManager) Delete(ctx context.Context, agentID string, deleteFiles bool, projectPath string, removeBranch bool) (bool, error) {
+func (m *mockManager) Delete(ctx context.Context, agentID string, deleteFiles bool, projectPath, projectID string, removeBranch bool) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastDeleteProjectPath = projectPath
@@ -198,7 +213,7 @@ func (m *mockManager) Delete(ctx context.Context, agentID string, deleteFiles bo
 	return true, nil
 }
 
-func (m *mockManager) DeleteTarget(ctx context.Context, agentName string, ref runtime.RunRef, deleteFiles bool, projectPath string, removeBranch bool) (bool, error) {
+func (m *mockManager) DeleteTarget(ctx context.Context, agentName, sharerKey string, ref runtime.RunRef, deleteFiles bool, projectPath string, removeBranch bool) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastDeleteProjectPath = projectPath
@@ -207,6 +222,7 @@ func (m *mockManager) DeleteTarget(ctx context.Context, agentName string, ref ru
 	m.lastDeleteRunID = ref.RunID
 	m.lastDeleteFiles = deleteFiles
 	m.lastDeleteRemoveBranch = removeBranch
+	m.lastDeleteSharerKey = sharerKey
 	m.deleteCalls++
 	if m.deleteTargetErr != nil {
 		return false, m.deleteTargetErr
@@ -318,6 +334,13 @@ func (m *mockManager) LastDeleteFiles() bool {
 	return m.lastDeleteFiles
 }
 
+// LastDeleteSharerKey returns the sharer key of the last DeleteTarget call.
+func (m *mockManager) LastDeleteSharerKey() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastDeleteSharerKey
+}
+
 func (m *mockManager) LastListFilter() map[string]string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -413,6 +436,41 @@ runtimes:
 	}
 }
 
+// asyncLaunchCleanupWait bounds how long a test server's cleanup waits for
+// its async launches to end (endAsyncLaunchesAtCleanup).
+const asyncLaunchCleanupWait = 10 * time.Second
+
+// endAsyncLaunchesAtCleanup ends srv's async launches before the test's
+// temp dirs are removed (ptone/scion#5142). A launch accepted by a test can
+// still be running when the test body returns (for example after a
+// deferred close of a blocked Start), and it writes its launch journal and
+// markers under the test's HOME. If t.TempDir's RemoveAll runs at the same
+// moment, it fails with "directory not empty". Registered after the
+// caller's temp dirs, so it runs before their removal (cleanups run last
+// registered, first). It drains srv as a shutdown would: a launch still
+// running is cancelled and reports broker_restarted to the test hub (the
+// test has already returned, so no assertion sees it), and the drain waits,
+// bounded, for every accepted launch to finish (its done channel closes
+// only after its last journal and marker write). Only accepted launches
+// (the drain's set) are waited for, not every launch registry record: some
+// tests register records directly that no launch ever finishes. It then
+// closes the journal.
+func endAsyncLaunchesAtCleanup(t *testing.T, srv *Server) {
+	t.Helper()
+	t.Cleanup(func() {
+		srv.DrainLaunches(context.Background(), asyncLaunchCleanupWait)
+		srv.launchDrain.mu.Lock()
+		n := len(srv.launchDrain.active)
+		srv.launchDrain.mu.Unlock()
+		if n > 0 {
+			t.Errorf("%d async launch(es) still running %v after the test; its temp dirs may not be removable", n, asyncLaunchCleanupWait)
+		}
+		if srv.launchJournal != nil {
+			srv.launchJournal.Close()
+		}
+	})
+}
+
 // newTestServerWithManager wires up a Server with the given agent.Manager
 // (e.g. a *filteringMockManager for tests that need List to honor the filter
 // map) plus the same isolated .scion environment newTestServer uses, so
@@ -421,7 +479,7 @@ func newTestServerWithManager(t *testing.T, mgr agent.Manager) *Server {
 	t.Helper()
 	setupTestScionEnv(t)
 
-	cfg := DefaultServerConfig()
+	cfg := testServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
 	cfg.ForceRuntime = "mock"
@@ -430,7 +488,9 @@ func newTestServerWithManager(t *testing.T, mgr agent.Manager) *Server {
 	// returns the mock manager directly instead of creating a real one.
 	rt := &runtime.MockRuntime{NameFunc: func() string { return "mock" }}
 
-	return New(cfg, mgr, rt)
+	srv := New(cfg, mgr, rt, config.RuntimeBuildRecord{})
+	endAsyncLaunchesAtCleanup(t, srv)
+	return srv
 }
 
 func newTestServer(t *testing.T) *Server {
@@ -478,7 +538,7 @@ func (m *envCapturingManager) Start(ctx context.Context, opts api.StartOptions) 
 }
 
 func newTestServerWithEnvCapture() (*Server, *envCapturingManager) {
-	cfg := DefaultServerConfig()
+	cfg := testServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
 	cfg.Debug = true
@@ -489,7 +549,7 @@ func newTestServerWithEnvCapture() (*Server, *envCapturingManager) {
 	// NameFunc returns "docker" so resolveManagerForOpts matches the settings-resolved runtime.
 	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
 
-	return New(cfg, mgr, rt), mgr
+	return New(cfg, mgr, rt, config.RuntimeBuildRecord{}), mgr
 }
 
 // provisionCapturingManager tracks whether Provision, Reprovision or Start
@@ -549,7 +609,7 @@ func (m *provisionCapturingManager) Start(ctx context.Context, opts api.StartOpt
 }
 
 func newTestServerWithProvisionCapture() (*Server, *provisionCapturingManager) {
-	cfg := DefaultServerConfig()
+	cfg := testServerConfig()
 	cfg.BrokerID = "test-broker-id"
 	cfg.BrokerName = "test-host"
 	cfg.ForceRuntime = "mock"
@@ -558,5 +618,5 @@ func newTestServerWithProvisionCapture() (*Server, *provisionCapturingManager) {
 	// NameFunc returns "docker" so resolveManagerForOpts matches the settings-resolved runtime.
 	rt := &runtime.MockRuntime{NameFunc: func() string { return "docker" }}
 
-	return New(cfg, mgr, rt), mgr
+	return New(cfg, mgr, rt, config.RuntimeBuildRecord{}), mgr
 }

@@ -34,6 +34,8 @@ var lifecycleDispatchMethods = map[string]bool{
 	"DispatchAgentCreate":           true,
 	"DispatchAgentCreateWithGather": true,
 	"DispatchAgentProvision":        true,
+	// The start-options entry point (ptone/scion#4669) is a start.
+	"DispatchAgentStartWithOptions": true,
 }
 
 // How a function that calls a lifecycle dispatch method keeps the agent's
@@ -73,6 +75,11 @@ var lifecycleDispatchCallers = map[string]lifecycleDispatchRule{
 	"Server.dispatchAgentDeletions":        {kind: intentRecorded},
 	"Server.handleWorkspaceSyncToFinalize": {kind: intentRecorded, recordedBy: "Server.withStartClaim"},
 	"dispatchDeleteFailedCreate":           {kind: intentRecorded, recordedBy: "Server.cleanupFailedCreate"},
+	// The delete of the run the broker reported holding (ptone/scion#5016)
+	// is reached only from deletionEngine.dispatch, after that function
+	// recorded the stopped intent for this delete; a second record here
+	// would overwrite the prior intent the engine's rollback restores.
+	"deletionEngine.retryReportedRunDelete": {kind: intentRecorded, recordedBy: "deletionEngine.dispatch"},
 
 	"Server.execDispatchStart":   {kind: intentExecutor},
 	"Server.execDispatchStop":    {kind: intentExecutor},

@@ -29,6 +29,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth"
 	"github.com/GoogleCloudPlatform/scion/pkg/transportauth/adcsource"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/privatefs"
 	"github.com/GoogleCloudPlatform/scion/pkg/version"
 	"github.com/spf13/cobra"
 )
@@ -106,9 +107,9 @@ func init() {
 // resolveBrokerJoinToken returns the join token, trimmed of surrounding
 // whitespace. It is read from tokenFile when set ('-' reads stdin), and
 // otherwise from SCION_BROKER_JOIN_TOKEN. A value without the scion_join_
-// prefix is rejected here, before any request is sent. A token file with
-// any group or other permission bits is used, with a warning written to
-// stderr.
+// prefix is rejected here, before any request is sent. A token file that
+// is not private (privatefs.CheckPrivate) is used, with a warning written
+// to stderr.
 func resolveBrokerJoinToken(tokenFile string, stdin io.Reader, stderr io.Writer) (string, error) {
 	var token, source string
 	switch tokenFile {
@@ -131,8 +132,12 @@ func resolveBrokerJoinToken(tokenFile string, stdin io.Reader, stderr io.Writer)
 		if err != nil {
 			return "", fmt.Errorf("failed to read the join token file: %w", err)
 		}
-		if info, statErr := f.Stat(); statErr == nil && info.Mode().Perm()&0o077 != 0 {
-			_, _ = fmt.Fprintf(stderr, "Warning: %s has group or other permissions (mode %04o); consider chmod 600\n", tokenFile, info.Mode().Perm())
+		// Checked on the open handle by privatefs: the
+		// mode bits and owner on unix, the real DACL and owner on Windows
+		// (where the command is gated; this keeps the warning honest if it
+		// is ever reached).
+		if perr := privatefs.CheckPrivate(f); perr != nil {
+			_, _ = fmt.Fprintf(stderr, "Warning: %s has group or other permissions or another owner (%v); consider restricting it to %s\n", tokenFile, perr, privatefs.Describe(privatefs.Private))
 		}
 		data, err := readBrokerJoinTokenInput(f)
 		_ = f.Close()
@@ -351,7 +356,7 @@ func completeJoinAndPersist(ctx context.Context, client hubclient.Client, p brok
 		BrokerID:         p.BrokerID,
 		JoinToken:        p.JoinToken,
 		Hostname:         p.Hostname,
-		Version:          version.Version,
+		Version:          version.Short(),
 		Capabilities:     brokerRegistrationCapabilities(),
 		Profiles:         buildBrokerProfiles(p.Settings),
 		WorkspaceStorage: loadBrokerRegistrationWorkspaceStorage(),
@@ -360,6 +365,11 @@ func completeJoinAndPersist(ctx context.Context, client hubclient.Client, p brok
 
 	joinResp, err := client.RuntimeBrokers().Join(ctx, joinReq)
 	if err != nil {
+		return nil, fmt.Errorf("failed to complete broker join: %w", err)
+	}
+	// The broker ID names the broker's state directory; refuse one that is
+	// not a single path element before saving anything.
+	if err := brokercredentials.ValidateBrokerIDPathElement(joinResp.BrokerID); err != nil {
 		return nil, fmt.Errorf("failed to complete broker join: %w", err)
 	}
 
@@ -398,8 +408,13 @@ func completeJoinAndPersist(ctx context.Context, client hubclient.Client, p brok
 // (one with a dev token): there the key would take precedence over the
 // co-located localhost and move the local broker onto the registered hub.
 // The CLI's hub.endpoint is never written. Failures are reported to w as
-// warnings, as 'register' has always done.
+// warnings, as 'register' has always done. A broker ID that is not a single
+// path element is not saved, and neither is anything else (warned to w).
 func persistBrokerHubSettings(w io.Writer, globalDir, endpoint, brokerID, hubName string) {
+	if err := brokercredentials.ValidateBrokerIDPathElement(brokerID); err != nil {
+		_, _ = fmt.Fprintf(w, "Warning: not saving the broker ID or hub settings: %v\n", err)
+		return
+	}
 	// hub.brokerId first: on a legacy-format file this write migrates it to
 	// the v1 format the in-place edit below needs.
 	if err := config.UpdateSetting(globalDir, "hub.brokerId", brokerID, true); err != nil {
@@ -436,8 +451,11 @@ var brokerHubEndpointSettingPath = []string{"server", "broker", "hub_endpoint"}
 // in the settings file in dir, editing it in place, unless the file already
 // sets it.
 func saveBrokerHubEndpointIfUnset(dir, endpoint string) error {
-	unlock := config.LockSettingsFile()
-	defer unlock()
+	lock, err := config.LockSettingsDir(dir)
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
 
 	if vs, err := config.LoadSingleFileVersioned(dir); err == nil &&
 		vs.Server != nil && vs.Server.Broker != nil && vs.Server.Broker.HubEndpoint != "" {
@@ -447,5 +465,5 @@ func saveBrokerHubEndpointIfUnset(dir, endpoint string) error {
 	if err != nil {
 		return err
 	}
-	return staged.Commit()
+	return staged.Commit(lock)
 }

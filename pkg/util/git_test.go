@@ -123,7 +123,7 @@ func TestGitUtils(t *testing.T) {
 		}
 
 		// Remove
-		if _, err := RemoveWorktree(repoDir, worktreePath, false); err != nil {
+		if _, err := RemoveWorktree(repoDir, worktreePath, repoDir, ""); err != nil {
 			t.Fatalf("RemoveWorktree failed: %v", err)
 		}
 		// Wait/Check? git worktree remove deletes the directory usually.
@@ -131,40 +131,20 @@ func TestGitUtils(t *testing.T) {
 			t.Errorf("worktree dir still exists after removal")
 		}
 
-		// Test PruneWorktrees
-		prunePath := filepath.Join(repoDir, "prune-test")
-		pruneBranch := "prune-branch"
-		if err := CreateWorktree(prunePath, pruneBranch); err != nil {
-			t.Fatalf("CreateWorktree for prune failed: %v", err)
-		}
-		// Manually remove directory to simulate stale worktree
-		if err := os.RemoveAll(prunePath); err != nil {
-			t.Fatalf("Failed to remove prune path: %v", err)
-		}
-		// Prune
-		if err := PruneWorktrees(); err != nil {
-			t.Fatalf("PruneWorktrees failed: %v", err)
-		}
-		// Verify we can create it again (if prune failed, this might fail with 'already exists')
-		if err := CreateWorktree(prunePath, pruneBranch); err != nil {
-			t.Errorf("Failed to recreate worktree after prune: %v", err)
-		}
-		// Clean up
-		_, _ = RemoveWorktree(repoDir, prunePath, true)
 	})
 
-	t.Run("PruneWorktreesIn", func(t *testing.T) {
-		prunePath := filepath.Join(repoDir, "prune-in-test")
-		pruneBranch := "prune-in-branch"
-		if err := CreateWorktree(prunePath, pruneBranch); err != nil {
+	t.Run("RemoveWorktreeEntryIn", func(t *testing.T) {
+		stalePath := filepath.Join(repoDir, "stale-entry-test")
+		staleBranch := "stale-entry-branch"
+		if err := CreateWorktree(stalePath, staleBranch); err != nil {
 			t.Fatalf("CreateWorktree failed: %v", err)
 		}
 		// Manually remove directory to simulate stale worktree
-		if err := os.RemoveAll(prunePath); err != nil {
-			t.Fatalf("Failed to remove prune path: %v", err)
+		if err := os.RemoveAll(stalePath); err != nil {
+			t.Fatalf("Failed to remove stale path: %v", err)
 		}
 
-		// PruneWorktreesIn should work even when CWD is outside the repo
+		// RemoveWorktreeEntryIn works even when CWD is outside the repo
 		outsideDir := t.TempDir()
 		prevWd, _ := os.Getwd()
 		if err := os.Chdir(outsideDir); err != nil {
@@ -172,19 +152,19 @@ func TestGitUtils(t *testing.T) {
 		}
 		defer func() { _ = os.Chdir(prevWd) }()
 
-		if err := PruneWorktreesIn(repoDir); err != nil {
-			t.Fatalf("PruneWorktreesIn failed: %v", err)
+		if err := RemoveWorktreeEntryIn(repoDir, stalePath); err != nil {
+			t.Fatalf("RemoveWorktreeEntryIn failed: %v", err)
 		}
 
-		// Verify we can create the worktree again (prune cleared the stale record)
+		// Verify we can create the worktree again (the stale entry is gone)
 		if err := os.Chdir(prevWd); err != nil {
 			t.Fatal(err)
 		}
-		if err := CreateWorktree(prunePath, pruneBranch); err != nil {
-			t.Errorf("Failed to recreate worktree after PruneWorktreesIn: %v", err)
+		if err := CreateWorktree(stalePath, staleBranch); err != nil {
+			t.Errorf("Failed to recreate worktree after RemoveWorktreeEntryIn: %v", err)
 		}
 		// Clean up
-		_, _ = RemoveWorktree(repoDir, prunePath, true)
+		_, _ = RemoveWorktree(repoDir, stalePath, repoDir, "")
 	})
 
 	t.Run("DeleteBranchIn", func(t *testing.T) {
@@ -194,13 +174,13 @@ func TestGitUtils(t *testing.T) {
 		if err := CreateWorktree(wtPath, branch); err != nil {
 			t.Fatalf("CreateWorktree failed: %v", err)
 		}
-		if _, err := RemoveWorktree(repoDir, wtPath, false); err != nil {
+		if _, err := RemoveWorktree(repoDir, wtPath, repoDir, ""); err != nil {
 			t.Fatalf("RemoveWorktree failed: %v", err)
 		}
 
 		// Branch should still exist
 		if !BranchExistsIn(repoDir, branch) {
-			t.Fatal("expected branch to still exist after RemoveWorktree(deleteBranch=false)")
+			t.Fatal("expected branch to still exist after RemoveWorktree with no branch to delete")
 		}
 
 		// DeleteBranchIn should remove it
@@ -241,7 +221,7 @@ func TestGitUtils(t *testing.T) {
 		}
 
 		// Clean up
-		_, _ = RemoveWorktree(repoDir, wtPath, true)
+		_, _ = RemoveWorktree(repoDir, wtPath, repoDir, "")
 	})
 
 	t.Run("RemoveWorktreeWithBranch", func(t *testing.T) {
@@ -252,7 +232,7 @@ func TestGitUtils(t *testing.T) {
 			t.Fatalf("CreateWorktree failed: %v", err)
 		}
 
-		deleted, err := RemoveWorktree(repoDir, wtPath, true)
+		deleted, err := RemoveWorktree(repoDir, wtPath, repoDir, branch)
 		if err != nil {
 			t.Fatalf("RemoveWorktree failed: %v", err)
 		}
@@ -396,8 +376,8 @@ func TestCreateWorktree_FromWorktreeSucceeds(t *testing.T) {
 	}
 
 	// Clean up
-	_, _ = RemoveWorktree(mainRepo, siblingPath, true)
-	_, _ = RemoveWorktree(mainRepo, wtPath, true)
+	_, _ = RemoveWorktree(mainRepo, siblingPath, mainRepo, "")
+	_, _ = RemoveWorktree(mainRepo, wtPath, mainRepo, "")
 }
 
 func TestCreateWorktree_RejectsInsideContainer(t *testing.T) {
@@ -493,7 +473,7 @@ func TestIsRegisteredWorktree_MainWorktreeAcceptedWhenRepoRootIsLinkedWorktree(t
 
 	linkedPath := filepath.Join(filepath.Dir(mainRepo), "linked-repo-feature")
 	addWorktreeDirect(t, mainRepo, linkedPath, "feature")
-	defer func() { _, _ = RemoveWorktree(mainRepo, linkedPath, true) }()
+	defer func() { _, _ = RemoveWorktree(mainRepo, linkedPath, mainRepo, "") }()
 
 	// repoRoot is the LINKED worktree here, simulating a project that lives
 	// there; path is the MAIN worktree, which must still be recognized as
@@ -515,7 +495,7 @@ func TestIsRegisteredWorktree_SiblingWorktreeAccepted(t *testing.T) {
 	// `git worktree add` accepts any destination.
 	siblingPath := filepath.Join(filepath.Dir(mainRepo), "sibling-repo-feature")
 	addWorktreeDirect(t, mainRepo, siblingPath, "feature")
-	defer func() { _, _ = RemoveWorktree(mainRepo, siblingPath, true) }()
+	defer func() { _, _ = RemoveWorktree(mainRepo, siblingPath, mainRepo, "") }()
 
 	ok, err := IsRegisteredWorktree(mainRepo, siblingPath)
 	if err != nil {
@@ -535,7 +515,7 @@ func TestIsRegisteredWorktree_ScionWorktreesConventionAccepted(t *testing.T) {
 	// -- it needs no special-case handling, only real git registration.
 	wtPath := filepath.Join(filepath.Dir(mainRepo), ".scion_worktrees", "proj", "agent")
 	addWorktreeDirect(t, mainRepo, wtPath, "agent-branch")
-	defer func() { _, _ = RemoveWorktree(mainRepo, wtPath, true) }()
+	defer func() { _, _ = RemoveWorktree(mainRepo, wtPath, mainRepo, "") }()
 
 	ok, err := IsRegisteredWorktree(mainRepo, wtPath)
 	if err != nil {
@@ -575,7 +555,7 @@ func TestIsRegisteredWorktree_DifferentRepoWorktreeRejected(t *testing.T) {
 	// be accepted as a worktree of repoA.
 	wtOfB := filepath.Join(filepath.Dir(repoB), "repoB-feature")
 	addWorktreeDirect(t, repoB, wtOfB, "feature")
-	defer func() { _, _ = RemoveWorktree(repoB, wtOfB, true) }()
+	defer func() { _, _ = RemoveWorktree(repoB, wtOfB, repoB, "") }()
 
 	ok, err := IsRegisteredWorktree(repoA, wtOfB)
 	if err != nil {
@@ -651,8 +631,6 @@ func TestIsRegisteredWorktree_PrunableRecreatedPathRejected(t *testing.T) {
 	if ok {
 		t.Error("expected a prunable (stale) worktree registration, now a plain recreated directory, to be rejected")
 	}
-
-	_ = PruneWorktreesIn(mainRepo)
 }
 
 // TestIsRegisteredWorktree_RecreatedWithForeignGitDirRefused covers a
@@ -676,7 +654,7 @@ func TestIsRegisteredWorktree_RecreatedWithForeignGitDirRefused(t *testing.T) {
 
 	linkedPath := filepath.Join(filepath.Dir(mainRepo), "linked-repo-for-foreign-gitdir-test")
 	addWorktreeDirect(t, mainRepo, linkedPath, "linked-branch")
-	defer func() { _, _ = RemoveWorktree(mainRepo, linkedPath, true) }()
+	defer func() { _, _ = RemoveWorktree(mainRepo, linkedPath, mainRepo, "") }()
 
 	recreatedWt := filepath.Join(filepath.Dir(mainRepo), "recreated-wt")
 	addWorktreeDirect(t, mainRepo, recreatedWt, "recreated-branch")
@@ -713,8 +691,6 @@ func TestIsRegisteredWorktree_RecreatedWithForeignGitDirRefused(t *testing.T) {
 	if ok {
 		t.Error("expected a worktree path recreated with a foreign repo's own .git dir to be rejected against a linked worktree repoRoot")
 	}
-
-	_ = PruneWorktreesIn(mainRepo)
 }
 
 // TestIsLinkedWorktreeOf_RejectsGitdirEqualToWorktreesDir covers a real
@@ -765,21 +741,6 @@ func TestIsLinkedWorktreeOf_RejectsGitdirEqualToWorktreesDir(t *testing.T) {
 	}
 }
 
-func TestPruneWorktrees_SkipsInsideContainer(t *testing.T) {
-	// When SCION_HOST_UID is set (agent container), pruning should be a no-op
-	// to prevent destroying sibling worktree metadata that appears stale from
-	// the container's mount layout.
-	t.Setenv("SCION_HOST_UID", "1000")
-
-	// Both prune functions should return nil without running git at all.
-	if err := PruneWorktrees(); err != nil {
-		t.Errorf("PruneWorktrees should no-op inside container, got: %v", err)
-	}
-	if err := PruneWorktreesIn("/nonexistent/path"); err != nil {
-		t.Errorf("PruneWorktreesIn should no-op inside container, got: %v", err)
-	}
-}
-
 // TestRemoveWorktree_RefusesOutOfTreePath covers acceptance criterion
 // 8: RemoveWorktree must refuse to remove a path whose resolved (symlink-free)
 // location does not lie under base, and must not touch anything under the
@@ -795,7 +756,7 @@ func TestRemoveWorktree_RefusesOutOfTreePath(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err := RemoveWorktree(base, outside, false)
+		_, err := RemoveWorktree(base, outside, base, "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained, got: %v", err)
 		}
@@ -806,7 +767,7 @@ func TestRemoveWorktree_RefusesOutOfTreePath(t *testing.T) {
 
 	t.Run("candidate equals base", func(t *testing.T) {
 		base := setupGitRepo(t)
-		_, err := RemoveWorktree(base, base, false)
+		_, err := RemoveWorktree(base, base, base, "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained for candidate==base, got: %v", err)
 		}
@@ -836,7 +797,7 @@ func TestRemoveWorktree_RefusesOutOfTreePath(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err := RemoveWorktree(base, leaf, false)
+		_, err := RemoveWorktree(base, leaf, base, "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained, got: %v", err)
 		}
@@ -869,7 +830,7 @@ func TestRemoveWorktree_RefusesOutOfTreePath(t *testing.T) {
 		}
 		candidate := filepath.Join(base, "worktrees", "name")
 
-		_, err := RemoveWorktree(base, candidate, false)
+		_, err := RemoveWorktree(base, candidate, base, "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained, got: %v", err)
 		}
@@ -897,7 +858,7 @@ func TestRemoveWorktree_RefusesOutOfTreePath(t *testing.T) {
 			t.Fatalf("CreateWorktree failed: %v", err)
 		}
 
-		if _, err := RemoveWorktree(base, wtPath, false); err != nil {
+		if _, err := RemoveWorktree(base, wtPath, base, ""); err != nil {
 			t.Fatalf("RemoveWorktree of a legitimate in-tree worktree should succeed, got: %v", err)
 		}
 		if _, statErr := os.Stat(wtPath); !os.IsNotExist(statErr) {
@@ -907,7 +868,7 @@ func TestRemoveWorktree_RefusesOutOfTreePath(t *testing.T) {
 
 	t.Run("non-existent path is a no-op, not an error", func(t *testing.T) {
 		base := setupGitRepo(t)
-		deleted, err := RemoveWorktree(base, filepath.Join(base, "worktrees", "never-existed"), false)
+		deleted, err := RemoveWorktree(base, filepath.Join(base, "worktrees", "never-existed"), base, "")
 		if err != nil {
 			t.Errorf("removing a non-existent path should be a no-op, got: %v", err)
 		}
@@ -931,28 +892,28 @@ func TestRemoveWorktree_PreRemovalValidationFailures_NoFallback(t *testing.T) {
 	t.Setenv("SCION_HOST_UID", "")
 
 	t.Run("empty base", func(t *testing.T) {
-		_, err := RemoveWorktree("", "/some/path", false)
+		_, err := RemoveWorktree("", "/some/path", "", "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained for empty base, got: %v", err)
 		}
 	})
 
 	t.Run("empty path", func(t *testing.T) {
-		_, err := RemoveWorktree("/some/base", "", false)
+		_, err := RemoveWorktree("/some/base", "", "/some/base", "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained for empty path, got: %v", err)
 		}
 	})
 
 	t.Run("relative base", func(t *testing.T) {
-		_, err := RemoveWorktree("relative/base", "/some/path", false)
+		_, err := RemoveWorktree("relative/base", "/some/path", "relative/base", "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained for relative base, got: %v", err)
 		}
 	})
 
 	t.Run("relative path", func(t *testing.T) {
-		_, err := RemoveWorktree("/some/base", "relative/path", false)
+		_, err := RemoveWorktree("/some/base", "relative/path", "/some/base", "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained for relative path, got: %v", err)
 		}
@@ -965,7 +926,7 @@ func TestRemoveWorktree_PreRemovalValidationFailures_NoFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 		candidate := filepath.Join(notADir, "child")
-		_, err := RemoveWorktree(base, candidate, false)
+		_, err := RemoveWorktree(base, candidate, base, "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained for a non-ENOENT Lstat error, got: %v", err)
 		}
@@ -981,7 +942,7 @@ func TestRemoveWorktree_PreRemovalValidationFailures_NoFallback(t *testing.T) {
 		if err := os.Symlink(loopA, loopB); err != nil {
 			t.Fatal(err)
 		}
-		_, err := RemoveWorktree(base, loopA, false)
+		_, err := RemoveWorktree(base, loopA, base, "")
 		if !errors.Is(err, ErrPathNotContained) {
 			t.Fatalf("expected ErrPathNotContained for a symlink loop, got: %v", err)
 		}
@@ -1350,7 +1311,7 @@ func TestPullSharedWorkspace(t *testing.T) {
 	}
 
 	t.Run("PullNoChanges", func(t *testing.T) {
-		result, err := PullSharedWorkspace(cloneDir, "")
+		result, err := PullSharedWorkspace(cloneDir, sourceDir, "")
 		if err != nil {
 			t.Fatalf("Pull failed: %v", err)
 		}
@@ -1375,7 +1336,7 @@ func TestPullSharedWorkspace(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		result, err := PullSharedWorkspace(cloneDir, "")
+		result, err := PullSharedWorkspace(cloneDir, sourceDir, "")
 		if err != nil {
 			t.Fatalf("Pull failed: %v", err)
 		}
@@ -1401,7 +1362,7 @@ func TestPullSharedWorkspace(t *testing.T) {
 
 	t.Run("PullFailure_NotARepo", func(t *testing.T) {
 		notARepo := t.TempDir()
-		_, err := PullSharedWorkspace(notARepo, "")
+		_, err := PullSharedWorkspace(notARepo, sourceDir, "")
 		if err == nil {
 			t.Fatal("expected pull to fail for non-repo directory")
 		}
@@ -1509,84 +1470,6 @@ func TestGitError_UserGuidance(t *testing.T) {
 	}
 }
 
-func TestAuthenticatedCloneURL(t *testing.T) {
-	const token = "ghp_exampletoken"
-
-	tests := []struct {
-		name     string
-		cloneURL string
-		token    string
-		want     string
-	}{
-		{
-			name:     "plain https remote gets credentials",
-			cloneURL: "https://github.com/org/repo.git",
-			token:    token,
-			want:     "https://oauth2:" + token + "@github.com/org/repo.git",
-		},
-		{
-			name:     "remote that already carries userinfo is not doubled up",
-			cloneURL: "https://org@dev.azure.com/org/project/_git/repo",
-			token:    token,
-			want:     "https://oauth2:" + token + "@dev.azure.com/org/project/_git/repo",
-		},
-		{
-			name:     "empty token leaves the URL alone",
-			cloneURL: "https://github.com/org/repo.git",
-			token:    "",
-			want:     "https://github.com/org/repo.git",
-		},
-		{
-			name:     "token with reserved characters is escaped",
-			cloneURL: "https://github.com/org/repo.git",
-			token:    "p@ss/word",
-			want:     "https://oauth2:p%40ss%2Fword@github.com/org/repo.git",
-		},
-		{
-			name:     "non-default port is preserved",
-			cloneURL: "https://host.example.com:8443/org/repo.git",
-			token:    token,
-			want:     "https://oauth2:" + token + "@host.example.com:8443/org/repo.git",
-		},
-		{
-			name:     "scp-style ssh remote is left alone",
-			cloneURL: "git@github.com:org/repo.git",
-			token:    token,
-			want:     "git@github.com:org/repo.git",
-		},
-		{
-			name:     "ssh scheme is left alone rather than given an oauth token",
-			cloneURL: "ssh://git@github.com/org/repo.git",
-			token:    token,
-			want:     "ssh://git@github.com/org/repo.git",
-		},
-		{
-			name:     "plain http is left alone",
-			cloneURL: "http://internal.example.com/org/repo.git",
-			token:    token,
-			want:     "http://internal.example.com/org/repo.git",
-		},
-		{
-			name:     "unparseable remote is returned unchanged",
-			cloneURL: "not a url",
-			token:    token,
-			want:     "not a url",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := authenticatedCloneURL(tt.cloneURL, tt.token)
-			if got != tt.want {
-				t.Errorf("authenticatedCloneURL(%q, token) = %q, want %q", tt.cloneURL, got, tt.want)
-			}
-			if tt.token != "" && strings.Count(got, "@") > 1 {
-				t.Errorf("result contains more than one @ separator: %q", got)
-			}
-		})
-	}
-}
-
 // fakeGitBinary writes a shell script that reports the given `git --version`
 // output and returns its path, for pointing SCION_GIT_BINARY at a specific
 // version without depending on whatever git happens to be installed on the
@@ -1680,5 +1563,95 @@ func TestStripGitURLCredentials(t *testing.T) {
 				t.Errorf("StripGitURLCredentials(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// After CloneSharedWorkspace, no credential remains anywhere in the clone's
+// .git/config (the remote URL included): the token is supplied through a scoped
+// credential helper in the environment, never embedded in the URL.
+func TestCloneSharedWorkspace_NoCredentialInConfig(t *testing.T) {
+	source := setupGitRepo(t)
+	if err := os.WriteFile(filepath.Join(source, "hello.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range [][]string{{"add", "hello.txt"}, {"commit", "-m", "c"}} {
+		c := exec.Command("git", a...)
+		c.Dir = source
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", a, err, out)
+		}
+	}
+	const token = "shared-clone-secret-token"
+	dest := filepath.Join(t.TempDir(), "workspace")
+	if err := CloneSharedWorkspace(dest, source, "", token); err != nil {
+		t.Fatalf("CloneSharedWorkspace: %v", err)
+	}
+	cfg, err := os.ReadFile(filepath.Join(dest, ".git", "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cfg), token) || strings.Contains(string(cfg), "oauth2:") {
+		t.Errorf(".git/config must carry no credential, got:\n%s", cfg)
+	}
+}
+
+// CloneSharedWorkspace with an https URL, run through a PATH-first fake git.
+// Asserts (i) the clone env carries the host-scoped credential helper, (ii) no
+// token appears on any git argv or in a GIT_CONFIG_VALUE, and (iii) the resulting
+// .git/config is credential-free (the token is supplied only via the env helper,
+// never embedded in the URL).
+func TestCloneSharedWorkspace_HTTPS_NoCredentialOnArgvOrConfig(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not installed")
+	}
+	const token = "shared-https-secret-token"
+	root := t.TempDir()
+	argvLog := filepath.Join(root, "argv.log")
+	envLog := filepath.Join(root, "env.log")
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Fake git: record argv + the credential-relevant env; a clone becomes a local
+	// init + remote add of the (credential-free) URL; config passes through.
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> '" + argvLog + "'\n" +
+		"env | grep -E '^(GIT_CONFIG_|SCION_SCOPED_GIT_CREDENTIAL)' >> '" + envLog + "'\n" +
+		"a1=''; a2=''; for a in \"$@\"; do a1=\"$a2\"; a2=\"$a\"; done\n" +
+		"case \" $* \" in\n" +
+		"  *' clone '*) '" + realGit + "' init -q \"$a2\" >/dev/null 2>&1; '" + realGit + "' -C \"$a2\" remote add origin \"$a1\" >/dev/null 2>&1; exit 0 ;;\n" +
+		"  *) exec '" + realGit + "' \"$@\" ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	dest := filepath.Join(root, "workspace")
+	if err := CloneSharedWorkspace(dest, "https://github.com/org/repo.git", "", token); err != nil {
+		t.Fatalf("CloneSharedWorkspace: %v", err)
+	}
+	argv, _ := os.ReadFile(argvLog)
+	envDump, _ := os.ReadFile(envLog)
+	cfg, _ := os.ReadFile(filepath.Join(dest, ".git", "config"))
+
+	// (i) the env carries the host-scoped credential helper.
+	if !strings.Contains(string(envDump), "credential.https://github.com.helper") {
+		t.Errorf("clone env is missing the host-scoped credential helper:\n%s", envDump)
+	}
+	// (ii) no token on any argv, and no GIT_CONFIG_VALUE carries it (the helper
+	// text is the constant; the token lives only in SCION_SCOPED_GIT_CREDENTIAL).
+	if strings.Contains(string(argv), token) {
+		t.Errorf("token appeared on a git argv:\n%s", argv)
+	}
+	for _, line := range strings.Split(string(envDump), "\n") {
+		if strings.HasPrefix(line, "GIT_CONFIG_VALUE_") && strings.Contains(line, token) {
+			t.Errorf("a GIT_CONFIG_VALUE carried the token: %q", line)
+		}
+	}
+	// (iii) .git/config ends credential-free.
+	if strings.Contains(string(cfg), token) || strings.Contains(string(cfg), "oauth2:") {
+		t.Errorf(".git/config must be credential-free, got:\n%s", cfg)
 	}
 }

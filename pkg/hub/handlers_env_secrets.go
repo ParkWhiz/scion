@@ -26,6 +26,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
@@ -142,7 +143,7 @@ func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, 
 			BadRequest(w, "scopeId is required for runtime_broker scope")
 			return "", false
 		}
-		_, err := s.store.GetRuntimeBroker(ctx, clientScopeID)
+		broker, err := s.store.GetRuntimeBroker(ctx, clientScopeID)
 		if err != nil {
 			if err == store.ErrNotFound {
 				NotFound(w, "RuntimeBroker")
@@ -151,34 +152,10 @@ func (s *Server) resolveEnvSecretAccess(w http.ResponseWriter, r *http.Request, 
 			}
 			return "", false
 		}
-		// Broker self-access
-		if brokerIdent := GetBrokerIdentityFromContext(ctx); brokerIdent != nil {
-			if brokerIdent.BrokerID() == clientScopeID {
-				return clientScopeID, true
-			}
-		}
-		identity := GetIdentityFromContext(ctx)
-		if identity == nil {
-			Unauthorized(w)
+		if !s.authorizeBrokerMaterial(w, r, broker, isWrite) {
 			return "", false
 		}
-		if userIdent, ok := identity.(UserIdentity); ok {
-			action := ActionRead
-			if isWrite {
-				action = ActionUpdate
-			}
-			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: "runtime_broker",
-				ID:   clientScopeID,
-			}, action)
-			if !decision.Allowed {
-				Forbidden(w)
-				return "", false
-			}
-			return clientScopeID, true
-		}
-		Forbidden(w)
-		return "", false
+		return clientScopeID, true
 
 	case store.ScopeHub:
 		// Hub scope: admin users can read and write; agents can read only.
@@ -1658,56 +1635,12 @@ func (s *Server) agentListSecrets(w http.ResponseWriter, r *http.Request, agentI
 	}
 
 	if includeUser {
-		eligible, err := s.progenyEligibleSecretIDs(ctx, facts.Agent)
-		if err != nil {
+		var userOK bool
+		secrets, items, userOK = s.agentListUserSecrets(ctx, agentID, ident, facts, secrets, items)
+		if !userOK {
 			emitListExitItem(store.ScopeUser, facts.Root.ID, GrantProgeny, "")
 			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "failed to list secrets", nil)
 			return
-		}
-		metas, err := s.secretBackend.List(ctx, secret.Filter{
-			Scope:   store.ScopeUser,
-			ScopeID: facts.Root.ID,
-		})
-		if err != nil {
-			emitListExitItem(store.ScopeUser, facts.Root.ID, GrantProgeny, "")
-			writeError(w, http.StatusInternalServerError, ErrCodeRuntimeError, "failed to list secrets", nil)
-			return
-		}
-		for _, m := range metas {
-			if m.SecretType == store.SecretTypeInternal {
-				continue
-			}
-			if !m.AllowProgeny || !eligible[m.ID] {
-				continue
-			}
-			live, kind, _, lerr := s.progenySourceLive(ctx, m)
-			if lerr != nil {
-				// A liveness-check error is not the same as "not shared":
-				// logged distinctly so an operator is not left to guess
-				// which one occurred, and recorded as a per-row item so the
-				// audit event shows the row was skipped rather than simply
-				// absent.
-				slog.Error("agent list secrets: progeny source liveness check failed",
-					"agent_id", agentID, "key", m.Name, "err", lerr)
-				items = append(items, materialSelectionItem(ItemResult{
-					Candidate: Candidate{Kind: MaterialKindSecret, Key: m.Name, Scope: store.ScopeUser, ScopeID: facts.Root.ID, Grant: GrantProgeny, Meta: m},
-					Reason:    ReasonBackendError,
-				}, "", ""))
-				continue
-			}
-			if !live {
-				continue
-			}
-			var src *SourceRef
-			if kind != "" {
-				src = &SourceRef{Kind: kind, ID: m.CreatedBy}
-			}
-			secrets = append(secrets, AgentSecretMeta{Key: m.Name, Type: m.SecretType, Target: m.Target})
-			items = append(items, materialSelectionItem(ItemResult{
-				Candidate: Candidate{Kind: MaterialKindSecret, Key: m.Name, Scope: store.ScopeUser, ScopeID: facts.Root.ID, Grant: GrantProgeny, SharingSource: src, Meta: m},
-				Allowed:   true,
-				Reason:    ReasonAllowed,
-			}, "", ""))
 		}
 	}
 
@@ -2229,19 +2162,48 @@ func (s *Server) handleProjectSecretByKey(w http.ResponseWriter, r *http.Request
 // this way.
 const autoProvideLinkedBy = "auto-provide"
 
+// autoProvideBrokersPageSize is the page size autoLinkProviders lists
+// auto-provide brokers with; it follows the cursor through every page.
+const autoProvideBrokersPageSize = 100
+
+// listAutoProvideBrokers returns every broker with auto_provide enabled,
+// newest first, following the list cursor through all pages so a hub with
+// more brokers than one page links them all (ptone/scion#1998). A cursor
+// the store has already returned is an error rather than an endless loop.
+func (s *Server) listAutoProvideBrokers(ctx context.Context) ([]store.RuntimeBroker, error) {
+	autoProvideTrue := true
+	var all []store.RuntimeBroker
+	cursor := ""
+	seen := make(map[string]struct{})
+	for {
+		page, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{
+			AutoProvide: &autoProvideTrue,
+		}, store.ListOptions{Limit: autoProvideBrokersPageSize, Cursor: cursor, SkipTotalCount: true})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Items...)
+		if page.NextCursor == "" {
+			return all, nil
+		}
+		if _, ok := seen[page.NextCursor]; ok {
+			return nil, fmt.Errorf("listing auto-provide brokers: pagination returned repeated cursor %q", page.NextCursor)
+		}
+		seen[page.NextCursor] = struct{}{}
+		cursor = page.NextCursor
+	}
+}
+
 // autoLinkProviders links brokers with auto_provide enabled as providers for a project.
 // If the project has no default runtime broker, the first auto-provided broker is set as default.
 func (s *Server) autoLinkProviders(ctx context.Context, project *store.Project) {
-	autoProvideTrue := true
-	autoProviders, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{
-		AutoProvide: &autoProvideTrue,
-	}, store.ListOptions{})
+	autoProviders, err := s.listAutoProvideBrokers(ctx)
 	if err != nil {
 		s.envSecretLog.Warn("Failed to query auto-provide brokers", "project_id", project.ID, "error", err)
 		return
 	}
 
-	for _, autoBroker := range autoProviders.Items {
+	for _, autoBroker := range autoProviders {
 		// A flat Runtime Broker never receives an automatic link or
 		// default, whatever the experiment state: it is linked only by an
 		// explicit link action.
@@ -2255,7 +2217,7 @@ func (s *Server) autoLinkProviders(ctx context.Context, project *store.Project) 
 			Status:     autoBroker.Status,
 			LinkedBy:   autoProvideLinkedBy,
 		}
-		if addErr := s.store.AddProjectProvider(ctx, provider); addErr != nil {
+		if addErr := s.linkProjectProvider(ctx, provider); addErr != nil {
 			s.envSecretLog.Warn("Failed to auto-link broker to project",
 				"broker", autoBroker.Name, "project_id", project.ID, "error", addErr)
 			continue
@@ -2569,7 +2531,7 @@ func (s *Server) addProjectProvider(w http.ResponseWriter, r *http.Request, proj
 		LinkedBy:   linkedBy,
 	}
 
-	if err := s.store.AddProjectProvider(ctx, provider); err != nil {
+	if err := s.linkProjectProvider(ctx, provider); err != nil {
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -2659,11 +2621,74 @@ func (s *Server) removeProjectProvider(w http.ResponseWriter, r *http.Request, p
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// authorizeBrokerMaterial decides access to a runtime broker's environment
+// variables and secrets. It writes the response and returns false when the
+// caller is refused.
+//   - The broker itself reads and writes its own material.
+//   - A test identity with an admin role is refused (test-admin policy).
+//   - A write needs an interactive session or dev credential (GOV_PENDING)
+//     and broker.update on the broker.
+//   - A read needs broker.read on the broker and, beyond it, either the
+//     owner relationship (the caller registered the broker) or
+//     broker.update. broker.read alone, which every hub member holds for
+//     the broker directory, does not reach a broker's material. A user
+//     access token needs the broker:read selector on a hub boundary for the
+//     first check; it holds no broker.update, so it reads only the material
+//     of brokers its user owns.
+func (s *Server) authorizeBrokerMaterial(w http.ResponseWriter, r *http.Request, broker *store.RuntimeBroker, isWrite bool) bool {
+	ctx := r.Context()
+	if brokerIdent := GetBrokerIdentityFromContext(ctx); brokerIdent != nil && brokerIdent.BrokerID() == broker.ID {
+		return true
+	}
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		Unauthorized(w)
+		return false
+	}
+	user, ok := identity.(UserIdentity)
+	if !ok {
+		Forbidden(w)
+		return false
+	}
+	// Broker material is not available to test identities with admin
+	// roles (test-admin policy), matching the material their agents may
+	// receive (testAdminRootScopes).
+	if s.testAdminPolicyRefuses(ctx, "handlers_env_secrets.go:authorizeBrokerMaterial") {
+		Forbidden(w)
+		return false
+	}
+	resource := brokerResource(broker)
+	if isWrite {
+		if _, ok := s.requireSessionCredentialFor(w, ctx, authzop.ReasonGovernancePending); !ok {
+			return false
+		}
+		if decision := s.authzService.CheckAccess(ctx, user, resource, ActionUpdate); !decision.Allowed {
+			logAuthzDenial(r, user, resource, ActionUpdate, decision.Reason)
+			Forbidden(w)
+			return false
+		}
+		return true
+	}
+	if decision := s.authzService.CheckAccess(ctx, user, resource, ActionRead); !decision.Allowed {
+		logAuthzDenial(r, user, resource, ActionRead, decision.Reason)
+		Forbidden(w)
+		return false
+	}
+	if broker.CreatedBy != "" && broker.CreatedBy == user.ID() {
+		return true
+	}
+	if decision := s.authzService.CheckAccess(ctx, user, resource, ActionUpdate); !decision.Allowed {
+		logAuthzDenial(r, user, resource, ActionUpdate, "broker material reads need the owner relationship or broker.update: "+decision.Reason)
+		Forbidden(w)
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleBrokerEnvVars(w http.ResponseWriter, r *http.Request, brokerID string) {
 	ctx := r.Context()
 
-	// Verify broker exists
-	_, err := s.store.GetRuntimeBroker(ctx, brokerID)
+	broker, err := s.store.GetRuntimeBroker(ctx, brokerID)
 	if err != nil {
 		if err == store.ErrNotFound {
 			NotFound(w, "RuntimeBroker")
@@ -2672,29 +2697,8 @@ func (s *Server) handleBrokerEnvVars(w http.ResponseWriter, r *http.Request, bro
 		writeErrorFromErr(w, err, "")
 		return
 	}
-
-	// Authorize access: broker self-access or user CheckAccess
-	if brokerIdent := GetBrokerIdentityFromContext(ctx); brokerIdent != nil && brokerIdent.BrokerID() == brokerID {
-		// Broker accessing its own env vars — allowed
-	} else {
-		identity := GetIdentityFromContext(ctx)
-		if identity == nil {
-			Unauthorized(w)
-			return
-		}
-		if userIdent, ok := identity.(UserIdentity); ok {
-			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: "runtime_broker",
-				ID:   brokerID,
-			}, ActionRead)
-			if !decision.Allowed {
-				Forbidden(w)
-				return
-			}
-		} else {
-			Forbidden(w)
-			return
-		}
+	if !s.authorizeBrokerMaterial(w, r, broker, false) {
+		return
 	}
 
 	switch r.Method {
@@ -2728,8 +2732,7 @@ func (s *Server) handleBrokerEnvVars(w http.ResponseWriter, r *http.Request, bro
 func (s *Server) handleBrokerEnvVarByKey(w http.ResponseWriter, r *http.Request, brokerID, key string) {
 	ctx := r.Context()
 
-	// Verify broker exists
-	_, err := s.store.GetRuntimeBroker(ctx, brokerID)
+	broker, err := s.store.GetRuntimeBroker(ctx, brokerID)
 	if err != nil {
 		if err == store.ErrNotFound {
 			NotFound(w, "RuntimeBroker")
@@ -2738,34 +2741,9 @@ func (s *Server) handleBrokerEnvVarByKey(w http.ResponseWriter, r *http.Request,
 		writeErrorFromErr(w, err, "")
 		return
 	}
-
-	// Authorize access: broker self-access or user CheckAccess
 	isWrite := r.Method == http.MethodPut || r.Method == http.MethodDelete
-	if brokerIdent := GetBrokerIdentityFromContext(ctx); brokerIdent != nil && brokerIdent.BrokerID() == brokerID {
-		// Broker accessing its own env vars — allowed
-	} else {
-		identity := GetIdentityFromContext(ctx)
-		if identity == nil {
-			Unauthorized(w)
-			return
-		}
-		if userIdent, ok := identity.(UserIdentity); ok {
-			action := ActionRead
-			if isWrite {
-				action = ActionUpdate
-			}
-			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: "runtime_broker",
-				ID:   brokerID,
-			}, action)
-			if !decision.Allowed {
-				Forbidden(w)
-				return
-			}
-		} else {
-			Forbidden(w)
-			return
-		}
+	if !s.authorizeBrokerMaterial(w, r, broker, isWrite) {
+		return
 	}
 
 	s.handleScopedEnvVarByKey(w, r, key, store.ScopeRuntimeBroker, brokerID)
@@ -2774,8 +2752,7 @@ func (s *Server) handleBrokerEnvVarByKey(w http.ResponseWriter, r *http.Request,
 func (s *Server) handleBrokerSecrets(w http.ResponseWriter, r *http.Request, brokerID string) {
 	ctx := r.Context()
 
-	// Verify broker exists
-	_, err := s.store.GetRuntimeBroker(ctx, brokerID)
+	broker, err := s.store.GetRuntimeBroker(ctx, brokerID)
 	if err != nil {
 		if err == store.ErrNotFound {
 			NotFound(w, "RuntimeBroker")
@@ -2784,29 +2761,8 @@ func (s *Server) handleBrokerSecrets(w http.ResponseWriter, r *http.Request, bro
 		writeErrorFromErr(w, err, "")
 		return
 	}
-
-	// Authorize access: broker self-access or user CheckAccess
-	if brokerIdent := GetBrokerIdentityFromContext(ctx); brokerIdent != nil && brokerIdent.BrokerID() == brokerID {
-		// Broker accessing its own secrets — allowed
-	} else {
-		identity := GetIdentityFromContext(ctx)
-		if identity == nil {
-			Unauthorized(w)
-			return
-		}
-		if userIdent, ok := identity.(UserIdentity); ok {
-			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: "runtime_broker",
-				ID:   brokerID,
-			}, ActionRead)
-			if !decision.Allowed {
-				Forbidden(w)
-				return
-			}
-		} else {
-			Forbidden(w)
-			return
-		}
+	if !s.authorizeBrokerMaterial(w, r, broker, false) {
+		return
 	}
 
 	switch r.Method {
@@ -2836,8 +2792,7 @@ func (s *Server) handleBrokerSecrets(w http.ResponseWriter, r *http.Request, bro
 func (s *Server) handleBrokerSecretByKey(w http.ResponseWriter, r *http.Request, brokerID, key string) {
 	ctx := r.Context()
 
-	// Verify broker exists
-	_, err := s.store.GetRuntimeBroker(ctx, brokerID)
+	broker, err := s.store.GetRuntimeBroker(ctx, brokerID)
 	if err != nil {
 		if err == store.ErrNotFound {
 			NotFound(w, "RuntimeBroker")
@@ -2846,34 +2801,9 @@ func (s *Server) handleBrokerSecretByKey(w http.ResponseWriter, r *http.Request,
 		writeErrorFromErr(w, err, "")
 		return
 	}
-
-	// Authorize access: broker self-access or user CheckAccess
 	isWrite := r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete
-	if brokerIdent := GetBrokerIdentityFromContext(ctx); brokerIdent != nil && brokerIdent.BrokerID() == brokerID {
-		// Broker accessing its own secrets — allowed
-	} else {
-		identity := GetIdentityFromContext(ctx)
-		if identity == nil {
-			Unauthorized(w)
-			return
-		}
-		if userIdent, ok := identity.(UserIdentity); ok {
-			action := ActionRead
-			if isWrite {
-				action = ActionUpdate
-			}
-			decision := s.authzService.CheckAccess(ctx, userIdent, Resource{
-				Type: "runtime_broker",
-				ID:   brokerID,
-			}, action)
-			if !decision.Allowed {
-				Forbidden(w)
-				return
-			}
-		} else {
-			Forbidden(w)
-			return
-		}
+	if !s.authorizeBrokerMaterial(w, r, broker, isWrite) {
+		return
 	}
 
 	s.handleScopedSecretByKey(w, r, key, store.ScopeRuntimeBroker, brokerID)

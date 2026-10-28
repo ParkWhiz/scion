@@ -107,20 +107,27 @@ var materialOperations = []OperationSpec{
 	{
 		ID:          "gcp.identity.mint",
 		Domain:      "gcp.identity",
-		Description: "Mint a GCP access token for a service account",
+		Description: "Mint a GCP access or identity token for the agent's assigned service account",
 		EntryPoints: []EntryPoint{
-			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/agent/gcp-token", Method: "POST"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/agent/gcp-token", Method: "POST", Response: ResponseCredential},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/agent/gcp-identity-token", Method: "POST", Response: ResponseCredential},
 		},
 		Principals:       []PrincipalKind{PrincipalAgent},
 		Credentials:      []CredentialKind{CredentialAgentJWT},
 		ResourceResolver: "agent-gcp-service-account",
-		BasePermission:   "gcp_service_account.mint",
-		Effects:          []SecurityEffect{EffectMintCredential},
-		DelegationKind:   DelegationNone,
+		// Both endpoints decide gcp_service_account.use on every request
+		// (authorizeAgentGCPMint). gcp_service_account.mint is the
+		// permission to create Hub-minted service accounts, not this.
+		BasePermission: "gcp_service_account.use",
+		Effects:        []SecurityEffect{EffectMintCredential},
+		DelegationKind: DelegationNone,
 		Governance: &GovernancePolicy{
 			Kind:        GovernanceIssuerCredential,
-			Description: "Agent mints GCP tokens scoped to its assigned service account",
+			Description: "Agent mints GCP tokens for its assigned service account while the principal recorded as the assignment's source holds gcp_service_account.assign on it (and passes actAs in enforce mode)",
 		},
+		// No before/after authority evaluation: a token mint changes no
+		// authority. The per-request authority check is the use decision
+		// named by BasePermission.
 		AuthorityEval: AuthorityEvalNone,
 		AuditObligation: &AuditObligation{
 			EventType:              "gcp.identity.mint",
@@ -248,8 +255,8 @@ var materialOperations = []OperationSpec{
 		Domain:      "env",
 		Description: "Read project environment variables",
 		EntryPoints: []EntryPoint{
-			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/env", Method: "GET"},
-			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/env/{key}", Method: "GET"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/env", Method: "GET", Response: ResponseCredential},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/env/{key}", Method: "GET", Response: ResponseCredential},
 		},
 		Principals:       []PrincipalKind{PrincipalUser},
 		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},
@@ -266,7 +273,7 @@ var materialOperations = []OperationSpec{
 		Domain:      "env",
 		Description: "List hub-level environment variables (scope=hub), without secret entries",
 		EntryPoints: []EntryPoint{
-			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/env", Method: "GET", Variant: "scope=hub"},
+			{Kind: EntryPointHTTPRoute, Pattern: "/api/v1/env", Method: "GET", Variant: "scope=hub", Response: ResponseCredential},
 		},
 		Principals:       []PrincipalKind{PrincipalUser},
 		Credentials:      []CredentialKind{CredentialSessionJWT, CredentialScopedUAT},

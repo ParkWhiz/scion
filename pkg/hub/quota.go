@@ -54,6 +54,17 @@ type QuotaService struct {
 	// scopeConflictMetrics counts reservation scope conflicts; nil until
 	// Server.SetQuotaScopeConflictMetrics.
 	scopeConflictMetrics atomic.Pointer[OTelQuotaScopeConflictMetrics]
+
+	// capacityMetrics counts backstop re-asserts and releases on
+	// deregistered Runtime Broker scopes; nil until
+	// Server.SetQuotaCapacityMetrics.
+	capacityMetrics atomic.Pointer[OTelQuotaCapacityMetrics]
+
+	// brokerBackfillPending holds, per Runtime Broker ID, a
+	// *brokerBackfillRetry for a broker whose registration backfill skipped an
+	// agent on this replica (Server.BackfillBrokerOnRegistration); its heartbeats
+	// retry it (Server.retryBrokerBackfill).
+	brokerBackfillPending sync.Map
 }
 
 // Sites of a reservation scope conflict, the site attribute of
@@ -174,6 +185,30 @@ func (e *ReservationScopeConflictError) Error() string {
 }
 
 func (e *ReservationScopeConflictError) Unwrap() error { return ErrReservationScopeConflict }
+
+// QuotaExceededError is the store.ErrQuotaExceeded refusal of Reserve,
+// naming the exhausted scope. It unwraps to store.ErrQuotaExceeded, so
+// errors.Is callers are unchanged, and its message is that sentinel's.
+type QuotaExceededError struct {
+	Limit     string
+	ScopeType string
+	ScopeID   string
+}
+
+func (e *QuotaExceededError) Error() string { return store.ErrQuotaExceeded.Error() }
+
+func (e *QuotaExceededError) Unwrap() error { return store.ErrQuotaExceeded }
+
+// quotaExceededDetails returns the API error details of err when it is a
+// broker-scoped QuotaExceededError: {runtimeBrokerId}. The broker's name is
+// omitted, so the error path makes no broker read. nil otherwise.
+func quotaExceededDetails(err error) map[string]interface{} {
+	var exceeded *QuotaExceededError
+	if !errors.As(err, &exceeded) || exceeded.ScopeType != store.QuotaScopeBroker || exceeded.ScopeID == "" {
+		return nil
+	}
+	return map[string]interface{}{"runtimeBrokerId": exceeded.ScopeID}
+}
 
 // ErrQuotaLockContention is returned when the advisory lock cannot be acquired,
 // indicating another concurrent request is checking the same quota scope.
@@ -319,7 +354,7 @@ func (qs *QuotaService) Reserve(ctx context.Context, limitName string, subjectID
 				"limit", limitName, "scope_type", scopeType, "scope_id", scopeID,
 				"count", count, "effective_limit", effectiveLimit)
 		} else {
-			return false, store.ErrQuotaExceeded
+			return false, &QuotaExceededError{Limit: limitName, ScopeType: scopeType, ScopeID: scopeID}
 		}
 	}
 
@@ -340,6 +375,113 @@ func (qs *QuotaService) Reserve(ctx context.Context, limitName string, subjectID
 	}
 
 	return true, nil
+}
+
+// TransferOpts are the TransferBrokerReservation request flags a caller of
+// QuotaService.TransferBroker or transferBrokerReservationUnchecked sets
+// (see store.BrokerReservationTransfer).
+type TransferOpts struct {
+	CreateIfAbsent    bool
+	RequireAgentOnTo  bool
+	FromReservationID string
+	Cond              *store.TransferAgentCond
+}
+
+// TransferBroker moves agentID's max_agents_per_broker reservation onto
+// toBroker atomically (store.TransferBrokerReservation), with the cap check
+// on toBroker. The source slot is freed only in the commit that secures the
+// target, so the source needs no lock. limited is false (and nothing is
+// written) when no limit definition exists.
+//
+// It joins Reserve's locking protocol on the target scope: on an unlimited
+// target it takes no lock and moves the row unchecked (Reserve writes no row
+// there, but the agent's existing row must not be lost); otherwise it takes
+// the in-process scope mutex, then the advisory lock, and counts inside the
+// transaction while holding both. Lock contention returns
+// ErrQuotaLockContention when enforcement is on, and proceeds unchecked when
+// it is off; with enforcement off the cap is not applied. Both unlocks are
+// deferred, so they run after the transaction has committed or rolled back.
+// A full target returns a *QuotaExceededError naming it, and the source
+// reservation is unchanged.
+func (qs *QuotaService) TransferBroker(ctx context.Context, agentID, toBroker string, o TransferOpts) (res store.BrokerReservationTransferResult, limited bool, err error) {
+	const limitName = store.LimitMaxAgentsPerBroker
+	req, limited, err := brokerTransferRequest(ctx, qs.store, agentID, toBroker, o)
+	if err != nil || !limited {
+		return res, false, err
+	}
+
+	effectiveLimit, err := qs.effectiveLimitForReserve(ctx, limitName, req.LimitDefinitionID, toBroker, store.QuotaScopeBroker, toBroker)
+	if err != nil {
+		return res, true, fmt.Errorf("quota: resolve effective limit for %q: %w", limitName, err)
+	}
+	if effectiveLimit > 0 {
+		scopeLock := qs.lockForScope(limitName, store.QuotaScopeBroker, toBroker)
+		scopeLock.Lock()
+		defer scopeLock.Unlock()
+
+		locker, ok := qs.store.(store.AdvisoryLocker)
+		if !ok {
+			return res, true, fmt.Errorf("quota enforcement unavailable: store does not support advisory locks")
+		}
+		acquired, release, err := locker.TryAdvisoryLockObject(ctx, store.LockQuotaEnforcement, store.StableProjectHash(toBroker))
+		if err != nil {
+			return res, true, fmt.Errorf("quota: advisory lock for %q: %w", limitName, err)
+		}
+		defer func() {
+			if releaseErr := release(); releaseErr != nil {
+				qs.logger.Warn("failed to release quota advisory lock",
+					"limit", limitName, "error", releaseErr)
+			}
+		}()
+		enforced := qs.isEnforced(limitName)
+		if !acquired && enforced {
+			return res, true, ErrQuotaLockContention
+		}
+		if enforced {
+			req.Cap = effectiveLimit
+		}
+	}
+
+	res, err = qs.store.TransferBrokerReservation(ctx, req)
+	if errors.Is(err, store.ErrQuotaExceeded) {
+		return res, true, &QuotaExceededError{Limit: limitName, ScopeType: store.QuotaScopeBroker, ScopeID: toBroker}
+	}
+	if err != nil {
+		return res, true, fmt.Errorf("quota: transfer reservation for %q: %w", limitName, err)
+	}
+	return res, true, nil
+}
+
+// brokerTransferRequest looks up the max_agents_per_broker limit definition
+// in st and builds the TransferBrokerReservation request moving agentID's
+// reservation onto toBroker with o's flags (Cap 0). limited is false, with
+// no error, when no limit definition exists. An empty toBroker is refused
+// with store.ErrInvalidTransfer before any lookup: no reservation may land
+// on an empty broker scope.
+func brokerTransferRequest(ctx context.Context, st store.Store, agentID, toBroker string, o TransferOpts) (req store.BrokerReservationTransfer, limited bool, err error) {
+	const limitName = store.LimitMaxAgentsPerBroker
+	if toBroker == "" {
+		return req, false, fmt.Errorf("quota: transfer reservation for %q to an empty broker ID: %w", limitName, store.ErrInvalidTransfer)
+	}
+	def, err := st.GetLimitDefinitionByName(ctx, limitName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return req, false, nil
+		}
+		return req, false, fmt.Errorf("quota: lookup limit definition %q: %w", limitName, err)
+	}
+	if def == nil {
+		return req, false, nil
+	}
+	return store.BrokerReservationTransfer{
+		LimitDefinitionID: def.ID,
+		AgentID:           agentID,
+		ToBrokerID:        toBroker,
+		CreateIfAbsent:    o.CreateIfAbsent,
+		RequireAgentOnTo:  o.RequireAgentOnTo,
+		FromReservationID: o.FromReservationID,
+		Cond:              o.Cond,
+	}, true, nil
 }
 
 // maxBrokerReservationInserts bounds insertBrokerReservation: the first

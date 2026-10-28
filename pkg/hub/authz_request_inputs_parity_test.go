@@ -568,8 +568,9 @@ func TestParity_D2_UnresolvablePermission(t *testing.T) {
 }
 
 // TestParity_D3_DeliveryGateZeroLoads is row D3: a deliver request is
-// denied at step 0 before any input load, for every credential kind,
-// because deliveryCredentialKinds is currently empty.
+// denied at step 0 before any input load for a user principal: the only
+// kind in deliveryCredentialKinds is the internal hub_delivery credential,
+// which no user identity derives.
 func TestParity_D3_DeliveryGateZeroLoads(t *testing.T) {
 	_, s := authzTestSetup(t)
 	f := newP1Fixture(t, s, "d3")
@@ -3569,8 +3570,8 @@ func TestParity_T2_TemplateGlobalAndProjectScoped(t *testing.T) {
 	addToHubMembersGroup(t, s, f.userID)
 	globalTplID := tid("t2-global-tpl")
 	projectTplID := tid("t2-project-tpl")
-	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: globalTplID, Name: "t2g", Slug: "t2g", Harness: "claude", Image: "img", Scope: store.TemplateScopeGlobal}))
-	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: projectTplID, Name: "t2p", Slug: "t2p", Harness: "claude", Image: "img", Scope: store.TemplateScopeProject, ScopeID: f.projectID}))
+	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: globalTplID, Name: "t2g", Slug: "t2g", Harness: "claude", Scope: store.TemplateScopeGlobal}))
+	require.NoError(t, s.CreateTemplate(ctx, &store.Template{ID: projectTplID, Name: "t2p", Slug: "t2p", Harness: "claude", Scope: store.TemplateScopeProject, ScopeID: f.projectID}))
 
 	t.Run("global", func(t *testing.T) {
 		actions, _ := runBatchParity(t, s, f.user, "template", templateResource(&store.Template{ID: globalTplID, Scope: store.TemplateScopeGlobal}))

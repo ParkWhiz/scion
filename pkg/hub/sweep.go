@@ -25,6 +25,11 @@ const stuckMessageThreshold = 5 * time.Minute
 
 const stuckMessageExpireTTL = 24 * time.Hour
 
+// stuckMessageLogIDCap bounds how many message IDs the stuck-pending sweep
+// line names (ptone/scion#4827). 20 UUIDs keep the line under about 1 KB;
+// message_ids_truncated on the line says when more rows were stuck.
+const stuckMessageLogIDCap = 20
+
 // defaultFailedMessageRetentionDays is the fallback retention window (in days)
 // for dispatch_state="failed" messages when
 // Server.Config.FailedMessageRetentionDays is unset or non-positive.
@@ -37,9 +42,16 @@ const missingRecipientFailureReason = "recipient agent no longer exists"
 // brokerMessageSweepHandler returns a handler that counts messages still in
 // dispatch_state='pending' beyond the stuck threshold and logs/emits metrics.
 // Messages stuck beyond stuckMessageExpireTTL are transitioned to failed.
-// After Phase 4 (no-queuing delivery), no code path creates pending rows — any
-// count > 0 indicates a bug. Registered as a RecurringSingleton guarded by
-// LockBrokerMessageSweep (B5-2).
+// After Phase 4 (no-queuing delivery), the only writer of pending rows is
+// ExecuteAgentDM: it persists the row "pending" for the length of its
+// dispatch, then marks it dispatched or failed. The dispatch is detached
+// from the caller's cancellation (dispatchContext), so a row stays pending
+// past the threshold only by design after a deadline-ambiguous dispatch
+// (AC-4 of #1689), or by a fault: a failed finalization write, a hub that
+// exited mid-dispatch, or a writer that left the state empty
+// (ptone/scion#4827). Every write of a pending row is logged as
+// store.MessageEnteredPendingLogMsg. Registered as a RecurringSingleton
+// guarded by LockBrokerMessageSweep (B5-2).
 func (s *Server) brokerMessageSweepHandler() func(ctx context.Context) {
 	return func(ctx context.Context) {
 		// Tight timeout: fail fast if DB connections are saturated rather than
@@ -55,23 +67,33 @@ func (s *Server) brokerMessageSweepHandler() func(ctx context.Context) {
 		}
 
 		if count > 0 {
-			s.agentLifecycleLog.Warn("sweep: stuck pending messages detected",
-				"count", count, "threshold", stuckMessageThreshold.String())
+			// Name the stuck rows (ptone/scion#4827) so each can be matched to
+			// its "row entered pending" line. The ID lookup is best-effort: a
+			// failure is logged on the line and does not stop the sweep.
+			attrs := []any{"count", count, "threshold", stuckMessageThreshold.String()}
+			ids, idsErr := s.store.ListStuckPendingMessageIDs(ctx, cutoff, stuckMessageLogIDCap)
+			if idsErr != nil {
+				attrs = append(attrs, "message_ids_error", idsErr)
+			} else {
+				attrs = append(attrs, "message_ids", ids, "message_ids_truncated", count > len(ids))
+			}
+			s.agentLifecycleLog.Warn("sweep: stuck pending messages detected", attrs...)
 		}
 
 		if rec := s.dispatchMetrics; rec != nil {
 			rec.ObserveMessageStuck(ctx, int64(count))
 		}
 
-		expireCutoff := time.Now().UTC().Add(-stuckMessageExpireTTL)
-		expired, err := s.store.ExpireStuckPendingMessages(ctx, expireCutoff, store.MessageExpiredStuckPendingReason)
+		expireNow := time.Now().UTC()
+		expireCutoff := expireNow.Add(-stuckMessageExpireTTL)
+		// A failed expiry is logged and does not stop the sweep: the
+		// missing-recipient step below must still run (ptone/scion#5211).
+		expired, err := s.store.ExpireAndListStuckPendingMessages(ctx, expireCutoff, store.MessageExpiredStuckPendingReason)
 		if err != nil {
 			s.agentLifecycleLog.Error("sweep: expire stuck pending messages failed", "error", err)
-			return
-		}
-		if expired > 0 {
+		} else if len(expired) > 0 {
 			s.agentLifecycleLog.Info("sweep: expired stuck pending messages",
-				"expired", expired, "ttl", stuckMessageExpireTTL.String())
+				expiredPendingLogAttrs(expired, expireNow, expiredMessageLogIDCap)...)
 		}
 
 		// Fail pending messages early when their recipient agent has already
@@ -137,5 +159,39 @@ func (s *Server) failedMessageRetentionHandler() func(ctx context.Context) {
 					"count", orphans)
 			}
 		}
+	}
+}
+
+// expiredMessageLogIDCap bounds how many expired messages the TTL-expiry
+// sweep line names (ptone/scion#5211). The count on the line is always the
+// full number expired; message_ids_truncated says when more were expired
+// than named.
+const expiredMessageLogIDCap = 20
+
+// expiredPendingLogAttrs builds the attributes of the "sweep: expired stuck
+// pending messages" line: the number expired, the TTL, and for up to limit
+// of the expired rows (oldest first) the message ID, the recipient and how
+// long the row was pending at now. The three lists are index-aligned. Only
+// identifiers and the routing target are logged, never a body.
+func expiredPendingLogAttrs(expired []store.ExpiredPendingMessage, now time.Time, limit int) []any {
+	named := expired
+	if len(named) > limit {
+		named = named[:limit]
+	}
+	ids := make([]string, 0, len(named))
+	recipients := make([]string, 0, len(named))
+	durations := make([]string, 0, len(named))
+	for _, m := range named {
+		ids = append(ids, m.ID)
+		recipients = append(recipients, m.Recipient)
+		durations = append(durations, now.Sub(m.CreatedAt).Round(time.Second).String())
+	}
+	return []any{
+		"expired", len(expired),
+		"ttl", stuckMessageExpireTTL.String(),
+		"message_ids", ids,
+		"recipients", recipients,
+		"pending_durations", durations,
+		"message_ids_truncated", len(expired) > len(named),
 	}
 }

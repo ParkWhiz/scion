@@ -676,7 +676,7 @@ the mechanism was sound and only the justification was invented:
     a thing this chart produces BY DEFAULT: with workspaceStorage.nfs disabled
     there is no shared volume and no workspace_storage section, nothing two
     pods can both write. With it enabled, every replica mounts the same NFS
-    export and the hub renders server.workspace_storage, so two pods - the two
+    export and the hub renders server.project_storage, so two pods - the two
     replicas of a RollingUpdate included - CAN write the same share. That is the
     case the next bullet anticipated, and the answer there still holds:
     concurrency on the share is the hub's to coordinate (Postgres advisory
@@ -1583,10 +1583,10 @@ Exactly one list is.
    NOT among them: PersistentPreRunE clears requiresProject for the server
    subtree before that check runs.
 
-   --profile/-p IS THE WEAK ENTRY AND IS LABELLED AS ONE. Its only consumer on
-   this path is config.RequireImageRegistry, and that call is skipped whenever
-   requiresRegistry is cleared for the hub or server subtree; LoadSettings does
-   not take it.
+   --profile/-p IS THE WEAK ENTRY AND IS LABELLED AS ONE. Nothing on this path
+   reads it: its former consumer, the CLI's image_registry pre-check
+   (config.RequireImageRegistry in cmd/root.go), was removed with local mode,
+   and LoadSettings does not take it.
    Every other consumer of the variable is a client subcommand. So it is INERT on
    server start today and I could find no harm for it - by axis (d), that is the
    same answer that removed the updateStrategy refusal. It survives here on the
@@ -1837,22 +1837,26 @@ Exactly one list is.
    SCION_SERVER_BASE_URL environment variable.
 
    Precedence for base-url, read from the hub rather than assumed, because "two
-   sources" only matters if one of them silently loses:
+   sources" only matters if one of them silently loses (see the server config
+   reference, "Web Base URL" and "Hub Endpoint Resolution", for the full rules):
 
-     cmd/server_foreground.go, initWebServer (the OAuth redirect base)
-       --base-url, else SCION_SERVER_BASE_URL, else http://localhost:<web-port>
-     cmd/server_foreground.go, resolveHubEndpoint (the URL agents dial)
-       settings file server.hub.public_url, else --base-url, else
-       SCION_SERVER_BASE_URL, else project settings, else localhost
+     cmd/server_web_base_url.go, resolveWebBaseURL (the OAuth redirect base)
+       --base-url, else SCION_SERVER_BASE_URL, else SCION_SERVER_HUB_ENDPOINT,
+       else server.hub.public_url from the global settings file, else (hosted,
+       Cloud Run IAP audience) the IAP-derived URL, else
+       http://localhost:<web-port>
+     cmd/server_foreground.go, resolveHubEndpointFrom (the URL agents dial)
+       --base-url, else SCION_SERVER_HUB_ENDPOINT, else SCION_SERVER_BASE_URL,
+       else server.hub.public_url from the settings file, else the fallbacks
 
-   Two consequences, both silent. ARGV BEATS THE ENVIRONMENT AT BOTH SITES, and
-   the environment variable is one this chart renders, so an argv --base-url
-   shadows a live value rather than a hypothetical one, with no error and, unless
-   --debug is on, no log line either. And the two sites do not
-   agree with each other - the settings file outranks argv when resolving the
-   agent-facing endpoint but is not consulted at all for the OAuth redirect - so
-   argv plus a settings file that sets public_url yields two different base URLs
-   in one process, each correct by its own rule.
+   ARGV BEATS THE ENVIRONMENT AT BOTH SITES, and the environment variable is
+   one this chart renders, so an argv --base-url shadows a live value rather
+   than a hypothetical one, with no error and, unless
+   --debug is on, no log line either. The two sites also rank
+   SCION_SERVER_BASE_URL and SCION_SERVER_HUB_ENDPOINT in opposite orders, so
+   setting both (for example through hub.extraEnv) can give the OAuth redirect
+   and the agent endpoint two different base URLs in one process, each correct
+   by its own rule.
 
    That is why this entry is reserved rather than merely discouraged. A later
    phase may still choose argv as the delivery channel for base-url, and this
@@ -2423,14 +2427,14 @@ than the registry check in scion-hub.settings can see from the rendered file:
   not at all.
 
   SCION_IMAGE_REGISTRY or SCION_MAINTENANCE_IMAGE_REGISTRY with an empty literal
-  value. requireImageRegistryForBroker (cmd/server_foreground.go) skips an empty
-  variable, so neither is a registry source. For SCION_IMAGE_REGISTRY it is
-  worse: the env layer has already replaced the settings file's image_registry
-  with "", so a registry the chart rendered is erased and the hub refuses to
-  start. The maintenance name is refused alongside it so that the two names
-  follow one rule. An entry with no value and no valueFrom is the same empty
-  string to Kubernetes and is refused too. A non-empty value is accepted and
-  counts as a registry source; a valueFrom is accepted unread.
+  value. An empty variable is not a registry: SCION_IMAGE_REGISTRY is read
+  directly as the node env layer and an empty value sets nothing, and
+  SCION_MAINTENANCE_IMAGE_REGISTRY applies only to maintenance builds. An
+  empty entry is almost always a mistake, so it is refused rather than
+  ignored, and the two names follow one rule. An entry with no value and no
+  valueFrom is the same empty string to Kubernetes and is refused too. A
+  non-empty SCION_IMAGE_REGISTRY is accepted and counts as a registry source;
+  a valueFrom is accepted unread.
 
 Applied here, in the extraEnv guard, so that it also holds under
 config.existingSecret, where the settings file is the operator's but the
@@ -2450,7 +2454,7 @@ Refused in every form, literal or valueFrom, matched case-insensitively.
 {{- fail "hub.extraEnv may not set SCION_SERVER_HUB_CLASS: it would override server.hub.class, an input of the hub's --test-mode gate, without the chart seeing it. Set the hub class with hub.hubClass (or in your own settings file under config.existingSecret)." }}
 {{- end }}
 {{- if and (has $name (list "SCION_IMAGE_REGISTRY" "SCION_MAINTENANCE_IMAGE_REGISTRY")) (not (dig "valueFrom" "" $entry)) (eq (toString (dig "value" "" $entry)) "") }}
-{{- fail (printf "hub.extraEnv may not set %s to an empty value. An empty value is not a registry source: requireImageRegistryForBroker (cmd/server_foreground.go) skips it. An empty SCION_IMAGE_REGISTRY also erases the rendered one, because the hub loads SCION_* environment variables over settings.yaml (LoadVersionedSettings, pkg/config/settings_v1.go) and image_registry becomes \"\", so the hub refuses to start with no registry. Remove the entry, or give it a non-empty value or a valueFrom." $name) }}
+{{- fail (printf "hub.extraEnv may not set %s to an empty value. An empty value is not a registry source: requireImageRegistryForBroker (cmd/server_foreground.go) skips it, and SCION_MAINTENANCE_IMAGE_REGISTRY applies only to maintenance image builds. Remove the entry, or give it a non-empty value or a valueFrom (for agent images, set SCION_IMAGE_REGISTRY or agents.imageRegistry)." $name) }}
 {{- end }}
 {{- if has $name $shadowable }}
 {{- fail (printf "hub.extraEnv may not set %s: the chart sets it, and hub.extraEnv is appended to the container's env list, which wins twice over - a container env entry takes precedence over the same name from envFrom, and a later entry in the list takes precedence over an earlier one. Either way the chart's value is replaced with no error and nothing in the manifest that reads as a conflict." $name) }}
@@ -2944,7 +2948,7 @@ source for it is the divergence this check exists to prevent. */}}
 
 {{- /* HA preflight block 1, part 3: hub blob storage. GCS, and not the
 Filestore share - workspace storage is a different subsystem under
-server.workspace_storage and does not satisfy this. */}}
+server.project_storage and does not satisfy this. */}}
 {{- if eq (lower (toString $emittedDriver)) "postgres" }}
 {{- if ne (lower (toString (dig "server" "storage" "provider" "" $doc))) "gcs" }}
 {{- fail (printf "rendered settings.yaml must set server.storage.provider: gcs under Postgres, got %s. Local blob storage is not HA-safe and the hub refuses to start. This is the hub's own blob store; the Filestore workspace share does not satisfy it." (include "scion-hub.diagValue" (dig "server" "storage" "provider" "" $doc))) }}
@@ -3477,7 +3481,8 @@ hack/verify.sh enforces it under the name migration-rename-hazard, across every
 values permutation rather than only the default one.
 */}}
 {{- /*
-server.workspace_storage, from scion-hub.nfsWorkspace - the same define the
+server.project_storage (the one storage block: workspace, shared dirs and homes;
+homes stay local), from scion-hub.nfsWorkspace - the same define the
 Deployment's volume and mount come from, so the two cannot disagree about the
 mount path. Absent when workspaceStorage.nfs is disabled, which leaves every
 other render byte-identical. Snake_case and field names as the Cloud Run
@@ -3485,7 +3490,7 @@ module's settings template writes them.
 */}}
 {{- $nfsWs := include "scion-hub.nfsWorkspace" . | fromYaml }}
 {{- if $nfsWs }}
-{{- $server = set $server "workspace_storage" (dict
+{{- $server = set $server "project_storage" (dict
     "backend" "nfs"
     "nfs" (dict
       "mount_root" $nfsWs.mountRoot
@@ -3545,32 +3550,31 @@ runServerForeground calls requireImageRegistryForBroker
 is not configured, but the runtime broker requires it" unless one of these is
 non-empty:
 
-  1. SCION_IMAGE_REGISTRY in the environment
-  2. SCION_MAINTENANCE_IMAGE_REGISTRY in the environment
-  3. image_registry resolved from settings.yaml for the active profile
-     (VersionedSettings.ResolveImageRegistry: profiles.<active>.image_registry,
-     else the top-level image_registry)
+  1. SCION_IMAGE_REGISTRY in the environment (the node env layer, read
+     directly, never folded into the settings)
+  2. image_registry resolved from settings.yaml for the active profile
+     (profiles.<active>.image_registry, else the top-level image_registry)
 
 Those are the cases accepted here, read off the merged document and
-hub.extraEnv: agents.imageRegistry and config.extra both reach (3), and an
-extraEnv entry of either name with a non-empty value or a valueFrom reaches (1)
-or (2). A valueFrom is accepted unread because the chart cannot see what it
-resolves to.
+hub.extraEnv: agents.imageRegistry and config.extra both reach (2), and an
+SCION_IMAGE_REGISTRY extraEnv entry with a non-empty value or a valueFrom
+reaches (1). A valueFrom is accepted unread because the chart cannot see what
+it resolves to. SCION_MAINTENANCE_IMAGE_REGISTRY applies to maintenance image
+builds only (ptone/scion#3916) and is not a source; a render that sets only it
+is refused with a message naming the replacement.
 
-This is only correct because scion-hub.assertExtraEnv refuses the two env
-entries that would change (3) behind the file's back. The koanf env layer in
+This is only correct because scion-hub.assertExtraEnv refuses the env entry
+that would change (2) behind the file's back: the koanf env layer in
 LoadVersionedSettings applies SCION_* variables over settings.yaml, so
-SCION_ACTIVE_PROFILE would change which profile (3) reads, and an empty
-SCION_IMAGE_REGISTRY would overwrite the top-level image_registry with "". The
-chart refuses SCION_ACTIVE_PROFILE in hub.extraEnv outright and refuses either
-registry variable with an empty literal value, rather than modelling the env
-layer's precedence here. The hub's DB-backed settings overlay does not count: startRuntimeBroker
-installs it after this check has run.
+SCION_ACTIVE_PROFILE would change which profile (2) reads. The chart refuses
+it in hub.extraEnv outright rather than modelling the env layer's precedence
+here. The hub's DB-backed settings do not count: a hosted hub checks before
+they are read.
 
-Not the check described under --profile in the reserved-flag comments. That
-one, config.RequireImageRegistry in cmd/root.go, is skipped for the server
-subtree and never runs on hub start; this one is in the server itself and
-always does.
+Not the CLI pre-check the reserved-flag comments mention under --profile.
+That one, config.RequireImageRegistry in cmd/root.go, was removed with local
+mode and never ran on hub start; this one is in the server itself and always
+does.
 
 Not evaluated under config.existingSecret, where this define is not reached:
 the settings file is the operator's, and the hub's own check still applies.
@@ -3588,10 +3592,13 @@ same render is reported first.
 {{- end }}
 {{- end }}
 {{- $registryFromEnv := false }}
+{{- $maintenanceRegistryOnly := false }}
 {{- range $entry := .Values.hub.extraEnv }}
-{{- if has (toString (dig "name" "" $entry)) (list "SCION_IMAGE_REGISTRY" "SCION_MAINTENANCE_IMAGE_REGISTRY") }}
 {{- if or (dig "value" "" $entry) (dig "valueFrom" "" $entry) }}
+{{- if eq (toString (dig "name" "" $entry)) "SCION_IMAGE_REGISTRY" }}
 {{- $registryFromEnv = true }}
+{{- else if eq (toString (dig "name" "" $entry)) "SCION_MAINTENANCE_IMAGE_REGISTRY" }}
+{{- $maintenanceRegistryOnly = true }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -3600,7 +3607,10 @@ same render is reported first.
 empty SCION_IMAGE_REGISTRY, or SCION_ACTIVE_PROFILE moving off the profile read
 here - and this Secret renders before the Deployment that runs the guard. */}}
 {{- include "scion-hub.assertExtraEnv" . }}
-{{- fail "agents.imageRegistry is required: this chart always runs the hub with an in-process runtime broker (--enable-runtime-broker), and with the broker enabled the hub refuses to start without an image registry (requireImageRegistryForBroker, cmd/server_foreground.go: \"image_registry is not configured, but the runtime broker requires it\"). Set agents.imageRegistry to the registry prefix agent images are pulled from, for example us-docker.pkg.dev/<project>/<repo>. The hub also accepts image_registry for the active profile through config.extra, or SCION_IMAGE_REGISTRY or SCION_MAINTENANCE_IMAGE_REGISTRY through hub.extraEnv." }}
+{{- if $maintenanceRegistryOnly }}
+{{- fail "hub.extraEnv sets only SCION_MAINTENANCE_IMAGE_REGISTRY, which now applies only to maintenance image builds and no longer supplies the agent image registry. Set agents.imageRegistry, image_registry through config.extra, or SCION_IMAGE_REGISTRY through hub.extraEnv (keep SCION_MAINTENANCE_IMAGE_REGISTRY only if maintenance builds need a different registry)." }}
+{{- end }}
+{{- fail "agents.imageRegistry is required: this chart always runs the hub with an in-process runtime broker (--enable-runtime-broker), and with the broker enabled the hub refuses to start without an image registry (requireImageRegistryForBroker, cmd/server_foreground.go: \"image_registry is not configured, but the runtime broker requires it\"). Set agents.imageRegistry to the registry prefix agent images are pulled from, for example us-docker.pkg.dev/<project>/<repo>. The hub also accepts image_registry for the active profile through config.extra, or SCION_IMAGE_REGISTRY through hub.extraEnv." }}
 {{- end }}
 {{- $rendered }}
 {{- end }}
@@ -4269,7 +4279,7 @@ WORKSPACE STORAGE - NFS. Appended at end of file, like the phases above.
 workspaceStorage.nfs, validated and normalised, as YAML - or the empty string
 when it is disabled. THE ONE SOURCE for both of its consumers:
 
-  - scion-hub.settings renders server.workspace_storage from it, and
+  - scion-hub.settings renders server.project_storage from it, and
   - deployment.yaml renders the hub pod's inline nfs volume and the hub
     container's mount from it.
 
@@ -4289,7 +4299,7 @@ V1NFSConfig and V1SharedDirStorageConfig).
 
 Field names match the Cloud Run module's settings template
 (deploy/terraform/modules/hub-cloudrun/templates/settings.yaml.tftpl,
-workspace_storage:), so the two deployments describe the share the same way.
+project_storage:), so the two deployments describe the share the same way.
 
 uid and gid are not values. They are rendered from the hub's effective
 hub.securityContext.runAsUser and runAsGroup - the same values
@@ -4305,7 +4315,8 @@ THE GUARDS, and why each one is here rather than left to the hub:
     chart's output saying why. A missing shareId makes the mount path the mount
     root itself, which still passes readiness while the hub and agents disagree
     about the tree. A missing pvName leaves agent pods with no claim to mount.
-  - config.extra.server.workspace_storage is refused while this is enabled.
+  - config.extra.server.project_storage (and the deprecated workspace_storage,
+    shared_dir_storage and home_storage) is refused while this is enabled.
     It would replace or change the settings half without touching the mount -
     exactly the drift this define exists to prevent. (The generic config.extra
     collision rule would catch an overlapping leaf too; this one names the
@@ -4333,7 +4344,7 @@ it, so the guards run even when the settings Secret is not rendered.
 {{- if $shareId }}{{- $inert = append $inert "workspaceStorage.nfs.shareId" }}{{- end }}
 {{- if $pvName }}{{- $inert = append $inert "workspaceStorage.nfs.pvName" }}{{- end }}
 {{- if $inert }}
-{{- fail (printf "%s set while workspaceStorage.nfs.enabled is false. The chart renders neither server.workspace_storage nor the hub's NFS mount in that case, so the value would reach nothing. Set workspaceStorage.nfs.enabled: true, or remove it." (join " and " $inert)) }}
+{{- fail (printf "%s set while workspaceStorage.nfs.enabled is false. The chart renders neither server.project_storage nor the hub's NFS mount in that case, so the value would reach nothing. Set workspaceStorage.nfs.enabled: true, or remove it." (join " and " $inert)) }}
 {{- end }}
 {{- else }}
 {{- $missing := list }}
@@ -4342,7 +4353,7 @@ it, so the guards run even when the settings Secret is not rendered.
 {{- if not $shareId }}{{- $missing = append $missing "workspaceStorage.nfs.shareId" }}{{- end }}
 {{- if not $pvName }}{{- $missing = append $missing "workspaceStorage.nfs.pvName" }}{{- end }}
 {{- if $missing }}
-{{- fail (printf "workspaceStorage.nfs.enabled is true, which requires %s. The chart renders the hub's NFS volume and server.workspace_storage from these, and the hub's /readyz fails unless the share is mounted at <mountRoot>/<shareId>." (join ", " $missing)) }}
+{{- fail (printf "workspaceStorage.nfs.enabled is true, which requires %s. The chart renders the hub's NFS volume and server.project_storage from these, and the hub's /readyz fails unless the share is mounted at <mountRoot>/<shareId>." (join ", " $missing)) }}
 {{- end }}
 {{- $mountRoot := trim (toString ($nfs.mountRoot | default "")) }}
 {{- $subpathRoot := trim (toString ($nfs.subpathRoot | default "")) }}
@@ -4366,8 +4377,12 @@ it, so the guards run even when the settings Secret is not rendered.
 {{- end }}
 {{- $extra := .Values.config.extra | default (dict) }}
 {{- $extraServer := $extra.server }}
-{{- if and (kindIs "map" $extraServer) (hasKey $extraServer "workspace_storage") }}
-{{- fail "workspaceStorage.nfs is enabled and config.extra also sets server.workspace_storage. The chart renders server.workspace_storage and the hub's NFS mount from workspaceStorage.nfs together, because the hub's /readyz fails unless the share is mounted at mount_root/shares[0].id; a settings block from config.extra could change one without the other. Use workspaceStorage.nfs alone." }}
+{{- if kindIs "map" $extraServer }}
+{{- range $key := list "project_storage" "workspace_storage" "shared_dir_storage" "home_storage" }}
+{{- if hasKey $extraServer $key }}
+{{- fail (printf "workspaceStorage.nfs is enabled and config.extra also sets server.%s. The chart renders server.project_storage and the hub's NFS mount from workspaceStorage.nfs together, because the hub's /readyz fails unless the share is mounted at mount_root/shares[0].id, and the hub accepts exactly one storage block; a settings block from config.extra could change one without the other. Use workspaceStorage.nfs alone." $key) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- $out := dict
     "server" $server

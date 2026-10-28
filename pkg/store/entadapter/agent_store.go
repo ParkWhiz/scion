@@ -133,6 +133,9 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 		LaunchStep:          a.LaunchStep,
 		LaunchError:         a.LaunchError,
 		LaunchCause:         a.LaunchCause,
+		LaunchPriorPhase:    a.LaunchPriorPhase,
+		LaunchRevokeOnFail:  a.LaunchRevokeOnFail,
+		LaunchResumePhase:   a.LaunchResumePhase,
 		RunID:               a.RunID,
 		PreviousRunIDs:      append([]string(nil), a.PreviousRunIds...),
 		WorkspacePlacement:  a.WorkspacePlacement,
@@ -218,6 +221,17 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 				"agent_id", sa.ID, "error", err)
 		}
 		sa.AppliedConfig = cfg
+	}
+	if a.PendingConfig != nil {
+		pending, err := store.UnmarshalPendingConfigFromStorage(*a.PendingConfig)
+		if err != nil {
+			// Logged rather than returned, as for applied_config above: one
+			// corrupt row must not break a listing. The agent reads as having
+			// no pending edits.
+			slog.Error("agent store: pending_config could not be used as stored; ignoring it",
+				"agent_id", sa.ID, "error", err)
+		}
+		sa.PendingConfig = pending
 	}
 	return sa
 }
@@ -325,8 +339,8 @@ func (s *AgentStore) CreateAgent(ctx context.Context, a *store.Agent) error {
 		// launch_* field CreateAgent sets — the rest start at their column
 		// defaults ("", false, 0) because a freshly created agent has no
 		// launch yet. Every other launch_* column is written only by
-		// BeginLaunch/MarkLaunchAccepted/EndLaunch/ApplyLaunchReport/
-		// RunLaunchReaperTick (§3.3).
+		// BeginLaunch/MarkLaunchAccepted/EndLaunch(WithCode)/
+		// ApplyLaunchReport/RunLaunchReaperTick (§3.3).
 		SetLaunchAsyncOptIn(a.LaunchAsyncOptIn)
 
 	if a.MessageMode != "" {
@@ -357,6 +371,13 @@ func (s *AgentStore) CreateAgent(ctx context.Context, a *store.Agent) error {
 	}
 	if cfg := marshalAppliedConfig(a.AppliedConfig); cfg != "" {
 		create.SetAppliedConfig(cfg)
+	}
+	pending, err := store.MarshalPendingConfigForStorage(a.PendingConfig)
+	if err != nil {
+		return fmt.Errorf("encode pending config: %w", err)
+	}
+	if pending != "" {
+		create.SetPendingConfig(pending)
 	}
 	// Always set, never leave NULL, even when harnessConfigOf returns "" (no
 	// harness configured). NULL is reserved to mean "never written by a
@@ -836,6 +857,9 @@ func buildAgentUpdate(ac *ent.AgentClient, uid uuid.UUID, a *store.Agent, expect
 	} else {
 		update.ClearAppliedConfig()
 	}
+	if err := setPendingConfig(update.Mutation(), a.PendingConfig); err != nil {
+		return nil, err
+	}
 	// Always set, never clear to NULL — see CreateAgent's identical comment
 	// and ReconcileHarnessConfigColumn's doc (ptone/scion#2146).
 	// AppliedConfig=nil (cleared above) still yields "" here, which is
@@ -1045,7 +1069,7 @@ func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, o
 	// than ignore it, so a caller that passes one (alone or alongside
 	// SortCursor) gets an error instead of a silently different page.
 	if opts.Cursor != "" {
-		return nil, fmt.Errorf("ListAgents: legacy cursor is not valid in sorted mode: %w", store.ErrInvalidInput)
+		return nil, fmt.Errorf("ListAgents: legacy cursor is not valid in sorted mode: %w", store.ErrInvalidCursor)
 	}
 	if opts.SortCursor != nil {
 		query.Where(agentAfterCursor(opts.SortBy, opts.SortDir, *opts.SortCursor))
@@ -1522,6 +1546,11 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 	if su.ReportSource != store.StatusReportSourceRuntime && store.IsHaltEvidence(su.ExitReason) {
 		su.ExitReason = ""
 	}
+	// The agent-reported signaled reason only fills an empty slot: a
+	// recorded reason is never replaced by it (ptone/scion#5278).
+	if su.ExitReason == string(state.ExitReasonSignaled) && current.ExitReason != "" {
+		su.ExitReason = ""
+	}
 
 	now := time.Now()
 
@@ -1667,7 +1696,9 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 			upd.SetMessage("")
 		}
 		upd.SetStalledFromActivity("")
-		upd.ClearExitCode()
+		if su.ExitCode == nil {
+			upd.ClearExitCode()
+		}
 		upd.SetExitReason("")
 	}
 
@@ -1678,8 +1709,35 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 	// (state.ExitReasonPreempted/ExitReasonEvicted), and that reason
 	// describes the old pod, not the new generation a start/restart brings
 	// up, so it must be cleared regardless of the current phase.
-	if su.ClearExit {
+	// A provisional start or reincarnation can retain old exits until the
+	// first running report; clear only after the guards accept that transition.
+	if su.ClearExit || (current.Phase == string(state.PhaseStarting) && su.Phase == string(state.PhaseRunning)) {
+		if su.ExitCode == nil {
+			upd.ClearExitCode()
+		}
+		upd.SetExitReason("")
+	}
+
+	// A move from a pre-running phase to running is the new run's first
+	// running write: the exit code and reason describe the previous run, so
+	// they are cleared, whichever path brings running (ptone/scion#5384).
+	// The provisional starting write keeps them, since a rollback restores
+	// the prior stopped or error phase, which still needs them. A running to
+	// running write keeps them too: a disruption reason can be recorded on a
+	// live agent. This reads the final phase, after every guard above.
+	if su.Phase == string(state.PhaseRunning) && isPreRunningPhase(current.Phase) {
 		upd.ClearExitCode()
+		upd.SetExitReason("")
+	}
+
+	// A stored signaled reason describes the run that ended; it is cleared
+	// when the agent next moves to starting or running, by any path (a
+	// reincarnation, or a start whose started-status write failed). This
+	// reads the final phase, after every guard above, so a write those
+	// guards neutralised (a delete hold, a reincarnation in flight, another
+	// run's report) never clears it. Only the reason is cleared.
+	if current.ExitReason == string(state.ExitReasonSignaled) && su.ExitReason == "" &&
+		(su.Phase == string(state.PhaseStarting) || su.Phase == string(state.PhaseRunning)) {
 		upd.SetExitReason("")
 	}
 
@@ -1756,6 +1814,16 @@ func isAgentReport(su store.AgentStatusUpdate) bool {
 	return su.ReportSource != ""
 }
 
+// isPreRunningPhase reports whether phase is one a run passes through
+// before it first reaches running.
+func isPreRunningPhase(phase string) bool {
+	switch state.Phase(phase) {
+	case state.PhaseCreated, state.PhaseProvisioning, state.PhaseCloning, state.PhaseStarting:
+		return true
+	}
+	return false
+}
+
 // isBrokerHeartbeat reports whether su is a broker heartbeat: the agent
 // runtime's own view of the container. sciontool's heartbeat goes through
 // the agent's status endpoint (source agent), so it is not one. Only a
@@ -1807,8 +1875,11 @@ func haltedStickyDrop(current *ent.Agent, su store.AgentStatusUpdate) bool {
 //   - the row is already stopped or error with no halt-evidence reason
 //     recorded, and the report (with no phase, or a stopped/error phase)
 //     brings one: a later report of the same run saying why it ended. Such
-//     an upgrade is blocked only when the report itself carries exit code
-//     0: the runtime saw a clean exit.
+//     an upgrade is blocked when the report itself carries exit code 0 (the
+//     runtime saw a clean exit), unless the row's reason is the
+//     agent-reported signaled: the agent stopped after a termination
+//     signal, so the clean exit is the graceful end of a disruption. The
+//     signaled reason is never evidence by itself.
 func evaluateHalt(current *ent.Agent, su store.AgentStatusUpdate) (bool, string) {
 	if current.RunIntent == nil || store.RunIntent(*current.RunIntent) != store.RunIntentRunning {
 		return false, ""
@@ -1833,7 +1904,7 @@ func evaluateHalt(current *ent.Agent, su store.AgentStatusUpdate) (bool, string)
 		if store.IsHaltEvidence(current.ExitReason) {
 			return false, ""
 		}
-		if su.ExitCode != nil && *su.ExitCode == 0 {
+		if su.ExitCode != nil && *su.ExitCode == 0 && current.ExitReason != string(state.ExitReasonSignaled) {
 			return false, ""
 		}
 		if newPhase == "" {
@@ -1913,6 +1984,60 @@ func (s *AgentStore) SetAgentWorkspacePlacement(ctx context.Context, agentID, pl
 	}
 	if affected == 0 {
 		return store.ErrNotFound
+	}
+	return nil
+}
+
+// UpdateAgentConfig implements store.AgentStore.UpdateAgentConfig.
+func (s *AgentStore) UpdateAgentConfig(ctx context.Context, agentID string, expectedVersion int64, applied *store.AgentAppliedConfig, pending *store.AgentPendingConfig) (int64, error) {
+	uid, err := parseUUID(agentID)
+	if err != nil {
+		return 0, err
+	}
+	newVersion := expectedVersion + 1
+	update := s.client.Agent.Update().
+		Where(agent.IDEQ(uid), agent.StateVersionEQ(expectedVersion), agent.DeletedAtIsNil()).
+		SetStateVersion(newVersion).
+		SetUpdated(time.Now()).
+		// Always set, never NULL: see buildAgentUpdate.
+		SetHarnessConfig(harnessConfigOf(applied))
+	if cfg := marshalAppliedConfig(applied); cfg != "" {
+		update.SetAppliedConfig(cfg)
+	} else {
+		update.ClearAppliedConfig()
+	}
+	if err := setPendingConfig(update.Mutation(), pending); err != nil {
+		return 0, err
+	}
+	affected, err := update.Save(ctx)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	if affected == 0 {
+		row, err := s.client.Agent.Get(ctx, uid)
+		if err != nil {
+			return 0, mapError(err)
+		}
+		if row.DeletedAt != nil {
+			return 0, store.ErrNotFound
+		}
+		return 0, store.ErrVersionConflict
+	}
+	return newVersion, nil
+}
+
+// setPendingConfig sets the pending_config column of an agent update to
+// pending's storage encoding, or clears it to NULL when pending holds no
+// edit.
+func setPendingConfig(m *ent.AgentMutation, pending *store.AgentPendingConfig) error {
+	raw, err := store.MarshalPendingConfigForStorage(pending)
+	if err != nil {
+		return fmt.Errorf("encode pending config: %w", err)
+	}
+	if raw == "" {
+		m.ClearPendingConfig()
+	} else {
+		m.SetPendingConfig(raw)
 	}
 	return nil
 }

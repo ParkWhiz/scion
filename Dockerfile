@@ -1,10 +1,22 @@
+# Scion Hub image: web frontend, scion binary with the web UI embedded, and a
+# slim Debian runtime. The default target (no --target) is the runtime image;
+# `--target hub-gke` is the non-root variant for the scion-hub Helm chart.
+#
+# Cloud Build: upload with --ignore-file=image-build/gcloudignore-omni. The
+# default .gcloudignore drops the web source (web/package.json, web/src/, ...)
+# because the other Cloud Build configs compile with -tags no_embed_web, so
+# `gcloud builds submit` of this file with the default ignore file fails at the
+# frontend stage's `COPY web/package.json`. A plain `docker build` is not
+# affected. image-build/cloudbuild-hub-gke.yaml already passes that ignore file;
+# cmd/gcloudignore_copy_contract_test.go checks every in-repo Cloud Build step.
+
 # Stage 1: Build the web frontend assets
 FROM node:22-alpine AS frontend
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY web/ .
-# npm run build already runs copy:shoelace-icons, vite build, and copy:client
+# npm run build runs the prebuild clean, copy:shoelace-icons and vite build
 RUN npm run build
 
 # Stage 2: Build the Scion Hub binary (with embedded web assets)

@@ -453,6 +453,30 @@ func (f HarnessConfigFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Valu
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.HarnessConfigMutation", m)
 }
 
+// The HubEncryptionMigrationFunc type is an adapter to allow the use of ordinary
+// function as HubEncryptionMigration mutator.
+type HubEncryptionMigrationFunc func(context.Context, *ent.HubEncryptionMigrationMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f HubEncryptionMigrationFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.HubEncryptionMigrationMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.HubEncryptionMigrationMutation", m)
+}
+
+// The HubEncryptionPolicyFunc type is an adapter to allow the use of ordinary
+// function as HubEncryptionPolicy mutator.
+type HubEncryptionPolicyFunc func(context.Context, *ent.HubEncryptionPolicyMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f HubEncryptionPolicyFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.HubEncryptionPolicyMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.HubEncryptionPolicyMutation", m)
+}
+
 // The HubInstanceFunc type is an adapter to allow the use of ordinary
 // function as HubInstance mutator.
 type HubInstanceFunc func(context.Context, *ent.HubInstanceMutation) (ent.Value, error)
@@ -727,6 +751,30 @@ func (f ProjectSyncStateFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.V
 		return f(ctx, mv)
 	}
 	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ProjectSyncStateMutation", m)
+}
+
+// The ProjectVisitorExclusionFunc type is an adapter to allow the use of ordinary
+// function as ProjectVisitorExclusion mutator.
+type ProjectVisitorExclusionFunc func(context.Context, *ent.ProjectVisitorExclusionMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f ProjectVisitorExclusionFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.ProjectVisitorExclusionMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ProjectVisitorExclusionMutation", m)
+}
+
+// The ProjectVisitorRuleFunc type is an adapter to allow the use of ordinary
+// function as ProjectVisitorRule mutator.
+type ProjectVisitorRuleFunc func(context.Context, *ent.ProjectVisitorRuleMutation) (ent.Value, error)
+
+// Mutate calls f(ctx, m).
+func (f ProjectVisitorRuleFunc) Mutate(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+	if mv, ok := m.(*ent.ProjectVisitorRuleMutation); ok {
+		return f(ctx, mv)
+	}
+	return nil, fmt.Errorf("unexpected mutation type %T. expect *ent.ProjectVisitorRuleMutation", m)
 }
 
 // The RelayInstanceFunc type is an adapter to allow the use of ordinary

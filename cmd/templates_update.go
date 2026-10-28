@@ -23,6 +23,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/urlredact"
 	"github.com/spf13/cobra"
 )
 
@@ -66,18 +67,7 @@ func runTemplatesUpdate(cmd *cobra.Command, args []string) error {
 		return newUsageError("--scope must be global, project or user")
 	}
 
-	var gp string
-	if projectPath != "" {
-		resolved, err := config.GetResolvedProjectDir(projectPath)
-		if err != nil {
-			return fmt.Errorf("failed to resolve project path %q: %w", projectPath, err)
-		}
-		gp = resolved
-	} else if projectDir, err := config.GetResolvedProjectDir(""); err == nil {
-		gp = projectDir
-	}
-
-	hubCtx, err := requireHub(gp)
+	hubCtx, err := requireHub(projectPath)
 	if err != nil {
 		return err
 	}
@@ -119,11 +109,12 @@ func templateSourceRefreshable(sourceURL string) bool {
 
 // displaySourceURL returns sourceURL for printing. The display never shows
 // credentials embedded in a source string: http(s) and builtin:// URLs are
-// shown without any username, password, query or fragment, and any other
-// source is shown as a fixed label.
+// shown without any username, password, query or fragment
+// (urlredact.HostAndPath), and any other source, or one holding an '@' the
+// shared user info rule cannot place, is shown as a fixed label.
 func displaySourceURL(sourceURL string) string {
-	u, err := url.Parse(strings.TrimSpace(sourceURL))
-	if err != nil || u.Opaque != "" || u.Host == "" {
+	u, ok := urlredact.HostAndPath(strings.TrimSpace(sourceURL))
+	if !ok || u.Opaque != "" || u.Host == "" {
 		return "(non-web source)"
 	}
 	switch strings.ToLower(u.Scheme) {
@@ -131,11 +122,6 @@ func displaySourceURL(sourceURL string) string {
 	default:
 		return "(non-web source)"
 	}
-	u.User = nil
-	u.RawQuery = ""
-	u.ForceQuery = false
-	u.Fragment = ""
-	u.RawFragment = ""
 	return u.String()
 }
 

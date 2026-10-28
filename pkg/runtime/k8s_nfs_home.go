@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
 	"github.com/GoogleCloudPlatform/scion/pkg/shareddirs"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
@@ -179,26 +180,6 @@ func (r *KubernetesRuntime) nfsHomeEnv(config RunConfig) ([]corev1.EnvVar, error
 	return env, nil
 }
 
-// withHomeStorageAnnotation returns annotations with
-// k8sHomeStorageAnnotation set when nfsHome is true and removed otherwise.
-// The input map is not modified; it is returned as is when no change is
-// needed.
-func withHomeStorageAnnotation(annotations map[string]string, nfsHome bool) map[string]string {
-	_, has := annotations[k8sHomeStorageAnnotation]
-	if !nfsHome && !has {
-		return annotations
-	}
-	out := make(map[string]string, len(annotations)+1)
-	for k, v := range annotations {
-		out[k] = v
-	}
-	delete(out, k8sHomeStorageAnnotation)
-	if nfsHome {
-		out[k8sHomeStorageAnnotation] = HomeStorageNFS
-	}
-	return out
-}
-
 // k8sHomeLinksResult is the content of k8sHomeLinksResultFile, written in
 // the pod by the step that places the links. Targets are relative to the
 // home. State is "linked" or "skipped" (a user file was kept at the
@@ -306,7 +287,7 @@ func (r *KubernetesRuntime) verifyK8sHomeLinks(ctx context.Context, namespace, p
 		targets = append(targets, l.Target)
 	}
 	runtimeLog().Info("Checking linked files in agent home", "agent", config.Name, "phase", "home-files", "targets", targets)
-	out, err := r.execInPod(ctx, namespace, podName, k8sHomeLinksResultCommand)
+	out, err := r.execInPodDialRetry(ctx, namespace, podName, k8sHomeLinksResultCommand, config.Name, "home-files")
 	if err != nil {
 		return fmt.Errorf("failed to read %s: %w", k8sHomeLinksResultFile, err)
 	}
@@ -315,7 +296,7 @@ func (r *KubernetesRuntime) verifyK8sHomeLinks(ctx context.Context, namespace, p
 		return err
 	}
 	script := k8sHomeLinkVerifyScript(util.GetHomeDir(config.UnixUsername), links, skipped)
-	if _, err := r.execInPod(ctx, namespace, podName, []string{"sh", "-c", script}); err != nil {
+	if _, err := r.execInPodDialRetry(ctx, namespace, podName, []string{"sh", "-c", script}, config.Name, "home-files"); err != nil {
 		return fmt.Errorf("failed to verify linked files in agent home: %w", err)
 	}
 	return nil
@@ -399,8 +380,18 @@ func NFSHomeSubPaths(subPathRoot, projectID, slug, agentID string) (agentDir, ho
 	if !validHomeAgentID(agentID) || agentID == slug {
 		return "", "", fmt.Errorf("home storage nfs: invalid agent ID %q", agentID)
 	}
-	agentDir = filepath.Join(subPathRoot, projectID, "agents", slug)
-	return agentDir, filepath.Join(agentDir, "home-"+agentID), nil
+	// The layout authority places homes (ptone/scion#5825): the Cloud Run
+	// agent runtime resolves the same path for the same (project, agent).
+	layout := projectfs.Layout{Backend: projectfs.BackendNFS, SubPathRoot: subPathRoot}
+	ar, err := layout.AgentRoot(projectID, slug)
+	if err != nil {
+		return "", "", fmt.Errorf("home storage nfs: %w", err)
+	}
+	h, err := layout.AgentHome(projectID, slug, agentID)
+	if err != nil {
+		return "", "", fmt.Errorf("home storage nfs: %w", err)
+	}
+	return ar.RelPath, h.RelPath, nil
 }
 
 // homeInitCommand wraps a sciontool home command in a check that the

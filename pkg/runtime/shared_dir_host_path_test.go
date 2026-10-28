@@ -89,7 +89,9 @@ func TestResolveSharedDirHostPath_NFS(t *testing.T) {
 	}
 }
 
-func TestResolveSharedDirHostPath_PerDirBackend(t *testing.T) {
+// The removed per-profile shared_dir_storage_backends override is never
+// consulted: placement comes from the storage block only.
+func TestResolveSharedDirHostPath_PerDirOverrideIgnored(t *testing.T) {
 	home := t.TempDir()
 	mountRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(mountRoot, "share1"), 0o755); err != nil {
@@ -101,14 +103,37 @@ func TestResolveSharedDirHostPath_PerDirBackend(t *testing.T) {
 	gs.Profiles = map[string]config.V1ProfileConfig{
 		"default": {SharedDirStorageBackends: map[string]string{"scratchpad": "nfs"}},
 	}
-
 	got, err := ResolveSharedDirHostPath(gs, home, "proj", testSharedDirProjectID, "scratchpad")
-	if err != nil || got.Backend != "nfs" {
-		t.Fatalf("scratchpad: got %+v, err %v; want nfs", got, err)
+	if err != nil || got.Backend != "local" {
+		t.Fatalf("scratchpad: got %+v, err %v; want local", got, err)
 	}
-	other, err := ResolveSharedDirHostPath(gs, home, "proj", testSharedDirProjectID, "other")
-	if err != nil || other.Backend != "local" {
-		t.Fatalf("other: got %+v, err %v; want local", other, err)
+}
+
+// server.project_storage nfs, and the deprecated server.workspace_storage
+// nfs alone, place shared dirs on the export with the workspace (one
+// backend, design OQ1), as agent start does.
+func TestResolveSharedDirHostPath_WorkspaceBackendPlacesSharedDirs(t *testing.T) {
+	home := t.TempDir()
+	mountRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(mountRoot, "share1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nfs := &config.V1NFSConfig{MountRoot: mountRoot, Shares: []config.V1NFSShare{{ID: "share1", Server: "10.0.0.2", Export: "/vol"}}}
+	resolvedRoot, _ := filepath.EvalSymlinks(mountRoot)
+	want := filepath.Join(resolvedRoot, "share1", "projects", testSharedDirProjectID, "shared-dirs", "scratchpad")
+	for name, srv := range map[string]*config.V1ServerConfig{
+		"project_storage":          {ProjectStorage: &config.V1ProjectStorageConfig{Backend: "nfs", NFS: nfs}},
+		"legacy workspace_storage": {WorkspaceStorage: &config.V1WorkspaceStorageConfig{Backend: "nfs", NFS: nfs}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := ResolveSharedDirHostPath(&config.VersionedSettings{Server: srv}, home, "proj", testSharedDirProjectID, "scratchpad")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Backend != "nfs" || got.Path != want {
+				t.Fatalf("got %+v, want nfs %q", got, want)
+			}
+		})
 	}
 }
 
@@ -177,8 +202,10 @@ func TestLoadSharedDirStorageSettings(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy format with a shared_dir_storage block fails closed", func(t *testing.T) {
-		// No schema_version: the legacy loader drops the server block.
+	t.Run("legacy format with a shared_dir_storage block is loaded", func(t *testing.T) {
+		// No schema_version: the file is converted at its own layer, which
+		// keeps its server block (ptone/scion#3919), so the operator's
+		// shared_dir_storage applies instead of failing closed.
 		writeGlobalSettings(t, `active_profile: local
 server:
   shared_dir_storage:
@@ -189,11 +216,11 @@ server:
         - id: share
 `)
 		gs, err := LoadSharedDirStorageSettings()
-		if !errors.Is(err, ErrSharedDirStorageUnavailable) {
-			t.Fatalf("err = %v, want ErrSharedDirStorageUnavailable", err)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
 		}
-		if gs != nil {
-			t.Fatalf("settings = %+v, want nil", gs)
+		if gs == nil || gs.Server == nil || gs.Server.SharedDirStorage == nil || gs.Server.SharedDirStorage.Backend != "nfs" {
+			t.Fatalf("settings = %+v, want the nfs shared_dir_storage block", gs)
 		}
 	})
 

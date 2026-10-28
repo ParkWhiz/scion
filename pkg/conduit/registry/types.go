@@ -62,6 +62,11 @@ var (
 	ErrSessionNotFound = errors.New("conduit registry: session not found")
 	// ErrInvalidInput wraps validation failures.
 	ErrInvalidInput = errors.New("conduit registry: invalid input")
+	// ErrRelayFeaturesColumnMissing is returned by RegisterRelay when the
+	// database has no relay_instances.features column: the hubs, which
+	// migrate the schema, have not been upgraded yet (relays never
+	// migrate; design v2.21.54).
+	ErrRelayFeaturesColumnMissing = errors.New("relay_instances.features missing: upgrade the hubs first")
 	// ErrNotRoutable is returned by Eligible for principal kinds that are
 	// never resolved by principal (user, relay-peer).
 	ErrNotRoutable = errors.New("conduit registry: principal kind is not routable by principal")
@@ -85,6 +90,24 @@ type RelayInstance struct {
 	StartedAt        time.Time
 	LastSeen         time.Time
 	Draining         bool
+	// Features lists the relay's features (relay_instances.features), set
+	// at registration and fixed per generation; nil when none. Readers
+	// ignore values they do not know (design v2.21.54).
+	Features []string
+}
+
+// RelayFeatureSingleton is the relay feature of a non-HA singleton relay
+// (server.relay.singleton; design §3.9 "Cloud Run singleton").
+const RelayFeatureSingleton = "singleton"
+
+// HasFeature reports whether the relay lists feature f.
+func (ri RelayInstance) HasFeature(f string) bool {
+	for _, have := range ri.Features {
+		if have == f {
+			return true
+		}
+	}
+	return false
 }
 
 // TransportLimits mirrors Capabilities.transport_limits (contract §3).
@@ -105,6 +128,21 @@ type Capabilities struct {
 	// v2.4 §3.4): "launch_id", "generation", or "" for legacy endpoints. The
 	// registry only stores and round-trips it; nothing filters on it.
 	IncarnationSource string `json:"incarnation_source,omitempty"`
+	// Features lists the optional protocol features the session's Hello
+	// advertised (Hello.capabilities.features), such as stream renewal.
+	// The registry only stores and round-trips it; nothing filters on it.
+	Features []string `json:"features,omitempty"`
+}
+
+// HasFeature reports whether the capabilities advertise the optional
+// protocol feature name. Only an exact name matches.
+func (c Capabilities) HasFeature(name string) bool {
+	for _, f := range c.Features {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Has reports whether the capabilities advertise name as a stream kind or

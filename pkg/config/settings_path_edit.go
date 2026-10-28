@@ -61,11 +61,13 @@ type StagedSettingsEdit struct {
 }
 
 // Commit writes the staged file atomically (see writeSettingsFileAtomic).
-func (s *StagedSettingsEdit) Commit() error {
+// lock is the settings lock for the file's directory, held since the edit
+// was prepared.
+func (s *StagedSettingsEdit) Commit(lock *SettingsLock) error {
 	if s == nil || len(s.Changed) == 0 {
 		return nil
 	}
-	return writeSettingsFileAtomic(s.target, s.data)
+	return writeSettingsFileAtomic(lock, s.target, s.data)
 }
 
 // Original returns the settings file bytes the edit was prepared against.
@@ -101,7 +103,7 @@ func readSettingsForEdit(dir string) (orig []byte, target string, err error) {
 // memory, editing nodes in place so comments, key order and unknown keys
 // survive, and returns the result for Commit. Edits whose value is already
 // in the file (or deletes of absent keys) are skipped and not reported in
-// Changed. The caller must hold LockSettingsFile from this call to Commit.
+// Changed. The caller must hold LockSettingsDir(dir) from this call to Commit.
 //
 // It keeps the guards UpdateVersionedSetting relies on: a file the struct
 // loader rejects is refused, an edit through an alias/anchor/opaque key is
@@ -122,7 +124,7 @@ func PrepareSettingsPathEdits(dir string, edits []SettingsPathEdit) (*StagedSett
 // SettingsFileEffective): an edit whose removal leaves the effective
 // settings of the result unchanged is dropped, so it is not written and not
 // reported in Changed. When no edit changes anything effective, nothing is
-// written. The caller must hold LockSettingsFile from this call to Commit.
+// written. The caller must hold LockSettingsDir(dir) from this call to Commit.
 func PrepareEffectiveSettingsPathEdits(dir string, edits []SettingsPathEdit) (*StagedSettingsEdit, error) {
 	orig, target, err := readSettingsForEdit(dir)
 	if err != nil {
@@ -172,7 +174,7 @@ func prepareSettingsEditsBytes(orig []byte, target string, edits []SettingsPathE
 		return nil, fmt.Errorf("failed to parse YAML settings at %s: %w", target, err)
 	}
 	var vs VersionedSettings
-	if err := doc.Decode(&vs); err != nil {
+	if err := decodeSettingsYAMLNode(doc, &vs); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML settings at %s: %w", target, err)
 	}
 	root := doc.Content[0]
@@ -360,7 +362,7 @@ type SettingsEffective struct {
 // SettingsFileEffective computes SettingsEffective for settings file bytes.
 func SettingsFileEffective(data []byte) (*SettingsEffective, error) {
 	var raw map[string]interface{}
-	if err := yamlv3.Unmarshal(data, &raw); err != nil {
+	if err := unmarshalSettingsYAML(data, &raw); err != nil {
 		return nil, err
 	}
 	var v1Server V1ServerConfig
@@ -377,7 +379,7 @@ func SettingsFileEffective(data []byte) (*SettingsEffective, error) {
 	applyTopLevelSettingsSections(gc, raw)
 
 	var typed VersionedSettings
-	if err := yamlv3.Unmarshal(data, &typed); err != nil {
+	if err := unmarshalSettingsYAML(data, &typed); err != nil {
 		return nil, err
 	}
 	normalizeZero(reflect.ValueOf(&typed).Elem())

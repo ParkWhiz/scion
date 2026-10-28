@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -92,8 +91,8 @@ const (
 	githubResolveBudget = 20 * time.Second
 )
 
-// GitHubSkillResolver resolves skills from GitHub repositories
-// using the GitHub Contents API.
+// GitHubSkillResolver resolves skills from GitHub repositories, listing
+// each skill directory with the GitHub git trees API.
 type GitHubSkillResolver struct {
 	httpClient           *http.Client
 	token                string            // Default GITHUB_TOKEN for authenticated requests
@@ -526,12 +525,10 @@ func (r *GitHubSkillResolver) concurrency() int {
 // panic is turned into a per-ref error instead of ending the process. The
 // returned message is generic and carries nothing from the panic value,
 // which may include credential material; the value and stack go to the log.
-// The log names the ref by its URI, which ParseGitHubSkillURI has already
-// accepted: it names at most a secret (?token=NAME), never a secret value,
-// and is the same string returned in ResolveError.URI.
+// The log names the ref by its redacted form (see LoggedSkillRef).
 func panicOutcome(ref api.SkillReference, p any) refOutcome {
 	slog.Error("github: panic during skill resolution",
-		"uri", ref.URI, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+		"uri", LoggedSkillRef(ref.URI), "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
 	return refOutcome{rerr: &ResolveError{
 		URI: ref.URI, Code: SkillErrCodeResolveFailed,
 		Message: "internal error during GitHub skill resolution",
@@ -557,7 +554,7 @@ func (r *GitHubSkillResolver) resolveRef(ctx context.Context, ghRef *GitHubSkill
 		retryAfter = r.cooldownRetryAfter(rl)
 	case errors.As(err, &rerr):
 		// Classify the failure into a stable cause code when possible
-		// (set by doWithRetry/listContents/resolveCommitSHA below), so
+		// (set by doWithRetry/listTree/resolveCommitSHA below), so
 		// the create path can map a required-skill failure to the
 		// right status instead of a generic 500/502.
 		code = rerr.code
@@ -622,14 +619,15 @@ func (r *GitHubSkillResolver) resolveOne(ctx context.Context, ghRef *GitHubSkill
 		// logRef carries no credential-derived material — unlike flightKey and
 		// credID, it is safe to put in a log line or an error message that
 		// might reach a caller (see ResolveWithFetch/coalesceFetch). It names
-		// the ref and the general kind of source that supplied the credential
-		// ("named" or "default"), without the credential's value, its
-		// fingerprint, the secret's own name, or the project/user scope.
+		// the ref in its redacted form (see LoggedSkillRef) and the general
+		// kind of source that supplied the credential ("named" or "default"),
+		// without the credential's value, its fingerprint, the secret's own
+		// name, or the project/user scope.
 		sourceKind := "default"
 		if r.credentialSource(ghRef) != "" {
 			sourceKind = "named"
 		}
-		logRef := ghRef.Raw + " (" + sourceKind + ")"
+		logRef := LoggedSkillRef(ghRef.Raw).String() + " (" + sourceKind + ")"
 
 		// A cached entry loaded from disk has no file content, so install
 		// downloads its files using the credential the install context's
@@ -638,17 +636,33 @@ func (r *GitHubSkillResolver) resolveOne(ctx context.Context, ghRef *GitHubSkill
 		// return the same one, such an entry is not used: the ref is
 		// resolved again, with content, so install never downloads a
 		// credential-scoped skill with a different credential or none.
-		var accept func(ResolvedSkill) bool
+		usable := func(ResolvedSkill) bool { return true }
 		if token != "" && credentialLookupFromContext(ctx)(ghRef.Raw) != token {
-			accept = hasAllFileContent
+			usable = hasAllFileContent
 			// Keep these callers out of flights started by callers that
 			// accept a content-less entry (see coalesceFetchAccept).
 			flightKey += "|with-content"
 		}
+		// An entry cached before file modes were read from the repository
+		// tree has none, so every file would install 0644. It is not
+		// served (fresh or stale) while a re-resolve can replace it; see
+		// the fallback below (ptone/scion#5781).
+		accept := func(skill ResolvedSkill) bool {
+			return usable(skill) && skillFilesHaveModes(skill.Files)
+		}
 
 		skill, err := r.resolutionCache.resolveWithFetchAccept(ctx, cacheKey, flightKey, credID, logRef, isBranchRef, refreshAllowed, accept, fetch)
 		if err != nil {
-			return nil, withRateLimitRef(withCallerRef(err, ghRef.Raw), ghRef.Raw)
+			legacy, ok := r.resolutionCache.legacyModelessEntry(cacheKey, isBranchRef)
+			if !ok || !usable(legacy) || ctx.Err() != nil {
+				return nil, withRateLimitRef(withCallerRef(err, ghRef.Raw), ghRef.Raw)
+			}
+			// The re-resolve failed (a rate-limit cooldown, a network
+			// error). Serving the entry as before beats failing the
+			// agent start over it, but its files may lack exec bits.
+			fmt.Fprintf(os.Stderr, "github: WARNING: re-resolving %s failed (%s); serving a cached entry from before file modes were recorded, so its files may lack executable bits\n",
+				logRef, ResolverReasonForLog(ghRef.Raw, err.Error()))
+			skill = legacy
 		}
 		resolved = skill
 	} else {
@@ -737,12 +751,12 @@ func (r *GitHubSkillResolver) fetchOne(ctx context.Context, ghRef *GitHubSkillRe
 		return ResolvedSkill{}, &refStageError{stage: "failed to resolve ref", ref: ghRef.Raw, err: err}
 	}
 
-	contents, err := r.listContents(ctx, ghRef, commitSHA, token)
+	files, err := r.listTree(ctx, ghRef, commitSHA, token)
 	if err != nil {
 		return ResolvedSkill{}, &refStageError{stage: "failed to list skill contents", ref: ghRef.Raw, err: err}
 	}
 
-	if len(contents) == 0 {
+	if len(files) == 0 {
 		return ResolvedSkill{}, fmt.Errorf("skill %q not found in repo %s/%s (empty directory at %s)",
 			ghRef.SkillName, ghRef.Owner, ghRef.Repo, ghRef.SkillPath)
 	}
@@ -750,31 +764,24 @@ func (r *GitHubSkillResolver) fetchOne(ctx context.Context, ghRef *GitHubSkillRe
 	var resolvedFiles []ResolvedFile
 	var fileInfos []transfer.FileInfo
 
-	expectedPrefix := ghRef.SkillPath + "/"
-	for _, entry := range contents {
-		if entry.Type != "file" {
-			continue
-		}
-		if !strings.HasPrefix(entry.Path, expectedPrefix) {
-			continue
-		}
-
-		content, err := r.downloadRawFile(ctx, ghRef, commitSHA, entry.Path, token)
+	for _, f := range files {
+		repoPath := ghRef.SkillPath + "/" + f.Path
+		content, err := r.downloadRawFile(ctx, ghRef, commitSHA, repoPath, token)
 		if err != nil {
-			return ResolvedSkill{}, fmt.Errorf("failed to download %s for skill %s: %w", entry.Path, ghRef.Raw, err)
+			return ResolvedSkill{}, fmt.Errorf("failed to download %s for skill %s: %w", repoPath, ghRef.Raw, err)
 		}
 
 		hash := fmt.Sprintf("sha256:%x", sha256.Sum256(content))
-		relPath := strings.TrimPrefix(entry.Path, ghRef.SkillPath+"/")
 
 		resolvedFiles = append(resolvedFiles, ResolvedFile{
-			Path:    relPath,
-			URL:     r.rawContentURL(ghRef, commitSHA, entry.Path),
+			Path:    f.Path,
+			URL:     r.rawContentURL(ghRef, commitSHA, repoPath),
 			Hash:    hash,
 			Size:    int64(len(content)),
+			Mode:    f.Mode,
 			Content: content, // Carry bytes so install phase skips unauthenticated re-download.
 		})
-		fileInfos = append(fileInfos, transfer.FileInfo{Path: relPath, Hash: hash})
+		fileInfos = append(fileInfos, transfer.FileInfo{Path: f.Path, Hash: hash})
 	}
 
 	if len(resolvedFiles) == 0 {
@@ -782,7 +789,7 @@ func (r *GitHubSkillResolver) fetchOne(ctx context.Context, ghRef *GitHubSkillRe
 			ghRef.SkillName, ghRef.Owner, ghRef.Repo)
 	}
 
-	bundleHash := transfer.ComputeContentHash(fileInfos)
+	bundleHash := transfer.ComputeContentHashV1(fileInfos)
 
 	return ResolvedSkill{
 		Name:     ghRef.SkillName,
@@ -890,15 +897,6 @@ func credentialFingerprint(token string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// githubContentEntry is the JSON structure returned by the GitHub Contents API.
-type githubContentEntry struct {
-	Name        string `json:"name"`
-	Path        string `json:"path"`
-	Type        string `json:"type"`
-	Size        int    `json:"size"`
-	DownloadURL string `json:"download_url"`
-}
-
 // isFullCommitSHA reports whether s is a complete 40-character lowercase
 // hexadecimal commit SHA. Such a ref is already fully resolved and requires
 // no GitHub API call to "resolve" it further.
@@ -920,7 +918,7 @@ func (r *GitHubSkillResolver) resolveCommitSHA(ctx context.Context, ghRef *GitHu
 		ref = "HEAD"
 	}
 
-	// Warn before any API call path — including listContents and downloadRawFile
+	// Warn before any API call path — including listTree and downloadRawFile
 	// called by the parent resolveOne after this function returns. Even when the
 	// full-SHA short-circuit below skips the SHA-lookup call, those subsequent
 	// calls still go out unauthenticated; the operator needs advance notice.
@@ -930,7 +928,7 @@ func (r *GitHubSkillResolver) resolveCommitSHA(ctx context.Context, ghRef *GitHu
 	if token == "" {
 		fmt.Fprintf(os.Stderr, "github: WARNING: no GITHUB_TOKEN configured for %s; "+
 			"making unauthenticated GitHub API call (limit: 60 req/hr per IP). "+
-			"Set a GITHUB_TOKEN project secret or broker env var to increase the limit.\n", ghRef.Raw)
+			"Set a GITHUB_TOKEN project secret or broker env var to increase the limit.\n", LoggedSkillRef(ghRef.Raw))
 	}
 
 	// Short-circuit: if the ref is already a full 40-char lowercase hex commit SHA,
@@ -977,10 +975,12 @@ func (r *GitHubSkillResolver) resolveCommitSHA(ctx context.Context, ghRef *GitHu
 	return sha, nil
 }
 
-func (r *GitHubSkillResolver) listContents(ctx context.Context, ghRef *GitHubSkillRef, commitSHA string, token string) ([]githubContentEntry, error) {
-	escapedPath := escapePathSegments(ghRef.SkillPath)
-	reqURL := fmt.Sprintf("%s/repos/%s/%s/contents/%s?ref=%s",
-		r.apiBase, url.PathEscape(ghRef.Owner), url.PathEscape(ghRef.Repo), escapedPath, url.QueryEscape(commitSHA))
+// listTree lists every regular file of the skill directory at commitSHA,
+// at any depth, with its mode, in one git trees API call (see
+// DecodeGitHubSkillTree for how symlinks, submodules, unsafe paths and a
+// truncated listing are handled).
+func (r *GitHubSkillResolver) listTree(ctx context.Context, ghRef *GitHubSkillRef, commitSHA string, token string) ([]GitHubTreeFile, error) {
+	reqURL := r.apiBase + GitHubSkillTreePath(ghRef.Owner, ghRef.Repo, ghRef.SkillPath, commitSHA)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -1004,15 +1004,15 @@ func (r *GitHubSkillResolver) listContents(ctx context.Context, ghRef *GitHubSki
 		}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, r.apiError(resp, "list contents")
+		return nil, r.apiError(resp, "list skill tree")
 	}
 
-	var entries []githubContentEntry
-	limited := io.LimitReader(resp.Body, 5*1024*1024)
-	if err := json.NewDecoder(limited).Decode(&entries); err != nil {
-		return nil, fmt.Errorf("failed to decode GitHub API response: %w", err)
+	files, err := DecodeGitHubSkillTree(resp.Body)
+	if err != nil && IsGitHubSkillTreeError(err) {
+		// A stable cause code, the same one the hub reports for these.
+		return nil, &githubResolveError{code: SkillErrCodeUnsupportedContent, msg: err.Error(), err: err}
 	}
-	return entries, nil
+	return files, err
 }
 
 func (r *GitHubSkillResolver) downloadRawFile(ctx context.Context, ghRef *GitHubSkillRef, commitSHA, filePath string, token string) ([]byte, error) {

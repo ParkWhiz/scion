@@ -168,6 +168,16 @@ func (Agent) Fields() []ent.Field {
 		field.Text("applied_config").
 			Optional(),
 
+		// pending_config holds the agent's pending config edits
+		// (store.AgentPendingConfig, ptone/scion#3976) as a JSON document:
+		// edits the hub stored instead of applying, folded into
+		// applied_config at the next start or reincarnation. NULL means no
+		// pending edits. A column of its own, not a key of applied_config,
+		// because a reincarnation rebuilds applied_config wholesale.
+		field.Text("pending_config").
+			Optional().
+			Nillable(),
+
 		// harness_config is a queryable shadow of applied_config's
 		// "harnessConfig" key, kept in sync by every write to applied_config
 		// (CreateAgent/UpdateAgent — see agent_store.go's harnessConfigOf
@@ -377,6 +387,28 @@ func (Agent) Fields() []ent.Field {
 		// (ptone/scion#4666), or "". It is written with launch_error by a
 		// failed report and cleared wherever launch_error is cleared.
 		field.String("launch_cause").
+			Optional().
+			Default(""),
+		// launch_prior_phase is the effective resting phase a start or
+		// restart launch began from (ptone/scion#4669): written by
+		// BeginStartLaunch, reset to "" by a create BeginLaunch. A failed
+		// start-kind launch reads it to choose the phase it ends in.
+		field.String("launch_prior_phase").
+			Optional().
+			Default(""),
+		// launch_revoke_on_fail records the Hub's decision, taken when a
+		// start launch began, whether a failed end revokes the start's
+		// credential (ptone/scion#4669). Written with launch_prior_phase.
+		field.Bool("launch_revoke_on_fail").
+			Default(false),
+		// launch_resume_phase is the resume memory of a failed start
+		// (ptone/scion#4669): the resting phase (suspended, created,
+		// provisioning or halted) a start-kind launch began from when its
+		// failure left the row in phase error, or "". Every launch-ending
+		// write of a start-kind launch writes it, and the
+		// ClearLaunchResumePhaseHook clears it on any write of a phase other
+		// than starting or error. UpdateAgent never writes it.
+		field.String("launch_resume_phase").
 			Optional().
 			Default(""),
 

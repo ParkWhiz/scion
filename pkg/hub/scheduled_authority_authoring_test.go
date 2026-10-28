@@ -23,19 +23,15 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // The revision ceiling of a scoped UAT is the token's frozen ceiling, with
-// its project boundary. revisionAuthorityCeiling is called directly: the
-// schedule routes refuse every UAT at the authoring credential gate before
-// any schedule handler logic runs
-// (TestSchedUATAuthoringRefusedAtBoundary). Recording through the routes
-// is covered by session-authored schedules
-// (TestScheduleAuthoringRecordsSessionCeiling,
-// TestSchedSessionReauthoringRecordsCeiling).
+// its project boundary. revisionAuthorityCeiling is called directly here;
+// recording through the routes is covered by
+// TestSchedUATAuthoringRecordsTokenCeiling and, for real tokens, by
+// TestScheduleAuthoringToken_RequiresCreateSelector.
 func TestSchedUATRevisionCeilingIsTokenCeiling(t *testing.T) {
 	srv, s, projectID := setupScheduleTest(t)
 	owner := setupScopedDispatchAgentOwner(t, srv, s, projectID, tid("sched-uat-ceiling-owner"))
@@ -50,15 +46,25 @@ func TestSchedUATRevisionCeilingIsTokenCeiling(t *testing.T) {
 	assert.Equal(t, projectID, c.BoundaryProjectID)
 }
 
-// A project-scoped UAT cannot author a schedule or a one-shot event of any
-// type: the authoring credential gate refuses it and nothing is written, and
-// scheduled_event.create is not eligible for a project boundary either. The
-// scheduled-message rule for scoped UATs is checked directly in
-// TestSessionOnlyGate_ReasonIsReported.
-func TestSchedUATAuthoringRefusedAtBoundary(t *testing.T) {
+// A project-scoped UAT with scheduled_event:create and the event type's
+// agent selector authors a schedule or a one-shot event of either type,
+// and each row records the token's attribution and its bounded ceiling with
+// the project boundary. scheduled_event.create is eligible for a project
+// boundary.
+func TestSchedUATAuthoringRecordsTokenCeiling(t *testing.T) {
 	srv, s, projectID := setupScheduleTest(t)
 	owner := setupScopedDispatchAgentOwner(t, srv, s, projectID, tid("sched-uat-boundary-owner"))
 	uat := NewScopedUserIdentity(owner, projectID, []string{"scheduled_event:create", "agent:create", "agent:message"})
+	want := uat.Ceiling()
+	assertRecorded := func(t *testing.T, label string, attr store.InitiatorAttribution, c store.EffectCeiling) {
+		t.Helper()
+		assert.Equal(t, store.InitiatorCredentialKindUAT, attr.InitiatorCredentialKind, label)
+		assert.Equal(t, owner.ID(), attr.InitiatorPrincipalID, label)
+		assert.Equal(t, store.EffectCeilingBounded, c.Kind, label)
+		assert.Equal(t, want.PermissionIDs, c.PermissionIDs, label)
+		assert.Equal(t, string(BoundaryKindProject), c.BoundaryKind, label)
+		assert.Equal(t, projectID, c.BoundaryProjectID, label)
+	}
 
 	schedules := []CreateScheduleRequest{
 		{Name: "uat-dispatch", CronExpr: "0 * * * *", EventType: "dispatch_agent", AgentName: "uat-worker"},
@@ -66,20 +72,30 @@ func TestSchedUATAuthoringRefusedAtBoundary(t *testing.T) {
 	}
 	for _, req := range schedules {
 		rec := doAuthoredScheduleRequest(t, srv, uat, projectID, "", http.MethodPost, req)
-		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
 		res, err := s.ListSchedules(context.Background(), store.ScheduleFilter{ProjectID: projectID, Name: req.Name}, store.ListOptions{})
 		require.NoError(t, err)
-		assert.Empty(t, res.Items, req.Name)
+		require.Len(t, res.Items, 1, req.Name)
+		assertRecorded(t, req.Name, res.Items[0].InitiatorAttribution, res.Items[0].AuthorityCeiling)
 	}
 
 	rec := doAuthoredEventRequest(t, srv, uat, projectID,
 		CreateScheduledEventRequest{EventType: "dispatch_agent", FireIn: "1h", AgentName: "uat-one-shot"})
-	assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
-	events, err := s.ListScheduledEvents(context.Background(), store.ScheduledEventFilter{ProjectID: projectID}, store.ListOptions{})
+	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	var evt store.ScheduledEvent
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&evt))
+	stored, err := s.GetScheduledEvent(context.Background(), evt.ID)
 	require.NoError(t, err)
-	assert.Empty(t, events.Items)
+	assertRecorded(t, "one-shot dispatch_agent event", stored.InitiatorAttribution, stored.AuthorityCeiling)
 
-	assertScheduledEventBoundaryIneligible(t, srv, uat, projectID, ActionCreate)
+	decision := srv.authzService.Decide(context.Background(), AuthzRequest{
+		Principal:  principalContextForIdentity(uat),
+		Credential: credentialContextForIdentity(uat),
+		Resource:   Resource{Type: "scheduled_event", ParentType: "project", ParentID: projectID},
+		Action:     ActionCreate,
+		Permission: "scheduled_event.create",
+	})
+	assert.True(t, decision.Allowed, decision.Reason)
 }
 
 // A session-authored edit that changes what a future dispatch does records
@@ -138,18 +154,22 @@ func TestScheduleTypeChangeToDispatchAgentUsesDispatchRule(t *testing.T) {
 	before, err := s.GetSchedule(context.Background(), created.ID)
 	require.NoError(t, err)
 
-	// An agent whose row is not stored: its write ceiling cannot be
-	// computed, so it cannot be recorded as an authority source.
-	unrecordable := &agentIdentityWrapper{&AgentTokenClaims{
-		Claims:    jwt.Claims{Subject: tid("sched-typechange-unstored-agent")},
-		ProjectID: projectID,
-		Scopes:    []AgentTokenScope{ScopeProjectRead, ScopeAgentCreate},
-	}}
+	// A local development user other than the recognized one, holding the
+	// project owner role: it may create agents, but its ceiling cannot be
+	// recorded as an authority source. Agent callers do not edit schedule
+	// definitions, so the PATCH caller is a user.
+	devID := tid("sched-typechange-dev")
+	require.NoError(t, s.CreateUser(context.Background(), &store.User{
+		ID: devID, Email: "devtypechange@example.com", DisplayName: "Dev", Role: "member", Status: "active",
+	}))
+	require.NoError(t, srv.createProjectOwnerRoleBinding(context.Background(), projectID, devID))
+	unrecordable := &DevUser{id: devID, email: "devtypechange@example.com", displayName: "Dev"}
 
 	rec = doAuthoredScheduleRequest(t, srv, unrecordable, projectID, created.ID, http.MethodPatch,
 		UpdateScheduleRequest{EventType: "dispatch_agent", Payload: `{"agentName":"ghost-worker"}`})
 	require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
 	assert.Contains(t, rec.Body.String(), string(DeniedByDelegationCeiling))
+	assert.Contains(t, rec.Body.String(), "cannot authorize scheduled work")
 	after, err := s.GetSchedule(context.Background(), created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "message", after.EventType)
@@ -161,6 +181,7 @@ func TestScheduleTypeChangeToDispatchAgentUsesDispatchRule(t *testing.T) {
 		UpdateScheduleRequest{Payload: `{"agentName":"ghost-target-2","message":"hi"}`})
 	require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
 	assert.Contains(t, rec.Body.String(), string(DeniedByDelegationCeiling))
+	assert.Contains(t, rec.Body.String(), "cannot authorize scheduled work")
 	after, err = s.GetSchedule(context.Background(), created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, before.Payload, after.Payload)

@@ -22,7 +22,11 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { resetServerFlagStateForTests, isFeatureEnabled } from '../utils/feature-flags.js';
-import { applyServerFeatureFlags } from './server-feature-flags.js';
+import {
+  applyServerFeatureFlags,
+  getPublicSettings,
+  invalidatePublicSettings,
+} from './server-feature-flags.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -33,6 +37,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 beforeEach(() => {
   resetServerFlagStateForTests();
+  invalidatePublicSettings();
   delete window.__SCION_FEATURES__;
   try {
     localStorage.clear();
@@ -192,6 +197,63 @@ describe('applyServerFeatureFlags: parallel boot fetch', () => {
   });
 });
 
+describe('applyServerFeatureFlags: embedded experiments (ptone/scion#2489)', () => {
+  function stubFetch(): ReturnType<typeof vi.fn> {
+    const spy = vi.fn((url: string) => {
+      if (url.includes('/api/v1/experiments'))
+        return Promise.resolve(jsonResponse({ experiments: { 'web.fixture_flag': true } }));
+      if (url.includes('/api/v1/settings/public'))
+        return Promise.resolve(jsonResponse({ nativeChatEnabled: false }));
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', spy);
+    return spy;
+  }
+
+  function requestedUrls(spy: ReturnType<typeof vi.fn>): string[] {
+    return spy.mock.calls.map((call) => String(call[0]));
+  }
+
+  it('applies an embedded map without requesting /api/v1/experiments', async () => {
+    const spy = stubFetch();
+
+    await applyServerFeatureFlags({ 'web.embedded_flag': true });
+
+    expect(isFeatureEnabled('web.embedded_flag')).toBe(true);
+    // Nothing from the experiments response, which was never requested.
+    expect(isFeatureEnabled('web.fixture_flag')).toBe(false);
+    expect(requestedUrls(spy)).toEqual(['/api/v1/settings/public']);
+    // settings/public is still requested and applied.
+    expect(isFeatureEnabled('web.native_chat')).toBe(false);
+  });
+
+  it('an empty embedded map is used as is', async () => {
+    const spy = stubFetch();
+
+    await applyServerFeatureFlags({});
+
+    expect(requestedUrls(spy)).toEqual(['/api/v1/settings/public']);
+    expect(isFeatureEnabled('web.gcs_links')).toBe(false);
+  });
+
+  it.each([
+    ['absent', undefined],
+    ['null', null],
+    ['an array', ['web.fixture_flag']],
+    ['a string', 'web.fixture_flag'],
+    ['a boolean', true],
+  ])('falls back to the request when the embedded map is %s', async (_label, embedded) => {
+    const spy = stubFetch();
+
+    await applyServerFeatureFlags(embedded);
+
+    expect(requestedUrls(spy)).toContain('/api/v1/experiments');
+    // The fetched map applies.
+    expect(isFeatureEnabled('web.fixture_flag')).toBe(true);
+    expect(window.__SCION_FEATURES__ ?? {}).not.toHaveProperty('0');
+  });
+});
+
 describe('applyServerFeatureFlags: web.gcs_links (registered experiment, ptone/scion#2545)', () => {
   function stubFetch(experimentsBody: unknown, experimentsStatus = 200): void {
     vi.stubGlobal(
@@ -239,5 +301,90 @@ describe('applyServerFeatureFlags: web.gcs_links (registered experiment, ptone/s
     );
     await applyServerFeatureFlags();
     expect(isFeatureEnabled('web.gcs_links')).toBe(false);
+  });
+});
+
+describe('getPublicSettings: one request per page load (ptone/scion#5311)', () => {
+  it('concurrent and later callers share one request', async () => {
+    const fetchSpy = vi.fn(() => Promise.resolve(jsonResponse({ telemetryEnabled: true })));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const [a, b] = await Promise.all([getPublicSettings(), getPublicSettings()]);
+    const c = await getPublicSettings();
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(a?.telemetryEnabled).toBe(true);
+    expect(b).toBe(a);
+    expect(c).toBe(a);
+  });
+
+  it('boot (applyServerFeatureFlags) fills the cache', async () => {
+    const fetchSpy = vi.fn(() => Promise.resolve(jsonResponse({ nativeChatEnabled: true })));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await applyServerFeatureFlags();
+    await getPublicSettings();
+
+    const settingsCalls = fetchSpy.mock.calls.filter((args: unknown[]) =>
+      String(args[0]).includes('/api/v1/settings/public')
+    );
+    expect(settingsCalls).toHaveLength(1);
+  });
+
+  const failures: Array<[string, () => Promise<Response>]> = [
+    ['a non-OK status', (): Promise<Response> => Promise.resolve(jsonResponse({}, 500))],
+    [
+      'a non-JSON body',
+      (): Promise<Response> => Promise.resolve(new Response('<html>', { status: 200 })),
+    ],
+    ['a rejected fetch', (): Promise<Response> => Promise.reject(new Error('down'))],
+    [
+      'a fetch that throws synchronously',
+      (): Promise<Response> => {
+        throw new Error('down');
+      },
+    ],
+  ];
+  it.each(failures)('%s resolves null and is not cached', async (_label, fail) => {
+    const fetchSpy = vi.fn(fail);
+    vi.stubGlobal('fetch', fetchSpy);
+    expect(await getPublicSettings()).toBeNull();
+
+    fetchSpy.mockImplementation(() => Promise.resolve(jsonResponse({ telemetryEnabled: true })));
+    expect((await getPublicSettings())?.telemetryEnabled).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('a request in flight when the cache is invalidated does not repopulate it', async () => {
+    let resolveOld!: (r: Response) => void;
+    const fetchSpy = vi.fn(
+      () =>
+        new Promise<Response>((r) => {
+          resolveOld = r;
+        })
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const old = getPublicSettings();
+    invalidatePublicSettings();
+    resolveOld(jsonResponse({ agentSecretsUserScopeOnly: false }));
+    expect((await old)?.agentSecretsUserScopeOnly).toBe(false);
+
+    fetchSpy.mockImplementation(() =>
+      Promise.resolve(jsonResponse({ agentSecretsUserScopeOnly: true }))
+    );
+    expect((await getPublicSettings())?.agentSecretsUserScopeOnly).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('getPublicSettings: shared object', () => {
+  it('the cached settings are frozen, so no caller can change what the others read', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(jsonResponse({ telemetryEnabled: true })))
+    );
+    const settings = await getPublicSettings();
+    expect(Object.isFrozen(settings)).toBe(true);
   });
 });

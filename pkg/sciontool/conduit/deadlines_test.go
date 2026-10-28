@@ -73,7 +73,43 @@ func startFakeAgent(t *testing.T, h *fakeHub, mod func(*Options)) *fakeAgent {
 			mod(o)
 		}
 	})
+	// Registered after startAgent's cleanup, so it runs first, while the
+	// agent still runs (ptone/scion#5037).
+	t.Cleanup(func() {
+		if t.Failed() {
+			fa.logSessionState(t)
+		}
+	})
 	return fa
+}
+
+// logSessionState logs, for a failed test, the agent's side of its live
+// session and how often the agent dialed the hub, so a session that ended
+// under the test names its own error and shows whether the agent redialed.
+func (fa *fakeAgent) logSessionState(t *testing.T) {
+	t.Helper()
+	fa.a.mu.Lock()
+	live := fa.a.live
+	fa.a.mu.Unlock()
+	dials := fa.h.conduitHits.Load()
+	if live == nil {
+		t.Logf("agent session state: no live session (hub saw %d dials)", dials)
+		return
+	}
+	ended := "open"
+	select {
+	case <-live.Done():
+		ended = "ended"
+	default:
+	}
+	goAway := false
+	select {
+	case <-live.GoAwayReceived():
+		goAway = true
+	default:
+	}
+	t.Logf("agent session state: session %s %s, err %v, GoAway received %v (hub saw %d dials)",
+		live.Info().SessionID, ended, live.Err(), goAway, dials)
 }
 
 // keysFetched waits for the outcome of the agent's first key fetch: on
@@ -112,6 +148,26 @@ func (fa *fakeAgent) deadline(t *testing.T, s core.LocalSession, st core.Stream)
 	return d
 }
 
+// waitTracked waits, for at most 10 seconds, until the agent tracks the
+// deadline of st. The agent accepts a stream before it registers the
+// stream's deadline (handleTCP), so a test that renews a stream it has
+// just opened waits for the registration first; a renewal that arrives
+// earlier is refused as untracked.
+func (fa *fakeAgent) waitTracked(t *testing.T, s core.LocalSession, st core.Stream) {
+	t.Helper()
+	b := target.Binding{SessionID: s.Info().SessionID, ConnectionEpoch: s.Info().ConnectionEpoch}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, ok := fa.a.deadlines.Deadline(b, st.ID()); ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream deadline not tracked within 10s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // mustRefuse opens o on s and requires a 4403 refusal.
 func mustRefuse(t *testing.T, s core.LocalSession, o *conduitv1.StreamOpen, what string) {
 	t.Helper()
@@ -143,17 +199,28 @@ func openAt(t *testing.T, key testKey, s core.LocalSession, port int, now time.T
 	})
 }
 
-// withDeadline gives a grant an authorization deadline (and a jti).
+// withDeadline gives a grant an authorization deadline, a jti and the
+// tunnel origin (which carries every stream kind, so a renewal naming
+// another kind differs from the open grant only in its stream).
 func withDeadline(jti string, until time.Time, interval time.Duration) func(*grant.Claims) {
-	return func(c *grant.Claims) { c.JTI, c.AuthzUntil, c.AuthzInterval = jti, until, interval }
+	return func(c *grant.Claims) {
+		c.JTI, c.AuthzUntil, c.AuthzInterval, c.Via = jti, until, interval, grant.ViaTunnel
+	}
 }
 
 // renewalFor mints a renewal minted at now for the stream st on s, opened
-// with a grant whose jti is openJTI.
-func renewalFor(t *testing.T, key testKey, s core.LocalSession, st core.Stream, now time.Time, openJTI string, until time.Time, mut func(*grant.RenewalClaims)) []byte {
+// by open with a grant whose jti is openJTI; its stream claim is copied
+// from open.
+func renewalFor(t *testing.T, key testKey, s core.LocalSession, st core.Stream, open *conduitv1.StreamOpen, now time.Time, openJTI string, until time.Time, mut func(*grant.RenewalClaims)) []byte {
 	t.Helper()
 	info := s.Info()
+	kind, err := core.StreamKindFromProto(open.GetKind())
+	if err != nil {
+		t.Fatal(err)
+	}
 	c := grant.RenewalClaims{
+		Stream: grant.StreamHeader{Kind: string(kind), Params: open.GetParams()},
+		Via:    grant.ViaTunnel, // withDeadline's origin
 		Issuer: "scion-hub", Subject: "user:u1", ProjectID: testProjectID,
 		Target: grant.Target{
 			Kind: grant.TargetKindAgent, ID: testAgentID, EndpointIncarnation: "launch-1",
@@ -336,9 +403,9 @@ func TestAgentRotatedKeyAcceptedAfterOneFetch(t *testing.T) {
 }
 
 // TestAgentEnforceModeRequiresDeadline: once the key fetch sets enforce,
-// a user stream's grant without authz_until is refused without consuming
-// its jti; with authz_until it is accepted, and a stream opened by an
-// agent principal needs none.
+// a user stream's grant without authz_until, or without a valid via, is
+// refused without consuming its jti; with both it is accepted, and a
+// stream opened by an agent principal needs neither.
 func TestAgentEnforceModeRequiresDeadline(t *testing.T) {
 	k1 := newTestKey(t, "k1")
 	h := newFakeHub(t, k1.public)
@@ -350,6 +417,9 @@ func TestAgentEnforceModeRequiresDeadline(t *testing.T) {
 	now := fakeStart
 
 	mustRefuse(t, s, openAt(t, k1, s, port, now, func(c *grant.Claims) { c.JTI = "open-1" }), "user grant without authz_until")
+	mustRefuse(t, s, openAt(t, k1, s, port, now, func(c *grant.Claims) {
+		c.JTI, c.AuthzUntil, c.AuthzInterval = "open-1", now.Add(time.Hour), time.Hour
+	}), "user grant with authz_until but no via")
 	// The refused grant did not consume its jti.
 	mustOpen(t, s, openAt(t, k1, s, port, now, withDeadline("open-1", now.Add(time.Hour), time.Hour)), "user grant with authz_until and the same jti")
 	mustOpen(t, s, openAt(t, k1, s, port, now, func(c *grant.Claims) { c.Subject = "agent:agent-2" }), "agent grant without authz_until")
@@ -399,8 +469,8 @@ func TestAgentDeadlineModeOff(t *testing.T) {
 // TestAgentStreamClosesAtDeadline: a stream whose grant carries
 // authz_until is closed with 4401 at authz_until + 30s, not before, when
 // no valid renewal arrives. Refused renewals (another open_jti, another
-// iss, past the cap) neither extend the deadline nor close the stream
-// early, and each is logged.
+// iss, past the cap, another stream) neither extend the deadline nor close
+// the stream early, and each is logged.
 func TestAgentStreamClosesAtDeadline(t *testing.T) {
 	readLog := captureLog(t)
 	k1 := newTestKey(t, "k1")
@@ -410,13 +480,18 @@ func TestAgentStreamClosesAtDeadline(t *testing.T) {
 	fa.keysFetched(t, true)
 	now := fakeStart
 	until := now.Add(10 * time.Second)
-	st := mustOpen(t, s, openAt(t, k1, s, echoListener(t), now, withDeadline("open-1", until, time.Minute)), "stream with a deadline")
+	open := openAt(t, k1, s, echoListener(t), now, withDeadline("open-1", until, time.Minute))
+	st := mustOpen(t, s, open, "stream with a deadline")
+	fa.waitTracked(t, s, st)
 
 	r := st.(core.StreamRenewer)
 	refused := [][]byte{
-		renewalFor(t, k1, s, st, now, "open-2", until.Add(20*time.Second), nil),
-		renewalFor(t, k1, s, st, now, "open-1", until.Add(20*time.Second), func(c *grant.RenewalClaims) { c.Issuer = "other-hub" }),
-		renewalFor(t, k1, s, st, now, "open-1", now.Add(time.Minute+target.DeadlineGrace+time.Second), nil),
+		renewalFor(t, k1, s, st, open, now, "open-2", until.Add(20*time.Second), nil),
+		renewalFor(t, k1, s, st, open, now, "open-1", until.Add(20*time.Second), func(c *grant.RenewalClaims) { c.Issuer = "other-hub" }),
+		renewalFor(t, k1, s, st, open, now, "open-1", now.Add(time.Minute+target.DeadlineGrace+time.Second), nil),
+		renewalFor(t, k1, s, st, open, now, "open-1", until.Add(20*time.Second), func(c *grant.RenewalClaims) {
+			c.Stream = grant.StreamHeader{Kind: grant.StreamKindPTY}
+		}),
 	}
 	for _, tok := range refused {
 		if err := r.Renew(tok); err != nil {
@@ -454,10 +529,12 @@ func TestAgentRenewalExtendsDeadline(t *testing.T) {
 	fa.keysFetched(t, true)
 	now := fakeStart
 	until := now.Add(10 * time.Second)
-	st := mustOpen(t, s, openAt(t, k1, s, echoListener(t), now, withDeadline("open-1", until, time.Minute)), "stream with a deadline")
+	open := openAt(t, k1, s, echoListener(t), now, withDeadline("open-1", until, time.Minute))
+	st := mustOpen(t, s, open, "stream with a deadline")
+	fa.waitTracked(t, s, st)
 
 	renewed := until.Add(20 * time.Second)
-	if err := st.(core.StreamRenewer).Renew(renewalFor(t, k1, s, st, now, "open-1", renewed, nil)); err != nil {
+	if err := st.(core.StreamRenewer).Renew(renewalFor(t, k1, s, st, open, now, "open-1", renewed, nil)); err != nil {
 		t.Fatal(err)
 	}
 	if out := fa.nextRenewal(t); out.err != nil || out.streamID != st.ID() {
@@ -480,8 +557,8 @@ func TestAgentRenewalExtendsDeadline(t *testing.T) {
 	}
 }
 
-// TestAgentAdvertisesStreamRenewal: the Hello lists the stream_renewal
-// feature.
+// TestAgentAdvertisesStreamRenewal: the Hello lists the stream_renewal.v2
+// feature (design v2.21.26).
 func TestAgentAdvertisesStreamRenewal(t *testing.T) {
 	h := newFakeHub(t, newTestKey(t, "k1").public)
 	startFakeAgent(t, h, nil)
@@ -503,13 +580,15 @@ func TestAgentRenewalUnknownKidDoesNotStallFrames(t *testing.T) {
 	s := h.nextSession(t)
 	fa.keysFetched(t, true)
 	now := fakeStart
-	st := mustOpen(t, s, openAt(t, k1, s, echoListener(t), now, withDeadline("open-1", now.Add(time.Minute), time.Hour)), "stream with a deadline")
+	open := openAt(t, k1, s, echoListener(t), now, withDeadline("open-1", now.Add(time.Minute), time.Hour))
+	st := mustOpen(t, s, open, "stream with a deadline")
+	fa.waitTracked(t, s, st)
 
 	h.set(func(h *fakeHub) { h.keys = []grant.PublicKey{k1.public, k2.public} })
 	blocking.Store(true)
 	r := st.(core.StreamRenewer)
 	viaK2 := now.Add(30 * time.Minute)
-	if err := r.Renew(renewalFor(t, k2, s, st, now, "open-1", viaK2, nil)); err != nil {
+	if err := r.Renew(renewalFor(t, k2, s, st, open, now, "open-1", viaK2, nil)); err != nil {
 		t.Fatal(err)
 	}
 	waitEntered(t, entered)
@@ -519,7 +598,7 @@ func TestAgentRenewalUnknownKidDoesNotStallFrames(t *testing.T) {
 		t.Fatal("stream stalled while a key fetch was in flight")
 	}
 	viaK1 := now.Add(10 * time.Minute)
-	if err := r.Renew(renewalFor(t, k1, s, st, now, "open-1", viaK1, nil)); err != nil {
+	if err := r.Renew(renewalFor(t, k1, s, st, open, now, "open-1", viaK1, nil)); err != nil {
 		t.Fatal(err)
 	}
 	if out := fa.nextRenewal(t); out.err != nil {
@@ -551,14 +630,16 @@ func TestAgentRenewalQueueFull(t *testing.T) {
 	s := h.nextSession(t)
 	fa.keysFetched(t, true)
 	now := fakeStart
-	st := mustOpen(t, s, openAt(t, k1, s, echoListener(t), now, withDeadline("open-1", now.Add(time.Minute), time.Hour)), "stream with a deadline")
+	open := openAt(t, k1, s, echoListener(t), now, withDeadline("open-1", now.Add(time.Minute), time.Hour))
+	st := mustOpen(t, s, open, "stream with a deadline")
+	fa.waitTracked(t, s, st)
 
 	h.set(func(h *fakeHub) { h.keys = []grant.PublicKey{k1.public, k2.public} })
 	blocking.Store(true)
 	r := st.(core.StreamRenewer)
 	// The first unknown-kid renewal takes the worker, which blocks in the
 	// key fetch.
-	if err := r.Renew(renewalFor(t, k2, s, st, now, "open-1", now.Add(2*time.Minute), nil)); err != nil {
+	if err := r.Renew(renewalFor(t, k2, s, st, open, now, "open-1", now.Add(2*time.Minute), nil)); err != nil {
 		t.Fatal(err)
 	}
 	waitEntered(t, entered)
@@ -566,14 +647,14 @@ func TestAgentRenewalQueueFull(t *testing.T) {
 	queued := now.Add(2 * time.Minute)
 	for i := range renewalQueueSize {
 		queued = now.Add(2*time.Minute + time.Duration(i+1)*time.Second)
-		if err := r.Renew(renewalFor(t, k2, s, st, now, "open-1", queued, nil)); err != nil {
+		if err := r.Renew(renewalFor(t, k2, s, st, open, now, "open-1", queued, nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	overflow := now.Add(50 * time.Minute)
 	const extra = 2
 	for range extra {
-		if err := r.Renew(renewalFor(t, k2, s, st, now, "open-1", overflow, nil)); err != nil {
+		if err := r.Renew(renewalFor(t, k2, s, st, open, now, "open-1", overflow, nil)); err != nil {
 			t.Fatal(err)
 		}
 		if out := fa.nextRenewal(t); !errors.Is(out.err, errRenewalQueueFull) {

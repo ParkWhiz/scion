@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -149,7 +150,7 @@ func TestInstallResolvedSkills_Success(t *testing.T) {
 	defer srv.Close()
 
 	// Compute bundle hash
-	bundleHash := transfer.ComputeContentHash([]transfer.FileInfo{
+	bundleHash := transfer.ComputeContentHashV1([]transfer.FileInfo{
 		{Path: "SKILL.md", Hash: contentHash},
 	})
 
@@ -292,7 +293,7 @@ func TestInstallResolvedSkills_DuplicateDestination(t *testing.T) {
 	// via scope-based precedence instead of producing a hard error.
 	content := []byte("# Winner Skill")
 	contentHash := transfer.HashBytes(content)
-	bundleHash := transfer.ComputeContentHash([]transfer.FileInfo{
+	bundleHash := transfer.ComputeContentHashV1([]transfer.FileInfo{
 		{Path: "SKILL.md", Hash: contentHash},
 	})
 
@@ -516,7 +517,7 @@ func TestInstallResolvedSkills_WithAsRename(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	bundleHash := transfer.ComputeContentHash([]transfer.FileInfo{
+	bundleHash := transfer.ComputeContentHashV1([]transfer.FileInfo{
 		{Path: "SKILL.md", Hash: contentHash},
 	})
 
@@ -576,7 +577,7 @@ func TestInstallResolvedSkills_NestedFiles(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	bundleHash := transfer.ComputeContentHash([]transfer.FileInfo{
+	bundleHash := transfer.ComputeContentHashV1([]transfer.FileInfo{
 		{Path: "SKILL.md", Hash: hash1},
 		{Path: "scripts/run.sh", Hash: hash2},
 	})
@@ -684,6 +685,33 @@ func TestEnumerateLocalSkills(t *testing.T) {
 	}
 }
 
+func TestEnumerateLocalSkills_SkipsAgentPluginDirs(t *testing.T) {
+	agentHome := t.TempDir()
+	skillsDir := ".claude/skills"
+	skillsPath := filepath.Join(agentHome, skillsDir)
+
+	_ = os.MkdirAll(filepath.Join(skillsPath, "local-skill"), 0755)
+	// An Agent Plugins bundle installed by the claude harness.
+	_ = os.MkdirAll(filepath.Join(skillsPath, "scion-smoke", ".claude-plugin"), 0755)
+	_ = os.WriteFile(filepath.Join(skillsPath, "scion-smoke", "plugin.json"), []byte(`{}`), 0644)
+	// A symlinked or directory plugin.json does not mark a bundle.
+	_ = os.MkdirAll(filepath.Join(skillsPath, "linked"), 0755)
+	_ = os.WriteFile(filepath.Join(skillsPath, "linked", "SKILL.md"), []byte("x"), 0644)
+	if err := os.Symlink("SKILL.md", filepath.Join(skillsPath, "linked", "plugin.json")); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.MkdirAll(filepath.Join(skillsPath, "dirmark", "plugin.json"), 0755)
+
+	var names []string
+	for _, e := range enumerateLocalSkills(agentHome, skillsDir) {
+		names = append(names, e.Name)
+	}
+	sort.Strings(names)
+	if strings.Join(names, ",") != "dirmark,linked,local-skill" {
+		t.Fatalf("local skills = %v, want [dirmark linked local-skill]", names)
+	}
+}
+
 func TestEnumerateLocalSkills_NonExistentDir(t *testing.T) {
 	entries := enumerateLocalSkills(t.TempDir(), ".claude/skills")
 	if len(entries) != 0 {
@@ -694,7 +722,7 @@ func TestEnumerateLocalSkills_NonExistentDir(t *testing.T) {
 func TestInstallResolvedSkills_OverridesExistingLocalSkill(t *testing.T) {
 	content := []byte("# Updated Skill")
 	contentHash := transfer.HashBytes(content)
-	bundleHash := transfer.ComputeContentHash([]transfer.FileInfo{
+	bundleHash := transfer.ComputeContentHashV1([]transfer.FileInfo{
 		{Path: "SKILL.md", Hash: contentHash},
 	})
 
@@ -766,7 +794,7 @@ func TestInstallOneSkill_GitBlobHashes(t *testing.T) {
 	defer srv.Close()
 
 	blobHash := transfer.GitBlobHashBytes([]byte(body))
-	bundleHash := transfer.ComputeContentHash([]transfer.FileInfo{
+	bundleHash := transfer.ComputeContentHashV1([]transfer.FileInfo{
 		{Path: "SKILL.md", Hash: blobHash},
 	})
 
@@ -1070,7 +1098,7 @@ func TestDeduplicateByDestName_NoCollision(t *testing.T) {
 func TestDeduplicateByDestName_CollisionRecordedInRecord(t *testing.T) {
 	content := []byte("# Skill")
 	contentHash := transfer.HashBytes(content)
-	bundleHash := transfer.ComputeContentHash([]transfer.FileInfo{
+	bundleHash := transfer.ComputeContentHashV1([]transfer.FileInfo{
 		{Path: "SKILL.md", Hash: contentHash},
 	})
 
@@ -1289,5 +1317,37 @@ func TestDeduplicateByDestName_AsAlias(t *testing.T) {
 	}
 	if len(collisions) != 0 {
 		t.Errorf("expected 0 collisions with alias, got %d", len(collisions))
+	}
+}
+
+// TestDownloadSkillFile_BodyReadErrorIsDownloadFailure checks that a failure
+// while reading the response body is reported as a download failure, not as
+// a local install failure (ptone/scion#5033).
+func TestDownloadSkillFile_BodyReadErrorIsDownloadFailure(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Promise more bytes than are sent: the client's body read ends
+		// with an unexpected EOF when the handler returns.
+		w.Header().Set("Content-Length", "100")
+		_, _ = w.Write([]byte("partial"))
+	}))
+	defer srv.Close()
+
+	origTransport := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = origTransport }()
+
+	dest := filepath.Join(t.TempDir(), "SKILL.md")
+	err := downloadSkillFile(context.Background(), srv.URL+"/signed/file?sig=x", dest, defaultMaxFileSize, gitHubCredential{})
+	if err == nil {
+		t.Fatal("expected an error for a truncated response body")
+	}
+	if got, want := publicInstallReason(err), "download failed while reading the response"; got != want {
+		t.Errorf("public reason = %q, want %q", got, want)
+	}
+	if strings.Contains(err.Error(), "failed to write") {
+		t.Errorf("body read error reported as a write failure: %v", err)
+	}
+	if strings.Contains(err.Error(), "sig=x") || strings.Contains(err.Error(), "/signed/") {
+		t.Errorf("error quotes the download URL: %v", err)
 	}
 }

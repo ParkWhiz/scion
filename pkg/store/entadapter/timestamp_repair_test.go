@@ -91,6 +91,7 @@ func TestUnreadableTimestampTables_OlderSchemaAndTablesOption(t *testing.T) {
 func TestUnreadableTimestampTables_Postgres(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = db.Close() })
 	tables, err := UnreadableTimestampTables(context.Background(), db, dialect.Postgres)
 	require.NoError(t, err)
@@ -121,6 +122,10 @@ func TestSnapshotSQLite(t *testing.T) {
 		again, err := SnapshotSQLite(ctx, db, "pre-test", at)
 		require.NoError(t, err)
 		assert.Equal(t, SQLiteSnapshot{Path: snap.Path, Reused: true}, again)
+		// Reuse is a use: the retention period counts from it.
+		info, err := os.Stat(snap.Path)
+		require.NoError(t, err)
+		assert.True(t, info.ModTime().Equal(at), "reuse must set the last use to %v, got %v", at, info.ModTime())
 	}
 	matches, err := filepath.Glob(path + ".pre-test-*")
 	require.NoError(t, err)
@@ -129,6 +134,7 @@ func TestSnapshotSQLite(t *testing.T) {
 
 	mem, err := sql.Open("sqlite", ":memory:")
 	require.NoError(t, err)
+	mem.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = mem.Close() })
 	_, err = SnapshotSQLite(ctx, mem, "pre-test", now)
 	assert.ErrorContains(t, err, "in-memory")

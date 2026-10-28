@@ -414,7 +414,9 @@ func (s *Server) handleScheduledList(w http.ResponseWriter, r *http.Request, key
 		}
 		sms = s.scheduledMessageStore()
 	} else {
-		target, serr := s.authorizeChatSend(ctx, user, key)
+		// Listing reads the caller's own rows: read access to the thread
+		// is enough, so a sender who lost posting still sees its rows.
+		target, serr := s.authorizeChatSendRead(ctx, user, key)
 		if serr != nil {
 			serr.write(w)
 			return
@@ -802,14 +804,7 @@ func (s *Server) startScheduledSendSweeper(ctx context.Context) {
 // longer than ctx allows. The runtime cannot be started again afterwards.
 func (s *Server) stopScheduledSendSweeper(ctx context.Context) {
 	rt := s.scheduledRuntime()
-	rt.mu.Lock()
-	rt.stopped = true
-	stop := rt.stopLoop
-	rt.stopLoop = nil
-	rt.mu.Unlock()
-	if stop != nil {
-		stop()
-	}
+	s.haltScheduledSendSweeper()
 	done := make(chan struct{})
 	go func() {
 		rt.running.Wait()
@@ -832,6 +827,23 @@ func (s *Server) stopScheduledSendSweeper(ctx context.Context) {
 		scheduledSendLog().Warn("scheduled send: shutdown deadline reached while deliveries were finishing")
 	case <-final.C:
 		scheduledSendLog().Warn("scheduled send: deliveries did not finish after being cut short")
+	}
+}
+
+// haltScheduledSendSweeper stops the sweeper loop, so no new sweep or
+// delivery starts, without waiting for the ones in progress
+// (stopScheduledSendSweeper does). The hub calls it when it begins
+// shutting down (Server.BeginShutdown, ptone/scion#5054). It is
+// idempotent, and the runtime cannot be started again afterwards.
+func (s *Server) haltScheduledSendSweeper() {
+	rt := s.scheduledRuntime()
+	rt.mu.Lock()
+	rt.stopped = true
+	stop := rt.stopLoop
+	rt.stopLoop = nil
+	rt.mu.Unlock()
+	if stop != nil {
+		stop()
 	}
 }
 
@@ -1086,8 +1098,9 @@ func (s *Server) checkScheduledFire(ctx context.Context, m *ScheduledChatMessage
 }
 
 // checkScheduledTopicFire runs the topic checks of a claimed row: the
-// topic exists, and its current project exists and grants the sender read
-// access. done is false when every check passed.
+// topic exists, and its current project exists, grants the sender read
+// access and lets the sender's account post (chatMayPost). done is false
+// when every check passed.
 func (s *Server) checkScheduledTopicFire(ctx context.Context, user UserIdentity, m *ScheduledChatMessage) (scheduledFireCheck, bool) {
 	s.mu.RLock()
 	wcs := s.webChatStore
@@ -1110,6 +1123,9 @@ func (s *Server) checkScheduledTopicFire(ctx context.Context, user UserIdentity,
 		return scheduledFireCheck{transient: true}, true
 	}
 	if !s.authzService.CheckAccess(ctx, user, projectResource(project), ActionRead).Allowed {
+		return scheduledFireCheck{reason: ScheduledFailureNoAccess}, true
+	}
+	if !s.chatMayPost(ctx, user, project).Allowed {
 		return scheduledFireCheck{reason: ScheduledFailureNoAccess}, true
 	}
 	return scheduledFireCheck{}, false

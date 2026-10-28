@@ -99,7 +99,7 @@ Agents use `sciontool` as their init process, which includes an embedded OTLP fo
 
 #### Via Settings File (Recommended)
 
-The preferred approach is to configure telemetry in `settings.yaml`. Settings at the global level apply to all agents; project-level settings apply to a specific project. Individual agents can further override these via their `scion-agent.yaml`; a template's `telemetry` block is ignored with a warning.
+The preferred approach is to configure telemetry in `settings.yaml`. Settings at the global level apply to all agents; project-level settings apply to a specific project. Templates cannot set telemetry (a template's `telemetry:` block is ignored), and an individual agent can only turn it on or off; the project's telemetry policy beats both. See the [telemetry ladder](/scion/reference/settings-precedence/#the-telemetry-ladder).
 
 ```yaml
 # In ~/.scion/settings.yaml (global) or .scion/settings.yaml (project)
@@ -236,17 +236,14 @@ Agents do not inherit debug settings. A Hub or Broker running with `--debug` (or
 
 To debug an agent, set `SCION_LOG_LEVEL` for it explicitly. The value uses the same syntax as above, and `scion` commands and `sciontool` inside the agent apply it.
 
-- **One agent, at start**: pass `--agent-log-level` to `scion start` or `scion resume`. It sets `SCION_LOG_LEVEL` in that agent's environment, both for local agents and for agents started through a Hub. An invalid value is rejected before the agent starts.
+- **One agent, at start**: pass `--agent-log-level` to `scion start` or `scion resume`. It sets `SCION_LOG_LEVEL` in that agent's environment. An invalid value is rejected before the agent starts.
 
   ```bash
   scion start my-agent --agent-log-level debug
   scion start my-agent --agent-log-level info,hubsync=debug
   ```
 
-  How long the setting lasts depends on the path:
-
-  - **Through a Hub**, the value is saved in the agent's applied configuration and kept on later restarts and resumes. To remove or change it, delete and re-create the agent. When the Hub reuses an agent that already exists (for example, resuming a suspended agent), it keeps the stored configuration and does not apply `--agent-log-level`; both `scion start` and `scion resume` print a warning in that case.
-  - **Locally**, the value applies to that launch only. A later `scion start` or `scion resume` without the flag starts the agent without it.
+  The value is saved in the agent's applied configuration and kept on later restarts and resumes. To remove or change it, delete and re-create the agent. When the Hub reuses an agent that already exists (for example, resuming a suspended agent), it keeps the stored configuration and does not apply `--agent-log-level`; both `scion start` and `scion resume` print a warning in that case.
 
 - **Many agents, through the Hub**: store `SCION_LOG_LEVEL` as a Hub environment variable at the scope you want. Use `--always` so it is injected without a template requesting it.
 
@@ -278,6 +275,35 @@ Local delivery diagnostics use span, log-record, or admitted metric-point units.
 The collector writes bounded delivery snapshots to local stderr and `agent.log` at startup, on the first export failure, at most once per minute during continued operation, and on shutdown. These remain visible while the telemetry destination is unavailable and are not sent through that destination. A final `degraded` snapshot with `Unconfirmed` records signals uncertain delivery after a failed drain.
 
 The server admits at most 16 active HTTP and gRPC processing requests together. A gRPC client can queue a 17th call locally on the same connection before the server receives it; use a caller deadline to bound that wait. The server's 15-second intake deadline starts only after it receives a stream. These are local collector limits, not end-to-end delivery or process-memory guarantees.
+
+### Hub Endpoint for Usage Analytics
+
+Configure agents with an `https` hub endpoint. sciontool reads the hub's identity from that endpoint to attribute usage analytics, and it holds usage records until the hub's identity is confirmed.
+
+Each agent home keeps its usage records in `.scion/analytics-outbox/`, tied to the hub that agent first reported to (the `hub_id` file). If a later reading of the hub's identity differs, and a second reading at least five minutes later agrees, sciontool records the home as moved to another hub (the `relocated` file). From then on it stops recording new usage for that home and holds the records that are not yet final. Records that were already final are still delivered unchanged.
+
+#### Recovering from a mistaken hub move
+
+Use this only when the agent never left its hub and the hub ID was read wrong, for example after a proxy or configuration change. If the agent was linked to a different hub, or the hub's own ID changed, do not recover: usage for that home stays held.
+
+1. Confirm that the agent's current hub registration is the hub named in the home's `.scion/analytics-outbox/hub_id`. Check this against the hub's configured ID (`server.hub.hub_id`, or the hub-id file on the hub host).
+2. Stop the agent through the hub, and confirm that no container or pod still has its home mounted.
+3. Take the outbox lock and keep it for steps 4 to 7, for example `flock .scion/analytics-outbox/lock bash`. Run these steps in that shell, from the outbox directory.
+4. Record the contents of `hub_id`, `relocated`, `epoch`, `seq`, `hub_mismatch` and `relocated_refused`, and the SHA-256 of every `ready-*`, `finalizing-*` and `staging.jsonl` file.
+5. Append one complete line to `relocation_history.jsonl`. The line is a JSON object with `observed_hub_id` (the content of `relocated`), `pinned_hub_id`, `hub_mismatch_total`, `relocated_refused_total`, `reset_at` (RFC 3339, UTC), `operator`, `reason` and `evidence_ref`. Then flush the file and the directory to disk (`sync relocation_history.jsonl .`). Read the last line back and check that it parses as JSON and names the same `observed_hub_id` and `pinned_hub_id`. If it does not, stop: leave `relocated` in place, and retry later by appending a new complete line. Never edit or truncate this file.
+6. Check that the files recorded in step 4 are unchanged. If anything differs, stop and leave `relocated` in place.
+7. Remove only the `relocated` file, then flush the directory (`sync .`). Do not change `hub_id`, `epoch`, `seq`, the counter files, or any `ready-*`, `finalizing-*` or staging file.
+8. Leave the locked shell, start the agent, then verify the result:
+   - held records are delivered under the original hub (the decisive check);
+   - after at least five minutes, the agent log shows no relocation warning (a hub ID that still reads wrong is recorded again only after a second reading five minutes later);
+   - the `ready-*` files from before the recovery still have the SHA-256 values recorded in step 4;
+   - the counters have not changed.
+
+If a recovery is interrupted before step 7, `relocated` is still present and usage stays held. Start again at step 3. The history line from the interrupted attempt stays in the file: a line marks a completed recovery only if the `relocated` file was removed afterwards. If a recovery is interrupted after step 7, continue with step 8.
+
+`relocated` is the current hold, and `relocation_history.jsonl` keeps the record of earlier holds. After a recovery, the history still shows that the home was once marked as moved.
+
+If the hub really is different, sciontool records the move again and finalizes nothing new under the old hub.
 
 ### What's Collected
 
@@ -337,6 +363,21 @@ jsonPayload.request_id = "YOUR_REQUEST_ID"
 ```
 
 See the [Local Development Logging guide](/scion/contributing/logging/#http-request-logging) for the full field reference and file output format.
+
+## Artifact Decision Log
+
+The Hub writes one structured entry per artifact decision (publish, versions, grants, share links, moves, expiry, deletion, owner liveness marks and authorization refusals) to a dedicated log, `scion-artifacts`. With `SCION_CLOUD_LOGGING=true` it is a separate Cloud Logging log. Otherwise it goes to stdout. Entries carry the artifact id (from the parsed route, never the raw path), the outcome, a fixed reason code for refusals and failures, and, for decisions made on a request, the route template and the `request_id` of the matching request log line:
+
+```
+-- Every decision about one artifact
+logName="projects/YOUR_PROJECT/logs/scion-artifacts"
+labels.artifact_id = "ARTIFACT_ID"
+
+-- Refusals and the request they answered
+logName="projects/YOUR_PROJECT/logs/scion-artifacts" AND labels.outcome = "refused"
+```
+
+Reads answered with `404` are logged at `DEBUG` only. Share-link tokens, titles, notes, file contents and credentials are never logged. See [Artifacts: Decision log](/scion/reference/artifacts/#decision-log) for the actions, fields and reason codes.
 
 ## Querying Logs by Subsystem
 
@@ -534,7 +575,7 @@ The Hub runs two separate checks on running agents, each every 5 minutes. They s
 
 - **Offline (no heartbeat)**: An agent whose last heartbeat is more than 2 minutes old is set to the `offline` activity. The process, or its connection to the Hub, is gone. One cause is an agent that cannot refresh its auth token, which stops its heartbeat and other updates. Stop and restart such an agent to give it a new token; an agent that keeps its connection to the Hub refreshes its token on its own. Agents whose activity is `blocked`, `completed` or `limits_exceeded` are not marked offline.
 - **Stalled (heartbeat but no activity)**: A `running` agent whose heartbeat is still arriving (within the last 2 minutes) but that has sent no activity events within `server.hub.stalled_threshold` (default `5m`) is set to the `stalled` activity. The process is alive but not making progress. Agents whose activity is `blocked`, `waiting_for_input`, `completed`, `limits_exceeded` or `offline` are excluded. With `server.hub.auto_suspend_stalled` on (default off), the Hub also suspends it; see [Auto-Suspend of Stalled Agents](/scion/local/agent-lifecycle/#auto-suspend-of-stalled-agents).
-- **Notifications**: A notification subscription can include the **Stalled** and **Error** triggers. The subscription set up during agent creation with notifications enabled includes both, along with **Completed**, **Waiting on Parent** and **Limits Exceeded**. `scion start` sets one up unless you pass `--no-notify`, and so does the web UI's create form when **Notify me on important agent state changes** is checked. A subscription you add later, from the web UI or with `scion notifications subscribe`, starts with only **Completed**, **Waiting on Parent** and **Limits Exceeded**.
+- **Notifications**: A notification subscription can include the **Stalled** and **Error** triggers. The subscription set up during agent creation with notifications enabled, and a subscription you add from the web UI, include both by default, along with **Completed**, **Waiting on Parent**, **Limits Exceeded** and **Halted**. `scion start` sets one up unless you pass `--no-notify`, and so does the web UI's create form when **Notify me on important agent state changes** is checked. A subscription you add with `scion notifications subscribe` starts with only `COMPLETED`, `WAITING_FOR_INPUT` and `LIMITS_EXCEEDED`; pass `--triggers` to include others.
 - **Visibility**: The Web UI shows `offline` and `stalled` agents with their own status badges, so they are not lost among active workloads.
 
 ## Server Maintenance Logs

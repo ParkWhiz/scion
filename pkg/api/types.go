@@ -381,10 +381,10 @@ type KubernetesConfig struct {
 // K8sToleration mirrors corev1.Toleration for use in agent configuration
 // without requiring Kubernetes API imports in config consumers.
 type K8sToleration struct {
-	Key      string `json:"key,omitempty" yaml:"key,omitempty"`
-	Operator string `json:"operator,omitempty" yaml:"operator,omitempty"` // Exists or Equal
-	Value    string `json:"value,omitempty" yaml:"value,omitempty"`
-	Effect   string `json:"effect,omitempty" yaml:"effect,omitempty"` // NoSchedule, PreferNoSchedule, NoExecute
+	Key      string `json:"key,omitempty" yaml:"key,omitempty" koanf:"key"`
+	Operator string `json:"operator,omitempty" yaml:"operator,omitempty" koanf:"operator"` // Exists or Equal
+	Value    string `json:"value,omitempty" yaml:"value,omitempty" koanf:"value"`
+	Effect   string `json:"effect,omitempty" yaml:"effect,omitempty" koanf:"effect"` // NoSchedule, PreferNoSchedule, NoExecute
 }
 
 type K8sResources struct {
@@ -566,7 +566,7 @@ type ScionConfig struct {
 	// branch in ProvisionAgent): both cases mount from a Volumes-derived path
 	// rather than GetAgent's managed <agentDir>/workspace recovery. RepoRoot
 	// resolution, not this flag, is what tells the two cases apart — see
-	// pkg/agent's readProvisionedWorktreeRepoRoot. That value is deliberately
+	// pkg/agent's repository root record (readRepoRootRecord). That value is deliberately
 	// not a field on ScionConfig (populated by unmarshaling templates, hub
 	// inline config, and --config files) nor on AgentInfo (persisted in
 	// agentHome, which the container can write) — see
@@ -592,6 +592,18 @@ type ScionConfig struct {
 	// carry it). A broker that ignores it starts the agent exactly as before
 	// the field existed.
 	ClearedFields []string `json:"cleared_fields,omitempty" yaml:"-"`
+
+	// ChangedFields lists the provision-rendered config keys (see
+	// RerenderableConfigKeys) the agent's owner changed after the agent was
+	// created. Like ClearedFields, the Hub records it on the agent's live
+	// inline config and sends it with every start; a Runtime Broker that
+	// advertises the changedFields capability re-renders the files
+	// provisioning wrote for each listed key (and for each cleared one,
+	// see RerenderConfigKeys) before the start, and never writes the list
+	// itself to disk. It is wire-only: it is ignored if a template sets it
+	// (yaml:"-", and config.MergeScionConfig does not carry it). A broker
+	// that ignores it starts the agent exactly as before the field existed.
+	ChangedFields []string `json:"changed_fields,omitempty" yaml:"-"`
 
 	// Info contains persisted metadata about the agent
 	Info *AgentInfo `json:"-" yaml:"-"`
@@ -689,9 +701,11 @@ type AgentInfo struct {
 	// from the project directory. The Docker, Podman, Apple and Kubernetes
 	// List fill it from the container's scion.project_id label, which
 	// carries the Hub project ID; Cloud Run Sandbox List fills it from its
-	// state entry, which records the same value. Cloud Run List leaves it
-	// empty. The two sources can differ; callers that need the Hub project
-	// ID should read the scion.project_id label (ptone/scion#3020).
+	// state entry, which records the same value, and Cloud Run List from
+	// the instance's GCP-sanitized scion_project_id label (a Hub project ID
+	// is unchanged by the sanitizing). The two sources can differ; callers
+	// that need the Hub project ID should read the scion.project_id label
+	// (ptone/scion#3020).
 	ProjectID   string `json:"projectId,omitempty"`
 	ProjectPath string `json:"projectPath,omitempty"` // Filesystem path (solo mode)
 
@@ -704,7 +718,7 @@ type AgentInfo struct {
 	Phase           string       `json:"phase,omitempty"`           // Lifecycle phase (created, provisioning, running, stopped, error)
 	Activity        string       `json:"activity,omitempty"`        // Runtime activity (working, thinking, executing, waiting_for_input, completed)
 	ExitCode        *int         `json:"exitCode,omitempty"`        // Structured exit code from runtime (nil = unknown)
-	ExitReason      string       `json:"exitReason,omitempty"`      // Terminal reason (see state.ExitReason), e.g. "crashed", "preempted", "oom_killed"
+	ExitReason      string       `json:"exitReason,omitempty"`      // Terminal reason (see state.ExitReason), e.g. "crashed", "preempted", "oom_killed"; "signaled" is agent-reported
 	Detail          *AgentDetail `json:"detail,omitempty"`          // Freeform context about the current activity
 
 	// Runtime configuration
@@ -733,6 +747,11 @@ type AgentInfo struct {
 	// agent. They are also included in Warnings; this field lets the broker
 	// relay just these to the hub without leaking its other local warnings.
 	HubOnlyEnvWarnings []string `json:"hubOnlyEnvWarnings,omitempty"`
+	// RelayedWarnings carries start warnings meant for the user that the
+	// broker relays to the hub alongside HubOnlyEnvWarnings, for example a GCP
+	// metadata mode that is not enforced under the agent's network mode. They
+	// are also included in Warnings.
+	RelayedWarnings []string `json:"relayedWarnings,omitempty"`
 
 	// ExplicitImage and ExplicitImagePullPolicy record the image /
 	// kubernetes.imagePullPolicy that the INLINE config (--config), not a
@@ -888,8 +907,7 @@ const (
 
 	// EnvKindSecretInjected is a value produced at dispatch time that
 	// exists in no store. Delivery channel is TBD (P3b).
-	// Examples: GITHUB_TOKEN from GitHub App, SCION_DEV_TOKEN,
-	// SCION_GIT_CLONE_URL.
+	// Examples: GITHUB_TOKEN from GitHub App, SCION_GIT_CLONE_URL.
 	EnvKindSecretInjected EnvKind = "secret-injected"
 
 	// EnvKindSecretBootstrap is a credential that bootstraps the secret
@@ -957,6 +975,22 @@ func ContextWithGitClone(ctx context.Context, gc *GitCloneConfig) context.Contex
 func GitCloneFromContext(ctx context.Context) *GitCloneConfig {
 	gc, _ := ctx.Value(gitCloneContextKey{}).(*GitCloneConfig)
 	return gc
+}
+
+type recordedOriginContextKey struct{}
+
+// ContextWithRecordedOrigin attaches the broker-recorded origin URL (the hub
+// project's repository), used to pin the git-lfs endpoint for a linked-checkout
+// worktree whose GitClone was cleared on the linked route. Prefer this over the
+// live remote.origin.url, which an agent can rewrite.
+func ContextWithRecordedOrigin(ctx context.Context, url string) context.Context {
+	return context.WithValue(ctx, recordedOriginContextKey{}, url)
+}
+
+// RecordedOriginFromContext returns the broker-recorded origin URL, or "" if unset.
+func RecordedOriginFromContext(ctx context.Context) string {
+	s, _ := ctx.Value(recordedOriginContextKey{}).(string)
+	return s
 }
 
 type freshProvisionContextKey struct{}
@@ -1141,18 +1175,18 @@ type provisionedWorktreeRepoRootContextKey struct{}
 // ContextWithGitClone / ContextWithSharedWorkspace: broker-local, never on
 // the wire.
 //
-// pkg/agent/run.go's Start consumes it (ProvisionedWorktreeRepoRootFromContext)
-// to set RunConfig.RepoRoot directly, skipping detectRepoRoot's "an explicit
-// workspace skips git detection" rule — that rule exists for a user's own
-// --workspace override and must not swallow the broker's own
-// provisioning. This doc is the canonical statement of that rationale; other
+// pkg/agent/run.go's Start consumes it (ProvisionedWorktreeRepoRootFromContext,
+// via resolveStartRepoRoot) to set RunConfig.RepoRoot directly, rather than
+// from the agent directory's recorded repository root — a broker-provisioned
+// worktree is authoritative for this dispatch. This doc is the canonical
+// statement of that rationale; other
 // call sites point back here.
 //
 // The value is never a ScionConfig field (populated by unmarshaling
 // templates, hub inline config, and --config files) or an AgentInfo field
 // (agent-info.json lives in agentHome, which the container can write). The
 // broker persists it in a broker-owned file under agentDir instead — see
-// pkg/agent's writeProvisionedWorktreeRepoRoot/readProvisionedWorktreeRepoRoot
+// pkg/agent's repository root record (writeRepoRootRecord/readRepoRootRecord)
 // — and run.go independently validates it against the real filesystem
 // (provision.ValidateWorktreeForBase) before trusting it either way.
 func ContextWithProvisionedWorktreeRepoRoot(ctx context.Context, repoRoot string) context.Context {
@@ -1341,6 +1375,12 @@ type StartOptions struct {
 	Env               map[string]string
 	ResolvedSecrets   []ResolvedSecret
 	BrokerMode        bool // When true, auth gathering skips local sources (broker env + filesystem)
+	// RecordedOriginURL is the broker-recorded origin for the project (the hub
+	// project's repository), captured from GitClone before the linked-checkout
+	// route clears GitClone. It is threaded to worktree creation so the git-lfs
+	// endpoint is pinned from this trusted origin rather than the live,
+	// agent-writable remote.origin.url. Empty when there is no recorded origin.
+	RecordedOriginURL string
 	// TrustedHubEndpoint is the broker's own operator-derived resolution of
 	// the hub endpoint — set only in BrokerMode, only from the request
 	// HubEndpoint, the hub connection endpoint, or this broker's configured
@@ -1380,16 +1420,7 @@ type StartOptions struct {
 	TelemetryOverride *bool        // Explicit telemetry override from CLI flags (--enable-telemetry / --disable-telemetry)
 	InlineConfig      *ScionConfig // Inline config from --config flag, merged over template config
 	SharedDirs        []SharedDir  // Project-level shared directories (from Hub, merged with settings)
-	// SharedDirBackendChanges asks a Reprovision to change the recorded
-	// shared-dir storage backend of the named shared dirs (dir name to
-	// backend, "nfs" or "local"). Only the agent's record changes;
-	// no data is copied, moved or deleted. Ignored outside Reprovision.
-	SharedDirBackendChanges map[string]string
-	// AllowEmptySharedDir, with SharedDirBackendChanges, skips the start
-	// check that refuses an empty directory on the new backend while the
-	// dir's directory on its previous backend is not empty.
-	AllowEmptySharedDir bool
-	ExtraHosts          []string // Extra --add-host entries for container networking (e.g. "example.com:host-gateway")
+	ExtraHosts        []string     // Extra --add-host entries for container networking (e.g. "example.com:host-gateway")
 
 	// EmptyPerAgentWorkspace gives the agent a private, initially empty,
 	// non-git workspace at <projectDir>/agents/<slug>/workspace (design
@@ -1457,6 +1488,16 @@ type StartOptions struct {
 	// is recomputed on every dispatch.
 	KubernetesBlockIdentity *KubernetesBlockIdentity
 
+	// ResolvedPlacement is the Kubernetes placement (node selector,
+	// tolerations, runtime class) the agent runtime server resolved for this
+	// start from its settings (ptone/scion#5085), and PlacementResolved
+	// records that the server ran that resolution (ResolvedPlacement may
+	// then be nil: nothing configured, or not a Kubernetes runtime).
+	// Manager.Start applies it over the agent's own kubernetes block with
+	// config.ApplyPlacement. Never persisted: recomputed on every start.
+	ResolvedPlacement *ResolvedPlacement `json:"-"`
+	PlacementResolved bool               `json:"-"`
+
 	// HostCredentialFiles is set by a co-located workstation broker whose
 	// host-credential policy allows it (hub on loopback, dev auth,
 	// use_host_credentials on). In broker mode the agent manager then reads
@@ -1466,11 +1507,26 @@ type StartOptions struct {
 	// persisted, so it is recomputed on every dispatch.
 	HostCredentialFiles bool
 
+	// RerenderKeys are the provision-rendered config keys
+	// (RerenderableConfigKeys) whose files this start renders again before
+	// the container starts, from the hub inline config's ChangedFields and
+	// ClearedFields (RerenderConfigKeys). A key whose rendered result is
+	// unchanged since its last render is not written again. Set by the
+	// Runtime Broker; never persisted.
+	RerenderKeys []string
+
 	// TemplateEnvSource is a local template path (hydrated by the broker on a
 	// start or restart of an agent with a Hub template) used only to compute
 	// the template env fallback (ptone/scion#4524). Unlike Template, it never
 	// affects image, harness-config or agent config resolution.
 	TemplateEnvSource string
+
+	// MoveReincarnationID, on the provision of a forced move (the
+	// fresh-agent-dir expectation), is the move's reincarnation ID. The
+	// provision writes it into the agent directory it creates, as the move
+	// marker, before anything else; a rollback delete removes only
+	// directories marked with it.
+	MoveReincarnationID string
 }
 
 // KubernetesBlockIdentity describes how a GCP identity "block" pod runs on

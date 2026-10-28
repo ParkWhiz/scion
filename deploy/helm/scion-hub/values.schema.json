@@ -374,7 +374,7 @@
       "properties": {
         "imageRegistry": {
           "type": "string",
-          "description": "Registry prefix agent images are pulled from. Rendered as the top-level image_registry key of settings.yaml. Required by the template when the chart renders settings.yaml, because the hub refuses to start its in-process broker without a registry; config.extra image_registry for the active profile, or a non-empty hub.extraEnv SCION_IMAGE_REGISTRY or SCION_MAINTENANCE_IMAGE_REGISTRY, also satisfies it."
+          "description": "Registry prefix agent images are pulled from. Rendered as the top-level image_registry key of settings.yaml. Required by the template when the chart renders settings.yaml, because the hub refuses to start its in-process broker without a registry; config.extra image_registry for the active profile, or a non-empty hub.extraEnv SCION_IMAGE_REGISTRY, also satisfies it (SCION_MAINTENANCE_IMAGE_REGISTRY applies to maintenance builds only)."
         }
       }
     },
@@ -579,7 +579,7 @@
     "workspaceStorage": {
       "type": "object",
       "additionalProperties": false,
-      "description": "The shared workspace share agent pods mount, rendered as server.workspace_storage. Not the hub's blob store (storage).",
+      "description": "The shared workspace share agent pods mount, rendered as server.project_storage. Not the hub's blob store (storage).",
       "properties": {
         "nfs": {
           "type": "object",
@@ -589,7 +589,7 @@
           "properties": {
             "enabled": {
               "type": "boolean",
-              "description": "Renders server.workspace_storage (backend nfs) and the hub pod's inline nfs volume. Refused with config.existingSecret and with config.extra.server.workspace_storage."
+              "description": "Renders server.project_storage (backend nfs, homes local) and the hub pod's inline nfs volume. Refused with config.existingSecret and with config.extra.server.project_storage (or a deprecated workspace_storage, shared_dir_storage or home_storage block)."
             },
             "server": {
               "type": "string",

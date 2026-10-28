@@ -64,10 +64,14 @@ func setupPassthroughServer(t *testing.T, owner *store.User, hostSAEmail, hostPr
 		GCPHostProjectID:           hostProjectID,
 	}
 	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+	// The broker is remote and serves the hub-managed project from its own
+	// checkout (LocalPath); a remote broker without one is refused at
+	// create (ptone/scion#5813).
 	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
 		ProjectID:  project.ID,
 		BrokerID:   broker.ID,
 		BrokerName: broker.Name,
+		LocalPath:  fixtureProviderCheckout(t),
 		Status:     store.BrokerStatusOnline,
 	}))
 	project.DefaultRuntimeBrokerID = broker.ID
@@ -100,8 +104,22 @@ func setupPassthroughSandboxServer(
 	hostSAEmail, hostProjectID string,
 ) (*Server, store.Store, *store.Project, *store.RuntimeBroker) {
 	t.Helper()
-	disp := &createAgentDispatcher{createPhase: string(state.PhaseRunning)}
 	srv, s := testServer(t)
+	project, broker := seedPassthroughSandboxServer(t, srv, s, owner, hostSAEmail, hostProjectID)
+	return srv, s, project, broker
+}
+
+// seedPassthroughSandboxServer is the body of setupPassthroughSandboxServer
+// on a server the caller built, for example with testServerWithStoreFault.
+func seedPassthroughSandboxServer(
+	t *testing.T,
+	srv *Server,
+	s store.Store,
+	owner *store.User,
+	hostSAEmail, hostProjectID string,
+) (*store.Project, *store.RuntimeBroker) {
+	t.Helper()
+	disp := &createAgentDispatcher{createPhase: string(state.PhaseRunning)}
 	ctx := context.Background()
 
 	require.NoError(t, s.CreateUser(ctx, owner))
@@ -132,15 +150,19 @@ func setupPassthroughSandboxServer(
 		},
 	}
 	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+	// The broker is remote and serves the hub-managed project from its own
+	// checkout (LocalPath); a remote broker without one is refused at
+	// create (ptone/scion#5813).
 	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
 		ProjectID:  project.ID,
 		BrokerID:   broker.ID,
 		BrokerName: broker.Name,
+		LocalPath:  fixtureProviderCheckout(t),
 		Status:     store.BrokerStatusOnline,
 	}))
 	project.DefaultRuntimeBrokerID = broker.ID
 	require.NoError(t, s.UpdateProject(ctx, project))
 
 	srv.SetDispatcher(disp)
-	return srv, s, project, broker
+	return project, broker
 }

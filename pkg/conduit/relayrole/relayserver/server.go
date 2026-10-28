@@ -32,6 +32,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/metric"
+
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/clock"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/registry"
@@ -111,6 +113,11 @@ type Config struct {
 	// RequireSelfCheck makes the relay probe its own internal endpoint at
 	// start (HA deployments).
 	RequireSelfCheck bool
+	// Singleton runs the relay as a non-HA singleton (relay.Config.Singleton).
+	Singleton bool
+	// MeterProvider, when set, exports the relay's metrics (metrics.go);
+	// nil: none.
+	MeterProvider metric.MeterProvider
 	// ExperimentPollPeriod is how often hub.conduit is re-read
 	// (DefaultExperimentPollPeriod).
 	ExperimentPollPeriod time.Duration
@@ -224,6 +231,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	role, err := relayrole.New(relayrole.Config{
 		Hub:             &relay.HubClient{BaseURL: cfg.HubInternalURL, HTTP: cfg.HTTPClient, Auth: cfg.PeerAuth},
 		RecheckInterval: cfg.RecheckInterval,
+		Clock:           cfg.Clock,
 		Events:          cfg.Events,
 		Subjects:        RevocationSubjects,
 		Logger:          log,
@@ -241,12 +249,34 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("conduit internal listener %s: %w", cfg.InternalListen, err)
 	}
 	s.InternalAddr = internalLn.Addr()
+	// The internal listener also serves the conduit dials a hub ingress
+	// proxies (design §3.9 "Ingress"): GET /api/v1/conduit, after the same
+	// relay-peer checks as every internal-API call, except that a relay
+	// that no longer serves answers 503 relay_not_admitting, which the
+	// ingress may re-pick on (AuthenticateIngressPeer). It has the public
+	// listener's header timeout and size limit; admission is the same
+	// code path (relayrole.Role), with the ingress arrival.
+	var currentRole atomic.Pointer[relayrole.Role]
 	s.internal = &http.Server{ReadHeaderTimeout: 10 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if r := current.Load(); r != nil {
-			r.InternalHandler().ServeHTTP(w, req)
+		r := current.Load()
+		if r == nil {
+			http.Error(w, "conduit relay not running", http.StatusServiceUnavailable)
 			return
 		}
-		http.Error(w, "conduit relay not running", http.StatusServiceUnavailable)
+		if req.URL.Path == relayrole.ConduitPath {
+			ro := currentRole.Load()
+			if ro == nil {
+				http.Error(w, "conduit relay not running", http.StatusServiceUnavailable)
+				return
+			}
+			peer, ok := r.AuthenticateIngressPeer(w, req)
+			if !ok {
+				return
+			}
+			ro.ServeIngress(w, req, peer)
+			return
+		}
+		r.InternalHandler().ServeHTTP(w, req)
 	})}
 	go s.serve(s.internal, internalLn, "relay internal listener")
 
@@ -259,6 +289,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		InternalEndpoint: endpoint,
 		PublicEndpoint:   cfg.PublicURL,
 		RequireSelfCheck: cfg.RequireSelfCheck,
+		Singleton:        cfg.Singleton,
 		Registry:         registry.New(cfg.Registry, registry.Config{}),
 		Store:            cfg.Registry,
 		Session:          conduit.Config{Clock: clock.Real()},
@@ -286,6 +317,9 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	}
 	s.Relay = r
 	role.Bind(r)
+	logRegisterRelayMetrics(log, cfg.MeterProvider, r, role, cfg.Singleton)
+	// Ingress dials are served only once the role is bound to the relay.
+	currentRole.Store(role)
 	role.Start(ctx)
 	// Subscribed before the events start, like the role's hooks.
 	var changed <-chan string

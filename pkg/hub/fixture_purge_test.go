@@ -926,7 +926,8 @@ func TestTestIdentityReaper_Registration(t *testing.T) {
 // remain and the cascade; it cannot reach purgeFixtureProject. The
 // purge-only selectors (purgeFixtureProject, the purge basis, the hard
 // delete flag, purgeTestIdentity) are reached only from the purge's own
-// files.
+// files (purgeTestIdentity also from the issuer cleanup, Phase 3c, which
+// runs the same purge per identity).
 func TestFixturePurge_ProjectPathUnreachableFromRequests(t *testing.T) {
 	var fields []string
 	rt := reflect.TypeOf(ProjectDeleteRequest{})
@@ -938,7 +939,7 @@ func TestFixturePurge_ProjectPathUnreachableFromRequests(t *testing.T) {
 	allowed := map[string][]string{
 		"purgeFixtureProject(":   {"fixture_purge.go", "project_fixture_purge.go"},
 		"withFixturePurgeBasis(": {"fixture_purge.go"},
-		"purgeTestIdentity(":     {"fixture_purge.go", "handlers_test_identities.go", "test_identity_reaper.go"},
+		"purgeTestIdentity(":     {"fixture_purge.go", "handlers_test_identities.go", "test_identity_reaper.go", "fixture_cleanup.go"},
 		"hard:":                  {"fixture_purge.go"},
 	}
 	for needle, files := range allowed {
@@ -1023,7 +1024,7 @@ func fpAddProvider(t *testing.T, s store.Store, projectID string) {
 	ctx := context.Background()
 	broker := &store.RuntimeBroker{ID: tid("fpp-broker-" + projectID), Name: "fpp broker", Slug: "fpp-broker-" + projectID[:8], Status: store.BrokerStatusOnline, Endpoint: "http://localhost:9800"}
 	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
-	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{ProjectID: projectID, BrokerID: broker.ID, BrokerName: broker.Name, Status: store.BrokerStatusOnline}))
+	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{ProjectID: projectID, BrokerID: broker.ID, BrokerName: broker.Name, LocalPath: fixtureProviderCheckout(t), Status: store.BrokerStatusOnline}))
 }
 
 // fpFinalizingSoftAgent creates a stamped agent and leaves it finalizing

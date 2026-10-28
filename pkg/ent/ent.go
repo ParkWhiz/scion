@@ -49,6 +49,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/group"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/groupmembership"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/harnessconfig"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubencryptionmigration"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubencryptionpolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubinstance"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/hubsetting"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/integrationconfig"
@@ -72,6 +74,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectcontributor"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectprestarthook"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectsyncstate"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectvisitorexclusion"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectvisitorrule"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/relayinstance"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/rolebinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/roledefinition"
@@ -191,6 +195,8 @@ func checkColumn(t, c string) error {
 			group.Table:                         group.ValidColumn,
 			groupmembership.Table:               groupmembership.ValidColumn,
 			harnessconfig.Table:                 harnessconfig.ValidColumn,
+			hubencryptionmigration.Table:        hubencryptionmigration.ValidColumn,
+			hubencryptionpolicy.Table:           hubencryptionpolicy.ValidColumn,
 			hubinstance.Table:                   hubinstance.ValidColumn,
 			hubsetting.Table:                    hubsetting.ValidColumn,
 			integrationconfig.Table:             integrationconfig.ValidColumn,
@@ -214,6 +220,8 @@ func checkColumn(t, c string) error {
 			projectcontributor.Table:            projectcontributor.ValidColumn,
 			projectprestarthook.Table:           projectprestarthook.ValidColumn,
 			projectsyncstate.Table:              projectsyncstate.ValidColumn,
+			projectvisitorexclusion.Table:       projectvisitorexclusion.ValidColumn,
+			projectvisitorrule.Table:            projectvisitorrule.ValidColumn,
 			relayinstance.Table:                 relayinstance.ValidColumn,
 			rolebinding.Table:                   rolebinding.ValidColumn,
 			roledefinition.Table:                roledefinition.ValidColumn,

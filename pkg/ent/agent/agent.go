@@ -90,6 +90,8 @@ const (
 	FieldMessage = "message"
 	// FieldAppliedConfig holds the string denoting the applied_config field in the database.
 	FieldAppliedConfig = "applied_config"
+	// FieldPendingConfig holds the string denoting the pending_config field in the database.
+	FieldPendingConfig = "pending_config"
 	// FieldHarnessConfig holds the string denoting the harness_config field in the database.
 	FieldHarnessConfig = "harness_config"
 	// FieldAncestry holds the string denoting the ancestry field in the database.
@@ -148,6 +150,12 @@ const (
 	FieldLaunchError = "launch_error"
 	// FieldLaunchCause holds the string denoting the launch_cause field in the database.
 	FieldLaunchCause = "launch_cause"
+	// FieldLaunchPriorPhase holds the string denoting the launch_prior_phase field in the database.
+	FieldLaunchPriorPhase = "launch_prior_phase"
+	// FieldLaunchRevokeOnFail holds the string denoting the launch_revoke_on_fail field in the database.
+	FieldLaunchRevokeOnFail = "launch_revoke_on_fail"
+	// FieldLaunchResumePhase holds the string denoting the launch_resume_phase field in the database.
+	FieldLaunchResumePhase = "launch_resume_phase"
 	// FieldDeletionState holds the string denoting the deletion_state field in the database.
 	FieldDeletionState = "deletion_state"
 	// FieldDeletionClaim holds the string denoting the deletion_claim field in the database.
@@ -283,6 +291,7 @@ var Columns = []string{
 	FieldTaskSummary,
 	FieldMessage,
 	FieldAppliedConfig,
+	FieldPendingConfig,
 	FieldHarnessConfig,
 	FieldAncestry,
 	FieldCreated,
@@ -312,6 +321,9 @@ var Columns = []string{
 	FieldLaunchStep,
 	FieldLaunchError,
 	FieldLaunchCause,
+	FieldLaunchPriorPhase,
+	FieldLaunchRevokeOnFail,
+	FieldLaunchResumePhase,
 	FieldDeletionState,
 	FieldDeletionClaim,
 	FieldDeletionLeaseAt,
@@ -400,6 +412,12 @@ var (
 	DefaultLaunchError string
 	// DefaultLaunchCause holds the default value on creation for the "launch_cause" field.
 	DefaultLaunchCause string
+	// DefaultLaunchPriorPhase holds the default value on creation for the "launch_prior_phase" field.
+	DefaultLaunchPriorPhase string
+	// DefaultLaunchRevokeOnFail holds the default value on creation for the "launch_revoke_on_fail" field.
+	DefaultLaunchRevokeOnFail bool
+	// DefaultLaunchResumePhase holds the default value on creation for the "launch_resume_phase" field.
+	DefaultLaunchResumePhase string
 	// DefaultDeletionState holds the default value on creation for the "deletion_state" field.
 	DefaultDeletionState string
 	// DefaultDeletionClaim holds the default value on creation for the "deletion_claim" field.
@@ -666,6 +684,11 @@ func ByAppliedConfig(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldAppliedConfig, opts...).ToFunc()
 }
 
+// ByPendingConfig orders the results by the pending_config field.
+func ByPendingConfig(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldPendingConfig, opts...).ToFunc()
+}
+
 // ByHarnessConfig orders the results by the harness_config field.
 func ByHarnessConfig(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldHarnessConfig, opts...).ToFunc()
@@ -799,6 +822,21 @@ func ByLaunchError(opts ...sql.OrderTermOption) OrderOption {
 // ByLaunchCause orders the results by the launch_cause field.
 func ByLaunchCause(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldLaunchCause, opts...).ToFunc()
+}
+
+// ByLaunchPriorPhase orders the results by the launch_prior_phase field.
+func ByLaunchPriorPhase(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLaunchPriorPhase, opts...).ToFunc()
+}
+
+// ByLaunchRevokeOnFail orders the results by the launch_revoke_on_fail field.
+func ByLaunchRevokeOnFail(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLaunchRevokeOnFail, opts...).ToFunc()
+}
+
+// ByLaunchResumePhase orders the results by the launch_resume_phase field.
+func ByLaunchResumePhase(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLaunchResumePhase, opts...).ToFunc()
 }
 
 // ByDeletionState orders the results by the deletion_state field.

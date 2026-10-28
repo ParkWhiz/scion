@@ -75,6 +75,9 @@ func (f *fakeDispatchStore) CountBrokerDispatchHealth(_ context.Context, _, _ ti
 func (f *fakeDispatchStore) CountStuckPendingMessages(_ context.Context, _ time.Time) (int, error) {
 	return 0, nil
 }
+func (f *fakeDispatchStore) ListStuckPendingMessageIDs(_ context.Context, _ time.Time, _ int) ([]string, error) {
+	return nil, nil
+}
 func (f *fakeDispatchStore) ExpireStuckPendingMessages(_ context.Context, _ time.Time, _ string) (int, error) {
 	return 0, nil
 }
@@ -83,6 +86,9 @@ func (f *fakeDispatchStore) FailPendingMessagesWithMissingRecipient(_ context.Co
 }
 func (f *fakeDispatchStore) BackfillNonAgentDispatchState(_ context.Context, _ string) (int, error) {
 	return 0, nil
+}
+func (f *fakeDispatchStore) ExpireAndListStuckPendingMessages(_ context.Context, _ time.Time, _ string) ([]store.ExpiredPendingMessage, error) {
+	return nil, nil
 }
 
 // sendStatus pushes a fake AgentStatusEvent onto the channel.

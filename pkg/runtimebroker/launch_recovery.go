@@ -17,7 +17,6 @@ package runtimebroker
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -143,10 +142,22 @@ func (s *Server) recoverInstance(id string) {
 
 // recoverLaunch sends one recovered launch's terminal under the instance ID
 // it was journalled with (design wave 3 §1 C-b: the hub fences reports by
-// that ID), cleans up on a confirming answer with the existing predicates,
-// and removes the record. With no definitive answer by its TTL, the record
-// is removed with no cleanup; `scion delete` removes what is left. If the
-// broker shuts down first, the record stays for the next boot.
+// that ID), cleans up on a confirming answer with the existing predicates
+// (or startFailureCleanup for a StartFailed terminal, see below), and
+// removes the record (or keeps it as cleanup_pending if the clean-up
+// fails, ptone/scion#5177). With no definitive answer by its TTL, the
+// record is kept for the next boot to resend, up to a bound, after which it
+// is removed with no cleanup and `scion delete` removes what is left
+// (ptone/scion#5186). If the broker shuts down first, the record stays for
+// the next boot.
+//
+// A terminal journalled StartFailed (the live broker saw this attempt's
+// Start fail) is classified with startFailureCleanup, as on the live path
+// (ptone/scion#5368): a resources-only outcome removes the recorded
+// resources and keeps the files, and when that clean-up fails the
+// cleanup_pending record is scoped to the resources. A PostCompleted one
+// that gets no answer has its resources removed now and is kept for the
+// resend; no clean-up scope is carried into that terminal_pending record.
 func (s *Server) recoverLaunch(path string, jr *journalRecord) {
 	ctx := s.recoveryContext()
 	if ctx.Err() != nil {
@@ -170,6 +181,12 @@ func (s *Server) recoverLaunch(path string, jr *journalRecord) {
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, ttl)
 	defer cancel()
+	if jr.State == journalCleanupPending.String() {
+		// The hub already confirmed the launch is over and asked for
+		// clean-up; only the clean-up is left (ptone/scion#5177).
+		s.finishRecoveredCleanup(ctx, path, jr, s.recoveryCleanup(ctx, jr, rec, jr.CleanupScope == cleanupScopeResources))
+		return
+	}
 	// A decided terminal is resent unchanged, so a succeeded is never
 	// turned into a failure; an unfinished launch reports broker_restarted.
 	var t journalTerminal
@@ -189,46 +206,84 @@ func (s *Server) recoverLaunch(path string, jr *journalRecord) {
 			// The broker is shutting down: the next boot tries again.
 			return
 		}
-		s.agentLifecycleLog.Warn("Launch recovery: no definitive answer within the TTL; record removed with no cleanup",
-			"agent_id", jr.AgentID, "launch_id", jr.LaunchID, "instance_id", jr.InstanceID, "error", err)
-		_ = os.Remove(path)
+		if t.StartFailed && startFailureCleanup(nil, err, t.PostCompleted) == launchCleanupResources {
+			// The hub had already answered completed, so nothing else
+			// removes this attempt's objects: remove them now, with the
+			// recovery context, and leave the files to a later boot's
+			// answer. A failure is retried at the next boot's resend.
+			s.agentLifecycleLog.Warn("Launch recovery: a failed start's report got no hub answer after the launch had completed; removing its recorded resources and keeping the record for a retry",
+				"agent_id", jr.AgentID, "launch_id", jr.LaunchID, "run_id", jr.RunID, "instance_id", jr.InstanceID)
+			if cleanupErr := s.recoveryCleanup(ctx, jr, rec, true); cleanupErr != nil {
+				s.agentLifecycleLog.Warn("Launch recovery: resource clean-up failed; it is retried at the next broker start",
+					"agent_id", jr.AgentID, "launch_id", jr.LaunchID, "error_class", string(cleanupFailureClassOf(cleanupErr)))
+			}
+		}
+		// No definitive answer: keep the record for the next boot to
+		// resend, up to the bound (ptone/scion#5186).
+		s.keepRecoveredReport(path, jr, t)
 		return
 	}
-	// The existing predicates decide cleanup, unchanged.
-	cleanup := shouldCleanupAfterFailureReport(result)
-	if t.Succeeded {
-		cleanup = shouldCleanupAfterSucceededReport(result)
+	action := launchCleanupNone
+	switch {
+	case t.Succeeded:
+		if shouldCleanupAfterSucceededReport(result) {
+			action = launchCleanupFull
+		}
+	case t.StartFailed:
+		action = startFailureCleanup(result, nil, t.PostCompleted)
+	case shouldCleanupAfterFailureReport(result):
+		action = launchCleanupFull
 	}
 	s.agentLifecycleLog.Info("Launch recovery: reported a launch an earlier broker process left unfinished",
 		"agent_id", jr.AgentID, "launch_id", jr.LaunchID, "instance_id", jr.InstanceID,
-		"state", jr.State, "succeeded", t.Succeeded, "error_code", t.ErrorCode, "cleanup", cleanup)
-	if cleanup {
-		s.recoveryCleanup(ctx, jr, rec)
+		"state", jr.State, "succeeded", t.Succeeded, "error_code", t.ErrorCode,
+		"cleanup", action != launchCleanupNone, "resources_only", action == launchCleanupResources)
+	var cleanupErr error
+	switch action {
+	case launchCleanupFull:
+		cleanupErr = s.recoveryCleanup(ctx, jr, rec, false)
+	case launchCleanupResources:
+		cleanupErr = s.recoveryCleanup(ctx, jr, rec, true)
+		if cleanupErr != nil {
+			// The cleanup_pending record finishRecoveredCleanup writes
+			// retries the resources only, never the files.
+			jr.CleanupScope = cleanupScopeResources
+		}
 	}
-	if ctx.Err() != nil {
-		return
-	}
-	_ = os.Remove(path)
+	s.finishRecoveredCleanup(ctx, path, jr, cleanupErr)
 }
 
-// recoveryCleanup removes a recovered launch's resources on a confirming
-// answer: its journalled handles (each delete preconditioned on the UID
-// recorded at create time, so a newer launch's objects are untouched), then
-// its name-addressed leftovers inside a registry slot.
-func (s *Server) recoveryCleanup(ctx context.Context, jr *journalRecord, rec *launchRecord) {
+// recoveryCleanup removes a recovered launch's resources (on a confirming
+// answer, or resources-only as startFailureCleanup decides): its journalled
+// handles (each delete preconditioned on the UID recorded at create time, so
+// a newer launch's objects are untouched), then, unless resourcesOnly, its
+// name-addressed leftovers inside a registry slot.
+func (s *Server) recoveryCleanup(ctx context.Context, jr *journalRecord, rec *launchRecord, resourcesOnly bool) error {
 	mgr := s.recoveryManager(jr)
 	if mgr == nil && jr.RuntimeIdentity == "" {
 		s.agentLifecycleLog.Warn("Launch recovery: the launch's runtime identity was not recorded; its resources are left for `scion delete`",
 			"agent_id", jr.AgentID, "launch_id", jr.LaunchID, "runtime", jr.RuntimeName)
-		return
+		return nil
 	}
 	if mgr == nil {
 		s.agentLifecycleLog.Warn("Launch recovery: the launch's runtime is no longer configured; its resources are left for `scion delete`",
 			"agent_id", jr.AgentID, "launch_id", jr.LaunchID, "runtime", jr.RuntimeName, "runtime_identity", jr.RuntimeIdentity)
-		return
+		return failCleanup(rec, cleanupFailRuntimeUnavailable)
 	}
-	s.cleanupLaunchResources(mgr, rec)
-	s.recoveryNameCleanup(ctx, mgr, jr, rec)
+	if resourcesOnly {
+		// The files are not this clean-up's (a local stop or delete owns
+		// them, or the hub has not confirmed this run's failure): only the
+		// recorded resources, as the live clean-up does.
+		return s.cleanupLaunchResources(mgr, rec)
+	}
+	err := errors.Join(
+		s.cleanupLaunchResources(mgr, rec),
+		s.recoveryNameCleanup(ctx, mgr, jr, rec),
+	)
+	// A flat create whose recovered cleanup ended its run and proved its
+	// files removed releases its slug (ptone/scion#5768).
+	s.retireCleanedCreateLaunch(rec, err, nil)
+	return err
 }
 
 // recoveryManager resolves the manager of the exact runtime a launch ran on,
@@ -240,7 +295,7 @@ func (s *Server) recoveryCleanup(ctx context.Context, jr *journalRecord, rec *la
 // matches. Nil when none matches, or when the launch's identity is unknown:
 // recovery then cleans up nothing rather than guess.
 func (s *Server) recoveryManager(jr *journalRecord) agent.Manager {
-	defMgr, defRT := s.defaultPair()
+	defMgr, defRT, _ := s.defaultPair()
 	if s.isFlat() {
 		// A flat instance serves exactly one runtime target.
 		return defMgr
@@ -261,7 +316,8 @@ func (s *Server) recoveryManager(jr *journalRecord) agent.Manager {
 	if jr.Profile == "" {
 		return nil
 	}
-	mgr, _, err := s.resolveManagerForOptsStrict(api.StartOptions{Name: jr.AgentName, ProjectPath: jr.ProjectPath, Profile: jr.Profile}, profileLenient, slog.LevelWarn)
+	res, err := s.resolveManagerForOptsStrict(api.StartOptions{Name: jr.AgentName, ProjectPath: jr.ProjectPath, Profile: jr.Profile}, profileLenient)
+	mgr := res.Manager
 	if err != nil || mgr == nil || s.launchRuntimeIdentity(mgr) != id {
 		return nil
 	}
@@ -285,7 +341,7 @@ func (s *Server) launchRuntimeIdentity(mgr agent.Manager) string {
 	if !reflect.TypeOf(mgr).Comparable() {
 		return ""
 	}
-	if defMgr, defRT := s.defaultPair(); defRT != nil && defMgr != nil && reflect.TypeOf(defMgr).Comparable() && defMgr == mgr {
+	if defMgr, defRT, _ := s.defaultPair(); defRT != nil && defMgr != nil && reflect.TypeOf(defMgr).Comparable() && defMgr == mgr {
 		return auxiliaryRuntimeIdentity(defRT)
 	}
 	s.auxiliaryRuntimesMu.RLock()
@@ -306,7 +362,7 @@ func (s *Server) launchRuntimeIdentity(mgr agent.Manager) string {
 // which never cancels anyone. A start that registers during the slot
 // cancels it, and recovery checks that before each call (design wave 3 §1
 // C-c step 5).
-func (s *Server) recoveryNameCleanup(ctx context.Context, mgr agent.Manager, jr *journalRecord, rec *launchRecord) {
+func (s *Server) recoveryNameCleanup(ctx context.Context, mgr agent.Manager, jr *journalRecord, rec *launchRecord) error {
 	key := jr.key()
 	slotCtx, cancel := context.WithTimeout(ctx, scionrt.AsyncLaunchCleanupBudget)
 	defer cancel()
@@ -315,21 +371,22 @@ func (s *Server) recoveryNameCleanup(ctx context.Context, mgr agent.Manager, jr 
 	if s.startsInFlight.anyFor(key) || !s.launchRegistry.TryBegin(key, slot) {
 		s.agentLifecycleLog.Info("Launch recovery: the agent name is in use by a newer start; leftover resources are removed by `scion delete`",
 			"agent_id", jr.AgentID, "launch_id", jr.LaunchID)
-		return
+		return nil
 	}
 	defer s.launchRegistry.Finish(key, slot)
 	if s.startsInFlight.anyFor(key) {
 		s.agentLifecycleLog.Info("Launch recovery: the agent name is in use by a newer start; leftover resources are removed by `scion delete`",
 			"agent_id", jr.AgentID, "launch_id", jr.LaunchID)
-		return
+		return nil
 	}
+	var runErr error
 	if jr.RunID != "" && slotCtx.Err() == nil {
-		s.deleteRecoveredRun(slotCtx, mgr, jr)
+		runErr = s.deleteRecoveredRun(slotCtx, mgr, jr)
 	}
 	if slotCtx.Err() != nil {
 		s.agentLifecycleLog.Info("Launch recovery: name-addressed cleanup stopped: a newer start took the name, or the broker is shutting down",
 			"agent_id", jr.AgentID, "launch_id", jr.LaunchID)
-		return
+		return runErr
 	}
 	opts := api.StartOptions{
 		Name:            jr.AgentName,
@@ -338,7 +395,7 @@ func (s *Server) recoveryNameCleanup(ctx context.Context, mgr agent.Manager, jr 
 		SharedWorkspace: jr.SharedWorkspace,
 		RunID:           jr.RunID,
 	}
-	s.cleanupLaunchFiles(rec, opts, jr.SharedWorkspace, jr.Slug)
+	return errors.Join(runErr, s.cleanupLaunchFiles(rec, opts, jr.SharedWorkspace, jr.Slug))
 }
 
 // deleteRecoveredRun deletes the runtime entry labelled with the recovered
@@ -346,24 +403,26 @@ func (s *Server) recoveryNameCleanup(ctx context.Context, mgr agent.Manager, jr 
 // (design wave 3 §1 C-d). Only an entry labelled with that run exactly is
 // deleted, never an unlabelled legacy entry or another run's; not found
 // counts as done.
-func (s *Server) deleteRecoveredRun(ctx context.Context, mgr agent.Manager, jr *journalRecord) {
+func (s *Server) deleteRecoveredRun(ctx context.Context, mgr agent.Manager, jr *journalRecord) error {
 	infos, err := mgr.List(ctx, map[string]string{"scion.name": api.Slugify(jr.AgentName)})
 	if err != nil {
 		s.agentLifecycleLog.Warn("Launch recovery: cannot list the agent's runtime entries; run-scoped cleanup skipped",
 			"agent_id", jr.AgentID, "launch_id", jr.LaunchID, "error", err)
-		return
+		return failCleanup(nil, cleanupFailRunList)
 	}
-	target, found, err := agent.SelectExactRunTarget(infos, jr.AgentName, jr.ProjectPath, jr.RunID)
+	target, found, err := agent.SelectExactRunTarget(infos, jr.AgentName, jr.ProjectPath, jr.ProjectID, jr.RunID)
 	if err != nil {
 		s.agentLifecycleLog.Warn("Launch recovery: run-scoped cleanup skipped", "agent_id", jr.AgentID, "launch_id", jr.LaunchID, "error", err)
-		return
+		return nil
 	}
 	if !found {
-		return
+		return nil
 	}
 	ref := scionrt.RunRef{ID: scionrt.AgentOperationID(target), RunID: target.RunID}
-	if _, err := mgr.DeleteTarget(ctx, jr.AgentName, ref, false, jr.ProjectPath, false); err != nil {
+	if _, err := mgr.DeleteTarget(ctx, jr.AgentName, "", ref, false, jr.ProjectPath, false); err != nil {
 		s.agentLifecycleLog.Warn("Launch recovery: failed to delete the launch's runtime entry",
 			"agent_id", jr.AgentID, "launch_id", jr.LaunchID, "run_id", jr.RunID, "error", err)
+		return failCleanup(nil, cleanupFailRunDelete)
 	}
+	return nil
 }
