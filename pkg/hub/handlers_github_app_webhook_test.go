@@ -1976,8 +1976,8 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 }
 
 func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
-	t.Setenv("SCION_REVIEW_TEMPLATE", "my-custom-review-tpl")
-	t.Setenv("SCION_VALIDATE_TEMPLATE", "my-custom-validate-tpl")
+	t.Setenv("GITHUB_REVIEW_TEMPLATE", "my-custom-review-tpl")
+	t.Setenv("GITHUB_VALIDATE_TEMPLATE", "my-custom-validate-tpl")
 
 	expiresAt := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339)
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2426,7 +2426,7 @@ func TestHandleGitHubWebhook_TemplateResolution_Database(t *testing.T) {
 	// Create the hub-scoped env var under the "hub" scopeID
 	if err := s.CreateEnvVar(ctx, &store.EnvVar{
 		ID:      tid("envvar-val-db-1"),
-		Key:     "SCION_VALIDATE_TEMPLATE",
+		Key:     "GITHUB_VALIDATE_TEMPLATE",
 		Value:   "my-db-validate-tpl",
 		Scope:   store.ScopeHub,
 		ScopeID: "hub",

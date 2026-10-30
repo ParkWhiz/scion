@@ -1306,15 +1306,15 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 		}
 
 		if cmd == "/review" {
-			targetTemplate = lookup("SCION_REVIEW_TEMPLATE")
+			targetTemplate = lookup("GITHUB_REVIEW_TEMPLATE")
 		} else if cmd == "/validate" {
-			targetTemplate = lookup("SCION_VALIDATE_TEMPLATE")
+			targetTemplate = lookup("GITHUB_VALIDATE_TEMPLATE")
 		} else if cmd == "/fix" {
-			targetTemplate = lookup("SCION_FIX_TEMPLATE")
+			targetTemplate = lookup("GITHUB_FIX_TEMPLATE")
 		} else if cmd == "/plan" {
-			targetTemplate = lookup("SCION_PLAN_TEMPLATE")
+			targetTemplate = lookup("GITHUB_PLAN_TEMPLATE")
 		} else if cmd == "/implement" {
-			targetTemplate = lookup("SCION_IMPLEMENT_TEMPLATE")
+			targetTemplate = lookup("GITHUB_IMPLEMENT_TEMPLATE")
 		}
 		if targetTemplate == "" {
 			targetTemplate = defaultTemplateFromSettings
