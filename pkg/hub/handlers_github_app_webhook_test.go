@@ -3233,82 +3233,42 @@ func TestHandleGitHubWebhook_PlanCommand(t *testing.T) {
 	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
 	srv.mu.Unlock()
 
-	brokerObj := &store.RuntimeBroker{
-		ID:          tid("broker-plan-1"),
-		Slug:        "broker-plan-1",
-		Name:        "Broker Plan 1",
-		Status:      store.BrokerStatusOnline,
-		AutoProvide: true,
-	}
+	brokerObj := &store.RuntimeBroker{ID: tid("broker-plan-1"), Slug: "broker-plan-1", Name: "Broker Plan 1", Status: store.BrokerStatusOnline, AutoProvide: true}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
 	}
-
-	installation := &store.GitHubInstallation{
-		InstallationID: instID,
-		AccountLogin:   "acme",
-		AccountType:    "Organization",
-		AppID:          42,
-		Repositories:   []string{"acme/plan-widgets"},
-		Status:         store.GitHubInstallationStatusActive,
-		CreatedAt:      time.Now(),
-		UpdatedAt:      time.Now(),
-	}
-	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+	if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+		InstallationID: instID, AccountLogin: "acme", AccountType: "Organization", AppID: 42,
+		Repositories: []string{"acme/plan-widgets"}, Status: store.GitHubInstallationStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
 		t.Fatalf("failed to create installation: %v", err)
 	}
-
 	project := &store.Project{
-		ID:                     tid("proj-plan-1"),
-		Name:                   "Proj Plan 1",
-		Slug:                   "proj-plan-1",
-		GitRemote:              "https://github.com/acme/plan-widgets.git",
-		GitHubInstallationID:   &instID,
-		DefaultRuntimeBrokerID: brokerObj.ID,
-		Created:                time.Now(),
-		Updated:                time.Now(),
+		ID: tid("proj-plan-1"), Name: "Proj Plan 1", Slug: "proj-plan-1",
+		GitRemote: "https://github.com/acme/plan-widgets.git", GitHubInstallationID: &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID, Created: time.Now(), Updated: time.Now(),
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
-
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default_plan"), Slug: "default", Name: "Default Template",
-		Harness: "gemini", Scope: "global",
-		Status:      "active",
-		ContentHash: "abc123",
-		Created:     time.Now(), Updated: time.Now(),
+		Harness: "gemini", Scope: "global", Status: "active", ContentHash: "abc123", Created: time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}
-
-	provider := &store.ProjectProvider{
-		ProjectID:  project.ID,
-		BrokerID:   brokerObj.ID,
-		BrokerName: brokerObj.Name,
-		Status:     store.BrokerStatusOnline,
-	}
-	if err := s.AddProjectProvider(ctx, provider); err != nil {
+	if err := s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID: project.ID, BrokerID: brokerObj.ID, BrokerName: brokerObj.Name, Status: store.BrokerStatusOnline,
+	}); err != nil {
 		t.Fatalf("failed to add project provider: %v", err)
 	}
 
-	// Payload 1: Issues event ("opened")
 	payload := map[string]interface{}{
-		"action": "opened",
-		"issue": map[string]interface{}{
-			"number":   201,
-			"html_url": "https://github.com/acme/plan-widgets/issues/201",
-			"body":     "Hello @scion /plan refactoring database layers",
-		},
-		"repository": map[string]interface{}{
-			"full_name": "acme/plan-widgets",
-		},
-		"sender": map[string]interface{}{
-			"login": "planner1",
-		},
-		"installation": map[string]interface{}{
-			"id": 124,
-		},
+		"action":       "opened",
+		"issue":        map[string]interface{}{"number": 201, "html_url": "https://github.com/acme/plan-widgets/issues/201", "body": "Hello @scion /plan refactoring database layers"},
+		"repository":   map[string]interface{}{"full_name": "acme/plan-widgets"},
+		"sender":       map[string]interface{}{"login": "planner1"},
+		"installation": map[string]interface{}{"id": 124},
 	}
 
 	payloadBytes := mustJSON(t, payload)
@@ -3371,86 +3331,43 @@ func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
 	srv.config.GitHubAppConfig.APIBaseURL = ghServer.URL
 	srv.mu.Unlock()
 
-	brokerObj := &store.RuntimeBroker{
-		ID:          tid("broker-implement-1"),
-		Slug:        "broker-implement-1",
-		Name:        "Broker Implement 1",
-		Status:      store.BrokerStatusOnline,
-		AutoProvide: true,
-	}
+	brokerObj := &store.RuntimeBroker{ID: tid("broker-implement-1"), Slug: "broker-implement-1", Name: "Broker Implement 1", Status: store.BrokerStatusOnline, AutoProvide: true}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
 	}
-
-	installation := &store.GitHubInstallation{
-		InstallationID: instID,
-		AccountLogin:   "acme",
-		AccountType:    "Organization",
-		AppID:          42,
-		Repositories:   []string{"acme/implement-widgets"},
-		Status:         store.GitHubInstallationStatusActive,
-		CreatedAt:      time.Now(),
-		UpdatedAt:      time.Now(),
-	}
-	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+	if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+		InstallationID: instID, AccountLogin: "acme", AccountType: "Organization", AppID: 42,
+		Repositories: []string{"acme/implement-widgets"}, Status: store.GitHubInstallationStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
 		t.Fatalf("failed to create installation: %v", err)
 	}
-
 	project := &store.Project{
-		ID:                     tid("proj-implement-1"),
-		Name:                   "Proj Implement 1",
-		Slug:                   "proj-implement-1",
-		GitRemote:              "https://github.com/acme/implement-widgets.git",
-		GitHubInstallationID:   &instID,
-		DefaultRuntimeBrokerID: brokerObj.ID,
-		Created:                time.Now(),
-		Updated:                time.Now(),
+		ID: tid("proj-implement-1"), Name: "Proj Implement 1", Slug: "proj-implement-1",
+		GitRemote: "https://github.com/acme/implement-widgets.git", GitHubInstallationID: &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID, Created: time.Now(), Updated: time.Now(),
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
-
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default_implement"), Slug: "default", Name: "Default Template",
-		Harness: "gemini", Scope: "global",
-		Status:      "active",
-		ContentHash: "abc123",
-		Created:     time.Now(), Updated: time.Now(),
+		Harness: "gemini", Scope: "global", Status: "active", ContentHash: "abc123", Created: time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}
-
-	provider := &store.ProjectProvider{
-		ProjectID:  project.ID,
-		BrokerID:   brokerObj.ID,
-		BrokerName: brokerObj.Name,
-		Status:     store.BrokerStatusOnline,
-	}
-	if err := s.AddProjectProvider(ctx, provider); err != nil {
+	if err := s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID: project.ID, BrokerID: brokerObj.ID, BrokerName: brokerObj.Name, Status: store.BrokerStatusOnline,
+	}); err != nil {
 		t.Fatalf("failed to add project provider: %v", err)
 	}
 
-	// Payload 2: Issue comment on a non-PR issue containing @scion and /implement
 	payload := map[string]interface{}{
-		"action": "created",
-		"issue": map[string]interface{}{
-			"number":       301,
-			"html_url":     "https://github.com/acme/implement-widgets/issues/301",
-			"pull_request": nil, // Non-PR issue comment!
-		},
-		"comment": map[string]interface{}{
-			"id":   555,
-			"body": "Hey @scion /implement the design doc from #201",
-		},
-		"repository": map[string]interface{}{
-			"full_name": "acme/implement-widgets",
-		},
-		"sender": map[string]interface{}{
-			"login": "coder456",
-		},
-		"installation": map[string]interface{}{
-			"id": 125,
-		},
+		"action":       "created",
+		"issue":        map[string]interface{}{"number": 301, "html_url": "https://github.com/acme/implement-widgets/issues/301", "pull_request": nil},
+		"comment":      map[string]interface{}{"id": 555, "body": "Hey @scion /implement the design doc from #201"},
+		"repository":   map[string]interface{}{"full_name": "acme/implement-widgets"},
+		"sender":       map[string]interface{}{"login": "coder456"},
+		"installation": map[string]interface{}{"id": 125},
 	}
 
 	payloadBytes := mustJSON(t, payload)
@@ -3507,106 +3424,52 @@ func TestHandleGitHubWebhook_PlanCommand_ActiveAgent(t *testing.T) {
 	srv.config.GitHubAppConfig.PrivateKey = string(pemBytes)
 	srv.mu.Unlock()
 
-	brokerObj := &store.RuntimeBroker{
-		ID:          tid("broker-plan-active-1"),
-		Slug:        "broker-plan-active-1",
-		Name:        "Broker Plan Active 1",
-		Status:      store.BrokerStatusOnline,
-		AutoProvide: true,
-	}
+	brokerObj := &store.RuntimeBroker{ID: tid("broker-plan-active-1"), Slug: "broker-plan-active-1", Name: "Broker Plan Active 1", Status: store.BrokerStatusOnline, AutoProvide: true}
 	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
 		t.Fatalf("failed to create broker: %v", err)
 	}
-
-	installation := &store.GitHubInstallation{
-		InstallationID: instID,
-		AccountLogin:   "acme",
-		AccountType:    "Organization",
-		AppID:          42,
-		Repositories:   []string{"acme/plan-widgets"},
-		Status:         store.GitHubInstallationStatusActive,
-		CreatedAt:      time.Now(),
-		UpdatedAt:      time.Now(),
-	}
-	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
+	if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+		InstallationID: instID, AccountLogin: "acme", AccountType: "Organization", AppID: 42,
+		Repositories: []string{"acme/plan-widgets"}, Status: store.GitHubInstallationStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}); err != nil {
 		t.Fatalf("failed to create installation: %v", err)
 	}
-
 	project := &store.Project{
-		ID:                     tid("proj-plan-active-1"),
-		Name:                   "Proj Plan Active 1",
-		Slug:                   "proj-plan-active-1",
-		GitRemote:              "https://github.com/acme/plan-widgets.git",
-		GitHubInstallationID:   &instID,
-		DefaultRuntimeBrokerID: brokerObj.ID,
-		Created:                time.Now(),
-		Updated:                time.Now(),
+		ID: tid("proj-plan-active-1"), Name: "Proj Plan Active 1", Slug: "proj-plan-active-1",
+		GitRemote: "https://github.com/acme/plan-widgets.git", GitHubInstallationID: &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID, Created: time.Now(), Updated: time.Now(),
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
-
 	if err := s.CreateTemplate(ctx, &store.Template{
 		ID: tid("tmpl_default_plan_active"), Slug: "default", Name: "Default Template",
-		Harness: "gemini", Scope: "global",
-		Status:      "active",
-		ContentHash: "abc123",
-		Created:     time.Now(), Updated: time.Now(),
+		Harness: "gemini", Scope: "global", Status: "active", ContentHash: "abc123", Created: time.Now(), Updated: time.Now(),
 	}); err != nil {
 		t.Fatalf("failed to create default template: %v", err)
 	}
-
-	provider := &store.ProjectProvider{
-		ProjectID:  project.ID,
-		BrokerID:   brokerObj.ID,
-		BrokerName: brokerObj.Name,
-		Status:     store.BrokerStatusOnline,
-	}
-	if err := s.AddProjectProvider(ctx, provider); err != nil {
+	if err := s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID: project.ID, BrokerID: brokerObj.ID, BrokerName: brokerObj.Name, Status: store.BrokerStatusOnline,
+	}); err != nil {
 		t.Fatalf("failed to add project provider: %v", err)
 	}
-
-	// Pre-create an active running agent labeled with the issue
 	activeAgent := &store.Agent{
-		ID:        tid("agent-plan-active-1"),
-		Slug:      "agent-plan-active-1",
-		Name:      "agent-plan-active-1",
-		ProjectID: project.ID,
-		Template:  "default",
-		Phase:     "running",
-		Labels: map[string]string{
-			"github-pr":    "201",
-			"github-issue": "201",
-			"github-repo":  "acme/plan-widgets",
-		},
-		Created: time.Now(),
-		Updated: time.Now(),
+		ID: tid("agent-plan-active-1"), Slug: "agent-plan-active-1", Name: "agent-plan-active-1",
+		ProjectID: project.ID, Template: "default", Phase: "running",
+		Labels:  map[string]string{"github-pr": "201", "github-issue": "201", "github-repo": "acme/plan-widgets"},
+		Created: time.Now(), Updated: time.Now(),
 	}
 	if err := s.CreateAgent(ctx, activeAgent); err != nil {
 		t.Fatalf("failed to create active agent: %v", err)
 	}
 
-	// Payload: Issue comment on issue 201 containing @scion and /plan
 	payload := map[string]interface{}{
-		"action": "created",
-		"issue": map[string]interface{}{
-			"number":       201,
-			"html_url":     "https://github.com/acme/plan-widgets/issues/201",
-			"pull_request": nil,
-		},
-		"comment": map[string]interface{}{
-			"id":   666,
-			"body": "Hey @scion /plan please refine to use Postgres",
-		},
-		"repository": map[string]interface{}{
-			"full_name": "acme/plan-widgets",
-		},
-		"sender": map[string]interface{}{
-			"login": "planner1",
-		},
-		"installation": map[string]interface{}{
-			"id": 124,
-		},
+		"action":       "created",
+		"issue":        map[string]interface{}{"number": 201, "html_url": "https://github.com/acme/plan-widgets/issues/201", "pull_request": nil},
+		"comment":      map[string]interface{}{"id": 666, "body": "Hey @scion /plan please refine to use Postgres"},
+		"repository":   map[string]interface{}{"full_name": "acme/plan-widgets"},
+		"sender":       map[string]interface{}{"login": "planner1"},
+		"installation": map[string]interface{}{"id": 124},
 	}
 
 	payloadBytes := mustJSON(t, payload)
@@ -3645,5 +3508,141 @@ func TestHandleGitHubWebhook_PlanCommand_ActiveAgent(t *testing.T) {
 	}
 	if len(agents.Items) != 1 {
 		t.Errorf("expected exactly 1 agent to exist, but found %d", len(agents.Items))
+	}
+}
+
+func TestHandleGitHubWebhook_SpawnedAgentStandingAndTokenGrant(t *testing.T) {
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	ownerUser := &store.User{ID: tid("user-webhook-owner"), Email: "owner@example.com", DisplayName: "Project Owner", Role: "member", Status: store.UserStatusActive, Created: now}
+	adminUser := &store.User{ID: tid("user-webhook-admin"), Email: "admin@example.com", DisplayName: "Project Admin", Role: "member", Status: store.UserStatusActive, Created: now}
+	for _, u := range []*store.User{ownerUser, adminUser} {
+		if err := s.CreateUser(ctx, u); err != nil {
+			t.Fatalf("failed to create user %s: %v", u.Email, err)
+		}
+	}
+
+	brokerObj := &store.RuntimeBroker{ID: tid("broker-webhook-standing"), Name: "test-broker-standing", Slug: "test-broker-standing", Status: store.BrokerStatusOnline, Created: now, Updated: now}
+	if err := s.CreateRuntimeBroker(ctx, brokerObj); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	instID := int64(777)
+	if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+		InstallationID: instID, AccountLogin: "acme", AccountType: "Organization", AppID: 1, Status: store.GitHubInstallationStatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+
+	project := &store.Project{
+		ID: tid("proj-webhook-standing"), Name: "Proj Webhook Standing", Slug: "proj-webhook-standing",
+		GitRemote: "https://github.com/acme/standing-widgets.git", GitHubInstallationID: &instID,
+		DefaultRuntimeBrokerID: brokerObj.ID, OwnerID: ownerUser.ID, CreatedBy: ownerUser.ID, Created: now, Updated: now,
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	ownerRD, err := s.GetRoleDefinitionByName(ctx, store.ProjectRoleOwner, store.RoleScopeProject)
+	if err != nil {
+		t.Fatalf("failed to get project-owner role definition: %v", err)
+	}
+	adminRD, err := s.GetRoleDefinitionByName(ctx, store.ProjectRoleAdmin, store.RoleScopeProject)
+	if err != nil {
+		t.Fatalf("failed to get project-admin role definition: %v", err)
+	}
+	if _, err := s.CreateRoleBinding(ctx, &store.RoleBinding{
+		ID: tid("rb-webhook-standing-owner"), RoleDefinitionID: ownerRD.ID, PrincipalType: store.RoleBindingPrincipalUser,
+		PrincipalID: ownerUser.ID, ScopeType: store.RoleScopeProject, ScopeID: project.ID, CreatedBy: ownerUser.ID, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("failed to create project-owner role binding: %v", err)
+	}
+	if _, err := s.CreateRoleBinding(ctx, &store.RoleBinding{
+		ID: tid("rb-webhook-standing-admin"), RoleDefinitionID: adminRD.ID, PrincipalType: store.RoleBindingPrincipalUser,
+		PrincipalID: adminUser.ID, ScopeType: store.RoleScopeProject, ScopeID: project.ID, CreatedBy: ownerUser.ID, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("failed to create project-admin role binding: %v", err)
+	}
+
+	if err := s.CreateTemplate(ctx, &store.Template{
+		ID: tid("tmpl_default_webhook_standing"), Slug: "default", Name: "Default Template",
+		Harness: "gemini", Scope: "global", Status: "active", ContentHash: "abc123", Created: now, Updated: now,
+	}); err != nil {
+		t.Fatalf("failed to create default template: %v", err)
+	}
+	if err := s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID: project.ID, BrokerID: brokerObj.ID, BrokerName: brokerObj.Name, Status: store.BrokerStatusOnline,
+	}); err != nil {
+		t.Fatalf("failed to add project provider: %v", err)
+	}
+
+	payloadBytes := mustJSON(t, map[string]interface{}{
+		"action":     "created",
+		"issue":      map[string]interface{}{"number": 42, "html_url": "https://github.com/acme/standing-widgets/issues/42", "pull_request": nil},
+		"comment":    map[string]interface{}{"id": 888, "body": "@scion /plan please plan this feature"},
+		"repository": map[string]interface{}{"full_name": "acme/standing-widgets"},
+		"sender":     map[string]interface{}{"login": "reviewer1"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payloadBytes))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("X-Hub-Signature-256", signWebhookPayload(payloadBytes, "test-webhook-secret"))
+
+	rec := httptest.NewRecorder()
+	srv.handleGitHubWebhook(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var spawnedAgent *store.Agent
+	for i := 0; i < 20; i++ {
+		agents, err := s.ListAgents(ctx, store.AgentFilter{ProjectID: project.ID}, store.ListOptions{Limit: 100})
+		if err == nil && len(agents.Items) > 0 {
+			spawnedAgent = &agents.Items[0]
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if spawnedAgent == nil {
+		t.Fatal("timed out waiting for webhook agent to be spawned")
+	}
+
+	if spawnedAgent.CreatedBy != ownerUser.ID || spawnedAgent.OwnerID != ownerUser.ID {
+		t.Errorf("expected CreatedBy/OwnerID=%q, got %q/%q", ownerUser.ID, spawnedAgent.CreatedBy, spawnedAgent.OwnerID)
+	}
+	if len(spawnedAgent.Ancestry) != 1 || spawnedAgent.Ancestry[0] != ownerUser.ID {
+		t.Errorf("expected Ancestry=[%q], got %v", ownerUser.ID, spawnedAgent.Ancestry)
+	}
+
+	// Verify agent standing and token grant authorization succeed (no root_user_missing).
+	if err := srv.agentStanding(ctx, spawnedAgent.ID); err != nil {
+		t.Fatalf("expected spawned agent to be in good standing, got error: %v", err)
+	}
+	grant, err := srv.AuthorizeAgentToken(ctx, spawnedAgent)
+	if err != nil {
+		t.Fatalf("expected AuthorizeAgentToken to succeed for webhook-spawned agent, got error: %v", err)
+	}
+	if grant.AgentID != spawnedAgent.ID || len(grant.Scopes) == 0 {
+		t.Errorf("unexpected token grant: AgentID=%q, Scopes=%v", grant.AgentID, grant.Scopes)
+	}
+
+	// Verify fallback priority when OwnerID is suspended -> project-admin -> system DevUserID.
+	ownerUser.Status = store.UserStatusSuspended
+	if err := s.UpdateUser(ctx, ownerUser); err != nil {
+		t.Fatalf("failed to suspend owner: %v", err)
+	}
+	resolved, err := srv.resolveWebhookAgentCreator(ctx, *project)
+	if err != nil || resolved.ID != adminUser.ID {
+		t.Fatalf("expected fallback to adminUser (%s), got %v, err=%v", adminUser.ID, resolved, err)
+	}
+
+	adminUser.Status = store.UserStatusSuspended
+	if err := s.UpdateUser(ctx, adminUser); err != nil {
+		t.Fatalf("failed to suspend admin: %v", err)
+	}
+	resolved, err = srv.resolveWebhookAgentCreator(ctx, *project)
+	if err != nil || resolved.ID != DevUserID {
+		t.Fatalf("expected fallback to DevUserID (%s), got %v, err=%v", DevUserID, resolved, err)
 	}
 }

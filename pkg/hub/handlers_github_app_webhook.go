@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1515,18 +1516,28 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 
 			// C: Provision and start the agent
 			slog.Info("Starting dynamic agent dispatch", "name", req.Name, "branch", req.Branch)
+			creatorUser, err := s.resolveWebhookAgentCreator(bgCtx, proj)
+			if err != nil {
+				slog.Error("Failed to resolve creator user for webhook agent", "project_id", proj.ID, "error", err)
+				return
+			}
+
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodPost, "/api/v1/agents", nil)
 
-			// Ent's created_by column requires a valid RFC 4122 UUID.
-			// "6550700c-b26a-54cf-bc7b-ec81c1be486a" is the deterministic UUID v5 for "system:github-webhook".
-			createdBy := "6550700c-b26a-54cf-bc7b-ec81c1be486a"
-			creatorName := "GitHub Webhook"
+			createdBy := creatorUser.ID
+			creatorName := creatorUser.DisplayName
+			if creatorName == "" {
+				creatorName = creatorUser.Email
+			}
+			if creatorName == "" {
+				creatorName = "GitHub Webhook"
+			}
 			notifySubscriberType := store.SubscriberTypeUser
 			notifySubscriberID := ""
-			ancestry := []string{"system:github-webhook"}
+			ancestry := []string{creatorUser.ID}
 
-			webhookUser := NewAuthenticatedUser(createdBy, "webhook@system.scion", creatorName, "admin", "webhook")
+			webhookUser := NewAuthenticatedUser(createdBy, creatorUser.Email, creatorName, creatorUser.Role, "webhook")
 			r = r.WithContext(contextWithIdentity(r.Context(), webhookUser))
 
 			s.createAgentInProject(w, r, req, proj.ID, createdBy, creatorName, ancestry, notifySubscriberType, notifySubscriberID)
@@ -1571,6 +1582,97 @@ func (s *Server) processComment(ctx context.Context, eventType, repoFullName str
 			}
 		}(p, prNumber, repoFullName, senderLogin, body, cmd, targetTemplate, installationID)
 	}
+}
+
+// resolveWebhookAgentCreator resolves an active human user admitted to proj who is
+// authorized to create and delegate agents on behalf of a GitHub webhook event.
+// It checks candidates in priority order:
+//  1. Project OwnerID and CreatedBy
+//  2. Active human users (project owners > project admins > project members > system admins)
+//  3. DevUserID fallback
+func (s *Server) resolveWebhookAgentCreator(ctx context.Context, proj store.Project) (*store.User, error) {
+	checked := make(map[string]bool)
+	checkCandidate := func(userID string) *store.User {
+		if userID == "" || checked[userID] {
+			return nil
+		}
+		checked[userID] = true
+		user, err := s.store.GetUser(ctx, userID)
+		if err != nil || user == nil || user.Status != store.UserStatusActive || !user.IsHumanKind() {
+			return nil
+		}
+		if admitted, err := s.userAdmittedToProjectOn(ctx, s.store, user, proj.ID, nil); err != nil || !admitted {
+			return nil
+		}
+		creatorName := user.DisplayName
+		if creatorName == "" {
+			creatorName = user.Email
+		}
+		authUser := NewAuthenticatedUser(user.ID, user.Email, creatorName, user.Role, "webhook")
+		if !s.agentCreateDecision(ctx, authUser, proj.ID).Allowed {
+			return nil
+		}
+		if s.authzService != nil {
+			grantDesc := GrantDescriptor{
+				Type:      GrantTypeAgentDelegation,
+				AgentRole: string(AgentRoleFull),
+				ProjectID: proj.ID,
+				ScopeType: store.RoleScopeProject,
+				ScopeID:   proj.ID,
+			}
+			if !s.authzService.CanDelegate(ctx, authUser, grantDesc).Allowed {
+				return nil
+			}
+		}
+		return user
+	}
+
+	// 1. Direct project owner / creator fields.
+	for _, id := range []string{proj.OwnerID, proj.CreatedBy} {
+		if u := checkCandidate(id); u != nil {
+			return u, nil
+		}
+	}
+
+	// 2. Active human users (project owners > project admins > project members > system admins).
+	if users, err := s.store.ListUsers(ctx, store.UserFilter{Status: store.UserStatusActive}, store.ListOptions{Limit: 100}); err == nil && len(users.Items) > 0 {
+		type rankedCandidate struct {
+			id       string
+			priority int
+		}
+		candidates := make([]rankedCandidate, 0, len(users.Items))
+		for _, u := range users.Items {
+			if u.ID == DevUserID || !u.IsHumanKind() {
+				continue
+			}
+			prio := 0
+			switch {
+			case s.isProjectOwner(ctx, u.ID, proj.ID):
+				prio = 2
+			case s.authzService != nil && s.authzService.isProjectOwnerOrAdmin(ctx, u.ID, proj.ID):
+				prio = 1
+			}
+			candidates = append(candidates, rankedCandidate{id: u.ID, priority: prio})
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].priority != candidates[j].priority {
+				return candidates[i].priority > candidates[j].priority
+			}
+			return candidates[i].id < candidates[j].id
+		})
+		for _, c := range candidates {
+			if u := checkCandidate(c.id); u != nil {
+				return u, nil
+			}
+		}
+	}
+
+	// 3. DevUserID fallback.
+	if u := checkCandidate(DevUserID); u != nil {
+		return u, nil
+	}
+
+	return nil, fmt.Errorf("no active admitted user with agent creation authority found for project %s", proj.ID)
 }
 
 // resolveBestProjectForPR implements a multi-tier prioritisation strategy to select the single best project for a PR comment webhook.
