@@ -73,13 +73,14 @@ func (s *Server) experimentEnabledIn(snap ExperimentsSnapshot, name string) bool
 // this deployment when it differs by deployment from the compiled default,
 // with ok true; otherwise ok is false and the compiled default applies.
 //
-// hub.attachment_artifacts defaults on when the hub's resource storage is an
-// object store (ptone/scion#5827): uploads then go to the artifact
-// service and reach agents through inbox delivery, and a hub replica keeps
-// no attachment bytes on its own disk. A hub with local resource storage
-// (the workstation server) keeps the compiled default, off.
+// hub.attachment_artifacts defaults on wherever the artifact service is
+// ready (attachmentArtifactsReady), local blob storage included
+// (ptone/scion#5828), and on every hub whose resource storage is an object
+// store (ptone/scion#5827): uploads then go to the artifact service and
+// reach each recipient agent through inbox delivery, so a workstation or
+// single-node hub needs no object storage for attachments.
 func (s *Server) deploymentExperimentDefault(name string) (bool, bool) {
-	if name == experiments.AttachmentArtifacts && s.objectStorageConfigured() {
+	if name == experiments.AttachmentArtifacts && (s.objectStorageConfigured() || s.attachmentArtifactsReady()) {
 		return true, true
 	}
 	return false, false
@@ -139,7 +140,7 @@ func (s *Server) requireExperiment(name string, next http.HandlerFunc) http.Hand
 // dispatchExperimentNames are the server-layer experiments whose state the
 // hub sends with each agent dispatch, because they change what the broker
 // does. hub.conduit is added separately (see dispatchExperiments).
-var dispatchExperimentNames = []string{experiments.K8sNFSHome, experiments.AgentPlugins}
+var dispatchExperimentNames = []string{experiments.K8sNFSHome, experiments.AgentPlugins, experiments.CloudRunNativeIdentity}
 
 // dispatchExperiments returns the dispatch experiments that are enabled
 // now, resolved from one snapshot, or nil when none is. hub.conduit is a

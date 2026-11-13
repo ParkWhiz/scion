@@ -52,6 +52,8 @@ const (
 	ErrCodeDiscoverFailed                   = apierr.ErrCodeDiscoverFailed
 	ErrCodeEmptyRoleSet                     = apierr.ErrCodeEmptyRoleSet
 	ErrCodeExperimentDisabled               = apierr.ErrCodeExperimentDisabled
+	ErrCodeHarnessConfigNotFound            = apierr.ErrCodeHarnessConfigNotFound
+	ErrCodeHarnessCredentialsMissing        = apierr.ErrCodeHarnessCredentialsMissing
 	ErrCodeExpiredJoinToken                 = apierr.ErrCodeExpiredJoinToken
 	ErrCodeForbidden                        = apierr.ErrCodeForbidden
 	ErrCodeHarnessConfigConflict            = apierr.ErrCodeHarnessConfigConflict
@@ -96,8 +98,12 @@ const (
 	ErrCodeRuntimeTargetMoveUnsupported     = apierr.ErrCodeRuntimeTargetMoveUnsupported
 	ErrCodeRuntimeTargetPinStale            = apierr.ErrCodeRuntimeTargetPinStale
 	ErrCodeRuntimeTargetRequired            = apierr.ErrCodeRuntimeTargetRequired
+	ErrCodeRuntimeTargetTypeUnsupported     = apierr.ErrCodeRuntimeTargetTypeUnsupported
 	ErrCodeScopeMismatch                    = apierr.ErrCodeScopeMismatch
 	ErrCodeScopeNotFound                    = apierr.ErrCodeScopeNotFound
+	ErrCodeSecretPendingExistingChanged     = apierr.ErrCodeSecretPendingExistingChanged
+	ErrCodeSecretPendingHeldByOtherAgent    = apierr.ErrCodeSecretPendingHeldByOtherAgent
+	ErrCodeSecretPendingCap                 = apierr.ErrCodeSecretPendingCap
 	ErrCodeSecretScopeRestricted            = apierr.ErrCodeSecretScopeRestricted
 	ErrCodeSecurityReviewRequired           = apierr.ErrCodeSecurityReviewRequired
 	ErrCodeSendInProgress                   = apierr.ErrCodeSendInProgress
@@ -111,6 +117,9 @@ const (
 	ErrCodeUnprocessable                    = apierr.ErrCodeUnprocessable
 	ErrCodeUnsupportedCapability            = apierr.ErrCodeUnsupportedCapability
 	ErrCodeUserDeleteBlocked                = apierr.ErrCodeUserDeleteBlocked
+	ErrCodeUserDeleteBlockersChanged        = apierr.ErrCodeUserDeleteBlockersChanged
+	ErrCodeUserDeleteForceForbidden         = apierr.ErrCodeUserDeleteForceForbidden
+	ErrCodeUserDeletionInProgress           = apierr.ErrCodeUserDeletionInProgress
 	ErrCodeUserNotFound                     = apierr.ErrCodeUserNotFound
 	ErrCodeValidationError                  = apierr.ErrCodeValidationError
 	ErrCodeVersionConflict                  = apierr.ErrCodeVersionConflict

@@ -154,14 +154,14 @@ type agentService struct {
 
 func (s *agentService) agentPath(agentID string) string {
 	if s.projectID != "" {
-		return "/api/v1/projects/" + s.projectID + "/agents/" + agentID
+		return "/api/v1/projects/" + url.PathEscape(s.projectID) + "/agents/" + url.PathEscape(agentID)
 	}
-	return "/api/v1/agents/" + agentID
+	return "/api/v1/agents/" + url.PathEscape(agentID)
 }
 
 func (s *agentService) agentsPath() string {
 	if s.projectID != "" {
-		return "/api/v1/projects/" + s.projectID + "/agents"
+		return "/api/v1/projects/" + url.PathEscape(s.projectID) + "/agents"
 	}
 	return "/api/v1/agents"
 }
@@ -196,6 +196,11 @@ type ListAgentsOptions struct {
 	// equals this value OR whose Ancestry contains it — the root agent plus
 	// all its descendants. Used by CLI --lineage.
 	LineageRootID string
+
+	// IncludeAuthority asks the Hub to include each agent's authority
+	// state (include=authority). It costs the Hub a delegation chain walk
+	// per listed agent.
+	IncludeAuthority bool
 
 	Page apiclient.PageOptions
 }
@@ -480,6 +485,9 @@ func (s *agentService) List(ctx context.Context, opts *ListAgentsOptions) (*List
 		}
 		if opts.LineageRootID != "" {
 			query.Set("lineageRootId", opts.LineageRootID)
+		}
+		if opts.IncludeAuthority {
+			query.Set("include", "authority")
 		}
 		opts.Page.ToQuery(query)
 	}
@@ -894,6 +902,10 @@ type MessageResponse struct {
 	// mid-`scion reincarnate` (design agent-reincarnate §3.7). The message
 	// was saved to conversation history but not dispatched.
 	Deferred string `json:"deferred,omitempty"`
+	// ConversationID is the conversation the message was recorded in, so
+	// the sender can reply into it. Empty on hubs that predate this field,
+	// or when the message was not recorded in a conversation.
+	ConversationID string `json:"conversation_id,omitempty"`
 	// MentionResults reports the outcome of server-side @mention fan-out,
 	// one entry per resolved mention name. Empty when the message had no
 	// mentions, or on hubs that predate this field.
@@ -1046,6 +1058,31 @@ type OutboundMessageRequest struct {
 	// AttachmentIDs names attachments the sending agent uploaded, by id
 	// (ptone/scion#4596). Attachments keeps meaning staged paths.
 	AttachmentIDs []string `json:"attachment_ids,omitempty"`
+	// Choices makes the message a choice prompt: the decisions as the JSON
+	// array scion message --choices takes. The hub validates them (the
+	// web.chat_choices experiment); Msg is then the optional intro.
+	Choices json.RawMessage `json:"choices,omitempty"`
+	// ChoicesUpdate lets Choices replace decisions whose keys exist.
+	ChoicesUpdate bool `json:"choices_update,omitempty"`
+}
+
+// ChoiceDecisionResult is one decision of a sent choice prompt.
+type ChoiceDecisionResult struct {
+	Key      string                  `json:"key"`
+	Version  int                     `json:"version"`
+	Ref      string                  `json:"ref"`
+	RowID    string                  `json:"row_id,omitempty"`
+	Replaced *ChoiceReplacedDecision `json:"replaced"`
+}
+
+// ChoiceReplacedDecision is the version a choice prompt replaced.
+// For a decided version, Answer is the effective answer's label and
+// AnsweredBy who gave it (the name, else the email).
+type ChoiceReplacedDecision struct {
+	Version    int    `json:"version"`
+	Status     string `json:"status"`
+	Answer     string `json:"answer,omitempty"`
+	AnsweredBy string `json:"answered_by,omitempty"`
 }
 
 // OutboundMessageResult is the parsed response from a successful outbound
@@ -1067,8 +1104,8 @@ type OutboundMessageResult struct {
 	// Deferred is set only when Status == "deferred".
 	Deferred string `json:"deferred,omitempty"`
 	// ConversationID is the conversation the message was recorded in. It is
-	// empty on hubs that predate this field, and on paths that do not report
-	// it (for example, a send to another agent).
+	// empty on hubs that predate this field, or when the message was not
+	// recorded in a conversation.
 	ConversationID string `json:"conversation_id,omitempty"`
 	// MentionResults reports the outcome of server-side @mention fan-out,
 	// one entry per resolved mention name. Empty when the message had no
@@ -1092,6 +1129,10 @@ type OutboundMessageResult struct {
 	// message, which was still sent without them. Empty when every
 	// attachment was recorded, or on hubs that predate this field.
 	AttachmentWarnings []AttachmentWarning `json:"attachment_warnings,omitempty"`
+
+	// Decisions lists the decisions of a choice prompt, one per decision
+	// sent; empty for any other message.
+	Decisions []ChoiceDecisionResult `json:"decisions,omitempty"`
 }
 
 // SendOutboundMessage sends a message from an agent via the outbound endpoint.
@@ -1131,7 +1172,7 @@ func (s *agentService) BroadcastMessage(ctx context.Context, msg *messages.Struc
 		StructuredMessage: msg,
 		Interrupt:         interrupt,
 	}
-	resp, err := s.c.post(ctx, "/api/v1/projects/"+s.projectID+"/broadcast", body, nil)
+	resp, err := s.c.post(ctx, "/api/v1/projects/"+url.PathEscape(s.projectID)+"/broadcast", body, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1362,9 +1403,12 @@ type ReincarnateAgentRequest struct {
 	Model          string `json:"model,omitempty"`
 	ThinkingLevel  *int   `json:"thinkingLevel,omitempty"`
 	HarnessAuth    string `json:"harnessAuth,omitempty"`
+	// HarnessConfig (`--harness`) moves the agent to another harness config
+	// and resets its home (ptone/scion#7757). A hub that predates it
+	// answers 400 "not yet supported".
+	HarnessConfig string `json:"harnessConfig,omitempty"`
 
 	// Overrides not yet supported by the hub.
-	HarnessConfig  string            `json:"harnessConfig,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	TemplateHash   string            `json:"templateHash,omitempty"`
 	ResetOverrides bool              `json:"resetOverrides,omitempty"`
@@ -1466,4 +1510,10 @@ type ReincarnationPlan struct {
 	ServiceAccount *FieldChange `json:"serviceAccount,omitempty"`
 	ThinkingLevel  *FieldChange `json:"thinkingLevel,omitempty"`
 	HarnessAuth    *FieldChange `json:"harnessAuth,omitempty"`
+
+	// HomeReset is set when the reincarnation deletes and rebuilds the
+	// agent's home (a harness switch); Warnings[0] is then the home-reset
+	// warning. Harness is the harness-config name old→new.
+	HomeReset bool         `json:"homeReset,omitempty"`
+	Harness   *FieldChange `json:"harness,omitempty"`
 }

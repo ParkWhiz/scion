@@ -30,6 +30,10 @@ type Tx struct {
 	AgentHold *AgentHoldClient
 	// AgentIdentityKey is the client for interacting with the AgentIdentityKey builders.
 	AgentIdentityKey *AgentIdentityKeyClient
+	// AgentLifecycleCursor is the client for interacting with the AgentLifecycleCursor builders.
+	AgentLifecycleCursor *AgentLifecycleCursorClient
+	// AgentLifecycleOutbox is the client for interacting with the AgentLifecycleOutbox builders.
+	AgentLifecycleOutbox *AgentLifecycleOutboxClient
 	// AgentRecovery is the client for interacting with the AgentRecovery builders.
 	AgentRecovery *AgentRecoveryClient
 	// AgentReincarnation is the client for interacting with the AgentReincarnation builders.
@@ -56,6 +60,10 @@ type Tx struct {
 	BrokerTargetInventory *BrokerTargetInventoryClient
 	// ChatLinkCode is the client for interacting with the ChatLinkCode builders.
 	ChatLinkCode *ChatLinkCodeClient
+	// ChatRetentionCursor is the client for interacting with the ChatRetentionCursor builders.
+	ChatRetentionCursor *ChatRetentionCursorClient
+	// ChatRetentionRun is the client for interacting with the ChatRetentionRun builders.
+	ChatRetentionRun *ChatRetentionRunClient
 	// ConduitPrincipalEpoch is the client for interacting with the ConduitPrincipalEpoch builders.
 	ConduitPrincipalEpoch *ConduitPrincipalEpochClient
 	// ConduitSession is the client for interacting with the ConduitSession builders.
@@ -64,6 +72,12 @@ type Tx struct {
 	Conversation *ConversationClient
 	// ConversationParticipant is the client for interacting with the ConversationParticipant builders.
 	ConversationParticipant *ConversationParticipantClient
+	// Decision is the client for interacting with the Decision builders.
+	Decision *DecisionClient
+	// DecisionAnswer is the client for interacting with the DecisionAnswer builders.
+	DecisionAnswer *DecisionAnswerClient
+	// DecisionKeyCounter is the client for interacting with the DecisionKeyCounter builders.
+	DecisionKeyCounter *DecisionKeyCounterClient
 	// DelegationAdoption is the client for interacting with the DelegationAdoption builders.
 	DelegationAdoption *DelegationAdoptionClient
 	// DelegationEdge is the client for interacting with the DelegationEdge builders.
@@ -126,6 +140,8 @@ type Tx struct {
 	Notification *NotificationClient
 	// NotificationSubscription is the client for interacting with the NotificationSubscription builders.
 	NotificationSubscription *NotificationSubscriptionClient
+	// PendingSecret is the client for interacting with the PendingSecret builders.
+	PendingSecret *PendingSecretClient
 	// PolicyBinding is the client for interacting with the PolicyBinding builders.
 	PolicyBinding *PolicyBindingClient
 	// Project is the client for interacting with the Project builders.
@@ -182,6 +198,10 @@ type Tx struct {
 	User *UserClient
 	// UserAccessToken is the client for interacting with the UserAccessToken builders.
 	UserAccessToken *UserAccessTokenClient
+	// UserDeletion is the client for interacting with the UserDeletion builders.
+	UserDeletion *UserDeletionClient
+	// UserDeletionAgent is the client for interacting with the UserDeletionAgent builders.
+	UserDeletionAgent *UserDeletionAgentClient
 	// UserTerminalWorkspace is the client for interacting with the UserTerminalWorkspace builders.
 	UserTerminalWorkspace *UserTerminalWorkspaceClient
 
@@ -324,6 +344,8 @@ func (tx *Tx) init() {
 	tx.AgentDelegationGrant = NewAgentDelegationGrantClient(tx.config)
 	tx.AgentHold = NewAgentHoldClient(tx.config)
 	tx.AgentIdentityKey = NewAgentIdentityKeyClient(tx.config)
+	tx.AgentLifecycleCursor = NewAgentLifecycleCursorClient(tx.config)
+	tx.AgentLifecycleOutbox = NewAgentLifecycleOutboxClient(tx.config)
 	tx.AgentRecovery = NewAgentRecoveryClient(tx.config)
 	tx.AgentReincarnation = NewAgentReincarnationClient(tx.config)
 	tx.AgentServiceAccountAssignment = NewAgentServiceAccountAssignmentClient(tx.config)
@@ -337,10 +359,15 @@ func (tx *Tx) init() {
 	tx.BrokerSetting = NewBrokerSettingClient(tx.config)
 	tx.BrokerTargetInventory = NewBrokerTargetInventoryClient(tx.config)
 	tx.ChatLinkCode = NewChatLinkCodeClient(tx.config)
+	tx.ChatRetentionCursor = NewChatRetentionCursorClient(tx.config)
+	tx.ChatRetentionRun = NewChatRetentionRunClient(tx.config)
 	tx.ConduitPrincipalEpoch = NewConduitPrincipalEpochClient(tx.config)
 	tx.ConduitSession = NewConduitSessionClient(tx.config)
 	tx.Conversation = NewConversationClient(tx.config)
 	tx.ConversationParticipant = NewConversationParticipantClient(tx.config)
+	tx.Decision = NewDecisionClient(tx.config)
+	tx.DecisionAnswer = NewDecisionAnswerClient(tx.config)
+	tx.DecisionKeyCounter = NewDecisionKeyCounterClient(tx.config)
 	tx.DelegationAdoption = NewDelegationAdoptionClient(tx.config)
 	tx.DelegationEdge = NewDelegationEdgeClient(tx.config)
 	tx.EntitlementBinding = NewEntitlementBindingClient(tx.config)
@@ -372,6 +399,7 @@ func (tx *Tx) init() {
 	tx.NonceCache = NewNonceCacheClient(tx.config)
 	tx.Notification = NewNotificationClient(tx.config)
 	tx.NotificationSubscription = NewNotificationSubscriptionClient(tx.config)
+	tx.PendingSecret = NewPendingSecretClient(tx.config)
 	tx.PolicyBinding = NewPolicyBindingClient(tx.config)
 	tx.Project = NewProjectClient(tx.config)
 	tx.ProjectContributor = NewProjectContributorClient(tx.config)
@@ -400,6 +428,8 @@ func (tx *Tx) init() {
 	tx.UsageReservation = NewUsageReservationClient(tx.config)
 	tx.User = NewUserClient(tx.config)
 	tx.UserAccessToken = NewUserAccessTokenClient(tx.config)
+	tx.UserDeletion = NewUserDeletionClient(tx.config)
+	tx.UserDeletionAgent = NewUserDeletionAgentClient(tx.config)
 	tx.UserTerminalWorkspace = NewUserTerminalWorkspaceClient(tx.config)
 }
 

@@ -28,11 +28,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/clock"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/registry"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/transport"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	conduitv1 "github.com/GoogleCloudPlatform/scion/proto/conduit/v1"
 )
 
@@ -166,8 +168,9 @@ type Config struct {
 	// InstanceID is this relay's instance id (the hub's instance id for an
 	// in-process relay). Required.
 	InstanceID string
-	// InternalEndpoint is the base URL (http://host:port) other relays use
-	// to reach this relay's internal API. "" means unaddressable: allowed
+	// InternalEndpoint is the base URL (https://host:port, or http:// to a
+	// loopback host: config.CheckRelayTransport) other relays use to reach
+	// this relay's internal API. "" means unaddressable: allowed
 	// only in single-node profiles; RequireSelfCheck refuses it.
 	InternalEndpoint string
 	// PublicEndpoint is optional (separate relay profiles).
@@ -202,9 +205,16 @@ type Config struct {
 	// PeerAuth authenticates internal API calls in both directions.
 	// Required for InternalHandler and for the self-check probe.
 	PeerAuth PeerAuth
-	// HTTPClient performs the self-check probe (default: a client with a
-	// 10s timeout).
+	// HTTPClient performs the self-check probe and this relay's calls to
+	// other relays (default: NewHopHTTPClientWithTimeout(nil, 10s), the
+	// system roots). A given client is used without redirects
+	// (hopClientWithoutRedirects); it is not modified.
 	HTTPClient *http.Client
+	// WSDialer dials internal stream hops to other relays (nil: gorilla
+	// defaults). With TLS on the internal hop it carries the hop client
+	// TLS configuration (NewHopWSDialer), as HTTPClient does
+	// (NewHopHTTPClient).
+	WSDialer *websocket.Dialer
 	// HeartbeatInterval defaults to DefaultHeartbeatInterval.
 	HeartbeatInterval time.Duration
 	// LifetimeHint is sent as Welcome.lifetime_hint_s (0 = none). With a
@@ -218,6 +228,13 @@ type Config struct {
 	// sends (lifetime, shutdown, supersede) ends by the cap. Must exceed
 	// LifetimeGoAwayLead.
 	LifetimeCap time.Duration
+	// JitterLifetimeCap, when set, maps LifetimeCap to the relay cap of
+	// one session, called once per session at the start of Serve, so
+	// sessions opened together do not all reach their cap together
+	// (ptone/scion#5245). A principal's own cap is applied after it and
+	// still only lowers the result. A result at or below
+	// LifetimeGoAwayLead is ignored (LifetimeCap is used).
+	JitterLifetimeCap func(time.Duration) time.Duration
 	// DeleteAttempts bounds DeleteSessionCAS retries (default 5).
 	DeleteAttempts int
 	// RPCTimeout caps internal RPCs (default 120s).
@@ -308,6 +325,12 @@ type Relay struct {
 	// handlers) so tests can prove none leak.
 	bridges       sync.WaitGroup
 	activeBridges atomic.Int64
+
+	// agentAdmitsLaunchID and agentAdmitsGeneration count the agent
+	// sessions admitted by this relay, by incarnation source
+	// (AgentSessionsAdmitted).
+	agentAdmitsLaunchID   atomic.Uint64
+	agentAdmitsGeneration atomic.Uint64
 	// testHookAfterOpen runs after the target accepted a bridged stream
 	// and before the late-accept check (test seam for the cancel race).
 	testHookAfterOpen func(hop *wsStream)
@@ -386,6 +409,14 @@ func New(cfg Config) (*Relay, error) {
 	if cfg.GrantKeys == nil {
 		return nil, errors.New("conduit relay: GrantKeys is required")
 	}
+	// Every relay profile registers its endpoint here, so this is the one
+	// place the advertised endpoint meets the internal hop rule: other
+	// relays and the hub ingress dial it as registered.
+	if cfg.InternalEndpoint != "" {
+		if err := config.CheckRelayTransport(cfg.InternalEndpoint); err != nil {
+			return nil, fmt.Errorf("conduit relay: InternalEndpoint: %w", err)
+		}
+	}
 	if cfg.LifetimeCap < 0 || (cfg.LifetimeCap > 0 && cfg.LifetimeCap <= LifetimeGoAwayLead) {
 		return nil, fmt.Errorf("conduit relay: LifetimeCap %s must be 0 or longer than the %s GoAway lead", cfg.LifetimeCap, LifetimeGoAwayLead)
 	}
@@ -417,7 +448,9 @@ func New(cfg Config) (*Relay, error) {
 		cfg.Logger = slog.Default()
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+		cfg.HTTPClient = NewHopHTTPClientWithTimeout(nil, 10*time.Second)
+	} else {
+		cfg.HTTPClient = hopClientWithoutRedirects(cfg.HTTPClient)
 	}
 	return &Relay{
 		cfg:      cfg,
@@ -679,6 +712,20 @@ func sessionLifetimeCap(relayCap, principalCap time.Duration) time.Duration {
 	return relayCap
 }
 
+// sessionRelayCap is the relay's lifetime cap for one new session:
+// Config.LifetimeCap, passed through Config.JitterLifetimeCap when both are
+// set and the jittered value still exceeds LifetimeGoAwayLead.
+func (r *Relay) sessionRelayCap() time.Duration {
+	c := r.cfg.LifetimeCap
+	if c <= 0 || r.cfg.JitterLifetimeCap == nil {
+		return c
+	}
+	if j := r.cfg.JitterLifetimeCap(c); j > LifetimeGoAwayLead {
+		return j
+	}
+	return c
+}
+
 // lifetimeHint is Welcome.lifetime_hint_s for e: with a cap, the whole
 // seconds until its lifetime GoAway; otherwise Config.LifetimeHint.
 func (r *Relay) lifetimeHint(e *entry) time.Duration {
@@ -721,7 +768,7 @@ func (r *Relay) Serve(ctx context.Context, conn transport.Conn, p Principal) err
 		defer r.serves.Done()
 	}
 	e := &entry{principal: p, readyCh: make(chan struct{})}
-	if lifetimeCap := sessionLifetimeCap(r.cfg.LifetimeCap, p.LifetimeCap); lifetimeCap > 0 {
+	if lifetimeCap := sessionLifetimeCap(r.sessionRelayCap(), p.LifetimeCap); lifetimeCap > 0 {
 		e.capAt = r.clk.Now().Add(lifetimeCap)
 	}
 	adm := &admitter{r: r, p: p, transport: conn.Transport(), e: e}
@@ -1154,6 +1201,28 @@ func (r *Relay) NotifyGrantKeysChanged() int {
 		n++
 	}
 	return n
+}
+
+// AgentSessionsAdmitted returns how many agent sessions this relay has
+// admitted since it started, by incarnation source: IncarnationSourceLaunchID
+// (the Hello presented the agent's launch id) and IncarnationSourceGeneration
+// (the interim fallback for a Hello without one).
+func (r *Relay) AgentSessionsAdmitted() map[string]uint64 {
+	return map[string]uint64{
+		IncarnationSourceLaunchID:   r.agentAdmitsLaunchID.Load(),
+		IncarnationSourceGeneration: r.agentAdmitsGeneration.Load(),
+	}
+}
+
+// countAgentAdmit records one admitted agent session with incarnation
+// source src.
+func (r *Relay) countAgentAdmit(src string) {
+	switch src {
+	case IncarnationSourceLaunchID:
+		r.agentAdmitsLaunchID.Add(1)
+	case IncarnationSourceGeneration:
+		r.agentAdmitsGeneration.Add(1)
+	}
 }
 
 // Sessions returns the number of live local sessions.

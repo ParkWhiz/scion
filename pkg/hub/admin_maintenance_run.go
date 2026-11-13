@@ -20,10 +20,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/maintenance"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/rebuildpreflight"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/entadapter"
 )
@@ -33,8 +36,53 @@ import (
 var operationParamAllowlist = map[string][]string{
 	"update-binary":  maintenance.UpdateBinaryParams,
 	"rebuild-server": {"branch"},
+	"rebuild-web":    {"branch"},
 	// The star reconciliation takes no parameters.
 	entadapter.ChatStarReconcileKey: {},
+	// The chat retention preview takes an optional window; the manual run
+	// takes nothing.
+	entadapter.ChatRetentionPreviewKey: {chatRetentionParamDays},
+	entadapter.ChatRetentionRunKey:     {},
+}
+
+// stringParamOperations lists the operations whose parameters must be JSON
+// strings: parseMigrationParams drops any other value, which would run the
+// operation as if the parameter were absent.
+var stringParamOperations = map[string]bool{
+	entadapter.ChatRetentionPreviewKey: true,
+}
+
+// checkStringParams refuses a run request whose "params" holds a value that
+// is not a string.
+func checkStringParams(body map[string]interface{}) error {
+	m, _ := body["params"].(map[string]interface{})
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if _, ok := m[k].(string); !ok {
+			return &maintenance.RequestError{Code: maintenance.CodeInvalidParam,
+				Message: fmt.Sprintf("parameter %s must be a string", k)}
+		}
+	}
+	return nil
+}
+
+// maintenanceOperationExperiments maps the operations that exist only while
+// an experiment is on to that experiment. While it is off the operation is
+// not listed and its routes answer 404.
+var maintenanceOperationExperiments = map[string]string{
+	entadapter.ChatRetentionPreviewKey: experiments.ChatRetention,
+	entadapter.ChatRetentionRunKey:     experiments.ChatRetention,
+}
+
+// maintenanceOperationAvailable reports whether operation key exists on
+// this hub now (its experiment, if any, is on).
+func (s *Server) maintenanceOperationAvailable(key string) bool {
+	name, gated := maintenanceOperationExperiments[key]
+	return !gated || s.experimentEnabled(name)
 }
 
 // rawRequestParams returns the keys of a run request's "params" object,
@@ -54,7 +102,7 @@ func rawRequestParams(body map[string]interface{}) map[string]string {
 // status of a *maintenance.RequestError (400 invalid_request otherwise).
 func writeMaintenanceRequestError(w http.ResponseWriter, err error) {
 	if re, ok := maintenance.IsRequestError(err); ok {
-		writeError(w, re.HTTPStatus(), re.Code, re.Message, nil)
+		writeError(w, re.HTTPStatus(), re.Code, re.Message, re.Details)
 		return
 	}
 	writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error(), nil)
@@ -224,6 +272,10 @@ var maintenanceRunTimeouts = map[string]time.Duration{
 	// Each batch of the star reconciliation is bounded too; this bounds
 	// the sweeps together.
 	entadapter.ChatStarReconcileKey: messageStarReconcileTimeout,
+	// A preview or manual chat retention run stops its walk early enough
+	// to record what it did before this.
+	entadapter.ChatRetentionPreviewKey: chatRetentionOpMaxDuration,
+	entadapter.ChatRetentionRunKey:     chatRetentionOpMaxDuration,
 }
 
 // maintenanceRunContext returns the context a run of key executes under.
@@ -233,6 +285,10 @@ func maintenanceRunContext(key string) (context.Context, context.CancelFunc) {
 	}
 	return context.WithCancel(context.Background())
 }
+
+// maintenanceTargetCheckTimeout bounds the release lookups an operation
+// request makes before its run is created (maintenance.TargetChecker).
+const maintenanceTargetCheckTimeout = 20 * time.Second
 
 // maintenanceCleanupTimeout bounds a cleanup write made after a failure.
 const maintenanceCleanupTimeout = 10 * time.Second
@@ -275,6 +331,16 @@ func (s *Server) launchMaintenanceRun(run *store.MaintenanceOperationRun, execut
 			f(ctx)
 		}
 
+		// encode is encodeRunResult, logging a Result that could not be
+		// encoded (the run then stores only its error).
+		encode := func(result map[string]any) string {
+			enc, err := encodeRunResult(result)
+			if err != nil {
+				log.Error("Failed to encode the run result; storing only its error", maintenanceLogAttrs(key, "run_id", runID, "error", err)...)
+			}
+			return enc
+		}
+
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error("Operation executor panicked", maintenanceLogAttrs(key, "run_id", runID, "panic", fmt.Sprint(r))...)
@@ -282,10 +348,11 @@ func (s *Server) launchMaintenanceRun(run *store.MaintenanceOperationRun, execut
 				run.CompletedAt = &finishedAt
 				run.Status = store.MaintenanceStatusFailed
 				run.Log = buf.String()
-				resultJSON, _ := json.Marshal(map[string]interface{}{
-					"error": fmt.Sprintf("executor panic: %v", r),
-				})
-				run.Result = string(resultJSON)
+				result, resultPanic := panicRunResult(executor, fmt.Sprintf("executor panic: %v", r))
+				if resultPanic != nil {
+					log.Error("Operation executor's RunResult panicked; storing only the run error", maintenanceLogAttrs(key, "run_id", runID, "panic", fmt.Sprint(resultPanic))...)
+				}
+				run.Result = encode(result)
 				cleanup(func(ctx context.Context) {
 					if err := s.store.UpdateMaintenanceRun(ctx, run); err != nil {
 						log.Error("Failed to update run record after panic", maintenanceLogAttrs(key, "run_id", runID, "error", err)...)
@@ -320,16 +387,25 @@ func (s *Server) launchMaintenanceRun(run *store.MaintenanceOperationRun, execut
 		case execErr != nil:
 			run.CompletedAt = &finishedAt
 			run.Status = store.MaintenanceStatusFailed
-			result := map[string]interface{}{"error": execErr.Error()}
+			// The executor's own result (maintenance.ResultReporter), with
+			// the run's error added last (rebuildpreflight.MergeFinal).
+			result := rebuildpreflight.MergeFinal(reportedRunResult(executor), execErr.Error())
 			if re, ok := maintenance.IsRequestError(execErr); ok {
 				result["code"] = re.Code
+				if re.Details != nil {
+					result["details"] = re.Details
+				}
 			}
-			resultJSON, _ := json.Marshal(result)
-			run.Result = string(resultJSON)
+			run.Result = encode(result)
 			if restarting {
 				cleanup(func(ctx context.Context) { s.clearPendingUpdateFor(ctx, runID) })
 			}
 			log.Error("Operation failed", maintenanceLogAttrs(key, "run_id", runID, "error", execErr, "duration", finishedAt.Sub(run.StartedAt))...)
+			// This writes the run log to the hub log. It is safe only while no
+			// executor writes into buf anything that can carry a credential:
+			// the output of a child given one (for example a database DSN)
+			// must be captured and redacted before it reaches buf, never
+			// streamed into it.
 			log.Debug("Operation failure log output", maintenanceLogAttrs(key, "run_id", runID, "log", run.Log)...)
 		case restarting:
 			// Status, result and log were written before the restart, and
@@ -341,6 +417,7 @@ func (s *Server) launchMaintenanceRun(run *store.MaintenanceOperationRun, execut
 		default:
 			run.CompletedAt = &finishedAt
 			run.Status = store.MaintenanceStatusCompleted
+			run.Result = encode(rebuildpreflight.MergeFinal(reportedRunResult(executor), ""))
 			log.Info("Operation completed successfully", maintenanceLogAttrs(key, "run_id", runID, "duration", finishedAt.Sub(run.StartedAt))...)
 		}
 
@@ -365,6 +442,9 @@ func (s *Server) markRunRestarting(ctx context.Context, run *store.MaintenanceOp
 	if p.Snapshot != "" {
 		result["snapshot"] = p.Snapshot
 	}
+	if p.Commit != "" {
+		result["commit"] = p.Commit
+	}
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
 		return fmt.Errorf("encode run result: %w", err)
@@ -379,6 +459,11 @@ func (s *Server) markRunRestarting(ctx context.Context, run *store.MaintenanceOp
 		Snapshot: p.Snapshot,
 		Strategy: p.Strategy,
 		At:       time.Now().UTC().Format(time.RFC3339),
+		Channel:  p.Channel,
+		Pin:      p.Pin,
+		SetBy:    run.StartedBy,
+		Mode:     p.Mode,
+		Commit:   p.Commit,
 	}
 	if err := s.writeHubSettingJSON(ctx, HubSettingSectionPendingUpdate, pending); err != nil {
 		return fmt.Errorf("record pending update: %w", err)
@@ -395,6 +480,8 @@ func (s *Server) markRunRestarting(ctx context.Context, run *store.MaintenanceOp
 		s.clearPendingUpdateAfterFailure(ctx, run.ID)
 		return fmt.Errorf("record run as restarting: %w", err)
 	}
+	// For the boot-failure guard (best-effort; the restart goes ahead).
+	s.writeUpdateStateBeforeRestart(run.ID, p)
 	// system.update_available is deliberately left alone: the update is not
 	// confirmed until the new binary boots (boot reconciliation clears it on
 	// "verified"), and a restart that fails and rolls back must keep the

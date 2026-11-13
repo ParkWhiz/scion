@@ -190,6 +190,11 @@ func resolveDaemonServerMode(cmd *cobra.Command) error {
 // runServerStartOrDaemon handles the server start command. By default it launches
 // the server as a background daemon. When --foreground is set, it runs directly.
 func runServerStartOrDaemon(cmd *cobra.Command, args []string) error {
+	// Resolve a relative --config against the launch directory, for this
+	// process's own reads and for the daemon child's args alike.
+	if err := absolutizeServerConfigPath(); err != nil {
+		return err
+	}
 	if serverStartForeground {
 		return runServerStart(cmd, args)
 	}
@@ -230,6 +235,17 @@ func runServerStartOrDaemon(cmd *cobra.Command, args []string) error {
 	// Check if at least one component is enabled
 	if !enableHub && !enableRuntimeBroker && !enableWeb {
 		return fmt.Errorf("no server components enabled; use --enable-hub, --enable-runtime-broker, or --enable-web")
+	}
+
+	// The convert host lock check (convert-apply design section 4.7), run
+	// here too so a refusal is reported directly instead of as a failed
+	// daemon start. The foreground server process takes the lock itself.
+	if enableRuntimeBroker {
+		lock, err := acquireConvertStartLock(globalDir)
+		if err != nil {
+			return err
+		}
+		lock.Release()
 	}
 
 	// Find the scion executable
@@ -1171,9 +1187,16 @@ func printWorkstationQuickstart(settingsMissingBeforeStart bool, globalDir strin
 		status, statusErr := onboardingStatusResult{}, errOnboardingStatusNotAsked
 		// The token is sent only to the local server (the status and
 		// sign-in link endpoints), never printed: the settings token if
-		// one is set, else the token file's contents.
-		serverToken := serverDevToken(serverCfg, globalDir)
-		if serverUp && hubEnabled {
+		// one is set, else the token file's contents. The transport rule
+		// applies first: the token is read and sent only over a loopback
+		// (or TLS) connection. For another bind host it is not read, the
+		// status is not asked and the settings-file signal below is used.
+		tokenAllowed := quickstartStatusAllowed(baseURL)
+		serverToken := ""
+		if serverUp && tokenAllowed && (hubEnabled || devAuth) {
+			serverToken = readServerDevToken(serverCfg, globalDir)
+		}
+		if serverUp && hubEnabled && tokenAllowed {
 			status, statusErr = quickstartOnboardingStatus(baseURL, serverToken)
 		}
 		if statusErr != nil {
@@ -1187,9 +1210,15 @@ func printWorkstationQuickstart(settingsMissingBeforeStart bool, globalDir strin
 			fmt.Println(msg)
 		}
 		// With dev auth the web UI signs a browser in only from a
-		// single-use sign-in link: open that instead of the bare URL.
+		// single-use sign-in link: open that instead of the bare URL. The
+		// link is requested with the server's token, so the transport rule
+		// applies: only over a loopback (or TLS) connection.
 		openURL := url
-		if devAuth && serverUp {
+		if devAuth && serverUp && !tokenAllowed {
+			fmt.Printf("Sign-in links are requested only over a loopback or TLS connection, so no sign-in link was requested.\n"+
+				"Bind the server to 127.0.0.1 (or 0.0.0.0) and run scion server open; from another machine, use an SSH forward to http://127.0.0.1:%d.\n", wPort)
+		}
+		if devAuth && serverUp && tokenAllowed {
 			if link, err := quickstartDevSignIn(baseURL, serverToken, webPath); err == nil {
 				openURL = link.URL
 				// The link is printed only to a terminal, so a redirected

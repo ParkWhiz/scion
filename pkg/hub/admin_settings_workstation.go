@@ -62,6 +62,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -602,9 +603,13 @@ func leafKeys(leaves []bodyLeaf) []string {
 	return out
 }
 
-// serverConfigFileValidationError is a client error in the file-routed part
-// of a workstation PUT (400).
-type serverConfigFileValidationError struct{ msg string }
+// serverConfigFileValidationError is a rejected value in the file-routed
+// part of a workstation PUT (422 validation_error). entries name each
+// failing field.
+type serverConfigFileValidationError struct {
+	msg     string
+	entries []settingsFieldError
+}
 
 func (e *serverConfigFileValidationError) Error() string { return e.msg }
 
@@ -612,7 +617,8 @@ func (e *serverConfigFileValidationError) Error() string { return e.msg }
 // PUT with the same rules the file-mode handler applies, normalising
 // req.Server.Hub.AgentEndpoint in place. ops supplies the current runtimes
 // and profiles when the request changes server.shared_dir_storage. A PUT
-// that sends keys under server.hub.conduit or server.hub.port_proxy is also
+// that sends keys under server.hub.conduit, server.hub.port_proxy,
+// server.hub.sse or server.hub.platform_request_timeout is also
 // checked with the Validate methods the hub applies at startup and refused
 // with a *serverConfigFileFieldError (422) when they fail.
 func validateServerConfigFileKeys(req *ServerConfigUpdateRequest, fileKeys []string, ops *OperationalSettings) error {
@@ -627,14 +633,16 @@ func validateServerConfigFileKeys(req *ServerConfigUpdateRequest, fileKeys []str
 	if under("server.hub.agent_endpoint") && req.Server != nil && req.Server.Hub != nil && req.Server.Hub.AgentEndpoint != "" {
 		normalized, err := config.ValidateAgentEndpoint(req.Server.Hub.AgentEndpoint)
 		if err != nil {
-			return &serverConfigFileValidationError{err.Error()}
+			return &serverConfigFileValidationError{msg: err.Error(),
+				entries: []settingsFieldError{{Field: "server.hub.agent_endpoint", Message: err.Error()}}}
 		}
 		req.Server.Hub.AgentEndpoint = normalized
 	}
 	if under("server.mode") && req.Server != nil {
 		// The server refuses to start with an unknown mode; never write one.
 		if err := config.ValidateServerMode(req.Server.Mode); err != nil {
-			return &serverConfigFileValidationError{err.Error()}
+			return &serverConfigFileValidationError{msg: err.Error(),
+				entries: []settingsFieldError{{Field: "server.mode", Message: err.Error()}}}
 		}
 	}
 	if under("server.broker.instances") && req.Server != nil && req.Server.Broker != nil {
@@ -645,7 +653,8 @@ func validateServerConfigFileKeys(req *ServerConfigUpdateRequest, fileKeys []str
 			for _, e := range errs {
 				all = append(all, e)
 			}
-			return &serverConfigFileValidationError{errors.Join(all...).Error()}
+			return &serverConfigFileValidationError{msg: errors.Join(all...).Error(),
+				entries: configValidationEntries(errs, "server.broker.instances")}
 		}
 	}
 	if req.Server != nil && (under("server.project_storage") || under("server.workspace_storage") ||
@@ -653,11 +662,11 @@ func validateServerConfigFileKeys(req *ServerConfigUpdateRequest, fileKeys []str
 		// Same check as the file-mode handler: the storage blocks must
 		// resolve to one server.project_storage.
 		if _, _, err := config.SynthesizeProjectStorage(req.Server.ProjectStorage, req.Server.WorkspaceStorage, req.Server.SharedDirStorage, req.Server.HomeStorage); err != nil {
-			return &serverConfigFileValidationError{err.Error()}
+			return &serverConfigFileValidationError{msg: err.Error(), entries: projectStorageEntries(err)}
 		}
 	}
 	if errs := config.RemovedStorageOverrideErrors(req.Runtimes, req.Profiles, nil); len(errs) > 0 {
-		return &serverConfigFileValidationError{errs[0].Error()}
+		return &serverConfigFileValidationError{msg: errs[0].Error(), entries: configValidationEntries(errs, "")}
 	}
 	return validateStartupCheckedFileBlocks(req, fileKeys)
 }
@@ -674,13 +683,21 @@ func (e *serverConfigFileFieldError) Error() string { return e.msg }
 
 // startupCheckedFileBlocks are file-only blocks the hub validates at startup
 // (validateServerPreflight in cmd/server_foreground.go), in the same order,
-// with the same Validate methods.
+// with the same Validate methods. server.hub.chat is the one block startup
+// reads leniently (an invalid value is logged and the default used): it is
+// listed so the PUT refuses a value the hub would ignore, instead of writing
+// it unnoticed.
 var startupCheckedFileBlocks = []struct {
 	path     []string
 	validate func(*config.GlobalConfig) error
 }{
 	{[]string{"server", "hub", "conduit"}, func(gc *config.GlobalConfig) error { return gc.Hub.Conduit.Validate() }},
 	{[]string{"server", "hub", "port_proxy"}, func(gc *config.GlobalConfig) error { return gc.Hub.PortProxy.Validate() }},
+	{[]string{"server", "hub", "sse"}, func(gc *config.GlobalConfig) error { return gc.Hub.SSE.Validate() }},
+	{[]string{"server", "hub", "platform_request_timeout"}, func(gc *config.GlobalConfig) error {
+		return config.ValidatePlatformRequestTimeout(gc.Hub.PlatformRequestTimeout)
+	}},
+	{[]string{"server", "hub", "chat"}, func(gc *config.GlobalConfig) error { return gc.Hub.Chat.Search.Validate() }},
 	{[]string{"server", "relay"}, func(gc *config.GlobalConfig) error { return gc.Relay.Validate() }},
 }
 
@@ -978,4 +995,24 @@ func (s *Server) applyServerConfigFileSideEffects(changed []string) (applied, re
 	}
 	sort.Strings(requiresRestart)
 	return applied, requiresRestart
+}
+
+// projectStorageEntries returns the validation entries of a refused storage
+// block: one per config.FieldError when err carries them
+// (config.ValidateProjectStorage), else one for server.project_storage.
+func projectStorageEntries(err error) []settingsFieldError {
+	var fields config.FieldErrorList
+	if !errors.As(err, &fields) || len(fields) == 0 {
+		return []settingsFieldError{{Field: "server.project_storage", Message: err.Error()}}
+	}
+	out := make([]settingsFieldError, 0, len(fields))
+	for _, f := range fields {
+		// The message carries the value: this route is admin-only.
+		msg := f.Rule
+		if f.Value != "" {
+			msg += fmt.Sprintf(" (got %q)", f.Value)
+		}
+		out = append(out, settingsFieldError{Field: f.Path, Message: msg})
+	}
+	return fillEmptySettingsFields(out, "server.project_storage")
 }

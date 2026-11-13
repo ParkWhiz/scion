@@ -60,6 +60,7 @@ interface AgentNotificationsResponse {
 }
 import { agentStatusBadge, stateLabel } from '../../shared/agent-state-display.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { showPendingSecretsStartHint } from '../../client/pending-secrets.js';
 import { agentPlacementView } from './agent-placement.js';
 import {
   gcpModeLabel,
@@ -74,6 +75,7 @@ import { AgentSeedEpoch } from '../../client/agent-seed-epoch.js';
 import '../shared/status-badge.js';
 import '../shared/detail-header.js';
 import { DeletionLeaseController } from '../shared/deletion-badge.js';
+import '../shared/authority-badge.js';
 import '../shared/deletion-banner.js';
 import { runAgentDelete, lifecycleActionErrorMessage } from '../../client/agent-delete.js';
 import { showResponseBodyWarnings } from '../../client/response-warnings.js';
@@ -186,6 +188,18 @@ function formatDurationHMS(totalSeconds: number): string {
   if (m > 0) parts.push(`${m}m`);
   if (s > 0 || parts.length === 0) parts.push(`${s}s`);
   return parts.join(' ');
+}
+
+/**
+ * A stored config limit as Limits card text, matching the Edit page: a count
+ * limit of 0 or a duration of "0" is Unlimited; an absent limit is Inherited
+ * (the hub fills it from the template, hub or broker defaults); otherwise the
+ * stored value.
+ */
+function formatConfigLimit(value: number | string | undefined): string {
+  if (value == null || value === '') return 'Inherited';
+  if (value === 0 || value === '0') return 'Unlimited';
+  return String(value);
 }
 
 @customElement('scion-page-agent-detail')
@@ -1305,6 +1319,7 @@ export class ScionPageAgentDetail extends LitElement {
         // The hub's start warnings (for example, a token issued without the
         // artifact scopes).
         await showResponseBodyWarnings(response);
+        void showPendingSecretsStartHint();
       }
 
       this.backgroundRefresh();
@@ -1807,6 +1822,7 @@ export class ScionPageAgentDetail extends LitElement {
         <sl-icon slot="icon" name="cpu"></sl-icon>
         ${agentStatusBadge(agent)}
         <scion-deletion-badge .deletion=${this.deletingView(agent)} live></scion-deletion-badge>
+        <scion-authority-badge .authority=${agent.authority}></scion-authority-badge>
         <scion-message-mode-badge
           mode=${agent.messageMode || 'project'}
           size="medium"
@@ -3052,11 +3068,13 @@ export class ScionPageAgentDetail extends LitElement {
   }
 
   private renderConfigLimitsCard(inline: AgentInlineConfig | undefined) {
-    const maxTurns = inline?.max_turns ?? 0;
-    const maxModelCalls = inline?.max_model_calls ?? 0;
-    const maxDuration = inline?.max_duration ?? '';
+    const maxTurns = inline?.max_turns;
+    const maxModelCalls = inline?.max_model_calls;
+    const maxDuration = inline?.max_duration;
 
-    if (!maxTurns && !maxModelCalls && !maxDuration) return nothing;
+    // A stored 0 (or "0" for the duration) is Unlimited, so the card hides
+    // only when no limit is stored at all.
+    if (maxTurns == null && maxModelCalls == null && !maxDuration) return nothing;
 
     return html`
       <div class="card">
@@ -3064,15 +3082,15 @@ export class ScionPageAgentDetail extends LitElement {
         <div class="info-grid">
           <div class="info-item">
             <span class="info-label">Max Turns</span>
-            <span class="info-value">${maxTurns || 'None'}</span>
+            <span class="info-value">${formatConfigLimit(maxTurns)}</span>
           </div>
           <div class="info-item">
             <span class="info-label">Max Model Calls</span>
-            <span class="info-value">${maxModelCalls || 'None'}</span>
+            <span class="info-value">${formatConfigLimit(maxModelCalls)}</span>
           </div>
           <div class="info-item">
             <span class="info-label">Max Duration</span>
-            <span class="info-value">${maxDuration || 'None'}</span>
+            <span class="info-value">${formatConfigLimit(maxDuration)}</span>
           </div>
         </div>
       </div>

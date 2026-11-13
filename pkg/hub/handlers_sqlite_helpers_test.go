@@ -20,8 +20,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -52,7 +50,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/plugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
 	"github.com/knadh/koanf/v2"
@@ -349,8 +346,6 @@ func def49Setup(t *testing.T) (srv *Server, s store.Store, projectID string, tar
 	return srv, s, projectID, targetAgent, userID
 }
 
-func strPtr(s string) *string { return &s }
-
 // alwaysDropUserBus is an eventbus.EventBus whose Publish always reports a
 // subscriber-buffer-full drop, simulating InProcessEventBus.Publish when a
 // project's user-message subscriber is saturated (ptone/scion#2311).
@@ -631,6 +626,8 @@ type reincarnateTestDispatcher struct {
 	// reprovisionConfigs snapshots the AppliedConfig of every reprovision
 	// dispatch, in call order, as the worker sent it.
 	reprovisionConfigs []store.AgentAppliedConfig
+	// reprovisionOpts records the options of every reprovision dispatch.
+	reprovisionOpts []ReprovisionOptions
 }
 
 func newReincarnateTestDispatcher() *reincarnateTestDispatcher {
@@ -688,7 +685,18 @@ func waitForReincarnationSettled(t *testing.T, s store.Store, agentID string) *s
 // reprovision capability, and wires the given dispatcher.
 func setupReincarnateTestServer(t *testing.T, disp AgentDispatcher) (*Server, store.Store, *store.Project, *store.RuntimeBroker) {
 	t.Helper()
+	return setupReincarnateTestServerWith(t, disp, nil)
+}
+
+// setupReincarnateTestServerWith is setupReincarnateTestServer with a hook
+// that runs right after the server is constructed, before any setup: the
+// place to call installStoreFault (see store_fault_helpers_test.go).
+func setupReincarnateTestServerWith(t *testing.T, disp AgentDispatcher, afterNew func(srv *Server)) (*Server, store.Store, *store.Project, *store.RuntimeBroker) {
+	t.Helper()
 	srv, s := testServer(t)
+	if afterNew != nil {
+		afterNew(srv)
+	}
 	ctx := context.Background()
 
 	project := &store.Project{
@@ -1637,6 +1645,14 @@ type routedTestEnv struct {
 func setupRoutedTestEnv(t *testing.T) routedTestEnv {
 	t.Helper()
 	srv, s := testServer(t)
+	return setupRoutedTestEnvOn(t, srv, s)
+}
+
+// setupRoutedTestEnvOn builds the routed test fixtures on an existing server
+// and its raw store, for a test that installs a store fault wrapper
+// (testServerWithStoreFault) before any setup.
+func setupRoutedTestEnvOn(t *testing.T, srv *Server, s store.Store) routedTestEnv {
+	t.Helper()
 	ctx := context.Background()
 
 	// Wire a recording dispatcher so dispatch tests exercise the full path.
@@ -1876,10 +1892,11 @@ func rotateSecretAsUser(t *testing.T, srv *Server, user *store.User, brokerID st
 	rec := httptest.NewRecorder()
 	if user == nil {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/brokers/"+brokerID+"/rotate-secret", nil)
+		req.RemoteAddr = tpLoopbackPeer // the transport policy admits a client on the hub host
 		srv.handleBrokerRotateSecret(rec, req, brokerID)
 		return rec
 	}
-	return doRequestAsUser(t, srv, user, http.MethodPost, "/api/v1/brokers/"+brokerID+"/rotate-secret", nil)
+	return doRequestAsUserLoopback(t, srv, user, http.MethodPost, "/api/v1/brokers/"+brokerID+"/rotate-secret", nil)
 }
 
 // setupMutePinTest builds a server with a web chat store, one project and one
@@ -3431,35 +3448,18 @@ const testOIDCIssuerURL = "https://scion.example.com"
 
 // installTestOIDCKeyManager sets an OIDCKeyManager with a fresh RS256 key and
 // the testOIDCIssuerURL issuer on srv. Routes that New() registers only when
-// the OIDC provider is enabled stay unregistered.
+// the OIDC provider is enabled stay unregistered. The manager is built by
+// NewOIDCKeyManager with no store and no secret backend, so it generates
+// an RSA-2048 key in memory and persists nothing.
 func installTestOIDCKeyManager(t *testing.T, srv *Server) {
 	t.Helper()
 
-	// Generate a test RSA key pair.
-	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	mgr, err := NewOIDCKeyManager(context.Background(), OIDCKeyManagerConfig{
+		IssuerURL:   testOIDCIssuerURL,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ValueCipher: secret.NewLegacyValueCipher(""),
+	})
 	require.NoError(t, err)
-
-	kid := computeKeyID(&privKey.PublicKey)
-	signingKey := &OIDCSigningKey{
-		KeyID:      kid,
-		PrivateKey: privKey,
-		PublicKey:  &privKey.PublicKey,
-		Active:     true,
-	}
-
-	// Create the RS256 signer (needed by identity token endpoint).
-	signer, err := jose.NewSigner(
-		jose.SigningKey{Algorithm: jose.RS256, Key: privKey},
-		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", kid),
-	)
-	require.NoError(t, err)
-
-	mgr := &OIDCKeyManager{
-		activeKey: signingKey,
-		allKeys:   []*OIDCSigningKey{signingKey},
-		signer:    signer,
-		issuerURL: testOIDCIssuerURL,
-	}
 
 	srv.oidcKeyManager = mgr
 	srv.oidcIssuerURL = testOIDCIssuerURL
@@ -5229,9 +5229,10 @@ func (d *reincarnateTestDispatcher) DispatchAgentCreate(context.Context, *store.
 func (d *reincarnateTestDispatcher) DispatchAgentProvision(context.Context, *store.Agent) error {
 	return nil
 }
-func (d *reincarnateTestDispatcher) DispatchAgentReprovision(_ context.Context, agent *store.Agent) error {
+func (d *reincarnateTestDispatcher) DispatchAgentReprovision(_ context.Context, agent *store.Agent, opts ReprovisionOptions) error {
 	d.mu.Lock()
 	d.reprovisionCalls++
+	d.reprovisionOpts = append(d.reprovisionOpts, opts)
 	if agent.AppliedConfig != nil {
 		d.reprovisionConfigs = append(d.reprovisionConfigs, *agent.AppliedConfig)
 	}
@@ -5318,9 +5319,11 @@ func (d *reincarnateTestDispatcher) moveSnapshot() (provisions, localDeletes, st
 }
 func (d *reincarnateTestDispatcher) DispatchAgentStart(ctx context.Context, agent *store.Agent, task string, resume bool) error {
 	d.mu.Lock()
-	// A start the hub refused before sending (its run not begun, or the hub
-	// shutting down) records no run, as in production.
-	if d.runStore != nil && !errors.Is(d.startErr, errStartRunNotBegun) && !errors.Is(d.startErr, ErrHubShuttingDown) {
+	// A start the hub refused before sending (its run not begun, the hub
+	// shutting down, or its pending config fold refused) records no run,
+	// as in production.
+	if d.runStore != nil && !errors.Is(d.startErr, errStartRunNotBegun) && !errors.Is(d.startErr, ErrHubShuttingDown) &&
+		!errors.Is(d.startErr, errPendingConfigFold) {
 		runID := fmt.Sprintf("run-%s-%d", agent.RuntimeBrokerID, len(d.startBrokers)+1)
 		if _, err := d.runStore.SetAgentRunID(ctx, agent.ID, runID, nil); err == nil {
 			agent.RunID = runID
@@ -5396,6 +5399,7 @@ func (d *reincarnateTestDispatcher) resetReprovisions(reprovisionErr error) {
 	defer d.mu.Unlock()
 	d.reprovisionCalls = 0
 	d.reprovisionConfigs = nil
+	d.reprovisionOpts = nil
 	d.reprovisionErr = reprovisionErr
 }
 
@@ -5434,7 +5438,7 @@ func (d *createAgentDispatcher) DispatchAgentProvision(_ context.Context, agent 
 	return nil
 }
 
-func (d *createAgentDispatcher) DispatchAgentReprovision(_ context.Context, agent *store.Agent) error {
+func (d *createAgentDispatcher) DispatchAgentReprovision(_ context.Context, agent *store.Agent, _ ReprovisionOptions) error {
 	agent.Phase = string(state.PhaseCreated)
 	return nil
 }
@@ -5732,7 +5736,7 @@ func (s *spaceMembersStore) ListProjectMembers(ctx context.Context, projectID st
 	return s.Store.ListProjectMembers(ctx, projectID)
 }
 
-func (p *readStateAtPublishSpy) PublishUserMessage(ctx context.Context, msg *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef) {
+func (p *readStateAtPublishSpy) PublishUserMessage(ctx context.Context, msg *store.Message, _ []AttachmentRef, _ []artifacts.MessageRef, _ ...ChatEventOption) {
 	p.called = true
 	p.messageID = msg.ID
 	p.readStateAtPublish, _ = p.wcs.GetReadState(ctx, msg.SenderID, msg.ThreadID)
@@ -6425,7 +6429,7 @@ func (d *def135Dispatcher) DispatchAgentProvision(_ context.Context, _ *store.Ag
 	return nil
 }
 
-func (d *def135Dispatcher) DispatchAgentReprovision(_ context.Context, _ *store.Agent) error {
+func (d *def135Dispatcher) DispatchAgentReprovision(_ context.Context, _ *store.Agent, _ ReprovisionOptions) error {
 	return nil
 }
 func (d *def135Dispatcher) DispatchAgentStart(_ context.Context, _ *store.Agent, _ string, _ bool) error {

@@ -64,6 +64,17 @@ import './chat-file-preview.js';
 import type { PreviewTarget } from './chat-file-preview.js';
 import '../code-editor.js';
 import '../markdown-preview.js';
+import './chat-choices.js';
+import './chat-choice-response.js';
+import { ANSWERABLE, chatChoicesEnabled } from '../../../client/chat-choices.js';
+import type { AskerAnswerability } from '../../../client/chat-choices.js';
+import type {
+  ChoiceAnswerMode,
+  ChoiceResponseSetView,
+  ChoiceResponseView,
+  DecisionView,
+} from '../../../shared/types.js';
+import { copyToClipboard, showCopyFailedToast } from '../../../utils/clipboard.js';
 
 /** Structured attachment reference from the W7 API. */
 export interface AttachmentRefInfo {
@@ -75,6 +86,19 @@ export interface AttachmentRefInfo {
   width?: number;
   /** Pixel height of an image attachment, when the server knows it. */
   height?: number;
+}
+
+/**
+ * A reply preview: the message a reply quotes. `unavailable` is set when
+ * that message no longer exists (for example removed by the hub's chat
+ * retention policy); `content` is then a placeholder and `senderName` is
+ * empty.
+ */
+export interface ReplyPreviewInfo {
+  messageId: string;
+  senderName: string;
+  content: string;
+  unavailable?: boolean;
 }
 
 /** The largest box an inline image thumbnail is drawn in, in CSS px. */
@@ -261,13 +285,12 @@ function replaceMatches(
  * Run one link pass over the text nodes under `root`. An element `skip`
  * matches is stepped over together with everything inside it. `linkify`
  * returns the pieces that replace a text node's text, or null to leave it.
- * Returns whether anything changed.
  */
 function linkifyTextNodes(
   root: DocumentFragment,
   skip: (el: Element) => boolean,
   linkify: (text: string) => LinkPiece[] | null
-): boolean {
+): void {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
     acceptNode: (node) => {
       if (node.nodeType !== Node.ELEMENT_NODE) return NodeFilter.FILTER_ACCEPT;
@@ -277,14 +300,11 @@ function linkifyTextNodes(
   // Collect first: replacing a node while walking would move the walker.
   const texts: Text[] = [];
   for (let node = walker.nextNode(); node; node = walker.nextNode()) texts.push(node as Text);
-  let changed = false;
   for (const node of texts) {
     const pieces = linkify(node.data);
     if (!pieces) continue;
     node.replaceWith(...pieces.filter((p) => p !== ''));
-    changed = true;
   }
-  return changed;
 }
 
 /** A skip test for elements with any of these (lowercase) local names. */
@@ -580,31 +600,25 @@ function styleMentionsInText(text: string): LinkPiece[] | null {
  * - GitHub refs: code and existing links; a ref inside backticks is
  *   literal text.
  *
- * Returns the input unchanged when nothing was linked.
+ * Works in place on the nodes the markdown renderer returned, with DOM calls
+ * only: link text is set as text, never parsed as markup.
  */
-function linkifyRenderedHtml(htmlStr: string, opts: { artifacts: boolean; gcs: boolean }): string {
-  const tpl = document.createElement('template');
-  tpl.innerHTML = htmlStr;
-  const root = tpl.content;
+function linkifyRenderedFragment(
+  root: DocumentFragment,
+  opts: { artifacts: boolean; gcs: boolean }
+): void {
   const isCode = elementsNamed('pre', 'code');
-  let changed = false;
   const artifactLinks = new WeakSet<Element>();
   if (opts.artifacts) {
-    changed =
-      linkifyTextNodes(root, elementsNamed('pre', 'code', 'a'), (text) =>
-        styleArtifactLinksInText(text, artifactLinks)
-      ) || changed;
+    linkifyTextNodes(root, elementsNamed('pre', 'code', 'a'), (text) =>
+      styleArtifactLinksInText(text, artifactLinks)
+    );
   }
-  changed =
-    linkifyTextNodes(root, (el) => isCode(el) || artifactLinks.has(el), styleMentionsInText) ||
-    changed;
-  changed =
-    linkifyTextNodes(root, elementsNamed('pre', 'a'), (text) =>
-      styleEntityLinksInText(text, opts.gcs)
-    ) || changed;
-  changed =
-    linkifyTextNodes(root, elementsNamed('pre', 'a', 'code'), styleGithubRefsInText) || changed;
-  return changed ? tpl.innerHTML : htmlStr;
+  linkifyTextNodes(root, (el) => isCode(el) || artifactLinks.has(el), styleMentionsInText);
+  linkifyTextNodes(root, elementsNamed('pre', 'a'), (text) =>
+    styleEntityLinksInText(text, opts.gcs)
+  );
+  linkifyTextNodes(root, elementsNamed('pre', 'a', 'code'), styleGithubRefsInText);
 }
 
 /** True when the file is a Markdown document. */
@@ -716,8 +730,8 @@ export class ScionChatMessage extends LitElement {
    * Show the message's More actions button (web.chat_starred_messages):
    * the keyboard entry to the message menu. The thread makes one message's
    * button the list's single tab stop (`actionsTabIndex` 0, the others
-   * -1) and moves it with the arrow keys; it shows on hover and while
-   * focus is in the message.
+   * -1) and moves it with the arrow keys. It is always visible: bare dots
+   * in the upper-right corner inside the bubble.
    */
   @property({ type: Boolean })
   actionsEnabled = false;
@@ -798,6 +812,30 @@ export class ScionChatMessage extends LitElement {
   @property()
   dispatchState = '';
 
+  /** A choice prompt's decisions (web.chat_choices; absent while off). */
+  @property({ type: Array })
+  decisions: DecisionView[] | undefined = undefined;
+
+  /** A choice prompt's intro, shown instead of the body when the card renders. */
+  @property()
+  choiceIntro: string | undefined = undefined;
+
+  /** A choice prompt's answer mode. */
+  @property()
+  answerMode: ChoiceAnswerMode | undefined = undefined;
+
+  /** Whether the viewer can answer the prompt's asker (design §4.5). */
+  @property({ attribute: false })
+  answerability: AskerAnswerability | undefined = undefined;
+
+  /** A choice-response's one-click answer (web.chat_choices; absent while off). */
+  @property({ attribute: false })
+  choiceResponse: ChoiceResponseView | undefined = undefined;
+
+  /** A choice-response's set submit (web.chat_choices; absent while off). */
+  @property({ attribute: false })
+  choiceResponseSet: ChoiceResponseSetView | undefined = undefined;
+
   /** Reason for dispatch failure. */
   @property()
   dispatchFailureReason = '';
@@ -842,7 +880,7 @@ export class ScionChatMessage extends LitElement {
 
   /** Reply preview data: the message this one is replying to. */
   @property({ type: Object })
-  replyPreview: { messageId: string; senderName: string; content: string } | null = null;
+  replyPreview: ReplyPreviewInfo | null = null;
 
   /** When set, indicates the message was edited at this timestamp. */
   @property()
@@ -876,8 +914,14 @@ export class ScionChatMessage extends LitElement {
   @property()
   currentUserId = '';
 
+  /**
+   * The rendered body: a `.md-content` element holding the markdown
+   * renderer's nodes, or null to show the body as plain text. Built once per
+   * body, and kept as one element so later renders move it rather than
+   * rebuild it.
+   */
   @state()
-  private renderedHtml = '';
+  private renderedContent: HTMLElement | null = null;
 
   /** Preview load state per attachment ID. Replaced, never mutated. */
   @state()
@@ -962,6 +1006,27 @@ export class ScionChatMessage extends LitElement {
       max-width: min(70%, 600px);
       min-width: 3rem;
       position: relative;
+    }
+
+    /* A choice-response is a compact line in the answerer's lane (design §4.6). */
+    .choice-response-row {
+      display: flex;
+      padding: 0.25rem 1rem;
+    }
+
+    .choice-response-row.own {
+      justify-content: flex-end;
+    }
+
+    .choice-response-row.other {
+      justify-content: flex-start;
+      padding-left: 3.5rem;
+    }
+
+    /* A choice card needs room for its buttons (design §4.1). */
+    .bubble.choice {
+      max-width: min(100%, 640px);
+      width: 100%;
     }
 
     .bubble-header {
@@ -1689,22 +1754,35 @@ export class ScionChatMessage extends LitElement {
       padding: 0.25rem 0.5rem;
       margin-bottom: 0.25rem;
       border-left: 3px solid var(--scion-primary-400, #60a5fa);
-      background: var(--scion-surface-50, #f8fafc);
+      background: var(--scion-bg, #f8fafc);
       border-radius: 0 0.25rem 0.25rem 0;
       cursor: pointer;
       font-size: var(--chat-fs-base);
-      color: var(--scion-neutral-500, #64748b);
+      color: var(--scion-text-muted, #64748b);
       max-width: 100%;
       overflow: hidden;
     }
 
     .reply-preview:hover {
-      background: var(--scion-surface-100, #f1f5f9);
+      background: var(--scion-bg-subtle, #f1f5f9);
     }
 
+    .reply-preview.unavailable {
+      cursor: default;
+      border-left-color: var(--scion-border, #e2e8f0);
+      color: var(--scion-neutral-400, #94a3b8);
+      font-style: italic;
+    }
+
+    .reply-preview.unavailable:hover {
+      background: var(--scion-bg, #f8fafc);
+    }
+
+    /* primary-600 in the light theme and primary-300 in the dark one, so the
+       name keeps AA contrast on the reply background in both. */
     .reply-preview .reply-sender {
       font-weight: 600;
-      color: var(--scion-primary-600, #2563eb);
+      color: var(--scion-primary-hover, #2563eb);
       white-space: nowrap;
     }
 
@@ -1720,47 +1798,52 @@ export class ScionChatMessage extends LitElement {
       color: var(--scion-neutral-400, #94a3b8);
     }
 
-    /* ---- More actions button: the keyboard entry to the message menu ---- */
+    /* ---- More actions button: the keyboard entry to the message menu ----
+       Always visible: bare dots in the upper-right corner inside the text
+       bubble. The bubble reserves a right-hand column for them, so they
+       never sit over the message text. An attachment-only message has no
+       text bubble: its bubble reserves the same column beside the
+       attachments. */
+    .bubble-content.has-actions,
+    .bubble.actions-corner {
+      position: relative;
+      padding-right: 2rem;
+    }
+
     .msg-actions {
       position: absolute;
-      bottom: 0;
-      right: calc(100% + 0.25rem);
+      top: 0.25rem;
+      right: 0.25rem;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 1.75rem;
-      height: 1.75rem;
+      /* The touch target; the glyph inside is smaller. */
+      width: 1.5rem;
+      height: 1.5rem;
       padding: 0;
-      border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.375rem;
-      background: var(--scion-surface, #ffffff);
+      border: none;
+      border-radius: 0.25rem;
+      background: none;
       color: var(--scion-text-muted, #64748b);
       font-size: 0.875rem;
+      line-height: 1;
       cursor: pointer;
-      /* Hidden until hovered or focused, but still focusable. */
-      opacity: 0;
     }
 
-    .from-agent .msg-actions {
-      right: auto;
-      left: calc(100% + 0.25rem);
+    /* The reserved column counts toward the bubble's max-width, so an
+       attachment-only bubble is no wider than its text neighbours. */
+    .bubble.actions-corner {
+      box-sizing: border-box;
     }
 
-    /* A headerless starred row keeps its gutter star next to the bubble:
-       the button moves one step further out, so neither covers the other. */
-    .bubble.has-star-meta .msg-actions {
-      right: calc(100% + 1.25rem);
+    .bubble.actions-corner > .msg-actions {
+      top: 0;
     }
 
-    .from-agent .bubble.has-star-meta .msg-actions {
-      right: auto;
-      left: calc(100% + 1.25rem);
-    }
-
-    .message-wrapper:hover .msg-actions,
-    .message-wrapper:focus-within .msg-actions,
-    .msg-actions[aria-expanded='true'] {
-      opacity: 1;
+    @media (hover: hover) {
+      .msg-actions:hover {
+        color: var(--scion-text, #1e293b);
+      }
     }
 
     .msg-actions:focus {
@@ -1769,7 +1852,7 @@ export class ScionChatMessage extends LitElement {
 
     .msg-actions:focus-visible {
       outline: 2px solid var(--scion-primary, #3b82f6);
-      outline-offset: 1px;
+      outline-offset: 0;
     }
 
     /* The message whose action button has keyboard focus. */
@@ -1785,13 +1868,6 @@ export class ScionChatMessage extends LitElement {
       overflow: hidden;
       clip: rect(0 0 0 0);
       white-space: nowrap;
-    }
-
-    @media (hover: none) {
-      /* Touch opens the action sheet with a tap; no floating button. */
-      .msg-actions {
-        display: none;
-      }
     }
 
     /* ---- Starred indicator (shape plus accent, never colour alone) ---- */
@@ -1979,6 +2055,15 @@ export class ScionChatMessage extends LitElement {
         padding-right: 0.5rem;
       }
 
+      .choice-response-row {
+        padding-left: 0.5rem;
+        padding-right: 0.5rem;
+      }
+
+      .choice-response-row.other {
+        padding-left: 3rem;
+      }
+
       .bubble-content {
         padding: 0.625rem 0.75rem;
       }
@@ -2032,10 +2117,17 @@ export class ScionChatMessage extends LitElement {
   }
 
   override updated(changed: Map<string, unknown>): void {
-    if (changed.has('body') || changed.has('plain')) {
+    const cardMode = this.showsChoiceCard;
+    if (
+      changed.has('body') ||
+      changed.has('plain') ||
+      changed.has('choiceIntro') ||
+      cardMode !== this.renderedCardMode
+    ) {
+      this.renderedCardMode = cardMode;
       void this.renderContent();
     }
-    if (changed.has('renderedHtml')) {
+    if (changed.has('renderedContent')) {
       this.wrapTables();
       this.injectCopyButtons();
       this.injectSyntaxHighlighting();
@@ -2135,14 +2227,19 @@ export class ScionChatMessage extends LitElement {
       btn.textContent = 'Copy';
       btn.addEventListener('click', () => {
         const code = pre.querySelector('code')?.textContent ?? pre.textContent ?? '';
-        void navigator.clipboard.writeText(code);
-        btn.textContent = 'Copied!';
-        const prev = (btn as CopyButton)._copyTimer;
-        if (prev) clearTimeout(prev);
-        (btn as CopyButton)._copyTimer = setTimeout(() => {
-          if (!this.isConnected) return;
-          btn.textContent = 'Copy';
-        }, 1500);
+        void copyToClipboard(code).then((ok) => {
+          if (!ok) {
+            showCopyFailedToast();
+            return;
+          }
+          btn.textContent = 'Copied!';
+          const prev = (btn as CopyButton)._copyTimer;
+          if (prev) clearTimeout(prev);
+          (btn as CopyButton)._copyTimer = setTimeout(() => {
+            if (!this.isConnected) return;
+            btn.textContent = 'Copy';
+          }, 1500);
+        });
       });
       pre.appendChild(btn);
     });
@@ -2329,26 +2426,57 @@ export class ScionChatMessage extends LitElement {
     });
   }
 
+  /** The card mode the rendered body was built for. */
+  private renderedCardMode = false;
+
+  /**
+   * Whether this message renders as a choice card (design §4.1): a
+   * choice-prompt with decisions, and the browser flag on. The hub omits
+   * the fields while the experiment is off; the flag gates presentation.
+   */
+  private get showsChoiceCard(): boolean {
+    const d = this.decisions;
+    return this.messageType === 'choice-prompt' && !!d && d.length > 0 && chatChoicesEnabled();
+  }
+
+  /** The text the bubble renders: the intro alone under a choice card. */
+  private get displayBody(): string {
+    return this.showsChoiceCard ? (this.choiceIntro ?? '') : this.body;
+  }
+
   private async renderContent(): Promise<void> {
-    if (!this.body || this.plain) {
-      this.renderedHtml = '';
+    const body = this.displayBody;
+    if (!body || this.plain) {
+      this.renderedContent = null;
       return;
     }
     const taskId = ++this.renderTaskId;
     try {
       const renderer = await getMarkdownRenderer();
       if (taskId !== this.renderTaskId) return;
+      const fragment = renderer.renderFragment(body);
       // gs:// links are gated on the server-reported feature flag AND the
       // message being agent-sent — a user-sent message never links, however
       // the body happens to be spelled.
-      this.renderedHtml = linkifyRenderedHtml(renderer.render(this.body), {
+      linkifyRenderedFragment(fragment, {
         artifacts: isFeatureEnabled(ARTIFACTS_FLAG),
         gcs: this.senderIsAgent && isFeatureEnabled('web.gcs_links'),
       });
+      this.renderedContent = fragment.hasChildNodes() ? this.contentElement(fragment) : null;
     } catch {
       if (taskId !== this.renderTaskId) return;
-      this.renderedHtml = '';
+      this.renderedContent = null;
     }
+  }
+
+  /** Wraps rendered nodes in the clickable `.md-content` element. */
+  private contentElement(fragment: DocumentFragment): HTMLElement {
+    const content = document.createElement('div');
+    content.className = 'md-content';
+    content.addEventListener('click', (e) => this.handleContentClick(e));
+    content.addEventListener('auxclick', (e) => this.handleContentAuxClick(e));
+    content.append(fragment);
+    return content;
   }
 
   /**
@@ -2471,7 +2599,15 @@ export class ScionChatMessage extends LitElement {
   /** Render the reply preview block above the bubble content. */
   private renderReplyPreview() {
     if (!this.replyPreview) return nothing;
-    const { messageId, senderName, content } = this.replyPreview;
+    const { messageId, senderName, content, unavailable } = this.replyPreview;
+    if (unavailable) {
+      // The quoted message is gone: a muted quote with nothing to jump to.
+      return html`
+        <div class="reply-preview unavailable">
+          <span class="reply-content">${content || '[no longer available]'}</span>
+        </div>
+      `;
+    }
     return html`
       <div class="reply-preview" @click=${() => this.handleScrollToMessage(messageId)}>
         <span class="reply-sender">${senderName}</span>
@@ -2491,14 +2627,19 @@ export class ScionChatMessage extends LitElement {
   }
 
   override render() {
+    if (this.showsChoiceResponse && !this.deletedAt) return this.renderChoiceResponse();
     const dirClass = this.fromAgent ? 'from-agent' : 'from-user';
     const groupClass = !this.showHeader ? ' grouped' : '';
     const isDeleted = !!this.deletedAt;
     // An attachment-only message (ptone/scion#6146) has no text: its
     // attachments render without an empty text bubble above them.
+    const choiceCard = this.showsChoiceCard;
     const attachmentOnly =
+      !choiceCard &&
       !(this.body ?? '').trim() &&
       ((this.attachmentRefs?.length ?? 0) > 0 || (this.attachments?.length ?? 0) > 0);
+    // The More actions dots sit inside the text bubble, in a reserved corner.
+    const contentActions = this.actionsEnabled ? ' has-actions' : '';
 
     return html`
       <div
@@ -2513,7 +2654,11 @@ export class ScionChatMessage extends LitElement {
           : this.fromAgent
             ? html`<div class="avatar-spacer"></div>`
             : nothing}
-        <div class="bubble${this.showsStarMeta() ? ' has-star-meta' : ''}">
+        <div
+          class="bubble${attachmentOnly && !isDeleted && this.actionsEnabled
+            ? ' actions-corner'
+            : ''}${choiceCard && !isDeleted ? ' choice' : ''}"
+        >
           ${this.showHeader && this.fromAgent
             ? html`
                 <div class="bubble-header">
@@ -2546,17 +2691,26 @@ export class ScionChatMessage extends LitElement {
             : nothing}
           ${this.renderAuthorizedBy()} ${this.replyPreview ? this.renderReplyPreview() : nothing}
           ${isDeleted
-            ? html`<div class="bubble-content">
+            ? html`<div class="bubble-content${contentActions}">
                 <span class="deleted-message">This message was deleted</span>
+                ${this.renderActionsButton()}
               </div>`
             : attachmentOnly
               ? nothing
-              : html`<div class="bubble-content">${this.renderBody()}</div>`}
+              : html`<div class="bubble-content${contentActions}">
+                  ${choiceCard && !this.displayBody.trim()
+                    ? nothing
+                    : this.renderBody()}${choiceCard
+                    ? this.renderChoiceCard()
+                    : nothing}${this.renderActionsButton()}
+                </div>`}
           ${isDeleted ? nothing : this.renderAttachments()}
           ${isDeleted ? nothing : this.renderArtifactChips()}
           ${isDeleted ? nothing : this.renderBadges()}
           ${isDeleted ? nothing : this.renderDeliveryState()}
-          ${this.showsStarMeta() ? this.renderStarMeta() : nothing} ${this.renderActionsButton()}
+          ${this.showsStarMeta() ? this.renderStarMeta() : nothing}
+          ${attachmentOnly && !isDeleted ? this.renderActionsButton() : nothing}
+          ${this.renderActionsHelp()}
         </div>
       </div>
       ${this.renderFullPreview()}
@@ -2581,29 +2735,36 @@ export class ScionChatMessage extends LitElement {
     const label = `More actions, message from ${who}, ${this.formatTime()}`;
     const active = this.actionsTabIndex === 0;
     return html`<button
-        type="button"
-        class="msg-actions"
-        tabindex=${this.actionsTabIndex}
-        aria-label=${label}
-        aria-haspopup="menu"
-        aria-expanded=${this.actionsExpanded ? 'true' : 'false'}
-        aria-describedby=${active ? 'actions-help' : nothing}
-        @click=${this.handleActionsClick}
-        @keydown=${this.handleActionsKeydown}
-        @focus=${(): void => {
-          this.actionsFocused = true;
-        }}
-        @blur=${(): void => {
-          this.actionsFocused = false;
-        }}
-      >
-        <sl-icon name="three-dots-vertical" aria-hidden="true"></sl-icon></button
-      >${active
-        ? html`<span class="actions-help" id="actions-help"
-            >Up and Down arrows move between messages. Shift+F10 also opens the menu. Tab leaves the
-            messages.</span
-          >`
-        : nothing}`;
+      type="button"
+      class="msg-actions"
+      tabindex=${this.actionsTabIndex}
+      aria-label=${label}
+      aria-haspopup="menu"
+      aria-expanded=${this.actionsExpanded ? 'true' : 'false'}
+      aria-describedby=${active ? 'actions-help' : nothing}
+      @click=${this.handleActionsClick}
+      @keydown=${this.handleActionsKeydown}
+      @focus=${(): void => {
+        this.actionsFocused = true;
+      }}
+      @blur=${(): void => {
+        this.actionsFocused = false;
+      }}
+    >
+      <sl-icon name="three-dots-vertical" aria-hidden="true"></sl-icon>
+    </button>`;
+  }
+
+  /**
+   * The tab stop's usage hint (the button's aria-describedby). It renders
+   * outside the text bubble so the bubble's text stays the message alone.
+   */
+  private renderActionsHelp(): TemplateResult | typeof nothing {
+    if (!this.actionsEnabled || this.actionsTabIndex !== 0) return nothing;
+    return html`<span class="actions-help" id="actions-help"
+      >Up and Down arrows move between messages. Shift+F10 also opens the menu. Tab leaves the
+      messages.</span
+    >`;
   }
 
   private handleActionsClick = (e: MouseEvent): void => {
@@ -2758,16 +2919,50 @@ export class ScionChatMessage extends LitElement {
     }
   }
 
+  private renderChoiceCard(): TemplateResult {
+    return html`<scion-chat-choices
+      .messageId=${this.messageId}
+      .decisions=${this.decisions ?? []}
+      .answerMode=${this.answerMode}
+      .currentUserId=${this.currentUserId}
+      .answerability=${this.answerability ?? ANSWERABLE}
+    ></scion-chat-choices>`;
+  }
+
+  /**
+   * Whether this message renders as a compact choice-response line
+   * (design §4.6): a choice-response carrying its view, and the browser
+   * flag on (double gate, as for the card).
+   */
+  private get showsChoiceResponse(): boolean {
+    return (
+      this.messageType === 'choice-response' &&
+      !!(this.choiceResponse || this.choiceResponseSet) &&
+      chatChoicesEnabled()
+    );
+  }
+
+  /** The response line in the answerer's lane, without a bubble. */
+  private renderChoiceResponse(): TemplateResult {
+    const own = !this.fromAgent;
+    return html`<div class="choice-response-row ${own ? 'own' : 'other'}">
+      <scion-chat-choice-response
+        lane=${own ? 'own' : 'other'}
+        .response=${this.choiceResponse}
+        .responseSet=${this.choiceResponseSet}
+        answererName=${own ? 'you' : this.senderName || this.sender}
+        agentName=${this.routedTo}
+        timestamp=${this.timestamp}
+        dispatchState=${this.dispatchState}
+      ></scion-chat-choice-response>
+    </div>`;
+  }
+
   private renderBody() {
-    if (this.plain || !this.renderedHtml) {
-      return html`<div class="plain-text">${this.body}</div>`;
+    if (this.plain || !this.renderedContent) {
+      return html`<div class="plain-text">${this.displayBody}</div>`;
     }
-    return html`<div
-      class="md-content"
-      @click=${this.handleContentClick}
-      @auxclick=${(e: MouseEvent) => this.handleContentAuxClick(e)}
-      .innerHTML=${this.renderedHtml}
-    ></div>`;
+    return this.renderedContent;
   }
 
   private renderBadges() {
@@ -2965,24 +3160,23 @@ export class ScionChatMessage extends LitElement {
   private async copyAttachmentText(id: string): Promise<void> {
     const state = this.previews.get(id);
     if (!state || state.status !== 'ready' || !state.text) return;
-    try {
-      await navigator.clipboard.writeText(state.text);
-      const next = new Set(this.copiedIds);
-      next.add(id);
-      this.copiedIds = next;
-      const existing = this.copyTimers.get(id);
-      if (existing) clearTimeout(existing);
-      const timer = setTimeout(() => {
-        if (!this.isConnected) return;
-        const after = new Set(this.copiedIds);
-        after.delete(id);
-        this.copiedIds = after;
-        this.copyTimers.delete(id);
-      }, 1500);
-      this.copyTimers.set(id, timer);
-    } catch {
-      // Clipboard write may fail in insecure contexts; silently ignore.
+    if (!(await copyToClipboard(state.text))) {
+      showCopyFailedToast();
+      return;
     }
+    const next = new Set(this.copiedIds);
+    next.add(id);
+    this.copiedIds = next;
+    const existing = this.copyTimers.get(id);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      if (!this.isConnected) return;
+      const after = new Set(this.copiedIds);
+      after.delete(id);
+      this.copiedIds = after;
+      this.copyTimers.delete(id);
+    }, 1500);
+    this.copyTimers.set(id, timer);
   }
 
   /** Rendered markdown body for a markdown attachment preview. */

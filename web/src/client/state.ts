@@ -449,6 +449,7 @@ export type StateEventType =
   | 'chat-dm-promoted'
   | 'chat-scheduled-updated'
   | 'chat-stars-updated'
+  | 'choice-updated'
   | 'agent-created';
 
 /**
@@ -810,7 +811,7 @@ export class StateManager extends EventTarget {
       return;
     }
 
-    // User-scoped chat events: user.{userId}.chat.{dm|typing|scheduled|stars|message.edited|message.deleted}
+    // User-scoped chat events: user.{userId}.chat.{dm|typing|scheduled|stars|choice.updated|message.edited|message.deleted}
     if (parts[0] === 'user' && parts.length >= 4 && parts[2] === 'chat') {
       // Human-to-human DMs have no project, so their typing events arrive on
       // the user-scoped subject rather than project.{id}.chat.typing.
@@ -828,6 +829,9 @@ export class StateManager extends EventTarget {
       } else if (parts[3] === 'read-state') {
         // A DM peer advanced their read watermark — drives the "seen" tick.
         this.notifyWithData('chat-read-state-updated', data);
+      } else if (parts[3] === 'choice') {
+        // user.{userId}.chat.choice.updated: a DM decision changed state.
+        if (parts[4] === 'updated') this.notifyWithData('choice-updated', data);
       } else if (parts[3] === 'message' && parts.length >= 5) {
         // Phase-3: user-scoped message.edited / message.deleted for DMs.
         const subType = parts[4];
@@ -897,6 +901,11 @@ export class StateManager extends EventTarget {
           } else if (subType === 'deleted') {
             this.notifyWithData('chat-message-deleted', chatDetail);
           }
+          return;
+        }
+        if (chatEventType === 'choice') {
+          // project.{projectId}.chat.choice.updated: a thread decision changed state.
+          if (parts[4] === 'updated') this.notifyWithData('choice-updated', chatDetail);
           return;
         }
         if (chatEventType === 'message') {
@@ -1680,6 +1689,18 @@ export class StateManager extends EventTarget {
 
   getBroker(id: string): RuntimeBroker | undefined {
     return this.state.brokers.get(id);
+  }
+
+  /**
+   * Drop a project this session can no longer read (the user left it,
+   * ptone/scion#7494) from the cached project list. It is tombstoned like a
+   * `deleted` event, so list merges (the projects page) drop its row, and
+   * `projects-updated` is sent.
+   */
+  forgetProject(projectId: string): void {
+    this.state.projects.delete(projectId);
+    this.state.deletedProjectIds.add(projectId);
+    this.notify('projects-updated');
   }
 
   getDeletedProjectIds(): Set<string> {

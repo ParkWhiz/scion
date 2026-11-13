@@ -162,9 +162,12 @@ var perfBudgets = []perfBudget{
 		// with main fb721f16f merged (its #3536 edit rows) plus the TX
 		// config.agent_plugins editability row (ptone/scion#4933). 14680: CI's
 		// measurement with the claude harness's agent_plugins capability row
-		// added (default-claude, ptone/scion#4933 U4).
+		// added (default-claude, ptone/scion#4933 U4). 14871: measured with
+		// main 8c666466 (14817) plus the "unlimitedUnsupported":true flags on
+		// config.max_turns and config.max_model_calls (+54 bytes measured,
+		// ptone/scion#5605).
 		// Store calls: the invited-user account-status check reads the user record per decision; this route has no request-local authz memo (ptone/scion#3684).
-		baseline: perfBudgetCounts{authzStoreCalls: 20, decisions: 10, dbReads: 0, bytes: 14680},
+		baseline: perfBudgetCounts{authzStoreCalls: 20, decisions: 10, dbReads: 0, bytes: 14871},
 	},
 	{
 		// Store calls: per-request sender standing (upstream #3101).
@@ -179,9 +182,12 @@ var perfBudgets = []perfBudget{
 		// with main fb721f16f merged (its #3536 edit rows) plus the TX
 		// config.agent_plugins editability row (ptone/scion#4933). 14680: CI's
 		// measurement with the claude harness's agent_plugins capability row
-		// added (default-claude, ptone/scion#4933 U4).
+		// added (default-claude, ptone/scion#4933 U4). 14871: measured with
+		// main 8c666466 (14817) plus the "unlimitedUnsupported":true flags on
+		// config.max_turns and config.max_model_calls (+54 bytes measured,
+		// ptone/scion#5605).
 		// Store calls: the invited-user account-status check reads the user record per decision; this route has no request-local authz memo (ptone/scion#3684).
-		baseline: perfBudgetCounts{authzStoreCalls: 19, decisions: 10, dbReads: 0, bytes: 14680},
+		baseline: perfBudgetCounts{authzStoreCalls: 19, decisions: 10, dbReads: 0, bytes: 14871},
 	},
 }
 
@@ -456,8 +462,8 @@ var perfBudgetWebRequests = []string{
 	"/api/v1/projects/{project}/metrics-summary",
 	"/api/v1/projects/{project}/metrics/summary",
 	"/api/v1/projects/{project}/workspace/files?limit=500",
-	"/api/v1/projects/{project}/agents?sort=updated&dir=desc&limit=25&fit=50&stats=1",
-	"/api/v1/projects/{project}/agents?limit=500",
+	"/api/v1/projects/{project}/agents?sort=updated&dir=desc&limit=25&fit=50&stats=1&include=authority",
+	"/api/v1/projects/{project}/agents?include=authority&limit=500",
 }
 
 // perfBudgetWebSchema is the file format; fixture.mjs computes the same

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authctx"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
@@ -40,6 +41,10 @@ type AuthConfig struct {
 	DevAuthToken string
 	// DevUserCfg holds identity overrides for the development user
 	DevUserCfg DevUserConfig
+	// DevUser, when set, is the live development identity (see
+	// devUserSource); it takes precedence over DevUserCfg so an identity
+	// change is picked up by the next request. Nil uses DevUserCfg as is.
+	DevUser *devUserSource
 	// AgentTokenSvc handles agent JWT validation
 	AgentTokenSvc *AgentTokenService
 	// UserTokenSvc handles user JWT validation
@@ -272,7 +277,14 @@ func normalizeConstraintAuditAuthFailures(w http.ResponseWriter, r *http.Request
 
 // serveAfterAuth unwraps the response normalizer before entering downstream
 // middleware or a handler, so only authentication failures are rewritten.
+// It also carries the request's note of authorization checks stopped by
+// the request context ending, and writes its one summary line (if any)
+// when the handler returns, including on panic.
 func serveAfterAuth(w http.ResponseWriter, next http.Handler, r *http.Request) {
+	if ctx, note := withAuthzStoppedNote(r.Context()); note != nil {
+		r = r.WithContext(ctx)
+		defer note.emit(r)
+	}
 	if normalizer, ok := w.(*constraintAuditAuthFailureWriter); ok {
 		next.ServeHTTP(normalizer.ResponseWriter, r)
 		return
@@ -298,7 +310,10 @@ func handlerAfterAuth(next http.Handler) http.Handler {
 func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 	// Parse trusted proxy CIDRs
 	trustedNets := parseTrustedProxies(cfg.TrustedProxies)
-	devUser := NewDevUser(cfg.DevUserCfg)
+	devUsers := cfg.DevUser
+	if devUsers == nil {
+		devUsers = newDevUserSource(cfg.DevUserCfg)
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -571,6 +586,18 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 					return
 				}
 
+				// Step 3f: Port page view (hub.port_view). A credential-less
+				// request of any method under /api/v1/portview/ in the
+				// route's one shape (isPortViewRequest) is passed through
+				// WITHOUT an identity: the route serves on the capability
+				// in its path alone, checked on every request, and never
+				// authorizes by an identity. It must stay above 3g.
+				if isPortViewRequest(r) {
+					ctx = contextWithAuthType(ctx, AuthTypeSignedURL)
+					serveAfterAuth(w, next, r.WithContext(ctx))
+					return
+				}
+
 				// Step 3g: no credential of any kind reached a port proxy
 				// route on a request that is not a page navigation
 				// (a navigation without a web session is sent to login by
@@ -579,9 +606,9 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				//
 				// ORDER: this step must stay the last one before the final
 				// 401. Any new step that lets a request without a
-				// credential through (as 3c to 3e do) goes ABOVE this
+				// credential through (as 3c to 3f do) goes ABOVE this
 				// one; placed below it, its port proxy requests would get
-				// this 401 instead. (3f is left free for such a step.)
+				// this 401 instead.
 				if isProxyRoute(r.URL.Path) && !isBrowserRequest(r) {
 					hinted := writePortProxyNoCredentials(w, r)
 					if cfg.RecordPortProxyNoCredentials != nil {
@@ -619,6 +646,7 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				if !admitDevUserAccount(ctx, cfg, log, w) {
 					return
 				}
+				devUser := devUsers.Load()
 				ctx = context.WithValue(ctx, userContextKey{}, devUser)
 				ctx = contextWithIdentity(ctx, devUser)
 				ctx = contextWithCredentialContext(ctx, credentialContextForIdentity(devUser))
@@ -714,6 +742,7 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 						if !admitDevUserAccount(ctx, cfg, log, w) {
 							return
 						}
+						devUser := devUsers.Load()
 						ctx = context.WithValue(ctx, userContextKey{}, devUser)
 						ctx = contextWithIdentity(ctx, devUser)
 						ctx = contextWithCredentialContext(ctx, credentialContextForIdentity(devUser))
@@ -762,6 +791,15 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				}
 				// JWT tokens are self-contained; check current user status
 				// from the store to enforce suspension between token refreshes.
+				//
+				// With no UserStore the row block, and with it the session
+				// generation check below, is skipped and no generation is
+				// recorded in the request context. No store means no
+				// revocation can have been recorded. Serving hubs always have
+				// a store: enforced by TestInitHubServer_RefusesNilStore
+				// (cmd) and TestNew_WiresAuthUserStoreFromStore (pkg/hub).
+				var rowGen int64
+				haveRowGen := false
 				if cfg.UserStore != nil {
 					// The account must be active (checkUserAccount, the rule
 					// decide applies): a suspended account, an account with no
@@ -792,6 +830,18 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 						writeAccountRefusal(w, refusal)
 						return
 					}
+					// The token's session generation must equal the users
+					// row's: any difference refuses (a missing claim reads
+					// as 0). This read of the row must stay authoritative;
+					// see sessionGenerationRefusal before adding a replica
+					// or cache on the user read path.
+					if reason := sessionGenerationRefusal(claims.SessionGeneration, u.SessionGeneration); reason != "" {
+						logSessionGenerationRefusal(ctx, log, "jwt_auth", claims.UserID, claims.SessionGeneration, u.SessionGeneration, reason)
+						writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+							"invalid access token: session revoked", nil)
+						return
+					}
+					rowGen, haveRowGen = u.SessionGeneration, true
 					// A federated account authenticates only with its
 					// issuer's token (the federated branch above), never
 					// with a hub-issued session or user token.
@@ -855,6 +905,11 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				ctx = contextWithIdentity(ctx, user)
 				ctx = contextWithCredentialContext(ctx, credentialContextForIdentity(user))
 				ctx = contextWithAuthType(ctx, AuthTypeJWT)
+				if haveRowGen {
+					// The users-row generation compared above (equal to the
+					// claim), for consumers that re-check later.
+					ctx = authctx.WithSessionGeneration(ctx, rowGen)
+				}
 				if cfg.Debug {
 					log.Debug("User authenticated", "email", user.Email())
 				}

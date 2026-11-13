@@ -460,7 +460,7 @@ func TestWorkstation_PutServerConfig_NoPartialWrites(t *testing.T) {
 		status int
 	}{
 		{"invalid Layer-1 value", `{"default_timezone":"Not/AZone","server":{"hub":{"port":9999}}}`, http.StatusUnprocessableEntity},
-		{"invalid file-routed value", `{"quotas":{"enforce_broker_quotas":false},"server":{"hub":{"agent_endpoint":"not a url"}}}`, http.StatusBadRequest},
+		{"invalid file-routed value", `{"quotas":{"enforce_broker_quotas":false},"server":{"hub":{"agent_endpoint":"not a url"}}}`, http.StatusUnprocessableEntity},
 		{"unknown key", `{"quotas":{"enforce_broker_quotas":false},"server":{"hub":{"port":9999,"bogus":1}}}`, http.StatusUnprocessableEntity},
 		{"revision conflict", `{"expected_revisions":{"quotas":999},"quotas":{"enforce_broker_quotas":false},"server":{"hub":{"port":9999}}}`, http.StatusConflict},
 	}
@@ -731,8 +731,10 @@ func TestWorkstation_PutServerConfig_InvalidModeRejected(t *testing.T) {
 	before := readFileString(t, settingsPath)
 	for _, mode := range []string{"Hosted", "prod"} {
 		rr := putServerConfig(t, srv, `{"server":{"mode":"`+mode+`"}}`)
-		if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "invalid server.mode") {
-			t.Errorf("mode %q: expected 400 invalid server.mode, got %d: %s", mode, rr.Code, rr.Body.String())
+		if rr.Code != http.StatusUnprocessableEntity || !strings.Contains(rr.Body.String(), "invalid server.mode") {
+			t.Errorf("mode %q: expected 422 invalid server.mode, got %d: %s", mode, rr.Code, rr.Body.String())
+		} else if e := settingsErrorEntries(t, rr); e[0].Field != "server.mode" {
+			t.Errorf("mode %q: field = %q, want server.mode", mode, e[0].Field)
 		}
 	}
 	if after := readFileString(t, settingsPath); after != before {
@@ -943,6 +945,29 @@ func TestHosted_PutServerConfig_PortProxyIsLayer0(t *testing.T) {
 	}
 }
 
+// TestHosted_PutServerConfig_LongLivedRequestSettingsAreLayer0: the events
+// stream settings and the platform request timeout are read at startup, so
+// a hosted hub's PUT rejects them as Layer-0 (ptone/scion#5230).
+func TestHosted_PutServerConfig_LongLivedRequestSettingsAreLayer0(t *testing.T) {
+	for body, key := range map[string]string{
+		`{"server":{"hub":{"sse":{"max_connection_age":"5m"}}}}`:  "server.hub.sse.max_connection_age",
+		`{"server":{"hub":{"platform_request_timeout":"900s"}}}`:  "server.hub.platform_request_timeout",
+		`{"server":{"hub":{"sse":{"heartbeat_interval":"20s"}}}}`: "server.hub.sse.heartbeat_interval",
+	} {
+		t.Run(key, func(t *testing.T) {
+			tempSettingsHome(t)
+			srv, _, _ := newSQLiteHubInMode(t, false, nil)
+			rr := putServerConfig(t, srv, body)
+			if rr.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("expected 422, got %d: %s", rr.Code, rr.Body.String())
+			}
+			if code, keys := rejectedKeys(t, rr); code != "layer0_rejected" || !reflect.DeepEqual(keys, []string{key}) {
+				t.Errorf("got %q %v, want layer0_rejected [%s]", code, keys, key)
+			}
+		})
+	}
+}
+
 // TestHosted_PutServerConfig_ConduitShutdownGraceIsLayer0: shutdown_grace
 // is read at startup under the server.hub.conduit Layer-0 prefix, so a
 // hosted hub's PUT rejects it as Layer-0.
@@ -1101,6 +1126,43 @@ func TestWorkstation_PutServerConfig_LegacyServerYAMLSources(t *testing.T) {
 	}
 }
 
+// scion server start now hands the hub an absolute --config path (here a
+// directory holding a server.yaml). After the server changes directory (as
+// with --global), the legacy server.yaml guard still finds that file and
+// refuses a save that would add a server block, and a settings reload still
+// reads it.
+func TestWorkstation_AbsoluteConfigPathSurvivesChdir(t *testing.T) {
+	isolateLogLevelState(t)
+	settingsPath := tempSettingsHome(t)
+	settings := "schema_version: \"1\"\nactive_profile: local\n"
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(configDir, "server.yaml"), []byte("logLevel: debug\nhub:\n  port: 7000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, _, _ := newSQLiteHubInMode(t, true, nil)
+	srv.config.ConfigPath = configDir
+	t.Chdir(t.TempDir())
+
+	rr := putServerConfig(t, srv, `{"server":{"log_level":"info"}}`)
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "legacy_server_yaml") {
+		t.Fatalf("expected 409 legacy_server_yaml, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if after := readFileString(t, settingsPath); after != settings {
+		t.Errorf("settings.yaml changed:\n%s", after)
+	}
+
+	results := srv.reloadSettings()
+	if errText, ok := results["error"]; ok {
+		t.Fatalf("reload failed: %v", errText)
+	}
+	if applied, _ := results["applied"].([]string); !slices.Contains(applied, "log_level") {
+		t.Errorf("the reload must read the server.yaml next to --config (log_level), applied = %v", results["applied"])
+	}
+}
+
 // With a server.yaml present but a settings.yaml that already
 // has a server key, the loader reads settings.yaml, so the PUT edits it.
 func TestWorkstation_PutServerConfig_ServerYAMLWithServerKeyAllowed(t *testing.T) {
@@ -1123,7 +1185,7 @@ func TestWorkstation_PutServerConfig_ServerYAMLWithServerKeyAllowed(t *testing.T
 }
 
 // A workstation PUT checks server.home_storage like the file-mode handler:
-// unknown values are rejected with 400 and nothing is written; a valid
+// unknown values are rejected with 422 and nothing is written; a valid
 // block is written.
 func TestWorkstation_PutServerConfig_HomeStorageValidated(t *testing.T) {
 	for _, body := range []string{
@@ -1136,9 +1198,10 @@ func TestWorkstation_PutServerConfig_HomeStorageValidated(t *testing.T) {
 			srv, _, _ := newSQLiteHubInMode(t, true, nil)
 			before := readFileString(t, settingsPath)
 			rr := putServerConfig(t, srv, body)
-			if rr.Code != http.StatusBadRequest {
-				t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+			if rr.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("expected 422, got %d: %s", rr.Code, rr.Body.String())
 			}
+			settingsErrorEntries(t, rr)
 			if after := readFileString(t, settingsPath); after != before {
 				t.Errorf("settings.yaml changed:\n%s", after)
 			}

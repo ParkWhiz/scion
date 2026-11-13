@@ -85,6 +85,12 @@ type Agent struct {
 	// PinnedRuntimeTarget is the agent's pinned placement on a flat Runtime
 	// Broker (read-only; nil for an unpinned agent).
 	PinnedRuntimeTarget *api.PinnedRuntimeTarget `json:"pinnedRuntimeTarget,omitempty"`
+
+	// Authority is the agent's authority state as the Hub computed it at
+	// read: always on a single-agent Get, and on listed agents only when
+	// ListAgentsOptions.IncludeAuthority is set. Nil from Hubs that predate
+	// it.
+	Authority *api.AgentAuthority `json:"authority,omitempty"`
 }
 
 // AgentLaunch is the Hub's view of an agent's current or most recent launch.
@@ -242,8 +248,11 @@ type ProjectSettings struct {
 	AutoExposePortsEnabled *bool   `json:"autoExposePortsEnabled,omitempty"`
 
 	// Default agent limits
-	DefaultMaxTurns      int                  `json:"defaultMaxTurns,omitempty"`
-	DefaultMaxModelCalls int                  `json:"defaultMaxModelCalls,omitempty"`
+	// DefaultMaxTurns and DefaultMaxModelCalls: nil inherits (no project
+	// value), 0 is an explicit "no limit" (Unlimited) and n >= 1 a limit.
+	// On the settings PUT, null clears them (ptone/scion#3925).
+	DefaultMaxTurns      *int                 `json:"defaultMaxTurns,omitempty"`
+	DefaultMaxModelCalls *int                 `json:"defaultMaxModelCalls,omitempty"`
 	DefaultMaxDuration   string               `json:"defaultMaxDuration,omitempty"`
 	DefaultResources     *ProjectResourceSpec `json:"defaultResources,omitempty"`
 
@@ -381,6 +390,11 @@ type RuntimeBroker struct {
 	// VersionStatus compares Version with the fleet hub version: match,
 	// mismatch or unknown. Empty for a plugin record, or from an older Hub.
 	VersionStatus string `json:"versionStatus,omitempty"`
+	// Health is the broker's last self-reported health as the Hub stored
+	// it (fixed words only, api.NormalizeBrokerHealthReport); nil when the
+	// broker never reported it. Its control_channel check says whether the
+	// Hub can send the broker commands.
+	Health *api.BrokerHealthReport `json:"health,omitempty"`
 }
 
 // BrokerCapabilities describes runtime broker capabilities.
@@ -419,6 +433,11 @@ type BrokerCapabilities struct {
 	// empty-per-agent workspace in place
 	// (store.BrokerCapabilities.ReprovisionEmptyPerAgent is its counterpart).
 	ReprovisionEmptyPerAgent bool `json:"reprovisionEmptyPerAgent,omitempty"`
+	// ReprovisionResetHomeRuntimes lists the runtimes on which the broker's
+	// reprovision can reset an agent home completely (ptone/scion#7757;
+	// store.BrokerCapabilities.ReprovisionResetHomeRuntimes is its
+	// counterpart).
+	ReprovisionResetHomeRuntimes []string `json:"reprovisionResetHomeRuntimes,omitempty"`
 	// ChangedFields indicates the broker re-renders, at start, the files
 	// provisioning wrote for the provision-rendered keys the hub lists in
 	// the inline config's changed_fields (ptone/scion#3982;
@@ -428,6 +447,16 @@ type BrokerCapabilities struct {
 	// cleared_fields at start (ptone/scion#3906, ptone/scion#4890;
 	// store.BrokerCapabilities.ClearedFields is its counterpart).
 	ClearedFields bool `json:"clearedFields,omitempty"`
+	// UnlimitedCountLimits indicates the broker honours an explicit
+	// max_turns or max_model_calls of 0 as "no limit" over an inherited one
+	// (ptone/scion#5605; store.BrokerCapabilities.UnlimitedCountLimits is
+	// its counterpart).
+	UnlimitedCountLimits bool `json:"unlimitedCountLimits,omitempty"`
+	// ClearedResourceSubfields indicates the broker applies the resources
+	// sub-field entries of cleared_fields at start (ptone/scion#5676;
+	// store.BrokerCapabilities.ClearedResourceSubfields is its
+	// counterpart).
+	ClearedResourceSubfields bool `json:"clearedResourceSubfields,omitempty"`
 	// StartsInFlight indicates the broker reports the agent starts still
 	// running on it in every heartbeat (BrokerHeartbeat.StartsInFlight). Only
 	// then does the hub read a start's absence from that list as "no start

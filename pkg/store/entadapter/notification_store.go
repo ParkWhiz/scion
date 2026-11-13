@@ -24,6 +24,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agenthold"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notificationsubscription"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/subscriptiontemplate"
@@ -140,6 +141,11 @@ func entNotifToStore(e *ent.Notification) *store.Notification {
 		DispatchOutcome:  e.DispatchOutcome,
 		DispatchReason:   e.DispatchReason,
 		NextAttemptAt:    e.NextAttemptAt,
+
+		Kind:         e.Kind,
+		ResourceType: e.ResourceType,
+		ResourceID:   e.ResourceID,
+		Excerpt:      e.Excerpt,
 	}
 }
 
@@ -416,6 +422,10 @@ func (s *NotificationStore) CreateNotification(ctx context.Context, notif *store
 		SetCreated(notif.CreatedAt).
 		SetDispatchAttempts(notif.DispatchAttempts).
 		SetDispatchOutcome(notif.DispatchOutcome).
+		SetKind(notif.Kind).
+		SetResourceType(notif.ResourceType).
+		SetResourceID(notif.ResourceID).
+		SetExcerpt(notif.Excerpt).
 		Save(ctx)
 	if err != nil {
 		return mapError(err)
@@ -491,6 +501,23 @@ func (s *NotificationStore) AcknowledgeNotification(ctx context.Context, id stri
 		return err
 	}
 	_, err = s.client.Notification.UpdateOneID(uid).SetAcknowledged(true).Save(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
+// UpdateNotificationContent implements store.NotificationStore.
+func (s *NotificationStore) UpdateNotificationContent(ctx context.Context, id, message, resourceID string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.Notification.UpdateOneID(uid).
+		SetMessage(message).
+		SetResourceID(resourceID).
+		SetAcknowledged(false).
+		Save(ctx)
 	if err != nil {
 		return mapError(err)
 	}
@@ -816,14 +843,14 @@ const undispatchedGracePeriod = 60 * time.Second
 // per query to avoid loading unbounded rows into memory.
 const undispatchedBatchLimit = 100
 
-// writeNotSuspended appends a "phase is not suspended" condition to an
-// EXISTS subquery over the agents table. The phase column is nullable and a
-// NULL phase is not suspended, so it compares COALESCE(phase, empty
-// string). A suspended subscriber's notifications are parked: never claimed
-// or attempted, and selected again once the agent leaves the suspended
-// phase. ExpireStaleAgentNotifications bounds how long they can stay parked.
-func writeNotSuspended(b *entsql.Builder) {
-	b.WriteString(" AND COALESCE(")
+// writeNotSuspendedExpr appends a "phase is not suspended" expression over
+// the agents table. The phase column is nullable and a NULL phase is not
+// suspended, so it compares COALESCE(phase, empty string). An unheld
+// suspended subscriber's notifications are parked: never claimed or
+// attempted, and selected again once the agent leaves the suspended phase.
+// ExpireStaleAgentNotifications bounds how long they can stay parked.
+func writeNotSuspendedExpr(b *entsql.Builder) {
+	b.WriteString("COALESCE(")
 	b.Ident(agent.Table)
 	b.WriteString(".")
 	b.Ident(agent.FieldPhase)
@@ -831,9 +858,48 @@ func writeNotSuspended(b *entsql.Builder) {
 	b.Arg(string(state.PhaseSuspended))
 }
 
+// writeActiveHoldExpr appends a "has an active hold" expression over the
+// agents table (ptone/scion#7145).
+func writeActiveHoldExpr(b *entsql.Builder) {
+	b.WriteString("EXISTS (SELECT 1 FROM ")
+	b.Ident(agenthold.Table)
+	b.WriteString(" WHERE ")
+	b.Ident(agenthold.Table)
+	b.WriteString(".")
+	b.Ident(agenthold.FieldAgentID)
+	b.WriteString(" = ")
+	b.Ident(agent.Table)
+	b.WriteString(".")
+	b.Ident(agent.FieldID)
+	b.WriteString(" AND ")
+	b.Ident(agenthold.Table)
+	b.WriteString(".")
+	b.Ident(agenthold.FieldClearedAt)
+	b.WriteString(" IS NULL)")
+}
+
+// writeHeldOverridesSuspended appends, to an EXISTS subquery over the agents
+// table, " AND ((<not suspended>[ AND <extra>]) OR <has an active hold>)".
+// A held subscriber's notifications are selected whatever its phase (and
+// whatever extra requires), so the dispatcher drops them as subscriber_held
+// at once instead of leaving them parked (ptone/scion#7145).
+func writeHeldOverridesSuspended(b *entsql.Builder, extra func(*entsql.Builder)) {
+	b.WriteString(" AND ((")
+	writeNotSuspendedExpr(b)
+	if extra != nil {
+		b.WriteString(" AND ")
+		extra(b)
+	}
+	b.WriteString(") OR ")
+	writeActiveHoldExpr(b)
+	b.WriteString(")")
+}
+
 // GetUndispatchedAgentNotifications returns agent-targeted notifications with
 // dispatched=false, ordered oldest-first, limited to 100 rows. A
-// notification whose subscriber agent is suspended is never returned.
+// notification whose subscriber agent is suspended is not returned, unless
+// the subscriber is held: a held subscriber's notifications are returned so
+// they can be dropped (ptone/scion#7145).
 //
 // When brokerID is empty (sweep mode), a 60s grace period is applied so the
 // sweep does not race with an in-flight primary dispatch. When brokerID is
@@ -885,12 +951,16 @@ func (s *NotificationStore) GetUndispatchedAgentNotifications(ctx context.Contex
 				b.Ident(agent.FieldProjectID)
 				b.WriteString(" = ")
 				b.WriteString(projIDCol)
-				writeNotSuspended(b)
-				b.WriteString(" AND ")
-				b.Ident(agent.Table)
-				b.WriteString(".")
-				b.Ident(agent.FieldRuntimeBrokerID)
-				b.WriteString(" != '')")
+				// Held overrides both the suspended filter and the
+				// broker filter: a held subscriber's notifications are
+				// dropped without a broker (ptone/scion#7145).
+				writeHeldOverridesSuspended(b, func(b *entsql.Builder) {
+					b.Ident(agent.Table)
+					b.WriteString(".")
+					b.Ident(agent.FieldRuntimeBrokerID)
+					b.WriteString(" != ''")
+				})
+				b.WriteString(")")
 			}))
 		})
 	}
@@ -918,13 +988,13 @@ func (s *NotificationStore) GetUndispatchedAgentNotifications(ctx context.Contex
 				b.Ident(agent.FieldProjectID)
 				b.WriteString(" = ")
 				b.WriteString(projIDCol)
-				writeNotSuspended(b)
 				b.WriteString(" AND ")
 				b.Ident(agent.Table)
 				b.WriteString(".")
 				b.Ident(agent.FieldRuntimeBrokerID)
 				b.WriteString(" = ")
 				b.Arg(brokerID)
+				writeHeldOverridesSuspended(b, nil)
 				b.WriteString(")")
 			}))
 		})

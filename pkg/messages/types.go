@@ -95,7 +95,20 @@ const (
 	// what was replied to. Mapped to text/request in the envelope taxonomy
 	// (same as TypeInstruction — a reply to an agent is still a request).
 	TypeReply = "reply"
+
+	// TypeChoicePrompt is an agent message that carries one or more
+	// decisions (choices.go). TypeChoiceResponse records an answer to one
+	// of them. Both are hub-minted: see IsHubMintedType.
+	TypeChoicePrompt   = "choice-prompt"
+	TypeChoiceResponse = "choice-response"
 )
+
+// IsHubMintedType reports whether t is a message type only the hub may set.
+// Every client send path must reject a caller-supplied type for which it
+// returns true.
+func IsHubMintedType(t string) bool {
+	return t == TypeChoicePrompt || t == TypeChoiceResponse
+}
 
 // System message category constants identify the origin of a system message.
 const (
@@ -123,6 +136,8 @@ var validTypes = map[string]bool{
 	TypeSystem:         true,
 	TypeChat:           true,
 	TypeReply:          true,
+	TypeChoicePrompt:   true,
+	TypeChoiceResponse: true,
 }
 
 // StructuredMessage represents a formatted Scion message.
@@ -169,6 +184,16 @@ type StructuredMessage struct {
 	// never accepted from request JSON. Empty means the subscriber persists
 	// the message as before.
 	StoredMessageID string `json:"-"`
+
+	// PersistMessageID and PersistCreatedAt, when set, are the id and the
+	// creation time the sending handler chose for the row the persisting
+	// subscriber stores for this message. The handler has already reported
+	// them to the sender and to observers (the receipt's message_id, the
+	// published Timestamp), so the stored row must carry the same values.
+	// Hub-internal like StoredMessageID: never rendered, never accepted from
+	// request JSON. Empty or zero means the subscriber picks its own.
+	PersistMessageID string    `json:"-"`
+	PersistCreatedAt time.Time `json:"-"`
 
 	// AttachmentDeliveries are the attachments stored as artifacts, bound to
 	// a stored message, that the hub delivers into the recipient agent's

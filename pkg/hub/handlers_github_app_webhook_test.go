@@ -40,58 +40,55 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
-func TestExtractOwnerRepo(t *testing.T) {
+func TestGitHubOwnerRepo(t *testing.T) {
+	githubCom := &Server{}
+	ghes := &Server{}
+	ghes.config.GitHubAppConfig.APIBaseURL = "https://github.example.com/api/v3"
+
 	tests := []struct {
 		name     string
+		srv      *Server
 		remote   string
 		expected string
 	}{
-		{"https github", "https://github.com/acme/widgets.git", "acme/widgets"},
-		{"https github no .git", "https://github.com/acme/widgets", "acme/widgets"},
-		{"https github trailing slash", "https://github.com/acme/widgets/", "acme/widgets"},
-		{"ssh github", "git@github.com:acme/widgets.git", "acme/widgets"},
-		{"ssh github no .git", "git@github.com:acme/widgets", "acme/widgets"},
-		{"http github", "http://github.com/acme/widgets.git", "acme/widgets"},
-		{"github enterprise https", "https://github.example.com/org/repo.git", "org/repo"},
-		{"ssh with slash prefix", "git@github.com:/acme/widgets.git", "acme/widgets"},
-		{"empty", "", ""},
-		{"just hostname", "github.com", ""},
-		{"no repo", "https://github.com/acme", ""},
-		{"too many parts", "https://github.com/a/b/c", ""},
+		{"https github", githubCom, "https://github.com/acme/widgets.git", "acme/widgets"},
+		{"https github no .git", githubCom, "https://github.com/acme/widgets", "acme/widgets"},
+		{"https github trailing slash", githubCom, "https://github.com/acme/widgets/", "acme/widgets"},
+		{"ssh github", githubCom, "git@github.com:acme/widgets.git", "acme/widgets"},
+		{"ssh github no .git", githubCom, "git@github.com:acme/widgets", "acme/widgets"},
+		{"http github", githubCom, "http://github.com/acme/widgets.git", "acme/widgets"},
+		{"case preserved", githubCom, "https://GitHub.com/Acme/Widgets.git", "Acme/Widgets"},
+		{"github enterprise https", ghes, "https://github.example.com/org/repo.git", "org/repo"},
+		{"github enterprise ssh with port", ghes, "ssh://git@github.example.com:2222/org/repo.git", "org/repo"},
+		{"ssh with port, other hostname", ghes, "ssh://git@gitlab.example.com:2222/org/repo.git", ""},
+		{"ssh userinfo names the GHES host", ghes, "ssh://git@github.example.com@other.example/org/repo.git", ""},
+		{"scp-form userinfo names the GHES host", ghes, "git@github.example.com@other.example:org/repo.git", ""},
+		{"scp-form path is not owner/repo", ghes, "git@github.example.com:other", ""},
+		{"https with a non-default port", ghes, "https://github.example.com:8443/org/repo.git", ""},
+		{"empty", githubCom, "", ""},
+		{"just hostname", githubCom, "github.com", ""},
+		{"no repo", githubCom, "https://github.com/acme", ""},
+		{"too many parts", githubCom, "https://github.com/a/b/c", ""},
+
+		// Host match: only the configured GitHub host.
+		{"other host", githubCom, "https://gitlab.com/acme/widgets.git", ""},
+		{"other host ssh", githubCom, "git@gitlab.com:acme/widgets.git", ""},
+		{"lookalike host", githubCom, "https://github.com.other.example/acme/widgets", ""},
+		{"port is a different host", githubCom, "https://github.com:8443/acme/widgets", ""},
+		{"userinfo before another host", githubCom, "https://github.com@other.example/acme/widgets", ""},
+		{"github.com when GHES is configured", ghes, "https://github.com/acme/widgets.git", ""},
+		{"GHES host when github.com is configured", githubCom, "https://github.example.com/org/repo.git", ""},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := extractOwnerRepo(tc.remote)
+			result := tc.srv.githubOwnerRepo(tc.remote)
 			if result != tc.expected {
-				t.Errorf("extractOwnerRepo(%q) = %q, want %q", tc.remote, result, tc.expected)
-			}
-		})
-	}
-}
-
-func TestIsValidOwnerRepo(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected bool
-	}{
-		{"acme/widgets", true},
-		{"a/b", true},
-		{"", false},
-		{"acme", false},
-		{"/repo", false},
-		{"owner/", false},
-		{"a/b/c", false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
-			result := isValidOwnerRepo(tc.input)
-			if result != tc.expected {
-				t.Errorf("isValidOwnerRepo(%q) = %v, want %v", tc.input, result, tc.expected)
+				t.Errorf("githubOwnerRepo(%q) = %q, want %q", tc.remote, result, tc.expected)
 			}
 		})
 	}
@@ -313,12 +310,20 @@ func TestHandleGitHubWebhook_InstallationCreated(t *testing.T) {
 	srv, s := webhookTestServer(t)
 	ctx := context.Background()
 
+	// The project's creator proves access to the repository with their own
+	// GitHub token; a repo-name match alone does not associate.
+	giveUserGitHubToken(t, srv, s, "creator-1", "ghp_creator_1")
+	fakeCreatorAccess(srv, map[string]githubapp.RepoAccess{
+		"ghp_creator_1|acme/widgets": {Push: true, Pull: true},
+	})
+
 	// Create a project with a matching git remote
 	project := &store.Project{
 		ID:        tid("project-1"),
 		Name:      "Test Project",
 		Slug:      "test-project",
 		GitRemote: "https://github.com/acme/widgets.git",
+		CreatedBy: "creator-1",
 		Created:   time.Now(),
 		Updated:   time.Now(),
 	}
@@ -551,11 +556,19 @@ func TestMatchProjectsToInstallation(t *testing.T) {
 	srv, s := webhookTestServer(t)
 	ctx := context.Background()
 
+	// The creator proves access to every repository with their own token.
+	giveUserGitHubToken(t, srv, s, "creator-g", "ghp_creator_g")
+	fakeCreatorAccess(srv, map[string]githubapp.RepoAccess{
+		"ghp_creator_g|acme/widgets": {Push: true, Pull: true},
+		"ghp_creator_g|acme/api":     {Push: true, Pull: true},
+		"ghp_creator_g|other/repo":   {Push: true, Pull: true},
+	})
+
 	// Create projects with different git remotes
 	projects := []*store.Project{
-		{ID: tid("g1"), Name: "G1", Slug: tid("g1"), GitRemote: "https://github.com/acme/widgets.git", Created: time.Now(), Updated: time.Now()},
-		{ID: tid("g2"), Name: "G2", Slug: tid("g2"), GitRemote: "https://github.com/acme/api.git", Created: time.Now(), Updated: time.Now()},
-		{ID: tid("g3"), Name: "G3", Slug: tid("g3"), GitRemote: "https://github.com/other/repo.git", Created: time.Now(), Updated: time.Now()},
+		{ID: tid("g1"), Name: "G1", Slug: tid("g1"), GitRemote: "https://github.com/acme/widgets.git", CreatedBy: "creator-g", Created: time.Now(), Updated: time.Now()},
+		{ID: tid("g2"), Name: "G2", Slug: tid("g2"), GitRemote: "https://github.com/acme/api.git", CreatedBy: "creator-g", Created: time.Now(), Updated: time.Now()},
+		{ID: tid("g3"), Name: "G3", Slug: tid("g3"), GitRemote: "https://github.com/other/repo.git", CreatedBy: "creator-g", Created: time.Now(), Updated: time.Now()},
 		{ID: tid("g4"), Name: "G4", Slug: tid("g4"), Created: time.Now(), Updated: time.Now()}, // No git remote
 	}
 
@@ -569,6 +582,7 @@ func TestMatchProjectsToInstallation(t *testing.T) {
 		InstallationID: 12345,
 		AccountLogin:   "acme",
 		Repositories:   []string{"acme/widgets", "acme/api"},
+		Status:         store.GitHubInstallationStatusActive,
 	}
 	if err := s.CreateGitHubInstallation(ctx, installation); err != nil {
 		t.Fatalf("failed to create installation: %v", err)
@@ -880,11 +894,17 @@ func TestWebhook_PublishesProjectUpdatedOnAutoMatch(t *testing.T) {
 	recorder := &recordingEventPublisher{}
 	srv.events = recorder
 
+	giveUserGitHubToken(t, srv, s, "creator-3", "ghp_creator_3")
+	fakeCreatorAccess(srv, map[string]githubapp.RepoAccess{
+		"ghp_creator_3|acme/widgets": {Push: true, Pull: true},
+	})
+
 	// Create a project with a matching git remote but no installation yet
 	project := &store.Project{
 		ID:        tid("project-event-3"),
 		Name:      "Event Test Project 3",
 		Slug:      "event-test-project-3",
+		CreatedBy: "creator-3",
 		GitRemote: "https://github.com/acme/widgets.git",
 		Created:   time.Now(),
 		Updated:   time.Now(),
@@ -1315,7 +1335,7 @@ func TestHandleGitHubWebhook_StrategyD_Fallback(t *testing.T) {
 		ID:                     tid("proj-fallback-1"),
 		Name:                   "Proj Fallback 1",
 		Slug:                   "proj-fallback-1",
-		GitRemote:              "https://github.com/acme/widgets.git",
+		GitRemote:              ghServer.URL + "/acme/widgets.git",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -1562,7 +1582,7 @@ func TestHandleGitHubWebhook_ReviewCommand_Fallback(t *testing.T) {
 		ID:                     tid("proj-review-fallback-1"),
 		Name:                   "Proj Review Fallback 1",
 		Slug:                   "proj-review-fallback-1",
-		GitRemote:              "https://github.com/acme/widgets.git",
+		GitRemote:              ghServer.URL + "/acme/widgets.git",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -1895,7 +1915,7 @@ func TestHandleGitHubWebhook_ValidateCommand_Fallback(t *testing.T) {
 		ID:                     tid("proj-validate-fallback-1"),
 		Name:                   "Proj Validate Fallback 1",
 		Slug:                   "proj-validate-fallback-1",
-		GitRemote:              "https://github.com/acme/widgets.git",
+		GitRemote:              ghServer.URL + "/acme/widgets.git",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2065,7 +2085,7 @@ func TestHandleGitHubWebhook_TemplateResolution(t *testing.T) {
 		ID:                     tid("proj-tpl-1"),
 		Name:                   "Proj Tpl 1",
 		Slug:                   "proj-tpl-1",
-		GitRemote:              "https://github.com/acme/widgets.git",
+		GitRemote:              ghServer.URL + "/acme/widgets.git",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2304,7 +2324,7 @@ profiles:
 		ID:                     tid("proj-srvtpl-1"),
 		Name:                   "Proj SrvTpl 1",
 		Slug:                   "proj-srvtpl-1",
-		GitRemote:              "https://github.com/acme/widgets.git",
+		GitRemote:              ghServer.URL + "/acme/widgets.git",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2474,7 +2494,7 @@ func TestHandleGitHubWebhook_TemplateResolution_Database(t *testing.T) {
 		ID:                     tid("proj-srvtpl-2"),
 		Name:                   "Proj SrvTpl 2",
 		Slug:                   "proj-srvtpl-2",
-		GitRemote:              "https://github.com/acme/widgets.git",
+		GitRemote:              ghServer.URL + "/acme/widgets.git",
 		GitHubInstallationID:   &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID,
 		Created:                time.Now(),
@@ -2991,7 +3011,7 @@ func TestHandleGitHubWebhook_NoAppropriateProjectCommentBack(t *testing.T) {
 		ID:        tid("proj-inappropriate-1"),
 		Name:      "Proj Inappropriate 1",
 		Slug:      "proj-inappropriate-1",
-		GitRemote: "https://github.com/acme/widgets.git",
+		GitRemote: ghServer.URL + "/acme/widgets.git",
 		Labels: map[string]string{
 			store.LabelWorkspaceMode: store.WorkspaceModeShared,
 		},
@@ -3147,7 +3167,7 @@ func TestHandleGitHubWebhook_FallbackToPRReviewComment(t *testing.T) {
 		ID:        tid("proj-inappropriate-1"),
 		Name:      "Proj Inappropriate 1",
 		Slug:      "proj-inappropriate-1",
-		GitRemote: "https://github.com/acme/widgets.git",
+		GitRemote: ghServer.URL + "/acme/widgets.git",
 		Labels: map[string]string{
 			store.LabelWorkspaceMode: store.WorkspaceModeShared,
 		},
@@ -3245,7 +3265,7 @@ func TestHandleGitHubWebhook_PlanCommand(t *testing.T) {
 	}
 	project := &store.Project{
 		ID: tid("proj-plan-1"), Name: "Proj Plan 1", Slug: "proj-plan-1",
-		GitRemote: "https://github.com/acme/plan-widgets.git", GitHubInstallationID: &instID,
+		GitRemote: ghServer.URL + "/acme/plan-widgets.git", GitHubInstallationID: &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID, Created: time.Now(), Updated: time.Now(),
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
@@ -3343,7 +3363,7 @@ func TestHandleGitHubWebhook_ImplementCommand(t *testing.T) {
 	}
 	project := &store.Project{
 		ID: tid("proj-implement-1"), Name: "Proj Implement 1", Slug: "proj-implement-1",
-		GitRemote: "https://github.com/acme/implement-widgets.git", GitHubInstallationID: &instID,
+		GitRemote: ghServer.URL + "/acme/implement-widgets.git", GitHubInstallationID: &instID,
 		DefaultRuntimeBrokerID: brokerObj.ID, Created: time.Now(), Updated: time.Now(),
 	}
 	if err := s.CreateProject(ctx, project); err != nil {

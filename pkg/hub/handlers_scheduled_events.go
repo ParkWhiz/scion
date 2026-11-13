@@ -38,6 +38,8 @@ type CreateScheduledEventRequest struct {
 	Message   string `json:"message,omitempty"`
 	Interrupt bool   `json:"interrupt,omitempty"`
 	Plain     bool   `json:"plain,omitempty"`
+	// Wake resumes a suspended target before delivery (ptone/scion#7734).
+	Wake bool `json:"wake,omitempty"`
 
 	// There is no top-level raw convenience field. This request surface
 	// never accepted one: a "raw" key here is an unknown field that JSON
@@ -321,6 +323,10 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", req.EventType), nil)
 		return
 	}
+	if req.Wake && req.EventType != "message" {
+		ValidationError(w, "wake applies to message events only", nil)
+		return
+	}
 	// The payload "raw" tombstone applies to both supported event types:
 	// the advanced Payload field is accepted verbatim for "dispatch_agent"
 	// too, and neither payload type has a raw field. A "raw" key (any case,
@@ -391,6 +397,10 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 			ValidationError(w, "agentName is required for dispatch_agent events", nil)
 			return
 		}
+		if !templateRefAllowed(req.Template) {
+			ValidationError(w, templateRefRefusal, nil)
+			return
+		}
 		p := DispatchAgentEventPayload{
 			AgentName: req.AgentName,
 			Template:  req.Template,
@@ -420,6 +430,7 @@ func (s *Server) createScheduledEvent(w http.ResponseWriter, r *http.Request, pr
 			Message:   req.Message,
 			Interrupt: req.Interrupt,
 			Plain:     req.Plain,
+			Wake:      req.Wake,
 		}
 		payloadBytes, err := json.Marshal(p)
 		if err != nil {

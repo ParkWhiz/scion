@@ -123,6 +123,10 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/env/":     "authenticated", // Env var by key
 	"/api/v1/secrets":  "authenticated", // List/create secrets
 	"/api/v1/secrets/": "authenticated", // Secret by key
+	// Caller's own pending secrets (agent-written, awaiting approval);
+	// session-only, own user ID only (resolveEnvSecretAccess).
+	"/api/v1/pending-secrets":  "authenticated",
+	"/api/v1/pending-secrets/": "authenticated",
 
 	// ── Usage ──────────────────────────────────────────────────────────
 	"/api/v1/usage/me": "authenticated", // Caller's own quota usage
@@ -166,10 +170,12 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/brokers/":     "authenticated", // Broker by ID routes
 
 	// ── Broker plugin endpoints ────────────────────────────────────────
-	"/api/v1/broker/inbound":        "broker-hmac", // Broker inbound messages — broker HMAC
-	"/api/v1/broker/inbound/routed": "broker-hmac", // Broker inbound routed messages — broker HMAC
-	"/api/v1/broker/callback":       "broker-hmac", // Broker callback delivery — broker HMAC
-	"/api/v1/broker/projects":       "broker-hmac", // Broker project listing — broker HMAC
+	"/api/v1/broker/inbound":                   "broker-hmac", // Broker inbound messages — broker HMAC
+	"/api/v1/broker/inbound/routed":            "broker-hmac", // Broker inbound routed messages — broker HMAC
+	"/api/v1/broker/inbound/attachments":       "broker-hmac", // Broker attachment upload — broker HMAC; sender authorized in handler
+	"/api/v1/broker/inbound/attachments/check": "broker-hmac", // Broker attachment check — broker HMAC; writes nothing
+	"/api/v1/broker/callback":                  "broker-hmac", // Broker callback delivery — broker HMAC
+	"/api/v1/broker/projects":                  "broker-hmac", // Broker project listing — broker HMAC
 
 	// ── Admin system endpoints ─────────────────────────────────────────
 	"/api/v1/admin/maintenance":                  "admin", // Maintenance mode — requires admin role
@@ -180,6 +186,7 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/admin/maintenance/update-available": "admin", // Update availability status
 	"/api/v1/admin/maintenance/restart":          "admin", // Restart hub
 	"/api/v1/admin/maintenance/update-status":    "admin", // Update status (version, installer, last update)
+	"/api/v1/admin/maintenance/releases":         "admin", // Release catalog per channel
 	"/api/v1/admin/scheduler":                    "admin", // Scheduler status
 	"/api/v1/admin/allow-list":                   "admin", // Allow list management
 	"/api/v1/admin/allow-list/":                  "admin", // Allow list by email
@@ -205,12 +212,15 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/admin/diagnostics/logs/stream":      "admin", // Diagnostics log stream
 	"/api/v1/admin/diagnostics/logs":             "admin", // Diagnostics logs
 	"/api/v1/admin/health/summary":               "admin", // Health summary
+	"/api/v1/admin/orphaned-agents":              "admin", // Orphaned and revoked agents (session only)
 	"/api/v1/admin/messaging":                    "admin", // Admin messaging
 	"/api/v1/admin/messaging/divergence":         "admin", // Admin messaging divergence check
 	"/api/v1/admin/experiments":                  "admin", // Admin experiment overrides
 	"/api/v1/admin/profiling":                    "admin", // Admin profiling switches (session only)
+	"/api/v1/admin/chat-retention":               "admin", // Admin chat retention settings (session only)
 	"/api/v1/admin/conduit/grant-keys/rotate":    "admin", // POST: rotate the conduit grant signing key; returns kids and timestamps only; 404 when hub.conduit is off
 	"/api/v1/admin/conduit/grant-keys/revoke":    "admin", // POST {kid}: revoke a conduit grant key at once; returns the kid only; 404 when hub.conduit is off
+	"/api/v1/admin/keys/status":                  "admin", // GET: this instance's server key status report (IDs, deadlines, counts; never key material); platform admin only; 404 when server.secret_rotation is off
 	"/api/v1/admin/limits":                       "admin", // Admin limits
 	"/api/v1/admin/limits/":                      "admin", // Admin limit by ID
 	"/api/v1/admin/entitlements/":                "admin", // Admin entitlement by ID
@@ -265,6 +275,8 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/chat/user-prefs":            "authenticated", // Chat user preferences
 	"/api/v1/chat/presence":              "authenticated", // Chat presence
 	"/api/v1/chat/search":                "authenticated", // Chat search
+	"/api/v1/decisions/":                 "authenticated", // Choice prompt decisions (read, answer)
+	"/api/v1/choice-prompts/":            "authenticated", // Choice prompt set answers
 	"/api/v1/chat/stars":                 "authenticated", // Caller's starred messages in one conversation; 404 when the experiment is off
 	"/api/v1/chat/stars/":                "authenticated", // Star state, star detail, star add/remove (caller's own); 404 when the experiment is off
 	"/api/v1/chat/starred-conversations": "authenticated", // Caller's conversations with starred messages (the Starred rail); 404 when the experiment is off
@@ -283,6 +295,9 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/artifacts/":        "authenticated", // Artifact by ID; service checks artifact.* through artifacts.Host; 404 when the experiment is off
 	"/api/v1/artifacts/shared/": "public",        // GET/HEAD: share-link read; the service resolves the link token in the path (hashed, one lookup) and answers 303 to the view route; rate limited; no session used; 404 when the experiment is off
 	"/api/v1/artifacts/view/":   "public",        // GET/HEAD: one version's files under a short-lived view capability in the path, verified by the service on every request (no session used); 404 when the experiment is off
+
+	// ── Port page view (hub.port_view experiment) ─────────────────────
+	"/api/v1/portview/": "public", // ANY: an agent's exposed port served on the short-lived page link in the path, checked with the user's port access on every request (no session used for access); 404 when the experiment is off
 
 	// ── Agent GCP identity ─────────────────────────────────────────────
 	"/api/v1/agent/gcp-token":          "agent-token", // Agent GCP access token
@@ -352,6 +367,9 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/system/apple-dns":            "workstation",       // Apple DNS helper
 	"/api/v1/system/registry":             "workstation",       // System registry
 	"/api/v1/system/workstation-settings": "workstation-admin", // Workstation settings
+	"/api/v1/system/welcome/preview":      "workstation-admin", // Welcome project preview
+	"/api/v1/system/welcome/install":      "workstation-admin", // Welcome project install
+	"/api/v1/system/welcome/skip":         "workstation-admin", // Welcome project skip
 
 	// ── Workstation-only filesystem endpoints ──────────────────────────
 	"/api/v1/system/fs/list":          "workstation", // Filesystem listing

@@ -21,6 +21,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentdelegationgrant"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agenthold"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentidentitykey"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentlifecyclecursor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentlifecycleoutbox"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentrecovery"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentreincarnation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentserviceaccountassignment"
@@ -34,10 +36,15 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokersetting"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokertargetinventory"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatlinkcode"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatretentioncursor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/chatretentionrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/conduitprincipalepoch"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/conduitsession"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/conversation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/conversationparticipant"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/decision"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/decisionanswer"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/decisionkeycounter"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/delegationadoption"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/delegationedge"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/entitlementbinding"
@@ -69,6 +76,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/noncecache"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notificationsubscription"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/pendingsecret"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/projectcontributor"
@@ -97,6 +105,8 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/usagereservation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/user"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/useraccesstoken"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletion"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/userdeletionagent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/userterminalworkspace"
 )
 
@@ -167,6 +177,8 @@ func checkColumn(t, c string) error {
 			agentdelegationgrant.Table:          agentdelegationgrant.ValidColumn,
 			agenthold.Table:                     agenthold.ValidColumn,
 			agentidentitykey.Table:              agentidentitykey.ValidColumn,
+			agentlifecyclecursor.Table:          agentlifecyclecursor.ValidColumn,
+			agentlifecycleoutbox.Table:          agentlifecycleoutbox.ValidColumn,
 			agentrecovery.Table:                 agentrecovery.ValidColumn,
 			agentreincarnation.Table:            agentreincarnation.ValidColumn,
 			agentserviceaccountassignment.Table: agentserviceaccountassignment.ValidColumn,
@@ -180,10 +192,15 @@ func checkColumn(t, c string) error {
 			brokersetting.Table:                 brokersetting.ValidColumn,
 			brokertargetinventory.Table:         brokertargetinventory.ValidColumn,
 			chatlinkcode.Table:                  chatlinkcode.ValidColumn,
+			chatretentioncursor.Table:           chatretentioncursor.ValidColumn,
+			chatretentionrun.Table:              chatretentionrun.ValidColumn,
 			conduitprincipalepoch.Table:         conduitprincipalepoch.ValidColumn,
 			conduitsession.Table:                conduitsession.ValidColumn,
 			conversation.Table:                  conversation.ValidColumn,
 			conversationparticipant.Table:       conversationparticipant.ValidColumn,
+			decision.Table:                      decision.ValidColumn,
+			decisionanswer.Table:                decisionanswer.ValidColumn,
+			decisionkeycounter.Table:            decisionkeycounter.ValidColumn,
 			delegationadoption.Table:            delegationadoption.ValidColumn,
 			delegationedge.Table:                delegationedge.ValidColumn,
 			entitlementbinding.Table:            entitlementbinding.ValidColumn,
@@ -215,6 +232,7 @@ func checkColumn(t, c string) error {
 			noncecache.Table:                    noncecache.ValidColumn,
 			notification.Table:                  notification.ValidColumn,
 			notificationsubscription.Table:      notificationsubscription.ValidColumn,
+			pendingsecret.Table:                 pendingsecret.ValidColumn,
 			policybinding.Table:                 policybinding.ValidColumn,
 			project.Table:                       project.ValidColumn,
 			projectcontributor.Table:            projectcontributor.ValidColumn,
@@ -243,6 +261,8 @@ func checkColumn(t, c string) error {
 			usagereservation.Table:              usagereservation.ValidColumn,
 			user.Table:                          user.ValidColumn,
 			useraccesstoken.Table:               useraccesstoken.ValidColumn,
+			userdeletion.Table:                  userdeletion.ValidColumn,
+			userdeletionagent.Table:             userdeletionagent.ValidColumn,
 			userterminalworkspace.Table:         userterminalworkspace.ValidColumn,
 		})
 	})

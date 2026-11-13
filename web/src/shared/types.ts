@@ -83,7 +83,8 @@ export interface AdminUser {
   displayName: string;
   avatarUrl?: string;
   role: UserRole;
-  status: 'active' | 'suspended' | 'invited';
+  /** deleting: a forced deletion of the user is in progress. */
+  status: 'active' | 'suspended' | 'invited' | 'deleting';
   created: string;
   lastLogin?: string;
   lastSeen?: string;
@@ -878,8 +879,19 @@ export interface AgentFieldEditState {
   sessionSensitive?: boolean;
   /** "session" for a session-sensitive field of a suspended agent. */
   note?: string;
-  /** Clearing or zeroing the field takes effect only at the next reincarnation. */
+  /** Clearing the field takes effect only at the next reincarnation. */
   clearNeedsReincarnate?: boolean;
+  /**
+   * On a count limit: the agent's broker cannot apply Unlimited (0), so the
+   * hub refuses a change to it (unlimitedCountLimits capability).
+   */
+  unlimitedUnsupported?: boolean;
+  /**
+   * On config.resources: the agent's broker does not apply a removed
+   * resources sub-field at a start (clearedResourceSubfields capability), so
+   * the removal takes effect only at the next reincarnation.
+   */
+  subfieldClearUnsupported?: boolean;
   /** Why a locked field is locked. */
   reason?: string;
 }
@@ -927,6 +939,27 @@ export interface AgentUpdateDisposition {
 
 /** A model size alias (pkg/config KnownModelAliases). */
 export type AgentModelSize = 'small' | 'medium' | 'large' | 'extra-large';
+
+/** The principal an {@link AgentAuthority} cause names. */
+export interface AgentAuthorityPrincipal {
+  /** "user" or "agent". */
+  kind: string;
+  /** Set only for a reader who may read that principal. */
+  id?: string;
+  deleted: boolean;
+}
+
+/**
+ * An agent's authority state (ptone/scion#2143). `orphaned` and `revoked`
+ * agents are denied every request that needs their delegation.
+ */
+export interface AgentAuthority {
+  /** "live", "orphaned", "revoked" or "unrecorded". */
+  state: string;
+  cause?: string;
+  principal?: AgentAuthorityPrincipal;
+  since?: string;
+}
 
 /**
  * Agent information from the Hub API
@@ -1024,6 +1057,11 @@ export interface Agent {
   // sends this key on REST agents and SSE status deltas; an explicit `null`
   // means no delete is active and must clear any earlier value.
   deletion?: DeletionInfo | null;
+
+  // The agent's authority state, computed by the hub at read
+  // (ptone/scion#2143): always on the single-agent GET, and on list items
+  // when the request carries include=authority. Absent means unknown.
+  authority?: AgentAuthority | null;
 
   // Computed by the hub: provisioned but never asked to run
   // (ptone/scion#2929). Absent means false.
@@ -1309,6 +1347,11 @@ export interface PresentedTarget {
   nodeSelector?: Record<string, string>;
   tolerations?: PresentedToleration[];
   runtimeClassName?: string;
+  /**
+   * True only when the instance reports placement. Absent or false means
+   * "not reported" (an older instance), not "no placement".
+   */
+  placementReported?: boolean;
 }
 
 /**
@@ -1638,6 +1681,124 @@ export interface Message {
   authorizingUserId?: string;
   /** The delegation grant of a message sent with an agent delegated credential. */
   delegationGrantId?: string;
+  /**
+   * Choice prompt decisions (messageType "choice-prompt"). Present only while
+   * the web.chat_choices experiment is on: from the history side map
+   * messageDecisions or inline on the live chat.message event.
+   */
+  decisions?: DecisionView[];
+  /** The prompt's intro without the hub's markdown fallback. */
+  choiceIntro?: string;
+  /** "single" for one decision, "set" for 2 or more (one submit answers all). */
+  answerMode?: ChoiceAnswerMode;
+  /** One-click answer carried by a "choice-response" message. */
+  choiceResponse?: ChoiceResponseView;
+  /** Set submit carried by a "choice-response" message. */
+  choiceResponseSet?: ChoiceResponseSetView;
+}
+
+// ---------------------------------------------------------------------------
+// Choices (mirror of pkg/hub/choices_view.go)
+// ---------------------------------------------------------------------------
+
+export type ChoiceAnswerMode = 'single' | 'set';
+
+/** One option of a decision (pkg/messages Choice). */
+export interface ChoiceOption {
+  id: string;
+  label: string;
+  /** Inline markdown. */
+  description?: string;
+}
+
+/** The version that replaced a decision. */
+export interface DecisionReplacedBy {
+  rowId: string;
+  messageId: string;
+  version: number;
+  at: string;
+}
+
+/** An answer as clients see it (AnswerView). */
+export interface AnswerView {
+  choiceId: string;
+  label: string;
+  answeredByUserId?: string;
+  answeredByName?: string;
+  answeredByEmail?: string;
+  /** "direct" or "agent_interpreted". */
+  provenance: string;
+  /** "answer", "confirm" or "override". */
+  outcome?: string;
+  interpretedByAgentId?: string;
+  sourceMessageId?: string;
+  surface: string;
+  responseMessageId: string;
+  batchId?: string;
+  matchedDefault?: boolean;
+  at: string;
+}
+
+/** One version of a decision as clients see it (DecisionView). */
+export interface DecisionView {
+  rowId: string;
+  messageId: string;
+  key: string;
+  ref: string;
+  version: number;
+  /** "pending", "decided" or "replaced". */
+  status: 'pending' | 'decided' | 'replaced' | (string & {});
+  askerAgentId: string;
+  askerAgentName: string;
+  /** Markdown. */
+  question: string;
+  defaultChoiceId?: string;
+  choices: ChoiceOption[];
+  replacedBy?: DecisionReplacedBy;
+  /** The effective answer; absent while pending. */
+  decision?: AnswerView;
+}
+
+/** What a choice-response row of a one-click answer carries. */
+export interface ChoiceResponseView {
+  rowId: string;
+  ref: string;
+  key: string;
+  version: number;
+  question: string;
+  choiceId: string;
+  label: string;
+  provenance: string;
+  promptMessageId: string;
+  sourceMessageId?: string;
+}
+
+/** One answer of a ChoiceResponseSetView. */
+export interface ChoiceResponseSetAnswer {
+  rowId: string;
+  ref: string;
+  key: string;
+  version: number;
+  question: string;
+  choiceId: string;
+  label: string;
+  provenance: string;
+  outcome: string;
+  matchedDefault: boolean;
+}
+
+/** What the choice-response row of a set submit carries, in position order. */
+export interface ChoiceResponseSetView {
+  promptMessageId: string;
+  batchId: string;
+  answers: ChoiceResponseSetAnswer[];
+}
+
+/** Payload of the chat.choice.updated SSE event. */
+export interface ChoiceUpdatedEvent {
+  decision: DecisionView;
+  messageId: string;
+  threadId: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,6 +1820,18 @@ export interface Notification {
   dispatched: boolean;
   acknowledged: boolean;
   createdAt: string;
+  /** What produced the notification (for example "artifact_grant"); absent when not classified. */
+  kind?: string;
+  /** The kind of thing the notification is about (for example "artifact"); absent otherwise. */
+  resourceType?: string;
+  /** The id of the thing the notification is about; absent otherwise. */
+  resourceId?: string;
+  /**
+   * Text another principal wrote, kept apart from `message`: for an
+   * "artifact_review_summary" row, the start of the reviewer's summary note.
+   * Render it as plain text only; absent for other kinds.
+   */
+  excerpt?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,7 +1871,22 @@ export interface Subscription {
  */
 export interface Capabilities {
   actions: string[];
+  /**
+   * Project self-leave (ptone/scion#7494): on a project's `_capabilities`
+   * only, and only while the hub's project-self-leave experiment is on.
+   * True when a leave would remove at least one of the caller's direct
+   * bindings. Absent means the action is not offered.
+   */
+  canLeave?: boolean;
+  /**
+   * Why a leave is blocked, when `canLeave` is false: a {@link LeaveBlockedReason}
+   * (an unknown value is treated as no reason).
+   */
+  leaveBlockedReason?: string;
 }
+
+/** Values of `leaveBlockedReason` on project and membership capabilities. */
+export type LeaveBlockedReason = 'last_owner' | 'group_derived';
 
 /**
  * Membership-specific capabilities returned in the project members API
@@ -1718,6 +1906,10 @@ export interface MembershipCapabilities {
    * Optional: absent means false.
    */
   canManageCustomRoles?: boolean;
+  /** Project self-leave; same meaning as on {@link Capabilities}. */
+  canLeave?: boolean;
+  /** Why a leave is blocked; same meaning as on {@link Capabilities}. */
+  leaveBlockedReason?: string;
 }
 
 /**

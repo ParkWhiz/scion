@@ -108,6 +108,23 @@ func TestSyncStart_ReplacesFailedAsyncStartLaunchError(t *testing.T) {
 	}
 }
 
+// TestSyncStart_TokenShapedBrokerMessageNotRelayed: a failed start's generic
+// 502 carries the broker's code and, for a message with a token shape, the
+// generic text in its place (brokerRecordText), never the token or the
+// raw body.
+func TestSyncStart_TokenShapedBrokerMessageNotRelayed(t *testing.T) {
+	startErr := fakeBrokerStartErr(t, http.StatusInternalServerError, brokerErrorBody("runtime_error", "auth failed with "+testTokenShaped))
+	disp := &skillFailDispatcher{startErr: startErr}
+	srv, s, project := setupCreateAgentServer(t, disp)
+	agent := createLifecycleTestAgent(t, s, project, "sync-start-token", state.PhaseStopped)
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents/"+agent.ID+"/start", nil)
+	require.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "runtime broker returned error 500 (runtime_error): "+brokerErrorGenericMessage)
+	assert.NotContains(t, rec.Body.String(), testTokenShaped)
+	assert.NotContains(t, rec.Body.String(), "auth failed")
+}
+
 // TestSyncStart_KeepsUnconfirmedLaunchOutcome covers an ended start launch
 // whose outcome the hub declared without the broker (broker_lost,
 // launch_timeout), followed by two failed synchronous starts
@@ -147,8 +164,9 @@ func TestSyncStart_KeepsUnconfirmedLaunchOutcome(t *testing.T) {
 // keptCreateHeartbeatAgent stores an agent in phase starting with an empty
 // applied config and run run-1, as a create looks when the hub kept it after
 // an unknown dispatch outcome; claimKind and claimState say which claim it
-// holds (state "" for none), and runtime is its stored runtime.
-func keptCreateHeartbeatAgent(t *testing.T, s store.Store, broker *store.RuntimeBroker, project *store.Project, name string, claimKind store.StartClaimKind, claimState store.StartClaimState, runtime string) *store.Agent {
+// holds (state "" for none), and runtime is its stored runtime. Each opt
+// changes the agent before it is stored.
+func keptCreateHeartbeatAgent(t *testing.T, s store.Store, broker *store.RuntimeBroker, project *store.Project, name string, claimKind store.StartClaimKind, claimState store.StartClaimState, runtime string, opts ...func(*store.Agent)) *store.Agent {
 	t.Helper()
 	ctx := context.Background()
 	agent := &store.Agent{
@@ -157,6 +175,9 @@ func keptCreateHeartbeatAgent(t *testing.T, s store.Store, broker *store.Runtime
 		Phase:         string(state.PhaseStarting),
 		Runtime:       runtime,
 		AppliedConfig: &store.AgentAppliedConfig{},
+	}
+	for _, opt := range opts {
+		opt(agent)
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent))
 	_, err := s.SetAgentRunID(ctx, agent.ID, "run-1", nil)
@@ -239,6 +260,85 @@ func TestHeartbeat_KeptCreateGetsResolvedConfig(t *testing.T) {
 				assert.Empty(t, got.AppliedConfig.Image, "this heartbeat must not record an image")
 				assert.Equal(t, c.agentRuntime, got.Runtime, "this heartbeat must not record a runtime")
 			}
+		})
+	}
+}
+
+// TestHeartbeat_KeptCreateRecordsHarnessAuthAndProfile pins which of the
+// harness auth and profile a kept create's heartbeat records
+// (ptone/scion#6232). The agent starts with both already stored, so only the
+// kept-create path can change them: with every gate met (an unconfirmed
+// create claim and the entry's own run ID), the reported values replace the
+// stored ones; an empty reported value keeps the stored one; with any gate
+// unmet, neither changes.
+func TestHeartbeat_KeptCreateRecordsHarnessAuthAndProfile(t *testing.T) {
+	const (
+		storedAuth      = "stored-auth"
+		storedProfile   = "stored-profile"
+		reportedAuth    = "reported-auth"
+		reportedProfile = "reported-profile"
+	)
+	cases := []struct {
+		name        string
+		claimKind   store.StartClaimKind
+		claimState  store.StartClaimState
+		runID       string
+		hbAuth      string
+		hbProfile   string
+		pinned      bool
+		wantAuth    string
+		wantProfile string
+	}{
+		{"kept create, own run, reported values replace stored", store.StartClaimCreate, store.StartClaimUnconfirmed, "run-1", reportedAuth, reportedProfile, false, reportedAuth, reportedProfile},
+		{"kept create, own run, empty values keep stored", store.StartClaimCreate, store.StartClaimUnconfirmed, "run-1", "", "", false, storedAuth, storedProfile},
+		{"kept create, other run", store.StartClaimCreate, store.StartClaimUnconfirmed, "run-other", reportedAuth, reportedProfile, false, storedAuth, storedProfile},
+		{"kept create, no run ID", store.StartClaimCreate, store.StartClaimUnconfirmed, "", reportedAuth, reportedProfile, false, storedAuth, storedProfile},
+		{"kept start claim, own run", store.StartClaimUser, store.StartClaimUnconfirmed, "run-1", reportedAuth, reportedProfile, false, storedAuth, storedProfile},
+		{"live create claim", store.StartClaimCreate, store.StartClaimLive, "run-1", reportedAuth, reportedProfile, false, storedAuth, storedProfile},
+		{"no claim", store.StartClaimCreate, "", "run-1", reportedAuth, reportedProfile, false, storedAuth, storedProfile},
+		// Pins current behaviour, which matches the dispatch-answer path
+		// (both use store.ApplyBrokerAgentConfig): a pinned agent keeps its
+		// stored profile, and its harness auth is the reported value.
+		{"pinned agent, kept create, own run", store.StartClaimCreate, store.StartClaimUnconfirmed, "run-1", reportedAuth, reportedProfile, true, reportedAuth, storedProfile},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, s := testServer(t)
+			grantDevUserRuntimeBrokerAccess(t, s)
+			broker, project := newQuotaTestBrokerAndProject(t, s, "kept-auth")
+			agent := keptCreateHeartbeatAgent(t, s, broker, project, "kept-auth-agent", c.claimKind, c.claimState, "", func(a *store.Agent) {
+				a.AppliedConfig.HarnessAuth = storedAuth
+				a.AppliedConfig.Profile = storedProfile
+				if c.pinned {
+					a.PinnedRuntimeBrokerID, a.PinnedRuntimeTargetID, a.PinnedRuntimeTargetType = broker.ID, "t-1", "docker"
+				}
+			})
+			before, err := s.GetAgent(context.Background(), agent.ID)
+			require.NoError(t, err)
+			require.NotNil(t, before.AppliedConfig)
+			require.Equal(t, storedAuth, before.AppliedConfig.HarnessAuth, "setup: harness auth stored")
+			require.Equal(t, storedProfile, before.AppliedConfig.Profile, "setup: profile stored")
+			require.Equal(t, c.pinned, before.IsPinned(), "setup: pin stored")
+
+			code := sendHeartbeat(t, srv, broker.ID, project.ID, brokerAgentHeartbeat{
+				Slug:            agent.Slug,
+				Phase:           "running",
+				Activity:        "working",
+				ContainerStatus: "Up 2 seconds",
+				RunID:           c.runID,
+				Template:        "resolved-template",
+				HarnessConfig:   "resolved-harness-config",
+				HarnessAuth:     c.hbAuth,
+				Image:           "registry.example/resolved:v1",
+				Profile:         c.hbProfile,
+			})
+			require.Equal(t, http.StatusOK, code)
+
+			got, err := s.GetAgent(context.Background(), agent.ID)
+			require.NoError(t, err)
+			require.NotNil(t, got.AppliedConfig)
+			assert.Equal(t, c.wantAuth, got.AppliedConfig.HarnessAuth, "recorded harness auth")
+			assert.Equal(t, c.wantProfile, got.AppliedConfig.Profile, "recorded profile")
 		})
 	}
 }

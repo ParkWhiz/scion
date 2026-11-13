@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
@@ -70,6 +72,11 @@ type ConduitExternalOptions struct {
 	PeerAuth relay.PeerAuth
 	// HTTPClient performs the internal calls to relays (nil: default).
 	HTTPClient *http.Client
+	// HopTLS is the TLS client configuration of every internal hop call
+	// to the relays, the ingress proxy leg included (relay.NewHopClientTLS;
+	// nil: the system roots). Used when HTTPClient is nil. Verification is
+	// never skipped.
+	HopTLS *tls.Config
 	// Ingress is the conduit ingress mode (config.ConduitIngressProxy or
 	// config.ConduitIngressRedirect; "" = proxy). Startup refuses redirect
 	// for now, so only proxy serves dials; any other value refuses them.
@@ -81,7 +88,10 @@ type ConduitExternalOptions struct {
 	// readiness gauge carries it as the cause attribute.
 	IngressOffCause string
 	// LifetimeCap is the hub's conduit session lifetime cap, sent to relays
-	// on the ingress leg (0 = config.ConduitDefaultLifetimeCap).
+	// on the ingress leg (0 = config.ConduitDefaultLifetimeCap). With a
+	// declared platform request timeout it is the top of the relays'
+	// per-session jitter range (config.ConduitLifetimeCapCeiling), so it
+	// bounds the sessions without undoing their jitter.
 	LifetimeCap time.Duration
 	// AuthzRecheckInterval overrides ServerConfig.ConduitAuthzRecheckInterval
 	// (0 = use it; negative disables the sweep, for tests).
@@ -136,6 +146,9 @@ type conduitExternalRuntime struct {
 	// legs counts the hub's open proxied legs; the drain step holds them
 	// and closes the ones left at its deadline.
 	legs conduitIngressLegs
+	// ingressPending holds this hub's placements the relays' session
+	// counts may not include yet (see conduitIngressPending).
+	ingressPending conduitIngressPending
 }
 
 // StartConduitExternal starts the hub's side of external relay mode: the
@@ -151,7 +164,7 @@ func (s *Server) StartConduitExternal(ctx context.Context, opts ConduitExternalO
 		return errors.New("conduit already started")
 	}
 	// Admission tokens minted on one hub replica must open on every other.
-	if _, err := s.conduitAdmissionAEAD(); err != nil {
+	if err := s.checkConduitAdmissionKeys(); err != nil {
 		return fmt.Errorf("conduit external relay mode: %w", err)
 	}
 	if opts.PeerAuth == nil {
@@ -198,7 +211,15 @@ func (s *Server) StartConduitExternal(ctx context.Context, opts ConduitExternalO
 	if id == "" {
 		id = ConduitInstanceID("")
 	}
-	peers := &relay.PeerClient{HTTP: opts.HTTPClient, Auth: opts.PeerAuth}
+	httpClient := opts.HTTPClient
+	var hopWS *websocket.Dialer
+	if opts.HopTLS != nil {
+		hopWS = relay.NewHopWSDialer(opts.HopTLS)
+		if httpClient == nil {
+			httpClient = relay.NewHopHTTPClient(opts.HopTLS)
+		}
+	}
+	peers := &relay.PeerClient{HTTP: httpClient, WS: hopWS, Auth: opts.PeerAuth}
 	rtr, err := router.New(router.Config{
 		Registry: reg,
 		Store:    st,
@@ -227,8 +248,8 @@ func (s *Server) StartConduitExternal(ctx context.Context, opts ConduitExternalO
 	if rt.lifetimeCap <= 0 {
 		rt.lifetimeCap = config.ConduitDefaultLifetimeCap
 	}
-	if opts.HTTPClient != nil && opts.HTTPClient.Transport != nil {
-		rt.ingressTransport = newConduitIngressTransport(opts.HTTPClient.Transport, conduitIngressResponseHeaderTimeout)
+	if httpClient != nil && httpClient.Transport != nil {
+		rt.ingressTransport = newConduitIngressTransport(httpClient.Transport, conduitIngressResponseHeaderTimeout)
 	}
 	s.conduitEligibleRelays.Store(-1)
 	if !s.conduitExternal.CompareAndSwap(nil, rt) {

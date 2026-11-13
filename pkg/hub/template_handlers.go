@@ -288,6 +288,14 @@ func (s *Server) listTemplatesV2(w http.ResponseWriter, r *http.Request) {
 		filter.Status = store.TemplateStatusActive
 	}
 
+	// An agent delegated credential lists project-scoped templates only, with
+	// its scope from the delegated list arm (.design/agent-delegation.md
+	// §11.8). It is not a user: scope=user lists nothing for it.
+	if d, ok := GetIdentityFromContext(ctx).(*DelegatedAgentIdentity); ok && d != nil {
+		s.listTemplatesDelegated(w, r, d, filter)
+		return
+	}
+
 	// When listing without explicit scope, include user-scoped templates
 	// for the authenticated user in the resolution results.
 	switch filter.Scope {
@@ -366,6 +374,9 @@ func (s *Server) createTemplateV2(w http.ResponseWriter, r *http.Request) {
 	// Validate required fields
 	if req.Name == "" {
 		ValidationError(w, "name is required", nil)
+		return
+	}
+	if refuseNonComponentResourceName(w, req.Name) {
 		return
 	}
 	if !isValidTemplateScope(req.Scope) {
@@ -499,7 +510,7 @@ func (s *Server) createTemplateV2(w http.ResponseWriter, r *http.Request) {
 	// available. Finalize commits them.
 	if len(req.Files) > 0 && stor != nil {
 		uploadID := api.NewUUID()
-		uploadURLs, err := s.generateTemplateUploadURLs(ctx, stor, template, req.Files, uploadID, requestBaseURL(r))
+		uploadURLs, err := s.generateTemplateUploadURLs(ctx, stor, template, req.Files, uploadID, s.requestBaseURL(r))
 		if err == nil {
 			response.UploadURLs = uploadURLs
 			response.UploadID = uploadID
@@ -624,6 +635,9 @@ func (s *Server) updateTemplateV2(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 	if refuseTemplateConfigFields(w, req.Config, req.Image) {
+		return
+	}
+	if refuseNonComponentResourceName(w, req.Name) {
 		return
 	}
 
@@ -824,12 +838,13 @@ func (s *Server) handleTemplateUpload(w http.ResponseWriter, r *http.Request, id
 	// them and commits (ptone/scion#4221). Local-storage URLs point at the
 	// hub's raw file endpoint with ?uploadId=, which stages only.
 	uploadID := api.NewUUID()
-	uploadURLs, err := s.generateTemplateUploadURLs(ctx, stor, template, req.Files, uploadID, requestBaseURL(r))
+	uploadURLs, err := s.generateTemplateUploadURLs(ctx, stor, template, req.Files, uploadID, s.requestBaseURL(r))
 	if err != nil {
 		if writeInvalidFilePathError(w, err) {
 			return
 		}
-		RuntimeError(w, "Failed to generate upload URLs: "+err.Error())
+		slog.ErrorContext(ctx, "template upload URLs failed", "template_id", id, "error", upstreamText(err.Error()))
+		RuntimeError(w, "Failed to generate upload URLs")
 		return
 	}
 	if len(uploadURLs) == 0 && len(req.Files) > 0 {
@@ -952,13 +967,14 @@ func (s *Server) handleTemplateDownload(w http.ResponseWriter, r *http.Request, 
 	// lands while the client downloads.
 	downloadURLs, manifestURL, expires, err := s.generateTemplateDownloadURLs(ctx, stor, template)
 	if err != nil {
-		RuntimeError(w, fmt.Sprintf("template %q: %s — run 'scion template validate %s' to diagnose", template.Name, err, template.Name))
+		slog.ErrorContext(ctx, "template download URLs failed", "template_id", id, "error", upstreamText(err.Error()))
+		RuntimeError(w, fmt.Sprintf("template %q: failed to generate download URLs — run 'scion template validate %s' to diagnose", template.Name, template.Name))
 		return
 	}
 
 	// For local storage, rewrite file:// URLs to HTTP proxy URLs
 	if stor.Provider() == storage.ProviderLocal {
-		hubURL := requestBaseURL(r)
+		hubURL := s.requestBaseURL(r)
 		downloadURLs = rewriteLocalTemplateDownloadURLs(downloadURLs, hubURL, id, isBlobLayout(template))
 	}
 
@@ -996,7 +1012,11 @@ func (s *Server) handleTemplateValidate(w http.ResponseWriter, r *http.Request, 
 	rs := s.templateStore()
 	report, err := rs.ValidateStorage(ctx, rec)
 	if err != nil {
-		RuntimeError(w, fmt.Sprintf("validation failed: %v", err))
+		// The error can carry the storage object path and the wrapped
+		// backend error: log it rendered, answer fixed text
+		// (ptone/scion#7498).
+		slog.ErrorContext(ctx, "template validation failed", "template_id", template.ID, "error", upstreamText(err.Error()))
+		RuntimeError(w, "validation failed")
 		return
 	}
 
@@ -1042,6 +1062,9 @@ func (s *Server) handleTemplateClone(w http.ResponseWriter, r *http.Request, id 
 
 	if req.Name == "" {
 		ValidationError(w, "name is required", nil)
+		return
+	}
+	if refuseNonComponentResourceName(w, req.Name) {
 		return
 	}
 	if !isValidTemplateScope(req.Scope) {

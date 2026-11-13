@@ -135,6 +135,11 @@ the recipient argument (agent:x or user:x for one, group[...] for several).
 In the JSON, an accepted recipient has status "delivered" and is counted
 under "delivered".
 
+Choice prompts (--choices or --choices-file, from an agent to a user or a
+conversation) print one line per decision with its key and version. With
+--format json the output is the Hub's full send result: message_id and
+decisions, plus every other field of an ordinary send.
+
 Exit codes:
   0  Sent. For a group, every recipient was accepted or deferred.
   1  Not sent. For a group, no recipient received the message, so the whole
@@ -157,13 +162,15 @@ Examples:
 		if cmd.Flags().Changed("raw") {
 			return errRawFlagRemoved
 		}
-		// --body-file provides the message, so we only need recipient
+		// --body-file provides the message, so we only need recipient.
+		// With choices the body (the intro above the decisions) is optional.
 		bodyFile, _ := cmd.Flags().GetString("body-file")
-		if bodyFile != "" {
+		withChoices := cmd.Flags().Changed("choices") || cmd.Flags().Changed("choices-file")
+		if bodyFile != "" || withChoices {
 			if len(args) < 1 {
 				return fmt.Errorf("recipient is required")
 			}
-			if len(args) > 1 {
+			if len(args) > 1 && bodyFile != "" {
 				return fmt.Errorf("--body-file and positional message arguments are mutually exclusive")
 			}
 			return nil
@@ -226,6 +233,22 @@ Examples:
 			return newUsageError("--body-file and positional message arguments are mutually exclusive")
 		}
 
+		// Choice prompts (--choices, --choices-file, --update): checked and
+		// read before the body, so --choices-file - owns stdin. The JSON is
+		// parsed only for early errors; the hub is the authority.
+		msgChoicesPayload = nil
+		agentTarget := agentName != "" || (convRef != nil && convRef.Kind == messaging.RefAgent)
+		if err := validateChoiceFlags(agentTarget, len(groupRecipients) > 0); err != nil {
+			return err
+		}
+		if choicesRequested() {
+			payload, err := loadChoicesPayload()
+			if err != nil {
+				return err
+			}
+			msgChoicesPayload = payload
+		}
+
 		// Resolve body from --body-file or stdin
 		var err error
 		message, err = resolveMessageBody(msgBodyFile, message)
@@ -238,8 +261,8 @@ Examples:
 		// the slug. Code spans and quoted lines are left unchanged.
 		message = messages.RewriteAgentMentions(message)
 
-		// Ensure we have a message body
-		if message == "" && len(msgArtifacts) == 0 {
+		// Ensure we have a message body (optional with choices)
+		if message == "" && len(msgArtifacts) == 0 && msgChoicesPayload == nil {
 			return fmt.Errorf("message body is empty; provide a message via positional args, --body-file, or pipe to stdin with '-'")
 		}
 
@@ -374,18 +397,20 @@ Examples:
 		// recipient send, which names them by id; otherwise today's path
 		// validation and staging run unchanged.
 		msgAttachUpload = nil
+		var attachFallback string
 		if len(msgAttach) > 0 {
 			toAgent := agentName != "" || (convRef != nil && convRef.Kind == messaging.RefAgent) || groupHasAgent(groupRecipients)
-			upload, staged, err := resolveAttachMode(hubCtx.Client, msgAttach, toAgent)
+			upload, staged, fallback, err := resolveAttachMode(hubCtx.Client, msgAttach, toAgent)
 			if err != nil {
 				return err
 			}
-			msgAttachUpload, msgAttach = upload, staged
+			msgAttachUpload, msgAttach, attachFallback = upload, staged, fallback
 		}
 
-		// Stage attachments to shared volume
+		// Stage attachments to shared volume; once staged, say why they were
+		// not uploaded.
 		if len(msgAttach) > 0 {
-			staged, err := stageAttachments(msgAttach)
+			staged, err := stageAttachmentsWithWarning(msgAttach, attachFallback)
 			if err != nil {
 				return fmt.Errorf("attachment staging failed: %w", err)
 			}
@@ -467,15 +492,23 @@ func buildStructuredMessage(sender, recipient, message string, attachments []str
 	return msg
 }
 
-// messageIDSuffix renders the created message's ID as the " (message <id>)"
-// suffix the send confirmations append (ptone/scion#3881), matching the
-// wording the deferred and outbound confirmations already use. It returns ""
-// when the hub reported no ID, leaving the confirmation as it was.
-func messageIDSuffix(id string) string {
-	if id == "" {
+// receiptSuffix renders the send receipt the confirmations append: the
+// conversation the message landed in and the created message's ID, as
+// " (conversation <cid>, message <id>)" (ptone/scion#3881). Either part is
+// left out when the hub did not report it, and it returns "" when the hub
+// reported neither.
+func receiptSuffix(messageID, conversationID string) string {
+	var parts []string
+	if conversationID != "" {
+		parts = append(parts, "conversation "+conversationID)
+	}
+	if messageID != "" {
+		parts = append(parts, "message "+messageID)
+	}
+	if len(parts) == 0 {
 		return ""
 	}
-	return " (message " + id + ")"
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 // hubStatusDeduplicated is the Hub's agent-message status for a send that
@@ -505,7 +538,7 @@ func agentAcceptedLine(target string, resp *hubclient.MessageResponse) string {
 			note = " (delivery unconfirmed)"
 		}
 	}
-	return "Message accepted for agent " + target + note + messageIDSuffix(messageResponseID(resp)) + "."
+	return "Message accepted for agent " + target + note + receiptSuffix(messageResponseID(resp), messageResponseConversationID(resp)) + "."
 }
 
 // printAgentSendConfirmation prints the last line of a successful single
@@ -515,7 +548,7 @@ func agentAcceptedLine(target string, resp *hubclient.MessageResponse) string {
 // other status prints agentAcceptedLine for target.
 func printAgentSendConfirmation(name, target string, resp *hubclient.MessageResponse) {
 	if resp != nil && resp.Status == "deferred" {
-		fmt.Printf("agent %s is reincarnating; message saved to history and will be seen on catch-up (message %s).\n", name, resp.MessageID)
+		fmt.Printf("agent %s is reincarnating; message saved to history and will be seen on catch-up%s.\n", name, receiptSuffix(resp.MessageID, resp.ConversationID))
 		return
 	}
 	fmt.Println(agentAcceptedLine(target, resp))
@@ -528,6 +561,15 @@ func messageResponseID(resp *hubclient.MessageResponse) string {
 		return ""
 	}
 	return resp.MessageID
+}
+
+// messageResponseConversationID returns the conversation an agent send
+// landed in, or "" when there is no response or the hub did not report it.
+func messageResponseConversationID(resp *hubclient.MessageResponse) string {
+	if resp == nil {
+		return ""
+	}
+	return resp.ConversationID
 }
 
 // agentMessageSendError renders a failed agent-message send. A 404 with the
@@ -792,6 +834,7 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		if ref.Kind == messaging.RefEmail {
 			outMsg.Recipient = "user:" + ref.Value
 		}
+		applyChoicesToOutbound(outMsg)
 
 		// DEF-51 principle: the validated probe must match the sent envelope
 		// by construction. Fields the outbound path does not send (Channel,
@@ -807,8 +850,12 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		if ref.Kind == messaging.RefEmail {
 			probe.Recipient = outMsg.Recipient
 		}
-		if err := messaging.ValidateLegacyMessage(probe); err != nil {
-			return fmt.Errorf("message validation failed: %w", err)
+		// A choice prompt's type and body are the hub's to set (the body
+		// may be empty), so only an ordinary message is probed.
+		if msgChoicesPayload == nil {
+			if err := messaging.ValidateLegacyMessage(probe); err != nil {
+				return fmt.Errorf("message validation failed: %w", err)
+			}
 		}
 
 		ids, sendCtx, sendCancel, err := uploadThenSendContext(context.Background())
@@ -821,6 +868,8 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		if err != nil {
 			return wrapHubError(fmt.Errorf("failed to send message to %s: %w", ref.Raw, err))
 		}
+		// The hub stored the prompt: mark the agent waiting for input.
+		defer afterChoicesSent()
 		if isJSONOutput() {
 			// JSON output with full result (MentionResults included, if any).
 			// outputJSON encodes a nil *OutboundMessageResult as JSON null,
@@ -841,14 +890,16 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		// Distinguish accepted dispatch from confirmed delivery.
 		switch result.Status {
 		case "sent":
-			fmt.Printf("Message sent to %s (message %s).\n", ref.Raw, result.MessageID)
+			fmt.Printf("Message sent to %s%s.\n", ref.Raw, receiptSuffix(result.MessageID, result.ConversationID))
 		case "deferred":
 			// Design agent-reincarnate §3.7: the recipient is mid-`scion
 			// reincarnate`. The message was saved to history, not dropped.
-			fmt.Printf("agent %s is reincarnating; message saved to history and will be seen on catch-up (message %s).\n", ref.Raw, result.MessageID)
+			fmt.Printf("agent %s is reincarnating; message saved to history and will be seen on catch-up%s.\n", ref.Raw, receiptSuffix(result.MessageID, result.ConversationID))
 		default:
-			fmt.Printf("Message dispatched to %s (message %s, status: %s).\n", ref.Raw, result.MessageID, result.Status)
+			fmt.Printf("Message dispatched to %s%s (status: %s).\n", ref.Raw, receiptSuffix(result.MessageID, result.ConversationID), result.Status)
 		}
+		// A choice prompt's decisions, whatever the status.
+		printChoiceDecisions(result)
 		printAttachmentWarnings(result.AttachmentWarnings)
 		return nil
 	}
@@ -965,6 +1016,7 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 		ThreadID:    msgThreadID,
 		Metadata:    artifactRefsMetadata(msgArtifactRefs),
 	}
+	applyChoicesToOutbound(outMsg)
 
 	attachmentIDs, sendCtx, sendCancel, err := uploadThenSendContext(context.Background())
 	if err != nil {
@@ -976,6 +1028,8 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 	if err != nil {
 		return wrapHubError(fmt.Errorf("failed to send message to %s: %w", userRecipient, err))
 	}
+	// The hub stored the prompt: mark the agent waiting for input.
+	defer afterChoicesSent()
 
 	if isJSONOutput() {
 		if result != nil {
@@ -992,14 +1046,10 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 	// reports it, so a send with --channel/--thread-id shows where it went.
 	// ptone/scion#3881: also name the created message when the hub
 	// reports its ID.
-	switch {
-	case result != nil && result.ConversationID != "" && result.MessageID != "":
-		fmt.Printf("Message sent to %s via Hub (conversation %s, message %s).\n", userRecipient, result.ConversationID, result.MessageID)
-	case result != nil && result.ConversationID != "":
-		fmt.Printf("Message sent to %s via Hub (conversation %s).\n", userRecipient, result.ConversationID)
-	case result != nil && result.MessageID != "":
-		fmt.Printf("Message sent to %s via Hub (message %s).\n", userRecipient, result.MessageID)
-	default:
+	if result != nil {
+		fmt.Printf("Message sent to %s via Hub%s.\n", userRecipient, receiptSuffix(result.MessageID, result.ConversationID))
+		printChoiceDecisions(result)
+	} else {
 		fmt.Printf("Message sent to %s via Hub.\n", userRecipient)
 	}
 	if result != nil {
@@ -1041,6 +1091,9 @@ type groupRecipientResult struct {
 	// (ptone/scion#3881), for delivered, deferred and ambiguous (unknown)
 	// sends. Empty when the send failed or the hub did not report one.
 	MessageID string `json:"message_id,omitempty"`
+	// ConversationID is the conversation the hub recorded this recipient's
+	// message in, when it reported one.
+	ConversationID string `json:"conversation_id,omitempty"`
 	// AttachmentWarnings lists attachments the hub could not record on this
 	// recipient's copy of the message (ptone/scion#3667).
 	AttachmentWarnings []hubclient.AttachmentWarning `json:"attachment_warnings,omitempty"`
@@ -1243,9 +1296,9 @@ func sendGroupMessageViaHubCtx(hubCtx *HubContext, recipients []messages.GroupRe
 		}
 		switch res.Status {
 		case groupStatusDelivered:
-			fmt.Printf("  Accepted: %s%s\n", res.Recipient, messageIDSuffix(res.MessageID))
+			fmt.Printf("  Accepted: %s%s\n", res.Recipient, receiptSuffix(res.MessageID, res.ConversationID))
 		case groupStatusDeferred:
-			fmt.Printf("  Deferred: %s (agent is reincarnating; saved)%s\n", res.Recipient, messageIDSuffix(res.MessageID))
+			fmt.Printf("  Deferred: %s (agent is reincarnating; saved)%s\n", res.Recipient, receiptSuffix(res.MessageID, res.ConversationID))
 		case groupStatusUnknown:
 			fmt.Printf("  Unknown: %s: %s\n", res.Recipient, res.Error)
 		default:
@@ -1268,10 +1321,11 @@ func sendGroupMessageViaHubCtx(hubCtx *HubContext, recipients []messages.GroupRe
 	// recordAmbiguous handles the Hub's 202 "ambiguous" outcome: it may or
 	// may not have dispatched the message, so it is unknown, not delivered.
 	// The attachment warnings are kept: the message was persisted either way.
-	recordAmbiguous := func(idx int, recipStr, messageID string, warnings []hubclient.AttachmentWarning) {
+	recordAmbiguous := func(idx int, recipStr, messageID, conversationID string, warnings []hubclient.AttachmentWarning) {
 		record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusUnknown,
-			Error:              fmt.Sprintf("Hub reported delivery as ambiguous (message %s); it may have been delivered", messageID),
+			Error:              fmt.Sprintf("Hub reported delivery as ambiguous%s; it may have been delivered", receiptSuffix(messageID, conversationID)),
 			MessageID:          messageID,
+			ConversationID:     conversationID,
 			AttachmentWarnings: warnings})
 	}
 
@@ -1324,14 +1378,14 @@ func sendGroupMessageViaHubCtx(hubCtx *HubContext, recipients []messages.GroupRe
 				warnings = sendResp.AttachmentWarnings
 			}
 			if sendResp != nil && sendResp.Status == "deferred" {
-				record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusDeferred, MessageID: sendResp.MessageID, AttachmentWarnings: warnings})
+				record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusDeferred, MessageID: sendResp.MessageID, ConversationID: sendResp.ConversationID, AttachmentWarnings: warnings})
 				return
 			}
 			if sendResp != nil && sendResp.Status == "ambiguous" {
-				recordAmbiguous(idx, recipStr, sendResp.MessageID, warnings)
+				recordAmbiguous(idx, recipStr, sendResp.MessageID, sendResp.ConversationID, warnings)
 				return
 			}
-			record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusDelivered, MessageID: messageResponseID(sendResp), AttachmentWarnings: warnings})
+			record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusDelivered, MessageID: messageResponseID(sendResp), ConversationID: messageResponseConversationID(sendResp), AttachmentWarnings: warnings})
 
 		case messages.RecipientUser:
 			senderAgent := os.Getenv("SCION_AGENT_NAME")
@@ -1371,14 +1425,15 @@ func sendGroupMessageViaHubCtx(hubCtx *HubContext, recipients []messages.GroupRe
 				warnings = outResp.AttachmentWarnings
 			}
 			if outResp != nil && outResp.Status == "ambiguous" {
-				recordAmbiguous(idx, recipStr, outResp.MessageID, warnings)
+				recordAmbiguous(idx, recipStr, outResp.MessageID, outResp.ConversationID, warnings)
 				return
 			}
-			var outMsgID string
+			var outMsgID, outConvID string
 			if outResp != nil {
 				outMsgID = outResp.MessageID
+				outConvID = outResp.ConversationID
 			}
-			record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusDelivered, MessageID: outMsgID, AttachmentWarnings: warnings})
+			record(idx, groupRecipientResult{Recipient: recipStr, Status: groupStatusDelivered, MessageID: outMsgID, ConversationID: outConvID, AttachmentWarnings: warnings})
 		}
 	}
 	boundedFanOut(fanCtx, len(recipients), maxFanOutConcurrency, hooks.onQueued, sendOne, recordNotSent)
@@ -1943,6 +1998,9 @@ func init() {
 	messageCmd.Flags().StringArrayVar(&msgArtifacts, "artifact", nil, "Reference a published artifact (work product to review, version or find later; use --attach for a file that is part of this message) (scion://artifact/<id>[@<seq>]), repeatable, at most 10. The reference is added to the message text and the recipient is shown how to fetch it; the hub attaches only artifacts you can read.")
 	messageCmd.Flags().StringArrayVar(&msgAttach, "attach", nil, "Attach a file as part of this message, repeatable (use --artifact for work product to review, version or find later). When the hub stores attachments as artifacts, the file is uploaded and an agent recipient gets it in ~/.scion/inbox/<message-id>/; HTML and SVG are refused. Otherwise use paths under /workspace or /scion-volumes (bare relative paths resolve to /workspace); attachments the hub cannot read are reported as warnings after an agent's send.")
 	messageCmd.Flags().StringVar(&msgBodyFile, "body-file", "", "Read message body from a file instead of positional args ('-' reads stdin; trailing CR/LF characters are trimmed)")
+	messageCmd.Flags().StringVar(&msgChoices, "choices", "", "Send a choice prompt: a JSON array of decisions for a user or conversation to answer (agents only; needs the web.chat_choices experiment). The body becomes the optional intro")
+	messageCmd.Flags().StringVar(&msgChoicesFile, "choices-file", "", "Read the --choices JSON from a file ('-' reads stdin, which then excludes --body-file -)")
+	messageCmd.Flags().BoolVar(&msgChoicesUpdate, "update", false, "With choices: replace decisions whose ids already exist (a new version each); without it, reusing an id is refused")
 
 	// Deprecated flags — still functional, emit warnings when used.
 	// These flags are hidden from help output to guide users toward

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
@@ -148,6 +149,9 @@ type RunConfig struct {
 	// HomeStorage describes the NFS agent home. Set exactly when
 	// HomeStorageBackend is HomeStorageNFS.
 	HomeStorage *HomeStorageRealization
+	// HomeResetID is the latest home reset ID from home-reset.json, empty
+	// when none. NFS-home runtimes compare it to their persistent leaf.
+	HomeResetID string
 	// NFSUID and NFSGID are the stable, node-independent UID/GID for NFS-backed
 	// workspaces. Advertised as SCION_HOST_UID/GID when WorkspaceBackendName is "nfs"
 	// instead of os.Getuid()/os.Getgid(). Default 1000:1000 (design §9.1).
@@ -261,13 +265,21 @@ type RunConfig struct {
 	// resources.
 	ObserveResourceCreated func(api.ResourceHandle)
 	// KubernetesBlockIdentity marks a pod whose GCP identity mode is
-	// "block" (ptone/scion#4034). The Kubernetes runtime then sets
-	// automountServiceAccountToken false and adds the Workload Identity node
-	// selector (KubernetesWorkloadIdentityNodeLabel). The ServiceAccount
+	// "block" (ptone/scion#4034). The Kubernetes runtime then adds the
+	// Workload Identity node selector (KubernetesWorkloadIdentityNodeLabel).
+	// automountServiceAccountToken is false on every agent pod, in every
+	// GCP identity mode, not only under block. The ServiceAccount
 	// itself comes from Kubernetes.ServiceAccountName, which the agent
 	// manager has already set to the block ServiceAccount or cleared.
 	// Ignored by other runtimes.
 	KubernetesBlockIdentity bool
+	// CloudRunIdentity is the broker-resolved Cloud Run instance identity
+	// for this dispatch (api.StartOptions.CloudRunIdentity). Nil: the Cloud
+	// Run runtime uses its configured service account, as before. Non-nil:
+	// the instance runs as its ServiceAccount, an empty ServiceAccount is
+	// refused before any create, and an existing instance is never started
+	// in place. Ignored by other runtimes.
+	CloudRunIdentity *api.CloudRunIdentity
 
 	// FallbackEnv is the template env layer (ptone/scion#4524): every
 	// runtime applies it with FallbackEnvEntries as the LAST step of its
@@ -466,9 +478,18 @@ type SharedDirRealization struct {
 	Backend string
 	// PVClaimName is the claim holding the share (the nfs share's pv_name,
 	// or the gke-shared-volume pv_claim_name). Empty means the share has no
-	// claim; buildPod must then fail closed rather than fall back to
-	// per-dir claims or an EmptyDir (design G5).
+	// claim; buildPod must then mount the dirs inline (Server, Export) or
+	// fail closed rather than fall back to per-dir claims or an EmptyDir
+	// (design G5).
 	PVClaimName string
+	// Server, Export and SubPathRoot are the nfs share's, set only when the
+	// shared dirs are on the Layout's own nfs share (not the transitional
+	// split). With no PVClaimName, buildPod then mounts each shared dir as
+	// an inline NFS volume of its server path; without them it fails
+	// closed.
+	Server      string
+	Export      string
+	SubPathRoot string
 	// ProjectID is the hub project ID the subPaths were resolved for;
 	// buildPod checks every subPath's project component against it.
 	ProjectID string
@@ -497,12 +518,17 @@ func (r *SharedDirRealization) Shared() bool {
 // to stop or remove; it is empty for legacy entries created before run IDs
 // existed.
 //
+// StopTimeout bounds how long Stop lets the entry shut down before it is
+// killed; zero means the backend's default (30s on Docker and Podman).
+// Backends without a stop timeout ignore it, and Delete ignores it.
+//
 // The signature change is deliberate (ptone/scion#2550): every backend must
 // decide how it honours RunID, rather than silently falling back to name
 // semantics through an optional side interface.
 type RunRef struct {
-	ID    string
-	RunID string
+	ID          string
+	RunID       string
+	StopTimeout time.Duration
 }
 
 // ErrRunMismatch is returned (wrapped) by a Delete whose RunRef names a run

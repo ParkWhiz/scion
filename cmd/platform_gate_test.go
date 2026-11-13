@@ -118,8 +118,9 @@ func TestWindowsGate_RefusesServerAndBroker(t *testing.T) {
 		{[]string{"expose"}, "expose"},
 		{[]string{"server"}, "server"},
 		// Commands with required flags or flag groups, given none: the
-		// refusal, not a required-flag error. The hub secret migrate tools
-		// also write the local hub database.
+		// refusal, not a required-flag error. hub secret migrate-names
+		// also writes the local hub database; hub secret migrate is
+		// disabled everywhere but stays gated.
 		{[]string{"hub", "secret", "migrate"}, "hub secret migrate"},
 		{[]string{"hub", "secret", "migrate-names"}, "hub secret migrate-names"},
 		{[]string{"server", "migrate"}, "server migrate"},
@@ -223,9 +224,9 @@ func TestWindowsGate_AllowsUseOnlyUnderProject(t *testing.T) {
 // shows the copied tree does carry those rules before gating.
 func TestWindowsGate_DropsFlagValidationOnGatedCommands(t *testing.T) {
 	root, _ := gateTestTree(t)
-	migrate := resolveCommandPath(root, "hub.secret.migrate")
+	migrate := resolveCommandPath(root, "hub.secret.migrate-names")
 	require.NotNil(t, migrate)
-	require.Error(t, migrate.ValidateRequiredFlags(), "control: hub secret migrate has required flags before gating")
+	require.Error(t, migrate.ValidateRequiredFlags(), "control: hub secret migrate-names has required flags before gating")
 	visitors := resolveCommandPath(root, "project.visitors.add")
 	require.NotNil(t, visitors)
 	require.Error(t, visitors.ValidateFlagGroups(), "control: project visitors add has a one-required group before gating")
@@ -248,7 +249,7 @@ func TestWindowsGate_DropsFlagValidationOnGatedCommands(t *testing.T) {
 	}
 	walk(root, "")
 	// The real tree keeps its rules: the copy's annotations were stripped.
-	assert.Error(t, resolveCommandPath(rootCmd, "hub.secret.migrate").ValidateRequiredFlags())
+	assert.Error(t, resolveCommandPath(rootCmd, "hub.secret.migrate-names").ValidateRequiredFlags())
 }
 
 // TestWindowsGate_RefusesBeforeProjectResolution: root's PersistentPreRunE
@@ -660,4 +661,89 @@ func TestWindowsGate_NoPersistentHooksOnAllowedAncestorsOfGatedCommands(t *testi
 	joined := strings.Join(after, "\n")
 	assert.Contains(t, joined, "hub (allowed on Windows) has PersistentPreRunE")
 	assert.Contains(t, joined, "the gated hub secret migrate")
+}
+
+// windowsUngatePrerequisiteCommands are the commands that stay refused on
+// Windows until their prerequisites hold: agent file removal fails closed on
+// Windows and the pkg/runtime Windows tests run on the Windows job. Each
+// entry is a command path as in windowsAllowed, with why it is held back.
+var windowsUngatePrerequisiteCommands = map[string]string{
+	// Local agent file removal: cleanupAfterHubDelete ->
+	// agent.DeleteAgentFiles -> util.RemoveAllSafe and util.RemoveWorktree.
+	// 'stop --rm' runs the same cleanup after the stop.
+	"delete": "removes the agent's local files and worktree",
+	"stop":   "--rm removes the agent's local files and worktree",
+	// The co-located Runtime Broker runs in this process (or in the server
+	// daemon this binary starts): runtimebroker -> AgentManager.Start ->
+	// Runtime.Run (Docker, Podman, Apple) -> buildCommonRunArgs, which
+	// registers the git metadata bind sources (bindChecked,
+	// registerPrivateGitConfig, registerReadOnlyBaseGitMounts).
+	"server.start":           "runs the co-located Runtime Broker (git bind sources)",
+	"server.restart":         "restarts the server daemon with its Runtime Broker",
+	"runtime-broker.start":   "runs the Runtime Broker (git bind sources)",
+	"runtime-broker.restart": "restarts the Runtime Broker",
+	// Agent launches: the Hub dispatches them to a Runtime Broker, which
+	// runs the AgentManager.Start path above; on a workstation that broker
+	// is the co-located one.
+	"start":  "launches an agent through a Runtime Broker (git bind sources)",
+	"resume": "relaunches an agent through a Runtime Broker (git bind sources)",
+}
+
+// TestWindowsGate_RefusesUngatePrerequisiteCommands checks that delete,
+// stop (with and without --rm) and every command that reaches the pkg/runtime
+// git bind-source code stay refused on Windows: none is in windowsAllowed,
+// each is marked for root's hook, and running it returns the refusal without
+// running the command. Aliases and flag positions are covered too.
+func TestWindowsGate_RefusesUngatePrerequisiteCommands(t *testing.T) {
+	// The commands and the --rm flag exist, so the refusals below are not
+	// vacuous.
+	for path := range windowsUngatePrerequisiteCommands {
+		require.NotNil(t, resolveCommandPath(rootCmd, path), "%s must be a real command", path)
+		assert.False(t, windowsAllowed[path], "%s must stay out of windowsAllowed: %s", path, windowsUngatePrerequisiteCommands[path])
+	}
+	require.NotNil(t, resolveCommandPath(rootCmd, "stop").Flags().Lookup("rm"), "stop must define --rm")
+
+	t.Run("marked", func(t *testing.T) {
+		root, _ := gateTestTree(t)
+		applyPlatformRestrictions(root, "windows")
+		for path := range windowsUngatePrerequisiteCommands {
+			assert.Error(t, windowsRefusal(resolveCommandPath(root, path)), "%s must be refused by root's hook", path)
+		}
+	})
+
+	for _, tc := range []struct {
+		args []string
+		path string
+	}{
+		{[]string{"delete", "agent-x"}, "delete"},
+		{[]string{"rm", "agent-x"}, "delete"}, // via the alias
+		{[]string{"delete", "agent-x", "agent-y", "--no-such-flag"}, "delete"},
+		{[]string{"stop", "agent-x"}, "stop"},
+		{[]string{"stop", "--rm", "agent-x"}, "stop"},
+		{[]string{"stop", "agent-x", "--rm"}, "stop"},
+		{[]string{"stop", "--rm=true", "agent-x"}, "stop"},
+		{[]string{"server", "start"}, "server start"},
+		{[]string{"server", "start", "--foreground"}, "server start"},
+		{[]string{"server", "restart"}, "server restart"},
+		{[]string{"runtime-broker", "start"}, "runtime-broker start"},
+		{[]string{"broker", "start", "--foreground"}, "runtime-broker start"}, // via the alias
+		{[]string{"runtime-broker", "restart"}, "runtime-broker restart"},
+		{[]string{"start", "agent-x"}, "start"},
+		{[]string{"start", "agent-x", "do", "the", "task"}, "start"},
+		{[]string{"run", "agent-x"}, "start"}, // via the alias
+		{[]string{"resume", "agent-x"}, "resume"},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			root, ran := gateTestTree(t)
+			applyPlatformRestrictions(root, "windows")
+			root.SetArgs(tc.args)
+
+			err := root.Execute()
+
+			require.Error(t, err)
+			assert.True(t, errors.Is(err, errUnsupportedOnWindows), "got %v", err)
+			assert.Equal(t, "scion "+tc.path+" is not supported on Windows; the Windows build supports hub client commands only (see docs: Windows)", err.Error())
+			assert.Empty(t, *ran, "a gated command must not run")
+		})
+	}
 }

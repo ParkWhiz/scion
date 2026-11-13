@@ -49,6 +49,32 @@ import { visibleInterval } from '../../client/visible-interval.js';
 export const SCHEDULE_BLOCKED_STATUS = 'SCHEDULE_BLOCKED';
 
 /**
+ * A review of one of the user's artifacts was finalized by another principal
+ * allowed to review it (ptone/scion#6853). The row's `excerpt` is the start of the
+ * reviewer's summary note, attributed by `message`; its artifact comes from
+ * `resourceId` and `projectId` only.
+ */
+export const ARTIFACT_REVIEW_SUMMARY_KIND = 'artifact_review_summary';
+export const ARTIFACT_REVIEW_SUBMITTED_STATUS = 'ARTIFACT_REVIEW_SUBMITTED';
+
+/**
+ * An agent saved a user secret for the user; it waits for the user's
+ * approval in Profile > Secrets. The row carries text only, never a value.
+ */
+export const SECRET_PENDING_KIND = 'secret_pending';
+export const SECRET_PENDING_STATUS = 'SECRET_PENDING';
+
+/** The path where the user decides on pending secrets. */
+const PROFILE_SECRETS_PATH = '/profile/secrets';
+
+/** The Profile > Secrets path for a pending secret row, or null for any other row. */
+export function pendingSecretLink(n: Notification): string | null {
+  return n.kind === SECRET_PENDING_KIND || n.status === SECRET_PENDING_STATUS
+    ? PROFILE_SECRETS_PATH
+    : null;
+}
+
+/**
  * Statuses of the chat rows the hub used to write into the bell (mentions
  * and DMs). It writes none now, but rows made before that can remain.
  */
@@ -60,6 +86,53 @@ const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 /** Whether a notification row names an agent the "View agent" link can open. */
 function hasAgentLink(agentId: string | undefined): boolean {
   return !!agentId && agentId !== NIL_UUID;
+}
+
+/** A lowercase canonical UUID, as the hub writes ids. */
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Line breaks the excerpt shows as a space. */
+const EXCERPT_BREAKS = /[\t\n\v\f\r\u0085\u2028\u2029]+/g;
+/** Control and format characters, removed from the excerpt. */
+const EXCERPT_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+
+/**
+ * The excerpt of a review summary row, or '' for any other row: no other
+ * kind shows one. The hub already cleans it; line breaks become spaces,
+ * control and format characters are removed and runs of spaces collapse
+ * here again, so a row from anywhere else still shows as one line of plain
+ * text.
+ */
+export function reviewSummaryExcerpt(n: Notification): string {
+  if (n.kind !== ARTIFACT_REVIEW_SUMMARY_KIND || typeof n.excerpt !== 'string') return '';
+  return n.excerpt
+    .replace(EXCERPT_BREAKS, ' ')
+    .replace(EXCERPT_UNSAFE, '')
+    .replace(/ {2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * The artifact page path of a review summary row, built from its project and
+ * resource fields alone (both canonical UUIDs, the project not the nil
+ * UUID), or null. The message and excerpt are never read. It is the path
+ * artifactPagePath (client/artifacts.ts) builds, written out here so the
+ * tray does not load the artifacts client. An artifact not homed in a
+ * project (the hub writes the nil UUID) deliberately gets no link; the CLI
+ * still prints its scion://artifact/ reference.
+ */
+export function reviewSummaryLink(n: Notification): string | null {
+  if (n.kind !== ARTIFACT_REVIEW_SUMMARY_KIND || n.resourceType !== 'artifact') return null;
+  const artifactId = n.resourceId ?? '';
+  const projectId = n.projectId ?? '';
+  if (
+    !CANONICAL_UUID.test(artifactId) ||
+    !CANONICAL_UUID.test(projectId) ||
+    projectId === NIL_UUID
+  ) {
+    return null;
+  }
+  return `/projects/${projectId}/artifacts/${artifactId}`;
 }
 
 /**
@@ -84,7 +157,13 @@ export function notificationFromEvent(data: unknown, userId: string | null): Not
   if (!str(d.agentId)) return null;
   if (d.acknowledged !== undefined && d.acknowledged !== false) return null;
   if (d.subscriberId !== undefined && d.subscriberId !== userId) return null;
+  const optional: Partial<Notification> = {};
+  if (str(d.kind)) optional.kind = d.kind;
+  if (str(d.resourceType)) optional.resourceType = d.resourceType;
+  if (str(d.resourceId)) optional.resourceId = d.resourceId;
+  if (str(d.excerpt)) optional.excerpt = d.excerpt;
   return {
+    ...optional,
     id: d.id,
     subscriptionId: str(d.subscriptionId) ? d.subscriptionId : '',
     agentId: d.agentId,
@@ -417,8 +496,10 @@ export class ScionNotificationTray extends LitElement {
     }
 
     const title = this.browserNotificationTitle(n.status);
+    // The Notification API shows the body as plain text.
+    const excerpt = reviewSummaryExcerpt(n);
     new window.Notification(title, {
-      body: n.message,
+      body: excerpt ? `${n.message}\n\u201c${excerpt}\u201d` : n.message,
       tag: n.id, // deduplicate if the same notification is seen again
       icon: '/scion-notification-icon.png',
     });
@@ -434,6 +515,10 @@ export class ScionNotificationTray extends LitElement {
         return 'Agent Limits Exceeded';
       case SCHEDULE_BLOCKED_STATUS:
         return 'Schedule Blocked';
+      case ARTIFACT_REVIEW_SUBMITTED_STATUS:
+        return 'Review Submitted';
+      case SECRET_PENDING_STATUS:
+        return 'Secret Awaiting Approval';
       default:
         return 'Scion Notification';
     }
@@ -503,6 +588,8 @@ export class ScionNotificationTray extends LitElement {
         return 'x-circle-fill';
       case SCHEDULE_BLOCKED_STATUS:
         return 'calendar-x';
+      case SECRET_PENDING_STATUS:
+        return 'shield-lock';
       default:
         return 'info-circle-fill';
     }
@@ -513,6 +600,7 @@ export class ScionNotificationTray extends LitElement {
       case 'COMPLETED':
         return 'status-success';
       case 'WAITING_FOR_INPUT':
+      case SECRET_PENDING_STATUS:
         return 'status-warning';
       case 'LIMITS_EXCEEDED':
       case SCHEDULE_BLOCKED_STATUS:
@@ -716,6 +804,18 @@ export class ScionNotificationTray extends LitElement {
       -webkit-line-clamp: 2;
       -webkit-box-orient: vertical;
       overflow: hidden;
+    }
+
+    .notif-excerpt {
+      margin-top: 0.25rem;
+      padding-left: 0.5rem;
+      border-left: 2px solid var(--scion-border, #e2e8f0);
+      font-size: 0.75rem;
+      line-height: 1.4;
+      font-style: italic;
+      color: var(--scion-text-muted, #64748b);
+      word-break: break-word;
+      white-space: normal;
     }
 
     .truncation-badge {
@@ -970,6 +1070,12 @@ export class ScionNotificationTray extends LitElement {
   }
 
   private renderItem(n: Notification) {
+    // The excerpt is another principal's text: it is bound as a text node,
+    // in its own element under the message that attributes it, never as
+    // markup, and the link beside it comes from the resource fields.
+    const excerpt = reviewSummaryExcerpt(n);
+    const artifactLink = reviewSummaryLink(n);
+    const secretsLink = pendingSecretLink(n);
     return html`
       <div class="notif-item">
         <div class="notif-icon ${this.statusClass(n.status)}">
@@ -980,8 +1086,25 @@ export class ScionNotificationTray extends LitElement {
           <sl-tooltip content=${n.message} hoist>
             <span class="truncation-badge" style="display:none">...</span>
           </sl-tooltip>
+          ${excerpt ? html`<div class="notif-excerpt">“${excerpt}”</div>` : nothing}
           <div class="notif-meta">
             <span>${this.relativeTime(n.createdAt)}</span>
+            ${artifactLink
+              ? html`<a
+                  href=${artifactLink}
+                  @click=${(e: Event): void => this.navigateToPath(e, artifactLink)}
+                >
+                  View artifact
+                </a>`
+              : nothing}
+            ${secretsLink
+              ? html`<a
+                  href=${secretsLink}
+                  @click=${(e: Event): void => this.navigateToPath(e, secretsLink)}
+                >
+                  Review secrets
+                </a>`
+              : nothing}
             ${!hasAgentLink(n.agentId)
               ? // Older rows can carry no agent (the nil UUID); a link would
                 // 404, so offer none.
@@ -1011,10 +1134,14 @@ export class ScionNotificationTray extends LitElement {
   }
 
   private navigateToAgent(e: Event, agentId: string): void {
+    this.navigateToPath(e, `/agents/${agentId}`);
+  }
+
+  private navigateToPath(e: Event, path: string): void {
     e.preventDefault();
     this.open = false;
     document.removeEventListener('click', this.boundOnClickOutside, true);
-    navigateTo(`/agents/${agentId}`);
+    navigateTo(path);
   }
 }
 

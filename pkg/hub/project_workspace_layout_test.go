@@ -19,6 +19,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
@@ -524,10 +526,13 @@ func newSourceRepo(t *testing.T) string {
 
 // cloneLocalFixture makes the hub's shared-workspace provisioning clone the
 // local repository src in place of the project's https clone URL, which the
-// URL check requires (and a hardened clone refuses local paths). It records
-// every provisioning input the hub passed and returns them.
+// URL check requires (and a hardened clone refuses local paths). src is
+// registered as a local clone fixture (provision.AllowLocalCloneFixture),
+// which ProvisionShared otherwise refuses. It records every provisioning
+// input the hub passed and returns them.
 func cloneLocalFixture(t *testing.T, src string) *[]provision.ProvisionInput {
 	t.Helper()
+	provision.AllowLocalCloneFixture(t, src)
 	var seen []provision.ProvisionInput
 	orig := provisionSharedClone
 	provisionSharedClone = func(in provision.ProvisionInput) error {
@@ -926,8 +931,9 @@ func (b *userTokenSecretBackend) Get(_ context.Context, name, scope, _ string) (
 // TestCreateSharedWorkspaceProject_SharedBackend_TokenBoundToRecordedRemote:
 // the hub binds the project's git token to the project's own recorded
 // remote (CloneTokenRemote from the project record, never the clone-url
-// label). A non-GitHub remote (here a GitHub Enterprise-style host) gets the
-// creator's token through the user GITHUB_TOKEN path.
+// label). The creator's token (the user GITHUB_TOKEN path) is personal, so
+// a GitHub Enterprise-style host gets it only when it is the configured
+// GitHub host.
 func TestCreateSharedWorkspaceProject_SharedBackend_TokenBoundToRecordedRemote(t *testing.T) {
 	f := newWorkspaceLayoutFixture(t)
 	f.useNFS()
@@ -946,8 +952,14 @@ func TestCreateSharedWorkspaceProject_SharedBackend_TokenBoundToRecordedRemote(t
 		return (*seen)[before]
 	}
 
-	in := create("Token Own Remote", "ghe.example.invalid/team/app", nil)
-	assert.Equal(t, token, in.CloneToken, "the creator's token is resolved for a non-GitHub remote")
+	in := create("Token Unconfigured Host", "ghe.example.invalid/team/other", nil)
+	assert.Empty(t, in.CloneToken, "the creator's personal token is not resolved for a host other than the GitHub host")
+
+	f.srv.mu.Lock()
+	f.srv.config.GitHubAppConfig.APIBaseURL = "https://ghe.example.invalid/api/v3"
+	f.srv.mu.Unlock()
+	in = create("Token Own Remote", "ghe.example.invalid/team/app", nil)
+	assert.Equal(t, token, in.CloneToken, "the creator's token is resolved for the configured GitHub host")
 	assert.Equal(t, "ghe.example.invalid/team/app", in.CloneTokenRemote, "bound to the recorded remote")
 	require.NotNil(t, in.GitClone)
 	assert.Equal(t, "https://ghe.example.invalid/team/app.git", in.GitClone.URL)
@@ -961,6 +973,123 @@ func TestCreateSharedWorkspaceProject_SharedBackend_TokenBoundToRecordedRemote(t
 		map[string]string{store.LabelCloneURL: "https://mirror.example.invalid/team/mirror.git"})
 	assert.Equal(t, "ghe.example.invalid/team/mirror", in.CloneTokenRemote, "the record, never the label")
 	assert.Equal(t, "https://mirror.example.invalid/team/mirror.git", in.GitClone.URL)
+}
+
+// TestCreateSharedWorkspaceProject_SharedBackend_NoCredentialRunsUnbound: the
+// hub's shared-workspace clone with no project credential runs anonymously
+// on ANY host, the GitHub host included: unbound (no token, no token remote),
+// so the hardened clone resets the hub host's own git authentication for it.
+// With a resolved credential (here the creator's token on the GitHub host)
+// the binding is kept.
+func TestCreateSharedWorkspaceProject_SharedBackend_NoCredentialRunsUnbound(t *testing.T) {
+	f := newWorkspaceLayoutFixture(t)
+	f.useNFS()
+	seen := cloneLocalFixture(t, newSourceRepo(t))
+	create := func(name, remote string) provision.ProvisionInput {
+		t.Helper()
+		before := len(*seen)
+		rec := doRequest(t, f.srv, http.MethodPost, "/api/v1/projects", CreateProjectRequest{
+			Name: name, GitRemote: remote, WorkspaceMode: store.WorkspaceModeShared,
+		})
+		require.Equal(t, http.StatusCreated, rec.Code, "%s: body: %s", name, rec.Body.String())
+		require.Len(t, *seen, before+1, "%s: one provisioning call", name)
+		return (*seen)[before]
+	}
+
+	for _, tc := range []struct{ name, remote string }{
+		{"Off Host No Token", "ghe.example.invalid/team/off"},
+		{"GitHub Host No Token", "github.com/team/on"},
+	} {
+		in := create(tc.name, tc.remote)
+		assert.Empty(t, in.CloneToken, tc.name)
+		assert.Empty(t, in.CloneTokenRemote, "%s: with no project credential the clone runs unbound", tc.name)
+		assert.True(t, in.HostGitHardened, tc.name)
+	}
+
+	const token = "test-creator-token"
+	f.srv.SetSecretBackend(&userTokenSecretBackend{value: token})
+	in := create("GitHub Host With Token", "github.com/team/tok")
+	assert.Equal(t, token, in.CloneToken)
+	assert.Equal(t, "github.com/team/tok", in.CloneTokenRemote, "with a project credential the binding is kept")
+}
+
+// TestCreateSharedWorkspaceProject_SharedBackend_SSHRefused: the hub's
+// shared-workspace clone of an ssh or scp repository URL is refused (422,
+// fixed text) before provisioning, at project create and project clone,
+// with or without a project git credential; the refusal leaves no project
+// root or provisioning state directory behind. An https clone with a
+// credential goes ahead.
+func TestCreateSharedWorkspaceProject_SharedBackend_SSHRefused(t *testing.T) {
+	f := newWorkspaceLayoutFixture(t)
+	f.useNFS()
+	record := fakeSSH(t)
+	seen := cloneLocalFixture(t, newSourceRepo(t))
+	projectsDir := filepath.Join(f.shareBase, "projects")
+	projectRoots := func() []string {
+		t.Helper()
+		entries, err := os.ReadDir(projectsDir)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		require.NoError(t, err)
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return names
+	}
+	create := func(name, remote, label string) (int, []byte) {
+		t.Helper()
+		rec := doRequest(t, f.srv, http.MethodPost, "/api/v1/projects", CreateProjectRequest{
+			Name: name, GitRemote: remote, WorkspaceMode: store.WorkspaceModeShared,
+			Labels: map[string]string{store.LabelCloneURL: label},
+		})
+		return rec.Code, rec.Body.Bytes()
+	}
+	labels := []struct{ name, label string }{
+		{"SSH", "ssh://git@github.com/team/s.git"},
+		{"SCP", "git@github.com:team/s.git"},
+	}
+	refused := func(withSecret bool, want string) {
+		t.Helper()
+		for _, lc := range labels {
+			name := fmt.Sprintf("%s Label Secret %t", lc.name, withSecret)
+			before := len(*seen)
+			code, body := create(name, "github.com/team/s", lc.label)
+			require.Equal(t, http.StatusUnprocessableEntity, code, "%s: %s", name, body)
+			assert.Equal(t, want, decodeErrorMessage(t, body), name)
+			assert.Len(t, *seen, before, "%s: nothing is provisioned", name)
+			assert.Empty(t, projectRoots(), "%s: no project root or state directory is left", name)
+		}
+	}
+
+	refused(false, sshUnsupportedText)
+	f.srv.SetSecretBackend(&userTokenSecretBackend{value: "test-creator-token"})
+	refused(true, sshSecretHTTPSOnlyText)
+
+	// https with a credential goes ahead and makes the project root.
+	before := len(*seen)
+	code, body := create("HTTPS Label With Credential", "github.com/team/s", "https://github.com/team/s.git")
+	require.Equal(t, http.StatusCreated, code, string(body))
+	require.Len(t, *seen, before+1, "with a credential an https clone goes ahead")
+	assert.Equal(t, "test-creator-token", (*seen)[before].CloneToken)
+	var src store.Project
+	require.NoError(t, json.Unmarshal(body, &src))
+	require.Equal(t, []string{src.ID}, projectRoots(), "the https create made its project root")
+
+	// Project clone of a source whose clone URL is ssh: refused the same way.
+	stored, err := f.s.GetProject(context.Background(), src.ID)
+	require.NoError(t, err)
+	stored.Labels[store.LabelCloneURL] = "git@github.com:team/s.git"
+	require.NoError(t, f.s.UpdateProject(context.Background(), stored))
+	before = len(*seen)
+	rec := doRequest(t, f.srv, http.MethodPost, "/api/v1/projects/"+src.ID+"/clone",
+		map[string]string{"name": "SCP Clone With Credential"})
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
+	assert.Equal(t, sshSecretHTTPSOnlyText, decodeErrorMessage(t, rec.Body.Bytes()))
+	assert.Len(t, *seen, before, "the clone provisions nothing")
+	assert.Equal(t, []string{src.ID}, projectRoots(), "the refused clone leaves no project root")
+	assert.False(t, sshRan(t, record), "git must not reach ssh")
 }
 
 // TestCreateSharedWorkspaceProject_SharedBackend_CloneFailureKeepsExistingRoot:
@@ -984,4 +1113,34 @@ func TestCreateSharedWorkspaceProject_SharedBackend_CloneFailureKeepsExistingRoo
 	got, err := os.ReadFile(filepath.Join(root, "keep.txt"))
 	require.NoError(t, err, "a project root that existed before the create is not removed")
 	assert.Equal(t, "existing", string(got))
+}
+
+// TestProvisionSharedCloneRefusesHostCloneURLs: the hub's provisioning entry
+// point itself (provisionSharedClone, unwrapped), given the input the hub
+// builds, refuses a local path, file://, http://, a <transport>::<address>
+// URL and a value starting with "-", independently of the hub's own URL
+// check ahead of it.
+func TestProvisionSharedCloneRefusesHostCloneURLs(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "repo.git")
+	for name, cloneURL := range map[string]string{
+		"local path":   local,
+		"file":         "file://" + local,
+		"http":         "http://git.example.invalid/test/repo.git",
+		"transport":    "ext::git-remote-probe",
+		"leading dash": "--upload-pack=git-remote-probe",
+	} {
+		t.Run(name, func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "workspace")
+			err := provisionSharedClone(provision.ProvisionInput{
+				Resolved:        provision.ResolvedWorkspace{HostPath: workspace},
+				ProjectID:       "project-refused-clone",
+				Mode:            store.SharingModeSharedPlain,
+				GitClone:        &api.GitCloneConfig{URL: cloneURL},
+				HostGitHardened: true,
+				SentinelDir:     filepath.Dir(workspace),
+			})
+			require.ErrorIs(t, err, provision.ErrHostCloneURLRefused)
+			assert.NoDirExists(t, workspace)
+		})
+	}
 }

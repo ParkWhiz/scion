@@ -24,8 +24,6 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
-	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
-	"github.com/GoogleCloudPlatform/scion/pkg/shareddirs"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -53,9 +51,6 @@ type ProjectDeletionService struct {
 	authz   *AuthzService
 	logger  *slog.Logger
 	nowFunc func() time.Time
-	// sharedDirLayout returns the hub's shared-dir Layout
-	// (Server.sharedDirLayout). Nil skips shared-dir cleanup on delete.
-	sharedDirLayout func() (projectfs.Layout, error)
 }
 
 // NewProjectDeletionService creates a new ProjectDeletionService.
@@ -104,6 +99,10 @@ type ProjectDeleteDecision struct {
 type ProjectDeleteResult struct {
 	Project        *store.Project // The project record before deletion.
 	CascadeSummary CascadeSummary // Summary of cascade-deleted state.
+	// PendingSecretValueRefs are the held values of the deleted pending
+	// secrets, for the caller to release with the secret backend after
+	// the commit.
+	PendingSecretValueRefs []string
 }
 
 // CascadeSummary records what was cascade-deleted in the transaction.
@@ -134,6 +133,13 @@ type CascadeSummary struct {
 	// the project's agents revoked by the delete; their credentials are
 	// revoked with them.
 	AgentDelegationGrants int `json:"agent_delegation_grants_revoked"`
+	// PendingSecrets is the number of pending secrets written from the
+	// project that were deleted.
+	PendingSecrets int `json:"pending_secrets_deleted"`
+
+	// pendingSecretValueRefs are the value refs of the deleted pending
+	// secrets (never serialized).
+	pendingSecretValueRefs []string
 }
 
 // ---------------------------------------------------------------------------
@@ -347,8 +353,9 @@ func (svc *ProjectDeletionService) Delete(ctx context.Context, req ProjectDelete
 		}
 
 		result = &ProjectDeleteResult{
-			Project:        project,
-			CascadeSummary: cascadeSummary,
+			Project:                project,
+			CascadeSummary:         cascadeSummary,
+			PendingSecretValueRefs: cascadeSummary.pendingSecretValueRefs,
 		}
 		return nil
 	})
@@ -378,64 +385,13 @@ func (svc *ProjectDeletionService) Delete(ctx context.Context, req ProjectDelete
 		}
 	}
 
-	// Best-effort NFS shared-dir cleanup (ptone/scion#1802, Phase 2 item 3).
-	// This runs AFTER the transaction has committed: the DB row is the
-	// source of truth for "the project is deleted", and a filesystem
-	// cleanup failure must never roll that back or fail the request — it is
-	// logged and left for operator follow-up, exactly like the pre-existing
-	// (out of scope here) local-backend and workspace-dir leftover trees
-	// this same issue documents. NFS backend only: local-backend and
-	// workspace-dir cleanup remain out of scope, tracked on #1802 itself.
-	svc.cleanupNFSSharedDirTree(ctx, project.ID)
-
+	// The project's storage (its tree on the shared project storage, the
+	// legacy slug-keyed trees naming it, and its object-storage prefix) is
+	// removed by the caller after this commit, best-effort and audited
+	// (Server.startProjectStorageCleanup, ptone/scion#5835): the DB row is
+	// the source of truth for "the project is deleted", and a storage
+	// failure never rolls it back.
 	return result, nil
-}
-
-// cleanupNFSSharedDirTree removes projectID's shared-dir tree
-// (<subpath_root>/<projectID>/shared-dirs, and the project directory when
-// it is then empty) from the share when the hub's shared-dir Layout is on
-// a shared backend (ptone/scion#1802). The Layout is the hub's in-memory
-// one (Server.sharedDirLayout, from server.project_storage resolved at
-// startup), never a settings-file read, so a project's own settings can
-// never influence it. There is one backend for every agent (no per-agent
-// record), so a local Layout has no tree on any share and cleanup is a
-// no-op. Removing a missing tree is a no-op. The removal is
-// shareddirs.DeleteProjectTree's symlink-refusing, fd-based walk; a
-// failure is logged at ERROR and never blocks or rolls back the DB
-// deletion (deletion is best-effort here).
-func (svc *ProjectDeletionService) cleanupNFSSharedDirTree(ctx context.Context, projectID string) {
-	if svc.sharedDirLayout == nil {
-		return
-	}
-	layout, err := svc.sharedDirLayout()
-	if err != nil {
-		svc.logger.ErrorContext(ctx, "shared-dir storage layout unavailable; skipping shared-dir cleanup on project delete",
-			"project_id", projectID, "error", err)
-		return
-	}
-	if !layout.Backend.Shared() {
-		return
-	}
-	if !shareddirs.ValidProjectID(projectID) {
-		// Should be unreachable (hub project IDs are UUIDs it generates
-		// itself); checked before the filesystem is touched at all.
-		svc.logger.ErrorContext(ctx, "refusing shared-dir cleanup on project delete: project ID fails validation",
-			"project_id", projectID)
-		return
-	}
-	// ProjectRoot validates the project ID again (hub project IDs are UUIDs it
-	// generates itself, so a failure should be unreachable) before the
-	// filesystem is touched at all.
-	root, err := layout.ProjectRoot(projectID)
-	if err != nil {
-		svc.logger.ErrorContext(ctx, "refusing shared-dir cleanup on project delete",
-			"project_id", projectID, "error", err)
-		return
-	}
-	if err := shareddirs.DeleteProjectTree(root.HostBase, root.SubPathRoot, projectID); err != nil {
-		svc.logger.ErrorContext(ctx, "failed to remove project's shared-dir tree on delete",
-			"project_id", projectID, "backend", string(layout.Backend), "host_base", root.HostBase, "error", err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +473,7 @@ func (svc *ProjectDeletionService) checkDeletionGovernanceFromStore(ctx context.
 		if rdErr != nil {
 			continue
 		}
-		if rd.Name == store.ProjectRoleOwner {
+		if builtInRoleName(rd) == store.ProjectRoleOwner {
 			return ProjectDeleteDecision{Allowed: true}
 		}
 	}
@@ -618,6 +574,18 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 		return cs, fmt.Errorf("cascade secrets: %w", err)
 	} else {
 		cs.Secrets = n
+	}
+
+	// 3b. Pending secrets written by the project's agents. They are
+	// user-scope secrets awaiting their owners' decision; the project is
+	// their provenance, and a pending secret from a deleted project is
+	// not offered for approval. Their held values are released by the
+	// caller after the commit (ProjectDeleteResult.PendingSecretValueRefs).
+	if refs, err := tx.DeletePendingSecretsByProject(ctx, projectID); err != nil {
+		return cs, fmt.Errorf("cascade pending secrets: %w", err)
+	} else {
+		cs.PendingSecrets = len(refs)
+		cs.pendingSecretValueRefs = refs
 	}
 
 	// 4. Env vars — project-scoped environment variables.
@@ -760,6 +728,7 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 	// |   (+ project_visitor_exclusions and the rules' role_bindings)                       |          |
 	// | groups                 | Transactional: ListGroups + DeleteGroup (step 2)         | Auth     |
 	// | secrets                | Transactional: DeleteSecretsByScope (step 3)             | Cred     |
+	// | pending_secrets        | Transactional: DeletePendingSecretsByProject (step 3b)   | Cred     |
 	// | env_vars               | Transactional: DeleteEnvVarsByScope (step 4)             | Config   |
 	// | skill_injections       | Transactional: DeleteSkillInjectionsByScope (step 5)     | Config   |
 	// | gcp_service_accounts   | Transactional: List + DeleteGCPServiceAccount (step 6)   | Cred     |

@@ -8,13 +8,16 @@
     "attachmentDelivery",
     "changedFields",
     "clearedFields",
+    "clearedResourceSubfields",
     "emptyPerAgentWorkspace",
     "nodeImageRegistry",
     "reprovision",
     "reprovisionEmptyPerAgent",
+    "reprovisionResetHomeRuntimes",
     "startsInFlight",
     "sync",
     "templateTiers",
+    "unlimitedCountLimits",
     "webPty"
   ]
 }

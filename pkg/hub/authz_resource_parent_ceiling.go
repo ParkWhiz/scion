@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/go-jose/go-jose/v4/jwt"
 
@@ -124,6 +125,10 @@ type ParentCeilingDecision struct {
 	// S3c through the legacy adopted-agent fallback; callers record the use
 	// (recordLegacyAdoptedFallback).
 	legacyFallback *legacyAdoptedFallback
+	// uatIntrinsic is set on an allowed user secret decision whose S3c
+	// passed at a token-recorded hop only through the intrinsic rule;
+	// callers count the use (recordUATIntrinsic).
+	uatIntrinsic bool
 }
 
 func parentCeilingDeny(cause DenyCause, reason string, proof ParentProof) ParentCeilingDecision {
@@ -307,7 +312,7 @@ func (a *AuthzService) EvaluateServiceAccountParentCeiling(ctx context.Context, 
 	}
 
 	// 5. The recorded effect ceiling.
-	if !EffectCeilingAllows(row.EffectCeiling, gcpServiceAccountAssignPermission, false) {
+	if !EffectCeilingAllows(uatHopEffectCeiling(row.SourcePrincipalKind, row.SourcePrincipalID, row.AuthorityProvenance, row.EffectCeiling), gcpServiceAccountAssignPermission, false) {
 		return parentCeilingDeny(DenyCauseCeilingEffectExceeded, "recorded ceiling does not allow assigning the service account", proof)
 	}
 
@@ -403,7 +408,7 @@ func (a *AuthzService) parentCeilingSourceIdentity(ctx context.Context, row stor
 // reviewed mappings have an evaluator; any other mapping denies with
 // ceiling_error, so adding a table row without an evaluator cannot allow.
 func (a *AuthzService) evaluateResourceParentCeiling(ctx context.Context, m ResourceParentCeiling, agentID string, resource Resource) ParentCeilingDecision {
-	proof := ParentProof{Permission: m.ParentPermission}
+	proof := ParentProof{Kind: ParentProofKindParentPermission, Permission: m.ParentPermission}
 	if resource.Type != m.ResourceType {
 		return parentCeilingDeny(DenyCauseCeilingError, "resource does not match the parent ceiling", proof)
 	}
@@ -430,10 +435,10 @@ func (a *AuthzService) evaluateResourceParentCeiling(ctx context.Context, m Reso
 func (a *AuthzService) applyResourceParentCeiling(ctx context.Context, m ResourceParentCeiling, agent AgentIdentity, resource Resource, decision Decision) Decision {
 	if agent == nil || isNilIdentity(agent) || agent.ID() == "" {
 		return parentCeilingDenyDecision(decision, DenyCauseCeilingError,
-			"parent ceiling: the principal is not an agent identity", ParentProof{Permission: m.ParentPermission})
+			"parent ceiling: the principal is not an agent identity", ParentProof{Kind: ParentProofKindParentPermission, Permission: m.ParentPermission})
 	}
 	if deny, cause, reason, adoptable := a.parentCeilingChainDeny(ctx, agent, m.DecisionPermission); deny {
-		decision = parentCeilingDenyDecision(decision, cause, reason, ParentProof{Permission: m.ParentPermission})
+		decision = parentCeilingDenyDecision(decision, cause, reason, ParentProof{Kind: ParentProofKindParentPermission, Permission: m.ParentPermission})
 		decision.adoptionRemediable = cause == DenyCauseCeilingUnrecorded && adoptable
 		return decision
 	}
@@ -631,6 +636,12 @@ func (a *AuthzService) decideStoredAgentServiceAccountUse(ctx context.Context, a
 	return decision
 }
 
+// reasonStoredAgentConstraintLoadError is the deny reason of
+// storedAgentAccessConstraintDeny when the access constraints cannot be
+// loaded. It names the failure, rather than the "no check function" text of
+// a restriction without a check.
+const reasonStoredAgentConstraintLoadError = "access constraint load error (fail-closed)"
+
 // storedAgentAccessConstraintDeny is Decide's step 7c for a stored agent
 // with no credential on the request: it loads the access constraints that
 // apply to the agent's principal closure (the agent and the groups it
@@ -661,7 +672,7 @@ func (a *AuthzService) storedAgentAccessConstraintDeny(ctx context.Context, iden
 	restrictions, err := a.accessConstraintRestrictions(ctx, closure, resourceCtx)
 	if err != nil {
 		a.logger.Warn("stored-agent use: failed to load access constraints (fail-closed)", "error", err)
-		return Decision{Allowed: false, Reason: "restriction removed permission: access_constraint_error - restriction has no check function (fail closed)", DenyCause: DenyCauseResolutionError}, true
+		return Decision{Allowed: false, Reason: reasonStoredAgentConstraintLoadError, DenyCause: DenyCauseResolutionError}, true
 	}
 	for _, r := range restrictions {
 		if r.Check == nil {
@@ -767,12 +778,44 @@ type userSecretChain struct {
 	// unrecorded one is still enforced: S3b, S3c and S3d run on it before
 	// the walk reaches the unrecorded hop, and a deny there leaves
 	// unrecorded false. Only a hop without recorded provenance sets it, and
-	// the callers (check 8 and the agent secret list) never deny on such a
-	// hop alone: they apply the progeny rule instead.
+	// the callers refuse such a chain (chain_unrecorded): check 8, the agent
+	// secret list, and start-time delivery of the owner's shared rows.
 	unrecorded bool
 	// legacyFallback is set when S3c passed through the legacy adopted-agent
 	// fallback (legacyAdoptedSecretUseFallback). Every other clause applied.
 	legacyFallback *legacyAdoptedFallback
+	// uatIntrinsic is set when S3c passed at a hop recorded from a user
+	// access token only through the intrinsic rule (uatIntrinsicDecides).
+	uatIntrinsic bool
+	// shape names where an unrecorded chain stops (unrecordedShape*), and
+	// shapeDepth and shapeAgentID the hop: depth 0 is the agent's own edge;
+	// for unrecorded_above, the ancestor agent whose edge is unrecorded.
+	shape        string
+	shapeDepth   int
+	shapeAgentID string
+}
+
+// Where an unrecorded chain stops (userSecretChain.shape). At depth 0 the
+// shape is the agent's own edge's; a stop further up is unrecorded_above.
+const (
+	unrecordedShapeNoEdge                = "no_edge"
+	unrecordedShapeSentinel              = "sentinel"
+	unrecordedShapeUnrecordedEdge        = "unrecorded_edge"
+	unrecordedShapeAmbiguousEdges        = "ambiguous_edges"
+	unrecordedShapeInconsistentPrincipal = "inconsistent_principal"
+	unrecordedShapeUnrecordedAbove       = "unrecorded_above"
+)
+
+// stopUnrecorded marks the chain unrecorded at depth, for delegate, with
+// shape (the own edge's shape at depth 0, unrecorded_above further up).
+func (c *userSecretChain) stopUnrecorded(depth int, delegateID, shape string) {
+	c.unrecorded = true
+	c.shapeDepth = depth
+	c.shapeAgentID = delegateID
+	if depth > 0 {
+		shape = unrecordedShapeUnrecordedAbove
+	}
+	c.shape = shape
 }
 
 func (c userSecretChain) deny(cause DenyCause, reason string) userSecretChain {
@@ -812,7 +855,8 @@ func secretParentStep(explain *[]DecisionStep, step, detail string) {
 //     recorded principal type-checks (ceiling_orphaned); S3b a local
 //     development hop needs dev auth and the local development user
 //     (ceiling_source_not_allowed); S3c a bounded ceiling allows secret.use,
-//     with no self-operation exception (ceiling_effect_exceeded); S3d an
+//     with no self-operation exception, read through uatHopEffectCeiling
+//     (ceiling_effect_exceeded); S3d an
 //     agent delegator is live and holds secret.use through its role
 //     (ceiling_orphaned, ceiling_delegator_lacks_permission); S3e depth and
 //     cycles (ceiling_orphaned);
@@ -842,6 +886,47 @@ func (a *AuthzService) EvaluateUserSecretParentCeiling(ctx context.Context, prin
 // evaluateUserSecretParentCeiling is EvaluateUserSecretParentCeiling with
 // explain steps and the unrecorded-hop note.
 func (a *AuthzService) evaluateUserSecretParentCeiling(ctx context.Context, principal AgentIdentity, resource Resource, explain *[]DecisionStep) (ParentCeilingDecision, unrecordedHopNote) {
+	return a.evaluateUserSecretParentCeilingWithChain(ctx, principal, resource, explain, nil)
+}
+
+// precomputedUserSecretChain is a chain verdict (userSecretChainVerdict) a
+// caller computed for an agent before calling Decide: the runtime read
+// computes it to choose its rule, and passes it on the request
+// (AuthzRequest.userSecretChain) so step 10 does not compute it again. It
+// grants nothing by itself: the verdict is the one step 10 would compute,
+// for the same agent, at the same point of the same request.
+type precomputedUserSecretChain struct {
+	agentID   string
+	projectID string
+	chain     userSecretChain
+}
+
+// newPrecomputedUserSecretChain records chain as principal's verdict. It
+// returns nil for an invalid principal, so step 10 computes the verdict.
+func newPrecomputedUserSecretChain(principal AgentIdentity, chain userSecretChain) *precomputedUserSecretChain {
+	if isNilIdentity(principal) || principal.ID() == "" {
+		return nil
+	}
+	return &precomputedUserSecretChain{agentID: principal.ID(), projectID: principal.ProjectID(), chain: chain}
+}
+
+// verdictFor returns the recorded verdict when it is principal's and no
+// explain trace is being collected (a trace needs the verdict's own steps).
+// Otherwise ok is false and the caller computes the verdict.
+func (p *precomputedUserSecretChain) verdictFor(principal AgentIdentity, explain *[]DecisionStep) (userSecretChain, bool) {
+	if p == nil || explain != nil || isNilIdentity(principal) {
+		return userSecretChain{}, false
+	}
+	if p.agentID == "" || p.agentID != principal.ID() || p.projectID != principal.ProjectID() {
+		return userSecretChain{}, false
+	}
+	return p.chain, true
+}
+
+// evaluateUserSecretParentCeilingWithChain is evaluateUserSecretParentCeiling
+// that uses pre, when it holds principal's verdict, instead of computing the
+// chain verdict again.
+func (a *AuthzService) evaluateUserSecretParentCeilingWithChain(ctx context.Context, principal AgentIdentity, resource Resource, explain *[]DecisionStep, pre *precomputedUserSecretChain) (ParentCeilingDecision, unrecordedHopNote) {
 	proof := ParentProof{Kind: ParentProofKindOwnershipFact, Permission: secretUsePermission, ResourceID: resource.ID}
 	if a == nil || a.store == nil || isNilIdentity(principal) || principal.ID() == "" {
 		secretParentStep(explain, "error", "invalid parent ceiling request")
@@ -852,7 +937,10 @@ func (a *AuthzService) evaluateUserSecretParentCeiling(ctx context.Context, prin
 		return parentCeilingDeny(DenyCauseCeilingResourceMissing, "invalid resource: no secret or parent user", proof), unrecordedHopNote{}
 	}
 	ctx = maskAuthzInputs(ctx)
-	chain := a.userSecretChainVerdict(ctx, principal, explain)
+	chain, ok := pre.verdictFor(principal, explain)
+	if !ok {
+		chain = a.userSecretChainVerdict(ctx, principal, explain)
+	}
 	if !chain.decision.Allowed {
 		d := chain.decision
 		d.Proof.ResourceID = resource.ID
@@ -869,13 +957,25 @@ func (a *AuthzService) evaluateUserSecretParentCeiling(ctx context.Context, prin
 	if d.Allowed && chain.legacyFallback != nil {
 		d.legacyFallback = chain.legacyFallback
 	}
+	if d.Allowed {
+		d.uatIntrinsic = chain.uatIntrinsic
+	}
 	return d, unrecordedHopNote{}
 }
+
+// userSecretChainVerdictObserver is a test seam: when it holds a function,
+// that function is called with the agent ID each time
+// userSecretChainVerdict runs. Only tests store one; it is empty in
+// production. It is atomic so a test may set it while others run.
+var userSecretChainVerdictObserver atomic.Pointer[func(agentID string)]
 
 // userSecretChainVerdict runs clauses S1-S4c for principal (see
 // EvaluateUserSecretParentCeiling). It masks the request's authorization
 // inputs itself, so it can be called on its own.
 func (a *AuthzService) userSecretChainVerdict(ctx context.Context, principal AgentIdentity, explain *[]DecisionStep) userSecretChain {
+	if obs := userSecretChainVerdictObserver.Load(); obs != nil && !isNilIdentity(principal) {
+		(*obs)(principal.ID())
+	}
 	chain := userSecretChain{decision: ParentCeilingDecision{Proof: ParentProof{Kind: ParentProofKindOwnershipFact, Permission: secretUsePermission}}}
 	if a == nil || a.store == nil || isNilIdentity(principal) || principal.ID() == "" {
 		secretParentStep(explain, "error", "invalid parent ceiling request")
@@ -940,12 +1040,12 @@ func (a *AuthzService) userSecretChainVerdict(ctx context.Context, principal Age
 		switch len(active) {
 		case 0:
 			secretParentStep(explain, "no_edge", fmt.Sprintf("no active delegation edge for agent:%s", delegateID))
-			chain.unrecorded = true
+			chain.stopUnrecorded(depth, delegateID, unrecordedShapeNoEdge)
 			return chain.deny(DenyCauseCeilingProvenanceMissing, "no recorded delegation for agent "+delegateID)
 		case 1:
 		default:
 			secretParentStep(explain, "duplicate_edges", fmt.Sprintf("%d active edges for agent:%s", len(active), delegateID))
-			chain.unrecorded = true
+			chain.stopUnrecorded(depth, delegateID, unrecordedShapeAmbiguousEdges)
 			return chain.deny(DenyCauseCeilingProvenanceAmbiguous, "more than one active delegation for agent "+delegateID)
 		}
 		edge := active[0]
@@ -953,7 +1053,7 @@ func (a *AuthzService) userSecretChainVerdict(ctx context.Context, principal Age
 		// S3s
 		if isMigrationSentinel(edge) {
 			secretParentStep(explain, "migration_edge", fmt.Sprintf("migration-provenance edge for agent:%s", delegateID))
-			chain.unrecorded = true
+			chain.stopUnrecorded(depth, delegateID, unrecordedShapeSentinel)
 			return chain.deny(DenyCauseCeilingOrphaned, "migration-provenance delegation supplies no source")
 		}
 		// S3a
@@ -961,13 +1061,13 @@ func (a *AuthzService) userSecretChainVerdict(ctx context.Context, principal Age
 			(edge.Kind != store.EffectCeilingPrincipal && edge.Kind != store.EffectCeilingBounded) {
 			secretParentStep(explain, "unrecorded", fmt.Sprintf("edge %s has no recorded provenance", edge.ID))
 			a.logUnrecordedHop(&chain.note, DenyCauseCeilingUnrecorded, edge, secretUsePermission)
-			chain.unrecorded = true
+			chain.stopUnrecorded(depth, delegateID, unrecordedShapeUnrecordedEdge)
 			return chain.deny(DenyCauseCeilingUnrecorded, "secret.use requires recorded provenance")
 		}
 		// S3f
 		if err := checkEdgePrincipal(edge); err != nil {
 			secretParentStep(explain, "principal_mismatch", fmt.Sprintf("edge %s: recorded principal is inconsistent", edge.ID))
-			chain.unrecorded = true
+			chain.stopUnrecorded(depth, delegateID, unrecordedShapeInconsistentPrincipal)
 			return chain.deny(DenyCauseCeilingOrphaned, "recorded delegation principal is inconsistent")
 		}
 		// S3b
@@ -982,8 +1082,15 @@ func (a *AuthzService) userSecretChainVerdict(ctx context.Context, principal Age
 			}
 		}
 		// S3c, with the legacy adopted-agent fallback (see
-		// user_secret_legacy_adopted_fallback.go).
-		if edge.Kind == store.EffectCeilingBounded && !EffectCeilingAllows(edge.EffectCeiling, secretUsePermission, false) {
+		// user_secret_legacy_adopted_fallback.go). A hop recorded from a user
+		// access token applies uatHopEffectCeiling: secret.use is intrinsic
+		// to it, and every other clause, on every hop and on the terminal
+		// user, still applies.
+		if edge.Kind == store.EffectCeilingBounded && uatIntrinsicDecides(edge.DelegatorType, edge.DelegatorID, edge.AuthorityProvenance, edge.EffectCeiling, secretUsePermission) {
+			secretParentStep(explain, "uat_intrinsic", fmt.Sprintf("edge %s: recorded from a user access token; secret.use is intrinsic to the hop", edge.ID))
+			chain.uatIntrinsic = true
+		}
+		if edge.Kind == store.EffectCeilingBounded && !EffectCeilingAllows(uatHopEffectCeiling(edge.DelegatorType, edge.DelegatorID, edge.AuthorityProvenance, edge.EffectCeiling), secretUsePermission, false) {
 			fb, err := a.legacyAdoptedSecretUseFallback(ctx, agent, edge, depth)
 			if err != nil {
 				secretParentStep(explain, "error", "adoption record lookup failed")
@@ -1022,7 +1129,7 @@ func (a *AuthzService) userSecretChainVerdict(ctx context.Context, principal Age
 		default:
 			// checkEdgePrincipal admits only user and agent delegators.
 			secretParentStep(explain, "principal_mismatch", fmt.Sprintf("edge %s has delegator type %q", edge.ID, edge.DelegatorType))
-			chain.unrecorded = true
+			chain.stopUnrecorded(depth, delegateID, unrecordedShapeInconsistentPrincipal)
 			return chain.deny(DenyCauseCeilingOrphaned, "recorded delegation principal is inconsistent")
 		}
 	}

@@ -78,9 +78,8 @@ func (s *Server) withSkillContentHashV2(sv *store.SkillVersion) *store.SkillVers
 // constraint that matches no version's v1 hash is matched against the v2
 // hash of each published or deprecated version (v1 first, then v2). When
 // several versions share that v2 (the same files republished), the oldest
-// wins (created ascending, then ID). The store's v1 lookup has no explicit
-// order (First() with no ORDER BY, so the database decides); making it
-// match is ptone/scion#6248.
+// wins (created ascending, then ID). The store's v1 lookup uses the same
+// status set and order (ptone/scion#6248).
 func (s *Server) resolveSkillVersion(ctx context.Context, skillID, constraint string) (*store.SkillVersion, error) {
 	sv, err := s.store.ResolveSkillVersion(ctx, skillID, constraint)
 	if err == nil || !errors.Is(err, store.ErrNotFound) ||
@@ -113,12 +112,12 @@ func (s *Server) resolveSkillVersion(ctx context.Context, skillID, constraint st
 
 // listAllSkillVersions returns every version of skillID, in any status.
 func (s *Server) listAllSkillVersions(ctx context.Context, skillID string) ([]store.SkillVersion, error) {
-	result, err := s.store.ListSkillVersions(ctx, skillID, store.ListOptions{})
+	result, err := s.store.ListSkillVersions(ctx, skillID, store.SkillVersionFilter{}, store.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	if result.TotalCount > len(result.Items) {
-		result, err = s.store.ListSkillVersions(ctx, skillID, store.ListOptions{Limit: result.TotalCount})
+		result, err = s.store.ListSkillVersions(ctx, skillID, store.SkillVersionFilter{}, store.ListOptions{Limit: result.TotalCount})
 		if err != nil {
 			return nil, err
 		}

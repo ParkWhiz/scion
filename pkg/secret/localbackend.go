@@ -116,9 +116,12 @@ func (b *LocalBackend) fetchValue(ctx context.Context, meta SecretMeta) FetchRes
 	}
 	sv, err := b.decryptStoreSecret(s)
 	if err != nil {
-		return FetchResult{Err: err}
+		// The typed error Resolve returns for an undecryptable value
+		// (errors.Is ErrResolveDecrypt), naming the key and scope only.
+		return FetchResult{Err: newResolveDecryptError([]ResolveFailure{{Key: s.Key, Scope: s.Scope, Kind: DecryptFailureKind(err)}})}
 	}
-	return FetchResult{Value: sv.Value}
+	// The stored ref verbatim, as Resolve reports it.
+	return FetchResult{Value: sv.Value, Ref: s.SecretRef}
 }
 
 func (b *LocalBackend) Set(ctx context.Context, input *SetSecretInput) (bool, *SecretMeta, error) {
@@ -236,6 +239,12 @@ func (b *LocalBackend) Resolve(ctx context.Context, userID, projectID, brokerID 
 			// Never project hub-internal infrastructure secrets (e.g. signing keys)
 			// into agent environments.
 			if s.SecretType == store.SecretTypeInternal {
+				continue
+			}
+			// Hub-scope rows are held to HubSecretDeliverable before their
+			// value is read, so an excluded row never shadows a broker-scope
+			// row of the same key.
+			if sc.scope == store.ScopeHub && !hubRowDeliverable(&s) {
 				continue
 			}
 			// The owner path: a user-scope row of userID is held to the
@@ -459,10 +468,7 @@ func (b *LocalBackend) decryptStoreSecret(s *store.Secret) (*SecretWithValue, er
 // reads as the empty value, exactly as before, so a managed cipher does
 // not misreport it as unadmitted plaintext (ptone/scion#1530 §7).
 func (b *LocalBackend) decryptPayload(raw, ref string) (string, error) {
-	if raw == "" && ref != "" {
-		return "", nil
-	}
-	return b.decryptRawValue(raw)
+	return DecodeStoredValue(b.cipher, raw, ref)
 }
 
 // decryptRawValue decrypts a raw stored value with the shared cipher. On
@@ -470,7 +476,20 @@ func (b *LocalBackend) decryptPayload(raw, ref string) (string, error) {
 // reported to the caller, never delivered as an indistinguishable empty
 // value.
 func (b *LocalBackend) decryptRawValue(raw string) (string, error) {
-	plaintext, err := b.cipher.Decrypt(raw)
+	return DecodeStoredValue(b.cipher, raw, "")
+}
+
+// DecodeStoredValue is the local backend's decode path: it turns a row's
+// stored at-rest form raw (with backend reference ref) into the secret's
+// value using cipher c. A reference-only row (an empty value with a
+// non-empty ref) holds no local payload and decodes to the empty value. On
+// failure the value is always empty and the error is typed (see
+// DecryptFailureKind); it never carries a value.
+func DecodeStoredValue(c *ValueCipher, raw, ref string) (string, error) {
+	if raw == "" && ref != "" {
+		return "", nil
+	}
+	plaintext, err := c.Decrypt(raw)
 	if err != nil {
 		return "", fmt.Errorf("decrypting secret value: %w", err)
 	}
