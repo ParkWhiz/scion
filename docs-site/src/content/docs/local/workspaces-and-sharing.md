@@ -39,7 +39,7 @@ The shared `.git` root is mounted **read-only**. Only `objects/`, `refs/`, `logs
 
 - **Isolation:** per-agent working tree; shared history.
 - **Requires git:** yes.
-- **Availability:** used automatically for **repositories linked to the local workstation Hub**, and for **Hub-managed git projects** created with workspace mode `worktree-per-agent` (requires git 2.48 or later on the Runtime Broker; see [Linked git projects](/scion/local/workspace/#linked-git-projects)). Not supported on Kubernetes (use `clone-per-agent` or a local or Docker Runtime Broker).
+- **Availability:** used automatically for **repositories linked to the local workstation Hub**, and for **Hub-managed git projects** created with workspace mode `worktree-per-agent` (requires git 2.48 or later on the Runtime Broker; see [Linked git projects](/scion/local/workspace/#linked-git-projects)). Not supported on Kubernetes, Cloud Run Instances, or shared (`nfs`) project storage with Docker, Podman, or Apple `container` (use `clone-per-agent` on Kubernetes or NFS, `clone-per-agent` or `shared-plain` on Cloud Run Instances, or run `worktree-per-agent` projects on a Docker, Podman, or Apple Runtime Broker using local `project_storage`; local `cloudrun-sandbox` is unaffected).
 - **Best for:** local git projects where multiple agents work in parallel on the same repository.
 
 ### Clone-per-agent
@@ -117,7 +117,7 @@ For a git project, only `shared` selects the shared checkout. A git project with
 Earlier releases treated an unlabeled git project as a shared checkout. After upgrading, an existing agent in such a project starts in a new clone on a Runtime Broker that does not have the NFS export mounted. Push any work in the shared checkout before you restart its agents.
 :::
 
-The Hub rejects unknown values with `400`. The mode is stored in the server-owned `scion.dev/workspace-mode` label: you cannot set or change that label directly, on create or later with an update. Creating or starting an Empty-per-agent agent on a Runtime Broker that does not support this mode fails with `412 Precondition Failed` (`unsupported_capability`). The error names the Runtime Broker and says which ones work: Docker, Podman, Apple, and Kubernetes Runtime Brokers. Upgrade an older Runtime Broker, or pick one of those; upgrading does not help a Cloud Run or Substrate Runtime Broker. See [`scion hub projects create`](/scion/reference/cli/#scion-hub) and the [Projects API](/scion/reference/api/#projects-apiv1projects).
+The Hub rejects unknown values with `400`. The mode is stored in the server-owned `scion.dev/workspace-mode` label: you cannot set or change that label directly, on create or later with an update. Creating or starting an Empty-per-agent agent on a Runtime Broker that does not support this mode fails with `412 Precondition Failed` (`unsupported_capability`). The error names the Runtime Broker and says which ones work: Docker, Podman, Apple, and Kubernetes Runtime Brokers. Upgrade an older Runtime Broker, or pick one of those; upgrading does not help a Cloud Run or Substrate Runtime Broker. Creating or starting a Worktree-per-agent agent on a Cloud Run Instances Runtime Broker (or Cloud Run Instances runtime profile; `cloudrun-sandbox` is unaffected) likewise fails with `412 Precondition Failed` (`unsupported_capability`) before any host worktree is created, naming the supported Cloud Run modes (`clone-per-agent` and `shared-plain`) and the local container Runtime Brokers (`Docker`, `Podman`, and `Apple`). See [`scion hub projects create`](/scion/reference/cli/#scion-hub) and the [Projects API](/scion/reference/api/#projects-apiv1projects).
 
 ## Runtime environment variables
 
@@ -125,7 +125,7 @@ Agents can discover their workspace provisioning at startup through two environm
 
 ### `SCION_WORKSPACE_MODE`
 
-The canonical workspace sharing mode for the project. The Runtime Broker sets it on every agent it starts. When the project has no workspace mode, its value is `shared-plain`. That includes Hub git projects created without `--workspace-mode`, even though each of their agents gets its own clone; for those, `SCION_WORKSPACE_GIT=true` tells the agent the workspace is a git checkout.
+The canonical workspace sharing mode for the project. The Runtime Broker sets it on every agent it starts. When the project has no workspace mode, its value is `shared-plain`. That includes Hub git projects created without `--workspace-mode`, even though each of their agents gets its own clone; for those, `SCION_WORKSPACE_GIT=true` tells the agent the workspace is a git checkout. When a `worktree-per-agent` start gets a clone inside the container instead of a worktree (on Docker, Podman or Apple `container` when the worktree cannot be provisioned, and on Kubernetes without NFS workspace storage), the value is `clone-per-agent`, because that is the workspace the agent gets; that clone can be shallow (`SCION_GIT_DEPTH`).
 
 | Value | Description |
 |---|---|
@@ -144,11 +144,15 @@ Present (value `"true"`) when the workspace is a git repository. Absent when the
 
 **Compatibility note:** The legacy `SCION_SHARED_WORKSPACE` variable has been removed ([ptone/scion#575](https://github.com/ptone/scion/issues/575)). The broker no longer sets it, and `sciontool init` ignores it if it is present. Use `SCION_WORKSPACE_MODE=shared-plain` together with `SCION_WORKSPACE_GIT=true` to detect a shared git workspace. An agent started by an older broker that sets neither new variable is treated as not being in a shared git workspace. An agent image whose `sciontool` predates `SCION_WORKSPACE_MODE` ([ptone/scion#572](https://github.com/ptone/scion/issues/572)) reads only the legacy variable, so on a current broker it also skips the shared-workspace git setup.
 
+### `SCION_GIT_DEPTH`
+
+Present when the workspace is cloned per agent in the container (`clone-per-agent`, or a `worktree-per-agent` start that fell back to a clone). Records the initial git clone depth configured for the workspace: `"1"` by default (shallow clone), `"N"` when `clone_depth: N` is set on the template or profile, or `"0"` when `clone_depth: full` is set. Because an agent can deepen an existing workspace in place (`git fetch --deepen=<N>` or `git fetch --unshallow`), check `git rev-parse --is-shallow-repository` for the live checkout state.
+
 ---
 
 ## Workspace Orientation & Invariants (Mandatory Boilerplate)
 
-All Scion agents should run a **workspace orientation check** immediately upon startup. By reading `SCION_WORKSPACE_MODE` and `SCION_WORKSPACE_GIT`, an agent can adapt its behavior to match its level of isolation.
+All Scion agents should run a **workspace orientation check** immediately upon startup. By reading `SCION_WORKSPACE_MODE`, `SCION_WORKSPACE_GIT`, and `SCION_GIT_DEPTH`, an agent can adapt its behavior to match its level of isolation.
 
 ### 1. Per-Mode Behavior Guidelines
 
@@ -163,6 +167,8 @@ Depending on the effective workspace sharing mode, agents must adhere to the fol
   * **Shared Git Repo**: The underlying git repository history, local branches, and refs are shared, and the `.git` root is mounted read-only (only `objects/`, `refs/`, `logs/`, `lfs/` and your worktree's state directory are writable). Treat local branch names as a shared namespace to avoid collisions, and note that commands that rewrite `packed-refs` or root files (such as deleting a branch or tag or running `git gc`) fail cleanly inside the container.
 * **When `SCION_WORKSPACE_MODE` is `clone-per-agent`**:
   * **Full Isolation**: Your clone is entirely your own. Nothing you do to the working tree, local refs, or local branches will affect any other agent's workspace.
+* **Whenever `SCION_GIT_DEPTH` is set (or `git rev-parse --is-shallow-repository` is `true`)**:
+  * **Shallow by Default**: Per-agent container clones (including `worktree-per-agent` starts that fell back to cloning) default to shallow depth 1 (`SCION_GIT_DEPTH=1`, `0` for full clone). Check `SCION_GIT_DEPTH` and `git rev-parse --is-shallow-repository` before running `git merge-base`, `...` diffs, two-dot ranges, `git log`/`blame`, or `git rebase`, and deepen first (`git fetch --deepen=<N>` or `git fetch --unshallow`) when history beyond the clone depth is needed.
 * **When `SCION_WORKSPACE_MODE` is `empty-per-agent`**:
   * **Private, Initially Empty**: `/workspace` is your own directory. It started empty and is not a git repository.
   * **Lifetime**: It is kept across suspend/resume where storage allows, and deleted with the agent. Put anything that other agents need, or that must outlive you, in a shared directory.

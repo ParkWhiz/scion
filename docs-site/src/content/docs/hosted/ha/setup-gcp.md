@@ -274,13 +274,18 @@ account's ambient credentials. This works because the Hub SA has `roles/containe
 
 ### 1f. Generate Session Secret
 
-The Hub uses a 32-byte hex session signing key:
+The Hub uses a 32-byte hex session and JWT signing key shared across replicas. Generate it directly into Secret Manager so the plaintext value is never printed to your terminal, written to disk, or stored in the Cloud Run service spec:
 
 ```bash
-export SCION_SERVER_SESSION_SECRET=$(openssl rand -hex 32)
-echo "Session secret: $SCION_SERVER_SESSION_SECRET"
-# Save this — you'll use it in the deploy command.
+openssl rand -hex 32 | tr -d '\n' | gcloud secrets create scion-hub-session-secret \
+  --data-file=- \
+  --replication-policy=automatic \
+  --project=$PROJECT_ID
 ```
+
+:::note[Existing deployments]
+If you already deployed `scion-hub` with `SCION_SERVER_SESSION_SECRET` (or `SESSION_SECRET`) set directly in `--set-env-vars`, seed `scion-hub-session-secret` with the current value from the running revision's environment instead of generating a new random key, then redeploy in [Section 3d](#3d-deploy-the-hub-to-cloud-run). Generating a new value rotates the session and legacy JWT signing key, signing every user out and invalidating existing Hub-signed tokens.
+:::
 
 ### Infrastructure Verification Checklist
 
@@ -303,6 +308,10 @@ gcloud container clusters describe scion-agents --region=$GKE_REGION \
 
 echo "Kubeconfig Secret:"
 gcloud secrets describe scion-gke-kubeconfig --project=$PROJECT_ID \
+  --format="value(name)" 2>/dev/null && echo "  OK" || echo "  MISSING"
+
+echo "Session Secret:"
+gcloud secrets describe scion-hub-session-secret --project=$PROJECT_ID \
   --format="value(name)" 2>/dev/null && echo "  OK" || echo "  MISSING"
 ```
 
@@ -385,19 +394,28 @@ behalf of the transport SA (via `gcpTransportMinter.MintIDToken`). This token is
 `Authorization: Bearer` for all Hub API calls through IAP. The `serviceAccountTokenCreator`
 role authorizes the Hub SA to mint tokens as the transport SA.
 
-### 2d. Hub Runner SA — Token Creator on Itself
+### 2d. Hub Runner SA — Blob Signing on Itself (for Signed URLs)
 
-The Hub generates signed GCS URLs for template files when dispatching agents. This operation requires the `iam.serviceAccounts.signBlob` permission, which requires the Hub Runner SA to have the Token Creator role on **itself**:
+The Hub generates signed GCS URLs for template files and download links when dispatching agents. This operation requires only the `iam.serviceAccounts.signBlob` permission on the Hub Runner SA itself.
+
+Grant a minimal custom role containing only `iam.serviceAccounts.signBlob` on the Hub Runner SA instead of `roles/iam.serviceAccountTokenCreator` (which also grants token minting permissions that the Hub does not need on its own identity):
 
 ```bash
+gcloud iam roles create scionBlobSigner \
+  --project=$PROJECT_ID \
+  --title="Scion Blob Signer" \
+  --description="Minimal role allowing only iam.serviceAccounts.signBlob for GCS signed URLs" \
+  --permissions=iam.serviceAccounts.signBlob \
+  --stage=GA
+
 gcloud iam service-accounts add-iam-policy-binding \
   $SA_HUB \
   --member="serviceAccount:$SA_HUB" \
-  --role="roles/iam.serviceAccountTokenCreator" \
+  --role="projects/$PROJECT_ID/roles/scionBlobSigner" \
   --project=$PROJECT_ID
 ```
 
-Without this binding, template generation will fail with: `Permission 'iam.serviceAccounts.signBlob' denied on resource`.
+Without this binding, signed URL generation will fail with: `Permission 'iam.serviceAccounts.signBlob' denied on resource`.
 
 ### 2e. Hub Runner SA — IAM Security Reviewer (Optional, for Policy Troubleshooter)
 
@@ -521,9 +539,23 @@ Pods dispatched to a different namespace (e.g. `default`) will fail with
 ### 2i. GKE Workload Identity for GCP Identity Mode Assign
 
 GCP identity mode **assign** on the Kubernetes runtime authenticates agent pods via
-Workload Identity, not via the sciontool metadata emulator used on Docker. Scion does
-not create, annotate, or bind Kubernetes ServiceAccounts (KSAs) for this — pre-provision
-each one yourself, then tell the broker about it in its own `settings.yaml`.
+Workload Identity, not via the sciontool metadata emulator used on Docker. By default, Scion does not create or annotate Kubernetes ServiceAccounts (KSAs) — you pre-provision each KSA yourself and map or annotate it.
+
+For a GSA the Hub mints while the `hub.k8s_workload_identity_setup` experiment is on:
+- Set `workload_identity_pool: <CLUSTER_PROJECT_ID>.svc.id.goog` on the broker's
+  `kubernetes` runtime entry (or `server.broker.instances[].runtime_target` on a flat
+  Runtime Broker instance) so the Hub grants `roles/iam.workloadIdentityUser` to the
+  conventional `<account ID>` KSA at mint.
+- Optionally set `create_service_accounts: true` on that same runtime entry (or flat
+  `runtime_target`) and grant the broker's Kubernetes identity `get`, `list`, and `create`
+  on `serviceaccounts` in the agent namespace (`get` and `create` on a flat instance, which
+  never lists `serviceaccounts`) so the broker creates and annotates the conventional
+  `<account ID>` KSA on first `assign` start (existing KSAs are never modified; a colliding
+  KSA fails with `identity_ksa_conflict`). New IAM bindings can take up to a few minutes to
+  propagate in GKE Workload Identity, and agent namespaces should be dedicated to Scion so
+  only the broker identity can create ServiceAccounts and pods there.
+See [Workload Identity binding at mint](/scion/hosted/ha/kubernetes/#workload-identity-binding-at-mint)
+and [GCP Identity Mode "assign"](/scion/hosted/ha/kubernetes/#gcp-identity-mode-assign-workload-identity-mapping).
 
 This section covers the cluster side: the Workload Identity binding and the broker
 mapping. Registering the GSA with the Hub and granting the Hub token-creator on it come
@@ -713,7 +745,7 @@ gcloud projects get-iam-policy $PROJECT_ID \
 | `scion-hub-runner` | `roles/storage.objectAdmin` | Project | GCS bucket read/write |
 | `scion-hub-runner` | `roles/secretmanager.admin` | Project | Read, write, create secret values |
 | `scion-hub-runner` | `roles/container.developer` | Project | GKE agent dispatch |
-| `scion-hub-runner` | `roles/iam.serviceAccountTokenCreator` | **On itself** | Generate GCS signed URLs |
+| `scion-hub-runner` | `projects/$PROJECT_ID/roles/scionBlobSigner` (`iam.serviceAccounts.signBlob`) | **On itself** | Generate GCS signed URLs / download links |
 | `scion-hub-runner` | `roles/iam.serviceAccountTokenCreator` | **On `scion-transport` SA** | Mint IAP tokens for agents |
 | `scion-hub-runner` | `roles/iam.securityReviewer` | Project/Org, plus each project that holds an assigned SA | Policy Troubleshooter (required for SA assignment when `gcp_iam_check_mode: enforce`) |
 | `scion-transport` | `roles/iap.httpsResourceAccessor` | Project | Allow IAP access to Hub |
@@ -998,7 +1030,7 @@ rm /tmp/settings-final.yaml
 
 ### 3d. Deploy the Hub to Cloud Run
 
-We can now deploy the Hub to Cloud Run cleanly. Notice that we mount both the kubeconfig and the `settings.yaml` files as secrets directly under `/etc/scion/` and `/home/scion/.scion/`, keeping the start command extremely simple and robust.
+We can now deploy the Hub to Cloud Run cleanly. Notice that we mount the kubeconfig and `settings.yaml` files as secrets under `/etc/scion/` and `/home/scion/.scion/` and inject `SCION_SERVER_SESSION_SECRET` from Secret Manager, keeping secrets out of the command line and revision environment literals (if migrating an existing service from a literal env var, seed `scion-hub-session-secret` with the current value first — see [Section 1f](#1f-generate-session-secret)).
 
 ```bash
 gcloud run deploy scion-hub \
@@ -1007,8 +1039,8 @@ gcloud run deploy scion-hub \
   --project=$PROJECT_ID \
   --service-account=scion-hub-runner@$PROJECT_ID.iam.gserviceaccount.com \
   --add-cloudsql-instances=$PROJECT_ID:$REGION:scion-hub-db \
-  --set-env-vars="SCION_DEPLOY=$(date +%s),KUBECONFIG=/etc/scion/kubeconfig.yaml,SCION_K8S_NAMESPACE=scion-agents,SCION_SERVER_SESSION_SECRET=$SCION_SERVER_SESSION_SECRET,SCION_CLOUDRUN_CPU_ALWAYS_ALLOCATED=true" \
-  --set-secrets="/etc/scion/kubeconfig.yaml=scion-gke-kubeconfig:latest,/home/scion/.scion/settings.yaml=scion-hub-settings:latest" \
+  --set-env-vars="SCION_DEPLOY=$(date +%s),KUBECONFIG=/etc/scion/kubeconfig.yaml,SCION_K8S_NAMESPACE=scion-agents,SCION_CLOUDRUN_CPU_ALWAYS_ALLOCATED=true" \
+  --set-secrets="/etc/scion/kubeconfig.yaml=scion-gke-kubeconfig:latest,/home/scion/.scion/settings.yaml=scion-hub-settings:latest,SCION_SERVER_SESSION_SECRET=scion-hub-session-secret:latest" \
   --min-instances=2 \
   --max-instances=3 \
   --cpu=1 \
@@ -1023,6 +1055,10 @@ gcloud run deploy scion-hub \
 ```
 
 `--no-cpu-throttling` keeps CPU allocated outside requests. The Runtime Broker in this service needs it to finish asynchronous agent launches after the create response. `SCION_CLOUDRUN_CPU_ALWAYS_ALLOCATED=true` tells the server that CPU is always allocated, which silences its startup warning; remove the variable if you deploy with CPU throttling. See [Asynchronous agent create](/scion/reference/server-config/#asynchronous-agent-create).
+
+:::caution[Do not enable `--use-http2` on `scion-hub`]
+Leave `scion-hub` on Cloud Run's default HTTP/1.1 container hop. Enabling `--use-http2` switches the container hop to HTTP/2 cleartext (`h2c`), which breaks all Hub WebSocket endpoints (web terminals / `scion attach`, port-forwarding tunnels, Conduit, and standalone Runtime Broker control channels). Cloud Run's HTTPS frontend already negotiates HTTP/2 with browsers by default without `--use-http2`. See [Section 3g](#3g-http2-websockets-and-optional-dedicated-events-service) for details.
+:::
 
 :::note[Why min-instances=2?]
 An HA Hub needs at least two running replicas, so that losing one instance
@@ -1098,7 +1134,9 @@ for all backends and fields.
 :::
 
 :::caution[Cloud Run Timeout Warning]
-We explicitly set `--timeout=900` (15 minutes). When dispatching the very first agent, GKE Autopilot triggers node provisioning to scale up from 0 nodes, which routinely takes 5-10 minutes. The default Cloud Run timeout (300 seconds) will prematurely kill the request, return a `503 Service Unavailable`, and tear down the initiating container. Set the timeout to at least 900 seconds to prevent this.
+We explicitly set `--timeout=900` (15 minutes). When dispatching the very first agent, GKE Autopilot triggers node provisioning to scale up from 0 nodes, which routinely takes 5-10 minutes. The default Cloud Run timeout (300 seconds) will prematurely kill the request, return a `503 Service Unavailable`, and tear down the initiating container. Set the timeout to at least 900 seconds to prevent this, and pair it with `server.hub.platform_request_timeout: "900s"` in `settings.yaml` so the Hub closes long-lived events streams and Conduit sessions cleanly before Cloud Run cuts them.
+
+For multi-user deployments, also raise `--concurrency` (to `250` or higher) and `--memory` (to `1Gi` or higher): every open web UI events stream, terminal session, and agent tunnel holds one `containerConcurrency` slot for its entire lifetime, and Cloud Run's default concurrency of `80` saturates with HTTP `429` errors under moderate UI and agent load. See [Sizing for Long-Lived Connections](/scion/hosted/ha/sizing/) for the slot formula, recommended settings pairing, and worked examples.
 :::
 
 ---
@@ -1185,6 +1223,45 @@ curl -s "$HUB_URL/health" \
   -H "Authorization: Bearer $TOKEN"
 # Expected: {"status":"healthy",...}
 ```
+
+---
+
+### 3g. HTTP/2, WebSockets, and Optional Dedicated Events Service
+
+#### Why not to enable `--use-http2` on `scion-hub`
+
+:::danger[Enabling `--use-http2` on `scion-hub` breaks Hub WebSockets]
+Do **not** pass `--use-http2` (or set `ports: [{name: h2c}]`) on the `scion-hub` Cloud Run service. Although the Hub listener accepts `h2c`, Cloud Run sends all requests to the container over HTTP/2 cleartext (`h2c`) when `--use-http2` is enabled instead of downgrading the backend hop to HTTP/1.1. That breaks Hub WebSocket endpoints, which require an HTTP/1.1 `Upgrade: websocket` handshake, including:
+
+- Interactive web terminals and `scion attach` (`GET /api/v1/agents/{id}/pty`)
+- Agent port-forwarding tunnels (`GET /api/v1/agents/{id}/ports/tunnel`)
+- Proxied agent-port WebSockets (`/api/v1/agents/{id}/ports/{port}/proxy/...` and, with `hub.port_view` enabled, `/api/v1/portview/{cap}/...`)
+- Conduit relay sessions (`GET /api/v1/conduit`)
+- Standalone Runtime Broker control channels (`GET /api/v1/runtime-brokers/connect`)
+
+Leave `scion-hub` on Cloud Run's default HTTP/1.1 backend hop. Only gRPC-only services with no WebSocket endpoints — such as `scion-discord` in [Section 4c](#4c-deploy-discord-service) — should set `--use-http2`.
+:::
+
+#### What HTTP/2 does and does not change
+
+- **Browser per-origin connection limits (already handled at the TLS edge):** You do **not** need `--use-http2` on Cloud Run for browsers to use HTTP/2. Cloud Run's HTTPS frontend (Google Front End), Cloud Load Balancing, and TLS-terminating proxies already negotiate HTTP/2 with browsers over TLS by default, multiplexing `/events` SSE streams and REST calls over a single connection and avoiding the browser's 6-connections-per-origin HTTP/1.1 cap while keeping the container hop on HTTP/1.1 so WebSockets work. (Plain-HTTP workstation Hubs on `http://localhost` remain on HTTP/1.1 because browsers do not speak cleartext `h2c`.)
+- **Cloud Run request-slot accounting (unchanged):** HTTP/2 does **not** reduce Cloud Run concurrency consumption. Each open `/events` SSE stream or WebSocket connection still holds **one `containerConcurrency` request slot** for its entire lifetime regardless of whether the frontend or backend hop uses HTTP/1.1 or HTTP/2.
+
+#### Optional later improvement: dedicated `/events` service (not part of the current plan)
+
+:::note[Optional architecture — not part of the current plan]
+Most deployments do not need a separate events service; tuning `--concurrency`, instance counts, and `--timeout` on `scion-hub` is the standard path. Documented here only as an optional later scaling option.
+:::
+
+If high browser viewer concurrency ever warrants isolating `/events` SSE streams from the rest of the Hub, you can deploy a second Cloud Run service from the **same Hub container image** behind an External Application Load Balancer URL map:
+
+- **Service configuration:** Run the Hub image with `--hosted --enable-hub --enable-web --foreground --web-port 8080` and **omit** `--enable-runtime-broker`. Mount the same base `settings.yaml` (overriding `server.auth.proxy.iap.audience` per backend service — see below), inject the same `SCION_SERVER_SESSION_SECRET`, and attach the same Cloud SQL PostgreSQL instance (cross-instance event fan-out uses PostgreSQL `LISTEN/NOTIFY`). Set a higher `--concurrency` (for example `--concurrency=1000`) on this SSE-only service.
+- **Routing:** Put an External Application Load Balancer in front of both Cloud Run services using two **serverless NEGs**, with a URL map that routes `/events` to the dedicated events service and all other paths (REST API, web UI, and all WebSocket endpoints) to `scion-hub`.
+
+**Trade-offs and constraints:**
+
+- **Requires a load balancer and per-backend IAP audiences:** Direct Cloud Run native IAP (`*.run.app`) cannot split paths across two services. Adding an External Application Load Balancer introduces a managed TLS certificate, two serverless NEGs, and IAP enabled on both backend services. Because IAP signs each backend service's JWT with its own `BACKEND_SERVICE_ID` and `server.auth.proxy.iap.audience` holds a single value (`/projects/PROJECT_NUMBER/global/backendServices/BACKEND_SERVICE_ID`), each Cloud Run service must validate its own backend-service audience (via a separate `settings.yaml` secret or the `SCION_SERVER_AUTH_PROXY_IAP_AUDIENCE` environment variable).
+- **Keep WebSockets off any `--use-http2` backend:** Because the dedicated service handles only `/events` (SSE), `--use-http2` may optionally be enabled on that SSE-only service — but **never** route WebSocket paths (`/api/v1/agents/*/pty`, `/api/v1/agents/*/ports/tunnel`, `/api/v1/agents/*/ports/*/proxy/...`, `/api/v1/portview/*`, `/api/v1/conduit`, `/api/v1/runtime-brokers/connect`) to a Cloud Run backend with `--use-http2` enabled. Keep all WebSocket traffic on the main HTTP/1.1 `scion-hub` backend.
 
 ---
 

@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agentcontrol"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 )
@@ -60,9 +61,19 @@ type RuntimeBrokerService interface {
 	Heartbeat(ctx context.Context, brokerID string, status *BrokerHeartbeat) (*BrokerHeartbeatResponse, error)
 
 	// ReportMessageFailures reports hub messages that the broker accepted
-	// into its delivery buffer but failed to deliver, so the hub can mark
-	// them failed instead of leaving them "dispatched".
-	ReportMessageFailures(ctx context.Context, brokerID string, req *MessageFailuresReport) error
+	// into its delivery buffer (or failed synchronously on interrupt) so the
+	// hub can mark them failed or hold them in awaiting_session. The response
+	// counts how many reported failures were marked, held, or ignored (zeroed
+	// when an older Hub replies with an empty 200 body).
+	ReportMessageFailures(ctx context.Context, brokerID string, req *MessageFailuresReport) (*MessageFailuresResponse, error)
+
+	// DeliverMessage asks the hub to run one deliver-message flush on the
+	// agent over its conduit session (design v2.22 §2.1). It returns the
+	// hub's status and decoded answer (zero when the body is not a
+	// deliver-message answer, as with a 404 for the experiment off). The
+	// request is sent once, never retried by the transport. err is set only
+	// for a transport failure, with status 0.
+	DeliverMessage(ctx context.Context, brokerID, agentID string, req *agentcontrol.DeliverRequest) (int, agentcontrol.DeliverResponse, error)
 
 	// ReportAgentLaunch sends one broker->hub launch report (design
 	// t1-async-create-v11.md §3.2, §7 P1b-1): a claim, checkpoint, progress
@@ -121,20 +132,22 @@ const (
 // create (ptone/scion#4818), plus RunID and WorkspacePlacement; it ignores
 // the rest.
 type AgentLaunchReportInfo struct {
-	ID              string `json:"id,omitempty"`
-	Slug            string `json:"slug,omitempty"`
-	ContainerID     string `json:"containerId,omitempty"`
-	Name            string `json:"name,omitempty"`
-	Template        string `json:"template,omitempty"`
-	HarnessConfig   string `json:"harnessConfig,omitempty"`
-	HarnessAuth     string `json:"harnessAuth,omitempty"`
-	Image           string `json:"image,omitempty"`
-	Runtime         string `json:"runtime,omitempty"`
-	RuntimeState    string `json:"runtimeState,omitempty"`
-	Profile         string `json:"profile,omitempty"`
-	Phase           string `json:"phase,omitempty"`
-	Activity        string `json:"activity,omitempty"`
-	ContainerStatus string `json:"containerStatus,omitempty"`
+	ID              string            `json:"id,omitempty"`
+	Slug            string            `json:"slug,omitempty"`
+	ContainerID     string            `json:"containerId,omitempty"`
+	Name            string            `json:"name,omitempty"`
+	Template        string            `json:"template,omitempty"`
+	HarnessConfig   string            `json:"harnessConfig,omitempty"`
+	HarnessAuth     string            `json:"harnessAuth,omitempty"`
+	Image           string            `json:"image,omitempty"`
+	Runtime         string            `json:"runtime,omitempty"`
+	RuntimeState    string            `json:"runtimeState,omitempty"`
+	Profile         string            `json:"profile,omitempty"`
+	ProjectID       string            `json:"projectId,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	Phase           string            `json:"phase,omitempty"`
+	Activity        string            `json:"activity,omitempty"`
+	ContainerStatus string            `json:"containerStatus,omitempty"`
 	// HarnessConfigSource is which harness-config source the start resolved
 	// (wire key matches RemoteAgentInfo.HarnessConfigSource).
 	HarnessConfigSource string `json:"harnessConfigSource,omitempty"`
@@ -196,11 +209,17 @@ const (
 	AgentLaunchReportReasonOtherOwner  = "other_owner"
 )
 
+// MessageFailureCodeAwaitingSession is the enum code a broker sends on a
+// MessageFailure when its final deliver-message attempt received a hub 503
+// with reason=no_session and exec is unavailable (ptone/scion#7881).
+const MessageFailureCodeAwaitingSession = "awaiting_session"
+
 // MessageFailure is one buffered delivery that failed on the broker.
 type MessageFailure struct {
 	MessageID string `json:"messageId"`
 	AgentID   string `json:"agentId,omitempty"`
 	ProjectID string `json:"projectId,omitempty"`
+	Code      string `json:"code,omitempty"`
 	Reason    string `json:"reason,omitempty"`
 }
 
@@ -215,13 +234,34 @@ type AttachmentOutcome struct {
 	Reason       string `json:"reason,omitempty"`
 }
 
+// MessageDelivery identifies a hub message that the broker successfully
+// injected into the recipient agent's session (ptone/scion#9015).
+type MessageDelivery struct {
+	MessageID string `json:"messageId"`
+	AgentID   string `json:"agentId,omitempty"`
+	ProjectID string `json:"projectId,omitempty"`
+}
+
 // MessageFailuresReport is the body of a message-failures report.
 type MessageFailuresReport struct {
 	Failures []MessageFailure `json:"failures"`
+	// Deliveries are hub messages whose session injection succeeded on the
+	// broker (ptone/scion#9015). Additive and optional so older hubs ignore
+	// it cleanly.
+	Deliveries []MessageDelivery `json:"deliveries,omitempty"`
 	// AttachmentOutcomes are the per-file outcomes of attachment deliveries
 	// (ptone/scion#4596). The hub logs and counts them; they never change a
 	// message's state.
 	AttachmentOutcomes []AttachmentOutcome `json:"attachmentOutcomes,omitempty"`
+}
+
+// MessageFailuresResponse is the decoded body of a 200 answer from
+// POST /api/v1/runtime-brokers/{id}/message-failures.
+type MessageFailuresResponse struct {
+	Marked    int `json:"marked,omitempty"`
+	Delivered int `json:"delivered,omitempty"`
+	Held      int `json:"held,omitempty"`
+	Ignored   int `json:"ignored,omitempty"`
 }
 
 // runtimeBrokerService is the implementation of RuntimeBrokerService.
@@ -249,9 +289,10 @@ type ListBrokersResponse struct {
 
 // UpdateBrokerRequest is the request for updating a runtime broker.
 type UpdateBrokerRequest struct {
-	Name        string            `json:"name,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
+	Name         string            `json:"name,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	Annotations  map[string]string `json:"annotations,omitempty"`
+	AdminManaged *bool             `json:"adminManaged,omitempty"`
 }
 
 // ListBrokerProjectsResponse is the response from listing broker projects.
@@ -343,6 +384,31 @@ type BrokerHeartbeat struct {
 	// it read-only, only from the broker's own credentials. A flat instance
 	// and an older broker omit it; the Hub then keeps the stored value.
 	ConversionPlanPresentation *api.ConversionPlanPresentation `json:"conversionPlanPresentation,omitempty"`
+	// WorkloadIdentityTargets lists the broker's Kubernetes runtime targets
+	// that have workload_identity_pool set (ptone/scion#3329 phase 5): one
+	// per profile for a legacy broker, at most one for a flat instance. It
+	// is sent on every heartbeat (it is small) together with
+	// Capabilities.WITargetsV1; the Hub stores it only when it changes. It
+	// has no omitempty: a nil list (the settings could not be read, or a
+	// broker that does not produce it) is sent as null and keeps the
+	// Hub's stored list, while an empty list replaces it. An older Hub
+	// ignores it.
+	WorkloadIdentityTargets []WorkloadIdentityTarget `json:"workloadIdentityTargets"`
+}
+
+// WorkloadIdentityTarget is one Kubernetes runtime target with a GKE
+// Workload Identity pool in a heartbeat (store.WorkloadIdentityTarget is its
+// counterpart). The Hub binds a GCP service account it mints to
+// serviceAccount:<Pool>[<Namespace>/<account ID>] for each.
+type WorkloadIdentityTarget struct {
+	// Profile is the legacy broker profile; empty for a flat instance.
+	Profile string `json:"profile,omitempty"`
+	// Pool is the Workload Identity pool, "<project>.svc.id.goog".
+	Pool string `json:"pool"`
+	// Namespace is the namespace the broker runs the target's agents in.
+	Namespace string `json:"namespace"`
+	// KSACreation reports create_service_accounts on the target (ptone/scion#7966).
+	KSACreation bool `json:"ksaCreation,omitempty"`
 }
 
 // StartInFlight identifies one agent start running on a broker.
@@ -425,6 +491,10 @@ type AgentHeartbeat struct {
 	// (api.AgentInfo.RunID); empty for an unlabelled entry. An older broker
 	// omits it.
 	RunID string `json:"runId,omitempty"`
+	// AgentID is the listed entry's Hub agent ID (its agent_id label, or
+	// the ID the runtime reports); empty when unknown. An older broker
+	// omits it, and the Hub then matches the entry by slug only.
+	AgentID string `json:"agentId,omitempty"`
 	// OtherEntries are the agent's entries listed by other targets of this
 	// broker, which the heartbeat does not report as agents of their own
 	// (one agent per project and name), each with its target and label.
@@ -445,16 +515,24 @@ type CreateBrokerRequest struct {
 	Name         string            `json:"name"`
 	Capabilities []string          `json:"capabilities,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
-	AutoProvide  bool              `json:"autoProvide,omitempty"` // Automatically add as provider for new projects
+	AutoProvide  bool              `json:"autoProvide,omitempty"`  // Automatically add as provider for new projects
+	AdminManaged bool              `json:"adminManaged,omitempty"` // Mark broker as admin-managed (requires broker.manage)
 	// RuntimeTarget is the flat Runtime Broker registration descriptor
 	// (.design/flat-runtime-brokers-contract.md section 6); nil is legacy.
 	RuntimeTarget *api.RuntimeTargetDescriptor `json:"runtimeTarget,omitempty"`
+	// GCPHostServiceAccountEmail and GCPHostProjectID claim the broker row's
+	// private GCP host pair on registration (subject to Hub actAs evaluation
+	// and fill-only-while-unset semantics).
+	GCPHostServiceAccountEmail string `json:"gcpHostServiceAccountEmail,omitempty"`
+	GCPHostProjectID           string `json:"gcpHostProjectId,omitempty"`
 	// JoinTokenTTLSeconds is the join token lifetime in seconds. Zero uses
 	// the hub default; otherwise the hub accepts 300 to 86400.
 	JoinTokenTTLSeconds int `json:"joinTokenTtlSeconds,omitempty"`
 	// PreserveSettings asks the hub to only issue a join token when the
 	// name matches an existing broker, leaving its settings unchanged.
 	PreserveSettings bool `json:"preserveSettings,omitempty"`
+	// Force allows re-registering a broker that is currently online on the Hub.
+	Force bool `json:"force,omitempty"`
 }
 
 // CreateBrokerResponse is returned when creating a new broker.
@@ -649,12 +727,46 @@ func (s *runtimeBrokerService) Heartbeat(ctx context.Context, brokerID string, s
 }
 
 // ReportMessageFailures reports buffered deliveries that failed on the broker.
-func (s *runtimeBrokerService) ReportMessageFailures(ctx context.Context, brokerID string, req *MessageFailuresReport) error {
+func (s *runtimeBrokerService) ReportMessageFailures(ctx context.Context, brokerID string, req *MessageFailuresReport) (*MessageFailuresResponse, error) {
 	resp, err := s.c.post(ctx, "/api/v1/runtime-brokers/"+url.PathEscape(brokerID)+"/message-failures", req, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return apiclient.CheckResponse(resp)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return nil, apiclient.ParseErrorResponse(resp)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil || len(bytes.TrimSpace(body)) == 0 {
+		return &MessageFailuresResponse{}, nil
+	}
+	var out MessageFailuresResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return &MessageFailuresResponse{}, nil
+	}
+	return &out, nil
+}
+
+// DeliverMessage posts one deliver-message flush to the hub. See the
+// RuntimeBrokerService doc comment.
+func (s *runtimeBrokerService) DeliverMessage(ctx context.Context, brokerID, agentID string, req *agentcontrol.DeliverRequest) (int, agentcontrol.DeliverResponse, error) {
+	path := "/api/v1/runtime-brokers/" + url.PathEscape(brokerID) + "/agents/" + url.PathEscape(agentID) + "/deliver"
+	// The hub may hold the call for its whole 110 s budget (a readiness
+	// wait of up to 90 s, then the paste), longer than the client's
+	// default timeout: this request gets the broker's 115 s instead. The
+	// caller's ctx still applies when it is shorter (review R2).
+	ctx = apiclient.WithRequestTimeout(ctx, agentcontrol.BrokerDeliverTimeout)
+	resp, err := s.c.postNoRetry(ctx, path, req, nil)
+	if err != nil {
+		return 0, agentcontrol.DeliverResponse{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return 0, agentcontrol.DeliverResponse{}, fmt.Errorf("read deliver answer: %w", err)
+	}
+	out, _ := agentcontrol.DecodeDeliverResponse(body)
+	return resp.StatusCode, out, nil
 }
 
 // ReportAgentLaunch posts one launch report. See the RuntimeBrokerService

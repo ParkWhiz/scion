@@ -15,6 +15,7 @@
 package messaging
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -93,14 +94,25 @@ func MapLegacyType(oldType, systemCategory string, hasAddressee bool) (MessageKi
 		intent := IntentRequest
 		return KindText, &intent, nil
 
-	case messages.TypeChoicePrompt:
+	case messages.TypeDecisionPrompt:
 		// An agent asks a human to decide; the decisions travel as rows, the
 		// body is the markdown fallback.
 		intent := IntentQuestion
 		return KindText, &intent, nil
 
-	case messages.TypeChoiceResponse:
+	case messages.TypeDecisionResponse:
 		// The hub-formatted record of an answer.
+		intent := IntentInform
+		return KindText, &intent, nil
+
+	case messages.TypeSecretRequest:
+		// An agent asks a human to supply one or more secrets; the requests
+		// travel as rows, the body is the markdown fallback.
+		intent := IntentQuestion
+		return KindText, &intent, nil
+
+	case messages.TypeSecretResponse:
+		// The hub-formatted record of a secret fulfillment or dismissal.
 		intent := IntentInform
 		return KindText, &intent, nil
 
@@ -118,6 +130,8 @@ func mapSystemCategory(category string) *EventBody {
 	switch category {
 	case messages.SystemCategoryScheduler:
 		return &EventBody{Type: EventScheduleFired}
+	case messages.SystemCategoryTrigger:
+		return &EventBody{Type: EventTriggerFired}
 	case messages.SystemCategoryPortForward:
 		return &EventBody{Type: EventPortExposed}
 	case messages.SystemCategoryArtifactReview:
@@ -133,6 +147,12 @@ func mapSystemCategory(category string) *EventBody {
 		// would both warn and silently reclassify it as
 		// agent.state-changed).
 		return &EventBody{Type: EventDeliveryFailed, Status: "DELIVERY_DEFERRED"}
+	case messages.SystemCategoryDeliveryUnconfirmed:
+		// ptone/scion#7405: pending-TTL expiry cannot distinguish a never-sent
+		// row from an AC-3/AC-4 row that was or may have been delivered, so the
+		// notice carries Status="DELIVERY_UNCONFIRMED" rather than claiming a
+		// definite failure.
+		return &EventBody{Type: EventDeliveryFailed, Status: "DELIVERY_UNCONFIRMED"}
 	default:
 		slog.Warn("unknown system_category, defaulting to agent.state-changed",
 			"system_category", category)
@@ -175,9 +195,39 @@ func MapLegacyEnvelope(old *messages.StructuredMessage, ident PersistedIdentity)
 	// Determine whether this message has a specific addressee (not broadcast).
 	hasAddressee := old.Recipient != "" && !old.Broadcasted
 
-	// Map type to new taxonomy.
+	// Map type to new taxonomy. system_category="trigger" (mapping TypeSystem
+	// to EventTriggerFired) is reserved exclusively for the hub-minted trigger
+	// sender identity; neutralise it for any other sender before mapping.
 	systemCategory := old.Metadata["system_category"]
+	if strings.EqualFold(strings.TrimSpace(systemCategory), messages.SystemCategoryTrigger) && !isHubMintedTriggerSender(old) {
+		systemCategory = ""
+	}
 	kind, intent, event := MapLegacyType(old.Type, systemCategory, hasAddressee)
+
+	// When StructuredMessage.Event carries a valid serialized EventBody on a
+	// hub-minted trigger or scheduler system message (§8.3, §8.4), use it
+	// verbatim within that sender's allowed event family instead of the category
+	// default. Client-, agent-, and user-originated messages may never override
+	// the EventBody or inject ExternalPayload integrity labels, and scheduler
+	// system messages may carry only schedule.fired metadata (never Trigger or
+	// ExternalPayload).
+	if kind == KindEvent && len(old.Event) > 0 {
+		if isHubMintedTriggerSender(old) {
+			var parsed EventBody
+			if err := json.Unmarshal(old.Event, &parsed); err == nil && parsed.Validate() == nil {
+				event = &parsed
+			}
+		} else if isHubMintedSchedulerSender(old) {
+			var parsed EventBody
+			if err := json.Unmarshal(old.Event, &parsed); err == nil &&
+				parsed.Validate() == nil &&
+				parsed.Type == EventScheduleFired &&
+				parsed.External == nil &&
+				parsed.Trigger == nil {
+				event = &parsed
+			}
+		}
+	}
 
 	// Human-to-human replies should be inform, not request.
 	// MapLegacyType maps TypeReply to IntentRequest (correct for agent
@@ -189,11 +239,11 @@ func MapLegacyEnvelope(old *messages.StructuredMessage, ident PersistedIdentity)
 
 	// Enrich event body from old fields where possible.
 	if event != nil {
-		if old.Status != "" {
+		if old.Status != "" && event.Status == "" {
 			event.Status = old.Status
 		}
 		// For state-change, the sender is typically the subject.
-		if event.Type == EventAgentStateChanged && old.Sender != "" {
+		if event.Type == EventAgentStateChanged && old.Sender != "" && event.Subject == "" {
 			event.Subject = old.Sender
 		}
 	}
@@ -357,142 +407,22 @@ func buildAddressees(old *messages.StructuredMessage, msgID string) []Addressee 
 	return addrs
 }
 
-// NewEnvelopeToLegacy converts a new Message and its Addressees back to the
-// old StructuredMessage format. This supports backward compatibility during the
-// transition period for code that still reads the old format.
-//
-// Loss is expected: the new format captures information (kind/intent split,
-// multiple addressees, delivery state) that the old format cannot represent.
-func NewEnvelopeToLegacy(msg *Message, addrs []Addressee) *messages.StructuredMessage {
-	if msg == nil {
-		return nil
-	}
-
-	old := &messages.StructuredMessage{
-		Version:        messages.Version,
-		Timestamp:      msg.CreatedAt.UTC().Format(time.RFC3339),
-		Msg:            msg.Body,
-		ConversationID: msg.ConversationID,
-		Urgent:         msg.Urgent,
-	}
-
-	// Map From to sender fields.
-	old.Sender = string(msg.From)
-	old.SenderID = string(msg.From)
-
-	// Map kind/intent/event back to old type.
-	old.Type = mapNewTypeToLegacy(msg)
-
-	// Map attachments.
-	for _, a := range msg.Attachments {
-		old.Attachments = append(old.Attachments, a.Path)
-	}
-
-	// Map metadata from event body.
-	if msg.Event != nil {
-		old.Metadata = make(map[string]string)
-		if cat := eventTypeToSystemCategory(msg.Event); cat != "" {
-			old.Metadata["system_category"] = cat
-		}
-		if msg.Event.Status != "" {
-			old.Status = msg.Event.Status
-		}
-	}
-
-	// Map first addressee to recipient.
-	if len(addrs) > 0 {
-		first := addrs[0]
-		old.Recipient = first.PrincipalKind + ":" + first.PrincipalID
-		old.RecipientID = old.Recipient
-
-		// Override type for delivery artifact via values.
-		switch first.Via {
-		case ViaBodyMention:
-			old.Type = messages.TypeMention
-			old.Metadata = ensureMetadata(old.Metadata)
-			old.Metadata["mention_source"] = string(msg.From)
-			old.Metadata["mention_position"] = "body"
-		case ViaExplicit:
-			// If there are multiple addressees, the old format uses group-set.
-			if len(addrs) > 1 {
-				old.Type = messages.TypeGroupSet
-			}
-		}
-	}
-
-	return old
+// isHubMintedTriggerSender reports whether old carries the hub-minted trigger
+// system sender identity stamped by ApplyDispatchedEventEnvelope.
+func isHubMintedTriggerSender(old *messages.StructuredMessage) bool {
+	return old != nil &&
+		old.Type == messages.TypeSystem &&
+		old.Sender == "trigger" &&
+		old.SenderID == "TRIGGER" &&
+		old.Metadata["system_category"] == messages.SystemCategoryTrigger
 }
 
-// mapNewTypeToLegacy maps the new kind/intent/event back to the old type enum.
-func mapNewTypeToLegacy(msg *Message) string {
-	switch msg.Kind {
-	case KindText:
-		if msg.Intent == nil {
-			return messages.TypeChat
-		}
-		switch *msg.Intent {
-		case IntentRequest:
-			return messages.TypeInstruction
-		case IntentQuestion:
-			return messages.TypeInputNeeded
-		case IntentInform:
-			// Never assistant-reply: that type is retired and only appears
-			// on historical rows, whatever the sender.
-			return messages.TypeChat
-		default:
-			return messages.TypeChat
-		}
-	case KindEvent:
-		if msg.Event == nil {
-			return messages.TypeStateChange
-		}
-		switch msg.Event.Type {
-		case EventAgentStateChanged:
-			return messages.TypeStateChange
-		case EventAgentInputNeeded:
-			return messages.TypeInputNeeded
-		case EventScheduleFired, EventPortExposed, EventDeliveryFailed, EventArtifactReview:
-			return messages.TypeSystem
-		default:
-			return messages.TypeStateChange
-		}
-	default:
-		return messages.TypeChat
-	}
-}
-
-// eventTypeToSystemCategory maps an EventBody back to the old system_category.
-// Takes the full body, not just the Type, because O-c (p2a-r2 review) reuses
-// EventDeliveryFailed's Type for the deferred notice (there is no dedicated
-// EventType for it) and distinguishes it only by Status — without checking
-// Status here, a deferred notice would round-trip back to
-// SystemCategoryDeliveryFailed and lose the distinction mapSystemCategory
-// made on the way in.
-func eventTypeToSystemCategory(body *EventBody) string {
-	if body == nil {
-		return ""
-	}
-	switch body.Type {
-	case EventScheduleFired:
-		return messages.SystemCategoryScheduler
-	case EventPortExposed:
-		return messages.SystemCategoryPortForward
-	case EventArtifactReview:
-		return messages.SystemCategoryArtifactReview
-	case EventDeliveryFailed:
-		if body.Status == "DELIVERY_DEFERRED" {
-			return messages.SystemCategoryDeliveryDeferred
-		}
-		return messages.SystemCategoryDeliveryFailed
-	default:
-		return ""
-	}
-}
-
-// ensureMetadata returns the metadata map, creating it if nil.
-func ensureMetadata(m map[string]string) map[string]string {
-	if m == nil {
-		return make(map[string]string)
-	}
-	return m
+// isHubMintedSchedulerSender reports whether old carries the hub-minted
+// scheduler system sender identity stamped by buildMessageActionMessage.
+func isHubMintedSchedulerSender(old *messages.StructuredMessage) bool {
+	return old != nil &&
+		old.Type == messages.TypeSystem &&
+		old.Sender == "scheduler" &&
+		old.SenderID == "SCHEDULER" &&
+		old.Metadata["system_category"] == messages.SystemCategoryScheduler
 }

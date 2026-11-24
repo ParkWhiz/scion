@@ -79,6 +79,11 @@ report='%s'
 [ -n "$report" ] && commit="$report"
 {
   echo '#!/bin/sh'
+  echo 'if [ "$1" = "server" ] && [ "$2" = "preflight" ]; then'
+  echo '  if [ "$3" = "--help" ]; then echo "Usage: scion server preflight --colocated-broker-id"; exit 0; fi'
+  echo '  echo "{\"version\":1,\"checks\":[\"settings.profiles\"],\"findings\":[],\"blocking\":0,\"warnings\":0}"'
+  echo '  exit 0'
+  echo 'fi'
   echo "echo '{\"version\":\"\",\"commit\":\"$commit\"}'"
 } > "$out"
 chmod 755 "$out"
@@ -96,6 +101,10 @@ func (f *rebuildFixture) callLog(t *testing.T) string {
 	return string(data)
 }
 
+func testReadyColocatedBroker(context.Context) (string, bool, error) {
+	return "broker-test", true, nil
+}
+
 func (f *rebuildFixture) executor(inst Installer) *RebuildServerExecutor {
 	return NewRebuildServerExecutor(RebuildServerOptions{
 		RepoPath:       f.repo,
@@ -104,7 +113,10 @@ func (f *rebuildFixture) executor(inst Installer) *RebuildServerExecutor {
 		UnitLocator: func(context.Context, string) (unitdrift.UnitInfo, error) {
 			return unitdrift.UnitInfo{}, errors.New("no systemd in tests")
 		},
-		UnitRevision: func(context.Context, string) (string, error) { return "abc1234", nil },
+		UnitRevision:      func(context.Context, string) (string, error) { return "abc1234", nil },
+		ColocatedBrokerID: testReadyColocatedBroker,
+		DatabaseDSN:       ":memory:",
+		DatabaseDriver:    "sqlite",
 	})
 }
 
@@ -309,6 +321,58 @@ func TestRebuildServer_SudoInstallStarterHub(t *testing.T) {
 	}
 }
 
+func TestRebuildServer_SudoInstallNoBlockSignalAndFailure(t *testing.T) {
+	t.Run("SIGTERM during --no-block restart is restart requested, not failed", func(t *testing.T) {
+		f := newRebuildFixture(t, "")
+		r := &fakeRunner{allowed: map[string]bool{}}
+		for _, a := range []string{ruleInstall, ruleNoBlock, rulePlain} {
+			r.allowed[strings.ReplaceAll(a, "$REPO", f.repo)] = true
+		}
+		inst := newSudoInstaller(DetectOptions{
+			RepoPath: f.repo,
+			Runner:   shellRunRunner{fakeRunner: r, script: "kill -TERM $$"},
+		}.withDefaults())
+
+		var got *PendingRestart
+		var log bytes.Buffer
+		err := f.executor(inst).RunWithBeforeRestart(context.Background(), &log, nil,
+			func(_ context.Context, p PendingRestart) error { got = &p; return nil })
+		if err != nil {
+			t.Fatalf("RunWithBeforeRestart = %v, want nil when restart child receives SIGTERM\n%s", err, log.String())
+		}
+		if got == nil || got.To != testGitRelease || got.Mode != UpdateModeGit || got.Strategy != StrategySudoInstall {
+			t.Fatalf("hook got %+v", got)
+		}
+		if strings.Contains(log.String(), "cannot be rolled back") {
+			t.Fatalf("log unexpectedly mentions rollback inability:\n%s", log.String())
+		}
+	})
+
+	t.Run("non-zero exit during --no-block restart still fails with no-rollback detail", func(t *testing.T) {
+		f := newRebuildFixture(t, "")
+		r := &fakeRunner{allowed: map[string]bool{}}
+		for _, a := range []string{ruleInstall, ruleNoBlock, rulePlain} {
+			r.allowed[strings.ReplaceAll(a, "$REPO", f.repo)] = true
+		}
+		inst := newSudoInstaller(DetectOptions{
+			RepoPath: f.repo,
+			Runner:   shellRunRunner{fakeRunner: r, script: "echo 'Failed to restart unit' >&2; exit 1"},
+		}.withDefaults())
+
+		hooked := false
+		var log bytes.Buffer
+		err := f.executor(inst).RunWithBeforeRestart(context.Background(), &log, nil,
+			func(context.Context, PendingRestart) error { hooked = true; return nil })
+		if err == nil || !strings.Contains(err.Error(), "restarting the hub failed") ||
+			!strings.Contains(err.Error(), "cannot be rolled back by the sudo-install installer") {
+			t.Fatalf("RunWithBeforeRestart = %v, want restart failure with sudo-install no-rollback note", err)
+		}
+		if !hooked {
+			t.Fatal("before-restart hook did not run")
+		}
+	})
+}
+
 func TestSudoInstaller_PreflightSudoAbsent(t *testing.T) {
 	opts, _ := sudoOpts(t, ruleInstall, ruleNoBlock)
 	opts.Runner = missingSudoRunner{}
@@ -405,10 +469,11 @@ func TestRebuildServer_FromPublishedAtForTheGuard(t *testing.T) {
 			f := newRebuildFixture(t, "")
 			src := &datedReleases{at: published}
 			e := NewRebuildServerExecutor(RebuildServerOptions{
-				RepoPath:       f.repo,
-				Installer:      &fakeInstaller{},
-				CurrentRelease: tc.current,
-				Releases:       src,
+				RepoPath:          f.repo,
+				Installer:         &fakeInstaller{},
+				CurrentRelease:    tc.current,
+				Releases:          src,
+				ColocatedBrokerID: testReadyColocatedBroker,
 			})
 			var got PendingRestart
 			if err := e.RunWithBeforeRestart(context.Background(), &bytes.Buffer{}, nil,
@@ -445,10 +510,11 @@ func TestRebuildServer_SymlinkClearsUnitDriftRecord(t *testing.T) {
 	inst, _, _ := symlinkInstallerForRebuild(t, "nightly-20261022")
 	st := &unitDriftStore{}
 	e := NewRebuildServerExecutor(RebuildServerOptions{
-		RepoPath:       f.repo,
-		Installer:      inst,
-		CurrentRelease: "nightly-20261022",
-		Store:          st,
+		RepoPath:          f.repo,
+		Installer:         inst,
+		CurrentRelease:    "nightly-20261022",
+		Store:             st,
+		ColocatedBrokerID: testReadyColocatedBroker,
 	})
 	var log bytes.Buffer
 	if err := e.Run(context.Background(), &log, nil); err != nil {
@@ -470,10 +536,11 @@ func TestRebuildServer_SnapshotBeforeActivation(t *testing.T) {
 	inst := &fakeInstaller{}
 	snaps := &fakeDBSnapshotter{calls: &inst.calls}
 	e := NewRebuildServerExecutor(RebuildServerOptions{
-		RepoPath:       f.repo,
-		Installer:      inst,
-		CurrentRelease: "git-89abcdef0123",
-		Snapshotter:    snaps,
+		RepoPath:          f.repo,
+		Installer:         inst,
+		CurrentRelease:    "git-89abcdef0123",
+		Snapshotter:       snaps,
+		ColocatedBrokerID: testReadyColocatedBroker,
 	})
 	var got PendingRestart
 	var log bytes.Buffer
@@ -509,9 +576,10 @@ func TestRebuildServer_SnapshotFailureInstallsNothing(t *testing.T) {
 	f := newRebuildFixture(t, "")
 	inst := &fakeInstaller{}
 	e := NewRebuildServerExecutor(RebuildServerOptions{
-		RepoPath:    f.repo,
-		Installer:   inst,
-		Snapshotter: &fakeDBSnapshotter{calls: &inst.calls, err: errors.New("disk full")},
+		RepoPath:          f.repo,
+		Installer:         inst,
+		Snapshotter:       &fakeDBSnapshotter{calls: &inst.calls, err: errors.New("disk full")},
+		ColocatedBrokerID: testReadyColocatedBroker,
 	})
 	hooked := false
 	err := e.RunWithBeforeRestart(context.Background(), &bytes.Buffer{}, nil,
@@ -530,9 +598,10 @@ func TestRebuildServer_UnsupportedSnapshotStillRebuilds(t *testing.T) {
 	f := newRebuildFixture(t, "")
 	inst := &fakeInstaller{}
 	e := NewRebuildServerExecutor(RebuildServerOptions{
-		RepoPath:    f.repo,
-		Installer:   inst,
-		Snapshotter: &fakeDBSnapshotter{calls: &inst.calls, unsupported: "PostgreSQL databases are not snapshotted"},
+		RepoPath:          f.repo,
+		Installer:         inst,
+		Snapshotter:       &fakeDBSnapshotter{calls: &inst.calls, unsupported: "PostgreSQL databases are not snapshotted"},
+		ColocatedBrokerID: testReadyColocatedBroker,
 	})
 	var got PendingRestart
 	var log bytes.Buffer
@@ -557,9 +626,10 @@ func TestRebuildServer_SettingsCheckWarnsOnly(t *testing.T) {
 	inst := &fakeInstaller{}
 	calls := 0
 	e := NewRebuildServerExecutor(RebuildServerOptions{
-		RepoPath:   f.repo,
-		RepoBranch: "main",
-		Installer:  inst,
+		RepoPath:          f.repo,
+		RepoBranch:        "main",
+		Installer:         inst,
+		ColocatedBrokerID: testReadyColocatedBroker,
 		SettingsCheck: func() []preflight.Finding {
 			calls++
 			return unsetTrustedProxiesFinding()
@@ -588,7 +658,7 @@ func TestRebuildServer_SettingsCheckWarnsOnly(t *testing.T) {
 
 	// Without a settings check there is no section.
 	var plain bytes.Buffer
-	e2 := NewRebuildServerExecutor(RebuildServerOptions{RepoPath: f.repo, RepoBranch: "main", Installer: &fakeInstaller{}})
+	e2 := NewRebuildServerExecutor(RebuildServerOptions{RepoPath: f.repo, RepoBranch: "main", Installer: &fakeInstaller{}, ColocatedBrokerID: testReadyColocatedBroker})
 	if err := e2.Run(context.Background(), &plain, nil); err != nil {
 		t.Fatalf("Run: %v\n%s", err, plain.String())
 	}
@@ -627,8 +697,11 @@ func TestRebuildServer_DetachedHeadWithoutBranchRefused(t *testing.T) {
 	inst := &fakeInstaller{}
 	e := NewRebuildServerExecutor(RebuildServerOptions{RepoPath: f.repo, Installer: inst})
 	err := e.Run(context.Background(), &bytes.Buffer{}, nil)
-	if err == nil || !strings.Contains(err.Error(), "the checkout is on a detached HEAD; set server.maintenance.repo_branch or pass the branch parameter") {
-		t.Fatalf("Run = %v, want the detached-HEAD refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "the checkout is on a detached HEAD; set SCION_MAINTENANCE_REPO_BRANCH (or @branch on SCION_MAINTENANCE_REPO_PATH) or pass the branch parameter") {
+		t.Fatalf("Run = %v, want the detached-HEAD refusal naming SCION_MAINTENANCE_REPO_BRANCH", err)
+	}
+	if strings.Contains(err.Error(), "server.maintenance.repo_branch") {
+		t.Fatalf("Run error still names nonexistent settings key: %v", err)
 	}
 	if calls := f.callLog(t); strings.TrimSpace(calls) != "git rev-parse --abbrev-ref HEAD" {
 		t.Fatalf("commands run = %q, want only the branch lookup", calls)
@@ -639,7 +712,7 @@ func TestRebuildServer_DetachedHeadWithoutBranchRefused(t *testing.T) {
 
 	// A requested branch (or a configured one) does not need the lookup.
 	inst2 := &fakeInstaller{}
-	e2 := NewRebuildServerExecutor(RebuildServerOptions{RepoPath: f.repo, Installer: inst2})
+	e2 := NewRebuildServerExecutor(RebuildServerOptions{RepoPath: f.repo, Installer: inst2, ColocatedBrokerID: testReadyColocatedBroker})
 	if err := e2.Run(context.Background(), &bytes.Buffer{}, map[string]string{"branch": "main"}); err != nil {
 		t.Fatalf("Run with branch=main: %v", err)
 	}
@@ -654,8 +727,11 @@ func TestRebuildWeb_DetachedHeadWithoutBranchRefused(t *testing.T) {
 	f := newRebuildFixture(t, "")
 	detachedGitStub(t, f)
 	err := NewRebuildWebExecutor(RebuildWebOptions{RepoPath: f.repo}).Run(context.Background(), &bytes.Buffer{}, nil)
-	if err == nil || !strings.Contains(err.Error(), "rebuild-web: the checkout is on a detached HEAD; set server.maintenance.repo_branch or pass the branch parameter") {
-		t.Fatalf("Run = %v, want the detached-HEAD refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "rebuild-web: the checkout is on a detached HEAD; set SCION_MAINTENANCE_REPO_BRANCH (or @branch on SCION_MAINTENANCE_REPO_PATH) or pass the branch parameter") {
+		t.Fatalf("Run = %v, want the detached-HEAD refusal naming SCION_MAINTENANCE_REPO_BRANCH", err)
+	}
+	if strings.Contains(err.Error(), "server.maintenance.repo_branch") {
+		t.Fatalf("Run error still names nonexistent settings key: %v", err)
 	}
 	if calls := f.callLog(t); strings.TrimSpace(calls) != "git rev-parse --abbrev-ref HEAD" {
 		t.Fatalf("commands run = %q, want only the branch lookup", calls)
@@ -679,7 +755,7 @@ func (b *binPathInstaller) Stage(ctx context.Context, tag, bin string) (string, 
 func TestRebuildServer_TempBuildRemovedBeforeRestart(t *testing.T) {
 	f := newRebuildFixture(t, "")
 	inst := &binPathInstaller{}
-	e := NewRebuildServerExecutor(RebuildServerOptions{RepoPath: f.repo, RepoBranch: "main", Installer: inst})
+	e := NewRebuildServerExecutor(RebuildServerOptions{RepoPath: f.repo, RepoBranch: "main", Installer: inst, ColocatedBrokerID: testReadyColocatedBroker})
 	hooked := false
 	err := e.RunWithBeforeRestart(context.Background(), &bytes.Buffer{}, nil, func(context.Context, PendingRestart) error {
 		hooked = true

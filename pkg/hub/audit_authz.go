@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
@@ -33,10 +34,15 @@ import (
 // Decision Audit Emitter
 // =============================================================================
 
-// auditWriteTimeout is the maximum time an async mutation audit INSERT may
-// take before the goroutine abandons the attempt and releases its store
-// reference.
+// auditWriteTimeout is the maximum time a best-effort mutation audit INSERT
+// (async or synchronous) may take before abandoning the attempt.
 const auditWriteTimeout = 1 * time.Second
+
+// auditCancelDrainGrace bounds how long CloseAuditWriter waits after cancelling
+// stuck mutation-audit write contexts for those goroutines to unwind before
+// returning, so cooperative writes exit before store.Close() runs without
+// letting a non-cooperative store hang shutdown.
+const auditCancelDrainGrace = 250 * time.Millisecond
 
 // emitDecisionAudit builds and emits a decision audit record from a Decide call.
 func (a *AuthzService) emitDecisionAudit(ctx context.Context, request AuthzRequest, decision Decision) {
@@ -125,6 +131,8 @@ func BuildDecisionAuditRecord(ctx context.Context, request AuthzRequest, decisio
 		record.ExecutorID = ec.ID
 	}
 
+	record.SessionMode = viewAsMemberSessionModeFor(ctx, principalID)
+
 	return record
 }
 
@@ -148,35 +156,197 @@ func routeFromContext(ctx context.Context) string {
 // Mutation Audit Helper
 // =============================================================================
 
+// mutationAuditTracker admits, tracks, and joins asynchronous mutation audit
+// writes started by Server.emitMutationAudit (ptone/scion#8111).
+//
+// Its zero value is ready to use, and admission allocates no long-lived
+// channels so an emitMutationAudit call inside a testing/synctest bubble
+// leaves no bubbled channel behind once the write completes.
+type mutationAuditTracker struct {
+	mu      sync.Mutex
+	closed  bool
+	nextID  uint64
+	cancels map[uint64]context.CancelFunc
+	drained chan struct{}
+}
+
+// goTracked admits one async mutation audit write with the given per-write
+// timeout and runs fn on a tracked goroutine. Once stop has closed admission,
+// goTracked returns false without starting a goroutine.
+func (t *mutationAuditTracker) goTracked(timeout time.Duration, fn func(ctx context.Context)) bool {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return false
+	}
+	writeCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	if t.cancels == nil {
+		t.cancels = make(map[uint64]context.CancelFunc)
+	}
+	t.nextID++
+	id := t.nextID
+	t.cancels[id] = cancel
+	t.mu.Unlock()
+
+	go func() {
+		defer func() {
+			cancel()
+			t.mu.Lock()
+			delete(t.cancels, id)
+			if len(t.cancels) == 0 && t.drained != nil {
+				close(t.drained)
+				t.drained = nil
+			}
+			t.mu.Unlock()
+		}()
+		fn(writeCtx)
+	}()
+	return true
+}
+
+// stop closes admission for new mutation audit writes and waits for in-flight
+// writes to finish, bounded by min(ctx deadline, grace). If that wait expires
+// while writes are still running, stop cancels their contexts so blocked store
+// calls abort promptly and waits up to cancelGrace for those goroutines to
+// unwind before returning, so cooperative writes finish exiting before the
+// store closes without letting a non-cooperative store hang shutdown. It
+// returns how many writes were cancelled at the bound and how many remained
+// running after cancelGrace. Safe to call more than once.
+func (t *mutationAuditTracker) stop(ctx context.Context, grace, cancelGrace time.Duration) (cancelled, remaining int) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t.mu.Lock()
+	t.closed = true
+	if len(t.cancels) == 0 {
+		t.mu.Unlock()
+		return 0, 0
+	}
+	if t.drained == nil {
+		t.drained = make(chan struct{})
+	}
+	drained := t.drained
+	t.mu.Unlock()
+
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-drained:
+		return 0, 0
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+
+	t.mu.Lock()
+	cancelled = len(t.cancels)
+	if cancelled == 0 {
+		t.mu.Unlock()
+		return 0, 0
+	}
+	for _, cancel := range t.cancels {
+		cancel()
+	}
+	t.mu.Unlock()
+
+	if cancelGrace > 0 {
+		cancelTimer := time.NewTimer(cancelGrace)
+		defer cancelTimer.Stop()
+		select {
+		case <-drained:
+			return cancelled, 0
+		case <-cancelTimer.C:
+		}
+	}
+
+	t.mu.Lock()
+	remaining = len(t.cancels)
+	t.mu.Unlock()
+	return cancelled, remaining
+}
+
 // emitMutationAudit creates a mutation audit record from a handler context.
-// It extracts actor identity from the context and stores the record.
-// Errors are logged but do not fail the request (best-effort).
+// It extracts actor identity from the context and stores the record
+// asynchronously so handlers are not blocked. Errors are logged via the logger
+// captured at call time and do not fail the request (best-effort).
+//
+// Shutdown pending-records contract (ptone/scion#8111): CloseAuditWriter joins
+// admitted writes up to min(ctx deadline, auditWriteTimeout) before the store
+// closes. Writes still blocked at that bound have their contexts cancelled and
+// are given up to auditCancelDrainGrace to exit before CloseAuditWriter
+// returns; calls arriving after admission closes are dropped with a warning.
+// Mutation audit emission is best-effort, so records cancelled at the shutdown
+// bound or arriving after admission closes can be lost at shutdown rather than
+// hanging shutdown or writing to a closed store.
 func (s *Server) emitMutationAudit(ctx context.Context, record *store.MutationAuditRecord) {
+	s.recordMutationAudit(ctx, record, true)
+}
+
+// emitMutationAuditSync creates and stores a mutation audit record
+// synchronously through the same record preparation, bounded timeout, and
+// best-effort logging path as emitMutationAudit, detached from request
+// cancellation so the write completes before the caller returns without
+// changing the caller's response on store errors.
+func (s *Server) emitMutationAuditSync(ctx context.Context, record *store.MutationAuditRecord) {
+	s.recordMutationAudit(ctx, record, false)
+}
+
+// recordMutationAudit builds and persists a best-effort mutation audit record,
+// shared between emitMutationAudit (async) and emitMutationAuditSync (sync).
+func (s *Server) recordMutationAudit(ctx context.Context, record *store.MutationAuditRecord, async bool) {
+	if record == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// E.2a: consolidated actor/credential-snapshot/correlation helper (plan
 	// §3.3), replacing this function's own copy of the extraction logic.
 	// ApplyActor only fills fields the caller has not already set explicitly.
 	auditActorFromContext(ctx).ApplyActor(record)
 
 	if record.Timestamp.IsZero() {
-		record.Timestamp = time.Now()
+		record.Timestamp = time.Now().UTC()
 	}
 
-	// Fire-and-forget: do not block the handler.
-	// Uses a short timeout context to prevent goroutine/memory leaks on shutdown.
-	go func() {
+	st := s.store
+	logger := slog.Default()
+	write := func(writeCtx context.Context) {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Warn("recovered panic in mutation audit emit", "panic", r)
+				logger.Warn("recovered panic in mutation audit emit",
+					"mutation_type", record.MutationType,
+					"target_id", record.TargetID,
+					"panic", r)
 			}
 		}()
-		writeCtx, cancel := context.WithTimeout(context.Background(), auditWriteTimeout)
-		defer cancel()
-		if err := s.store.CreateMutationAudit(writeCtx, record); err != nil {
-			slog.Warn("failed to emit mutation audit record",
+		if st == nil {
+			logger.Warn("failed to emit mutation audit record",
 				"mutation_type", record.MutationType,
+				"target_id", record.TargetID,
+				"error", "no store")
+			return
+		}
+		if err := st.CreateMutationAudit(writeCtx, record); err != nil {
+			logger.Warn("failed to emit mutation audit record",
+				"mutation_type", record.MutationType,
+				"target_id", record.TargetID,
 				"error", err)
 		}
-	}()
+	}
+
+	if !async {
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditWriteTimeout)
+		defer cancel()
+		write(writeCtx)
+		return
+	}
+
+	if !s.mutationAuditWork.goTracked(auditWriteTimeout, write) {
+		logger.Warn("dropped mutation audit record after audit shutdown",
+			"mutation_type", record.MutationType,
+			"target_id", record.TargetID)
+	}
 }
 
 // =============================================================================
@@ -420,14 +590,20 @@ func (s *Server) handleAuthzExplain(w http.ResponseWriter, r *http.Request) {
 		resource.ParentType = "project"
 		resource.ParentID = req.Resource.ProjectID
 	}
-	// A skill's authorization depends on its own scope (ScopeKind and, for
-	// user-scoped skills, the owning user), which the request does not
-	// carry. Build it from the stored record the way the read handlers do,
-	// so explain matches real decisions. An unknown ID keeps the bare
-	// resource, which every skill check denies.
-	if resource.Type == "skill" && resource.ID != "" {
+	// A skill's or template's authorization depends on its own scope
+	// (ScopeKind and, for user-scoped records, the owning user), which the
+	// request does not carry. Build it from the stored record the way the
+	// read/write handlers do, so explain matches real decisions (including
+	// *_global twins via catalogWriteAction). An unknown ID keeps the bare
+	// resource, which every check denies.
+	switch {
+	case resource.Type == "skill" && resource.ID != "":
 		if sk, err := s.store.GetSkill(ctx, resource.ID); err == nil {
 			resource = skillResource(sk)
+		}
+	case resource.Type == "template" && resource.ID != "":
+		if tmpl, err := s.store.GetTemplate(ctx, resource.ID); err == nil {
+			resource = templateResource(tmpl)
 		}
 	}
 
@@ -459,6 +635,7 @@ func (s *Server) handleAuthzExplain(w http.ResponseWriter, r *http.Request) {
 	// using the explain-specific helper (not resolveResourcePermission, which
 	// is reserved for production enforcement).
 	permissionID := req.Permission
+	explainAction := Action(req.Action)
 	if permissionID != "" {
 		// Explicit permission: validate against the canonical registry.
 		if !isKnownPermission(permissionID) {
@@ -468,7 +645,13 @@ func (s *Server) handleAuthzExplain(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// No explicit permission: canonicalize from resource.type + action.
-		permissionID = canonicalizeExplainPermission(req.Resource.Type, req.Action)
+		// Enforcement checks the stored record's scope twin (for example
+		// skill.update_global on a global skill), so explain must too:
+		// resolve the action kind-aware from the loaded record before
+		// canonicalizing, or it would report plain skill.update as allowed
+		// where the real write is refused.
+		explainAction = catalogWriteAction(resource.Type, resource.ScopeKind, explainAction)
+		permissionID = canonicalizeExplainPermission(req.Resource.Type, string(explainAction))
 	}
 
 	// Build the authz request with Explain enabled.
@@ -476,7 +659,7 @@ func (s *Server) handleAuthzExplain(w http.ResponseWriter, r *http.Request) {
 		Principal:  principalContextForIdentity(explainIdentity),
 		Credential: credentialContextForIdentity(explainIdentity),
 		Resource:   resource,
-		Action:     Action(req.Action),
+		Action:     explainAction,
 		Permission: permissionID,
 		Explain:    true,
 	}
@@ -861,9 +1044,50 @@ func newAgentIdentityFromStore(agent *store.Agent) AgentIdentity {
 // Audit Retention Controls
 // =============================================================================
 
-// CleanupAuditRecords removes audit records older than the specified retention period.
+// auditRecordCleanupTimeout bounds one run of the periodic audit record cleanup.
+const auditRecordCleanupTimeout = 30 * time.Second
+
+// auditRetentionDays returns the effective mutation audit retention window in
+// days: DefaultAuditRetentionDays (90) when unset, or the configured value
+// (0 disables automatic cleanup).
+func (s *Server) auditRetentionDays() int {
+	if s.config.AuditRetentionDays == nil {
+		return DefaultAuditRetentionDays
+	}
+	return *s.config.AuditRetentionDays
+}
+
+// auditRecordCleanupHandler returns the recurring singleton handler that
+// deletes mutation audit records older than server.hub.audit_retention_days.
+// When retention is 0 (disabled), the handler is a no-op.
+func (s *Server) auditRecordCleanupHandler() func(ctx context.Context) {
+	return func(ctx context.Context) {
+		retentionDays := s.auditRetentionDays()
+		if retentionDays <= 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(ctx, auditRecordCleanupTimeout)
+		defer cancel()
+		if err := s.CleanupAuditRecords(ctx, retentionDays); err != nil {
+			slog.Error("audit-record-cleanup: failed to clean up audit records",
+				"error", err,
+				"retention_days", retentionDays)
+		}
+	}
+}
+
+// CleanupAuditRecords removes mutation audit records older than the specified
+// retention period in days. A retentionDays of 0 disables cleanup (no-op);
+// negative values return an error.
 func (s *Server) CleanupAuditRecords(ctx context.Context, retentionDays int) error {
-	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	if retentionDays < 0 {
+		return fmt.Errorf("invalid audit retention days %d: must be >= 0", retentionDays)
+	}
+	if retentionDays == 0 {
+		return nil
+	}
+
+	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays)
 
 	mutationCount, err := s.store.DeleteMutationAuditsBefore(ctx, cutoff)
 	if err != nil {

@@ -47,6 +47,10 @@ import {
 } from '../../shared/types.js';
 import { agentStatusBadge } from '../../shared/agent-state-display.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { loadAdminStatus } from '../../client/admin-status.js';
+import type { AdminStatus } from '../../lib/admin-permissions.js';
+import { current, projectsRoot } from '../../client/crumbs.js';
+import { projectDisplayName } from '../../client/project-label.js';
 import { showPendingSecretsStartHint } from '../../client/pending-secrets.js';
 import { dispatchPageTitle } from '../../client/page-title.js';
 import {
@@ -120,7 +124,13 @@ import {
 } from '../../client/project-leave.js';
 import '../shared/project-leave-dialog.js';
 import type { ProjectLeftDetail, ScionProjectLeaveDialog } from '../shared/project-leave-dialog.js';
-import { AGENT_BADGES_FLAG, isFeatureEnabled } from '../../utils/feature-flags.js';
+import {
+  AGENT_BADGES_FLAG,
+  FEATURE_FLAGS_CHANGED_EVENT,
+  decisionsEnabled,
+  isFeatureEnabled,
+} from '../../utils/feature-flags.js';
+import { fetchProjectDecisionCounts } from '../../client/project-decisions.js';
 import { agentBadges } from '../shared/agent-badges.js';
 import { ARTIFACTS_FLAG } from '../../client/artifacts.js';
 import '../shared/artifact-list.js';
@@ -470,6 +480,54 @@ export class ScionPageProjectDetail extends LitElement {
 
   private boundOnAgentsResync = () => {
     this.agentWindow.markResync();
+  };
+
+  @state()
+  private decisionsEnabled = false;
+
+  @state()
+  private waitingOnYouDecisionsCount = 0;
+
+  private decisionsCountAbort: AbortController | null = null;
+  private decisionsCountTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private boundOnFeatureFlagsChanged = (): void => {
+    const next = decisionsEnabled();
+    if (next === this.decisionsEnabled) return;
+    this.decisionsEnabled = next;
+    if (!next) {
+      this.cancelDecisionsCountLoad();
+      this.waitingOnYouDecisionsCount = 0;
+      return;
+    }
+    if (this.project && this.projectId) {
+      void this.loadDecisionsCount();
+    }
+  };
+
+  private boundOnDecisionUpdated = (e: Event): void => {
+    if (!this.decisionsEnabled || !this.projectId) return;
+    const raw = (e as CustomEvent).detail as {
+      data?: { projectId?: string };
+      projectId?: string;
+    } | null;
+    const data = raw?.data ?? raw;
+    if (data?.projectId && data.projectId !== this.projectId) return;
+    this.scheduleDecisionsCountRefresh();
+  };
+
+  private boundOnChatMessageReceived = (e: Event): void => {
+    if (!this.decisionsEnabled || !this.projectId) return;
+    const raw = (e as CustomEvent).detail as {
+      data?: { projectId?: string; type?: string; decisions?: unknown };
+      projectId?: string;
+      type?: string;
+      decisions?: unknown;
+    } | null;
+    const data = raw?.data ?? raw;
+    if (data?.projectId && data.projectId !== this.projectId) return;
+    if (data?.type !== 'decision-prompt' && !Array.isArray(data?.decisions)) return;
+    this.scheduleDecisionsCountRefresh();
   };
 
   /**
@@ -1147,7 +1205,7 @@ export class ScionPageProjectDetail extends LitElement {
 
     .scope-toggle button.active {
       background: var(--scion-primary, #3b82f6);
-      color: white;
+      color: var(--scion-primary-text, #ffffff);
     }
 
     th.sortable {
@@ -1190,12 +1248,22 @@ export class ScionPageProjectDetail extends LitElement {
       cursor: pointer;
     }
 
+    .decisions-btn sl-badge::part(base) {
+      font-size: 0.65rem;
+      margin-left: 0.35rem;
+    }
+
     @media (max-width: 768px) {
       .hide-mobile {
         display: none;
       }
     }
   `;
+
+  @state()
+  private adminStatus: AdminStatus | null = null;
+
+  private adminStatusUserId: string | null = null;
 
   private boundOnProjectsUpdated = this.onProjectsUpdated.bind(this);
 
@@ -1273,6 +1341,8 @@ export class ScionPageProjectDetail extends LitElement {
       view: listViewOf(this.viewMode),
     });
 
+    this.decisionsEnabled = decisionsEnabled();
+
     // Set SSE scope to this project (receives all agent events within
     // project) before the first load: a drain belongs to the scope
     // generation it started in, and is discarded if the scope changes
@@ -1283,21 +1353,29 @@ export class ScionPageProjectDetail extends LitElement {
 
     void this.loadData();
     void this.loadHubProjectCapabilities();
+    void this.loadAdminStatusForUser();
 
     // Listen for real-time updates
+    window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
     stateManager.addEventListener('projects-updated', this.boundOnProjectsUpdated);
     stateManager.addEventListener('agents-changed', this.boundOnAgentsChanged);
     stateManager.addEventListener('agents-resync', this.boundOnAgentsResync);
+    stateManager.addEventListener('decision-updated', this.boundOnDecisionUpdated);
+    stateManager.addEventListener('chat-message-received', this.boundOnChatMessageReceived);
     this.agentWindow.addEventListener('change', this.boundOnWindowChange);
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
+    window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
     stateManager.removeEventListener('projects-updated', this.boundOnProjectsUpdated);
     stateManager.removeEventListener('agents-changed', this.boundOnAgentsChanged);
     stateManager.removeEventListener('agents-resync', this.boundOnAgentsResync);
+    stateManager.removeEventListener('decision-updated', this.boundOnDecisionUpdated);
+    stateManager.removeEventListener('chat-message-received', this.boundOnChatMessageReceived);
     this.agentWindow.removeEventListener('change', this.boundOnWindowChange);
     this.cancelAgentsLoad();
+    this.cancelDecisionsCountLoad();
     this.filesSectionObserver?.disconnect();
     this.filesSectionObserver = null;
     this.observedFilesPlaceholder = null;
@@ -1329,8 +1407,26 @@ export class ScionPageProjectDetail extends LitElement {
 
   override updated(changed: Map<string, unknown>): void {
     super.updated(changed);
+    if (changed.has('pageData')) {
+      void this.loadAdminStatusForUser();
+    }
     this.observeFilesSection();
     this.noteRowsReady();
+  }
+
+  private async loadAdminStatusForUser(): Promise<void> {
+    const userId = this.pageData?.user?.id ?? null;
+    if (!userId) {
+      this.adminStatusUserId = null;
+      this.adminStatus = null;
+      return;
+    }
+    if (userId === this.adminStatusUserId) return;
+    this.adminStatusUserId = userId;
+    const status = await loadAdminStatus(userId);
+    if (this.adminStatusUserId === userId) {
+      this.adminStatus = status;
+    }
   }
 
   /**
@@ -1625,6 +1721,9 @@ export class ScionPageProjectDetail extends LitElement {
     // Fetch metrics summary (non-blocking, gracefully degrades)
     void this.loadMetricsSummary();
     void this.loadSessionMetricsSummary();
+    if (this.decisionsEnabled) {
+      void this.loadDecisionsCount();
+    }
 
     // Auto-discover GitHub App installation if project has a GitHub remote but no installation
     if (
@@ -1655,6 +1754,46 @@ export class ScionPageProjectDetail extends LitElement {
       this.metricsSummary = data;
     } catch {
       this.metricsSummary = null;
+    }
+  }
+
+  private cancelDecisionsCountLoad(): void {
+    if (this.decisionsCountTimer !== null) {
+      clearTimeout(this.decisionsCountTimer);
+      this.decisionsCountTimer = null;
+    }
+    this.decisionsCountAbort?.abort();
+    this.decisionsCountAbort = null;
+  }
+
+  private scheduleDecisionsCountRefresh(): void {
+    if (this.decisionsCountTimer !== null) {
+      clearTimeout(this.decisionsCountTimer);
+    }
+    this.decisionsCountTimer = setTimeout(() => {
+      this.decisionsCountTimer = null;
+      if (this.isConnected && this.decisionsEnabled && this.projectId) {
+        void this.loadDecisionsCount();
+      }
+    }, 100);
+  }
+
+  private async loadDecisionsCount(): Promise<void> {
+    if (!this.decisionsEnabled || !this.projectId) return;
+    this.decisionsCountAbort?.abort();
+    const ac = new AbortController();
+    this.decisionsCountAbort = ac;
+    try {
+      const counts = await fetchProjectDecisionCounts(this.projectId, ac.signal);
+      if (ac.signal.aborted || !this.isConnected || !this.decisionsEnabled) return;
+      this.waitingOnYouDecisionsCount = counts.waitingOnYou;
+    } catch {
+      if (ac.signal.aborted) return;
+      // Non-blocking badge fetch: leave previous/0 count if unavailable.
+    } finally {
+      if (this.decisionsCountAbort === ac) {
+        this.decisionsCountAbort = null;
+      }
     }
   }
 
@@ -2731,7 +2870,13 @@ export class ScionPageProjectDetail extends LitElement {
 
     return html`
       <scion-detail-header heading=${this.project.name}>
-        <scion-back-link slot="back" href="/projects">Back to Projects</scion-back-link>
+        <scion-breadcrumb
+          slot="back"
+          .crumbs=${[
+            projectsRoot(),
+            current(projectDisplayName(this.project, this.projectId || this.project.id)),
+          ]}
+        ></scion-breadcrumb>
         ${this.renderProjectIcon()} ${this.renderLinkedBadge()}
         <div slot="meta" class="header-path">
           <scion-git-remote-display .project=${this.project}></scion-git-remote-display>
@@ -2763,7 +2908,7 @@ export class ScionPageProjectDetail extends LitElement {
               `
             : nothing}
           ${can(this.project?._capabilities, 'read') && can(this.hubProjectCapabilities, 'create')
-            ? this.pageData?.user?.role === 'admin'
+            ? this.adminStatus?.isAdmin === true
               ? html`
                   <sl-dropdown>
                     <sl-button slot="trigger" size="small" caret>
@@ -2788,6 +2933,25 @@ export class ScionPageProjectDetail extends LitElement {
                     Clone
                   </sl-button>
                 `
+            : nothing}
+          ${this.decisionsEnabled
+            ? html`
+                <a
+                  href="/projects/${encodeURIComponent(this.projectId)}/decisions"
+                  style="text-decoration: none;"
+                  data-decisions-link
+                >
+                  <sl-button size="small" class="decisions-btn" data-decisions-button>
+                    <sl-icon slot="prefix" name="signpost-split"></sl-icon>
+                    Decisions
+                    ${this.waitingOnYouDecisionsCount > 0
+                      ? html`<sl-badge variant="primary" pill class="decisions-badge"
+                          >${this.waitingOnYouDecisionsCount}</sl-badge
+                        >`
+                      : nothing}
+                  </sl-button>
+                </a>
+              `
             : nothing}
           <a href="/projects/${this.projectId}/metrics" style="text-decoration: none;">
             <sl-button size="small">
@@ -3223,6 +3387,7 @@ export class ScionPageProjectDetail extends LitElement {
 
   private renderLoading() {
     return html`
+      <scion-breadcrumb .crumbs=${[projectsRoot()]}></scion-breadcrumb>
       <div class="loading-state">
         <sl-spinner></sl-spinner>
         <p>Loading project...</p>
@@ -3284,7 +3449,7 @@ export class ScionPageProjectDetail extends LitElement {
   private renderError() {
     if (this.noAccess) {
       return html`
-        <scion-back-link href="/projects">Back to Projects</scion-back-link>
+        <scion-breadcrumb .crumbs=${[projectsRoot()]}></scion-breadcrumb>
 
         <div class="error-state" data-project-no-access>
           <sl-icon name="exclamation-triangle"></sl-icon>
@@ -3294,7 +3459,7 @@ export class ScionPageProjectDetail extends LitElement {
       `;
     }
     return html`
-      <scion-back-link href="/projects">Back to Projects</scion-back-link>
+      <scion-breadcrumb .crumbs=${[projectsRoot()]}></scion-breadcrumb>
 
       <div class="error-state">
         <sl-icon name="exclamation-triangle"></sl-icon>

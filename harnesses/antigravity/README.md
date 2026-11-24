@@ -2,7 +2,8 @@
 
 Scion harness configuration for
 [Antigravity CLI](https://antigravity.google/product/antigravity-cli), a
-Gemini-based coding agent CLI using OAuth via gnome-keyring.
+Gemini-based coding agent CLI. It authenticates with an OAuth token file, a
+Gemini API key or Vertex AI (see [Auth Modes](#auth-modes)).
 
 ## Install
 
@@ -22,12 +23,22 @@ scion harness-config install github.com/GoogleCloudPlatform/scion/tree/main/harn
 
 | Mode | Env / Secret | Notes |
 |------|-------------|-------|
-| `oauth-token` (default) | `AGY_KEYRING_TOKEN` | OAuth refresh token JSON stored in gnome-keyring |
-| `vertex-ai` | `AGY_KEYRING_TOKEN` + `GOOGLE_CLOUD_PROJECT` | Enterprise/GCP mode via keyring + Vertex AI |
+| `oauth-token` (default) | `AGY_TOKEN` file secret | OAuth token JSON with a `refresh_token`, staged at `~/.gemini/antigravity-cli/antigravity-oauth-token` |
+| `api-key` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | The provisioner sets `modelProvider` to `gemini` in `settings.json` |
+| `vertex-ai` | `GOOGLE_CLOUD_PROJECT` + `GOOGLE_CLOUD_LOCATION` (or `GOOGLE_CLOUD_REGION`) + ADC | ADC from the `gcloud-adc` file secret, `GOOGLE_APPLICATION_CREDENTIALS`, or the agent's assigned GCP service account; requires AGY CLI >= 1.1.10 |
 
-Both auth modes require a JSON object containing a `refresh_token` field,
-injected via the `AGY_KEYRING_TOKEN` secret. The provisioner initializes
-gnome-keyring and stores the token at container startup.
+When no type is chosen, the provisioner tries `vertex-ai`, then
+`oauth-token`, then `api-key`. A bind-mounted
+`antigravity-oauth-token` file also selects `oauth-token`.
+
+For `oauth-token`, the `AGY_TOKEN` JSON must contain a `refresh_token`
+field, at the top level or under `token`. At launch the generated wrapper
+starts D-Bus and gnome-keyring and stores the token in the keyring before
+running `agy`. `vertex-ai` skips the keyring.
+
+If you have no token, start the agent without credentials, run `agy` to
+log in, then run `python3 /home/scion/.scion/harness/capture_auth.py` to
+capture `AGY_TOKEN`.
 
 ## Bundle Layout
 
@@ -35,6 +46,7 @@ gnome-keyring and stores the token at container startup.
 antigravity/
   config.yaml       # Harness configuration (provisioner, capabilities, auth)
   provision.py       # Container-side provisioner (pre-start hook)
+  capture_auth.py    # Captures AGY_TOKEN after an interactive login
   dialect.yaml       # Hook dialect mapping (antigravity events -> scion events)
   Dockerfile         # Image build (FROM scion-base)
   cloudbuild.yaml    # Cloud Build configuration
@@ -49,8 +61,25 @@ core-base -> scion-base -> scion-antigravity
 ```
 
 The keyring packages (`gnome-keyring`, `libsecret`, `dbus-x11`) are
-provided by `core-base`. The antigravity Dockerfile adds the Antigravity
-CLI binary on top of `scion-base`.
+provided by `core-base`. The antigravity `Dockerfile` installs the Antigravity
+CLI binary (`/usr/local/bin/agy`) on top of `scion-base` via the upstream
+installer script (`https://antigravity.google/cli/install.sh --dir /usr/local/bin`),
+and the `scion` omni image chains directly from this `Dockerfile` so both
+standalone and omni images share the same install step.
+
+- **Version recording & reproducibility:** Following the image-build reproducibility
+  model in [`image-build/README.md`](../../image-build/README.md) ("Same recipe, not
+  same bits"), the `Dockerfile` tracks the latest upstream `agy` release at build
+  time rather than maintaining a manual `AGY_VERSION` pin. Both `install.sh` and the
+  post-install `/usr/local/bin/agy --version` check print the exact installed version
+  into the Docker / Cloud Build log, and published images are pinned by registry
+  digest (`build-manifest.json`).
+- **Installer failure behavior:** `curl -fsSL -o /tmp/agy-install.sh` writes the
+  installer to disk before invoking `bash` (avoiding silent exit-0 when `curl` fails
+  in Docker's non-`pipefail` `/bin/sh`), `install.sh` runs with `set -euo pipefail`
+  and verifies the downloaded archive's SHA-512 checksum against the upstream HTTPS
+  manifest (`linux_amd64` / `linux_arm64`), and `/usr/local/bin/agy --version` fails
+  the build if the binary is missing or cannot execute.
 
 ```sh
 # Local Docker build

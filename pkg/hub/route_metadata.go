@@ -34,6 +34,25 @@ const (
 	RouteWebhook       RouteClassification = "webhook"       // Webhook signature verification
 )
 
+// AgentStandingPolicy declares how delegation standing (agent_standing.go) is
+// enforced for a RouteAgentToken route.
+type AgentStandingPolicy string
+
+const (
+	// AgentStandingGuard enforces agentStandingForbidden in routeGuard for
+	// every AgentIdentity caller before the handler runs. Use this for
+	// agent-authenticated credential- or token-issuing routes.
+	AgentStandingGuard AgentStandingPolicy = "guard"
+	// AgentStandingHandler declares that the handler enforces delegation
+	// standing itself (for example, when custom error mapping or per-item
+	// admission applies). Still verified end-to-end by
+	// TestAgentStanding_CredentialRoutesCoverage.
+	AgentStandingHandler AgentStandingPolicy = "handler"
+	// AgentStandingExempt declares that the route does not issue
+	// credentials, tokens, or secrets; AgentStandingReason must explain why.
+	AgentStandingExempt AgentStandingPolicy = "exempt"
+)
+
 // RouteMetadata describes the authorization requirements for a single route.
 type RouteMetadata struct {
 	// Pattern is the HTTP method+path registered on the mux (e.g., "GET /api/v1/agents").
@@ -99,6 +118,17 @@ type RouteMetadata struct {
 	// visitorAdmittedSubRoutes lists for the pattern and method, and only
 	// when the sub-route's per-request check passes (admitVisitorSubRoute).
 	VisitorMethods []string
+
+	// AgentStanding declares how the agent delegation-standing check is
+	// enforced on a RouteAgentToken route (AgentStandingGuard,
+	// AgentStandingHandler, or AgentStandingExempt). Every RouteAgentToken
+	// route must set it; validateAgentStandingRoutes refuses to start a
+	// server otherwise. Non-RouteAgentToken routes must leave it empty.
+	AgentStanding AgentStandingPolicy
+	// AgentStandingReason documents why a RouteAgentToken route uses
+	// AgentStandingHandler or AgentStandingExempt. Required for those two
+	// policies and empty otherwise.
+	AgentStandingReason string
 }
 
 // routeMetadataTable maps every registered mux pattern to its authorization metadata.
@@ -288,6 +318,18 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 	"/api/v1/users/me/terminal-workspace": {
 		Pattern: "/api/v1/users/me/terminal-workspace", RouteID: "users.me.terminalWorkspace",
+		Classification: RouteAuthenticated,
+	},
+	"/api/v1/users/me/exec-container": {
+		Pattern: "/api/v1/users/me/exec-container", RouteID: "users.me.execContainer",
+		Classification: RouteAuthenticated,
+	},
+	"/api/v1/users/me/decisions": {
+		Pattern: "/api/v1/users/me/decisions", RouteID: "users.me.decisions",
+		Classification: RouteAuthenticated,
+	},
+	"/api/v1/users/me/inbox/summary": {
+		Pattern: "/api/v1/users/me/inbox/summary", RouteID: "users.me.inbox.summary",
 		Classification: RouteAuthenticated,
 	},
 	"/api/v1/users/me/templates": {
@@ -503,6 +545,16 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "/api/v1/conduit/grant-keys", RouteID: "conduit.grant_keys",
 		Classification: RouteAuthenticated,
 	},
+	// Trigger rule preset schemas and stateless form compiler, behind
+	// hub.github_triggers. Reads no tenant rows and mutates no state.
+	"GET /api/v1/trigger-presets": {
+		Pattern: "GET /api/v1/trigger-presets", RouteID: "triggerPresets.list",
+		Classification: RouteAuthenticated,
+	},
+	"POST /api/v1/trigger-presets/compile": {
+		Pattern: "POST /api/v1/trigger-presets/compile", RouteID: "triggerPresets.compile",
+		Classification: RouteAuthenticated,
+	},
 	// Conduit sessions (WebSocket), behind hub.conduit. Agent principals
 	// authenticate with an agent token carrying agent:port:forward (the
 	// handler reads the agent row); runtime broker principals authenticate
@@ -510,7 +562,9 @@ var routeMetadataTable = map[string]RouteMetadata{
 	// and their sessions carry the hub's transient broker RPCs.
 	"/api/v1/conduit": {
 		Pattern: "/api/v1/conduit", RouteID: "conduit.session",
-		Classification: RouteAgentToken,
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingHandler,
+		AgentStandingReason: "handler checks scope and agent row before calling agentStandingForbidden in decideConduitAgent, and re-checks standing on in-band AuthRefresh",
 	},
 
 	// -------------------------------------------------------------------------
@@ -707,18 +761,23 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RoutePolicy,
 		Permission:     "project.read", Resource: "project", Action: "read",
 	},
-	// decisions.byId reads and answers a choice prompt decision; the
+	// decisions.byId reads and answers a decision prompt decision; the
 	// handler authorizes per conversation (read or send rights on the
-	// prompt's thread or DM). 404 while web.chat_choices is off.
+	// prompt's thread or DM). 404 while web.decisions is off.
 	"/api/v1/decisions/": {
 		Pattern: "/api/v1/decisions/", RouteID: "decisions.byId",
 		Classification: RoutePolicy,
 		Permission:     "project.read", Resource: "project", Action: "read",
 	},
-	"/api/v1/choice-prompts/": {
-		Pattern: "/api/v1/choice-prompts/", RouteID: "choiceprompts.byId",
+	"/api/v1/decision-prompts/": {
+		Pattern: "/api/v1/decision-prompts/", RouteID: "decisionprompts.byId",
 		Classification: RoutePolicy,
 		Permission:     "project.read", Resource: "project", Action: "read",
+	},
+	"/api/v1/secret-requests/": {
+		Pattern: "/api/v1/secret-requests/", RouteID: "secretrequests.byMessageId",
+		Classification: RoutePolicy,
+		Permission:     "agent.read", Resource: "agent", Action: "read",
 	},
 	"/api/v1/chat/search": {
 		Pattern: "/api/v1/chat/search", RouteID: "chat.search",
@@ -849,6 +908,11 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 	"/api/v1/admin/maintenance/update-status": {
 		Pattern: "/api/v1/admin/maintenance/update-status", RouteID: "admin.maintenance.updateStatus",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
+	},
+	"/api/v1/admin/maintenance/auto-update": {
+		Pattern: "/api/v1/admin/maintenance/auto-update", RouteID: "admin.maintenance.autoUpdate",
 		Classification: RouteHubAdmin,
 		Permission:     "hub.maintenance.execute", Resource: "hub", Action: "execute",
 	},
@@ -1049,6 +1113,36 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Permission:     "hub.health.read", Resource: "hub", Action: "read",
 		SessionOnly: authzop.ReasonGovernancePending,
 	},
+	// Runtime objects no hub agent owns (ptone/scion#7930), an operator
+	// diagnostic under the permission of the health summary. Session only
+	// (GOV_PENDING).
+	"/api/v1/admin/runtime-orphans": {
+		Pattern: "/api/v1/admin/runtime-orphans", RouteID: "admin.runtimeOrphans",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.health.read", Resource: "hub", Action: "read",
+		SessionOnly: authzop.ReasonGovernancePending,
+	},
+	// System One provider instances (ptone/scion#8044; 404 while hub.system_one
+	// is off). Session only (CREDENTIAL_MANAGEMENT): instances store and
+	// exercise hub-scoped internal API keys.
+	"/api/v1/admin/system-one/adapters": {
+		Pattern: "/api/v1/admin/system-one/adapters", RouteID: "admin.systemOne.adapters",
+		Classification: RouteHubAdmin,
+		Permission:     "system_one_instance.read", Resource: "system_one_instance", Action: "read",
+		SessionOnly: authzop.ReasonCredentialManagement,
+	},
+	"/api/v1/admin/system-one/instances": {
+		Pattern: "/api/v1/admin/system-one/instances", RouteID: "admin.systemOne.instances",
+		Classification: RouteHubAdmin,
+		Permission:     "system_one_instance.read", Resource: "system_one_instance", Action: "read",
+		SessionOnly: authzop.ReasonCredentialManagement,
+	},
+	"/api/v1/admin/system-one/instances/": {
+		Pattern: "/api/v1/admin/system-one/instances/", RouteID: "admin.systemOne.instances.byName",
+		Classification: RouteHubAdmin,
+		Permission:     "system_one_instance.read", Resource: "system_one_instance", Action: "read",
+		SessionOnly: authzop.ReasonCredentialManagement,
+	},
 	"/api/v1/admin/messaging/divergence": {
 		Pattern: "/api/v1/admin/messaging/divergence", RouteID: "admin.messaging.divergence",
 		Classification: RouteHubAdmin,
@@ -1202,6 +1296,12 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RouteAuthenticated,
 		Permission:     "hub.audit.read", Resource: "hub", Action: "read",
 	},
+	"/api/v1/admin/effective-permissions": {
+		Pattern: "/api/v1/admin/effective-permissions", RouteID: "admin.effectivePermissions",
+		Classification: RouteHubAdmin,
+		Permission:     "role_binding.read", Resource: "role_binding", Action: "read",
+		BearerTarget: "hub_instance",
+	},
 
 	// -------------------------------------------------------------------------
 	// Authenticated: the caller's own pending secrets
@@ -1269,6 +1369,21 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 	"POST /api/v1/github-app/sync-permissions": {
 		Pattern: "POST /api/v1/github-app/sync-permissions", RouteID: "githubApp.syncPermissions",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.github_app.update", Resource: "hub", Action: "update",
+	},
+	"GET /api/v1/github-app/repo-routing": {
+		Pattern: "GET /api/v1/github-app/repo-routing", RouteID: "githubApp.repoRouting.list",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.github_app.read", Resource: "hub", Action: "read",
+	},
+	"PUT /api/v1/github-app/repo-routing/{owner}/{repo}": {
+		Pattern: "PUT /api/v1/github-app/repo-routing/{owner}/{repo}", RouteID: "githubApp.repoRouting.set",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.github_app.update", Resource: "hub", Action: "update",
+	},
+	"DELETE /api/v1/github-app/repo-routing/{owner}/{repo}": {
+		Pattern: "DELETE /api/v1/github-app/repo-routing/{owner}/{repo}", RouteID: "githubApp.repoRouting.delete",
 		Classification: RouteHubAdmin,
 		Permission:     "hub.github_app.update", Resource: "hub", Action: "update",
 	},
@@ -1474,19 +1589,57 @@ var routeMetadataTable = map[string]RouteMetadata{
 	// -------------------------------------------------------------------------
 	"/api/v1/agent/gcp-token": {
 		Pattern: "/api/v1/agent/gcp-token", RouteID: "agent.gcpToken",
-		Classification: RouteAgentToken,
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingHandler,
+		AgentStandingReason: "handler checks rate limit and maps GetAgent lookup faults to 403 before calling agentStandingForbidden",
 	},
 	"/api/v1/agent/gcp-identity-token": {
 		Pattern: "/api/v1/agent/gcp-identity-token", RouteID: "agent.gcpIdentityToken",
-		Classification: RouteAgentToken,
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingHandler,
+		AgentStandingReason: "handler checks rate limit and maps GetAgent lookup faults to 403 before calling agentStandingForbidden",
 	},
 	"POST /api/v1/agent/identity-token": {
 		Pattern: "POST /api/v1/agent/identity-token", RouteID: "agent.identityToken",
-		Classification: RouteAgentToken,
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingHandler,
+		AgentStandingReason: "handler checks rate limit and maps missing agent to 404 before calling AgentStandingForbidden",
 	},
 	"POST /api/v1/agent/secrets": {
 		Pattern: "POST /api/v1/agent/secrets", RouteID: "agent.secretFetch",
-		Classification: RouteAgentToken,
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingHandler,
+		AgentStandingReason: "handler enforces agentStandingFor(secret.use) in materialRuntimePrecheck with per-item chain delegation checks",
+	},
+	"GET /api/v1/agent/hub": {
+		Pattern: "GET /api/v1/agent/hub", RouteID: "agent.hubInfo",
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingExempt,
+		AgentStandingReason: "returns only the hub's non-secret hub_id identifier; issues no credentials, tokens, or secrets",
+	},
+	"/api/v1/agent/decisions": {
+		Pattern: "/api/v1/agent/decisions", RouteID: "agent.decisions",
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingExempt,
+		AgentStandingReason: "reads and records agent decisions; issues no credentials, tokens, or secrets",
+	},
+	"/api/v1/agent/decisions/": {
+		Pattern: "/api/v1/agent/decisions/", RouteID: "agent.decisionsByKey",
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingExempt,
+		AgentStandingReason: "reads and records agent decisions; issues no credentials, tokens, or secrets",
+	},
+	"/api/v1/agent/secret-requests": {
+		Pattern: "/api/v1/agent/secret-requests", RouteID: "agent.secretRequests",
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingExempt,
+		AgentStandingReason: "lists and withdraws the calling agent's secret request metadata; never reads, writes, or returns secret values",
+	},
+	"/api/v1/agent/secret-requests/": {
+		Pattern: "/api/v1/agent/secret-requests/", RouteID: "agent.secretRequestsAction",
+		Classification:      RouteAgentToken,
+		AgentStanding:       AgentStandingExempt,
+		AgentStandingReason: "lists and withdraws the calling agent's secret request metadata; never reads, writes, or returns secret values",
 	},
 
 	// -------------------------------------------------------------------------
@@ -1563,10 +1716,14 @@ var routeMetadataTable = map[string]RouteMetadata{
 	},
 
 	// -------------------------------------------------------------------------
-	// Webhook: GitHub webhook
+	// Webhook: GitHub webhook & generic trigger webhook ingress
 	// -------------------------------------------------------------------------
 	"/api/v1/webhooks/github": {
 		Pattern: "/api/v1/webhooks/github", RouteID: "webhooks.github",
+		Classification: RouteWebhook,
+	},
+	"/api/v1/hooks/{id}": {
+		Pattern: "/api/v1/hooks/{id}", RouteID: "hooks.receive",
 		Classification: RouteWebhook,
 	},
 }
@@ -1809,6 +1966,16 @@ func (s *Server) routeGuard(meta RouteMetadata, next http.HandlerFunc) http.Hand
 			if identity == nil {
 				writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
 				return
+			}
+			// Enforce delegation standing structurally unless the route
+			// explicitly declares handler-level standing enforcement or an
+			// exemption (ptone/scion#8104). Fail closed when unset.
+			if meta.AgentStanding != AgentStandingHandler && meta.AgentStanding != AgentStandingExempt {
+				if agentIdent, ok := identity.(AgentIdentity); ok {
+					if s.agentStandingForbidden(r.Context(), w, agentIdent.ID()) {
+						return
+					}
+				}
 			}
 			next(w, r)
 		case RouteWebhook:

@@ -27,6 +27,7 @@ import (
 
 	"log/slog"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/hubfire"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -370,9 +371,9 @@ func TestOneShotTimerFiresAtCorrectTime(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
 	s := newTestSchedulerWithStore(1*time.Second, ms)
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		return nil
-	})
+	}))
 
 	var fired atomic.Int32
 
@@ -465,9 +466,9 @@ func TestOneShotExpiredTimerFiresImmediately(t *testing.T) {
 	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	s := newTestSchedulerWithStore(1*time.Second, ms)
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		return nil
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -636,9 +637,9 @@ func TestOneShotHandlerPanicRecovery(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
 	s := newTestSchedulerWithStore(1*time.Second, ms)
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		return nil
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -737,13 +738,13 @@ func TestRegisterEventHandlerAndDispatch(t *testing.T) {
 	var receivedPayload string
 	var mu sync.Mutex
 
-	s.RegisterEventHandler("message", func(_ context.Context, evt store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, req hubfire.FireRequest) error {
 		handlerCalled.Add(1)
 		mu.Lock()
-		receivedPayload = evt.Payload
+		receivedPayload = req.Payload
 		mu.Unlock()
 		return nil
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -783,9 +784,9 @@ func TestEventHandlerErrorIsCaptured(t *testing.T) {
 	ms := newMockStore()
 	s := newTestSchedulerWithStore(1*time.Second, ms)
 
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		return fmt.Errorf("handler failed: something went wrong")
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -852,10 +853,10 @@ func TestScheduleEventWithCancelledCallerContext(t *testing.T) {
 	s := newTestSchedulerWithStore(1*time.Second, ms)
 
 	var handlerCalled atomic.Int32
-	s.RegisterEventHandler("message", func(_ context.Context, evt store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		handlerCalled.Add(1)
 		return nil
-	})
+	}))
 
 	// Start the scheduler with a long-lived context (simulates server lifetime)
 	serverCtx, serverCancel := context.WithCancel(context.Background())
@@ -932,10 +933,10 @@ func TestExpiredEventsFromDowntimeStillFire(t *testing.T) {
 	}
 
 	s := newTestSchedulerWithStore(1*time.Second, ms)
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		fired.Add(1)
 		return nil
-	})
+	}))
 
 	serverCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1021,7 +1022,9 @@ func TestMessageEventHandler_AgentNotFound(t *testing.T) {
 
 	// Create a Server with the mock store — no agents registered
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 
 	err := handler(ctx, evt)
 	if err == nil {
@@ -1050,7 +1053,9 @@ func TestMessageEventHandler_AgentNotFoundByID(t *testing.T) {
 	_ = ms.CreateScheduledEvent(ctx, &evt)
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 
 	err := handler(ctx, evt)
 	if err == nil {
@@ -1070,14 +1075,14 @@ func TestMultipleEventHandlers(t *testing.T) {
 
 	var messageCalled, statusCalled atomic.Int32
 
-	s.RegisterEventHandler("message", func(_ context.Context, _ store.ScheduledEvent) error {
+	s.RegisterAction(newTestFireAction("message", func(_ context.Context, _ hubfire.FireRequest) error {
 		messageCalled.Add(1)
 		return nil
-	})
-	s.RegisterEventHandler("status_update", func(_ context.Context, _ store.ScheduledEvent) error {
+	}))
+	s.RegisterAction(newTestFireAction("status_update", func(_ context.Context, _ hubfire.FireRequest) error {
 		statusCalled.Add(1)
 		return nil
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1118,7 +1123,9 @@ func TestDispatchAgentEventHandler_InvalidPayload(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := store.ScheduledEvent{
@@ -1141,7 +1148,9 @@ func TestDispatchAgentEventHandler_MissingAgentName(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := store.ScheduledEvent{
@@ -1165,7 +1174,9 @@ func TestDispatchAgentEventHandler_ProjectNotFound(t *testing.T) {
 	ms := newMockStore()
 	creatorID := seedFullRoleDispatchCreator(ms, "nonexistent-project")
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := withMockAgentRevision(store.ScheduledEvent{
@@ -1204,7 +1215,9 @@ func TestDispatchAgentEventHandler_AgentAlreadyExists(t *testing.T) {
 	}
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := withMockAgentRevision(store.ScheduledEvent{
@@ -1275,7 +1288,7 @@ func newBlockedFireFixture(t *testing.T, createdBy string) *blockedFireFixture {
 }
 
 func (f *blockedFireFixture) fire() error {
-	return f.srv.dispatchAgentEventHandler()(context.Background(), f.evt)
+	return fireScheduledActionForTest(context.Background(), f.srv, "dispatch_agent", f.evt)
 }
 
 // published drains every event published so far.
@@ -1460,7 +1473,9 @@ func TestDispatchAgentEventHandler_CreatesAgentNoDispatcher(t *testing.T) {
 	seedFullRoleDispatchCreator(ms, "project-1")
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	ctx := context.Background()
 	evt := withMockAgentRevision(store.ScheduledEvent{
@@ -1488,8 +1503,14 @@ func TestDispatchAgentEventHandler_CreatesAgentNoDispatcher(t *testing.T) {
 			if a.AppliedConfig == nil || a.AppliedConfig.Task != "Do the thing" {
 				t.Errorf("expected task 'Do the thing' in applied config")
 			}
-			if a.AppliedConfig.AgentRole != string(AgentRoleNone) {
-				t.Errorf("expected scheduled agent role %q, got %q", AgentRoleNone, a.AppliedConfig.AgentRole)
+			if a.AppliedConfig.AgentRole != string(AgentRoleFull) {
+				t.Errorf("expected scheduled agent role %q, got %q", AgentRoleFull, a.AppliedConfig.AgentRole)
+			}
+			if a.AppliedConfig.NoAuth {
+				t.Errorf("expected default scheduled agent NoAuth=false, got true")
+			}
+			if a.OwnerID != "creator-agent" {
+				t.Errorf("expected scheduled agent OwnerID %q, got %q", "creator-agent", a.OwnerID)
 			}
 			break
 		}
@@ -1510,7 +1531,9 @@ func TestDispatchAgentEventHandler_FireRequiresAgentCreateScope(t *testing.T) {
 	}
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	err := handler(context.Background(), withMockAgentRevision(store.ScheduledEvent{
 		ID:        "dispatch-readonly-creator",
@@ -1533,6 +1556,7 @@ func TestDispatchAgentEventHandler_FireRequiresAgentCreateScope(t *testing.T) {
 func TestAuthorizeScheduledAgentCreate_UserSuccessReturnsAllowed(t *testing.T) {
 	t.Parallel()
 	ms := newMockStore()
+	ms.projects["project-1"] = &store.Project{ID: "project-1", Name: "test-project"}
 	ms.users["admin-user"] = &store.User{
 		ID:          "admin-user",
 		Email:       "admin@example.com",
@@ -1562,7 +1586,7 @@ func TestAuthorizeScheduledAgentCreate_UserSuccessReturnsAllowed(t *testing.T) {
 	srv := newEventHandlerTestServer(ms)
 	srv.authzService = NewAuthzService(ms, slog.Default())
 
-	allowed, err := srv.authorizeScheduledAgentCreate(context.Background(), withSessionRevision(store.ScheduledEvent{
+	allowed, err := authorizeDispatchAgentForTest(context.Background(), srv, withSessionRevision(store.ScheduledEvent{
 		ID:        "dispatch-admin-user",
 		ProjectID: "project-1",
 		EventType: "dispatch_agent",
@@ -1590,7 +1614,9 @@ func TestDispatchAgentEventHandler_SuspendedUserCreatorDenied(t *testing.T) {
 
 	srv := newEventHandlerTestServer(ms)
 	srv.authzService = NewAuthzService(ms, slog.Default())
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	err := handler(context.Background(), withSessionRevision(store.ScheduledEvent{
 		ID:        "dispatch-suspended-user",
@@ -1616,7 +1642,9 @@ func TestDispatchAgentEventHandler_EmptyCreatorDenied(t *testing.T) {
 	ms.projects["project-1"] = &store.Project{ID: "project-1", Name: "test-project"}
 
 	srv := newEventHandlerTestServer(ms)
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	err := handler(context.Background(), store.ScheduledEvent{
 		ID:        "dispatch-empty-creator",
@@ -1659,7 +1687,9 @@ func TestDispatchAgentEventHandler_ResolvableTemplateDoesNotPanic(t *testing.T) 
 	creatorID := seedFullRoleDispatchCreator(ms, "project-1")
 
 	srv := newEventHandlerTestServer(&resolvingTemplateStore{ms})
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 
 	evt := withMockAgentRevision(store.ScheduledEvent{
 		ID:        "dispatch-resolvable-1",
@@ -2079,6 +2109,163 @@ func TestSchedulerJitter(t *testing.T) {
 	}
 }
 
+func TestSchedulerStopDuringJitterDoesNotRunHandler(t *testing.T) {
+	t.Parallel()
+
+	t.Run("handler never runs after Stop with live parent context", func(t *testing.T) {
+		t.Parallel()
+		s := NewScheduler(nil, slog.Default())
+		s.tickInterval = 10 * time.Second
+		s.MaxJitter = 80 * time.Millisecond
+
+		inJitter := make(chan struct{})
+		var jitterOnce sync.Once
+		s.jitterFn = func(max time.Duration) time.Duration {
+			jitterOnce.Do(func() { close(inJitter) })
+			return max
+		}
+
+		var called atomic.Int32
+		s.RegisterRecurring("jittered-stop", 1, func(_ context.Context) {
+			called.Add(1)
+		})
+
+		// Deliberately use an uncancelled parent context: Stop alone must abort
+		// the jitter wait so jobs do not fire after Stop returns.
+		s.Start(context.Background())
+
+		select {
+		case <-inJitter:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for recurring handler to enter jitter wait")
+		}
+		// Give the goroutine a moment to park in the jitter select.
+		time.Sleep(15 * time.Millisecond)
+
+		s.Stop()
+
+		// Wait past the full 80ms jitter window to catch a job that slept through Stop.
+		time.Sleep(120 * time.Millisecond)
+		if got := called.Load(); got != 0 {
+			t.Fatalf("recurring handler ran %d time(s) after Stop during jitter wait; want 0", got)
+		}
+	})
+
+	t.Run("Stop returns without waiting out long jitter", func(t *testing.T) {
+		t.Parallel()
+		s := NewScheduler(nil, slog.Default())
+		s.tickInterval = 10 * time.Second
+		s.MaxJitter = 10 * time.Second
+
+		inJitter := make(chan struct{})
+		var jitterOnce sync.Once
+		s.jitterFn = func(max time.Duration) time.Duration {
+			jitterOnce.Do(func() { close(inJitter) })
+			return max
+		}
+
+		var called atomic.Int32
+		s.RegisterRecurring("long-jitter-stop", 1, func(_ context.Context) {
+			called.Add(1)
+		})
+
+		s.Start(context.Background())
+
+		select {
+		case <-inJitter:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for recurring handler to enter jitter wait")
+		}
+		time.Sleep(15 * time.Millisecond)
+
+		stopped := make(chan struct{})
+		go func() {
+			s.Stop()
+			close(stopped)
+		}()
+
+		select {
+		case <-stopped:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Stop blocked waiting out the jitter window instead of aborting on stopCh")
+		}
+		if got := called.Load(); got != 0 {
+			t.Fatalf("recurring handler ran %d time(s); want 0", got)
+		}
+	})
+}
+
+func TestSchedulerStopWaitsForInFlightRecurringAndSkipsQueued(t *testing.T) {
+	t.Parallel()
+	s := NewScheduler(nil, slog.Default(), WithMaxConcurrency(1))
+	s.tickInterval = 15 * time.Millisecond
+	s.MaxJitter = 0
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var calls atomic.Int32
+
+	s.RegisterRecurring("serialized", 1, func(_ context.Context) {
+		n := calls.Add(1)
+		if n == 1 {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+		}
+	})
+
+	s.Start(context.Background())
+
+	// Tick 0 grabs the single semaphore slot and blocks on release.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for tick-0 handler to enter")
+	}
+
+	// Wait for tick 1 to advance so a second handler goroutine is spawned and
+	// queued on s.sem behind the blocked tick-0 handler.
+	deadline := time.Now().Add(2 * time.Second)
+	for s.Status().TickCount < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for tick 1 while tick-0 handler held s.sem")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	stopped := make(chan struct{})
+	go func() {
+		s.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-s.stopCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not close stopCh")
+	}
+
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while an in-flight recurring handler was still running")
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after the in-flight recurring handler finished")
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("recurring handler calls = %d, want 1 (queued semaphore waiter should not run after Stop)", got)
+	}
+}
+
 func TestSchedulerStatusIncludesMaxConcurrency(t *testing.T) {
 	t.Parallel()
 	s := NewScheduler(nil, slog.Default(), WithMaxConcurrency(5))
@@ -2379,7 +2566,7 @@ func TestDispatchAgentEventHandler_AgentCreatorSetsCreatorName(t *testing.T) {
 	ms.agents["creator-agent"].Name = "lead-agent"
 
 	srv := newEventHandlerTestServer(ms)
-	if err := srv.dispatchAgentEventHandler()(context.Background(), withMockAgentRevision(store.ScheduledEvent{
+	if err := fireScheduledActionForTest(context.Background(), srv, "dispatch_agent", withMockAgentRevision(store.ScheduledEvent{
 		ID:        "dispatch-creator-name",
 		ProjectID: "project-1",
 		EventType: "dispatch_agent",

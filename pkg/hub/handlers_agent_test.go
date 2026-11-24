@@ -69,13 +69,8 @@ func TestAgentStatusUpdate_Authorization(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent2))
 
-	// Get agent token service
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-
 	// Generate token for agent 1
-	token1, err := tokenSvc.GenerateAgentToken(agent1.ID, project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	token1 := srv.generateRecordedAgentToken(t, agent1.ID, project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 
 	t.Run("Agent 1 can update its own status", func(t *testing.T) {
 		status := store.AgentStatusUpdate{
@@ -413,15 +408,11 @@ func TestAgentCreateAgent_WithScope(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, callingAgent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-
 	t.Run("Agent with project:agent:create scope can create agent in same project", func(t *testing.T) {
-		token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+		token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 			ScopeAgentStatusUpdate,
 			ScopeAgentCreate,
 		}, nil)
-		require.NoError(t, err)
 
 		body, _ := json.Marshal(CreateAgentRequest{
 			Name:      "Sub Agent",
@@ -456,11 +447,10 @@ func TestAgentCreateAgent_WithScope(t *testing.T) {
 		}
 		require.NoError(t, s.CreateProject(ctx, otherProject))
 
-		token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+		token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 			ScopeAgentStatusUpdate,
 			ScopeAgentCreate,
 		}, nil)
-		require.NoError(t, err)
 
 		body, _ := json.Marshal(CreateAgentRequest{
 			Name:      "Cross Project Agent",
@@ -478,10 +468,9 @@ func TestAgentCreateAgent_WithScope(t *testing.T) {
 
 	t.Run("Agent without project:agent:create scope is rejected", func(t *testing.T) {
 		// Token with only status update scope (no create scope)
-		token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+		token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 			ScopeAgentStatusUpdate,
 		}, nil)
-		require.NoError(t, err)
 
 		body, _ := json.Marshal(CreateAgentRequest{
 			Name:      "Unauthorized Sub",
@@ -530,15 +519,11 @@ func TestAgentLifecycle_WithScope(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, targetAgent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-
 	t.Run("Agent with project:agent:lifecycle scope can perform lifecycle actions in same project", func(t *testing.T) {
-		token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+		token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 			ScopeAgentStatusUpdate,
 			ScopeAgentLifecycle,
 		}, nil)
-		require.NoError(t, err)
 
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+targetAgent.ID+"/stop", nil)
 		req.Header.Set("X-Scion-Agent-Token", token)
@@ -568,11 +553,10 @@ func TestAgentLifecycle_WithScope(t *testing.T) {
 		}
 		require.NoError(t, s.CreateAgent(ctx, otherAgent))
 
-		token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+		token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 			ScopeAgentStatusUpdate,
 			ScopeAgentLifecycle,
 		}, nil)
-		require.NoError(t, err)
 
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+otherAgent.ID+"/stop", nil)
 		req.Header.Set("X-Scion-Agent-Token", token)
@@ -585,10 +569,9 @@ func TestAgentLifecycle_WithScope(t *testing.T) {
 
 	t.Run("Agent without lifecycle scope cannot perform lifecycle actions", func(t *testing.T) {
 		// Token with only status update scope (existing behavior)
-		token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+		token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 			ScopeAgentStatusUpdate,
 		}, nil)
-		require.NoError(t, err)
 
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+targetAgent.ID+"/stop", nil)
 		req.Header.Set("X-Scion-Agent-Token", token)
@@ -661,13 +644,9 @@ func TestAgentGetAgent_ProjectIsolation(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-
 	// Token includes ScopeProjectRead (required for read endpoints) and
 	// ScopeAgentStatusUpdate (standard baseline scope).
-	token, err := tokenSvc.GenerateAgentToken(agent1.ID, project1.ID, []AgentTokenScope{ScopeAgentStatusUpdate, ScopeProjectRead}, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent1.ID, project1.ID, []AgentTokenScope{ScopeAgentStatusUpdate, ScopeProjectRead}, nil)
 
 	// CO1: agent.read has no AgentScopes mapping in the permissions registry,
 	// so the agent scope restriction blocks agent-to-agent reads at the kernel
@@ -1194,7 +1173,9 @@ func TestCreateAgent_DuplicateSlugStopped_Returns409(t *testing.T) {
 	})
 
 	require.Equal(t, http.StatusConflict, rec.Code)
-	assert.Contains(t, rec.Body.String(), "already exists in this project")
+	assert.Contains(t, rec.Body.String(), ErrCodeAgentExistsResumable)
+	assert.Contains(t, rec.Body.String(), "stopped")
+	assert.Contains(t, rec.Body.String(), "scion resume my-stopped-agent")
 }
 
 func TestCreateAgent_DuplicateSlugError_Returns409(t *testing.T) {
@@ -2185,7 +2166,6 @@ func TestGetAgent_ProfileInResponse(t *testing.T) {
 // backfills the profile in AppliedConfig when the agent record is missing it.
 func TestHeartbeat_BackfillsProfile(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{
@@ -2700,16 +2680,12 @@ func TestCreateAgent_NotifyCreatesSubscription(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, callingAgent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-
 	t.Run("Notify=true creates subscription for agent caller", func(t *testing.T) {
-		token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+		token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 			ScopeAgentStatusUpdate,
 			ScopeAgentCreate,
 			ScopeAgentNotify,
 		}, nil)
-		require.NoError(t, err)
 
 		body, _ := json.Marshal(CreateAgentRequest{
 			Name:      "Sub Worker",
@@ -2748,11 +2724,10 @@ func TestCreateAgent_NotifyCreatesSubscription(t *testing.T) {
 	})
 
 	t.Run("Notify=false does not create subscription", func(t *testing.T) {
-		token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+		token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 			ScopeAgentStatusUpdate,
 			ScopeAgentCreate,
 		}, nil)
-		require.NoError(t, err)
 
 		body, _ := json.Marshal(CreateAgentRequest{
 			Name:      "Sub Worker No Notify",
@@ -2838,13 +2813,11 @@ func TestCreateAgent_NotifySubscriptionCascadeOnDelete(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, callingAgent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	token, err := tokenSvc.GenerateAgentToken(callingAgent.ID, project.ID, []AgentTokenScope{
+	token := srv.generateRecordedAgentToken(t, callingAgent.ID, project.ID, []AgentTokenScope{
 		ScopeAgentStatusUpdate,
 		ScopeAgentCreate,
 		ScopeAgentNotify,
 	}, nil)
-	require.NoError(t, err)
 
 	// Create agent with notify
 	body, _ := json.Marshal(CreateAgentRequest{
@@ -2879,7 +2852,6 @@ func TestCreateAgent_NotifySubscriptionCascadeOnDelete(t *testing.T) {
 
 func TestBrokerHeartbeat_PublishesActivitySSE(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	// Wire up a real event publisher so we can subscribe to SSE events
@@ -2980,7 +2952,6 @@ func TestBrokerHeartbeat_ContainerExitedDerivesCrash(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, s := testServer(t)
-			grantDevUserRuntimeBrokerAccess(t, s)
 			ctx := context.Background()
 
 			project := &store.Project{ID: tid("project-hb-crash"), Name: "P", Slug: "hb-crash-project"}
@@ -3025,7 +2996,6 @@ func TestBrokerHeartbeat_ContainerExitedDerivesCrash(t *testing.T) {
 
 func TestBrokerHeartbeat_RepeatedActivityDoesNotRefreshLastActivityEvent(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	// Create project, broker, and agent
@@ -3122,7 +3092,6 @@ func TestBrokerHeartbeat_RepeatedActivityDoesNotRefreshLastActivityEvent(t *test
 
 func TestBrokerHeartbeat_StalledAgentNotOverwrittenBySameActivity(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	// Create project, broker, and agent
@@ -3181,7 +3150,6 @@ func TestBrokerHeartbeat_StalledAgentNotOverwrittenBySameActivity(t *testing.T) 
 
 func TestBrokerHeartbeat_StalledAgentRecoveredByNewActivity(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	// Create project, broker, and agent
@@ -3240,7 +3208,6 @@ func TestBrokerHeartbeat_StalledAgentRecoveredByNewActivity(t *testing.T) {
 
 func TestBrokerHeartbeat_StalledWorkingAgentNotOverwrittenBySameActivity(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("project-stall-working"), Name: "Stall Working Project", Slug: "stall-working-project"}
@@ -3297,7 +3264,6 @@ func TestBrokerHeartbeat_StalledWorkingAgentNotOverwrittenBySameActivity(t *test
 
 func TestBrokerHeartbeat_DoesNotRevertStoppedAgent(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("project-stop-revert"), Name: "Stop Revert Project", Slug: "stop-revert-project"}
@@ -3356,7 +3322,6 @@ func TestBrokerHeartbeat_DoesNotRevertStoppedAgent(t *testing.T) {
 
 func TestBrokerHeartbeat_DoesNotRevertStoppedAgent_LegacyPath(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("project-stop-legacy"), Name: "Stop Legacy Project", Slug: "stop-legacy-project"}
@@ -3405,7 +3370,6 @@ func TestBrokerHeartbeat_DoesNotRevertStoppedAgent_LegacyPath(t *testing.T) {
 
 func TestBrokerHeartbeat_PropagatesTerminalActivityOnStoppedAgent(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-crash-hb"), Name: "Crash HB Project", Slug: "crash-hb-proj"}
@@ -3455,7 +3419,6 @@ func TestBrokerHeartbeat_PropagatesTerminalActivityOnStoppedAgent(t *testing.T) 
 
 func TestBrokerHeartbeat_DoesNotOverwriteTerminalActivityWithNonTerminal(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-term-guard"), Name: "Term Guard Project", Slug: "term-guard-proj"}
@@ -5104,10 +5067,7 @@ func TestAgentStatusUpdate_RejectsPhaseRegression(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-	token, err := tokenSvc.GenerateAgentToken(agent.ID, project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent.ID, project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 
 	// Attempt to regress phase from running → starting (as a spurious session would)
 	status := store.AgentStatusUpdate{Phase: string(state.PhaseStarting)}
@@ -5142,10 +5102,7 @@ func TestAgentStatusUpdate_ActivityAutoCorrectsPhase(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-	token, err := tokenSvc.GenerateAgentToken(agent.ID, project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent.ID, project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 
 	// Send an activity-only update (working) while phase is starting.
 	// This should auto-correct the phase to running.
@@ -5169,7 +5126,6 @@ func TestAgentStatusUpdate_ActivityAutoCorrectsPhase(t *testing.T) {
 
 func TestBrokerHeartbeat_RejectsPhaseRegression(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-hb-regress"), Name: "HB Regression Project", Slug: "hb-regress-project"}
@@ -5220,7 +5176,6 @@ func TestBrokerHeartbeat_RejectsPhaseRegression(t *testing.T) {
 // and the heartbeat's ordinal guard suppresses the downgrade.
 func TestBrokerHeartbeat_RejectsRunningToCreatedRegression(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-hb-created"), Name: "HB Created Project", Slug: "hb-created-project"}
@@ -5279,10 +5234,7 @@ func TestAgentStatusUpdate_SuspendedIsStickyAgainstStatusPost(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-	token, err := tokenSvc.GenerateAgentToken(agent.ID, project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent.ID, project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 
 	// The dying container reports stopped+crashed via the async status POST.
 	status := store.AgentStatusUpdate{
@@ -5503,7 +5455,6 @@ func TestAgentStatusUpdate_MessageOnlyPostApplied(t *testing.T) {
 // heartbeat reporting stopped/crashed for a suspended agent leaves it suspended.
 func TestBrokerHeartbeat_DoesNotRevertSuspendedAgent(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-susp-hb"), Name: "Suspend HB Project", Slug: "susp-hb-project"}
@@ -5759,7 +5710,6 @@ func TestBrokerHeartbeat_PhaseErrorPersistsExitCodeAndReason(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, s := testServer(t)
-			grantDevUserRuntimeBrokerAccess(t, s)
 			ctx := context.Background()
 
 			project := &store.Project{ID: tid("proj-pe-exit-" + tc.name), Name: "P", Slug: "pe-exit-proj-" + tc.name}
@@ -5859,7 +5809,6 @@ func TestBrokerHeartbeat_BackfillsContainerStatusFromStructuredPhase(t *testing.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, s := testServer(t)
-			grantDevUserRuntimeBrokerAccess(t, s)
 			ctx := context.Background()
 
 			project := &store.Project{ID: tid("proj-backfill-" + tc.name), Name: "P", Slug: "backfill-proj-" + tc.name}
@@ -5906,7 +5855,6 @@ func TestBrokerHeartbeat_BackfillsContainerStatusFromStructuredPhase(t *testing.
 // already sent.
 func TestBrokerHeartbeat_NoBackfillWhenContainerStatusPresent(t *testing.T) {
 	srv, s := testServer(t)
-	grantDevUserRuntimeBrokerAccess(t, s)
 	ctx := context.Background()
 
 	project := &store.Project{ID: tid("proj-no-backfill"), Name: "P", Slug: "no-backfill-proj"}

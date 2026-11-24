@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"entgo.io/ent/dialect"
@@ -29,8 +30,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agenthold"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentreincarnation"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
@@ -101,6 +104,7 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 		Slug:                a.Slug,
 		Name:                a.Name,
 		Template:            a.Template,
+		HarnessConfig:       a.HarnessConfig,
 		ProjectID:           a.ProjectID.String(),
 		Labels:              a.Labels,
 		Annotations:         a.Annotations,
@@ -113,6 +117,7 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 		ExitReason:          a.ExitReason,
 		RuntimeState:        a.RuntimeState,
 		StalledFromActivity: a.StalledFromActivity,
+		SuspendReason:       derefString(a.SuspendReason),
 		CurrentTurns:        a.CurrentTurns,
 		CurrentModelCalls:   a.CurrentModelCalls,
 		Image:               a.Image,
@@ -209,9 +214,17 @@ func entAgentToStore(a *ent.Agent) *store.Agent {
 	if a.LastSeen != nil {
 		sa.LastSeen = *a.LastSeen
 	}
+	if a.ActivitySince != nil {
+		since := *a.ActivitySince
+		sa.ActivitySince = &since
+	}
 	if a.LastActivityEvent != nil {
 		sa.LastActivityEvent = *a.LastActivityEvent
 	}
+	sa.LastLiveProcessAt = copyTimePtr(a.LastLiveProcessAt)
+	sa.LastLiveWorkAt = copyTimePtr(a.LastLiveWorkAt)
+	sa.LastDeliveryAt = copyTimePtr(a.LastDeliveryAt)
+	sa.IdleSuspendClaimUntil = copyTimePtr(a.IdleSuspendClaimUntil)
 	if a.StartedAt != nil {
 		sa.StartedAt = *a.StartedAt
 	}
@@ -348,6 +361,7 @@ func (s *AgentStore) CreateAgent(ctx context.Context, a *store.Agent) (err error
 		SetContainerStatus(a.ContainerStatus).
 		SetRuntimeState(a.RuntimeState).
 		SetStalledFromActivity(a.StalledFromActivity).
+		SetNillableSuspendReason(nillableString(a.SuspendReason)).
 		SetCurrentTurns(a.CurrentTurns).
 		SetCurrentModelCalls(a.CurrentModelCalls).
 		SetImage(a.Image).
@@ -369,6 +383,7 @@ func (s *AgentStore) CreateAgent(ctx context.Context, a *store.Agent) (err error
 		// BeginLaunch/MarkLaunchAccepted/EndLaunch(WithCode)/
 		// ApplyLaunchReport/RunLaunchReaperTick (§3.3).
 		SetLaunchAsyncOptIn(a.LaunchAsyncOptIn)
+	stampActivitySince(create.Mutation(), "", "", time.Now())
 
 	if a.MessageMode != "" {
 		create.SetMessageMode(agent.MessageMode(a.MessageMode))
@@ -473,7 +488,11 @@ func (s *AgentStore) GetAgent(ctx context.Context, id string) (*store.Agent, err
 	if err != nil {
 		return nil, mapError(err)
 	}
-	return entAgentToStore(a), nil
+	sa := entAgentToStore(a)
+	if err := s.populateIdleSuspendClaimActive(ctx, sa); err != nil {
+		return nil, err
+	}
+	return sa, nil
 }
 
 // GetAgentRunState implements store.AgentStore.GetAgentRunState: one
@@ -509,7 +528,11 @@ func (s *AgentStore) GetAgentBySlug(ctx context.Context, projectID, slug string)
 	if err != nil {
 		return nil, mapError(err)
 	}
-	return entAgentToStore(a), nil
+	sa := entAgentToStore(a)
+	if err := s.populateIdleSuspendClaimActive(ctx, sa); err != nil {
+		return nil, err
+	}
+	return sa, nil
 }
 
 // GetAgentsByIDs retrieves agents by a list of IDs.
@@ -912,7 +935,7 @@ func (s *AgentStore) updateAgentObserved(ctx context.Context, obs store.AgentWri
 // is updated to the row's value, so the caller's copy matches what is
 // written.
 func buildAgentUpdate(ctx context.Context, ac *ent.AgentClient, uid uuid.UUID, a *store.Agent, expectedVersion, newVersion int64, now time.Time, lock bool) (*ent.AgentUpdate, error) {
-	appliedRaw, native, keepNative, err := appliedConfigForWrite(ctx, ac, uid, a.AppliedConfig, lock)
+	appliedRaw, native, keepNative, prior, err := appliedConfigForWrite(ctx, ac, uid, a.AppliedConfig, lock)
 	if err != nil {
 		return nil, err
 	}
@@ -978,9 +1001,14 @@ func buildAgentUpdate(ctx context.Context, ac *ent.AgentClient, uid uuid.UUID, a
 	}
 	// Always set, never clear to NULL — see CreateAgent's identical comment
 	// and ReconcileHarnessConfigColumn's doc (ptone/scion#2146).
-	// AppliedConfig=nil (cleared above) still yields "" here, which is
-	// exactly the sentinel this row should carry, not NULL.
-	update.SetHarnessConfig(harnessConfigOf(a.AppliedConfig))
+	// For execution containers (HarnessConfig == "shell"), never clear or
+	// overwrite the shell marker (for example after loading a row whose
+	// applied_config failed to parse, or from a disagreeing broker report).
+	hc := harnessConfigOf(a.AppliedConfig)
+	if a.HarnessConfig == config.ShellHarnessConfigName {
+		hc = a.HarnessConfig
+	}
+	update.SetHarnessConfig(hc)
 	if a.LastSeen.IsZero() {
 		update.ClearLastSeen()
 	} else {
@@ -1004,6 +1032,15 @@ func buildAgentUpdate(ctx context.Context, ac *ent.AgentClient, uid uuid.UUID, a
 			return nil, err
 		}
 		update.SetOwnerID(ownerUID)
+	}
+
+	// activity_since follows the row's own activity, read with the applied
+	// config above, never the caller's copy (see stampActivitySince). A
+	// status report landing between that read and this CAS (which does not
+	// bump state_version) can leave it one change behind; the whole-row
+	// write overwrites that report's activity in the same way.
+	if prior != nil {
+		stampActivitySince(update.Mutation(), prior.Phase, prior.Activity, now)
 	}
 
 	// T1 async agent create (design §3.3, T3): a write of phase=running
@@ -1125,7 +1162,7 @@ func sortedUniqueUUIDs(ids []string) ([]uuid.UUID, error) {
 // legacy path, unchanged; opts.SortBy set to "created" or "updated" is the
 // real-SQL sorted-mode path the global endpoint's sorted mode uses directly.
 func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, opts store.ListOptions) (*store.ListResult[store.Agent], error) {
-	preds, err := agentFilterPredicates(filter)
+	preds, err := s.agentFilterPredicates(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -1176,6 +1213,9 @@ func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, o
 		for _, a := range rows {
 			items = append(items, *entAgentToStore(a))
 		}
+		if err := s.populateListIdleSuspendClaimActive(ctx, items); err != nil {
+			return nil, err
+		}
 
 		result := &store.ListResult[store.Agent]{TotalCount: totalCount}
 		if len(items) > limit {
@@ -1224,6 +1264,9 @@ func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, o
 	for _, a := range rows {
 		items = append(items, *entAgentToStore(a))
 	}
+	if err := s.populateListIdleSuspendClaimActive(ctx, items); err != nil {
+		return nil, err
+	}
 
 	result := &store.ListResult[store.Agent]{TotalCount: totalCount}
 	if len(items) > limit {
@@ -1244,7 +1287,7 @@ func (s *AgentStore) ListAgents(ctx context.Context, filter store.AgentFilter, o
 // global endpoint's stats population is the same SQL scope predicate that
 // already authorizes the request, with no per-row read filter.
 func (s *AgentStore) CountAgentsByPhaseIDs(ctx context.Context, filter store.AgentFilter) ([]store.IDPhase, error) {
-	preds, err := agentFilterPredicates(filter)
+	preds, err := s.agentFilterPredicates(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -1269,7 +1312,7 @@ func (s *AgentStore) CountAgentsByPhaseIDs(ctx context.Context, filter store.Age
 // a cheap COUNT before any member row is read, so a candidate pool above the
 // ceiling costs no more than one query.
 func (s *AgentStore) CountAgents(ctx context.Context, filter store.AgentFilter) (int, error) {
-	preds, err := agentFilterPredicates(filter)
+	preds, err := s.agentFilterPredicates(ctx, filter)
 	if err != nil {
 		return 0, err
 	}
@@ -1362,7 +1405,7 @@ func (s *AgentStore) ListAgentMembers(ctx context.Context, filter store.AgentFil
 		return nil, fmt.Errorf("ListAgentMembers: invalid dir %q: %w", dir, store.ErrInvalidInput)
 	}
 
-	preds, err := agentFilterPredicates(filter)
+	preds, err := s.agentFilterPredicates(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -1475,9 +1518,38 @@ func agentBeforeCursor(cursorCreated time.Time, cursorID uuid.UUID) predicate.Ag
 	return keysetBeforeCursor(agent.FieldCreated, agent.FieldID, cursorCreated, cursorID)
 }
 
+// populateListIdleSuspendClaimActive populates IdleSuspendClaimActive against
+// a single store-clock read when at least one listed row carries a non-nil
+// IdleSuspendClaimUntil. Common-case listings without idle claims incur zero
+// extra queries.
+func (s *AgentStore) populateListIdleSuspendClaimActive(ctx context.Context, items []store.Agent) error {
+	needClock := false
+	for i := range items {
+		if items[i].IdleSuspendClaimUntil != nil {
+			needClock = true
+			break
+		}
+	}
+	if !needClock {
+		return nil
+	}
+	now, err := s.driverStoreNow(ctx)
+	if err != nil {
+		return err
+	}
+	now = claimTime(now)
+	extended := s.idleSuspendExtended()
+	for i := range items {
+		if items[i].IdleSuspendClaimUntil != nil {
+			items[i].SetIdleSuspendFlags(now, extended)
+		}
+	}
+	return nil
+}
+
 // agentFilterPredicates translates a store.AgentFilter into Ent predicates,
 // preserving the exact OR/AND composition of the legacy SQLite query.
-func agentFilterPredicates(filter store.AgentFilter) ([]predicate.Agent, error) {
+func (s *AgentStore) agentFilterPredicates(ctx context.Context, filter store.AgentFilter) ([]predicate.Agent, error) {
 	var preds []predicate.Agent
 
 	switch {
@@ -1528,11 +1600,43 @@ func agentFilterPredicates(filter store.AgentFilter) ([]predicate.Agent, error) 
 	}
 	switch {
 	case filter.Phase != "" && filter.OrRunIntent != "":
-		preds = append(preds, agent.Or(agent.PhaseEQ(filter.Phase), agent.RunIntentEQ(filter.OrRunIntent)))
+		if filter.OrActiveIdleClaim {
+			now, err := s.driverStoreNow(ctx)
+			if err != nil {
+				return nil, err
+			}
+			// An idle suspend still in progress after its lease expired
+			// (store.Agent.SetIdleSuspendFlags) counts too: a user stop-all
+			// must clear it, or recovery would convert the row it just
+			// stopped.
+			inProgress := []predicate.Agent{agent.IdleSuspendClaimUntilGT(claimTime(now))}
+			if s.idleSuspendExtended() {
+				inProgress = append(inProgress, agent.And(
+					agent.RunIntentEQ(string(store.RunIntentStopped)),
+					agent.PhaseIn(string(state.PhaseRunning), string(state.PhaseStopping), string(state.PhaseStopped), string(state.PhaseError)),
+				))
+			}
+			preds = append(preds, agent.Or(
+				agent.PhaseEQ(filter.Phase),
+				agent.RunIntentEQ(filter.OrRunIntent),
+				agent.And(
+					agent.IdleSuspendClaimUntilNotNil(),
+					agent.Or(inProgress...),
+				),
+			))
+		} else {
+			preds = append(preds, agent.Or(
+				agent.PhaseEQ(filter.Phase),
+				agent.RunIntentEQ(filter.OrRunIntent),
+			))
+		}
 	case filter.Phase != "":
 		preds = append(preds, agent.PhaseEQ(filter.Phase))
 	case filter.OrRunIntent != "":
 		preds = append(preds, agent.RunIntentEQ(filter.OrRunIntent))
+	}
+	if filter.Activity != "" {
+		preds = append(preds, agent.ActivityEQ(filter.Activity))
 	}
 	if filter.AncestorID != "" {
 		preds = append(preds, ancestryContains(filter.AncestorID))
@@ -1625,12 +1729,127 @@ func agentFilterPredicates(filter store.AgentFilter) ([]predicate.Agent, error) 
 		preds = append(preds, agent.ProjectIDNotIn(excludeIDs...))
 	}
 
+	// Structured filter query terms (ANDed with all other predicates,
+	// including AuthorizedProjectIDs and ExcludedProjectIDs).
+	if filter.Query != nil {
+		qPreds, err := agentQueryTermsPredicates(filter.Query)
+		if err != nil {
+			return nil, err
+		}
+		preds = append(preds, qPreds...)
+	}
+
 	// Exclude soft-deleted agents unless explicitly requested.
 	if !filter.IncludeDeleted {
 		preds = append(preds, agent.DeletedAtIsNil())
 	}
 
 	return preds, nil
+}
+
+// agentQueryTermsPredicates translates validated store.QueryTerms into Ent
+// predicates through an explicit field allowlist. Unknown fields return an
+// error rather than becoming a no-op.
+func agentQueryTermsPredicates(qt *store.QueryTerms) ([]predicate.Agent, error) {
+	if qt == nil {
+		return nil, nil
+	}
+	var preds []predicate.Agent
+
+	for _, term := range qt.Terms {
+		if len(term.Values) == 0 {
+			continue
+		}
+		switch term.Field {
+		case "phase":
+			if term.Negate {
+				preds = append(preds, agent.PhaseNotIn(term.Values...))
+			} else {
+				preds = append(preds, agent.PhaseIn(term.Values...))
+			}
+		case "label":
+			if term.Negate {
+				// NOT (v1 OR v2 ...) == (NOT v1) AND (NOT v2) ...
+				for _, v := range term.Values {
+					p, err := agentLabelPredicate(v, term.Op, true)
+					if err != nil {
+						return nil, err
+					}
+					preds = append(preds, p)
+				}
+			} else {
+				orParts := make([]predicate.Agent, 0, len(term.Values))
+				for _, v := range term.Values {
+					p, err := agentLabelPredicate(v, term.Op, false)
+					if err != nil {
+						return nil, err
+					}
+					orParts = append(orParts, p)
+				}
+				if len(orParts) == 1 {
+					preds = append(preds, orParts[0])
+				} else {
+					preds = append(preds, agent.Or(orParts...))
+				}
+			}
+		default:
+			return nil, fmt.Errorf("agentQueryTermsPredicates: unsupported filter field %q: %w", term.Field, store.ErrInvalidInput)
+		}
+	}
+
+	if qt.Text != "" {
+		preds = append(preds, agent.Or(
+			agent.NameContainsFold(qt.Text),
+			agent.SlugContainsFold(qt.Text),
+		))
+	}
+
+	for _, ex := range qt.ExcludeText {
+		if ex == "" {
+			continue
+		}
+		preds = append(preds, agent.Not(agent.Or(
+			agent.NameContainsFold(ex),
+			agent.SlugContainsFold(ex),
+		)))
+	}
+
+	return preds, nil
+}
+
+func agentLabelPredicate(val string, op store.QueryOp, negate bool) (predicate.Agent, error) {
+	switch op {
+	case store.QueryOpHasKey:
+		if negate {
+			return labelNotHasKey(val), nil
+		}
+		return labelHasKey(val), nil
+	case store.QueryOpLabelEq:
+		k, v, ok := strings.Cut(val, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("agentLabelPredicate: invalid label_eq value %q: %w", val, store.ErrInvalidInput)
+		}
+		if negate {
+			return labelNotContains(k, v), nil
+		}
+		return labelContains(k, v), nil
+	case store.QueryOpEq, "":
+		if k, v, ok := strings.Cut(val, "="); ok {
+			if k == "" {
+				return nil, fmt.Errorf("agentLabelPredicate: empty label key in %q: %w", val, store.ErrInvalidInput)
+			}
+			if negate {
+				return labelNotContains(k, v), nil
+			}
+			return labelContains(k, v), nil
+		}
+		if negate {
+			return labelNotHasKey(val), nil
+		}
+		return labelHasKey(val), nil
+	default:
+		return nil, fmt.Errorf("agentLabelPredicate: unsupported op %q: %w", op, store.ErrInvalidInput)
+	}
 }
 
 // UpdateAgentStatus applies a partial, status-only update. It is the hottest
@@ -1684,6 +1903,47 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 	if su.IfRunID != "" && current.RunID != su.IfRunID {
 		return store.ErrRunChanged
 	}
+	if su.IfAutoWakeReason && (current.SuspendReason == nil || !state.SuspendReason(*current.SuspendReason).AutoWakes()) {
+		return store.ErrPhaseMismatch
+	}
+	clearSuspendReasonForHold := false
+	if su.IfNoStartClaim || su.IfNoActiveIdleClaim || su.IfIdleSuspendCommit != nil || su.IfIdleSuspendRecover != nil {
+		if su.IfNoStartClaim && heldClaimError(current) != nil {
+			return store.ErrClaimPredicate
+		}
+		if current.IdleSuspendClaimUntil != nil || su.IfIdleSuspendCommit != nil || su.IfIdleSuspendRecover != nil {
+			storeClock, err := entTxStoreNow(ctx, tx, s.dialect() == dialect.Postgres)
+			if err != nil {
+				return err
+			}
+			idleActive := current.IdleSuspendClaimUntil != nil && storeClock.Before(*current.IdleSuspendClaimUntil)
+			if (su.IfNoActiveIdleClaim || su.IfNoStartClaim) && idleActive {
+				return store.ErrClaimPredicate
+			}
+			if su.IfIdleSuspendCommit != nil || su.IfIdleSuspendRecover != nil {
+				if su.IfIdleSuspendCommit != nil && !checkIdleSuspendCommit(current, *su.IfIdleSuspendCommit, storeClock) {
+					return store.ErrIdleSuspendPrecondition
+				}
+				if su.IfIdleSuspendRecover != nil && !checkIdleSuspendRecover(current, *su.IfIdleSuspendRecover, storeClock) {
+					return store.ErrIdleSuspendPrecondition
+				}
+				// If a membership-loss hold took effect while the idle claim's
+				// container stop was in flight, finish moving the row out of
+				// running/stopping/stopped/error into suspended, but leave
+				// suspend_reason NULL so the held agent never auto-wakes.
+				held, herr := tx.AgentHold.Query().
+					Where(agenthold.AgentIDEQ(current.ID), agenthold.ClearedAtIsNil()).
+					Exist(ctx)
+				if herr != nil {
+					return mapError(herr)
+				}
+				if held {
+					su.SuspendReason = ""
+					clearSuspendReasonForHold = true
+				}
+			}
+		}
+	}
 
 	// The exit reason is a closed set: a value outside it is dropped here,
 	// whatever the caller, before any rule reads it.
@@ -1704,6 +1964,10 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 
 	now := time.Now()
 
+	// statusOwned is false once a guard below has taken the agent's status
+	// fields away from this report; live work then must not un-stall it.
+	statusOwned := true
+
 	// Guard 0c, enforced inside the transaction (design ptone/scion#2483
 	// §2.1 Guards): while a delete holds a live lease, or once the row is
 	// soft-deleted, a status report must not move phase, activity or the
@@ -1718,6 +1982,7 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 		deleteHolds = store.DeletionHoldsRow(current.DeletionState, current.DeletionLeaseAt, now)
 	}
 	if current.DeletedAt != nil || deleteHolds {
+		statusOwned = false
 		su.Phase = ""
 		su.Activity = ""
 		su.ExitCode = nil
@@ -1734,6 +1999,7 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 	// ExitReason/Message, so the report must not move them. The other
 	// fields (ContainerStatus, heartbeat, ...) still apply, as in the hub.
 	if su.GuardReincarnation && store.ReincarnationInFlight(current.ReincarnationState) {
+		statusOwned = false
 		su.Phase = ""
 		su.Activity = ""
 		su.ExitCode = nil
@@ -1772,20 +2038,59 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 			store.StartClaimKind(current.StartClaimKind), current.RunID, current.RunIDUpdatedAt, current.StartClaimAt)
 		if (preMint && store.RestartPreMintReport(su, current.RunID)) || store.RunlessAgentTokenReport(su, current.RunIDUpdatedAt) {
 			store.DropReportedStatus(&su)
+			statusOwned = false
 		}
 	}
 
-	// The halted phase: sticky against reports, and the halt rule itself.
-	// See haltedStickyDrop and evaluateHalt. Only a broker heartbeat is
-	// evidence of how a run ended: the agent's own reports never halt it and
-	// never change a halted row's exit reason.
+	// The suspended and halted phases: sticky against reports, and the halt
+	// rule itself. See haltedStickyDrop and evaluateHalt. Only a broker
+	// heartbeat is evidence of how a run ended: the agent's own reports never
+	// halt it and never change a halted row's exit reason.
 	halting := false
 	var haltedFrom string
 	// A hub rollback (Restore) is never a report; the check documents that
 	// a restore never halts.
 	if isAgentReport(su) && !su.Restore {
-		if current.Phase == string(state.PhaseHalted) {
+		switch state.Phase(current.Phase) {
+		case state.PhaseSuspended:
+			// Suspended is sticky against agent and runtime reports on the
+			// locked row (ptone/scion#8256), mirroring haltedStickyDrop
+			// without the start-claim exception (suspend releases a
+			// superseded start claim after recording phase=suspended, and
+			// resume moves the row to starting before launching the new
+			// container).
+			//
+			// Field decisions:
+			//   - Phase: dropped, keeping phase=suspended so
+			//     entc.ClearSuspendReasonHook never sees a phase change that
+			//     would clear suspend_reason.
+			//   - Activity: dropped (both terminal activities such as
+			//     crashed/limits_exceeded and live/other activities), so any
+			//     retained suspend activity (completed, idle, harness_error)
+			//     is preserved, ToolName and StalledFromActivity remain
+			//     empty, and LastActivityEvent is untouched.
+			//   - ExitReason / ExitCode: dropped; the hub stopped the
+			//     container intentionally to suspend it, so teardown signals
+			//     or exit codes do not refine a suspension.
+			//   - ContainerStatus: exited/stopped statuses apply to confirm
+			//     teardown, while a live status ("running", "Up ...") is held
+			//     unless run intent is running, matching
+			//     heartbeatContainerStatusHeld (ptone/scion#3607).
+			//   - Other harmless fields (Message, ConnectionState,
+			//     RuntimeState, TaskSummary, CurrentTurns, CurrentModelCalls,
+			//     StartedAt, LiveWork timestamps, LastSeen, Updated) still
+			//     apply, matching haltedStickyDrop and Guard 0.
+			statusOwned = false
+			su.Phase = ""
+			su.Activity = ""
+			su.ExitReason = ""
+			su.ExitCode = nil
+			if !runIntentRunning(current) && containerStatusIsLive(su.ContainerStatus) {
+				su.ContainerStatus = ""
+			}
+		case state.PhaseHalted:
 			if haltedStickyDrop(current, su) {
+				statusOwned = false
 				su.Phase = ""
 				su.Activity = ""
 				// Only a broker heartbeat's halt evidence may refine why
@@ -1796,13 +2101,15 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 					su.ExitCode = nil
 				}
 			}
-		} else if isBrokerHeartbeat(su) {
-			// The agent's own report applies as before, never as a halt.
-			if ok, from := evaluateHalt(current, su); ok {
-				halting = true
-				haltedFrom = from
-				su.Phase = string(state.PhaseHalted)
-				su.Activity = ""
+		default:
+			if isBrokerHeartbeat(su) {
+				// The agent's own report applies as before, never as a halt.
+				if ok, from := evaluateHalt(current, su); ok {
+					halting = true
+					haltedFrom = from
+					su.Phase = string(state.PhaseHalted)
+					su.Activity = ""
+				}
 			}
 		}
 	}
@@ -1813,6 +2120,13 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 
 	if su.Phase != "" {
 		upd.SetPhase(su.Phase)
+		if strings.EqualFold(su.Phase, string(state.PhaseSuspended)) {
+			if su.SuspendReason != "" {
+				upd.SetSuspendReason(su.SuspendReason)
+			} else if clearSuspendReasonForHold {
+				upd.ClearSuspendReason()
+			}
+		}
 	}
 
 	activityProvided := su.Activity != ""
@@ -1827,26 +2141,81 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 			upd.SetActivity(su.Activity)
 		}
 		// A fresh activity report clears any stalled marker and refreshes the
-		// activity timestamp; tool_name tracks the new activity verbatim.
+		// activity timestamp; tool_name tracks the new activity verbatim. A
+		// failed-start rollback restoring priorActivity keeps LastActivityEvent.
 		upd.SetStalledFromActivity("")
-		upd.SetLastActivityEvent(now)
+		if !su.Restore {
+			upd.SetLastActivityEvent(now)
+		}
 		upd.SetToolName(su.ToolName)
+	} else if strings.EqualFold(su.Phase, string(state.PhaseSuspended)) {
+		// Transitioning to suspended: preserve retained activities (completed,
+		// idle, harness_error; computed from stalled_from_activity when stalled)
+		// and clear any other activity, stall marker, and tool name. If a
+		// container or runtime shutdown report already moved the row to stopped
+		// or error and cleared or replaced current.Activity before the hub's
+		// post-stop suspend write ran, restore su.RetainedActivity.
+		retained := string(state.RetainedSuspendActivity(
+			state.Activity(current.Activity),
+			state.Activity(current.StalledFromActivity),
+		))
+		if retained == "" &&
+			(current.Phase == string(state.PhaseStopped) || current.Phase == string(state.PhaseError)) &&
+			(current.Activity == "" || isTerminalActivity(current.Activity)) &&
+			su.RetainedActivity != "" {
+			retained = string(state.RetainedSuspendActivity(state.Activity(su.RetainedActivity), ""))
+		}
+		upd.SetActivity(retained)
+		upd.SetStalledFromActivity("")
+		upd.SetToolName("")
 	} else if store.IsTerminalPhase(su.Phase) {
 		// Transitioning to a terminal phase without an explicit activity: clear
 		// any leftover live activity (e.g. a lingering "stalled" set by the
 		// platform) so a stopped/crashed agent never displays a stale activity.
 		// A terminal activity (crashed/limits_exceeded) carries information about
-		// HOW the agent stopped and is preserved.
-		if current.Activity != "" && !isTerminalActivity(current.Activity) {
+		// HOW the agent stopped and is preserved. On PhaseStopped, completed is
+		// also retained (like PhaseSuspended) so a subsequent resume/restart
+		// knows the prior run finished (ptone/scion#8900).
+		if strings.EqualFold(su.Phase, string(state.PhaseStopped)) {
+			retained := string(state.RetainedStopActivity(
+				state.Activity(current.Activity),
+				state.Activity(current.StalledFromActivity),
+			))
+			if retained != current.Activity || current.StalledFromActivity != "" || current.ToolName != "" {
+				upd.SetActivity(retained)
+				upd.SetStalledFromActivity("")
+				upd.SetToolName("")
+			}
+		} else if current.Activity != "" && !isTerminalActivity(current.Activity) {
 			upd.SetActivity("")
 			upd.SetStalledFromActivity("")
 			upd.SetToolName("")
 		}
 	}
-	// A halt clears the activity outright, a terminal one included: the
-	// exit reason says how the run ended.
+	// Un-stall on live work (ptone/scion#7855): a stalled running agent
+	// whose container reports stall-suppressing live work is demonstrably
+	// active, so its activity before the stall comes back and the activity
+	// timestamp is refreshed. This only restores stalled_from_activity; it
+	// never writes any other activity (no idle or blocked; ptone/scion#7826).
+	unstalled := false
+	if su.LiveWork != nil && su.LiveWork.SuppressStall && statusOwned && !activityProvided && !halting &&
+		current.Activity == string(state.ActivityStalled) && current.Phase == string(state.PhaseRunning) &&
+		(su.Phase == "" || su.Phase == string(state.PhaseRunning)) {
+		upd.SetActivity(current.StalledFromActivity)
+		upd.SetStalledFromActivity("")
+		upd.SetLastActivityEvent(now)
+		unstalled = true
+	}
+	// A halt clears live and terminal activities (the exit reason says how the
+	// run ended), but retains completed (including stalled-from-completed) so a
+	// subsequent resume or restart knows the prior run finished
+	// (ptone/scion#8900).
 	if halting {
-		upd.SetActivity("")
+		retained := string(state.RetainedHaltActivity(
+			state.Activity(current.Activity),
+			state.Activity(current.StalledFromActivity),
+		))
+		upd.SetActivity(retained)
 		upd.SetStalledFromActivity("")
 		upd.SetToolName("")
 	}
@@ -1868,6 +2237,22 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 			upd.ClearExitCode()
 		}
 		upd.SetExitReason("")
+	}
+	// Leaving suspended (or stopped/halted with a retained completed activity)
+	// for starting or running clears any retained activity before the new
+	// container runs, without disturbing exit fields
+	// (pinned by TestUpdateAgentStatus_ExitFieldsKeptOutsidePreRunningToRunning)
+	// or a new container's activity posted during dispatch before
+	// ClearTerminalRemnants runs.
+	if (current.Phase == string(state.PhaseSuspended) ||
+		((current.Phase == string(state.PhaseStopped) || current.Phase == string(state.PhaseHalted)) &&
+			state.Activity(current.Activity).IsRetainedOnStop())) &&
+		(su.Phase == string(state.PhaseStarting) || su.Phase == string(state.PhaseRunning)) {
+		if !activityProvided {
+			upd.SetActivity("")
+			upd.SetToolName("")
+		}
+		upd.SetStalledFromActivity("")
 	}
 
 	// ClearExit covers the case the phase-transition clear above does not:
@@ -1923,10 +2308,26 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 			upd.SetLaunchEndReason(store.LaunchEndReasonRunningObserved)
 		}
 	}
+	// Any hub-authored lifecycle write (stop, stop-all, suspend, restart, hold,
+	// queued stop, limits stop, start) other than the idle-suspend commit
+	// itself invalidates an in-flight idle-suspend claim so a concurrent idle
+	// worker can never overwrite a user lifecycle action with suspended(idle).
+	// Container and runtime reports (isAgentReport) always preserve the claim.
+	if !isAgentReport(su) && su.IfIdleSuspendCommit == nil &&
+		(su.Phase != "" || su.ContainerStatus == store.ContainerStatusStopQueued || su.SuspendReason != "") {
+		upd.ClearIdleSuspendClaimUntil()
+	}
 
 	if su.Message != "" {
 		upd.SetMessage(su.Message)
 	} else if su.ClearMessageIf != "" && current.Message == su.ClearMessageIf {
+		upd.SetMessage("")
+	} else if current.Message == state.StalledNoHookActivityHint &&
+		((activityProvided && su.Activity != string(state.ActivityStalled)) ||
+			unstalled ||
+			halting ||
+			store.IsTerminalPhase(su.Phase) ||
+			(current.Phase == string(state.PhaseSuspended) && (su.Phase == string(state.PhaseStarting) || su.Phase == string(state.PhaseRunning)))) {
 		upd.SetMessage("")
 	}
 	if su.ConnectionState != "" {
@@ -1960,6 +2361,35 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 			upd.SetStartedAt(t)
 		}
 	}
+	// Live work from the container's heartbeat (ptone/scion#7855): any
+	// live work guards auto-suspend; work that suppresses STALLED also
+	// keeps the stall sweep off the agent (MarkStalledAgents).
+	if su.LiveWork != nil {
+		upd.SetLastLiveProcessAt(now)
+		if su.LiveWork.SuppressStall {
+			upd.SetLastLiveWorkAt(now)
+		}
+	}
+
+	stampActivitySince(upd.Mutation(), current.Phase, current.Activity, now)
+
+	// Shell execution container attached-terminal guard (ptone/scion#8812 §3.3, AC2):
+	// while a terminal client is attached, refresh activity_since so idle-suspend
+	// measures IdleSuspendAfter from detach rather than from container ready time.
+	// Scoped strictly to shell agents in running/idle so LLM-agent behavior is unchanged.
+	if su.LiveWork != nil && su.LiveWork.Kind == "attached" && isShellEntAgent(current) {
+		effPhase, ok := upd.Mutation().Phase()
+		if !ok && !upd.Mutation().PhaseCleared() {
+			effPhase = current.Phase
+		}
+		effActivity, ok := upd.Mutation().Activity()
+		if !ok && !upd.Mutation().ActivityCleared() {
+			effActivity = current.Activity
+		}
+		if effPhase == string(state.PhaseRunning) && strings.EqualFold(effActivity, string(state.ActivityIdle)) {
+			upd.SetActivitySince(now)
+		}
+	}
 
 	if err := upd.Exec(ctx); err != nil {
 		return mapError(err)
@@ -1971,7 +2401,7 @@ func (s *AgentStore) UpdateAgentStatus(ctx context.Context, id string, su store.
 		return err
 	}
 	if su.Result != nil {
-		*su.Result = store.AgentStatusResult{Halted: halting, HaltedFrom: haltedFrom}
+		*su.Result = store.AgentStatusResult{Halted: halting, HaltedFrom: haltedFrom, Unstalled: unstalled}
 	}
 	return nil
 }
@@ -1997,13 +2427,26 @@ func statusWriteHints(su store.AgentStatusUpdate) store.AgentWriteHints {
 
 // isAgentReport reports whether su is a status report about the agent's
 // run (ReportSource set by the broker heartbeat handler or the agent's
-// status endpoint). Reports are subject to the run check and to halted's
-// stickiness; of them, only a runtime report can halt
-// (isBrokerHeartbeat). Hub-internal writers (stop recordings, the launch
-// reaper, the failed launch report, the delete engine, reincarnation, the
-// start path) leave ReportSource empty.
+// status endpoint). Reports are subject to the run check and to
+// suspended's and halted's stickiness; of them, only a runtime report can
+// halt (isBrokerHeartbeat). Hub-internal writers (stop recordings, the
+// launch reaper, the failed launch report, the delete engine,
+// reincarnation, the start path) leave ReportSource empty.
 func isAgentReport(su store.AgentStatusUpdate) bool {
 	return su.ReportSource != ""
+}
+
+// runIntentRunning reports whether the locked row's run_intent is running.
+func runIntentRunning(a *ent.Agent) bool {
+	return a.RunIntent != nil && store.RunIntent(*a.RunIntent) == store.RunIntentRunning
+}
+
+// containerStatusIsLive reports whether cs describes a confirmed live
+// container ("running" or "Up ..."), matching heartbeatContainerStatusHeld
+// in pkg/hub.
+func containerStatusIsLive(cs string) bool {
+	s := strings.ToLower(cs)
+	return strings.HasPrefix(s, "up") || s == "running"
 }
 
 // isPreRunningPhase reports whether phase is one a run passes through
@@ -2212,7 +2655,7 @@ func (s *AgentStore) UpdateAgentConfig(ctx context.Context, agentID string, expe
 		// Preserves the recorded native Cloud Run decision: the document
 		// carries the row's value and the write applies only while the row
 		// still holds it (appliedConfigForWrite).
-		appliedRaw, native, keepNative, err := appliedConfigForWrite(ctx, ac, uid, applied, s.usesRowLocks())
+		appliedRaw, native, keepNative, _, err := appliedConfigForWrite(ctx, ac, uid, applied, s.usesRowLocks())
 		if err != nil {
 			return 0, err
 		}
@@ -2222,9 +2665,15 @@ func (s *AgentStore) UpdateAgentConfig(ctx context.Context, agentID string, expe
 		update := ac.Update().
 			Where(agent.IDEQ(uid), agent.StateVersionEQ(expectedVersion), agent.DeletedAtIsNil(), keepNative).
 			SetStateVersion(newVersion).
-			SetUpdated(time.Now()).
-			// Always set, never NULL: see buildAgentUpdate.
-			SetHarnessConfig(harnessConfigOf(applied))
+			SetUpdated(time.Now())
+		if applied != nil {
+			// Always set, never NULL: see buildAgentUpdate. When applied is
+			// nil, leave harness_config untouched for all agents so
+			// pending-config clears on a row whose applied_config failed to
+			// parse do not erase an existing harness_config (including the
+			// shell marker).
+			update.SetHarnessConfig(harnessConfigOf(applied))
+		}
 		if appliedRaw != "" {
 			update.SetAppliedConfig(appliedRaw)
 		} else {
@@ -2320,7 +2769,7 @@ func utcExposedPorts(ports []store.ExposedPort) []store.ExposedPort {
 
 // staleOfflineExcluded lists the terminal/sticky activities that must not be
 // overwritten when sweeping stale agents to "offline".
-var staleOfflineExcluded = []string{"completed", "limits_exceeded", "blocked", "offline"}
+var staleOfflineExcluded = []string{"completed", "limits_exceeded", "blocked", "idle", "offline"}
 
 // MarkStaleAgentsOffline marks running agents whose last heartbeat predates
 // threshold as offline, returning the updated records for event publishing.
@@ -2351,13 +2800,15 @@ func (s *AgentStore) MarkStaleAgentsOffline(ctx context.Context, threshold time.
 
 	updated := make([]store.Agent, 0, len(candidates))
 	for _, a := range candidates {
-		if err := tx.Agent.UpdateOneID(a.ID).
+		upd := tx.Agent.UpdateOneID(a.ID).
 			SetActivity("offline").
-			SetUpdated(now).
-			Exec(ctx); err != nil {
+			SetUpdated(now)
+		stampActivitySince(upd.Mutation(), a.Phase, a.Activity, now)
+		if err := upd.Exec(ctx); err != nil {
 			return nil, err
 		}
 		a.Activity = "offline"
+		a.ActivitySince = &now
 		a.Updated = now
 		updated = append(updated, *entAgentToStore(a))
 	}
@@ -2891,12 +3342,19 @@ func (s *AgentStore) setAgentNativeCloudRunOnce(ctx context.Context, uid uuid.UU
 
 // stalledExcluded lists the activities that disqualify a running agent from
 // being marked "stalled" (terminal, already-stalled, or intentionally waiting).
-var stalledExcluded = []string{"completed", "limits_exceeded", "blocked", "stalled", "offline", "waiting_for_input"}
+// harness_error is excluded too: the harness already reported why it is not
+// making progress, and that reason must not be replaced by a stall. It is
+// not in staleOfflineExcluded: when heartbeats stop, offline is the truth.
+var stalledExcluded = []string{"completed", "limits_exceeded", "blocked", "idle", "stalled", "offline", "waiting_for_input", string(state.ActivityHarnessError)}
 
 // MarkStalledAgents marks running agents whose last activity event predates
-// activityThreshold but whose heartbeat is still recent (>= heartbeatRecency)
-// as stalled, preserving the prior activity in stalled_from_activity.
-func (s *AgentStore) MarkStalledAgents(ctx context.Context, activityThreshold, heartbeatRecency time.Time) ([]store.Agent, error) {
+// the applicable cutoff (cutoffs.Thinking for activity "thinking",
+// cutoffs.Activity for every other included activity) while their heartbeat is
+// still recent (>= heartbeatRecency) as stalled, preserving the prior activity
+// in stalled_from_activity. An agent whose container reported stall-suppressing
+// live work since the applicable cutoff is left alone (ptone/scion#7855): a
+// long tool call or a background job doing CPU work is not a hang.
+func (s *AgentStore) MarkStalledAgents(ctx context.Context, cutoffs store.StallCutoffs, heartbeatRecency time.Time) ([]store.Agent, error) {
 	useLock := s.usesRowLocks()
 
 	tx, err := s.client.Tx(ctx)
@@ -2909,11 +3367,22 @@ func (s *AgentStore) MarkStalledAgents(ctx context.Context, activityThreshold, h
 
 	q := tx.Agent.Query().Where(
 		agent.LastActivityEventNotNil(),
-		agent.LastActivityEventLT(activityThreshold),
 		agent.LastSeenNotNil(),
 		agent.LastSeenGTE(heartbeatRecency),
 		agent.PhaseEQ("running"),
 		agent.ActivityNotIn(stalledExcluded...),
+		agent.Or(
+			agent.And(
+				agent.ActivityNEQ(string(state.ActivityThinking)),
+				agent.LastActivityEventLT(cutoffs.Activity),
+				agent.Or(agent.LastLiveWorkAtIsNil(), agent.LastLiveWorkAtLT(cutoffs.Activity)),
+			),
+			agent.And(
+				agent.ActivityEQ(string(state.ActivityThinking)),
+				agent.LastActivityEventLT(cutoffs.Thinking),
+				agent.Or(agent.LastLiveWorkAtIsNil(), agent.LastLiveWorkAtLT(cutoffs.Thinking)),
+			),
+		),
 	)
 	if useLock {
 		q = q.ForUpdate()
@@ -2926,15 +3395,24 @@ func (s *AgentStore) MarkStalledAgents(ctx context.Context, activityThreshold, h
 	updated := make([]store.Agent, 0, len(candidates))
 	for _, a := range candidates {
 		prevActivity := a.Activity
-		if err := tx.Agent.UpdateOneID(a.ID).
+		noHookSinceStart := stalledWithoutHookSinceStart(a)
+		upd := tx.Agent.UpdateOneID(a.ID).
 			SetStalledFromActivity(prevActivity).
 			SetActivity("stalled").
-			SetUpdated(now).
-			Exec(ctx); err != nil {
+			SetUpdated(now)
+		if noHookSinceStart {
+			upd.SetMessage(state.StalledNoHookActivityHint)
+		}
+		stampActivitySince(upd.Mutation(), a.Phase, prevActivity, now)
+		if err := upd.Exec(ctx); err != nil {
 			return nil, err
 		}
 		a.StalledFromActivity = prevActivity
 		a.Activity = "stalled"
+		if noHookSinceStart {
+			a.Message = state.StalledNoHookActivityHint
+		}
+		a.ActivitySince = &now
 		a.Updated = now
 		updated = append(updated, *entAgentToStore(a))
 	}
@@ -2945,12 +3423,133 @@ func (s *AgentStore) MarkStalledAgents(ctx context.Context, activityThreshold, h
 	return updated, nil
 }
 
+// startupActivityTimestampSlack bounds |last_activity_event - started_at| when
+// started_at was formatted at RFC3339 second resolution by the container while
+// last_activity_event was stamped at nanosecond resolution by the Hub in the
+// same start status update.
+const startupActivityTimestampSlack = 2 * time.Second
+
+// stalledWithoutHookSinceStart reports whether candidate row a is stalling
+// without having reported any harness hook event since start (ptone/scion#4556).
+//
+// At startup, sciontool init reports initializing/"Agent started" (setting
+// started_at) and watchHarnessReady transitions to working with either
+// "Harness started" (settle mode) or "Harness readiness not confirmed by
+// deadline; assuming ready" (hook-mode timeout when no ready hook fired).
+// Every harness hook event updates activity and/or replaces message (e.g.
+// "Session started", "Processing", "Executing: ...", "Ready"), so an agent
+// still at initializing, at working with one of those init-only startup
+// messages, or at working with an empty message whose last_activity_event
+// has not moved past started_at has never reported a hook event since start.
+func stalledWithoutHookSinceStart(a *ent.Agent) bool {
+	if a.CurrentTurns > 0 || a.CurrentModelCalls > 0 {
+		return false
+	}
+	switch state.Activity(a.Activity) {
+	case state.ActivityInitializing:
+		return true
+	case state.ActivityWorking:
+		if state.IsPreHookStartupMessage(a.Message) {
+			return true
+		}
+		if a.Message == "" && a.StartedAt != nil && a.LastActivityEvent != nil {
+			diff := a.LastActivityEvent.Sub(*a.StartedAt)
+			if diff < 0 {
+				diff = -diff
+			}
+			return diff <= startupActivityTimestampSlack
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// entTxStoreNow reads the store clock inside an *ent.Tx, following storeNow
+// (launch_store.go): Postgres executes "SELECT now()" on tx's connection so
+// preconditions compare against the database transaction's clock; SQLite
+// (single-process) uses time.Now().
+func entTxStoreNow(ctx context.Context, tx *ent.Tx, isPostgres bool) (time.Time, error) {
+	if !isPostgres {
+		return time.Now(), nil
+	}
+	var rows entsql.Rows
+	if err := tx.Client().Driver().Query(ctx, "SELECT now()", []any{}, &rows); err != nil {
+		return time.Time{}, fmt.Errorf("agent store: SELECT now(): %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return time.Time{}, fmt.Errorf("agent store: SELECT now(): %w", err)
+		}
+		return time.Time{}, fmt.Errorf("agent store: SELECT now(): no row")
+	}
+	var now time.Time
+	if err := rows.Scan(&now); err != nil {
+		return time.Time{}, fmt.Errorf("agent store: SELECT now(): %w", err)
+	}
+	return now, nil
+}
+
+// ListIdleSuspendCandidates implements store.AgentStore.
+func (s *AgentStore) ListIdleSuspendCandidates(ctx context.Context, cutoff, heartbeatRecency, liveWorkCutoff, backoffCutoff time.Time, after *store.IdleSuspendCursor, limit int) ([]store.Agent, error) {
+	q := s.client.Agent.Query().Where(
+		agent.DeletedAtIsNil(),
+		agent.PhaseEQ(string(state.PhaseRunning)),
+		agent.ActivityIn(state.SuspendEligibleActivities()...),
+		agent.ActivitySinceNotNil(),
+		agent.ActivitySinceLT(cutoff.UTC()),
+		agent.LastSeenNotNil(),
+		agent.LastSeenGTE(heartbeatRecency.UTC()),
+		agent.Or(
+			agent.LastLiveProcessAtIsNil(),
+			agent.LastLiveProcessAtLT(liveWorkCutoff.UTC()),
+		),
+	)
+	if !backoffCutoff.IsZero() {
+		q = q.Where(agent.Or(
+			agent.IdleSuspendClaimUntilIsNil(),
+			agent.IdleSuspendClaimUntilLT(backoffCutoff.UTC()),
+		))
+	}
+	if after != nil {
+		afterUID, err := parseUUID(after.ID)
+		if err != nil {
+			return nil, err
+		}
+		ts := after.ActivitySince.UTC()
+		q = q.Where(agent.Or(
+			agent.ActivitySinceGT(ts),
+			agent.And(
+				agent.ActivitySinceEQ(ts),
+				agent.IDGT(afterUID),
+			),
+		))
+	}
+	q = q.Order(
+		ent.Asc(agent.FieldActivitySince),
+		ent.Asc(agent.FieldID),
+	)
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	rows, err := q.All(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	out := make([]store.Agent, len(rows))
+	for i, a := range rows {
+		out[i] = *entAgentToStore(a)
+	}
+	return out, nil
+}
+
 // --- helpers ---
 
 // isTerminalActivity reports whether the activity is a terminal/sticky state
 // that a non-terminal status report must not overwrite on a stopped agent.
 func isTerminalActivity(activity string) bool {
-	return activity == "crashed" || activity == "limits_exceeded"
+	return strings.EqualFold(activity, "crashed") || strings.EqualFold(activity, "limits_exceeded")
 }
 
 // marshalAppliedConfig serializes the applied-config document to JSON text,
@@ -2988,6 +3587,17 @@ func harnessConfigOf(cfg *store.AgentAppliedConfig) string {
 		return ""
 	}
 	return cfg.HarnessConfig
+}
+
+// isShellEntAgent reports whether the stored ent.Agent uses the reserved
+// built-in "shell" harness config.
+//
+// The indexed harness_config shadow column (populated unconditionally from
+// AppliedConfig.HarnessConfig via harnessConfigOf on CreateAgent and
+// UpdateAgent) is the authoritative store-level source, matching
+// pkg/hub.isShellAgent without raw-decoding applied_config JSON.
+func isShellEntAgent(a *ent.Agent) bool {
+	return a != nil && a.HarnessConfig == config.ShellHarnessConfigName
 }
 
 // parseTimeString parses a status update's started_at string, accepting the

@@ -34,7 +34,7 @@ import (
 func TestRegistryHasAllSections(t *testing.T) {
 	expected := []string{"access", "lifecycle", "maintenance", "messaging",
 		"telemetry", "agent_defaults", "endpoints", "github_app", "notifications",
-		"project_defaults", "auto_expose_ports", "quotas", "agent_secrets", "federation", "experiments", "artifacts", "profiling",
+		"project_defaults", "auto_expose_ports", "quotas", "agent_secrets", "broker_policy", "federation", "experiments", "artifacts", "profiling",
 		"agent_delegation_policy", "chat_retention"}
 	for _, name := range expected {
 		if SectionByName(name) == nil {
@@ -244,6 +244,9 @@ func TestValidateValidDoc(t *testing.T) {
 		{"agent_secrets", `{"user_scope_only":true}`},
 		{"agent_secrets", `{"user_scope_only":false}`},
 		{"agent_secrets", `{}`},
+		{"broker_policy", `{"admin_managed_only":true}`},
+		{"broker_policy", `{"admin_managed_only":false}`},
+		{"broker_policy", `{}`},
 		{"federation", `{"enabled":true,"trusted_issuers":[{"issuer_url":"https://hub.example.com","issuer_type":"hub"}],"algorithms":["RS256"]}`},
 		{"federation", `{"enabled":false}`},
 		{"federation", `{}`},
@@ -282,6 +285,8 @@ func TestValidateInvalidDoc(t *testing.T) {
 		{"quotas", `{"unknown_field":true}`, "additional property"},
 		{"agent_secrets", `{"user_scope_only":"yes"}`, "wrong type for boolean"},
 		{"agent_secrets", `{"unknown_field":true}`, "additional property"},
+		{"broker_policy", `{"admin_managed_only":"yes"}`, "wrong type for boolean"},
+		{"broker_policy", `{"unknown_field":true}`, "additional property"},
 		{"federation", `{"trusted_issuers":[{"issuer_url":""}]}`, "empty issuer_url (minLength)"},
 		{"federation", `{"algorithms":["INVALID"]}`, "invalid algorithm enum"},
 		{"federation", `{"trusted_issuers":[{"issuer_type":"unknown"}]}`, "invalid issuer_type enum"},
@@ -543,6 +548,34 @@ func TestGitHubAppExtractExcludesSecrets(t *testing.T) {
 	}
 	if doc["private_key_path"] == nil {
 		t.Error("expected private_key_path in section doc (path only, not secret)")
+	}
+}
+
+func TestGitHubAppSlugAndMentionAliasesRoundTrip(t *testing.T) {
+	k := koanf.New(".")
+	_ = k.Load(confmap.Provider(map[string]interface{}{
+		"server.github_app.app_id":                  42,
+		"server.github_app.app_slug":                "scion-enterprise",
+		"server.github_app.command_mention_aliases": []string{"scion", "scion-bot"},
+	}, "."), nil)
+
+	raw, err := ExtractSectionFromKoanf(k, "github_app")
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if errs := Validate("github_app", raw); len(errs) != 0 {
+		t.Fatalf("validate: %v", errs)
+	}
+
+	loaded, err := LoadSectionsIntoKoanf(map[string]json.RawMessage{"github_app": raw})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := loaded.String("server.github_app.app_slug"); got != "scion-enterprise" {
+		t.Fatalf("app_slug = %q, want %q", got, "scion-enterprise")
+	}
+	if got := loaded.Strings("server.github_app.command_mention_aliases"); len(got) != 2 || got[0] != "scion" || got[1] != "scion-bot" {
+		t.Fatalf("command_mention_aliases = %v, want [scion scion-bot]", got)
 	}
 }
 

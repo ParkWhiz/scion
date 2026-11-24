@@ -105,6 +105,10 @@ type BrokerCapabilities struct {
 	// directory at <projectDir>/agents/<slug>/workspace (design #2703). The
 	// hub refuses to dispatch such agents to a broker without it (412).
 	EmptyPerAgentWorkspace bool `json:"emptyPerAgentWorkspace"`
+	// EphemeralPersistence indicates the broker's runtime can run an agent
+	// with persistence: ephemeral (ptone/scion#7780; Cloud Run only). The
+	// hub refuses an ephemeral create on a broker without it.
+	EphemeralPersistence bool `json:"ephemeralPersistence,omitempty"`
 	// AgentMove indicates this broker can take part in moving an agent to
 	// or from another broker on the same workspace export (`scion
 	// reincarnate --broker`). The hub refuses a move unless both brokers
@@ -124,6 +128,10 @@ type BrokerCapabilities struct {
 	// NFS leaf). The hub refuses a home-resetting reincarnation (412) for any
 	// other runtime, before anything is stopped (ptone/scion#7757).
 	ReprovisionResetHomeRuntimes []string `json:"reprovisionResetHomeRuntimes,omitempty"`
+	// RestartingRuntimes lists the runtimes on which the platform may
+	// restart an agent container that exited, so the hub stops a run that
+	// reported limits_exceeded (ptone/scion#7928).
+	RestartingRuntimes []string `json:"restartingRuntimes,omitempty"`
 	// ChangedFields indicates this broker re-renders, at start, the files
 	// provisioning wrote for the provision-rendered keys the hub lists in
 	// the inline config's changed_fields (ptone/scion#3982).
@@ -151,6 +159,10 @@ type BrokerCapabilities struct {
 	// create/start/restart as policy above everything. A hub may stop writing those values into
 	// InlineConfig only for a broker that reports this (ptone/scion#4222).
 	TemplateTiers bool `json:"templateTiers,omitempty"`
+	// HomeFiles indicates this broker writes create-time HomeFiles entries into
+	// the newly provisioned agent's home directory under .scion/ before
+	// starting the harness (ptone/scion#8058).
+	HomeFiles bool `json:"homeFiles,omitempty"`
 }
 
 // ProjectInfo is a summary of a project registered on this broker.
@@ -317,6 +329,11 @@ type CreateAgentRequest struct {
 	// side effect.
 	ExpectedRuntimeTargetID string `json:"expectedRuntimeTargetId,omitempty"`
 
+	// Persistence is the agent's persistence as the hub stamped it at
+	// create (ptone/scion#7780): ephemeral, or empty for persistent. The
+	// hub sends it on every create, start and restart.
+	Persistence api.Persistence `json:"persistence,omitempty"`
+
 	// ResolvedEnv contains the fully merged environment variables and secrets
 	// from all applicable scopes (user, project, runtime broker). These are resolved
 	// by the Hub before dispatching the agent creation request.
@@ -472,6 +489,11 @@ type CreateAgentRequest struct {
 	// LaunchKeepaliveSeconds is the Hub's configured keepalive interval. The
 	// broker defaults to 15 when absent (design §3.7).
 	LaunchKeepaliveSeconds int `json:"launchKeepaliveSeconds,omitempty"`
+
+	// HomeFiles carries small control-plane files the Hub asks the broker to
+	// write under .scion/ in the newly provisioned agent's home directory on
+	// create only (ptone/scion#8058). Content is base64-encoded on the wire.
+	HomeFiles []api.HomeFile `json:"homeFiles,omitempty"`
 }
 
 // CreateAgentConfig contains configuration for agent creation.

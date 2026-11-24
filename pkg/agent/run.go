@@ -22,6 +22,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"os/user"
@@ -37,6 +38,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/agentplugin"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/envpolicy"
 	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/harness"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/imagecheck"
@@ -53,6 +55,35 @@ import (
 
 var ErrTmuxBinaryNotFound = errors.New("tmux binary not found")
 var ErrContainerNameInUse = errors.New("agent name is already in use by a stopped container; please delete the existing agent or choose a different name")
+
+// runningContainerMatchesAgent reports whether an already-running container
+// found by slug may be reused for a no-task Start (ptone/scion#8080).
+//
+// A container whose agent_id label (or runtime-reported ID) is empty or not a
+// UUID (legacy containers label their name) is accepted for backward
+// compatibility. Otherwise, the label carries a Hub agent UUID, and the
+// container is reusable only when it matches the current agent's SCION_AGENT_ID
+// (compared in canonical UUID form). A different UUID (or a UUID when
+// SCION_AGENT_ID is unset) marks the container as stale so pre-clean deletes
+// and recreates it.
+func runningContainerMatchesAgent(a api.AgentInfo, currentAgentID string) bool {
+	containerID := a.Labels[api.LabelAgentID]
+	if containerID == "" {
+		containerID = a.ID
+	}
+	u, err := uuid.Parse(containerID)
+	if err != nil {
+		return true
+	}
+	if currentAgentID == "" {
+		return false
+	}
+	cur, err := uuid.Parse(currentAgentID)
+	if err != nil {
+		return false
+	}
+	return u == cur
+}
 
 func classifyLaunchRuntimeError(err error, resolvedImage string) error {
 	if err == nil {
@@ -97,7 +128,19 @@ func sortedEnvVarKeys(envVars map[string]string) []string {
 }
 
 func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.AgentInfo, error) {
+	// Refused before anything is provisioned or recorded (the broker
+	// refuses it earlier still, in buildStartContext).
+	if err := runtime.CheckPersistenceSupported(m.Runtime, opts.Persistence); err != nil {
+		return nil, err
+	}
+	// An ephemeral agent's session is never kept, so every start is a fresh
+	// one: the prompt-file task is sent again and the harness starts
+	// without its resume flag (ptone/scion#7780).
+	if opts.Persistence.IsEphemeral() {
+		opts.Resume = false
+	}
 	ctx = m.withWorkspaceLock(ctx)
+	ctx = runtime.WithLaunchProgress(ctx, opts.Progress)
 	startEntry := time.Now()
 	// callerHubEndpoint is opts.Env's SCION_HUB_ENDPOINT exactly as the
 	// caller passed it in — captured before anything below ever writes to
@@ -224,8 +267,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			isRunning := a.Phase == string(state.PhaseRunning)
 			if isRunning {
 				// If a new task is provided, we might want to recreate even if running
-				// but if no task provided, we just return the running one
-				if opts.Task == "" {
+				// but if no task provided, we just return the running one — provided
+				// its agent_id label does not belong to a different agent (ptone/scion#8080).
+				if opts.Task == "" && runningContainerMatchesAgent(a, hubDispatchedAgentID) {
 					a.Detached = true
 					if opts.Detached != nil {
 						a.Detached = *opts.Detached
@@ -241,7 +285,9 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 					return &a, nil
 				}
 			}
-			// If it exists but not running (or we have a new task), we delete it so we can recreate it.
+			// If it exists but not running (or we have a new task, or it is a
+			// stale container for another agent ID), we delete it so we can
+			// recreate it.
 			// The delete is by name/ID found by name, so an async launch
 			// checkpoints first: a launch the hub has already ended must
 			// not remove a newer launch's agent.
@@ -394,9 +440,15 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	}
 
 	task := opts.Task
+	priorStatusNotice := false
 
 	if task == "" && !opts.Resume {
-		task = promptFileContent
+		if isPriorStatusCompleted(opts.PriorStatus) {
+			task = formatPriorCompletionNotice(opts.PriorStatus)
+			priorStatusNotice = true
+		} else {
+			task = promptFileContent
+		}
 	} else if task != "" {
 		// Explicit prompt always wins — write/overwrite prompt.md
 		if writeErr := os.WriteFile(promptFile, []byte(task), 0644); writeErr != nil {
@@ -485,36 +537,42 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// a restart of such an agent whose template disappeared keeps that
 	// recorded value instead of dropping to Hub settings or the file
 	// default, as an agent with no template name does.
+	// Shell execution containers take no template chain, no template env layer,
+	// and no template-derived launch inputs (security audit H1 / H1-R).
+	isShell := harnessConfigName == config.ShellHarnessConfigName || harnessName == config.ShellHarnessConfigName
+
 	templateUnresolvable := false
 	templateName := ""
-	if opts.Template != "" && filepath.IsAbs(opts.Template) {
-		templateName = opts.Template
-	}
-	if templateName == "" && hydrated {
-		templateUnresolvable = true
-		util.Debugf("image resolution: template was loaded from a content-addressed cache, not resolved by name")
-	}
-	if templateName == "" && !hydrated {
-		if provenance != nil {
-			templateName = provenance.Template
-		} else if finalScionCfg != nil && finalScionCfg.Info != nil {
-			templateName = finalScionCfg.Info.Template
-		}
-	}
-	if templateName == "" && !hydrated {
-		templateName = opts.Template
-	}
 	var templatePaths []string
 	var templateChain []*config.Template
-	if templateName != "" {
-		if chain, err := config.GetTemplateChainInProject(ctx, templateName, opts.ProjectPath); err == nil {
-			templateChain = chain
-			for _, tpl := range chain {
-				templatePaths = append(templatePaths, tpl.Path)
-			}
-		} else {
+	if !isShell {
+		if opts.Template != "" && filepath.IsAbs(opts.Template) {
+			templateName = opts.Template
+		}
+		if templateName == "" && hydrated {
 			templateUnresolvable = true
-			util.Debugf("image resolution: template %q could not be resolved: %v", templateName, err)
+			util.Debugf("image resolution: template was loaded from a content-addressed cache, not resolved by name")
+		}
+		if templateName == "" && !hydrated {
+			if provenance != nil {
+				templateName = provenance.Template
+			} else if finalScionCfg != nil && finalScionCfg.Info != nil {
+				templateName = finalScionCfg.Info.Template
+			}
+		}
+		if templateName == "" && !hydrated {
+			templateName = opts.Template
+		}
+		if templateName != "" {
+			if chain, err := config.GetTemplateChainInProject(ctx, templateName, opts.ProjectPath); err == nil {
+				templateChain = chain
+				for _, tpl := range chain {
+					templatePaths = append(templatePaths, tpl.Path)
+				}
+			} else {
+				templateUnresolvable = true
+				util.Debugf("image resolution: template %q could not be resolved: %v", templateName, err)
+			}
 		}
 	}
 
@@ -540,9 +598,25 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// The on-disk harness-config's model_aliases, for resolving a size alias
 	// in the effective model (resolveEffectiveModel).
 	var hcModelAliases map[string]string
+	// The on-disk harness-config bundle env layer, captured for per-start
+	// literal delivery and legacy demotion. env_template is read from the
+	// resolved harness config (harness.Resolve below) so warnings and runtime
+	// GetEnv() emission always come from the same resolution.
+	var rawHCBundleEnv map[string]string
+	var hcBundleEnv map[string]string
+	var hcEnvWarnings []string
+	var hcDirUnresolved bool
 	if harnessConfigName != "" {
 		if hcDir, err := resolveHarnessConfigDir(ctx, harnessConfigName, projectDir, templatePaths...); err == nil {
+			// Its volumes are applied below on every start.
+			if opts.HostedMode {
+				if err := CheckHostedHarnessConfig(true, hcDir, m.Runtime.Name()); err != nil {
+					return nil, err
+				}
+			}
 			hcModelAliases = hcDir.Config.ModelAliases
+			rawHCBundleEnv = hcDir.Config.Env
+			hcBundleEnv, _ = BundleEnvLayer(rawHCBundleEnv)
 			if hcDir.Config.Image != "" {
 				fileImage = hcDir.Config.Image
 				util.Debugf("image resolution: on-disk harness-config image=%s path=%s", fileImage, hcDir.Path)
@@ -557,9 +631,11 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			}
 		} else {
 			util.Debugf("image resolution: on-disk harness-config %q not found: %v", harnessConfigName, err)
+			hcDirUnresolved = true
 		}
 	}
 
+	var rawSettingsHCEnv map[string]string
 	if settings != nil && harnessConfigName != "" {
 		// Settings are resolved against startProfile (see above).
 		settingsProfile := startProfile
@@ -573,6 +649,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		}
 		hConfig, err := settings.ResolveHarnessConfig(settingsProfile, harnessConfigName)
 		if err == nil {
+			rawSettingsHCEnv = hConfig.Env
 			imageHConfig := hConfig
 			if imageProfile != settingsProfile {
 				if c, imgErr := settings.ResolveHarnessConfig(imageProfile, harnessConfigName); imgErr == nil {
@@ -634,6 +711,31 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 		if err := runtime.CheckVolumeSources(finalScionCfg.Volumes); err != nil {
 			return nil, err
 		}
+	}
+
+	// Agent's own env (inline/requester env): read from scion-agent.json on
+	// disk rather than from finalScionCfg, which on a first start is the
+	// config ProvisionAgent returned with bundle and settings-hc env merged
+	// in. This ensures first start and restart see the same persisted own env,
+	// bundle env is delivered solely from Start-time resolution, and
+	// scion-agent.json rewrites below never persist bundle or settings-hc env.
+	var ownEnvVars map[string]string
+	if finalScionCfg != nil {
+		ownEnvVars = maps.Clone(finalScionCfg.Env)
+	}
+	if persisted, ok := readPersistedAgentEnv(agentDir); ok {
+		ownEnvVars = persisted
+		if startInlineConfig != nil && len(startInlineConfig.Env) > 0 {
+			if ownEnvVars == nil {
+				ownEnvVars = make(map[string]string, len(startInlineConfig.Env))
+			}
+			for k, v := range startInlineConfig.Env {
+				ownEnvVars[k] = v
+			}
+		}
+	}
+	if finalScionCfg != nil {
+		finalScionCfg = withOwnEnv(finalScionCfg, ownEnvVars)
 	}
 
 	// Limits (ptone/scion#623): the agent's own max_turns, max_model_calls
@@ -746,18 +848,24 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// opts.Template unset (so image and harness-config resolution are
 	// unchanged); the broker hydrates the template and passes its path in
 	// opts.TemplateEnvSource for the template env only.
-	envChain := templateChain
-	if envChain == nil && opts.TemplateEnvSource != "" {
-		if chain, err := config.GetTemplateChainInProject(ctx, opts.TemplateEnvSource, opts.ProjectPath); err == nil {
-			envChain = chain
-		} else {
-			util.Debugf("template env: source %q could not be resolved: %v", opts.TemplateEnvSource, err)
+	var envChain []*config.Template
+	var templateEnv map[string]string
+	var templatesUnresolvable bool
+	if !isShell {
+		envChain = templateChain
+		if envChain == nil && opts.TemplateEnvSource != "" {
+			if chain, err := config.GetTemplateChainInProject(ctx, opts.TemplateEnvSource, opts.ProjectPath); err == nil {
+				envChain = chain
+			} else {
+				util.Debugf("template env: source %q could not be resolved: %v", opts.TemplateEnvSource, err)
+			}
 		}
-	}
-	templateEnv := templateChainEnv(envChain)
-	if envChain == nil && (templateUnresolvable || opts.TemplateEnvSource != "") {
-		if label := templateDisplayName(templateName, provenance, finalScionCfg); label != "" {
-			warnings = append(warnings, fmt.Sprintf("Warning: template %s not found; its env fallback is not applied", label))
+		templateEnv = templateChainEnv(envChain)
+		templatesUnresolvable = envChain == nil && (templateUnresolvable || opts.TemplateEnvSource != "")
+		if templatesUnresolvable {
+			if label := templateDisplayName(templateName, provenance, finalScionCfg); label != "" {
+				warnings = append(warnings, fmt.Sprintf("Warning: template %s not found; its env fallback is not applied", label))
+			}
 		}
 	}
 
@@ -978,6 +1086,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// if any (for restaging capture-auth assets after a bundle clear).
 	var resolvedHCDir *config.HarnessConfigDir
 	var noAuthConfig *config.HarnessNoAuthConfig
+	var resolvedHarnessArgs []string
 	// aliasHarness keys the built-in model-alias fallback
 	// (resolveEffectiveModel): the declared harness of the harness-config
 	// this launch resolved, or the stored name when none was resolved (the
@@ -985,7 +1094,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	aliasHarness := harnessName
 	if harnessConfigName != "" {
 		var resolveTemplatePaths []string
-		if opts.Template != "" && (filepath.IsAbs(opts.Template) || !hydrated) {
+		if !isShell && opts.Template != "" && (filepath.IsAbs(opts.Template) || !hydrated) {
 			tplName := opts.Template
 			if !filepath.IsAbs(tplName) {
 				// For an agent with broker-side image provenance, the
@@ -1068,6 +1177,16 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			h = resolved.Harness
 			aliasHarness = resolved.Config.Harness
 			noAuthConfig = resolved.Config.NoAuthConfig
+			if _, tplWarns := sanitizeHarnessConfigEnv(resolved.Config.EnvTemplate, "env_template", false); len(tplWarns) > 0 {
+				hcEnvWarnings = append(hcEnvWarnings, tplWarns...)
+			}
+			// Scope settings-merged harness args fallback to harnesses that
+			// honour settings-level args (currently only generic) so existing
+			// non-generic harnesses keep their prior command behavior when
+			// settings.yaml carries harness args (ptone/scion#5082).
+			if harness.HonoursSettingsArgs(resolved.Config.Harness) {
+				resolvedHarnessArgs = resolved.Config.Args
+			}
 			resolvedHCDir = resolved.ConfigDir
 			if resolved.ConfigDir != nil {
 				harnessConfigRevision = config.ComputeHarnessConfigRevision(resolved.ConfigDir.Path)
@@ -1210,7 +1329,7 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			var restored []string
 			err := writeAgentHome(ctx, func() error {
 				var restoreErr error
-				restored, restoreErr = restoreSecretsRecord(agentDir, agentHome, agentID, hcIdentity)
+				restored, restoreErr = restoreSecretsRecord(agentDir, agentHome, agentID, hcIdentity, cs.RestorableSecretName)
 				return restoreErr
 			})
 			if err != nil {
@@ -1219,14 +1338,16 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			cs.SetRecordedSecrets(restored)
 		}
 		// Restage the capture-auth assets a non-container-script harness
-		// keeps in the bundle, as ProvisionAgent stages them.
-		if _, isContainerScript := h.(*harness.ContainerScriptHarness); !isContainerScript && resolvedHCDir != nil && resolvedHCDir.Path != "" {
-			if err := writeAgentHome(ctx, func() error {
-				return harness.StageCaptureAuthAssets(agentHome, resolvedHCDir.Path, resolvedHCDir.Config.Auth)
-			}); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: capture-auth asset staging failed: %v\n", err)
-			}
-		}
+		// keeps in the bundle when permitted by the context's harness-config
+		// policy, as ProvisionAgent stages them.
+		stageFallbackCaptureAuthAssets(ctx, opts.Name, h, harnessConfigName, resolvedHCDir, agentHome, func(fn func() error) error {
+			return writeAgentHome(ctx, fn)
+		})
+	}
+	if err := clearDisallowedBundleHooksOnStart(ctx, opts.Name, harnessConfigName, resolvedHCDir, envChain, templatesUnresolvable, agentDir, agentHome, func(fn func() error) error {
+		return writeAgentHome(ctx, fn)
+	}); err != nil {
+		return nil, err
 	}
 
 	// Reconcile the harness bundle for existing agents. Provision() is
@@ -1250,8 +1371,24 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 	// will not fire, so the hook would silently not run — worse than aborting.
 	// Called unconditionally: with an empty script the helper clears any file
 	// staged by an earlier occupant of this agent home.
-	if err := writeAgentHome(ctx, func() error { return harness.WriteProjectPreStartHook(agentHome, opts.ProjectPreStartHookScript) }); err != nil {
+	// Defence in depth (security audit H3 / ptone/scion#8812 I1): shell
+	// execution containers never run a project/hub pre-start hook; forcing an
+	// empty script also removes any stale staged file.
+	preStartHookScript := opts.ProjectPreStartHookScript
+	if harnessConfigName == config.ShellHarnessConfigName || h.Name() == config.ShellHarnessConfigName {
+		preStartHookScript = ""
+	}
+	if err := writeAgentHome(ctx, func() error { return harness.WriteProjectPreStartHook(agentHome, preStartHookScript) }); err != nil {
 		return nil, fmt.Errorf("re-stage project pre-start hook: %w", err)
+	}
+
+	// Stage create-only HomeFiles under .scion/ after the home exists and
+	// before the harness/container starts. Never rewritten on resume, start,
+	// or restart (opts.FreshProvision is false on all non-create paths).
+	if opts.FreshProvision && !opts.Resume && len(opts.HomeFiles) > 0 {
+		if err := writeAgentHome(ctx, func() error { return writeProvisionHomeFiles(agentHome, opts.HomeFiles) }); err != nil {
+			return nil, fmt.Errorf("stage create home files: %w", err)
+		}
 	}
 
 	// Resolve auth metadata for the config-driven env var pipeline.
@@ -1268,10 +1405,16 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 
 	// 3. Resolve credentials via new auth pipeline
 
+	// Snapshot caller/hub env before settings-declared harness-config env is
+	// merged into opts.Env so provenance distinguishes caller-supplied keys.
+	callerEnv := maps.Clone(opts.Env)
+
 	// Inject settings-declared env into opts.Env and build the auth overlay.
 	// Extracted so the injection-then-overlay sequence is testable without
-	// standing up a full agent; see resolveAuthEnvOverlay.
-	authEnvOverlay, droppedBrokerEnvVars := resolveAuthEnvOverlay(&opts, settings, profileName, harnessConfigName)
+	// standing up a full agent; see resolveAuthEnvOverlayWithPolicy.
+	authEnvOverlay, droppedBrokerEnvVars, settingsHCEnv, settingsHCWarnings := resolveAuthEnvOverlayWithPolicy(&opts, settings, profileName, harnessConfigName)
+	warnings = append(warnings, hcEnvWarnings...)
+	warnings = append(warnings, settingsHCWarnings...)
 
 	// Agents created in no-auth mode persist auth_selectedType "none". The
 	// start, restart, resume and wake paths may reach here without NoAuth
@@ -1370,7 +1513,12 @@ func (m *AgentManager) Start(ctx context.Context, opts api.StartOptions) (*api.A
 			// Record the staged secret files auth-candidates.json references,
 			// so later starts restore exactly these.
 			if cs, isContainerScript := h.(*harness.ContainerScriptHarness); isContainerScript {
-				if err := recordSecrets(agentDir, agentHome, cs.StagedSecretNames(), hcIdentity); err != nil {
+				if _, err := recordSecrets(agentDir, agentHome, agentID, recordUpdate{
+					Names:          cs.StagedSecretNames(),
+					Current:        hcIdentity,
+					FreshSatisfied: cs.FreshResolutionSatisfiedAuth(),
+					Allow:          cs.RestorableSecretName,
+				}); err != nil {
 					return nil, fmt.Errorf("record harness secrets: %w", err)
 				}
 				// On the broker, fail the start here, before any container
@@ -1458,6 +1606,18 @@ authDone:
 		opts.HarnessAuth = ""
 	}
 
+	// Reject a generic harness start whose command would be empty before
+	// pulling images, writing credentials, or creating any runtime resource
+	// (ptone/scion#5082). Checked before modelCommandArgs so --model alone
+	// cannot stand in for a command; skipped when no-auth mode runs its own
+	// shell command instead of the harness.
+	if !noAuthModeActive(opts.NoAuth, noAuthConfig) && h != nil {
+		preTask, preCmdArgs := resolveBaseCommandInputs(finalScionCfg, resolvedHarnessArgs, task)
+		if err := harness.ValidateCommand(h, preTask, harnessResume(opts), preCmdArgs); err != nil {
+			return nil, err
+		}
+	}
+
 	// 4. Launch container
 	detached := true
 
@@ -1470,13 +1630,22 @@ authDone:
 	}
 
 	exists, err := m.Runtime.ImageExists(ctx, resolvedImage)
+	if err != nil {
+		var lf *runtime.LaunchFailure
+		if errors.As(err, &lf) {
+			return nil, err
+		}
+	}
 	if err != nil || !exists {
 		if err := m.Runtime.PullImage(ctx, resolvedImage); err != nil {
 			return nil, fmt.Errorf("failed to pull image '%s': %w", resolvedImage, err)
 		}
 	}
 
-	template := agentTemplateDisplayName(opts.TemplateName, finalScionCfg)
+	template := ""
+	if !isShell {
+		template = agentTemplateDisplayName(opts.TemplateName, finalScionCfg)
+	}
 
 	if opts.Env == nil {
 		opts.Env = make(map[string]string)
@@ -1721,7 +1890,7 @@ authDone:
 			finalScionCfg = &api.ScionConfig{}
 		}
 		finalScionCfg.AuthSelectedType = opts.HarnessAuth
-		cfgData, marshalErr := json.MarshalIndent(withLimits(withEnvironment(persistableAgentConfig(finalScionCfg, agentOwnTelemetry), ownEnv), ownLimits), "", "  ")
+		cfgData, marshalErr := json.MarshalIndent(withOwnEnv(withLimits(withEnvironment(persistableAgentConfig(finalScionCfg, agentOwnTelemetry), ownEnv), ownLimits), ownEnvVars), "", "  ")
 		if marshalErr != nil {
 			return nil, fmt.Errorf("failed to marshal agent config: %w", marshalErr)
 		}
@@ -1732,7 +1901,7 @@ authDone:
 	} else if finalScionCfg != nil && harness.IsHarnessImplementationName(finalScionCfg.AuthSelectedType) {
 		// Active corruption repair: clear the corrupted value and rewrite.
 		finalScionCfg.AuthSelectedType = ""
-		cfgData, marshalErr := json.MarshalIndent(withLimits(withEnvironment(persistableAgentConfig(finalScionCfg, agentOwnTelemetry), ownEnv), ownLimits), "", "  ")
+		cfgData, marshalErr := json.MarshalIndent(withOwnEnv(withLimits(withEnvironment(persistableAgentConfig(finalScionCfg, agentOwnTelemetry), ownEnv), ownLimits), ownEnvVars), "", "  ")
 		if marshalErr != nil {
 			return nil, fmt.Errorf("failed to marshal repaired agent config: %w", marshalErr)
 		}
@@ -1807,7 +1976,24 @@ authDone:
 	suppressedFallbackKeys := sortedKeys(templateFallbackSuppressedKeys(authMeta))
 	envCfg, demotedTemplateKeys := demoteLegacyTemplateEnv(finalScionCfg, templateEnv)
 	warnings = append(warnings, suppressedDemotedKeyWarnings(demotedTemplateKeys, suppressedFallbackKeys)...)
-	agentEnv, envWarnings, missingEnvKeys, droppedConfigEnv := buildAgentEnv(envCfg, opts.Env, api.HubAgentDefaultsFromContext(ctx).DefaultEnv(), opts.BrokerMode)
+	envCfg, _ = demoteLegacyHarnessConfigEnv(envCfg, rawHCBundleEnv, hcBundleEnv, rawSettingsHCEnv, settingsHCEnv)
+	var inlineEnv map[string]string
+	if opts.InlineConfig != nil {
+		inlineEnv = opts.InlineConfig.Env
+	}
+	agentEnv, envWarnings, missingEnvKeys, droppedConfigEnv := buildTrackedAgentEnv(
+		rawHCBundleEnv,
+		envCfg,
+		opts.Env,
+		settingsHCEnv,
+		callerEnv,
+		inlineEnv,
+		api.HubAgentDefaultsFromContext(ctx).DefaultEnv(),
+		opts.BrokerMode,
+	)
+	if hcDirUnresolved && finalScionCfg != nil && len(finalScionCfg.Env) > 0 {
+		warnings = append(warnings, fmt.Sprintf("Warning: harness-config %q could not be resolved at start; persisted env provenance cannot be verified.", harnessConfigName))
+	}
 	droppedBrokerEnvVars = append(droppedBrokerEnvVars, droppedConfigEnv...)
 	hubOnlyEnvWarnings := warnDroppedBrokerEnv(agentID, opts.Env, droppedBrokerEnvVars)
 	warnings = append(warnings, hubOnlyEnvWarnings...)
@@ -1830,13 +2016,14 @@ authDone:
 	// (opts.ExtraHosts, colocatedExtraHosts) and the runtime bridge mapping
 	// build them, so the hub transport check below may read them; RunConfig
 	// uses this same list.
-	runExtraHosts := mergeExtraHosts(opts.ExtraHosts, runtime.BridgeExtraHosts(m.Runtime.Name(), agentEnv))
+	agentEnvSnapshot := agentEnv.Slice()
+	runExtraHosts := mergeExtraHosts(opts.ExtraHosts, runtime.BridgeExtraHosts(m.Runtime.Name(), agentEnvSnapshot))
 
 	// Hub endpoint transport policy, on the final env (after the agent-level
 	// hub config, the config env layer and host networking's rewrite), before
 	// any container work: an agent is never started with a hub endpoint that
 	// would carry its hub credential unencrypted off the container's host.
-	if err := checkAgentHubTransport(opts.Name, m.Runtime.Name(), runExtraHosts, agentEnv); err != nil {
+	if err := checkAgentHubTransport(opts.Name, m.Runtime.Name(), runExtraHosts, agentEnvSnapshot); err != nil {
 		slog.Warn("Start: refusing agent start: unencrypted hub endpoint that is not host-local",
 			"agent", opts.Name, "runtime", m.Runtime.Name())
 		return nil, err
@@ -1845,7 +2032,7 @@ authDone:
 	// Host networking and the GCP metadata mode: refuse assign, warn the
 	// user for block. Decided on the merged env, before any container work.
 	var relayedWarnings []string
-	hostNetWarning, hostNetErr := checkHostNetworkMetadata(opts.Name, m.Runtime.Name(), networkMode, agentEnv)
+	hostNetWarning, hostNetErr := checkHostNetworkMetadata(opts.Name, m.Runtime.Name(), networkMode, agentEnvSnapshot)
 	if hostNetErr != nil {
 		slog.Warn("Start: refusing agent start: GCP metadata mode under host networking",
 			"agent", opts.Name, "runtime", m.Runtime.Name(), "network_mode", networkMode,
@@ -1863,7 +2050,7 @@ authDone:
 	// a warning: in the container sciontool logs a failed telemetry start
 	// and runs the agent anyway (cmd/sciontool/commands/init.go), so a
 	// start that worked without telemetry must not fail here.
-	if err := config.ValidateTelemetryEnv(agentEnv); err != nil {
+	if err := config.ValidateTelemetryEnv(agentEnvSnapshot); err != nil {
 		warnings = append(warnings, fmt.Sprintf("Warning: %v; with cloud telemetry export configured, the agent starts without telemetry", err))
 	}
 
@@ -2215,6 +2402,14 @@ authDone:
 		// with server.project_storage gets the warning too.
 		warnK8sWorkspaceBackendDropped(m.Runtime.Name(), settings.Server.EffectiveWorkspaceStorage(), nil)
 		if backend.Name() == "nfs" {
+			// Defense-in-depth: local container runtimes (Docker, Podman, Apple
+			// container) do not support worktree-per-agent on shared (NFS)
+			// storage. Refuse before any NFS leaf creation or workspace
+			// overwrite so agents never silently share the project root
+			// (ptone/scion#8646).
+			if err := checkLocalContainerNFSWorktree(m.Runtime.Name(), emptyPerAgent, opts.Env, opts.Name); err != nil {
+				return nil, err
+			}
 			// A broker only warns about invalid workspace_storage at
 			// startup, so check the ids here, before any leaf directory
 			// is created on the export and before the runtime uses them
@@ -2272,7 +2467,7 @@ authDone:
 					slog.Info("workspace_storage nfs: "+reason, "agent", opts.Name)
 					agentDirName, agentBranch = "", ""
 					opts.Env["SCION_WORKSPACE_MODE"] = string(store.SharingModeSharedPlain)
-					agentEnv = withEnvValue(agentEnv, "SCION_WORKSPACE_MODE", string(store.SharingModeSharedPlain))
+					agentEnv.Set("SCION_WORKSPACE_MODE", string(store.SharingModeSharedPlain), envOriginBrokerSystem)
 				}
 			}
 			// A Cloud Run clone-per-agent agent mounts its own workspace
@@ -2284,7 +2479,7 @@ authDone:
 				if keep, reason := cloudRunKeepSharedCheckout(opts.FreshProvision, agentDir, resolvedWorkspace, api.Slugify(opts.Name)); keep {
 					slog.Info("workspace_storage nfs: "+reason, "agent", opts.Name)
 					opts.Env["SCION_WORKSPACE_MODE"] = string(store.SharingModeSharedPlain)
-					agentEnv = withEnvValue(agentEnv, "SCION_WORKSPACE_MODE", string(store.SharingModeSharedPlain))
+					agentEnv.Set("SCION_WORKSPACE_MODE", string(store.SharingModeSharedPlain), envOriginBrokerSystem)
 				} else {
 					recordCloudRunAgentWorkspace(agentDir, opts.Name)
 				}
@@ -2397,6 +2592,20 @@ authDone:
 		}
 	}
 
+	// A worktree-per-agent Kubernetes start that got no NFS workspace
+	// backend clones the project inside its container (possibly shallow):
+	// label it clone-per-agent, the workspace it actually gets, so guidance
+	// keyed on the mode does not promise worktree semantics and full history
+	// (ptone/scion#7906). The broker keeps worktree-per-agent on Kubernetes
+	// for nfsWorktreeSelection above. Every placement decision is already
+	// made here, and without a backend workspacePlacementFor reports local
+	// whatever the mode. An NFS start that selected no worktree (an agent
+	// name that is not a slug, or no mountable pod share) keeps its label.
+	if k8sWorktreeCloneFallback(m.Runtime.Name(), workspaceBackendName, emptyPerAgent, opts) {
+		opts.Env["SCION_WORKSPACE_MODE"] = string(store.SharingModeClonePerAgent)
+		agentEnv.Set("SCION_WORKSPACE_MODE", string(store.SharingModeClonePerAgent), envOriginBrokerSystem)
+	}
+
 	// The workspace backend above (NFS/cloudrun/gke) can replace
 	// effectiveWorkspace with a backend-managed path — real for
 	// worktree-per-agent when server.workspace_storage.backend is
@@ -2460,6 +2669,7 @@ authDone:
 		Share:         nfsPodShare,
 		ClonePerAgent: opts.GitClone != nil && store.ResolveWorkspaceSharingMode(opts.Env["SCION_WORKSPACE_MODE"]) == store.SharingModeClonePerAgent,
 		AgentDirName:  nfsAgentDirName,
+		Ephemeral:     opts.Persistence.IsEphemeral(),
 	})
 
 	// Kubernetes shared-dir PVC defaults from settings: the profile's value,
@@ -2527,17 +2737,16 @@ authDone:
 	// SCION_LAUNCH_ID carries the same value as the run label, so the
 	// container's env and label cannot disagree. Any value from the
 	// request or template env is replaced.
-	agentEnv = withLaunchIDEnv(agentEnv, runID)
+	agentEnv.Set(envLaunchID, runID, envOriginBrokerSystem)
 	// Only the caller's SCION_WORKSPACE_GIT reaches the container env; a
 	// value any merged layer added is removed (see dispatchWorkspaceGit).
-	agentEnv = enforceWorkspaceGitEnv(agentEnv, dispatchWorkspaceGit, dispatchWorkspaceGitSet)
+	enforceWorkspaceGitTracked(agentEnv, dispatchWorkspaceGit, dispatchWorkspaceGitSet)
 
 	// In no-auth mode the harness-config's no-auth env (its bundle's
-	// no-auth-env.yaml) joins the container env; api-key and auth-file
-	// starts never carry it.
+	// no-auth-env.yaml) joins the container env with envOriginNoAuthHC;
+	// api-key and auth-file starts never carry it.
 	noAuthActive := noAuthModeActive(opts.NoAuth, noAuthConfig)
-	var noAuthEnvWarnings []string
-	agentEnv, noAuthEnvWarnings = applyNoAuthEnv(agentEnv, noAuthConfig, noAuthActive, opts.Name)
+	noAuthEnvWarnings := applyNoAuthEnvTracked(agentEnv, noAuthConfig, noAuthActive, opts.Name)
 	warnings = append(warnings, noAuthEnvWarnings...)
 
 	// The template env layer is never part of agentEnv: it travels as
@@ -2548,11 +2757,38 @@ authDone:
 	templateFallbackEnv, templateEnvFallbackWarnings := templateEnvFallback(templateEnv, opts.BrokerMode, opts.Name)
 	warnings = append(warnings, templateEnvFallbackWarnings...)
 
+	// When resuming without an explicit task, replace the hardcoded generic
+	// resume prompt with a status-aware notice for harnesses that declare
+	// task_flag (antigravity, gemini-cli, copilot, opencode). Non-task_flag
+	// harnesses (claude, codex, grok-build, pi, ...) stay promptless
+	// (ptone/scion#8900).
+	if opts.Resume && task == "" && opts.PriorStatus != nil && harnessUsesTaskFlag(h, finalScionCfg) {
+		task = harness.ResumePromptForPriorStatus(opts.PriorStatus)
+		priorStatusNotice = true
+	}
+
 	// Write the full task to the agent home, and pass a short pointer to
 	// it instead when the task is too large to pass inline.
 	task, err = deliverTaskFile(agentHome, task)
 	if err != nil {
 		return nil, err
+	}
+	// Tell sciontool init whether this start has a task, for its
+	// first-turn watchdog. An inherited value is always replaced.
+	// A prior-status notice is not an initial task (ptone/scion#8900).
+	if task != "" && !priorStatusNotice {
+		agentEnv.Set(envInitialTask, "1", envOriginBrokerSystem)
+	} else {
+		agentEnv.Delete(envInitialTask)
+	}
+
+	// When create-time HomeFiles wrote the trigger event file (or the Hub
+	// advertised SCION_TRIGGER_EVENT_FILE for a trigger-dispatched agent),
+	// set or override it with the resolved container home path for unixUsername
+	// (Hub decides that the file exists; Broker decides where home is).
+	if (opts.FreshProvision && !opts.Resume && hasHomeFile(opts.HomeFiles, api.TriggerEventHomeFilePath)) ||
+		agentEnv.Has(api.EnvTriggerEventFile) {
+		agentEnv.Set(api.EnvTriggerEventFile, resolvedTriggerEventFilePath(unixUsername), envOriginBrokerSystem)
 	}
 
 	// The container-script provisioner reads the manifest inside the
@@ -2615,6 +2851,7 @@ authDone:
 	if err != nil {
 		return nil, err
 	}
+	finalAgentEnv := agentEnv.Slice()
 	runCfg := runtime.RunConfig{
 		Name:                   containerName(projectName, opts.Name),
 		PrivateGitConfigSource: privateGitConfigSource,
@@ -2670,29 +2907,17 @@ authDone:
 		GitCloneForInit:  nfsInitGitClone(opts),
 		TelemetryEnabled: telemetryEnabled,
 		Task: func() string {
-			// When task_flag is set, task is delivered via CommandArgs instead
-			if finalScionCfg != nil && finalScionCfg.TaskFlag != "" {
-				return ""
-			}
-			return task
+			runTask, _ := resolveBaseCommandInputs(finalScionCfg, resolvedHarnessArgs, task)
+			return runTask
 		}(),
 		CommandArgs: func() []string {
-			var args []string
-			if finalScionCfg != nil {
-				args = finalScionCfg.CommandArgs
-			}
+			_, baseArgs := resolveBaseCommandInputs(finalScionCfg, resolvedHarnessArgs, task)
 			// The model flag comes before user args, from the same
 			// effective model as SCION_MODEL.
-			args = modelCommandArgs(effectiveModel, args)
-			if finalScionCfg != nil {
-				// If task_flag is configured, append task as a flag value
-				if finalScionCfg.TaskFlag != "" && task != "" {
-					args = append(args, finalScionCfg.TaskFlag, task)
-				}
-			}
-			return args
+			return modelCommandArgs(effectiveModel, baseArgs)
 		}(),
-		Env:             agentEnv,
+		Env:             finalAgentEnv,
+		HookWithheldEnv: agentEnv.HarnessConfigKeys(),
 		ResolvedSecrets: opts.ResolvedSecrets,
 
 		FallbackEnv:            templateFallbackEnv,
@@ -2817,8 +3042,9 @@ authDone:
 			return ""
 		}(),
 		Debug:                util.DebugEnabled(),
-		Resume:               opts.Resume,
-		MetadataInterception: metadataInterceptionGranted(m.Runtime.Name(), networkMode, agentEnv),
+		Resume:               harnessResume(opts),
+		Persistence:          opts.Persistence,
+		MetadataInterception: metadataInterceptionGranted(m.Runtime.Name(), networkMode, finalAgentEnv),
 		ExtraHosts:           runExtraHosts,
 		NetworkMode:          networkMode,
 		Labels: func() map[string]string {
@@ -2830,6 +3056,11 @@ authDone:
 				"scion.harness_auth":   opts.HarnessAuth,
 				"agent_id":             agentID,
 				api.LabelRunID:         runID,
+			}
+			// The agent's sciontool registers deliver-message: its
+			// deliveries may go over conduit (conduit_deliver.go).
+			if launchedWithConduitDeliver(finalAgentEnv) {
+				l[LabelConduitDeliver] = "true"
 			}
 			for k, v := range projectkeys.ProjectNameLabels(projectName) {
 				l[k] = v
@@ -2964,10 +3195,20 @@ authDone:
 		}
 	}
 
-	// Fetch fresh info and verify the container is actually running
-	allAgents, err := m.listRuntime(ctx, map[string]string{"scion.name": slug})
+	// Fetch fresh info and verify the container is actually running.
+	// Scope the query to this project when projectID is known (so runtimes
+	// such as Substrate do not trip their cross-project ambiguity guard when
+	// two projects run the same agent name).
+	postRunFilter := map[string]string{"scion.name": slug}
+	if projectID != "" {
+		postRunFilter["scion.project_id"] = projectID
+	}
+	allAgents, err := m.listRuntime(ctx, postRunFilter)
 	if err == nil {
-		for _, a := range allAgents {
+		matchID := scopeProjectID(projectID, projectDir)
+		var found *api.AgentInfo
+		for i := range allAgents {
+			a := allAgents[i]
 			// An entry of another run is never this start's container, so
 			// it is neither reported, failed nor deleted here
 			// (ptone/scion#7289): a runtime with a deterministic instance
@@ -2976,53 +3217,59 @@ authDone:
 			if !postRunEntryOfRun(a, runID) {
 				continue
 			}
-			matched := a.ContainerID == id || strings.EqualFold(a.Name, opts.Name)
-			// An owned (flat instance) manager matches by name only within
-			// the agent's project, never another project's same-named agent.
-			if matched && m.owner != nil && a.ContainerID != id && !matchAgentProject(a, projectName, scopeProjectID(projectID, projectDir)) {
-				matched = false
+			// Keep the exact ContainerID == id match first, because Docker's
+			// Run returns a long ID while its listing returns a short one.
+			if a.ContainerID == id {
+				found = &allAgents[i]
+				break
 			}
-			if matched {
-				// Check if the container has already exited
-				if a.Phase == string(state.PhaseStopped) || a.Phase == string(state.PhaseError) || a.Phase == string(state.PhaseHalted) {
-					// Try to get logs for diagnosis
-					logs, _ := m.Runtime.GetLogs(ctx, id)
-					_ = m.Runtime.Delete(ctx, runtime.RunRef{ID: id, RunID: runID})
-					// Record the failed start as the Run error path does, so
-					// list shows error rather than the pre-run phase. The
-					// container is gone, so the host write keeps the
-					// ptone/scion#4766 invariant (no host write while the
-					// container may read the file).
-					if recErr := setStartFailedRunID(RunOwnerTargetFor(opts), runID); recErr != nil {
-						slog.Warn("Start: failed to record the failed start in the host state file",
-							"agent", opts.Name, "run_id", runID, "error", recErr)
-					}
-					if updateErr := UpdateAgentConfig(opts.Name, opts.ProjectPath, string(state.PhaseError), m.Runtime.Name(), profileName); updateErr != nil {
-						util.Debugf("Start: failed to mark agent error in local config: %v", updateErr)
-					}
-					return nil, fmt.Errorf("container started but exited immediately (status: %s). Container logs:\n%s", a.ContainerStatus, logs)
-				}
-				a.Detached = detached
-				a.Warnings = warnings
-				a.HubOnlyEnvWarnings = hubOnlyEnvWarnings
-				a.RelayedWarnings = relayedWarnings
-				a.StartNotice = startNotice
-				a.Phase = successPhase
-				a.HarnessConfig = harnessConfigName
-				a.HarnessConfigRevision = harnessConfigRevision
-				a.HarnessConfigSource = harnessConfigSource
-				// The effective configuration the hub records (WP1 slice 3).
-				a.Harness = launchedHarness
-				a.Model = effectiveModel
-				a.ConfigResolved = true
-				if th := startedTemplateHash(provenance, finalScionCfg); th != "" {
-					a.TemplateHash = th
-				}
-				a.HarnessAuth = opts.HarnessAuth
-				a.Profile = profileName
-				a.WorkspacePlacement = workspacePlacement
-				return &a, nil
+			// Name fallback is always project-scoped (ptone/scion#8240):
+			// never match another project's same-named agent.
+			if found == nil && strings.EqualFold(a.Name, opts.Name) && matchAgentProject(a, projectName, matchID) {
+				found = &allAgents[i]
 			}
+		}
+		if found != nil {
+			a := *found
+			// Check if the container has already exited
+			if a.Phase == string(state.PhaseStopped) || a.Phase == string(state.PhaseError) || a.Phase == string(state.PhaseHalted) {
+				// Try to get logs for diagnosis
+				logs, _ := m.Runtime.GetLogs(ctx, id)
+				_ = m.Runtime.Delete(ctx, runtime.RunRef{ID: id, RunID: runID})
+				// Record the failed start as the Run error path does, so
+				// list shows error rather than the pre-run phase. The
+				// container is gone, so the host write keeps the
+				// ptone/scion#4766 invariant (no host write while the
+				// container may read the file).
+				if recErr := setStartFailedRunID(RunOwnerTargetFor(opts), runID); recErr != nil {
+					slog.Warn("Start: failed to record the failed start in the host state file",
+						"agent", opts.Name, "run_id", runID, "error", recErr)
+				}
+				if updateErr := UpdateAgentConfig(opts.Name, opts.ProjectPath, string(state.PhaseError), m.Runtime.Name(), profileName); updateErr != nil {
+					util.Debugf("Start: failed to mark agent error in local config: %v", updateErr)
+				}
+				return nil, fmt.Errorf("container started but exited immediately (status: %s). Container logs:\n%s", a.ContainerStatus, logs)
+			}
+			a.Detached = detached
+			a.Warnings = warnings
+			a.HubOnlyEnvWarnings = hubOnlyEnvWarnings
+			a.RelayedWarnings = relayedWarnings
+			a.StartNotice = startNotice
+			a.Phase = successPhase
+			a.HarnessConfig = harnessConfigName
+			a.HarnessConfigRevision = harnessConfigRevision
+			a.HarnessConfigSource = harnessConfigSource
+			// The effective configuration the hub records (WP1 slice 3).
+			a.Harness = launchedHarness
+			a.Model = effectiveModel
+			a.ConfigResolved = true
+			if th := startedTemplateHash(provenance, finalScionCfg); th != "" {
+				a.TemplateHash = th
+			}
+			a.HarnessAuth = opts.HarnessAuth
+			a.Profile = profileName
+			a.WorkspacePlacement = workspacePlacement
+			return &a, nil
 		}
 	}
 
@@ -3051,6 +3298,13 @@ authDone:
 	}, nil
 }
 
+// harnessResume reports whether the harness is launched with its resume
+// flag: on a resume, except for an ephemeral agent, whose session is never
+// kept and so always starts fresh (ptone/scion#7780).
+func harnessResume(opts api.StartOptions) bool {
+	return opts.Resume && !opts.Persistence.IsEphemeral()
+}
+
 // workspacePlacementInput is what a start resolved about its workspace.
 type workspacePlacementInput struct {
 	// Backend is the workspace backend that served the workspace ("" for
@@ -3067,6 +3321,9 @@ type workspacePlacementInput struct {
 	// AgentDirName is the agent's own directory on the export, when one
 	// was chosen (clone-per-agent and empty-per-agent on Kubernetes).
 	AgentDirName string
+	// Ephemeral is true for an agent with ephemeral persistence: its
+	// workspace is instance-local whatever the backend.
+	Ephemeral bool
 }
 
 // exportMountingRuntimes are the non-Kubernetes runtimes that mount the nfs
@@ -3096,7 +3353,7 @@ var exportMountingRuntimes = map[string]bool{
 // in its own agent directory, which also needs the share. Other runtimes count only when
 // listed in exportMountingRuntimes.
 func workspacePlacementFor(in workspacePlacementInput) string {
-	if in.Backend != "nfs" {
+	if in.Ephemeral || in.Backend != "nfs" {
 		return api.WorkspacePlacementLocal
 	}
 	if isKubernetesRuntime(in.Runtime) {
@@ -3132,6 +3389,11 @@ func workspacePlacementFor(in workspacePlacementInput) string {
 // The writes are confined to the agent home (pkg/agenthome), through one
 // handle opened on the home: a link at the token file or its temp file is
 // replaced, never written through, and a linked .scion is refused.
+const (
+	agentTokenFileRel    = ".scion/scion-token"
+	agentTokenTmpFileRel = ".scion/scion-token.tmp"
+)
+
 func writeAgentTokenFile(agentHome, token string) error {
 	scionDir := filepath.Join(agentHome, ".scion")
 	home, err := agenthome.OpenCreate(agentHome, 0700)
@@ -3143,17 +3405,16 @@ func writeAgentTokenFile(agentHome, token string) error {
 		return fmt.Errorf("create agent token directory %s: %w", scionDir, err)
 	}
 
-	const tokenRel, tmpRel = ".scion/scion-token", ".scion/scion-token.tmp"
-	tokenPath := filepath.Join(scionDir, "scion-token")
-	tmp := tokenPath + ".tmp"
-	if err := home.WriteFile(tmpRel, []byte(token), 0600); err != nil {
-		_ = home.Remove(tmpRel)
+	tokenPath := filepath.Join(agentHome, filepath.FromSlash(agentTokenFileRel))
+	tmp := filepath.Join(agentHome, filepath.FromSlash(agentTokenTmpFileRel))
+	if err := home.WriteFile(agentTokenTmpFileRel, []byte(token), 0600); err != nil {
+		_ = home.Remove(agentTokenTmpFileRel)
 		return fmt.Errorf("write agent token file %s: %w", tmp, err)
 	}
-	if err := home.Rename(tmpRel, tokenRel); err != nil {
+	if err := home.Rename(agentTokenTmpFileRel, agentTokenFileRel); err != nil {
 		// Best effort: the temp file holds the credential, so leaving it behind
 		// on a path we are about to abort on is worse than a lost error here.
-		_ = home.Remove(tmpRel)
+		_ = home.Remove(agentTokenTmpFileRel)
 		return fmt.Errorf("install agent token file %s from %s: %w", tokenPath, tmp, err)
 	}
 
@@ -3246,7 +3507,7 @@ func removeAgentTokenFile(agentHome string) error {
 		return err
 	}
 	defer func() { _ = home.Close() }()
-	for _, rel := range []string{".scion/scion-token.tmp", ".scion/scion-token"} {
+	for _, rel := range []string{agentTokenTmpFileRel, agentTokenFileRel} {
 		if err := home.Remove(rel); err != nil {
 			return err
 		}
@@ -3994,7 +4255,69 @@ func containerName(projectName, agentName string) string {
 // when the key is absent from the merged env or has an empty value, i.e. when
 // no layer would otherwise put it in the container.
 func buildAgentEnv(scionCfg *api.ScionConfig, extraEnv map[string]string, defaultEnv map[string]string, brokerMode bool) (env []string, warnings []string, missingKeys []string, dropped []droppedBrokerEnv) {
+	tracked, warnings, missingKeys, dropped := buildTrackedAgentEnv(nil, scionCfg, extraEnv, nil, extraEnv, nil, defaultEnv, brokerMode)
+	return tracked.Slice(), warnings, missingKeys, dropped
+}
+
+// buildAgentEnvWithBundle merges the per-start literal harness-config bundle
+// env layer (rawBundleEnv, evaluated via BundleEnvLayer), the agent's own
+// persisted config layer (scionCfg.Env), extraEnv (opts.Env, which carries
+// hub/caller env plus settings-hc env for absent keys), and defaultEnv (hub
+// defaults fill) in ascending precedence:
+//
+//	bundleEnv < scionCfg.Env < extraEnv < defaultEnv (fills absent/empty only)
+//
+// Retained for direct unit tests that inspect the slice and origin map.
+func buildAgentEnvWithBundle(rawBundleEnv map[string]string, scionCfg *api.ScionConfig, extraEnv map[string]string, defaultEnv map[string]string, brokerMode bool) (env []string, warnings []string, missingKeys []string, dropped []droppedBrokerEnv, provenance map[string]envOrigin) {
+	tracked, warnings, missingKeys, dropped := buildTrackedAgentEnv(rawBundleEnv, scionCfg, extraEnv, nil, extraEnv, nil, defaultEnv, brokerMode)
+	provenance = make(map[string]envOrigin, len(tracked.entries))
+	for k, ent := range tracked.entries {
+		provenance[k] = ent.origin
+	}
+	return tracked.Slice(), warnings, missingKeys, dropped, provenance
+}
+
+// buildTrackedAgentEnv merges the broker-side container env layers into a
+// trackedAgentEnv whose entries carry their exact winning envOrigin:
+//
+//	bundleEnv < scionCfg.Env < extraEnv (callerEnv + settingsHCEnv + broker SCION_*) < defaultEnv (fills absent/empty only)
+//
+// Persisted scionCfg.Env keys that are declared in the live bundle and not
+// overridden by callerEnv or inlineEnv receive envOriginLegacyHC so non-demoted
+// legacy bundle keys stay withheld from hooks. Keys in extraEnv that came from
+// settingsHCEnv (absent or empty in callerEnv) receive envOriginSettingsHC.
+func buildTrackedAgentEnv(
+	rawBundleEnv map[string]string,
+	scionCfg *api.ScionConfig,
+	extraEnv map[string]string,
+	settingsHCEnv map[string]string,
+	callerEnv map[string]string,
+	inlineEnv map[string]string,
+	defaultEnv map[string]string,
+	brokerMode bool,
+) (env *trackedAgentEnv, warnings []string, missingKeys []string, dropped []droppedBrokerEnv) {
 	combined := make(map[string]string)
+	origins := make(map[string]envOrigin)
+
+	var bundleEntries map[string]string
+	if len(rawBundleEnv) > 0 {
+		var bundleWarnings []string
+		bundleEntries, bundleWarnings = BundleEnvLayer(rawBundleEnv)
+		warnings = append(warnings, bundleWarnings...)
+		for _, k := range sortedKeys(bundleEntries) {
+			v := bundleEntries[k]
+			if skipBrokerLocalEnvKey(brokerMode, k) {
+				dropped = append(dropped, droppedBrokerEnv{Key: k, Value: v, Layer: envLayerConfig})
+				continue
+			}
+			if brokerMode && k == "SCION_AUTH_TOKEN" {
+				warnings = append(warnings, ignoredAuthTokenWarning)
+				continue
+			}
+			combined[k] = v
+			origins[k] = envOriginBundle
+		}
+	}
 
 	if scionCfg != nil && scionCfg.Env != nil {
 		for k, v := range scionCfg.Env {
@@ -4007,6 +4330,11 @@ func buildAgentEnv(scionCfg *api.ScionConfig, extraEnv map[string]string, defaul
 			}
 
 			if expandedKey == "" {
+				continue
+			}
+			if config.IsReservedLifecycleEnvKey(expandedKey) {
+				slog.Warn("ignoring reserved lifecycle environment variable in agent config", "key", expandedKey)
+				warnings = append(warnings, fmt.Sprintf("Warning: ignoring %s: reserved for container lifecycle initialization", expandedKey))
 				continue
 			}
 			if skipBrokerLocalEnvKey(brokerMode, expandedKey) {
@@ -4042,23 +4370,43 @@ func buildAgentEnv(scionCfg *api.ScionConfig, extraEnv map[string]string, defaul
 				continue
 			}
 			combined[expandedKey] = expandedValue
+			origin := envOriginConfigOwn
+			if _, declared := bundleEntries[expandedKey]; declared {
+				if callerEnv[expandedKey] == "" && inlineEnv[expandedKey] == "" {
+					origin = envOriginLegacyHC
+				}
+			}
+			origins[expandedKey] = origin
 		}
 	}
-	// Add extraEnv
+	// Add extraEnv (opts.Env: callerEnv + settingsHCEnv for absent keys +
+	// broker-set SCION_* / telemetry keys).
 	for k, v := range extraEnv {
 		combined[k] = v
+		origin := envOriginCaller
+		if _, fromSettings := settingsHCEnv[k]; fromSettings && callerEnv[k] == "" {
+			origin = envOriginSettingsHC
+		}
+		origins[k] = origin
 	}
-	// Lowest tier: fill only what no layer above set.
+	// Lowest tier: fill only what no layer above set. When k has a
+	// harness-publishable hint equivalent (e.g. SCION_AUTO_EXPOSE_PORTS ->
+	// HARNESS_HINT_AUTO_EXPOSE_PORTS) that is already set, skip the lower-tier
+	// hub default so it does not shadow the harness hint in container readers.
 	for k, v := range defaultEnv {
 		if brokerMode && k == "SCION_AUTH_TOKEN" {
 			continue
 		}
+		if hint, ok := envpolicy.LegacyHarnessHint(k); ok && combined[hint] != "" {
+			continue
+		}
 		if combined[k] == "" {
 			combined[k] = v
+			origins[k] = envOriginDefault
 		}
 	}
 
-	agentEnv := []string{}
+	tracked := newTrackedAgentEnv()
 	for k, v := range combined {
 		if v == "" && skipBrokerLocalEnvKey(brokerMode, k) {
 			continue
@@ -4068,10 +4416,10 @@ func buildAgentEnv(scionCfg *api.ScionConfig, extraEnv map[string]string, defaul
 			warnings = append(warnings, fmt.Sprintf("Warning: Environment variable '%s' has no value and will be omitted.", k))
 			continue
 		}
-		agentEnv = append(agentEnv, fmt.Sprintf("%s=%s", k, v))
+		tracked.Set(k, v, origins[k])
 	}
 	sortDroppedBrokerEnv(dropped)
-	return agentEnv, warnings, missingKeys, dropped
+	return tracked, warnings, missingKeys, dropped
 }
 
 // refuseHostEnvForAgent reports whether the host env value of name must never
@@ -4143,6 +4491,66 @@ func withLaunchIDEnv(env []string, runID string) []string {
 	return append(out, envLaunchID+"="+runID)
 }
 
+// isPriorStatusCompleted reports whether prior records a completed previous run.
+func isPriorStatusCompleted(prior *api.PriorStatus) bool {
+	return prior != nil && strings.EqualFold(strings.TrimSpace(prior.Activity), string(state.ActivityCompleted))
+}
+
+// formatPriorCompletionNotice builds the notice passed to a freshly started or
+// restarted harness when the agent's previous run completed (ptone/scion#8900).
+func formatPriorCompletionNotice(prior *api.PriorStatus) string {
+	var b strings.Builder
+	b.WriteString("Your previous run completed")
+	if prior != nil {
+		if !prior.At.IsZero() {
+			b.WriteString(" at ")
+			b.WriteString(prior.At.UTC().Format(time.RFC3339))
+		}
+		if summary := strings.TrimSpace(prior.Summary); summary != "" {
+			b.WriteString(" (")
+			b.WriteString(summary)
+			b.WriteString(")")
+		}
+	}
+	b.WriteString(". Wait for new instructions; do not restart the original task unless instructed.")
+	return b.String()
+}
+
+// harnessUsesTaskFlag reports whether h or cfg declares a task_flag (the
+// harnesses that inject a synthetic resume prompt on resume=true, task="").
+func harnessUsesTaskFlag(h api.Harness, cfg *api.ScionConfig) bool {
+	if cfg != nil && cfg.TaskFlag != "" {
+		return true
+	}
+	if tf, ok := h.(interface{ HasTaskFlag() bool }); ok {
+		return tf.HasTaskFlag()
+	}
+	return false
+}
+
+// envInitialTask is the container env variable set to "1" when the agent
+// starts with a task. sciontool init runs its first-turn watchdog only
+// then (ptone/scion#7858): a task-less or resumed start waits for input
+// and rightly sends no turn event.
+const envInitialTask = "SCION_INITIAL_TASK"
+
+// withInitialTaskEnv returns env with every SCION_INITIAL_TASK entry
+// removed and, when hasTask, SCION_INITIAL_TASK=1 appended. A value from
+// the request, a template or a stored env never reaches the container: the
+// variable describes this start only.
+func withInitialTaskEnv(env []string, hasTask bool) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, envInitialTask+"=") {
+			out = append(out, kv)
+		}
+	}
+	if hasTask {
+		out = append(out, envInitialTask+"=1")
+	}
+	return out
+}
+
 // resolveAuthEnvOverlay injects settings-declared env vars into opts.Env and
 // returns the auth overlay that GatherAuthWithEnv consumes. It is the exact
 // sequence Start runs at the point auth resolution begins, extracted so it can
@@ -4151,6 +4559,15 @@ func withLaunchIDEnv(env []string, runID string) []string {
 // For a broker-mode start, hub-only keys (see IsHubOnlyEnvKey) in the
 // harness-config entry are not merged; they are returned in dropped instead.
 func resolveAuthEnvOverlay(opts *api.StartOptions, settings *config.VersionedSettings, profileName, harnessConfigName string) (overlay map[string]string, dropped []droppedBrokerEnv) {
+	overlay, dropped, _, _ = resolveAuthEnvOverlayWithPolicy(opts, settings, profileName, harnessConfigName)
+	return overlay, dropped
+}
+
+// resolveAuthEnvOverlayWithPolicy injects sanitized settings-declared
+// harness-config env vars into opts.Env and returns the auth overlay, any
+// dropped hub-only broker env entries, the sanitized settings harness-config
+// env map (for hook-env provenance), and any SCION_* policy warnings.
+func resolveAuthEnvOverlayWithPolicy(opts *api.StartOptions, settings *config.VersionedSettings, profileName, harnessConfigName string) (overlay map[string]string, dropped []droppedBrokerEnv, settingsHCEnv map[string]string, hcWarnings []string) {
 	// Inject harness-config env into opts.Env BEFORE the auth overlay is built,
 	// so GatherAuthWithEnv can see credentials the harness config declares
 	// (GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_REGION, ...).
@@ -4164,19 +4581,39 @@ func resolveAuthEnvOverlay(opts *api.StartOptions, settings *config.VersionedSet
 	// Profile env is fully retired — profiles.<p>.env was removed from both
 	// the struct and the JSON schema (G3-full). This reads the harness config
 	// only. See design §0.3.
-	if settings != nil && harnessConfigName != "" {
+	if settings != nil && harnessConfigName != "" && harnessConfigName != config.ShellHarnessConfigName {
 		if hcEntry, err := settings.ResolveHarnessConfig(profileName, harnessConfigName); err == nil && len(hcEntry.Env) > 0 {
-			if opts.Env == nil {
-				opts.Env = make(map[string]string)
-			}
+			// Check hub-only broker keys first so broker-mode accounting and
+			// warnings stay accurate even for SCION_* hub-only keys (e.g.
+			// SCION_GIT_TOKEN_REMOTE, SCION_GIT_CLONE_URL).
+			nonHubOnly := make(map[string]string, len(hcEntry.Env))
+			var droppedReserved []string
 			for k, v := range hcEntry.Env {
 				if skipBrokerLocalEnvKey(opts.BrokerMode, k) {
 					dropped = append(dropped, droppedBrokerEnv{Key: k, Value: v, Layer: envLayerHarnessConfigEntry})
 					continue
 				}
-				if _, exists := opts.Env[k]; !exists { // never clobber hub-supplied values
-					opts.Env[k] = v
+				if config.IsReservedLifecycleEnvKey(k) {
+					droppedReserved = append(droppedReserved, k)
 				}
+				nonHubOnly[k] = v
+			}
+			sanitized, warns := sanitizeHarnessConfigEnv(nonHubOnly, "settings", false)
+			hcWarnings = append(hcWarnings, warns...)
+			settingsHCEnv = sanitized
+			if len(sanitized) > 0 {
+				if opts.Env == nil {
+					opts.Env = make(map[string]string)
+				}
+				for k, v := range sanitized {
+					if _, exists := opts.Env[k]; !exists { // never clobber hub-supplied values
+						opts.Env[k] = v
+					}
+				}
+			}
+			slices.Sort(droppedReserved)
+			for _, k := range droppedReserved {
+				slog.Warn("ignoring reserved lifecycle environment variable in harness-config", "key", k)
 			}
 		}
 	}
@@ -4185,7 +4622,7 @@ func resolveAuthEnvOverlay(opts *api.StartOptions, settings *config.VersionedSet
 	// Build a temporary auth overlay from resolved env-type secrets so auth
 	// resolution can detect credentials without mutating opts.Env (which is
 	// later projected into the container environment).
-	return buildAuthEnvOverlay(opts.Env, opts.ResolvedSecrets), dropped
+	return buildAuthEnvOverlay(opts.Env, opts.ResolvedSecrets), dropped, settingsHCEnv, hcWarnings
 }
 
 // buildAuthEnvOverlay creates an auth-only view of the environment by layering
@@ -4422,27 +4859,7 @@ func configAuthEnvKeySet(authMeta *config.HarnessAuthMetadata) map[string]struct
 // It is deliberately wider than configAuthEnvKeySet, which drives Start's
 // auth-env filtering and must not change with it.
 func templateFallbackSuppressedKeys(authMeta *config.HarnessAuthMetadata) map[string]struct{} {
-	if authMeta == nil {
-		return nil
-	}
-	keys := make(map[string]struct{})
-	for k := range configAuthEnvKeySet(authMeta) {
-		keys[k] = struct{}{}
-	}
-	for _, authType := range authMeta.Types {
-		for _, req := range authType.RequiredFiles {
-			for _, k := range req.AlternativeEnvKeys {
-				keys[k] = struct{}{}
-			}
-		}
-	}
-	for k := range authMeta.Autodetect.Env {
-		keys[k] = struct{}{}
-	}
-	if len(keys) == 0 {
-		return nil
-	}
-	return keys
+	return harness.DeclaredAuthEnvKeys(authMeta)
 }
 
 func authFileKind(name, target string) string {
@@ -4582,6 +4999,25 @@ func resolveEffectiveModel(envModel string, cfg *api.ScionConfig, hcAliases map[
 		}
 	}
 	return model
+}
+
+// resolveBaseCommandInputs computes the task and non-model command arguments
+// passed to Harness.GetCommand: cfg.CommandArgs (falling back to harnessArgs
+// when empty), plus cfg.TaskFlag and task when task_flag is configured.
+func resolveBaseCommandInputs(cfg *api.ScionConfig, harnessArgs []string, task string) (runTask string, args []string) {
+	if cfg != nil {
+		args = append(args, cfg.CommandArgs...)
+	}
+	if len(args) == 0 && len(harnessArgs) > 0 {
+		args = append(args, harnessArgs...)
+	}
+	if cfg != nil && cfg.TaskFlag != "" {
+		if task != "" {
+			args = append(args, cfg.TaskFlag, task)
+		}
+		return "", args
+	}
+	return task, args
 }
 
 // modelCommandArgs prepends the harness model flag for model to args. It

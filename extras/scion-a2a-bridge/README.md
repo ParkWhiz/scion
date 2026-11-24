@@ -63,7 +63,7 @@ docker run -p 8443:8443 -p 9090:9090 \
 | `/projects/{project}/agents/{agent}/jsonrpc` | POST | A2A JSON-RPC endpoint |
 | `/healthz` | GET | Liveness check |
 | `/readyz` | GET | Readiness check (database, broker) |
-| `/metrics` | GET | Prometheus metrics (restrict access — see Security) |
+| `/metrics` | GET | Prometheus metrics (authenticated — see Security) |
 
 ### Supported JSON-RPC methods
 
@@ -77,9 +77,43 @@ docker run -p 8443:8443 -p 9090:9090 \
 - `tasks/pushNotification/get` — list webhooks for a task
 - `tasks/pushNotification/delete` — remove a webhook
 
-## TLS
+## TLS and reverse proxy
 
-The A2A server listens on plain HTTP. **TLS must be terminated at a reverse proxy** (e.g. Caddy, nginx, or a cloud load balancer) in front of the bridge. The bridge logs a `WARN` at startup as a reminder. Do not expose the bridge port directly to the internet without a TLS-terminating proxy.
+The A2A server listens on plain HTTP (`:8443` by default). **TLS must be terminated at a reverse proxy** (e.g. Caddy, nginx, or a cloud load balancer) in front of the bridge. The bridge logs a `WARN` at startup as a reminder. Do not expose the bridge port or the broker plugin RPC port (`localhost:9090`) directly to the internet without a TLS-terminating proxy and network restrictions.
+
+> **Warning — Path collisions when co-hosting with the Scion Hub:** Both the Scion Hub Web Dashboard and the A2A Protocol Bridge serve routes under `/projects/*` (as well as `/.well-known/*`, `/healthz`, `/readyz`, and `/metrics`). **Do not route `/projects/*` on the Hub's hostname directly to the bridge.** Direct browser links and page refreshes to Hub project pages (`/projects/...`) carry browser session cookies rather than A2A credentials, so the bridge rejects them with `401 Unauthorized` instead of loading the Web Dashboard.
+
+When co-hosting the bridge and the Hub behind Caddy on the same host, use either a separate hostname (recommended) or a stripped path prefix:
+
+### Separate hostname (recommended)
+
+```caddy
+hub.example.com {
+    reverse_proxy localhost:8080
+}
+
+a2a.example.com {
+    reverse_proxy localhost:8443
+}
+```
+
+Set `bridge.external_url` (and **External URL** in **Admin > Integrations > A2A Bridge**, if configured in the Admin UI) to `https://a2a.example.com`.
+
+### Distinct path prefix on the same hostname
+
+```caddy
+hub.example.com {
+    handle_path /a2a/* {
+        reverse_proxy localhost:8443
+    }
+
+    handle {
+        reverse_proxy localhost:8080
+    }
+}
+```
+
+Use `handle_path /a2a/*` (not `handle /a2a/*`) so Caddy strips `/a2a` before forwarding to `:8443`, and set `bridge.external_url` (and **External URL** in the Admin UI, if set) to `https://hub.example.com/a2a` so generated Agent Cards and rewritten OIDC `jwks_uri` links include the `/a2a` prefix. Point A2A clients at `https://hub.example.com/a2a/projects/<project>/agents/<agent>` (root-level `/.well-known/*` on `hub.example.com` remains served by the Hub).
 
 ## Ports
 
@@ -120,6 +154,8 @@ Changes saved via the admin UI take effect immediately on the running bridge —
 `hubBearer` (Google credential pass-through) and `geGoogle` (Google credential exchange — **deprecated and scheduled for removal in a future release; it continues to work until then**) are not offered in the **Auth scheme** dropdown. Configure either one via the `auth.scheme` key in `scion-a2a-bridge.yaml` instead — see `scion-a2a-bridge.yaml.sample` for the `hubBearer` block. `hubBearer` forwards the caller's Google credential to the Hub verbatim: no Hub-issued token to cache or refresh, and the Hub re-checks the user (including suspension) on every request.
 
 `hubBearer`/`geGoogle` set in YAML can't be overridden from the admin UI, and neither can any other scheme the dropdown doesn't offer (for example `federation`): saving A2A integration settings pushes the dropdown's `auth_scheme` value, but a scheme not offered in that dropdown is pinned and the push is ignored. The bridge logs a `WARN` naming both the YAML and the pushed scheme the first time this happens, and `DEBUG` for repeats of the same pair. (Bridges built before this protection was added should be upgraded; on those, the admin UI has no way to remove a previously pushed `auth_scheme` on its own.)
+
+Under `auth.scheme: "federation"`, federation agent callers may start new tasks to existing agents with `SendMessage` and `SendStreamingMessage` (without a `taskId`); message delivery is authenticated by the Scion Hub (the bridge does not verify agent token signatures locally and does not auto-provision agents for federation callers). Bridge-local task routes and operations that reference an existing task (`GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, push-notification configuration routes, `GetExtendedAgentCard`, and `SendMessage`/`SendStreamingMessage` with a `taskId`, across both JSON-RPC and v0 REST) are not available for federation agent callers and return a permission-denied error (`403` / JSON-RPC `-31403`). Federated user callers (project visitors verified with the Hub) keep full access to their own task routes.
 
 ### Project and agent exposure
 
@@ -464,7 +500,14 @@ By default the broker plugin RPC binds to loopback only. Setting `plugin.allow_r
 
 ### `/metrics` endpoint
 
-The `/metrics` endpoint requires the same API key authentication as other non-public endpoints. Prometheus scrapers must include the API key in their scrape configuration (e.g., via `authorization` or `headers` in the Prometheus job config). If this is undesirable, consider running a dedicated metrics listener on a separate port restricted to internal networks.
+The `/metrics` endpoint enforces the bridge's configured authentication scheme (`auth.scheme`), matching other non-public endpoints, and is subject to the bridge's standard rate limiting. Prometheus scrapers must supply credentials matching `auth.scheme`:
+
+- **`bearer`, `hubUAT`, `hubBearer`, `hubJWT`, `geGoogle`**: send `Authorization: Bearer <token>` (for example, via Prometheus's `authorization` block in the scrape job config).
+- **`apiKey`**: send `X-API-Key: <key>` (standard Prometheus `authorization` sends `Authorization`; use `bearer`, a scraper that supports custom headers, or an internal proxy). When `auth.scheme` is unset, either `X-API-Key` or `Authorization: Bearer` is accepted.
+- **`federation`**: `/metrics` fails closed (`403 Forbidden`) under the federation scheme.
+- **`none`**: open (unauthenticated), matching all other endpoints when authentication is explicitly disabled.
+
+If authenticating scrapers through the configured A2A scheme is undesirable (or when using `federation`), consider running a dedicated metrics listener on a separate port restricted to internal networks.
 
 ### Rate limiting and `trust_proxy`
 

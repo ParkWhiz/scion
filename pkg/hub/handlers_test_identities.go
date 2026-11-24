@@ -816,7 +816,14 @@ func (s *Server) handleCreateTestIdentity(w http.ResponseWriter, r *http.Request
 		if err := s.testIdentities.hooks.syncGrants(ctx, tx, u.ID, u.Role, testIdentityGrantsCreatedBy); err != nil {
 			return fmt.Errorf("sync hub role grants: %w", err)
 		}
-		token, expiresIn, err = s.userTokenService.MintAccessTokenWithTTL(u.ID, u.Email, u.DisplayName, u.Role, u.SessionGeneration, ClientTypeAPI, tokenTTL)
+		token, expiresIn, err = s.userTokenService.MintAccessTokenWithTTL(UserTokenSubject{
+			UserID:            u.ID,
+			Email:             u.Email,
+			DisplayName:       u.DisplayName,
+			Role:              u.Role,
+			SessionGeneration: u.SessionGeneration,
+			ClientType:        ClientTypeAPI,
+		}, tokenTTL)
 		if err != nil {
 			return fmt.Errorf("issue token: %w", err)
 		}
@@ -1022,7 +1029,14 @@ func (s *Server) handleIssueTestIdentityToken(w http.ResponseWriter, r *http.Req
 				return err
 			}
 		}
-		token, expiresIn, err = s.userTokenService.MintAccessTokenWithTTL(u.ID, u.Email, u.DisplayName, u.Role, u.SessionGeneration, ClientTypeAPI, tokenTTL)
+		token, expiresIn, err = s.userTokenService.MintAccessTokenWithTTL(UserTokenSubject{
+			UserID:            u.ID,
+			Email:             u.Email,
+			DisplayName:       u.DisplayName,
+			Role:              u.Role,
+			SessionGeneration: u.SessionGeneration,
+			ClientType:        ClientTypeAPI,
+		}, tokenTTL)
 		if err != nil {
 			return fmt.Errorf("issue token: %w", err)
 		}
@@ -1487,6 +1501,8 @@ func (s *Server) fixtureLeftoverIssuer(ctx context.Context, rootID string) (stri
 	for _, stamps := range [][]store.FixtureProvenance{
 		fixtureStamps(set.Agents, func(a store.Agent) store.FixtureProvenance { return a.Fixture }),
 		fixtureStamps(set.Schedules, func(sc store.Schedule) store.FixtureProvenance { return sc.Fixture }),
+		fixtureStamps(set.Triggers, func(tr store.Trigger) store.FixtureProvenance { return tr.Fixture }),
+		fixtureStamps(set.WebhookEndpoints, func(ep store.WebhookEndpoint) store.FixtureProvenance { return ep.Fixture }),
 		fixtureStamps(set.Groups, func(g store.Group) store.FixtureProvenance { return g.Fixture }),
 		fixtureStamps(set.Projects, func(p store.Project) store.FixtureProvenance { return p.Fixture }),
 	} {

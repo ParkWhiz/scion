@@ -11,6 +11,7 @@ import (
 	"entgo.io/ent"
 	"entgo.io/ent/dialect/sql"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsuspendscreen"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/project"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
@@ -65,6 +66,8 @@ type Agent struct {
 	RuntimeState string `json:"runtime_state,omitempty"`
 	// StalledFromActivity holds the value of the "stalled_from_activity" field.
 	StalledFromActivity string `json:"stalled_from_activity,omitempty"`
+	// SuspendReason holds the value of the "suspend_reason" field.
+	SuspendReason *string `json:"suspend_reason,omitempty"`
 	// CurrentTurns holds the value of the "current_turns" field.
 	CurrentTurns int `json:"current_turns,omitempty"`
 	// CurrentModelCalls holds the value of the "current_model_calls" field.
@@ -111,6 +114,10 @@ type Agent struct {
 	LastSeen *time.Time `json:"last_seen,omitempty"`
 	// LastActivityEvent holds the value of the "last_activity_event" field.
 	LastActivityEvent *time.Time `json:"last_activity_event,omitempty"`
+	// LastLiveProcessAt holds the value of the "last_live_process_at" field.
+	LastLiveProcessAt *time.Time `json:"last_live_process_at,omitempty"`
+	// LastLiveWorkAt holds the value of the "last_live_work_at" field.
+	LastLiveWorkAt *time.Time `json:"last_live_work_at,omitempty"`
 	// StartedAt holds the value of the "started_at" field.
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	// DeletedAt holds the value of the "deleted_at" field.
@@ -211,6 +218,12 @@ type Agent struct {
 	StartClaimLaunchID string `json:"start_claim_launch_id,omitempty"`
 	// SoftDeleteOpID holds the value of the "soft_delete_op_id" field.
 	SoftDeleteOpID *string `json:"soft_delete_op_id,omitempty"`
+	// ActivitySince holds the value of the "activity_since" field.
+	ActivitySince *time.Time `json:"activity_since,omitempty"`
+	// LastDeliveryAt holds the value of the "last_delivery_at" field.
+	LastDeliveryAt *time.Time `json:"last_delivery_at,omitempty"`
+	// IdleSuspendClaimUntil holds the value of the "idle_suspend_claim_until" field.
+	IdleSuspendClaimUntil *time.Time `json:"idle_suspend_claim_until,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
 	// The values are being populated by the AgentQuery when eager-loading is set.
 	Edges        AgentEdges `json:"edges"`
@@ -229,9 +242,11 @@ type AgentEdges struct {
 	Holds []*AgentHold `json:"holds,omitempty"`
 	// ReportedRuns holds the value of the reported_runs edge.
 	ReportedRuns []*BrokerReportedRun `json:"reported_runs,omitempty"`
+	// SuspendScreen holds the value of the suspend_screen edge.
+	SuspendScreen *AgentSuspendScreen `json:"suspend_screen,omitempty"`
 	// loadedTypes holds the information for reporting if a
 	// type was loaded (or requested) in eager-loading or not.
-	loadedTypes [5]bool
+	loadedTypes [6]bool
 }
 
 // ProjectOrErr returns the Project value or an error if the edge
@@ -281,6 +296,17 @@ func (e AgentEdges) ReportedRunsOrErr() ([]*BrokerReportedRun, error) {
 	return nil, &NotLoadedError{edge: "reported_runs"}
 }
 
+// SuspendScreenOrErr returns the SuspendScreen value or an error if the edge
+// was not loaded in eager-loading, or loaded but was not found.
+func (e AgentEdges) SuspendScreenOrErr() (*AgentSuspendScreen, error) {
+	if e.SuspendScreen != nil {
+		return e.SuspendScreen, nil
+	} else if e.loadedTypes[5] {
+		return nil, &NotFoundError{label: agentsuspendscreen.Label}
+	}
+	return nil, &NotLoadedError{edge: "suspend_screen"}
+}
+
 // scanValues returns the types for scanning values from sql.Rows.
 func (*Agent) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
@@ -294,9 +320,9 @@ func (*Agent) scanValues(columns []string) ([]any, error) {
 			values[i] = new(sql.NullBool)
 		case agent.FieldExitCode, agent.FieldCurrentTurns, agent.FieldCurrentModelCalls, agent.FieldStateVersion, agent.FieldGeneration, agent.FieldLaunchSeq, agent.FieldDeletionClaim:
 			values[i] = new(sql.NullInt64)
-		case agent.FieldSlug, agent.FieldName, agent.FieldTemplate, agent.FieldStatus, agent.FieldMessageMode, agent.FieldPhase, agent.FieldActivity, agent.FieldToolName, agent.FieldConnectionState, agent.FieldContainerStatus, agent.FieldExitReason, agent.FieldRuntimeState, agent.FieldStalledFromActivity, agent.FieldImage, agent.FieldRuntime, agent.FieldRuntimeBrokerID, agent.FieldWorkspacePlacement, agent.FieldPinnedRuntimeBrokerID, agent.FieldPinnedRuntimeTargetID, agent.FieldPinnedRuntimeTargetType, agent.FieldTaskSummary, agent.FieldMessage, agent.FieldAppliedConfig, agent.FieldEffectiveConfig, agent.FieldPendingConfig, agent.FieldHarnessConfig, agent.FieldReincarnationState, agent.FieldLaunchID, agent.FieldLaunchRunID, agent.FieldRunID, agent.FieldSSHHostKey, agent.FieldSSHHostKeyRunID, agent.FieldLaunchState, agent.FieldLaunchEndReason, agent.FieldLaunchKind, agent.FieldLaunchOwner, agent.FieldLaunchStep, agent.FieldLaunchError, agent.FieldLaunchCause, agent.FieldLaunchPriorPhase, agent.FieldLaunchResumePhase, agent.FieldDeletionState, agent.FieldDeletionCode, agent.FieldDeletionError, agent.FieldDeletionPrior, agent.FieldDeletionRequest, agent.FieldRunIntent, agent.FieldStartClaimID, agent.FieldStartClaimKind, agent.FieldStartClaimState, agent.FieldStartClaimOwner, agent.FieldStartClaimTarget, agent.FieldStartClaimLaunchID, agent.FieldSoftDeleteOpID:
+		case agent.FieldSlug, agent.FieldName, agent.FieldTemplate, agent.FieldStatus, agent.FieldMessageMode, agent.FieldPhase, agent.FieldActivity, agent.FieldToolName, agent.FieldConnectionState, agent.FieldContainerStatus, agent.FieldExitReason, agent.FieldRuntimeState, agent.FieldStalledFromActivity, agent.FieldSuspendReason, agent.FieldImage, agent.FieldRuntime, agent.FieldRuntimeBrokerID, agent.FieldWorkspacePlacement, agent.FieldPinnedRuntimeBrokerID, agent.FieldPinnedRuntimeTargetID, agent.FieldPinnedRuntimeTargetType, agent.FieldTaskSummary, agent.FieldMessage, agent.FieldAppliedConfig, agent.FieldEffectiveConfig, agent.FieldPendingConfig, agent.FieldHarnessConfig, agent.FieldReincarnationState, agent.FieldLaunchID, agent.FieldLaunchRunID, agent.FieldRunID, agent.FieldSSHHostKey, agent.FieldSSHHostKeyRunID, agent.FieldLaunchState, agent.FieldLaunchEndReason, agent.FieldLaunchKind, agent.FieldLaunchOwner, agent.FieldLaunchStep, agent.FieldLaunchError, agent.FieldLaunchCause, agent.FieldLaunchPriorPhase, agent.FieldLaunchResumePhase, agent.FieldDeletionState, agent.FieldDeletionCode, agent.FieldDeletionError, agent.FieldDeletionPrior, agent.FieldDeletionRequest, agent.FieldRunIntent, agent.FieldStartClaimID, agent.FieldStartClaimKind, agent.FieldStartClaimState, agent.FieldStartClaimOwner, agent.FieldStartClaimTarget, agent.FieldStartClaimLaunchID, agent.FieldSoftDeleteOpID:
 			values[i] = new(sql.NullString)
-		case agent.FieldCreated, agent.FieldUpdated, agent.FieldLastSeen, agent.FieldLastActivityEvent, agent.FieldStartedAt, agent.FieldDeletedAt, agent.FieldReincarnationUpdatedAt, agent.FieldRunIDUpdatedAt, agent.FieldLaunchDeadline, agent.FieldLaunchLastReportAt, agent.FieldDeletionLeaseAt, agent.FieldDeletionStartedAt, agent.FieldDeletionFailedAt, agent.FieldRunIntentAt, agent.FieldRunIntentMarkedAt, agent.FieldStartClaimAt, agent.FieldStartClaimLeaseUntil, agent.FieldStartClaimUnconfirmedAt, agent.FieldStartClaimHoldUntil:
+		case agent.FieldCreated, agent.FieldUpdated, agent.FieldLastSeen, agent.FieldLastActivityEvent, agent.FieldLastLiveProcessAt, agent.FieldLastLiveWorkAt, agent.FieldStartedAt, agent.FieldDeletedAt, agent.FieldReincarnationUpdatedAt, agent.FieldRunIDUpdatedAt, agent.FieldLaunchDeadline, agent.FieldLaunchLastReportAt, agent.FieldDeletionLeaseAt, agent.FieldDeletionStartedAt, agent.FieldDeletionFailedAt, agent.FieldRunIntentAt, agent.FieldRunIntentMarkedAt, agent.FieldStartClaimAt, agent.FieldStartClaimLeaseUntil, agent.FieldStartClaimUnconfirmedAt, agent.FieldStartClaimHoldUntil, agent.FieldActivitySince, agent.FieldLastDeliveryAt, agent.FieldIdleSuspendClaimUntil:
 			values[i] = new(sql.NullTime)
 		case agent.FieldID, agent.FieldProjectID:
 			values[i] = new(uuid.UUID)
@@ -462,6 +488,13 @@ func (_m *Agent) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.StalledFromActivity = value.String
 			}
+		case agent.FieldSuspendReason:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field suspend_reason", values[i])
+			} else if value.Valid {
+				_m.SuspendReason = new(string)
+				*_m.SuspendReason = value.String
+			}
 		case agent.FieldCurrentTurns:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
 				return fmt.Errorf("unexpected type %T for field current_turns", values[i])
@@ -609,6 +642,20 @@ func (_m *Agent) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.LastActivityEvent = new(time.Time)
 				*_m.LastActivityEvent = value.Time
+			}
+		case agent.FieldLastLiveProcessAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field last_live_process_at", values[i])
+			} else if value.Valid {
+				_m.LastLiveProcessAt = new(time.Time)
+				*_m.LastLiveProcessAt = value.Time
+			}
+		case agent.FieldLastLiveWorkAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field last_live_work_at", values[i])
+			} else if value.Valid {
+				_m.LastLiveWorkAt = new(time.Time)
+				*_m.LastLiveWorkAt = value.Time
 			}
 		case agent.FieldStartedAt:
 			if value, ok := values[i].(*sql.NullTime); !ok {
@@ -930,6 +977,27 @@ func (_m *Agent) assignValues(columns []string, values []any) error {
 				_m.SoftDeleteOpID = new(string)
 				*_m.SoftDeleteOpID = value.String
 			}
+		case agent.FieldActivitySince:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field activity_since", values[i])
+			} else if value.Valid {
+				_m.ActivitySince = new(time.Time)
+				*_m.ActivitySince = value.Time
+			}
+		case agent.FieldLastDeliveryAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field last_delivery_at", values[i])
+			} else if value.Valid {
+				_m.LastDeliveryAt = new(time.Time)
+				*_m.LastDeliveryAt = value.Time
+			}
+		case agent.FieldIdleSuspendClaimUntil:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field idle_suspend_claim_until", values[i])
+			} else if value.Valid {
+				_m.IdleSuspendClaimUntil = new(time.Time)
+				*_m.IdleSuspendClaimUntil = value.Time
+			}
 		default:
 			_m.selectValues.Set(columns[i], values[i])
 		}
@@ -966,6 +1034,11 @@ func (_m *Agent) QueryHolds() *AgentHoldQuery {
 // QueryReportedRuns queries the "reported_runs" edge of the Agent entity.
 func (_m *Agent) QueryReportedRuns() *BrokerReportedRunQuery {
 	return NewAgentClient(_m.config).QueryReportedRuns(_m)
+}
+
+// QuerySuspendScreen queries the "suspend_screen" edge of the Agent entity.
+func (_m *Agent) QuerySuspendScreen() *AgentSuspendScreenQuery {
+	return NewAgentClient(_m.config).QuerySuspendScreen(_m)
 }
 
 // Update returns a builder for updating this Agent.
@@ -1067,6 +1140,11 @@ func (_m *Agent) String() string {
 	builder.WriteString("stalled_from_activity=")
 	builder.WriteString(_m.StalledFromActivity)
 	builder.WriteString(", ")
+	if v := _m.SuspendReason; v != nil {
+		builder.WriteString("suspend_reason=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
 	builder.WriteString("current_turns=")
 	builder.WriteString(fmt.Sprintf("%v", _m.CurrentTurns))
 	builder.WriteString(", ")
@@ -1145,6 +1223,16 @@ func (_m *Agent) String() string {
 	builder.WriteString(", ")
 	if v := _m.LastActivityEvent; v != nil {
 		builder.WriteString("last_activity_event=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.LastLiveProcessAt; v != nil {
+		builder.WriteString("last_live_process_at=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.LastLiveWorkAt; v != nil {
+		builder.WriteString("last_live_work_at=")
 		builder.WriteString(v.Format(time.ANSIC))
 	}
 	builder.WriteString(", ")
@@ -1332,6 +1420,21 @@ func (_m *Agent) String() string {
 	if v := _m.SoftDeleteOpID; v != nil {
 		builder.WriteString("soft_delete_op_id=")
 		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	if v := _m.ActivitySince; v != nil {
+		builder.WriteString("activity_since=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.LastDeliveryAt; v != nil {
+		builder.WriteString("last_delivery_at=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.IdleSuspendClaimUntil; v != nil {
+		builder.WriteString("idle_suspend_claim_until=")
+		builder.WriteString(v.Format(time.ANSIC))
 	}
 	builder.WriteByte(')')
 	return builder.String()

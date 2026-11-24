@@ -95,6 +95,11 @@ func ChoiceLabel(v string) predicate.DecisionAnswer {
 	return predicate.DecisionAnswer(sql.FieldEQ(FieldChoiceLabel, v))
 }
 
+// OtherText applies equality check predicate on the "other_text" field. It's identical to OtherTextEQ.
+func OtherText(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldEQ(FieldOtherText, v))
+}
+
 // AnsweredByUserID applies equality check predicate on the "answered_by_user_id" field. It's identical to AnsweredByUserIDEQ.
 func AnsweredByUserID(v string) predicate.DecisionAnswer {
 	return predicate.DecisionAnswer(sql.FieldEQ(FieldAnsweredByUserID, v))
@@ -108,6 +113,11 @@ func AnsweredByName(v string) predicate.DecisionAnswer {
 // AnsweredByEmail applies equality check predicate on the "answered_by_email" field. It's identical to AnsweredByEmailEQ.
 func AnsweredByEmail(v string) predicate.DecisionAnswer {
 	return predicate.DecisionAnswer(sql.FieldEQ(FieldAnsweredByEmail, v))
+}
+
+// DismissReason applies equality check predicate on the "dismiss_reason" field. It's identical to DismissReasonEQ.
+func DismissReason(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldEQ(FieldDismissReason, v))
 }
 
 // InterpretedByAgentID applies equality check predicate on the "interpreted_by_agent_id" field. It's identical to InterpretedByAgentIDEQ.
@@ -575,6 +585,81 @@ func ChoiceLabelContainsFold(v string) predicate.DecisionAnswer {
 	return predicate.DecisionAnswer(sql.FieldContainsFold(FieldChoiceLabel, v))
 }
 
+// OtherTextEQ applies the EQ predicate on the "other_text" field.
+func OtherTextEQ(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldEQ(FieldOtherText, v))
+}
+
+// OtherTextNEQ applies the NEQ predicate on the "other_text" field.
+func OtherTextNEQ(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldNEQ(FieldOtherText, v))
+}
+
+// OtherTextIn applies the In predicate on the "other_text" field.
+func OtherTextIn(vs ...string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldIn(FieldOtherText, vs...))
+}
+
+// OtherTextNotIn applies the NotIn predicate on the "other_text" field.
+func OtherTextNotIn(vs ...string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldNotIn(FieldOtherText, vs...))
+}
+
+// OtherTextGT applies the GT predicate on the "other_text" field.
+func OtherTextGT(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldGT(FieldOtherText, v))
+}
+
+// OtherTextGTE applies the GTE predicate on the "other_text" field.
+func OtherTextGTE(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldGTE(FieldOtherText, v))
+}
+
+// OtherTextLT applies the LT predicate on the "other_text" field.
+func OtherTextLT(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldLT(FieldOtherText, v))
+}
+
+// OtherTextLTE applies the LTE predicate on the "other_text" field.
+func OtherTextLTE(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldLTE(FieldOtherText, v))
+}
+
+// OtherTextContains applies the Contains predicate on the "other_text" field.
+func OtherTextContains(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldContains(FieldOtherText, v))
+}
+
+// OtherTextHasPrefix applies the HasPrefix predicate on the "other_text" field.
+func OtherTextHasPrefix(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldHasPrefix(FieldOtherText, v))
+}
+
+// OtherTextHasSuffix applies the HasSuffix predicate on the "other_text" field.
+func OtherTextHasSuffix(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldHasSuffix(FieldOtherText, v))
+}
+
+// OtherTextIsNil applies the IsNil predicate on the "other_text" field.
+func OtherTextIsNil() predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldIsNull(FieldOtherText))
+}
+
+// OtherTextNotNil applies the NotNil predicate on the "other_text" field.
+func OtherTextNotNil() predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldNotNull(FieldOtherText))
+}
+
+// OtherTextEqualFold applies the EqualFold predicate on the "other_text" field.
+func OtherTextEqualFold(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldEqualFold(FieldOtherText, v))
+}
+
+// OtherTextContainsFold applies the ContainsFold predicate on the "other_text" field.
+func OtherTextContainsFold(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldContainsFold(FieldOtherText, v))
+}
+
 // AnsweredByUserIDEQ applies the EQ predicate on the "answered_by_user_id" field.
 func AnsweredByUserIDEQ(v string) predicate.DecisionAnswer {
 	return predicate.DecisionAnswer(sql.FieldEQ(FieldAnsweredByUserID, v))
@@ -818,6 +903,81 @@ func OutcomeIn(vs ...Outcome) predicate.DecisionAnswer {
 // OutcomeNotIn applies the NotIn predicate on the "outcome" field.
 func OutcomeNotIn(vs ...Outcome) predicate.DecisionAnswer {
 	return predicate.DecisionAnswer(sql.FieldNotIn(FieldOutcome, vs...))
+}
+
+// DismissReasonEQ applies the EQ predicate on the "dismiss_reason" field.
+func DismissReasonEQ(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldEQ(FieldDismissReason, v))
+}
+
+// DismissReasonNEQ applies the NEQ predicate on the "dismiss_reason" field.
+func DismissReasonNEQ(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldNEQ(FieldDismissReason, v))
+}
+
+// DismissReasonIn applies the In predicate on the "dismiss_reason" field.
+func DismissReasonIn(vs ...string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldIn(FieldDismissReason, vs...))
+}
+
+// DismissReasonNotIn applies the NotIn predicate on the "dismiss_reason" field.
+func DismissReasonNotIn(vs ...string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldNotIn(FieldDismissReason, vs...))
+}
+
+// DismissReasonGT applies the GT predicate on the "dismiss_reason" field.
+func DismissReasonGT(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldGT(FieldDismissReason, v))
+}
+
+// DismissReasonGTE applies the GTE predicate on the "dismiss_reason" field.
+func DismissReasonGTE(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldGTE(FieldDismissReason, v))
+}
+
+// DismissReasonLT applies the LT predicate on the "dismiss_reason" field.
+func DismissReasonLT(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldLT(FieldDismissReason, v))
+}
+
+// DismissReasonLTE applies the LTE predicate on the "dismiss_reason" field.
+func DismissReasonLTE(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldLTE(FieldDismissReason, v))
+}
+
+// DismissReasonContains applies the Contains predicate on the "dismiss_reason" field.
+func DismissReasonContains(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldContains(FieldDismissReason, v))
+}
+
+// DismissReasonHasPrefix applies the HasPrefix predicate on the "dismiss_reason" field.
+func DismissReasonHasPrefix(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldHasPrefix(FieldDismissReason, v))
+}
+
+// DismissReasonHasSuffix applies the HasSuffix predicate on the "dismiss_reason" field.
+func DismissReasonHasSuffix(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldHasSuffix(FieldDismissReason, v))
+}
+
+// DismissReasonIsNil applies the IsNil predicate on the "dismiss_reason" field.
+func DismissReasonIsNil() predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldIsNull(FieldDismissReason))
+}
+
+// DismissReasonNotNil applies the NotNil predicate on the "dismiss_reason" field.
+func DismissReasonNotNil() predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldNotNull(FieldDismissReason))
+}
+
+// DismissReasonEqualFold applies the EqualFold predicate on the "dismiss_reason" field.
+func DismissReasonEqualFold(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldEqualFold(FieldDismissReason, v))
+}
+
+// DismissReasonContainsFold applies the ContainsFold predicate on the "dismiss_reason" field.
+func DismissReasonContainsFold(v string) predicate.DecisionAnswer {
+	return predicate.DecisionAnswer(sql.FieldContainsFold(FieldDismissReason, v))
 }
 
 // InterpretedByAgentIDEQ applies the EQ predicate on the "interpreted_by_agent_id" field.

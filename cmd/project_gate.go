@@ -15,6 +15,9 @@
 package cmd
 
 import (
+	"strconv"
+	"strings"
+
 	"github.com/spf13/cobra"
 )
 
@@ -39,6 +42,7 @@ var hubUserLevelCommands = map[string]bool{
 // command per line. (expose and unexpose act as the calling agent, with
 // its own hub identity and no agent reference.)
 var hubOnlyCommands = map[string]bool{
+	"inbox":      true,
 	"tunnel":     true,
 	"ssh":        true,
 	"ssh-config": true,
@@ -123,12 +127,122 @@ func commandRequiresProject(cmd *cobra.Command) bool {
 	if parentName == "project" {
 		return false
 	}
+	// 'templates update', 'templates delete', 'templates sync' and 'templates
+	// push' (and their singular 'template' aliases) with --scope global or
+	// --scope user act on global or user templates and read no project, so
+	// they run outside a project (ptone/scion#1713, ptone/scion#8318,
+	// ptone/scion#8643).
+	if isProjectlessScopedTemplatesCommand(cmd) {
+		return false
+	}
+	// 'harness-config sync' and 'harness-config push' with --scope global
+	// upload to the global Hub scope and read no project, so they run outside
+	// a project (ptone/scion#2903).
+	if isProjectlessScopedHarnessConfigCommand(cmd) {
+		return false
+	}
+	// 'decisions list --all-projects' queries GET /api/v1/users/me/decisions
+	// across the user's Hub projects and needs no local project (ptone/scion#7995).
+	if isAllProjectsDecisionsList(cmd) {
+		return false
+	}
+	// 'notifications subscriptions' reads Hub subscriptions (optionally across
+	// all projects or for a --project Hub reference) and needs no local project
+	// (ptone/scion#8127).
+	if isNotificationsSubscriptionsCommand(cmd) {
+		return false
+	}
 	// design Amendment A26.2 O1: same reasoning as checkAgentContainerContext
 	// — --handoff-template never touches the project or the Hub.
 	if isReincarnateHandoffTemplateInvocation(cmd) {
 		return false
 	}
 	return true
+}
+
+// isAllProjectsDecisionsList reports whether cmd is 'decisions list' with
+// --all-projects set.
+func isAllProjectsDecisionsList(cmd *cobra.Command) bool {
+	if !isDecisionsListCommand(cmd) {
+		return false
+	}
+	allProjects, _ := cmd.Flags().GetBool("all-projects")
+	return allProjects
+}
+
+// isAllProjectsDecisionsListArgs reports whether target is 'decisions list'
+// with --all-projects requested, before or after cobra parses flags (mirrors
+// hubProfileRequested for Execute's early autoHelp settings load).
+func isAllProjectsDecisionsListArgs(target *cobra.Command, args []string) bool {
+	if !isDecisionsListCommand(target) {
+		return false
+	}
+	if isAllProjectsDecisionsList(target) {
+		return true
+	}
+	requested := false
+	for _, a := range args {
+		if a == "--" {
+			break
+		}
+		switch {
+		case a == "--all-projects":
+			requested = true
+		case strings.HasPrefix(a, "--all-projects="):
+			if v, err := strconv.ParseBool(strings.TrimPrefix(a, "--all-projects=")); err == nil {
+				requested = v
+			}
+		}
+	}
+	return requested
+}
+
+func isDecisionsListCommand(cmd *cobra.Command) bool {
+	return cmd != nil && cmd.Name() == "list" && cmd.Parent() != nil && cmd.Parent().Name() == "decisions" && isTopLevel(cmd.Parent())
+}
+
+func isNotificationsSubscriptionsCommand(cmd *cobra.Command) bool {
+	return cmd != nil && cmd.Name() == "subscriptions" && cmd.Parent() != nil && cmd.Parent().Name() == "notifications" && isTopLevel(cmd.Parent())
+}
+
+// isProjectlessScopedTemplatesCommand reports whether cmd is a scoped
+// 'templates' (or singular 'template') subcommand ('update', 'delete', 'sync',
+// or 'push') targeting 'global' or 'user' scope, neither of which reads a
+// project.
+func isProjectlessScopedTemplatesCommand(cmd *cobra.Command) bool {
+	if cmd == nil || cmd.Parent() == nil || !isTopLevel(cmd.Parent()) {
+		return false
+	}
+	parent := cmd.Parent().Name()
+	if parent != "templates" && parent != "template" {
+		return false
+	}
+	switch cmd.Name() {
+	case "update", "delete", "sync", "push":
+	default:
+		return false
+	}
+	scope, _ := cmd.Flags().GetString("scope")
+	return scope == "global" || scope == "user"
+}
+
+// isProjectlessScopedHarnessConfigCommand reports whether cmd is
+// 'harness-config sync' or 'harness-config push' targeting 'global' scope,
+// which reads no project.
+func isProjectlessScopedHarnessConfigCommand(cmd *cobra.Command) bool {
+	if cmd == nil || cmd.Parent() == nil || !isTopLevel(cmd.Parent()) {
+		return false
+	}
+	if cmd.Parent().Name() != "harness-config" {
+		return false
+	}
+	switch cmd.Name() {
+	case "sync", "push":
+	default:
+		return false
+	}
+	scope, _ := cmd.Flags().GetString("scope")
+	return scope == "global"
 }
 
 // isTopLevel reports whether c is a direct child of the root command.

@@ -80,6 +80,16 @@ func isBrokerRuntimeUnavailable(err error) bool {
 		se.brokerErrorCode() == brokerCodeRuntimeUnavailable
 }
 
+// isStartRefusedBeforeCreate reports whether err is a start error where no
+// container was created on the broker: either isConfirmedStartNotActedOnError
+// accepts err, or the broker refused the start with 503 runtime_unavailable
+// before entering Manager.Start (no startAttempted marker). It leaves
+// isConfirmedStartNotActedOnError unchanged.
+func isStartRefusedBeforeCreate(err error) bool {
+	return isConfirmedStartNotActedOnError(err) ||
+		(isBrokerRuntimeUnavailable(err) && !brokerStartAttempted(err))
+}
+
 // isBrokerDraining reports whether err is a runtime broker's 503 answer with
 // error code broker_draining (api.BrokerErrCodeBrokerDraining): the broker
 // is shutting down and refused the request before any start tracker,
@@ -200,7 +210,8 @@ func writeRestartStopFailed(w http.ResponseWriter, stopErr error) {
 //
 // A runtime_unavailable answer whose details carry
 // api.BrokerErrorReasonProfileUnresolved (a stored-profile miss on a
-// co-located broker, ptone/scion#4955) keeps the code and the 503, but gets
+// co-located broker, ptone/scion#4955, or an unresolvable settings profile on
+// a legacy broker, ptone/scion#3817) keeps the code and the 503, but gets
 // the hub's own text naming the profile, without the retry-later wording
 // and without Retry-After: it lasts until the profiles or runtimes are
 // changed. The broker's message is not relayed.
@@ -277,20 +288,23 @@ func brokerProfileUnresolved(err error) (string, bool) {
 }
 
 // brokerProfileUnresolvedMessage is the hub's client-facing text for a
-// broker's profile_unresolved refusal; profile is "" when the dispatch
-// needed the default profile and active_profile is unset.
+// broker's profile_unresolved refusal — returned for both Hub stored-profile
+// misses on a co-located broker and settings-profile misses on a legacy
+// broker; profile is "" when the dispatch needed the default profile and
+// active_profile is unset.
 func brokerProfileUnresolvedMessage(profile string) string {
 	if profile == "" {
-		return "The agent's runtime profile cannot be resolved on its runtime broker: active_profile is unset or not one of the hub's stored profiles; set active_profile to a stored profile, or give the agent an explicit profile"
+		return "The agent's runtime profile cannot be resolved on its runtime broker: active_profile is unset or is not configured for this broker; set active_profile to an available profile, or give the agent an explicit profile"
 	}
-	return fmt.Sprintf("Runtime profile %q cannot be resolved on the agent's runtime broker: it is not one of the hub's stored profiles, or its runtime is not one of the hub's stored runtimes; choose a stored profile, or fix the server's profiles and runtimes settings", profile)
+	return fmt.Sprintf("Runtime profile %q cannot be resolved on the agent's runtime broker: the profile or its runtime is not configured for this broker; choose an available profile, or check the profiles and runtimes configured on the broker or hub", profile)
 }
 
 // RuntimeTargetRefusal is a typed flat Runtime Broker refusal raised by the
 // Hub (.design/flat-runtime-brokers-contract.md sections 7 and 9): a
 // correctness or compatibility refusal, never an authorization result.
 // Handlers write it with its own Status, Code and Details; it is classified
-// as a confirmed not-acted-on start error.
+// as a confirmed not-acted-on start error. It also carries the Hub's other
+// pre-dispatch refusals, such as hosted_config_refused (hostedConfigRefusal).
 type RuntimeTargetRefusal struct {
 	Code    string
 	Status  int

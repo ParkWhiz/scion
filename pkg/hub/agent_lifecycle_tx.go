@@ -242,14 +242,25 @@ func (s *Server) softDeleteAgentTx(ctx context.Context, tx store.Store, a *store
 	return nil
 }
 
+// hardDeleteCredentialRevokeReason maps an edge-deactivation cause to the
+// credential revoke reason recorded on agent_credentials rows when the agent
+// row is removed.
+func hardDeleteCredentialRevokeReason(cause store.EdgeDeactivationCause) string {
+	if cause == store.EdgeDeactivationCreateCompensation {
+		return agentCredentialRevokeReasonCreateFailed
+	}
+	return agentCredentialRevokeReasonDeleted
+}
+
 // agentHardDeleteWork is the work every removal of an agent row must commit
-// with it: deactivate the agent's delegation edges and its service-account
-// assignments with d (neither has a foreign key to the agent, so the rows
-// survive as history), then run the hard-delete hooks. Both the hard delete
-// (hardDeleteAgentTx) and the rollback of a committed create
-// (compensateAgentCreate) run it, so a hook registered for hard delete also
-// runs when a create is rolled back. label prefixes store errors; a hook
-// error is returned as is.
+// with it: revoke the agent's active credentials, deactivate its delegation
+// edges and its service-account assignments with d (none of the three has a
+// foreign key to the agent, so the rows survive as history), then run the
+// hard-delete hooks. Both the hard delete (hardDeleteAgentTx) and the rollback
+// of a committed create (compensateAgentCreate, deleteFailedCreateRow) run it,
+// so credential revocation and any hook registered for hard delete also run
+// when a create is rolled back. label prefixes store errors; a hook error is
+// returned as is.
 //
 // Only the edges where the agent is the delegate are deactivated. Edges where
 // it is the delegator are left as they are: authorization re-loads each
@@ -261,6 +272,9 @@ func (s *Server) softDeleteAgentTx(ctx context.Context, tx store.Store, a *store
 // delete, which removes every agent of the project in one transaction,
 // deactivates both sides (deactivateProjectAgentEdges).
 func (s *Server) agentHardDeleteWork(ctx context.Context, tx store.Store, a *store.Agent, actor AuditActor, d store.Deactivation, label string) (edges, assignments int, err error) {
+	if _, err := tx.RevokeAgentCredentialsByAgent(ctx, a.ID, "system", hardDeleteCredentialRevokeReason(d.Cause)); err != nil {
+		return 0, 0, fmt.Errorf("%s: revoke agent credentials: %w", label, err)
+	}
 	edges, err = tx.DeactivateDelegationEdgesForDelegate(ctx, store.DelegationPrincipalAgent, a.ID, d)
 	if err != nil {
 		return 0, 0, fmt.Errorf("%s: deactivate delegation edges: %w", label, err)
@@ -268,6 +282,27 @@ func (s *Server) agentHardDeleteWork(ctx context.Context, tx store.Store, a *sto
 	assignments, err = tx.DeactivateAgentServiceAccountAssignments(ctx, a.ID, d)
 	if err != nil {
 		return 0, 0, fmt.Errorf("%s: deactivate service-account assignments: %w", label, err)
+	}
+	// Capture the exact agent-scope secret key set inside the transaction from
+	// the same rows DeleteSecretsByScope removes so post-commit external
+	// cleanup (e.g. GCP Secret Manager) deletes keys written right up to commit.
+	if rows, lerr := tx.ListSecrets(ctx, store.SecretFilter{Scope: store.ScopeAgent, ScopeID: a.ID}); lerr != nil {
+		return 0, 0, fmt.Errorf("%s: list agent-scope secrets: %w", label, lerr)
+	} else if len(rows) > 0 {
+		keys := make([]string, 0, len(rows))
+		for _, r := range rows {
+			keys = append(keys, r.Key)
+		}
+		recordAgentSecretCleanupKeys(ctx, keys)
+	}
+	if _, err := tx.DeleteSecretsByScope(ctx, store.ScopeAgent, a.ID); err != nil {
+		return 0, 0, fmt.Errorf("%s: delete agent-scope secrets: %w", label, err)
+	}
+	// Withdraw pending/fulfilling secret requests inside the transaction;
+	// live updates and audit events are published strictly after commit by
+	// withAgentSecretCleanup (R4).
+	if _, err := tx.WithdrawAgentSecretRequestsOnDelete(ctx, a.ID, time.Now().UTC()); err != nil {
+		return 0, 0, fmt.Errorf("%s: withdraw agent secret requests: %w", label, err)
 	}
 	if err := runAgentTxHooks(ctx, "hard-delete", s.lifecycleTxHooks.snapshot(&s.lifecycleTxHooks.hardDelete), tx, a, actor); err != nil {
 		return 0, 0, err
@@ -277,10 +312,10 @@ func (s *Server) agentHardDeleteWork(ctx context.Context, tx store.Store, a *sto
 
 // hardDeleteAgentTx runs inside the finalize transaction of a hard delete,
 // after the engine removed the agent row and its dependents. In order:
-// agentHardDeleteWork with cause agent_hard_delete (edges, service-account
-// assignments, hard-delete hooks), then the agent_hard_delete audit record.
-// a is the row as it was just before the delete; the row itself is not
-// readable.
+// agentHardDeleteWork with cause agent_hard_delete (active credential
+// revocation, edges, service-account assignments, hard-delete hooks), then the
+// agent_hard_delete audit record. a is the row as it was just before the
+// delete; the row itself is not readable.
 //
 // The hard delete of an incomplete create is a hard delete like any other;
 // its audit summary carries incomplete_create=true.
@@ -571,6 +606,15 @@ type reincarnateAuthority struct {
 	// of the owner's shared secrets are refused after this re-record
 	// (runtimeReadReRecordNotice).
 	RuntimeReadNotice string
+	// RoleChanged is true when the reincarnation patches the agent's role
+	// to a different role than the stored one. A role-changing claim records
+	// a restorable edge (ID == reincarnation ID, replaced edges deactivated
+	// with cause reincarnate_replaced under the reincarnation ID), so a
+	// failure that restores the previous configuration restores the prior
+	// edge in the same transaction (restoreReincarnationDelegationEdge).
+	// Same-role repairs and owner reclaims leave RoleChanged false so the
+	// repaired or reclaimed edge stays in force after a failure.
+	RoleChanged bool
 }
 
 // reincarnateClaimTx claims agent for a reincarnation in one transaction.
@@ -597,7 +641,16 @@ type reincarnateAuthority struct {
 // ID. A failure that restores the previous configuration then restores the
 // replaced row with it (restoreReincarnationAssignment). When sa names the
 // same account, the row is replaced as by any other write (sa_replaced) and
-// stays after a failure, like the re-recorded edge.
+// stays after a failure.
+//
+// Similarly, when auth carries a role change (auth.RoleChanged), the
+// delegation edge replacement is restorable: the replaced edges are
+// deactivated with cause reincarnate_replaced under the reincarnation ID,
+// and the new edge takes the reincarnation ID as its own ID, so a failure
+// that restores the previous configuration restores the prior edge in the
+// same transaction (restoreReincarnationDelegationEdge). Same-role repairs
+// and owner reclaims keep a fresh edge ID and operation ID, so they stay
+// in force after a failure.
 func (s *Server) reincarnateClaimTx(ctx context.Context, agent *store.Agent, rec *store.AgentReincarnation, auth *reincarnateAuthority, sa *store.AgentServiceAccountAssignment, actor AuditActor) error {
 	if agent == nil {
 		return fmt.Errorf("%w: nil agent in reincarnateClaimTx", store.ErrInvalidInput)
@@ -630,6 +683,7 @@ func (s *Server) reincarnateClaimTx(ctx context.Context, agent *store.Agent, rec
 		}
 		replaced := 0
 		priorDelegator := ""
+		edgeRestorable := false
 		if auth != nil {
 			if auth.OwnerReclaim {
 				priorDelegator, err = activeDelegators(ctx, tx, row.ID)
@@ -637,16 +691,25 @@ func (s *Server) reincarnateClaimTx(ctx context.Context, agent *store.Agent, rec
 					return fmt.Errorf("reincarnate: read delegation edges: %w", err)
 				}
 			}
+			edgeOpID := opID
+			edgeID := ""
+			if auth.RoleChanged {
+				edgeRestorable = true
+				opID = rec.ID
+				edgeOpID = rec.ID
+				edgeID = rec.ID
+			}
 			n, err := tx.DeactivateDelegationEdgesForDelegate(ctx, store.DelegationPrincipalAgent, row.ID, store.Deactivation{
 				Cause: store.EdgeDeactivationReincarnateReplaced,
 				At:    &now,
-				OpID:  opID,
+				OpID:  edgeOpID,
 			})
 			if err != nil {
 				return fmt.Errorf("reincarnate: deactivate delegation edges: %w", err)
 			}
 			replaced = n
 			edge := &store.DelegationEdge{
+				ID:                  edgeID,
 				DelegatorType:       auth.DelegatorType,
 				DelegatorID:         auth.DelegatorID,
 				DelegateType:        store.DelegationPrincipalAgent,
@@ -704,11 +767,12 @@ func (s *Server) reincarnateClaimTx(ctx context.Context, agent *store.Agent, rec
 			ReincarnationID      string `json:"reincarnation_id"`
 			ReRecorded           bool   `json:"re_recorded"`
 			EdgesReplaced        int    `json:"edges_replaced"`
+			EdgeRestorable       bool   `json:"edge_restorable,omitempty"`
 			ServiceAccountRecord *bool  `json:"service_account_recorded,omitempty"`
 			AssignmentRestorable bool   `json:"service_account_restorable,omitempty"`
 			OwnerReclaim         bool   `json:"owner_reclaim,omitempty"`
 			PriorDelegator       string `json:"prior_delegator,omitempty"`
-		}{opID, rec.ID, auth != nil, replaced, saRecorded, restorable, auth != nil && auth.OwnerReclaim, priorDelegator})
+		}{opID, rec.ID, auth != nil, replaced, edgeRestorable, saRecorded, restorable, auth != nil && auth.OwnerReclaim, priorDelegator})
 		if err != nil {
 			return err
 		}

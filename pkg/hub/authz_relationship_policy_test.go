@@ -61,21 +61,23 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 		"project.create", "project.read", "project.update", "project.delete",
 		"project.manage", "project.register", "project.set_messaging_policy",
 		"project.clone", "project.list", "project.secret_read", "project.manage_visitors",
-		"project.chat_post",
+		"project.chat_post", "project.manage_message_policies", "project.read_message_policies",
 	},
-	{"owner", "user", "template"}:       {},
+	{"owner", "user", "template"}:       {"template.create_global", "template.update_global", "template.delete_global"},
 	{"owner", "user", "harness_config"}: {},
 	{"owner", "user", "group"}:          {},
 	// broker.auto_provide offers a broker to every project; it is held by
 	// super-admins only, so owning a broker does not grant it.
-	{"owner", "user", "broker"}: {"broker.auto_provide"},
+	// broker.manage registers and approves admin-managed brokers; owning a
+	// broker must not grant it (ptone/scion#7829).
+	{"owner", "user", "broker"}: {"broker.auto_provide", "broker.manage"},
 	// gcp_service_account.use (ptone/scion#2129) is meant for an agent's own
 	// token-mint request. It has no AgentScopes: the GCP token scope is per
 	// service account and cannot be matched statically, so no credential
 	// satisfies it until the slice that wires the token-mint check adds that
 	// mapping. No user relationship, including ownership, should grant it.
 	{"owner", "user", "gcp_service_account"}: {"gcp_service_account.use"},
-	{"owner", "user", "skill"}:               {},
+	{"owner", "user", "skill"}:               {"skill.create_global", "skill.update_global", "skill.delete_global"},
 	{"ancestor", "user", "agent"}:            {"agent.log_append", "agent.delegation.exchange", "agent.delegation.revoke", "agent.delegation.credential.revoke", "agent.delegation.list", "agent.delegation.read", "agent.delegation.revoke_all"},
 	// Agent ancestors: permissions with no agent JWT scope, and the
 	// Reserved agent.log_append.
@@ -101,7 +103,7 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 		"gcp_service_account.use",
 	},
 	{"progeny", "agent", "skill"}: {
-		"skill.create", "skill.create_global", "skill.update", "skill.delete", "skill.list", "skill.register",
+		"skill.create", "skill.create_global", "skill.update", "skill.update_global", "skill.delete", "skill.delete_global", "skill.list", "skill.register",
 	},
 	// Progeny material pairs (ptone/scion#2129). Every secret and env_var
 	// permission is admitted; skill_injection.deliver is granted by
@@ -118,6 +120,7 @@ var relationshipOwnerExcluded = map[relationshipAllowKey][]string{
 	{"hub_association", "agent", "env_var"}:     {},
 	{"broker_association", "agent", "secret"}:   {"secret.use"},
 	{"broker_association", "agent", "env_var"}:  {},
+	{"agent_association", "agent", "secret"}:    {"secret.use"},
 }
 
 func policyCellPermissions() map[relationshipAllowKey]map[string]bool {

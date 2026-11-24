@@ -140,6 +140,55 @@ export A2A_API_KEY="your-secure-static-api-key"
 ### Step 4: Verify Connection
 Return to the Hub **Admin > Integrations** page. Click **Reconnect** on the A2A Bridge integration card. Once the Hub successfully dials the bridge's RPC server on port `9090`, the status badge will update to **Connected**. If the bridge restarts or loses its RPC connection later, the Hub's plugin supervisor automatically re-dials it with exponential backoff and replays topic subscriptions; see [Message-Bus Plugin Supervision](/scion/hosted/user/external-channels/#message-bus-plugin-supervision).
 
+### Step 5: Configure a Reverse Proxy
+
+The A2A HTTP server (`:8443` by default) listens on plain HTTP. Terminate TLS at a reverse proxy such as Caddy, nginx, or a cloud load balancer in front of it, and keep the broker plugin RPC listener (`localhost:9090`) unreachable from outside the host.
+
+:::caution[Avoid Path Collisions When Co-Hosting with the Hub]
+Both the Scion Hub Web Dashboard and the A2A Protocol Bridge serve paths under `/projects/*` (as well as `/.well-known/*`, `/healthz`, `/readyz`, and `/metrics`). **Do not route `/projects/*` on the Hub's hostname directly to the bridge.**
+
+The Web Dashboard uses `/projects/*` for browser pages such as `/projects/<slug>` and `/projects/<slug>/settings`, while the bridge serves A2A endpoints under `/projects/{projectSlug}/agents/...` and enforces A2A credential authentication (`X-API-Key` or `Authorization: Bearer`) on non-public paths. Routing `/projects/*` to the bridge sends direct links and page refreshes for Hub project pages to the bridge, which rejects cookie-authenticated browser requests with `401 Unauthorized` instead of loading the Web Dashboard.
+:::
+
+When co-hosting the bridge and the Hub behind Caddy on the same machine, isolate the bridge with either a separate hostname or a stripped path prefix:
+
+#### Option A: Separate Hostname (Recommended)
+
+Serve the Hub and the bridge on distinct hostnames so neither service shares a URL namespace (including root-level `/.well-known/*` discovery endpoints):
+
+```caddy
+hub.example.com {
+    reverse_proxy localhost:8080
+}
+
+a2a.example.com {
+    reverse_proxy localhost:8443
+}
+```
+
+Set `bridge.external_url` in `scion-a2a-bridge.yaml` (and **External URL** in **Admin > Integrations > A2A Bridge**, if set there) to `https://a2a.example.com`. On a VM provisioned with `scripts/starter-hub/`, which obtains a wildcard certificate (`*.<CERT_DOMAIN>`), include the same `tls /etc/letsencrypt/live/<CERT_DOMAIN>/fullchain.pem /etc/letsencrypt/live/<CERT_DOMAIN>/privkey.pem` directive in both site blocks, and restore your custom `/etc/caddy/Caddyfile` after re-running `gce-start-hub.sh --full` (which writes the default single-site Hub Caddyfile).
+
+#### Option B: Distinct Path Prefix on the Same Hostname
+
+If you only have one hostname, mount the bridge under a dedicated prefix such as `/a2a/*` using Caddy's `handle_path` directive, which strips `/a2a` before forwarding requests to the bridge:
+
+```caddy
+hub.example.com {
+    handle_path /a2a/* {
+        reverse_proxy localhost:8443
+    }
+
+    handle {
+        reverse_proxy localhost:8080
+    }
+}
+```
+
+When serving the bridge under `/a2a/*`:
+* **Use `handle_path /a2a/*` (not `handle /a2a/*`)**: The bridge registers routes at `/projects/...` and `/.well-known/...` and expects the `/a2a` prefix to be stripped by the proxy.
+* **Include the prefix in `external_url`**: Set `bridge.external_url` in `scion-a2a-bridge.yaml` (and **External URL** in **Admin > Integrations > A2A Bridge**, if configured in the Admin UI overlay) to `https://hub.example.com/a2a` so generated Agent Cards and rewritten OIDC `jwks_uri` values advertise `https://hub.example.com/a2a/projects/<project-slug>/agents/<agent-slug>/jsonrpc` rather than the Hub's unprefixed `/projects/...` path.
+* **Point clients at the prefixed URLs**: Configure A2A clients with `https://hub.example.com/a2a/projects/<project-slug>/agents/<agent-slug>` (or `https://hub.example.com/a2a/.well-known/agent-card.json`). Root-level `https://hub.example.com/.well-known/*` remains served by the Hub.
+
 ### Dev-Mode Rebuild
 When running the Scion Hub in development mode (`MaintenanceConfig.RepoPath` is configured in `settings.yaml`), clicking **Update** inside the A2A integration detail page triggers an automatic compilation of the bridge binary directly from your local repository. The Hub will output instructions for you to restart the process manually to apply the new binary.
 
@@ -161,8 +210,9 @@ bridge:
   # Port and address for the A2A HTTP server (JSON-RPC, agent cards, health check).
   listen_address: ":8443"
 
-  # Public-facing base URL where A2A clients reach this bridge. 
+  # Public-facing base URL where A2A clients reach this bridge.
   # Used to construct agent card URLs and self-referencing links.
+  # Include any reverse-proxy path prefix (e.g., "https://hub.example.com/a2a").
   external_url: "https://a2a.example.com"
 
   # Identity included in generated Agent Cards.
@@ -398,6 +448,7 @@ auth:
 #### 4. `oidcFederation` (For Federated Access)
 * **How it works**: Callers present an OIDC ID token issued by a trusted federation provider.
 * **Token Verification & Bookkeeping**: The bridge decodes the OIDC token and performs local bookkeeping. It fully supports RFC 7519 `aud` (audience) claim validation, accepting the claim in either string or array-of-strings format.
+* **Federation Agent Task Routes**: Under `auth.scheme: "federation"`, federation agent callers may start new tasks to existing agents with `SendMessage` and `SendStreamingMessage` (without a `taskId`); message delivery is authenticated by the Scion Hub (the bridge does not verify agent token signatures locally and does not auto-provision agents for federation callers). Bridge-local task routes and operations that reference an existing task (`GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, push-notification configuration routes, `GetExtendedAgentCard`, and `SendMessage`/`SendStreamingMessage` with a `taskId`, across both JSON-RPC and v0 REST) are not available for federation agent callers and return a permission-denied error (`403` / JSON-RPC `-31403`). Federated user callers (project visitors verified with the Hub via `/api/v1/auth/me`) continue to have full access to their own task routes.
 * **Transport Auth Wiring**: Integrated with Google Cloud Identity-Aware Proxy (IAP) transport auth wiring to automatically resolve and bypass platform-level guards when accessing protected backends.
 * **OIDC & JWKS Discovery Proxying**: Behind IAP, third-party federation callers cannot access the Scion Hub's OIDC discovery and JWKS public keys because they lack IAP credentials. The bridge resolves this by proxying `/.well-known/openid-configuration` and `/.well-known/jwks.json`:
   - It uses its own internal **bridge transport auth** (IAP credentials) to fetch these documents from the Hub.
@@ -434,11 +485,11 @@ The bridge exposes the following HTTP endpoints:
 | `/.well-known/agent-card.json` | GET | None | Base bridge registry agent card. |
 | `/.well-known/openid-configuration` | GET | None | OIDC discovery proxy document for deployments behind IAP. Uses bridge transport auth to fetch from the Hub and rewrites the `jwks_uri` to point back to the bridge. Cached for 5 minutes. |
 | `/.well-known/jwks.json` | GET | None | JSON Web Key Set (JWKS) proxy endpoint. Serves Hub public keys with a 5-minute cache. |
-| `/projects/{projectSlug}/agents/{agentSlug}/.well-known/agent-card.json` | GET | Configured Scheme | Per-agent capabilities card. |
+| `/projects/{projectSlug}/agents/{agentSlug}/.well-known/agent-card.json` | GET | None | Per-agent capabilities card. |
 | `/projects/{projectSlug}/agents/{agentSlug}/jsonrpc` | POST | Configured Scheme | Primary A2A JSON-RPC 2.0 communication endpoint. |
 | `/healthz` | GET | None | Liveness check (returns HTTP 200). |
 | `/readyz` | GET | None | Readiness check (checks DB and active broker plugin connection). |
-| `/metrics` | GET | Configured Scheme | Prometheus metrics. |
+| `/metrics` | GET | Configured Scheme | Prometheus metrics (disabled under `federation`). |
 
 ---
 
@@ -464,12 +515,35 @@ Standard A2A JSON-RPC methods supported at the `/jsonrpc` endpoint:
 
 ## 10. Troubleshooting & Operations
 
+### Direct Links to `/projects/...` Return `401 Unauthorized`
+If opening or refreshing a Hub project URL (`/projects/<slug>`) in a browser returns `401` (`unauthorized`) instead of the Web Dashboard, your reverse proxy is routing `/projects/*` on the Hub's hostname to the A2A Protocol Bridge. Because the bridge enforces A2A token authentication on `/projects/*` routes, browser session cookies are rejected. Serve the bridge on a separate hostname or behind a stripped path prefix such as `/a2a/*`; see [Step 5: Configure a Reverse Proxy](#step-5-configure-a-reverse-proxy).
+
 ### Health Checks (`/healthz` & `/readyz`)
 * **Liveness (`/healthz`)**: Returns `HTTP 200 OK` as long as the HTTP server is listening. Used by container runtimes to detect deadlocks.
 * **Readiness (`/readyz`)**: Returns `HTTP 200 OK` only when:
   1. The local SQLite database is reachable and writable.
   2. The Hub's broker plugin has successfully dialed and established its active RPC connection.
   * If either component fails, `/readyz` returns `HTTP 503 Service Unavailable`, preventing traffic from hitting the node.
+
+### Metrics Scraping (`/metrics`)
+`/metrics` serves Prometheus metrics and requires the bridge's configured `auth.scheme`, matching other non-public endpoints (and is subject to the bridge's standard rate limiting).
+
+Configure your Prometheus scrape job to send credentials matching `auth.scheme`:
+* **Bearer-based schemes (`bearer`, `hubUAT`, `hubBearer`, `hubJWT`, `geGoogle`)**: configure `authorization` in the Prometheus scrape job to send `Authorization: Bearer <token>` (for example, using `credentials_file` pointing to a token file).
+* **`apiKey`**: send `X-API-Key: <key>` (Prometheus's built-in `authorization` block sends `Authorization`; use `bearer`, a scraper that supports custom headers, or an internal proxy). When `auth.scheme` is unset, either `X-API-Key` or `Authorization: Bearer` is accepted.
+* **`federation`**: `/metrics` fails closed (`403 Forbidden`) under the federation scheme.
+* **`none`**: open (no credentials required), matching all other endpoints when authentication is explicitly disabled.
+
+```yaml
+scrape_configs:
+  - job_name: scion-a2a-bridge
+    scheme: https
+    static_configs:
+      - targets: ["a2a.example.com"]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/a2a-bridge-token
+```
 
 ### SQLite State Database Permissions
 The SQLite database stores task metadata and webhook credentials (`auth_credentials`) in plain text.

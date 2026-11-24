@@ -42,7 +42,7 @@ type APIError struct {
 
 // Error implements the error interface.
 func (e *APIError) Error() string {
-	msg := e.Message + e.messageDeniedSuffix()
+	msg := e.Message + e.messageDeniedSuffix() + e.messagePolicyRejectedSuffix()
 	if e.RequestID != "" {
 		return fmt.Sprintf("%s: %s (status: %d, request: %s)",
 			e.Code, msg, e.StatusCode, e.RequestID)
@@ -75,6 +75,27 @@ func (e *APIError) messageDeniedSuffix() string {
 		return ""
 	}
 	return " [" + strings.Join(parts, ", ") + "]"
+}
+
+// messagePolicyRejectedSuffix returns the rejecting policy name and advisory
+// remediation for a 422 message_policy_rejected response (ptone/scion#8047), so
+// an agent or CLI caller reading err.Error() sees which policy rejected the
+// outbound message and how to revise it rather than retrying verbatim.
+func (e *APIError) messagePolicyRejectedSuffix() string {
+	if e.Code != ErrCodeMessagePolicyRejected || len(e.Details) == 0 {
+		return ""
+	}
+	var parts []string
+	if v, ok := e.Details["policy"].(string); ok && v != "" {
+		parts = append(parts, "policy: "+v)
+	}
+	if v, ok := e.Details["remediation"].(string); ok && v != "" {
+		parts = append(parts, "remediation: "+v)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " [" + strings.Join(parts, "; ") + "]"
 }
 
 // IsNotFound returns true if the error is a 404 Not Found.
@@ -149,6 +170,24 @@ const (
 	// ErrCodeMessageDenied is returned when message-send authorization
 	// denies a delivery. Details carry reason, senderMode and recipientMode.
 	ErrCodeMessageDenied = "message_denied"
+	// ErrCodeMessagePolicyRejected is returned (HTTP 422) when an enforced
+	// project message policy rejects an outbound agent send (ptone/scion#8047).
+	// Details carry policy, policy_revision, class, and optional remediation.
+	ErrCodeMessagePolicyRejected = "message_policy_rejected"
+	// ErrCodeBrokerDeregistered is returned (HTTP 401) when a broker presents a
+	// broker ID that has no active registration on the Hub (e.g. after the
+	// broker was deregistered). Brokers treat this as a terminal response and
+	// stop retrying until re-registered.
+	ErrCodeBrokerDeregistered = "broker_deregistered"
+	// ErrCodeBrokerOnline is returned (HTTP 409) when a broker re-registration
+	// matches an existing broker that is currently online and force was not
+	// set. Details carry brokerId, brokerName, and status.
+	ErrCodeBrokerOnline = "broker_online"
+	// ErrCodeMissingScope is the hub's 403 code when an agent credential
+	// lacks one or more ceiling-optional scopes required for an operation.
+	// Details carry every missing scope under "scopes" (and the first under
+	// "scope").
+	ErrCodeMissingScope = "missing_scope"
 )
 
 // errorResponse matches the API error response format.
@@ -281,6 +320,16 @@ func IsForbiddenError(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.IsForbidden()
+	}
+	return false
+}
+
+// IsBrokerDeregisteredError reports whether err is a Hub refusal stating that
+// the broker is deregistered and must stop retrying.
+func IsBrokerDeregisteredError(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == ErrCodeBrokerDeregistered
 	}
 	return false
 }

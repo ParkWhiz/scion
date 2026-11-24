@@ -137,14 +137,16 @@ describe('scion-chat-members agent tooltip', () => {
 
   it('falls back to the display label, not the raw state name (ptone/scion#1571)', async () => {
     const blocked = await mount([agent({ activity: 'blocked' })]);
-    expect(tooltipContent(blocked)).toBe('waiting on others');
+    expect(tooltipContent(blocked).split('\n')[0]).toBe('waiting on others');
+    expect(tooltipContent(blocked)).toContain('expecting to hear back');
     document.body.innerHTML = '';
     const waiting = await mount([agent({ activity: 'waiting_for_input' })]);
     expect(tooltipContent(waiting)).toBe('waiting on parent');
     document.body.innerHTML = '';
     // Matched case-insensitively, like resolveAgentStatus (the badge's status source).
     const upper = await mount([agent({ activity: 'BLOCKED' as never })]);
-    expect(tooltipContent(upper)).toBe('waiting on others');
+    expect(tooltipContent(upper).split('\n')[0]).toBe('waiting on others');
+    expect(tooltipContent(upper)).toContain('expecting to hear back');
   });
 
   it('shows the last activity event as the updated time', async () => {
@@ -160,6 +162,83 @@ describe('scion-chat-members agent tooltip', () => {
       agent({ detailMessage: 'Running tests', lastSeen: new Date().toISOString() }),
     ]);
     expect(tooltipContent(el)).toBe('Running tests');
+  });
+
+  it('shows suspended · <activity> for retained suspend activities and plain phase otherwise', async () => {
+    const suspDone = await mount([agent({ phase: 'suspended', activity: 'completed' })]);
+    expect(tooltipContent(suspDone)).toBe('suspended · completed');
+    expect(badgeStatus(suspDone)).toBe('suspended');
+    document.body.innerHTML = '';
+
+    const suspIdle = await mount([agent({ phase: 'suspended', activity: 'idle' })]);
+    expect(tooltipContent(suspIdle)).toBe('suspended · idle');
+    document.body.innerHTML = '';
+
+    const suspHarnessErr = await mount([agent({ phase: 'suspended', activity: 'harness_error' })]);
+    expect(tooltipContent(suspHarnessErr)).toBe('suspended · harness error');
+    expect(badgeStatus(suspHarnessErr)).toBe('suspended');
+    document.body.innerHTML = '';
+
+    const suspStaleBlocked = await mount([agent({ phase: 'suspended', activity: 'blocked' })]);
+    expect(tooltipContent(suspStaleBlocked)).toBe('suspended');
+    document.body.innerHTML = '';
+
+    const stoppedStaleWork = await mount([agent({ phase: 'stopped', activity: 'working' })]);
+    expect(tooltipContent(stoppedStaleWork)).toBe('stopped');
+    document.body.innerHTML = '';
+
+    const stoppedCrashed = await mount([agent({ phase: 'stopped', activity: 'crashed' as never })]);
+    expect(tooltipContent(stoppedCrashed)).toBe('crashed');
+    document.body.innerHTML = '';
+
+    const stoppedLimits = await mount([agent({ phase: 'stopped', activity: 'limits_exceeded' })]);
+    expect(tooltipContent(stoppedLimits)).toBe('limits exceeded');
+  });
+});
+
+describe('scion-chat-members idle and suspend reason (ptone/scion#7826)', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  function tooltipContent(el: ScionChatMembers): string {
+    const tip = el.shadowRoot?.querySelector('sl-tooltip') as { content?: string } | null;
+    return tip?.content ?? '';
+  }
+
+  function badgeLabel(el: ScionChatMembers): string | null {
+    return el.shadowRoot?.querySelector('scion-status-badge')?.getAttribute('label') ?? null;
+  }
+
+  it('shows a running idle agent with the idle badge', async () => {
+    const el = await mount([agent({ phase: 'running', activity: 'idle' })]);
+    expect(badgeStatus(el)).toBe('idle');
+    expect(tooltipContent(el).split('\n')[0]).toBe('idle');
+    expect(tooltipContent(el)).toContain('Done with any known work.');
+  });
+
+  it('labels a suspended agent like the agent list, with the reason explained', async () => {
+    const el = await mount([
+      agent({ phase: 'suspended', activity: 'completed', suspendReason: 'idle' }),
+    ]);
+    expect(badgeStatus(el)).toBe('suspended');
+    expect(badgeLabel(el)).toBe('suspended · completed (idle)');
+    const lines = tooltipContent(el).split('\n');
+    expect(lines[0]).toBe('suspended · completed (idle)');
+    expect(lines[1]).toMatch(/idle/);
+    document.body.innerHTML = '';
+
+    const user = await mount([agent({ phase: 'suspended', activity: '', suspendReason: 'user' })]);
+    expect(badgeLabel(user)).toBe('suspended (user)');
+  });
+
+  it('ignores a stale reason once the agent runs again', async () => {
+    const el = await mount([
+      agent({ phase: 'running', activity: 'working', suspendReason: 'idle' }),
+    ]);
+    expect(badgeStatus(el)).toBe('working');
+    expect(badgeLabel(el)).toBe('');
+    expect(tooltipContent(el)).toBe('working');
   });
 });
 
@@ -315,6 +394,12 @@ describe('scion-chat-members wobble', () => {
     await el.updateComplete;
 
     expect(isWobbling(el)).toBe(true);
+
+    // Settling into idle stops the wobble just like completed/blocked.
+    el.agents = [agent({ activity: 'idle' })];
+    await el.updateComplete;
+    await el.updateComplete;
+    expect(isWobbling(el)).toBe(false);
   });
 
   it('re-renders without the wobble class once the 3s timer elapses', async () => {
@@ -465,5 +550,64 @@ describe('scion-chat-members people search', () => {
     el.humansTruncated = true;
     await el.updateComplete;
     expect(names(el)).toEqual(['Ann', 'Bob']);
+  });
+});
+
+describe('scion-chat-members async/failed deletion badge', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('hides deletion badge for normal agents and renders compact badge for deleting / failed', async () => {
+    const normal = await mount([agent({ canAttach: true })]);
+    const hiddenBadge = normal.shadowRoot?.querySelector('scion-deletion-badge');
+    expect(hiddenBadge?.hasAttribute('hidden')).toBe(true);
+    expect(normal.shadowRoot?.querySelector('a.agent-terminal')).not.toBeNull();
+    document.body.innerHTML = '';
+
+    const leaseFuture = new Date(Date.now() + 60_000).toISOString();
+    const deletingEl = await mount([
+      agent({
+        canAttach: true,
+        phase: 'stopping',
+        deletion: {
+          state: 'deleting',
+          soft: true,
+          startedAt: new Date().toISOString(),
+          leaseExpiresAt: leaseFuture,
+        },
+      } as Partial<ChatAgentMember>),
+    ]);
+    const delBadge = deletingEl.shadowRoot?.querySelector('scion-deletion-badge') as
+      | (HTMLElement & { updateComplete: Promise<unknown> })
+      | null;
+    await delBadge?.updateComplete;
+    expect(delBadge?.hasAttribute('hidden')).toBe(false);
+    expect(delBadge?.shadowRoot?.textContent).toContain('Deleting…');
+    // Terminal button is suppressed while teardown is actively running.
+    expect(deletingEl.shadowRoot?.querySelector('a.agent-terminal')).toBeNull();
+    document.body.innerHTML = '';
+
+    const expFuture = new Date(Date.now() + 600_000).toISOString();
+    const failedEl = await mount([
+      agent({
+        canAttach: true,
+        phase: 'stopped',
+        deletion: {
+          state: 'failed',
+          soft: true,
+          startedAt: new Date().toISOString(),
+          expiresAt: expFuture,
+        },
+      } as Partial<ChatAgentMember>),
+    ]);
+    const failBadge = failedEl.shadowRoot?.querySelector('scion-deletion-badge') as
+      | (HTMLElement & { updateComplete: Promise<unknown> })
+      | null;
+    await failBadge?.updateComplete;
+    expect(failBadge?.hasAttribute('hidden')).toBe(false);
+    expect(failBadge?.shadowRoot?.textContent).toContain('Delete failed');
+    // Once failed (no active delete), terminal gating reverts to canAttach.
+    expect(failedEl.shadowRoot?.querySelector('a.agent-terminal')).not.toBeNull();
   });
 });

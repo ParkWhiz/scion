@@ -459,6 +459,9 @@ func (s *AgentStore) applyLaunchReportPreRunning(ctx context.Context, ltx *launc
 		if ownerToSet != "" {
 			upd.SetLaunchOwner(ownerToSet)
 		}
+		// Pre-running to running: activity_since starts now if the row
+		// carries an activity (stampActivitySince).
+		stampActivitySince(upd.Mutation(), current.Phase, current.Activity, now)
 		updated, err := withLaunchEndSettlement(upd, current, store.LaunchEndReasonSucceeded, now).Save(ctx)
 		if err != nil {
 			return store.LaunchReportAnswer{}, nil, mapError(err)
@@ -609,6 +612,9 @@ func failedAfterRunningObservedApplies(current *ent.Agent, r store.LaunchReport,
 	if store.ReincarnationInFlight(current.ReincarnationState) {
 		return false
 	}
+	if current.IdleSuspendClaimUntil != nil && claimTime(now).Before(*current.IdleSuspendClaimUntil) {
+		return false
+	}
 	if r.ErrorCode == store.LaunchErrorBrokerRestarted {
 		return false
 	}
@@ -627,8 +633,10 @@ func failedAfterRunningObservedApplies(current *ent.Agent, r store.LaunchReport,
 // untouched.
 func applySucceededAgentInfo(upd *ent.AgentUpdateOne, current *ent.Agent, r store.LaunchReport) {
 	a := store.Agent{
+		ID:                    current.ID.String(),
 		Template:              current.Template,
 		Runtime:               current.Runtime,
+		HarnessConfig:         current.HarnessConfig,
 		PinnedRuntimeTargetID: derefString(current.PinnedRuntimeTargetID),
 	}
 	if current.AppliedConfig != "" {

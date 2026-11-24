@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -75,17 +76,43 @@ func dispatchMessageIDFromContext(ctx context.Context) string {
 // more to report can split it across requests.
 const maxMessageFailuresPerReport = 50
 
+const messageFailureCodeAwaitingSession = "awaiting_session"
+
+// Hold-until-session bounds (ptone/scion#7881; H2 confirmed). Variables so
+// tests can exercise bounds without waiting minutes.
+var (
+	messageHoldTTL            = 10 * time.Minute
+	messageHoldMaxProofAge    = 2 * time.Minute
+	maxHeldMessagesPerAgent   = 100
+	hubConduitDeliverRuntimes = map[string]bool{
+		"cloudrun":           true,
+		"cloudrun-instances": true,
+	}
+)
+
 // messageDeliveryFailure is one failed delivery reported by a broker.
 type messageDeliveryFailure struct {
 	MessageID string `json:"messageId"`
 	AgentID   string `json:"agentId,omitempty"`
 	ProjectID string `json:"projectId,omitempty"`
+	Code      string `json:"code,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+}
+
+// messageDeliveryConfirmation is one successful session injection reported by
+// a broker (ptone/scion#9015).
+type messageDeliveryConfirmation struct {
+	MessageID string `json:"messageId"`
+	AgentID   string `json:"agentId,omitempty"`
+	ProjectID string `json:"projectId,omitempty"`
 }
 
 // messageDeliveryFailuresRequest is the body of a message-failures report.
 type messageDeliveryFailuresRequest struct {
 	Failures []messageDeliveryFailure `json:"failures"`
+	// Deliveries are hub messages whose session injection succeeded on the
+	// broker (ptone/scion#9015). Optional and additive for mixed-version hubs.
+	Deliveries []messageDeliveryConfirmation `json:"deliveries,omitempty"`
 	// AttachmentOutcomes are the per-file outcomes of attachment deliveries
 	// (ptone/scion#4596); logged and counted only.
 	AttachmentOutcomes []attachmentDeliveryOutcome `json:"attachmentOutcomes,omitempty"`
@@ -136,17 +163,20 @@ const maxAttachmentOutcomesPerReport = 100
 
 // messageDeliveryFailuresResponse reports how many rows were updated.
 type messageDeliveryFailuresResponse struct {
-	Marked  int `json:"marked"`
-	Ignored int `json:"ignored"`
+	Marked    int `json:"marked"`
+	Delivered int `json:"delivered,omitempty"`
+	Held      int `json:"held,omitempty"`
+	Ignored   int `json:"ignored"`
 }
 
 // handleBrokerMessageFailures processes a broker's report of messages that
 // were accepted into its delivery buffer but could not be delivered.
 //
 // Only the broker itself may report, and only for messages whose recipient
-// agent is assigned to that broker. Rows not in pending/dispatched state are
-// left untouched, so a report can never resurrect or overwrite a terminal
-// state set by the hub.
+// agent is assigned to that broker. Rows not in pending, dispatched,
+// delivering or partial state are left untouched, so a report can never
+// resurrect or overwrite a terminal state set by the hub (delivered,
+// failed, deferred, no_recipient).
 func (s *Server) handleBrokerMessageFailures(w http.ResponseWriter, r *http.Request, brokerID string) {
 	ctx := r.Context()
 
@@ -167,6 +197,16 @@ func (s *Server) handleBrokerMessageFailures(w http.ResponseWriter, r *http.Requ
 		BadRequest(w, "too many failures in one report")
 		return
 	}
+	if len(req.Deliveries) > maxMessageFailuresPerReport {
+		BadRequest(w, "too many deliveries in one report")
+		return
+	}
+	for _, f := range req.Failures {
+		if f.Code != "" && f.Code != messageFailureCodeAwaitingSession {
+			BadRequest(w, "invalid failure code")
+			return
+		}
+	}
 	if len(req.AttachmentOutcomes) > maxAttachmentOutcomesPerReport {
 		BadRequest(w, "too many attachment outcomes in one report")
 		return
@@ -180,8 +220,18 @@ func (s *Server) handleBrokerMessageFailures(w http.ResponseWriter, r *http.Requ
 
 	resp := messageDeliveryFailuresResponse{}
 	for _, f := range req.Failures {
-		if s.applyBrokerMessageFailure(ctx, brokerID, f) {
+		switch s.applyBrokerMessageFailureOutcome(ctx, brokerID, f) {
+		case brokerFailureMarked:
 			resp.Marked++
+		case brokerFailureHeld:
+			resp.Held++
+		default:
+			resp.Ignored++
+		}
+	}
+	for _, d := range req.Deliveries {
+		if s.applyBrokerMessageDeliveryOutcome(ctx, brokerID, d) {
+			resp.Delivered++
 		} else {
 			resp.Ignored++
 		}
@@ -189,11 +239,55 @@ func (s *Server) handleBrokerMessageFailures(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// applyBrokerMessageFailure validates and applies one reported failure.
-// Returns true when the message row was moved to failed.
-func (s *Server) applyBrokerMessageFailure(ctx context.Context, brokerID string, f messageDeliveryFailure) bool {
-	if f.MessageID == "" {
+type brokerFailureOutcome int
+
+const (
+	brokerFailureIgnored brokerFailureOutcome = iota
+	brokerFailureMarked
+	brokerFailureHeld
+)
+
+// agentUsesConduitDelivery reports whether target's runtime uses Conduit
+// deliver-message rather than exec. Checks recorded Runtime first, falling
+// back to PinnedRuntimeTargetType and broker runtime resolution while an
+// agent is still starting before its first heartbeat.
+func (s *Server) agentUsesConduitDelivery(ctx context.Context, agent *store.Agent) bool {
+	if agent == nil {
 		return false
+	}
+	rt := strings.ToLower(strings.TrimSpace(agent.Runtime))
+	if rt == "" {
+		rt = strings.ToLower(strings.TrimSpace(agent.PinnedRuntimeTargetType))
+	}
+	if rt == "" && agent.RuntimeBrokerID != "" && s.store != nil {
+		if b, err := s.store.GetRuntimeBroker(ctx, agent.RuntimeBrokerID); err == nil && b != nil {
+			if flatCloudRunBroker(b) {
+				return true
+			}
+			if resolved := resolveAgentRuntime(agent, b); resolved != "" {
+				rt = strings.ToLower(strings.TrimSpace(resolved))
+			} else {
+				profileName := ""
+				if agent.AppliedConfig != nil {
+					profileName = agent.AppliedConfig.Profile
+				}
+				if _, profType, ok := resolveAgentRuntimeProfileType(b, profileName); ok {
+					rt = strings.ToLower(strings.TrimSpace(profType))
+				} else if b.RuntimeTarget != nil {
+					if _, canonical := flatTargetTypeCheck(b.RuntimeTarget.Type); canonical && b.RuntimeTarget.Type != "" {
+						rt = strings.ToLower(strings.TrimSpace(b.RuntimeTarget.Type))
+					}
+				}
+			}
+		}
+	}
+	return hubConduitDeliverRuntimes[rt]
+}
+
+// applyBrokerMessageFailureOutcome validates and applies one reported failure.
+func (s *Server) applyBrokerMessageFailureOutcome(ctx context.Context, brokerID string, f messageDeliveryFailure) brokerFailureOutcome {
+	if f.MessageID == "" {
+		return brokerFailureIgnored
 	}
 	msg, err := s.store.GetMessage(ctx, f.MessageID)
 	if err != nil {
@@ -201,35 +295,91 @@ func (s *Server) applyBrokerMessageFailure(ctx context.Context, brokerID string,
 			slog.Warn("message-failures: message lookup failed",
 				"broker_id", brokerID, "message_id", f.MessageID, "error", err)
 		}
-		return false
+		return brokerFailureIgnored
 	}
 
 	// Ownership: the recipient agent must be assigned to the reporting broker.
+	// Always derive ownership from the stored msg.RecipientID; request body
+	// agentId and projectId are informational only and never trusted.
 	recipientAgentID := msg.RecipientID
 	if recipientAgentID == "" || !strings.HasPrefix(msg.Recipient, "agent:") {
-		return false
+		return brokerFailureIgnored
 	}
 	agent, err := s.store.GetAgent(ctx, recipientAgentID)
 	if err != nil || agent == nil || agent.RuntimeBrokerID != brokerID {
 		slog.Warn("message-failures: broker reported failure for message it does not own",
 			"broker_id", brokerID, "message_id", f.MessageID)
-		return false
+		return brokerFailureIgnored
+	}
+
+	// Hold-until-session CAS (ptone/scion#7881): only when the broker sent
+	// code=awaiting_session, hold is enabled, the agent uses conduit delivery,
+	// and the store CAS verifies a fresh hub-stamped no_session proof on a
+	// dispatched row under the per-agent cap. Otherwise fall through and fail
+	// the row as today.
+	if f.Code == messageFailureCodeAwaitingSession &&
+		msg.DispatchState == store.MessageDispatchDispatched &&
+		s.conduitDeliverEnabled() &&
+		s.agentUsesConduitDelivery(ctx, agent) {
+		finCtx, finCancel := finalizationContext(ctx)
+		held, hErr := s.store.HoldMessageAwaitingSession(finCtx, store.HoldMessageParams{
+			MessageID:   msg.ID,
+			AgentID:     agent.ID,
+			MaxProofAge: messageHoldMaxProofAge,
+			HoldTTL:     messageHoldTTL,
+			MaxHeld:     s.heldMessagesCap(),
+		})
+		finCancel()
+		if hErr != nil {
+			slog.Error("message-failures: hold awaiting_session CAS failed",
+				"broker_id", brokerID, "message_id", msg.ID, "agent_id", agent.ID, "error", hErr)
+		} else if held {
+			if s.messageLog != nil {
+				s.messageLog.Info("message held awaiting conduit session",
+					"message_id", msg.ID,
+					"agent_id", agent.ID,
+					"project_id", agent.ProjectID,
+					"broker_id", brokerID,
+				)
+			}
+			// If a conduit session advertising deliver-message connected in the
+			// window between /deliver's 503 and this hold CAS committing (M-09),
+			// trigger re-drive immediately rather than waiting for the 30s sweep.
+			s.maybeScheduleHeldMessageRedriveIfConnected(agent.ID)
+			return brokerFailureHeld
+		}
 	}
 
 	switch msg.DispatchState {
 	case store.MessageDispatchDispatched, store.MessageDispatchPending:
+	case store.MessageDispatchPartial, store.MessageDispatchDelivering:
+		// A conduit delivery that may have pasted (gap G5 of the v2.22
+		// freeze): the row is failed and the sender told, as with a
+		// partial exec delivery. delivery_id and delivery_outcome stay, so
+		// a same-id /deliver still replays without calling the agent. A
+		// delivered row is never failed.
 	default:
-		return false
+		return brokerFailureIgnored
 	}
 
 	reason := sanitizeFailureReason(f.Reason)
 	if reason == "" {
 		reason = "broker delivery failed after buffering"
 	}
-	if err := s.markFailed(ctx, msg.ID, reason); err != nil {
+	// One conditional write decides (review R4): a /deliver finish racing
+	// this report wins or loses atomically, a delivered row is never
+	// failed, and the notices below go out only when this call made the
+	// transition.
+	finCtx, finCancel := finalizationContext(ctx)
+	won, err := s.store.FailUndeliveredMessage(finCtx, msg.ID, reason)
+	finCancel()
+	if err != nil {
 		slog.Error("message-failures: failed to mark message failed",
 			"broker_id", brokerID, "message_id", msg.ID, "error", err)
-		return false
+		return brokerFailureIgnored
+	}
+	if !won {
+		return brokerFailureIgnored
 	}
 	if s.messageLog != nil {
 		s.messageLog.Warn("message delivery failed after broker acceptance; marked failed",
@@ -241,10 +391,102 @@ func (s *Server) applyBrokerMessageFailure(ctx context.Context, brokerID string,
 		)
 	}
 
+	s.notifyStoredMessageSenderFailed(ctx, agent, msg, reason)
+	return brokerFailureMarked
+}
+
+// applyBrokerMessageDeliveryOutcome validates broker ownership and atomically
+// transitions a pending/dispatched message row to delivered, pushing a live
+// SSE update to human senders (ptone/scion#9015).
+func (s *Server) applyBrokerMessageDeliveryOutcome(ctx context.Context, brokerID string, d messageDeliveryConfirmation) bool {
+	if d.MessageID == "" {
+		return false
+	}
+	msg, err := s.store.GetMessage(ctx, d.MessageID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			slog.Warn("message-failures: delivery message lookup failed",
+				"broker_id", brokerID, "message_id", d.MessageID, "error", err)
+		}
+		return false
+	}
+
+	// Ownership: the recipient agent must be assigned to the reporting broker.
+	// Always derive ownership from the stored msg.RecipientID; request body
+	// agentId and projectId are informational only and never trusted.
+	recipientAgentID := msg.RecipientID
+	if recipientAgentID == "" || !strings.HasPrefix(msg.Recipient, "agent:") {
+		return false
+	}
+	agent, err := s.store.GetAgent(ctx, recipientAgentID)
+	if err != nil || agent == nil || agent.RuntimeBrokerID != brokerID {
+		slog.Warn("message-failures: broker reported delivery for message it does not own",
+			"broker_id", brokerID, "message_id", d.MessageID)
+		return false
+	}
+
+	switch msg.DispatchState {
+	case store.MessageDispatchDispatched, store.MessageDispatchPending:
+	default:
+		return false
+	}
+
+	finCtx, finCancel := finalizationContext(ctx)
+	defer finCancel()
+	won, err := s.store.MarkMessageDelivered(finCtx, msg.ID)
+	if err != nil {
+		slog.Error("message-failures: failed to mark message delivered",
+			"broker_id", brokerID, "message_id", msg.ID, "error", err)
+		return false
+	}
+	if !won {
+		return false
+	}
+	if s.messageLog != nil {
+		s.messageLog.Info("message delivery confirmed by broker; marked delivered",
+			"message_id", msg.ID,
+			"agent_id", agent.ID,
+			"project_id", agent.ProjectID,
+			"broker_id", brokerID,
+		)
+	}
+
+	s.notifyStoredMessageSenderDelivered(finCtx, msg)
+	return true
+}
+
+// notifyStoredMessageSenderDelivered pushes a live SSE update to connected
+// human browser clients after dispatch_state=delivered has committed.
+func (s *Server) notifyStoredMessageSenderDelivered(ctx context.Context, msg *store.Message) {
+	if msg == nil {
+		return
+	}
+	if strings.HasPrefix(msg.Sender, "user:") && s.events != nil {
+		cp := *msg
+		cp.DispatchState = store.MessageDispatchDelivered
+		s.events.PublishUserMessage(ctx, &cp, nil, nil)
+	}
+}
+
+// notifyStoredMessageSenderFailed notifies an agent sender (via DELIVERY_FAILED
+// notice) or connected human browser clients (via PublishUserMessage) after the
+// stored message row's dispatch_state=failed write has already committed.
+func (s *Server) notifyStoredMessageSenderFailed(ctx context.Context, agent *store.Agent, msg *store.Message, reason string) {
+	if msg == nil {
+		return
+	}
 	// Tell an agent sender its message was not delivered, mirroring the
 	// DELIVERY_FAILED notice sent for synchronous broker failures.
 	if proxy := s.GetMessageBrokerProxy(); proxy != nil && strings.HasPrefix(msg.Sender, "agent:") && msg.SenderID != "" {
-		proxy.publishDeliveryFailed(ctx, agent.ProjectID, agent.Slug, &messages.StructuredMessage{
+		var projectID, agentSlug string
+		if agent != nil {
+			projectID = agent.ProjectID
+			agentSlug = agent.Slug
+		} else {
+			projectID = msg.ProjectID
+			agentSlug = strings.TrimPrefix(msg.Recipient, "agent:")
+		}
+		proxy.publishDeliveryFailed(ctx, projectID, agentSlug, &messages.StructuredMessage{
 			Sender:   msg.Sender,
 			SenderID: msg.SenderID,
 		}, errors.New(reason))
@@ -256,23 +498,48 @@ func (s *Server) applyBrokerMessageFailure(ctx context.Context, brokerID string,
 	// (rather than only on next reload) and renders the "Failed" delivery
 	// badge the web chat client already supports for its own outbound
 	// messages (ptone/scion#1866).
-	//
-	// This function never calls CreateMessage itself — unlike the other
-	// PublishUserMessage call sites, it acts on a row persisted by an
-	// earlier request. msg came from the s.store.GetMessage(ctx, f.MessageID)
-	// lookup above, which already returned false on a missing/lookup-error
-	// row, and by this point s.markFailed(ctx, msg.ID, reason) has already
-	// written dispatch_state=failed for that same row (returning false above
-	// on error, before this point is reached). The two local field
-	// assignments just mirror that already-committed write onto the
-	// in-memory copy so the published event matches what markFailed
-	// persisted, rather than the stale pre-failure snapshot fetched above.
 	if strings.HasPrefix(msg.Sender, "user:") && s.events != nil {
-		msg.DispatchState = store.MessageDispatchFailed
-		msg.DispatchFailureReason = &reason
-		s.events.PublishUserMessage(ctx, msg, nil, nil)
+		cp := *msg
+		cp.DispatchState = store.MessageDispatchFailed
+		cp.DispatchFailureReason = &reason
+		s.events.PublishUserMessage(ctx, &cp, nil, nil)
 	}
-	return true
+}
+
+// notifyStoredMessageSenderUnconfirmed notifies an agent sender (via
+// DELIVERY_UNCONFIRMED notice) or connected human browser clients (via
+// PublishUserMessage with dispatchFailureCode=delivery_unconfirmed) after
+// dispatch_state=failed has been committed for an ambiguous delivery outcome —
+// either when ExpireAndListStuckPendingMessages expires a stuck pending row
+// with store.MessageExpiredStuckPendingReason (ptone/scion#7405) or when a
+// background auto-wake dispatch finalizes an ambiguous timeout/cancellation
+// via FailUndeliveredMessage with dispatchOutcomeUnknownReason. In both cases
+// delivery may have occurred, so unconfirmed wording tells the sender to check
+// before resending.
+func (s *Server) notifyStoredMessageSenderUnconfirmed(ctx context.Context, agent *store.Agent, msg *store.Message) {
+	if msg == nil {
+		return
+	}
+	if proxy := s.GetMessageBrokerProxy(); proxy != nil && strings.HasPrefix(msg.Sender, "agent:") && msg.SenderID != "" {
+		var agentSlug string
+		if agent != nil && agent.Slug != "" {
+			agentSlug = agent.Slug
+		} else {
+			agentSlug = strings.TrimPrefix(msg.Recipient, "agent:")
+		}
+		proxy.publishDeliveryUnconfirmed(ctx, agentSlug, &messages.StructuredMessage{
+			Sender:   msg.Sender,
+			SenderID: msg.SenderID,
+		})
+	}
+
+	if strings.HasPrefix(msg.Sender, "user:") && s.events != nil {
+		cp := *msg
+		cp.DispatchState = store.MessageDispatchFailed
+		reason := store.MessageExpiredStuckPendingReason
+		cp.DispatchFailureReason = &reason
+		s.events.PublishUserMessage(ctx, &cp, nil, nil)
+	}
 }
 
 // maxFailureReasonBytes bounds the broker-supplied failure reason that is

@@ -47,7 +47,11 @@ interface HarnessConfigEntry {
 }
 
 import { isAgentLaunching, isIncompleteCreate, isSharedWorkspace } from '../../shared/types.js';
+import { agentParentTrail, current, type Named } from '../../client/crumbs.js';
+import { projectDisplayName, projectLabelNow } from '../../client/project-label.js';
+import '../shared/breadcrumb.js';
 import { isTargetKubernetesOnly } from '../../shared/runtime-kind.js';
+import { isFlatBroker, runtimeTargetLabel } from '../../shared/runtime-target.js';
 import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
 import { AGENT_CREATE_TRIGGERS, defaultTriggersHint } from '../../shared/notification-triggers.js';
 import {
@@ -62,6 +66,11 @@ import { GCPServiceAccountsLoader } from '../../client/gcp-sa-accounts-loader.js
 import { apiFetch, apiFetchAllPages, parseApiError } from '../../client/api.js';
 import { showPendingSecretsStartHint } from '../../client/pending-secrets.js';
 import { getPublicSettings } from '../../client/server-feature-flags.js';
+import {
+  FEATURE_FLAGS_CHANGED_EVENT,
+  FLAT_BROKERS_FLAG,
+  isFeatureEnabled,
+} from '../../utils/feature-flags.js';
 import { navigateTo } from '../../client/navigation.js';
 import { showToast } from '../../utils/toast.js';
 import { showResponseWarnings, showResponseBodyWarnings } from '../../client/response-warnings.js';
@@ -125,11 +134,24 @@ export class ScionPageAgentCreate extends LitElement {
   /** Cached project settings keyed by projectId */
   private projectSettingsCache: Map<string, ProjectCreateDefaults> = new Map();
 
-  /** Profiles available on the currently selected broker */
+  /** The currently selected Runtime Broker, if any. */
+  private get selectedBroker(): RuntimeBroker | undefined {
+    if (!this.brokerId) return undefined;
+    return this.brokers.find((b) => b.id === this.brokerId);
+  }
+
+  /** Effective runtime profile for the selected broker (flat brokers never take a profile). */
+  private get effectiveProfile(): string {
+    const broker = this.selectedBroker;
+    if (broker && isFlatBroker(broker)) return '';
+    return this.profile;
+  }
+
+  /** Profiles available on the currently selected legacy broker (empty for flat brokers). */
   private get selectedBrokerProfiles(): import('../../shared/types.js').BrokerProfile[] {
-    if (!this.brokerId) return [];
-    const broker = this.brokers.find((b) => b.id === this.brokerId);
-    return broker?.profiles?.filter((p) => p.available) ?? [];
+    const broker = this.selectedBroker;
+    if (!broker || isFlatBroker(broker)) return [];
+    return broker.profiles?.filter((p) => p.available) ?? [];
   }
 
   /**
@@ -141,9 +163,7 @@ export class ScionPageAgentCreate extends LitElement {
    * profiles mix runtime types, this is false.
    */
   private get targetRuntimeIsKubernetesOnly(): boolean {
-    if (!this.brokerId) return false;
-    const broker = this.brokers.find((b) => b.id === this.brokerId);
-    return isTargetKubernetesOnly(broker, this.profile);
+    return isTargetKubernetesOnly(this.selectedBroker, this.effectiveProfile);
   }
 
   /** The currently selected project */
@@ -164,11 +184,41 @@ export class ScionPageAgentCreate extends LitElement {
 
   /** Inherited values for the form's unset fields, from what this page fetched. */
   private get placeholders(): Record<string, AgentConfigPlaceholder> {
+    const broker = this.selectedBroker;
     return resolveInheritedPlaceholders({
       template: this.selectedTemplate,
       projectSettings: this.projectSettings,
       hubSettings: this.hubSettings,
+      broker: broker
+        ? { id: broker.id, name: broker.name || broker.id, flat: isFlatBroker(broker) }
+        : null,
+      profile: this.effectiveProfile,
+      flatBrokersEnabled: isFeatureEnabled(FLAT_BROKERS_FLAG),
+      gcpServiceAccounts: this.gcp.gcpServiceAccounts,
     });
+  }
+
+  private unsubscribeGcp: (() => void) | null = null;
+
+  private readonly boundOnFeatureFlagsChanged = (): void => {
+    this.syncGcpTarget();
+    this.requestUpdate();
+  };
+
+  private syncGcpTarget(): void {
+    const broker = this.selectedBroker;
+    const flat = !!broker && isFlatBroker(broker);
+    this.gcp.setTarget(
+      this.targetRuntimeIsKubernetesOnly,
+      this.effectiveProfile,
+      flat
+        ? {
+            brokerId: broker.id,
+            brokerLabel: broker.name || broker.id,
+            flatBrokersEnabled: isFeatureEnabled(FLAT_BROKERS_FLAG),
+          }
+        : null
+    );
   }
 
   private get form(): ScionAgentConfigForm | null {
@@ -182,20 +232,6 @@ export class ScionPageAgentCreate extends LitElement {
   static override styles = css`
     :host {
       display: block;
-    }
-
-    .back-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-      color: var(--scion-text-muted, #64748b);
-      text-decoration: none;
-      font-size: 0.875rem;
-      margin-bottom: 1rem;
-    }
-
-    .back-link:hover {
-      color: var(--scion-primary, #3b82f6);
     }
 
     .page-header {
@@ -379,7 +415,10 @@ export class ScionPageAgentCreate extends LitElement {
   override connectedCallback(): void {
     super.connectedCallback();
 
+    this.unsubscribeGcp = this.gcp.subscribe(() => this.requestUpdate());
+
     if (typeof window !== 'undefined') {
+      window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
       const params = new URLSearchParams(window.location.search);
 
       const projectParam = params.get('projectId');
@@ -396,18 +435,29 @@ export class ScionPageAgentCreate extends LitElement {
     void this.loadFormData();
   }
 
+  override disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this.form?.clearSecrets();
+    this.unsubscribeGcp?.();
+    this.unsubscribeGcp = null;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
+  }
+
   override willUpdate(changedProperties: Map<string, unknown>): void {
     super.willUpdate(changedProperties);
     // Hand the GCP identity state the current target whenever the
     // broker/profile selection or the broker list changes: its hint
-    // describes Block on a Kubernetes target. Whether an explicit identity
-    // is sent is gated separately by gcpIdentityUserSet.
+    // describes Block on a Kubernetes target and per-broker defaults on flat
+    // Runtime Brokers. Whether an explicit identity is sent is gated
+    // separately by gcpIdentityUserSet.
     if (
       changedProperties.has('brokerId') ||
       changedProperties.has('profile') ||
       changedProperties.has('brokers')
     ) {
-      this.gcp.setTarget(this.targetRuntimeIsKubernetesOnly, this.profile);
+      this.syncGcpTarget();
       // The accounts' mapping state is for one target: ask again when it
       // changes (ptone/scion#4391). Not before the first load has started.
       void this.gcpAccounts.targetChanged();
@@ -639,6 +689,11 @@ export class ScionPageAgentCreate extends LitElement {
   }
 
   private autoSelectProfile(): void {
+    const broker = this.selectedBroker;
+    if (!broker || isFlatBroker(broker)) {
+      this.profile = '';
+      return;
+    }
     const profiles = this.selectedBrokerProfiles;
     if (profiles.length === 1) {
       this.profile = profiles[0].name;
@@ -707,7 +762,7 @@ export class ScionPageAgentCreate extends LitElement {
   private readonly gcpAccounts = new GCPServiceAccountsLoader({
     projectId: () => this.projectId,
     target: () =>
-      assignStatusTarget(this.targetRuntimeIsKubernetesOnly, this.brokerId, this.profile),
+      assignStatusTarget(this.targetRuntimeIsKubernetesOnly, this.brokerId, this.effectiveProfile),
     accounts: () => this.gcp.gcpServiceAccounts,
     setAccounts: (accounts) => this.gcp.setAccounts(accounts),
   });
@@ -812,8 +867,8 @@ export class ScionPageAgentCreate extends LitElement {
 
     // The submit-time guards read the live target, even if no update has
     // handed it to the identity state yet.
-    this.gcp.targetKubernetesOnly = this.targetRuntimeIsKubernetesOnly;
-    this.gcp.profile = this.profile;
+    const profile = this.effectiveProfile;
+    this.syncGcpTarget();
 
     // The form's validation includes the GCP identity rules. The form is
     // rendered once the page has loaded; the identity state is checked
@@ -844,7 +899,7 @@ export class ScionPageAgentCreate extends LitElement {
       // Only a picked harness config; unset, the hub applies its own order.
       if (this.resolvedHarness) body.harnessConfig = this.resolvedHarness;
       if (this.brokerId) body.runtimeBrokerId = this.brokerId;
-      if (this.profile) body.profile = this.profile;
+      if (profile) body.profile = profile;
       if (this.task.trim()) body.task = this.task.trim();
 
       // Additional Options: only what the user set. Everything else
@@ -854,6 +909,8 @@ export class ScionPageAgentCreate extends LitElement {
         Object.assign(body, form.collectTopLevel());
         const config = form.collectConfigPatch();
         if (Object.keys(config).length > 0) body.config = config;
+        const secrets = form.collectSecrets();
+        if (secrets.length > 0) body.secrets = secrets;
       } else {
         const gcpIdentity = this.gcp.toRequest();
         if (gcpIdentity) body.gcp_identity = gcpIdentity;
@@ -895,6 +952,9 @@ export class ScionPageAgentCreate extends LitElement {
       if (!agentId) {
         throw new Error('No agent ID in response');
       }
+
+      // Clear create-time secrets from memory as soon as the create succeeds.
+      form?.clearSecrets();
 
       // Start the agent unless the create response shows it already started.
       // An async launch the hub accepted is the hub's to finish: while it
@@ -951,11 +1011,27 @@ export class ScionPageAgentCreate extends LitElement {
   // Render
   // ═══════════════════════════════════════════════════════════════════
 
+  private parentCrumbs(allowPending: boolean) {
+    if (this.sourceProject) {
+      const named: Named = {
+        id: this.sourceProject.id,
+        label: projectDisplayName(this.sourceProject, this.sourceProject.id),
+      };
+      return agentParentTrail(named);
+    }
+    if (this.projectFromUrl && this.projectId.trim()) {
+      const cached = projectLabelNow(this.projectId);
+      return agentParentTrail(allowPending ? cached : { id: cached.id, label: cached.label });
+    }
+    return agentParentTrail(null);
+  }
+
   override render() {
     // After the first load the form stays mounted during a reload, so the
     // user's Additional Options edits (kept in the form) survive it.
     if (this.loading && !this.loadedOnce) {
       return html`
+        <scion-breadcrumb .crumbs=${this.parentCrumbs(true)}></scion-breadcrumb>
         <div class="loading-state">
           <sl-spinner></sl-spinner>
           <p>Loading...</p>
@@ -963,14 +1039,10 @@ export class ScionPageAgentCreate extends LitElement {
       `;
     }
 
-    const backHref = this.sourceProject ? `/projects/${this.sourceProject.id}` : '/agents';
-    const backLabel = this.sourceProject ? `To ${this.sourceProject.name}` : 'Back to Agents';
+    const crumbs = [...this.parentCrumbs(false), current('New agent', false)];
 
     return html`
-      <a href="${backHref}" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        ${backLabel}
-      </a>
+      <scion-breadcrumb .crumbs=${crumbs}></scion-breadcrumb>
 
       <div class="page-header">
         <h1>
@@ -1202,18 +1274,22 @@ export class ScionPageAgentCreate extends LitElement {
             this.autoSelectProfile();
           }}
         >
-          ${this.brokers.map(
-            (b) =>
-              html`<sl-option value=${b.id} ?disabled=${b.status === 'offline'}>
-                ${b.name} (${b.status})
-              </sl-option>`
-          )}
+          ${this.brokers.map((b) => {
+            const target = isFlatBroker(b) ? runtimeTargetLabel(b) : '';
+            const label = target
+              ? `${b.name} — ${target} (${b.status})`
+              : `${b.name} (${b.status})`;
+            return html`<sl-option value=${b.id} ?disabled=${b.status === 'offline'}>
+              ${label}
+            </sl-option>`;
+          })}
         </sl-select>
         <div class="hint">The compute node that will run this agent.</div>
       </div>
 
-      <!-- Runtime Profile (conditional: broker has profiles) -->
-      ${this.selectedBrokerProfiles.length > 0
+      <!-- Runtime Profile (conditional: legacy broker with profiles) -->
+      ${(!this.selectedBroker || !isFlatBroker(this.selectedBroker)) &&
+      this.selectedBrokerProfiles.length > 0
         ? html`
             <div class="form-field">
               <label for="profile">Runtime Profile</label>

@@ -67,6 +67,7 @@ func (s *Server) onAgentHalted(ctx context.Context, agent *store.Agent, haltedFr
 		close(done)
 		return done
 	}
+	s.expireHeldMessagesForAgent(ctx, agent.ID, holdFailReasonAgentStopped)
 	s.agentLifecycleLog.Warn("agent halted by the platform",
 		"agent_id", agent.ID, "agent", agent.Slug, "project_id", agent.ProjectID,
 		"exit_reason", agent.ExitReason, "halted_from", haltedFrom)
@@ -109,7 +110,7 @@ func (s *Server) onAgentHalted(ctx context.Context, agent *store.Agent, haltedFr
 // agent's free-text message is not included: the sentence is attributed to
 // the platform, so it holds only values the hub controls.
 func haltedNotificationMessage(agent *store.Agent) string {
-	return fmt.Sprintf("%s was halted by the platform (%s). %s. Resume: scion start %s.",
+	return fmt.Sprintf("%s was halted by the platform (%s). %s. Resume: scion resume %s.",
 		agent.Slug, state.ExitReason(agent.ExitReason).Label(), haltedWorkspaceWording(agent), agent.Slug)
 }
 

@@ -1059,7 +1059,7 @@ var relationshipCharacterizedAllowlist = map[relationshipAllowKey][]string{
 		"gcp_service_account.assign",
 	},
 	{"owner", "user", "skill"}: {
-		"skill.create", "skill.create_global", "skill.read", "skill.update", "skill.delete",
+		"skill.create", "skill.read", "skill.update", "skill.delete",
 		"skill.list", "skill.register",
 	},
 
@@ -1106,6 +1106,7 @@ var relationshipCharacterizedAllowlist = map[relationshipAllowKey][]string{
 	{"hub_association", "agent", "env_var"}:     {"env_var.deliver"},
 	{"broker_association", "agent", "secret"}:   {"secret.deliver"},
 	{"broker_association", "agent", "env_var"}:  {"env_var.deliver"},
+	{"agent_association", "agent", "secret"}:    {"secret.deliver"},
 
 	// An agent may read its origin user's personal (user-scoped) skills,
 	// through the same progeny relationship as opted-in secrets, keyed on
@@ -1169,6 +1170,7 @@ var knownRelationshipNames = map[string]bool{
 	"project_association":  true,
 	"hub_association":      true,
 	"broker_association":   true,
+	"agent_association":    true,
 }
 
 // relationshipPolicyPrincipalKinds is the principal-kind vocabulary rows use.
@@ -1663,12 +1665,8 @@ type bearerFixture struct {
 // the handler-level authorization these tests are designed to exercise.
 func (f *bypassAgentsFixture) token(t *testing.T, scopes ...AgentTokenScope) string {
 	t.Helper()
-	svc := f.srv.GetAgentTokenService()
-	require.NotNil(t, svc)
 	allScopes := append([]AgentTokenScope{ScopeProjectRead}, scopes...)
-	tok, err := svc.GenerateAgentToken(f.caller.ID, f.caller.ProjectID, allScopes, nil)
-	require.NoError(t, err)
-	return tok
+	return f.srv.generateRecordedAgentToken(t, f.caller.ID, f.caller.ProjectID, allScopes, nil)
 }
 
 // asAgent issues a request carrying the calling agent's token.

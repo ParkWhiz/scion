@@ -814,6 +814,7 @@ func (s *Server) handleTopicGet(w http.ResponseWriter, r *http.Request, topicID 
 		return
 	}
 
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, topic)
 }
 
@@ -897,7 +898,7 @@ func (s *Server) handleTopicPatch(w http.ResponseWriter, r *http.Request, topicI
 			return
 		}
 		if !threadNameRegexp.MatchString(name) {
-			ValidationError(w, "name contains invalid characters", nil)
+			ValidationError(w, threadNameInvalidCharsMessage, nil)
 			return
 		}
 		updates.Name = &name
@@ -1218,6 +1219,7 @@ func (s *Server) handleConversationSend(w http.ResponseWriter, r *http.Request, 
 		Metadata:    body.Metadata,
 		Interrupt:   body.Interrupt,
 		Wake:        body.Wake,
+		DetachWake:  true,
 		OfferWake:   body.OfferWake,
 	}
 
@@ -1536,6 +1538,12 @@ const (
 	// (the agent looked reachable) but dispatchWithBrokerRetry returned an
 	// error synchronously.
 	dispatchFailureCodeDispatchError = "dispatch_error"
+	// dispatchFailureCodeDeliveryUnconfirmed is derived when a pending message
+	// row expired past stuckMessageExpireTTL (store.MessageExpiredStuckPendingReason,
+	// ptone/scion#7405): delivery may already have occurred (AC-3 or an
+	// interrupted dispatch), so UI surfaces must show "Delivery unconfirmed"
+	// rather than "Failed".
+	dispatchFailureCodeDeliveryUnconfirmed = "delivery_unconfirmed"
 )
 
 // dispatchFailureCodeFromReason derives a machine-readable dispatchFailureCode
@@ -1544,7 +1552,9 @@ const (
 // only thing available (nc-delivery-unreachable review R2, events.go
 // PublishUserMessage). Mirrors the frontend's own history-row fallback in
 // chat-message.ts renderDeliveryState: a reason with the "Agent unreachable"
-// prefix implies the agent_unreachable code. Anything else is left empty —
+// prefix implies the agent_unreachable code, and
+// store.MessageExpiredStuckPendingReason implies delivery_unconfirmed
+// (ptone/scion#7405). Anything else is left empty —
 // in particular the synchronous dispatch_error branch's raw dispatch-error
 // text, which does not follow this prefix and is out of scope here (its SSE
 // publish happens before that reason is even set; see the FYI note in the
@@ -1552,6 +1562,9 @@ const (
 func dispatchFailureCodeFromReason(reason string) string {
 	if strings.HasPrefix(reason, "Agent unreachable") {
 		return dispatchFailureCodeAgentUnreachable
+	}
+	if reason == store.MessageExpiredStuckPendingReason {
+		return dispatchFailureCodeDeliveryUnconfirmed
 	}
 	return ""
 }
@@ -1573,10 +1586,14 @@ var unreachablePhases = map[string]bool{
 	string(state.PhaseHalted):    true,
 }
 
-// agentGoneReason is the failure reason recorded when the primary agent no
-// longer resolves to a live agent. A soft-deleted agent and an agent whose
-// record is missing get this same reason, so the two cases read alike.
+// agentGoneReason is the failure reason recorded when an agent no longer
+// resolves to a live agent on paths that do not distinguish deletion (such as
+// decision answers).
 const agentGoneReason = "Agent unreachable"
+
+// agentDeletedReason is the failure reason recorded in chat v2 when the target
+// agent has been deleted (soft-deleted or missing from the store).
+const agentDeletedReason = "Agent unreachable (deleted)"
 
 // agentUnreachableReason returns the failure reason for an unreachable
 // primary given the suffix from isAgentUnreachable.
@@ -1590,18 +1607,28 @@ func agentUnreachableReason(suffix string) string {
 // isAgentUnreachable reports whether agent is unreachable for chat v2 primary
 // dispatch: soft-deleted, or in a phase whose container cannot accept a
 // buffered message (suspended, stopping, stopped, error). The returned string
-// is a short reason suffix for agentUnreachableReason: the phase name, or
-// empty for a soft-deleted agent (reported like a missing one) and when
+// is a short reason suffix for agentUnreachableReason: "deleted" for a
+// soft-deleted agent, the phase name for an unreachable phase, or empty when
 // reachable.
 func isAgentUnreachable(agent *store.Agent) (bool, string) {
 	if agent == nil {
 		return false, ""
 	}
 	if !agent.DeletedAt.IsZero() {
-		return true, ""
+		return true, "deleted"
 	}
 	if unreachablePhases[agent.Phase] {
 		return true, agent.Phase
+	}
+	return false, ""
+}
+
+func (s *Server) isAgentUnreachable(agent *store.Agent) (bool, string) {
+	if unreachable, why := isAgentUnreachable(agent); unreachable {
+		return true, why
+	}
+	if agent != nil && agent.IdleSuspendClaimActive {
+		return true, string(state.PhaseSuspended)
 	}
 	return false, ""
 }
@@ -1621,6 +1648,12 @@ type chatSendOptions struct {
 	// with 403 when the caller lacks the lifecycle permission the start
 	// route requires, and a failed wake persists nothing.
 	Wake bool
+	// DetachWake detaches a wake send from caller cancellation with
+	// context.WithoutCancel, bounded by chatWakeSendBudget, so a dropped
+	// HTTP client does not abort an in-progress wake. Server-driven callers
+	// (scheduled sends) leave it false so their own deadline and shutdown
+	// abort stay attached.
+	DetachWake bool
 	// OfferWake makes a suspended primary that the caller may wake answer
 	// 409 agent_not_running with details canWake=true, persisting nothing,
 	// instead of a failed "Agent unreachable (suspended)" row. The client
@@ -1638,6 +1671,11 @@ type chatSendOptions struct {
 	// number of agent recipients. The HTTP handler uses it to extend the
 	// connection's write deadline past the server-wide WriteTimeout.
 	BeforeWake func(recipients int)
+	// HumanMentionNames, when HumanMentionsResolved is true, supplies the
+	// prose @mention names (including wrapped mentions) not matching any
+	// project agent for recording human mention dots.
+	HumanMentionNames     []string
+	HumanMentionsResolved bool
 }
 
 const (
@@ -1700,6 +1738,16 @@ func (s *Server) suspendedPrimaryWakeable(ctx context.Context, user UserIdentity
 	return s.agentLifecycleAllowed(ctx, user, agent)
 }
 
+// isWakeRefusal reports whether a wakeAgentForDM error is a policy or standing
+// refusal (no permission, or a held agent / held ancestor / standing refusal
+// from startGate) rather than an operational wake failure.
+func isWakeRefusal(wakeErr *AgentDMError) bool {
+	if wakeErr == nil {
+		return false
+	}
+	return wakeErr.HTTPStatus == http.StatusForbidden || wakeErr.StandingRefused
+}
+
 // sendAgentRouted sends a message through the existing agent dispatch path.
 // It returns the response body of the persisted message, or the error
 // the send handler answers with.
@@ -1712,14 +1760,31 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 		return nil, newChatSendError(http.StatusInternalServerError, "INTERNAL", "no agent to route to", nil)
 	}
 
+	// Skip shell execution containers silently when other routed agents exist;
+	// only refuse when every routed agent is a shell container (ptone/scion#8812 §3.4 S5).
+	originalPrimaryIsShell := isShellAgent(agents[0])
+	nonShell := make([]*store.Agent, 0, len(agents))
+	for _, a := range agents {
+		if !isShellAgent(a) {
+			nonShell = append(nonShell, a)
+		}
+	}
+	if len(nonShell) == 0 {
+		dmErr := shellAgentNotMessageableError(agents[0])
+		return nil, newChatSendError(dmErr.HTTPStatus, dmErr.Code, dmErr.Message, nil)
+	}
+	agents = nonShell
 	primaryAgent := agents[0]
 
-	// The primary agent (agents[0]) always gets TypeInstruction. Secondaries
-	// (agents[1:]) get TypeMention via the fan-out path. The primary is the
-	// thread's implicit agent or the first-mentioned agent — it is never a
-	// "mention" recipient regardless of how the list was assembled.
+	// The primary agent (agents[0]) normally gets TypeInstruction (or TypeReply).
+	// Secondaries (agents[1:]) get TypeMention via the fan-out path. If the
+	// original primary was a dropped shell execution container, keep
+	// TypeMention so dropping the shell recipient does not change the remaining
+	// agents' message type.
 	msgType := messages.TypeInstruction
-	if replyToID != "" {
+	if originalPrimaryIsShell {
+		msgType = messages.TypeMention
+	} else if replyToID != "" {
 		msgType = messages.TypeReply
 	}
 
@@ -1819,7 +1884,7 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 	// are unaffected: dispatch proceeds normally because buffered messages
 	// land once the agent comes up. Modeled on the phase check in
 	// dispatchRoutedRecipient (handlers_broker_inbound_routed.go).
-	primaryUnreachable, primaryUnreachableReason := isAgentUnreachable(primaryAgent)
+	primaryUnreachable, primaryUnreachableReason := s.isAgentUnreachable(primaryAgent)
 	// A held primary (ptone/scion#3433) is unreachable whatever its phase:
 	// the row is kept, never dispatched. A lookup fault is treated the same.
 	if !primaryUnreachable && primaryAgent != nil {
@@ -1860,17 +1925,28 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 	// validation, so a denied or invalid send can neither be offered a
 	// wake nor resume an agent. The wake itself runs later, right before
 	// persistence (see wakePrimary below).
+	//
+	// A primary the hub suspended (shouldAutoWake, ptone/scion#7826) is
+	// woken without a wake request and without the lifecycle permission:
+	// the send authorization suffices. A held primary is never woken; it
+	// keeps the unreachable handling above.
 	wakePrimary := false
-	if !primaryReincarnating && state.Phase(primaryAgent.Phase) == state.PhaseSuspended &&
-		primaryAgent.DeletedAt.IsZero() && (opts.Wake || opts.OfferWake) {
+	autoWakePrimary := !primaryReincarnating && primaryAgent.DeletedAt.IsZero() &&
+		s.shouldQueueAutoWake(primaryAgent) && !s.agentHeldOrUnknown(ctx, primaryAgent.ID)
+	if !primaryReincarnating && (state.Phase(primaryAgent.Phase) == state.PhaseSuspended || autoWakePrimary) &&
+		primaryAgent.DeletedAt.IsZero() && (opts.Wake || opts.OfferWake || autoWakePrimary) {
 		switch {
+		case autoWakePrimary:
+			wakePrimary = true
 		case opts.Wake && !s.agentLifecycleAllowed(ctx, user, primaryAgent):
-			return nil, newChatSendError(http.StatusForbidden, ErrCodeForbidden,
+			serr := newChatSendError(http.StatusForbidden, ErrCodeForbidden,
 				"You do not have permission to wake this agent", map[string]interface{}{
 					"agentId":   primaryAgent.ID,
 					"agentSlug": primaryAgent.Slug,
 					"phase":     primaryAgent.Phase,
 				})
+			serr.wakeFailure = wakeFailureRefused
+			return nil, serr
 		case opts.Wake:
 			wakePrimary = true
 		case s.suspendedPrimaryWakeable(ctx, user, primaryAgent):
@@ -1884,7 +1960,13 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 		}
 	}
 
-	// Persist the message.
+	// Persist the message (translating any @<email> matching a human member of
+	// the project into @<display-slug> for human-facing display while keeping
+	// agentContent untouched for agent dispatch — ptone/scion#8133).
+	displayContent := content
+	if len(humanMembers) > 0 {
+		displayContent = translateMentionsInboundWithOptions(content, humanMembers, s.mentionOptions())
+	}
 	storeMsg := &store.Message{
 		ID:            api.NewUUID(),
 		ProjectID:     projectID,
@@ -1892,7 +1974,7 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 		SenderID:      msg.SenderID,
 		Recipient:     msg.Recipient,
 		RecipientID:   msg.RecipientID,
-		Msg:           content,
+		Msg:           displayContent,
 		Type:          msgType,
 		AgentID:       primaryAgent.ID,
 		Channel:       "web",
@@ -1909,6 +1991,11 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 		storeMsg.DispatchFailureReason = &unreachableReason
 		dispatchFailureCode = dispatchFailureCodeAgentUnreachable
 	}
+	prePersistErr := func(serr *chatSendError) *chatSendError {
+		serr.notPersisted = wakePrimary
+		return serr
+	}
+
 	// B15 dual-write: resolve-or-create conversation for web chat user→agent messages.
 	// chatV2ConvResult is declared outside the block so Phase 9b(ii)
 	// rendering can read it after persistence.
@@ -1933,7 +2020,7 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 				if s.writeDenyEnabled() {
 					messaging.WriteDenialMetrics.Inc("chat_v2.agent_routed.thread")
 					s.messageLog.Error("conversation resolution failed", "error", convErr)
-					return nil, newChatSendError(http.StatusConflict, ErrCodeConversationNotResolved, "conversation resolution failed", nil)
+					return nil, prePersistErr(newChatSendError(http.StatusConflict, ErrCodeConversationNotResolved, "conversation resolution failed", nil))
 				}
 				s.messageLog.Warn("conversation resolution failed (write-deny OFF, continuing)", "error", convErr)
 			}
@@ -1944,7 +2031,7 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 				if s.writeDenyEnabled() {
 					messaging.WriteDenialMetrics.Inc("chat_v2.agent_routed.dm")
 					s.messageLog.Error("conversation resolution failed", "error", convErr)
-					return nil, newChatSendError(http.StatusConflict, ErrCodeConversationNotResolved, "conversation resolution failed", nil)
+					return nil, prePersistErr(newChatSendError(http.StatusConflict, ErrCodeConversationNotResolved, "conversation resolution failed", nil))
 				}
 				s.messageLog.Warn("conversation resolution failed (write-deny OFF, continuing)", "error", convErr)
 			}
@@ -1954,7 +2041,7 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 			if err := messaging.ValidateAttributed(storeMsg.ConversationID); err != nil {
 				if s.writeDenyEnabled() {
 					messaging.WriteDenialMetrics.Inc("chat_v2.agent_routed.validate")
-					return nil, newChatSendError(http.StatusConflict, ErrCodeConversationNotResolved, err.Error(), nil)
+					return nil, prePersistErr(newChatSendError(http.StatusConflict, ErrCodeConversationNotResolved, err.Error(), nil))
 				}
 				s.messageLog.Warn("ValidateAttributed failed (write-deny OFF, continuing)", "error", err)
 			}
@@ -1972,30 +2059,61 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 		if opts.BeforeWake != nil {
 			opts.BeforeWake(len(agents))
 		}
-		// Detach from client cancellation: a dropped connection must not
-		// abort a wake in progress, nor the persist and dispatch after it.
-		// The send then runs to its end with its idempotency key in flight
-		// (a retry is told send_in_progress), so the client's retry finds
-		// the finished outcome. The detached context carries one overall
-		// deadline (chatWakeSendBudget), so a stalled store or event call
-		// ends the send instead of keeping the key in flight forever.
-		// Within it the wake (chatWakeResumeBudget) and each dispatch
-		// (30s) have their own bounds; markFailed uses its finalization
-		// timeout and still runs after the deadline.
-		var cancelSend context.CancelFunc
-		ctx, cancelSend = context.WithTimeout(context.WithoutCancel(ctx), chatWakeSendBudget(len(agents)))
-		defer cancelSend()
+		// For HTTP requests (opts.DetachWake), detach from client
+		// cancellation: a dropped connection must not abort a wake in
+		// progress, nor the persist and dispatch after it. The send then
+		// runs to its end with its idempotency key in flight (a retry is
+		// told send_in_progress), so the client's retry finds the finished
+		// outcome. The detached context carries one overall deadline
+		// (chatWakeSendBudget), so a stalled store or event call ends the
+		// send instead of keeping the key in flight forever. Server-driven
+		// callers (scheduled sends) keep their own context so shutdown
+		// aborts and their delivery budget remain attached.
+		if opts.DetachWake {
+			var cancelSend context.CancelFunc
+			ctx, cancelSend = context.WithTimeout(context.WithoutCancel(ctx), chatWakeSendBudget(len(agents)))
+			defer cancelSend()
+		}
 		wakeCtx, cancelWake := context.WithTimeout(ctx, chatWakeResumeBudget)
 		// wakeAgentForDM reports managed runtimes, a missing broker, the
 		// start gate and readiness failures as typed errors.
-		_, wakeErr := s.wakeAgentForDM(wakeCtx, primaryAgent)
+		var wakeRes *WakeResult
+		var wakeErr *AgentDMError
+		if autoWakePrimary {
+			// A hub-suspended primary whose wake another start already
+			// holds is waited for and delivered to (wakeOrAwaitStart);
+			// a wait that ends without a ready agent answers as a
+			// deferred wake does below.
+			var awaitErr error
+			wakeErr, awaitErr = s.wakeOrAwaitStart(wakeCtx, primaryAgent)
+			if wakeErr == nil && awaitErr != nil {
+				wakeRes = &WakeResult{Outcome: WakeDeferred}
+			}
+		} else {
+			wakeRes, wakeErr = s.wakeAgentForDM(wakeCtx, primaryAgent)
+		}
 		cancelWake()
 		if wakeErr != nil {
-			return nil, chatSendFromAgentDMError(wakeErr)
+			serr := chatSendFromAgentDMError(wakeErr)
+			if isWakeRefusal(wakeErr) {
+				serr.wakeFailure = wakeFailureRefused
+			} else {
+				serr.wakeFailure = wakeFailureFailed
+			}
+			return nil, serr
+		}
+		if wakeRes != nil && wakeRes.Outcome == WakeDeferred {
+			return nil, &chatSendError{
+				Status:      http.StatusServiceUnavailable,
+				Code:        ErrCodeUnavailable,
+				Message:     fmt.Sprintf("Failed to wake agent: %s; retry shortly", s.deferredReason(primaryAgent)),
+				RetryAfter:  5 * time.Second,
+				wakeFailure: wakeFailureFailed,
+			}
 		}
 		// wakeAgentForDM moved the agent to running in place: the row is
 		// no longer born failed.
-		primaryUnreachable, _ = isAgentUnreachable(primaryAgent)
+		primaryUnreachable, _ = s.isAgentUnreachable(primaryAgent)
 		if !primaryUnreachable {
 			storeMsg.DispatchState = store.MessageDispatchDispatched
 			storeMsg.DispatchFailureReason = nil
@@ -2009,7 +2127,7 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 	}
 	if err := s.store.CreateMessage(ctx, storeMsg); err != nil {
 		s.messageLog.Error("Failed to persist agent-routed message", "error", err)
-		return nil, newChatSendError(http.StatusInternalServerError, "INTERNAL", "failed to persist message", nil)
+		return nil, prePersistErr(newChatSendError(http.StatusInternalServerError, "INTERNAL", "failed to persist message", nil))
 	}
 	if opts.OnPersisted != nil {
 		opts.OnPersisted(storeMsg.ID)
@@ -2086,7 +2204,11 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 	// translation, so this adds no lookup. Only names that matched no agent
 	// are candidates (agent slugs take precedence).
 	var mentionedHumans []string
-	if humanNames := unresolvedMentionNames(mentionResults); len(humanNames) > 0 {
+	humanNames := opts.HumanMentionNames
+	if !opts.HumanMentionsResolved {
+		humanNames = unresolvedMentionNames(mentionResults)
+	}
+	if len(humanNames) > 0 {
 		mentionedHumans = mentionedHumanIDs(humanMembers, humanNames, user.ID())
 		s.recordHumanMentions(ctx, key, storeMsg.ID, mentionedHumans)
 	}
@@ -2162,7 +2284,8 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 	primaryDispatchOK := true
 	if primaryReincarnating || primaryUnreachable {
 		primaryDispatchOK = false
-	} else if dispatcher != nil {
+	}
+	if primaryDispatchOK && dispatcher != nil {
 		// withDispatchMessageID carries the hub message ID to the broker so a
 		// later buffered-delivery failure report (#1820) can mark this row
 		// failed even though this synchronous call returns nil (message_delivery_failures.go).
@@ -2186,7 +2309,48 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 		// dispatchWithBrokerRetry (effectiveInterrupt), the single place
 		// that decides it.
 		primaryInterrupt := interrupt && state.Phase(primaryAgent.Phase) == state.PhaseRunning
-		if err := dispatchWithBrokerRetry(retryCtx, nil, dispatcher, primaryAgent, agentContent, primaryInterrupt, msg); err != nil {
+		if _, err := s.holdOrDispatch(retryCtx, primaryAgent, storeMsg.ID, storeMsg, func() error {
+			return dispatchWithBrokerRetry(
+				retryCtx,
+				s.deliveryMarker(),
+				nil,
+				dispatcher,
+				primaryAgent,
+				agentContent,
+				primaryInterrupt,
+				msg,
+				withSyncAutoWakeHook(func(_ context.Context, target *store.Agent) (context.Context, context.CancelFunc, error) {
+					if !s.shouldQueueAutoWake(target) || s.agentHeldOrUnknown(ctx, target.ID) {
+						return nil, nil, &errAgentIdleSuspending{agent: target, claimActive: target.IdleSuspendClaimActive}
+					}
+					if opts.BeforeWake != nil {
+						opts.BeforeWake(len(agents))
+					}
+					baseCtx := ctx
+					if opts.DetachWake {
+						baseCtx = context.WithoutCancel(ctx)
+					}
+					wakeCtx, cancelWake := context.WithTimeout(baseCtx, chatWakeResumeBudget)
+					dmErr, awaitErr := s.wakeOrAwaitStart(wakeCtx, target)
+					cancelWake()
+					if dmErr != nil {
+						return nil, nil, &errAutoWakeRefused{dmErr: dmErr}
+					}
+					if awaitErr != nil {
+						return nil, nil, &errAutoWakeRefused{dmErr: startInProgressDMError(target, awaitErr), awaitErr: awaitErr}
+					}
+					newCtx, newCancel := context.WithTimeout(withDispatchMessageID(baseCtx, storeMsg.ID), 30*time.Second)
+					if err := s.refreshHoldLaunchAfterWake(newCtx, target, storeMsg.ID, storeMsg); err != nil {
+						newCancel()
+						return nil, nil, err
+					}
+					return newCtx, newCancel, nil
+				}),
+				withAdjustUrgentAfterWake(func(target *store.Agent, _ bool) bool {
+					return interrupt && state.Phase(target.Phase) == state.PhaseRunning
+				}),
+			)
+		}); err != nil {
 			s.messageLog.Error("Failed to dispatch to agent", "agent", primaryAgent.Slug, "error", err)
 			_ = s.markFailed(ctx, storeMsg.ID, err.Error())
 			// Mirror the store update above in storeMsg so the response
@@ -2210,6 +2374,9 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 	// Handle additional mentioned agents (fan-out).
 	if len(agents) > 1 {
 		for _, mentionAgent := range agents[1:] {
+			if isShellAgent(mentionAgent) {
+				continue
+			}
 			// Phase 3 msg-authz: Check message authorization on each mentioned agent.
 			// Replaces the ActionAttach check — chat v2 mention fan-out is messaging.
 			mentionAllowed, _, _ := s.authorizeAgentMessage(ctx, user, mentionAgent, false)
@@ -2395,6 +2562,22 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 				}
 				continue
 			}
+			// A secondary the hub suspended (shouldAutoWake,
+			// ptone/scion#7826) is woken in the background and gets its
+			// stored copy once ready; the send does not wait for it. A wake
+			// that fails marks the copy failed. A hub that is shutting down
+			// cannot start the wake, and the copy takes the dispatch below.
+			// It is registered as a group participant now, as the agent
+			// mention fan-out does for a queued wake, so a woken agent in
+			// lineage or branch mode can reply into the group. On purpose
+			// before delivery: a participant is a listing index, not an
+			// ACL, so one whose wake then fails stays listed harmlessly.
+			if mentionPersisted && dispatcher != nil && s.shouldQueueAutoWake(mentionAgent) &&
+				!s.agentHeldOrUnknown(ctx, mentionAgent.ID) &&
+				s.queueAutoWake(mentionAgent, s.chatSecondaryAutoWakeItem(mentionStoreMsg.ID, mentionAddressee, agentContent, mentionMsg)) {
+				dispatchedAgents = append(dispatchedAgents, mentionAgent)
+				continue
+			}
 			if dispatcher != nil {
 				// withDispatchMessageID: same rationale as the primary dispatch
 				// above, so a buffered-delivery failure on this mention row can
@@ -2405,7 +2588,23 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 				// stopped and error secondaries also take the buffered
 				// non-interrupt dispatch.
 				mentionInterrupt := interrupt && state.Phase(mentionAgent.Phase) == state.PhaseRunning
-				if err := dispatchWithBrokerRetry(retryCtx, nil, dispatcher, mentionAgent, agentContent, mentionInterrupt, mentionMsg); err != nil {
+				mentionID := ""
+				var mentionPtr *store.Message
+				if mentionPersisted {
+					mentionID = mentionStoreMsg.ID
+					mentionPtr = mentionStoreMsg
+				}
+				if _, err := s.holdOrDispatch(retryCtx, mentionAgent, mentionID, mentionPtr, func() error {
+					return dispatchWithBrokerRetry(retryCtx, s.deliveryMarker(), nil, dispatcher, mentionAgent, agentContent, mentionInterrupt, mentionMsg)
+				}); err != nil {
+					var idleErr *errAgentIdleSuspending
+					if errors.As(err, &idleErr) && mentionPersisted &&
+						s.shouldQueueAutoWake(mentionAgent) && !s.agentHeldOrUnknown(ctx, mentionAgent.ID) &&
+						s.queueAutoWake(mentionAgent, s.chatSecondaryAutoWakeItem(mentionStoreMsg.ID, mentionAddressee, agentContent, mentionMsg)) {
+						cancel()
+						dispatchedAgents = append(dispatchedAgents, mentionAgent)
+						continue
+					}
 					s.messageLog.Error("Failed to dispatch mention", "slug", mentionAgent.Slug, "error", err)
 					s.finishAttachmentAddressee(context.WithoutCancel(ctx), mentionAddressee, err)
 					mentionDispatchOK = false
@@ -2443,7 +2642,7 @@ func (s *Server) sendAgentRouted(ctx context.Context, key, projectID string, use
 
 	resp := chatMessageResponse{
 		ID:                  storeMsg.ID,
-		Content:             content,
+		Content:             displayContent,
 		Sender:              storeMsg.Sender,
 		SenderID:            storeMsg.SenderID,
 		Type:                storeMsg.Type,
@@ -2561,6 +2760,15 @@ func (s *Server) sendHumanToHuman(ctx context.Context, key, projectID string, us
 		msgType = messages.TypeReply
 	}
 
+	var humanMembers []chatMemberEntry
+	if projectID != "" && (len(mentionNames) > 0 || strings.Contains(content, "@")) {
+		humanMembers = s.resolveProjectHumanMembers(ctx, projectID)
+	}
+	displayContent := content
+	if len(humanMembers) > 0 {
+		displayContent = translateMentionsInboundWithOptions(content, humanMembers, s.mentionOptions())
+	}
+
 	storeMsg := &store.Message{
 		ID:            api.NewUUID(),
 		ProjectID:     msgProjectID,
@@ -2568,7 +2776,7 @@ func (s *Server) sendHumanToHuman(ctx context.Context, key, projectID string, us
 		SenderID:      user.ID(),
 		Recipient:     recipient,
 		RecipientID:   recipientID,
-		Msg:           content,
+		Msg:           displayContent,
 		Type:          msgType,
 		Channel:       "web",
 		ThreadID:      key,
@@ -2679,7 +2887,7 @@ func (s *Server) sendHumanToHuman(ctx context.Context, key, projectID string, us
 	// mention dots) on this event. Thread membership reuses the result.
 	var mentionedHumans []string
 	if len(mentionNames) > 0 && projectID != "" {
-		mentionedHumans = mentionedHumanIDs(s.resolveProjectHumanMembers(ctx, projectID), mentionNames, user.ID())
+		mentionedHumans = mentionedHumanIDs(humanMembers, mentionNames, user.ID())
 		s.recordHumanMentions(ctx, key, storeMsg.ID, mentionedHumans)
 	}
 
@@ -2714,7 +2922,7 @@ func (s *Server) sendHumanToHuman(ctx context.Context, key, projectID string, us
 
 	resp := chatMessageResponse{
 		ID:          storeMsg.ID,
-		Content:     content,
+		Content:     displayContent,
 		Sender:      storeMsg.Sender,
 		SenderID:    storeMsg.SenderID,
 		Type:        storeMsg.Type,
@@ -2823,10 +3031,15 @@ func (s *Server) handleMessageEdit(w http.ResponseWriter, r *http.Request, key, 
 		return
 	}
 
-	// Resolve projectID for event publishing.
+	// Resolve projectID for event publishing and mention translation.
 	projectID := msg.ProjectID
 	if projectID == uuid.Nil.String() {
 		projectID = ""
+	}
+	if projectID != "" && strings.Contains(content, "@") {
+		if editHumanMembers := s.resolveProjectHumanMembers(ctx, projectID); len(editHumanMembers) > 0 {
+			content = translateMentionsInboundWithOptions(content, editHumanMembers, s.mentionOptions())
+		}
 	}
 
 	// Update message content and mark as edited.
@@ -3406,7 +3619,7 @@ func (s *Server) chatHistoryPage(ctx context.Context, wcs WebChatStore, key, his
 		MessageExtensions:           messageExtensions,
 		ReplyPreviews:               replyPreviews,
 	}
-	s.addChoiceHistoryViews(ctx, &resp)
+	s.addDecisionHistoryViews(ctx, &resp)
 	return resp
 }
 
@@ -3429,9 +3642,16 @@ func (s *Server) handleConversationInteragent(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	q := r.URL.Query()
+	messageID := q.Get("messageId")
+
 	// Only agent DMs are supported.
 	if !strings.HasPrefix(key, "dm:agent:") {
-		writeJSON(w, http.StatusOK, interagentResponse{Messages: []store.Message{}})
+		if messageID != "" {
+			NotFound(w, "Message")
+			return
+		}
+		writeJSON(w, http.StatusOK, interagentResponse{Messages: []interagentEntry{}})
 		return
 	}
 	if !validDMKey(key) {
@@ -3446,7 +3666,11 @@ func (s *Server) handleConversationInteragent(w http.ResponseWriter, r *http.Req
 	// Extract the agent UUID from the DM key.
 	agentID := parseAgentDMKey(key)
 	if agentID == "" {
-		writeJSON(w, http.StatusOK, interagentResponse{Messages: []store.Message{}})
+		if messageID != "" {
+			NotFound(w, "Message")
+			return
+		}
+		writeJSON(w, http.StatusOK, interagentResponse{Messages: []interagentEntry{}})
 		return
 	}
 
@@ -3457,7 +3681,15 @@ func (s *Server) handleConversationInteragent(w http.ResponseWriter, r *http.Req
 	// field like "agent:<slug>" was set).
 	agent, err := s.store.GetAgent(ctx, agentID)
 	if err != nil || agent == nil {
-		writeJSON(w, http.StatusOK, interagentResponse{Messages: []store.Message{}})
+		if messageID != "" {
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				writeErrorFromErr(w, err, "Agent")
+				return
+			}
+			NotFound(w, "Message")
+			return
+		}
+		writeJSON(w, http.StatusOK, interagentResponse{Messages: []interagentEntry{}})
 		return
 	}
 
@@ -3472,7 +3704,20 @@ func (s *Server) handleConversationInteragent(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	q := r.URL.Query()
+	if messageID != "" {
+		msg, err := s.store.GetMessage(ctx, messageID)
+		if err != nil {
+			writeErrorFromErr(w, err, "Message")
+			return
+		}
+		if !interagentMessageInvolvesAgent(msg, agent) {
+			NotFound(w, "Message")
+			return
+		}
+		entry := s.toInteragentEntry(ctx, user.ID(), msg, false, nil)
+		writeJSON(w, http.StatusOK, interagentResponse{Messages: []interagentEntry{entry}})
+		return
+	}
 
 	// Parse optional time-range bounds.
 	var after, before time.Time
@@ -3545,44 +3790,134 @@ func (s *Server) handleConversationInteragent(w http.ResponseWriter, r *http.Req
 	// A row whose provenance stamps name different projects but which has
 	// no conversation ID cannot be checked, so its body is stripped too.
 	seen := make(map[string]bool, len(result.Items))
-	filtered := make([]store.Message, 0, len(result.Items)+len(senderResult.Items))
-	viewerID := user.ID()
-	addMsg := func(m store.Message) {
-		if !strings.HasPrefix(m.Sender, "agent:") || !strings.HasPrefix(m.Recipient, "agent:") {
+	candidates := make([]store.Message, 0, len(result.Items)+len(senderResult.Items))
+	addCandidate := func(m store.Message) {
+		if !interagentMessageInvolvesAgent(&m, agent) {
 			return
 		}
 		if seen[m.ID] {
 			return
 		}
 		seen[m.ID] = true
-		switch {
-		case isCrossProjectRow(&m) && m.ConversationID == "":
-			// No conversation to check participation against: fail closed.
-			m.Msg = ""
-		case ClassifyLegacyViewQuery(&m) == LegacyViewCanonical && m.ConversationID != "":
+		candidates = append(candidates, m)
+	}
+	for _, m := range result.Items {
+		addCandidate(m)
+	}
+	for _, m := range senderResult.Items {
+		addCandidate(m)
+	}
+
+	slices.SortFunc(candidates, func(a, b store.Message) int {
+		if c := b.CreatedAt.Compare(a.CreatedAt); c != 0 {
+			return c
+		}
+		return strings.Compare(b.ID, a.ID)
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+
+	viewerID := user.ID()
+	allowedByConv := make(map[string]bool)
+	entries := make([]interagentEntry, len(candidates))
+	for i := range candidates {
+		entries[i] = s.toInteragentEntry(ctx, viewerID, &candidates[i], true, allowedByConv)
+	}
+
+	writeJSON(w, http.StatusOK, interagentResponse{Messages: entries})
+}
+
+const interagentPreviewRunes = 300
+
+// interagentMessageInvolvesAgent reports whether m is an agent-to-agent
+// message involving agent (either via canonical SenderID/RecipientID or via
+// pre-SenderID legacy slug matching within the agent's project).
+func interagentMessageInvolvesAgent(m *store.Message, agent *store.Agent) bool {
+	if m == nil || agent == nil {
+		return false
+	}
+	if !strings.HasPrefix(m.Sender, "agent:") || !strings.HasPrefix(m.Recipient, "agent:") {
+		return false
+	}
+	if m.SenderID == agent.ID || m.RecipientID == agent.ID {
+		return true
+	}
+	return m.SenderID == "" && m.Sender == "agent:"+agent.Slug && m.ProjectID == agent.ProjectID
+}
+
+func (s *Server) toInteragentEntry(
+	ctx context.Context,
+	viewerID string,
+	m *store.Message,
+	truncate bool,
+	allowedByConv map[string]bool,
+) interagentEntry {
+	body := ""
+	msgTruncated := false
+	if s.interagentBodyVisible(ctx, viewerID, m, allowedByConv) {
+		body = m.Msg
+		if truncate && utf8.RuneCountInString(body) > interagentPreviewRunes {
+			body = truncatePreview(body, interagentPreviewRunes)
+			msgTruncated = true
+		}
+	}
+	return interagentEntry{
+		ID:                 m.ID,
+		Sender:             m.Sender,
+		Recipient:          m.Recipient,
+		Msg:                body,
+		MsgTruncated:       msgTruncated,
+		CreatedAt:          m.CreatedAt,
+		SenderProjectID:    m.SenderProjectID,
+		RecipientProjectID: m.RecipientProjectID,
+	}
+}
+
+// interagentBodyVisible reports whether viewerID may see the body of an
+// inter-agent message row, memoizing per-conversation cross-project decisions
+// in allowedByConv when non-nil.
+func (s *Server) interagentBodyVisible(
+	ctx context.Context,
+	viewerID string,
+	m *store.Message,
+	allowedByConv map[string]bool,
+) bool {
+	switch {
+	case isCrossProjectRow(m) && m.ConversationID == "":
+		// No conversation to check participation against: fail closed.
+		return false
+	case ClassifyLegacyViewQuery(m) == LegacyViewCanonical && m.ConversationID != "":
+		allowed, ok := allowedByConv[m.ConversationID]
+		if !ok {
 			decision := s.AuthorizeCrossProjectContentAccess(
 				ctx, viewerID, m.ConversationID, ContentSurfaceInteragentView,
 			)
-			if !decision.Allowed {
-				// Strip body — participation not verified.
-				m.Msg = ""
+			allowed = decision.Allowed
+			if allowedByConv != nil {
+				allowedByConv[m.ConversationID] = allowed
 			}
 		}
-		filtered = append(filtered, m)
+		return allowed
+	default:
+		return true
 	}
-	for _, m := range result.Items {
-		addMsg(m)
-	}
-	for _, m := range senderResult.Items {
-		addMsg(m)
-	}
-
-	writeJSON(w, http.StatusOK, interagentResponse{Messages: filtered})
 }
 
 // interagentResponse is the response for the interagent endpoint.
 type interagentResponse struct {
-	Messages []store.Message `json:"messages"`
+	Messages []interagentEntry `json:"messages"`
+}
+
+type interagentEntry struct {
+	ID                 string    `json:"id"`
+	Sender             string    `json:"sender"`
+	Recipient          string    `json:"recipient"`
+	Msg                string    `json:"msg"`
+	MsgTruncated       bool      `json:"msgTruncated,omitempty"`
+	CreatedAt          time.Time `json:"createdAt"`
+	SenderProjectID    *string   `json:"senderProjectId,omitempty"`
+	RecipientProjectID *string   `json:"recipientProjectId,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -4194,7 +4529,7 @@ func (s *Server) handleConversationPromote(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if !threadNameRegexp.MatchString(body.Name) {
-		ValidationError(w, "thread name contains invalid characters", nil)
+		ValidationError(w, "thread "+threadNameInvalidCharsMessage, nil)
 		return
 	}
 
@@ -4679,8 +5014,6 @@ func (s *Server) handleChatDMs(w http.ResponseWriter, r *http.Request) {
 		}
 		if lastMessage := lastMessages[dm.ConversationKey]; lastMessage != nil {
 			entry.LastMessageID = lastMessage.ID
-			entry.LastMessagePreview = truncatePreview(lastMessage.Msg, 120)
-			entry.LastMessageSender = lastMessage.Sender
 		}
 
 		switch dm.PeerKind {
@@ -4688,7 +5021,6 @@ func (s *Server) handleChatDMs(w http.ResponseWriter, r *http.Request) {
 			if peerUser := peerUsers[dm.PeerID]; peerUser != nil {
 				entry.PeerName = peerUser.DisplayName
 				entry.PeerEmail = peerUser.Email
-				entry.PeerAvatar = peerUser.AvatarURL
 			}
 		case "agent":
 			if peerAgent := peerAgents[dm.PeerID]; peerAgent != nil {
@@ -4724,6 +5056,10 @@ func (s *Server) handleChatDMs(w http.ResponseWriter, r *http.Request) {
 // collected so far.
 var spaceMembersMaxAgents = 10000
 
+// spaceMembersMessageRunes bounds the freeform agent status detail carried on
+// each agent member entry (rendered only in the sidebar row tooltip).
+const spaceMembersMessageRunes = 280
+
 // handleSpaceMembers handles GET /api/v1/chat/spaces/{projectId}/members.
 func (s *Server) handleSpaceMembers(w http.ResponseWriter, r *http.Request, projectID string) {
 	if r.Method != http.MethodGet {
@@ -4754,38 +5090,62 @@ func (s *Server) handleSpaceMembers(w http.ResponseWriter, r *http.Request, proj
 	s.mu.RUnlock()
 
 	// --- Humans: list project members via role bindings (PM1) ---
-	var humans []chatMemberEntry
 	projectMembers, err := s.store.ListProjectMembers(ctx, project.ID)
 	if err != nil {
 		slog.Error("chat members: failed to list project members", "project", project.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to list project members", nil)
 		return
 	}
-	seen := make(map[string]bool)
+	type uniqueMember struct {
+		userID string
+		role   string
+	}
+	uniqueMembers := make([]uniqueMember, 0, len(projectMembers))
+	memberIDs := make([]string, 0, len(projectMembers))
+	seen := make(map[string]bool, len(projectMembers))
 	for _, m := range projectMembers {
-		if seen[m.UserID] {
+		if m == nil || seen[m.UserID] {
 			continue
 		}
 		seen[m.UserID] = true
-		u, err := s.store.GetUser(ctx, m.UserID)
+		uniqueMembers = append(uniqueMembers, uniqueMember{userID: m.UserID, role: m.Role})
+		memberIDs = append(memberIDs, m.UserID)
+	}
+
+	var usersByID map[string]*store.User
+	if len(memberIDs) > 0 {
+		usersByID, err = s.store.GetUsersByIDs(ctx, memberIDs)
 		if err != nil {
+			slog.Error("chat members: failed to load project member users", "project", project.ID, "error", err)
+			writeError(w, http.StatusInternalServerError, "INTERNAL", "failed to list project members", nil)
+			return
+		}
+	}
+
+	humans := make([]chatHumanMemberEntry, 0, len(uniqueMembers))
+	for _, m := range uniqueMembers {
+		u := usersByID[m.userID]
+		if u == nil {
 			continue
 		}
-		entry := chatMemberEntry{
+		entry := chatHumanMemberEntry{
 			ID:          u.ID,
-			Kind:        "user",
 			DisplayName: u.DisplayName,
 			Email:       u.Email,
 			AvatarURL:   u.AvatarURL,
-			Role:        m.Role,
+			Role:        m.role,
 		}
 		if pm != nil {
 			entry.PresenceState = string(pm.GetState(u.ID))
 		}
 		humans = append(humans, entry)
 	}
-	if humans == nil {
-		humans = []chatMemberEntry{}
+
+	if r.URL.Query().Get("include") == "humans" {
+		writeJSON(w, http.StatusOK, chatMembersHumansResponse{
+			Humans: humans,
+		})
+		return
 	}
 
 	// --- Agents: list agents for the project ---
@@ -4800,12 +5160,11 @@ func (s *Server) handleSpaceMembers(w http.ResponseWriter, r *http.Request, proj
 	if !agentsVisible {
 		writeJSON(w, http.StatusOK, chatMembersResponse{
 			Humans: humans,
-			Agents: []chatMemberEntry{},
+			Agents: []chatAgentMemberEntry{},
 		})
 		return
 	}
 
-	var agents []chatMemberEntry
 	projectAgents, truncated, err := walkProjectAgentPages(ctx, s.store, project.ID, spaceMembersMaxAgents)
 	if err != nil {
 		// A client that has gone away is not a server failure, and nothing
@@ -4827,31 +5186,32 @@ func (s *Server) handleSpaceMembers(w http.ResponseWriter, r *http.Request, proj
 	// and access constraints load once instead of once per agent. Every
 	// decision still runs, and is audited, individually.
 	attachCtx := withAuthzInputMemo(ctx)
-	for _, a := range projectAgents {
+	now := time.Now()
+	seesDeletionDetail := callerSeesDeletionDetail(ctx)
+	agents := make([]chatAgentMemberEntry, 0, len(projectAgents))
+	for i := range projectAgents {
+		a := &projectAgents[i]
 		// Each attach check reads the store and may write an audit record,
 		// so stop once the client has gone rather than finishing the list.
 		if ctx.Err() != nil {
 			return
 		}
-		entry := chatMemberEntry{
-			ID:          a.ID,
-			Kind:        "agent",
-			DisplayName: a.Name,
-			Slug:        a.Slug,
-			Phase:       a.Phase,
-			Activity:    a.Activity,
-			ProjectID:   a.ProjectID,
-			Message:     a.Message,
+		entry := chatAgentMemberEntry{
+			ID:            a.ID,
+			DisplayName:   a.Name,
+			Slug:          a.Slug,
+			Phase:         a.Phase,
+			Activity:      a.Activity,
+			SuspendReason: a.SuspendReason,
+			Message:       truncatePreview(a.Message, spaceMembersMessageRunes),
+			Deletion:      deletionViewForCaller(a, now, seesDeletionDetail),
 		}
 		// Whether this viewer may open a terminal on this agent. The PTY
 		// route gates on authorizeAgentLifecycle, which decides
 		// ActionAttach for a user identity, so ask the same question here
 		// rather than offering a control the server will refuse.
 		entry.CanAttach = s.authzService.CheckAccess(
-			attachCtx, user, agentResource(&a), ActionAttach).Allowed
-		if !a.LastSeen.IsZero() {
-			entry.LastSeen = a.LastSeen.UTC().Format(time.RFC3339)
-		}
+			attachCtx, user, agentResource(a), ActionAttach).Allowed
 		switch {
 		case !a.LastActivityEvent.IsZero():
 			entry.LastActivityEvent = a.LastActivityEvent.UTC().Format(time.RFC3339)
@@ -4859,9 +5219,6 @@ func (s *Server) handleSpaceMembers(w http.ResponseWriter, r *http.Request, proj
 			entry.LastActivityEvent = a.Updated.UTC().Format(time.RFC3339)
 		}
 		agents = append(agents, entry)
-	}
-	if agents == nil {
-		agents = []chatMemberEntry{}
 	}
 
 	writeJSON(w, http.StatusOK, chatMembersResponse{
@@ -5294,8 +5651,7 @@ func (s *Server) handleChatSearch(w http.ResponseWriter, r *http.Request) {
 		s.recordChatSearch(ctx, slog.Default(), shape)
 		if shape.outcome == chatSearchOutcomeTimeout {
 			// No partial results: the whole search is refused.
-			writeError(w, http.StatusServiceUnavailable, "SEARCH_TIMEOUT",
-				"Search took too long. Try a longer phrase or search one space.", nil)
+			writeChatSearchTimeout(w)
 		}
 		return true
 	}
@@ -5433,8 +5789,7 @@ func (s *Server) handleChatSearch(w http.ResponseWriter, r *http.Request) {
 			shape.outcome = chatSearchOutcomeTimeout
 			shape.duration = time.Since(searchStart)
 			s.recordChatSearch(ctx, slog.Default(), shape)
-			writeError(w, http.StatusServiceUnavailable, "SEARCH_TIMEOUT",
-				"Search took too long. Try a longer phrase or search one space.", nil)
+			writeChatSearchTimeout(w)
 			return
 		}
 		shape.outcome = chatSearchOutcomeError
@@ -6124,18 +6479,18 @@ type chatHistoryResponse struct {
 	// the oldest page (no nextCursor); see chatHistoryRetentionMarker.
 	Retention *chatHistoryRetention `json:"retention,omitempty"`
 
-	// MessageDecisions and MessageChoiceIntros (choice-prompt rows) and
-	// MessageChoiceResponses (choice-response rows) are keyed by message
-	// ID, set only while web.chat_choices is on (design choices v4, 4.4).
+	// MessageDecisions and MessageDecisionIntros (decision-prompt rows) and
+	// MessageDecisionResponses (decision-response rows) are keyed by message
+	// ID, set only while web.decisions is on (design choices v4, 4.4).
 	// The intro is the agent's body without the markdown fallback.
-	MessageDecisions       map[string][]DecisionView     `json:"messageDecisions,omitempty"`
-	MessageChoiceIntros    map[string]string             `json:"messageChoiceIntros,omitempty"`
-	MessageChoiceResponses map[string]ChoiceResponseView `json:"messageChoiceResponses,omitempty"`
-	// MessageChoiceAnswerModes (choice-prompt rows: "single" or "set") and
-	// MessageChoiceResponseSets (the response rows of set submits) are set
+	MessageDecisions         map[string][]DecisionView       `json:"messageDecisions,omitempty"`
+	MessageDecisionIntros    map[string]string               `json:"messageDecisionIntros,omitempty"`
+	MessageDecisionResponses map[string]DecisionResponseView `json:"messageDecisionResponses,omitempty"`
+	// MessageDecisionAnswerModes (decision-prompt rows: "single" or "set") and
+	// MessageDecisionResponseSets (the response rows of set submits) are set
 	// under the same rule (design choices v5, 5.1 and 5.2).
-	MessageChoiceAnswerModes  map[string]string                `json:"messageChoiceAnswerModes,omitempty"`
-	MessageChoiceResponseSets map[string]ChoiceResponseSetView `json:"messageChoiceResponseSets,omitempty"`
+	MessageDecisionAnswerModes  map[string]string                  `json:"messageDecisionAnswerModes,omitempty"`
+	MessageDecisionResponseSets map[string]DecisionResponseSetView `json:"messageDecisionResponseSets,omitempty"`
 }
 
 // chatHistoryRetention is the history page's retention marker: messages
@@ -6164,20 +6519,17 @@ type chatDMListResponse struct {
 }
 
 type chatDMEntry struct {
-	ConversationKey    string    `json:"conversationKey"`
-	PeerID             string    `json:"peerId"`
-	PeerKind           string    `json:"peerKind"`
-	PeerName           string    `json:"peerName,omitempty"`
-	PeerEmail          string    `json:"peerEmail,omitempty"`
-	PeerSlug           string    `json:"peerSlug,omitempty"`
-	PeerAvatar         string    `json:"peerAvatar,omitempty"`
-	LastMessageID      string    `json:"lastMessageId,omitempty"`
-	LastActivityAt     time.Time `json:"lastActivityAt"`
-	LastReadMessageID  string    `json:"lastReadMessageId,omitempty"`
-	HasUnread          bool      `json:"hasUnread"`
-	Muted              bool      `json:"muted"`
-	LastMessagePreview string    `json:"lastMessagePreview,omitempty"`
-	LastMessageSender  string    `json:"lastMessageSender,omitempty"`
+	ConversationKey   string    `json:"conversationKey"`
+	PeerID            string    `json:"peerId"`
+	PeerKind          string    `json:"peerKind"`
+	PeerName          string    `json:"peerName,omitempty"`
+	PeerEmail         string    `json:"peerEmail,omitempty"`
+	PeerSlug          string    `json:"peerSlug,omitempty"`
+	LastMessageID     string    `json:"lastMessageId,omitempty"`
+	LastActivityAt    time.Time `json:"lastActivityAt"`
+	LastReadMessageID string    `json:"-"`
+	HasUnread         bool      `json:"hasUnread"`
+	Muted             bool      `json:"muted"`
 
 	// PeerDeleted is true when the peer is an agent that has been deleted
 	// (soft-deleted, or no longer has an agent row). Such a DM is kept
@@ -6187,8 +6539,51 @@ type chatDMEntry struct {
 }
 
 type chatMembersResponse struct {
-	Humans []chatMemberEntry `json:"humans"`
-	Agents []chatMemberEntry `json:"agents"`
+	Humans []chatHumanMemberEntry `json:"humans"`
+	Agents []chatAgentMemberEntry `json:"agents"`
+}
+
+// chatMembersHumansResponse is the `?include=humans` wire shape: `agents` is
+// omitted so "not requested" cannot be mistaken for "zero agents".
+type chatMembersHumansResponse struct {
+	Humans []chatHumanMemberEntry `json:"humans"`
+}
+
+type chatHumanMemberEntry struct {
+	ID            string `json:"id"`
+	DisplayName   string `json:"displayName"`
+	Email         string `json:"email,omitempty"`
+	AvatarURL     string `json:"avatarUrl,omitempty"`
+	Role          string `json:"role,omitempty"`
+	PresenceState string `json:"presenceState,omitempty"`
+}
+
+type chatAgentMemberEntry struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+	Slug        string `json:"slug,omitempty"`
+	Phase       string `json:"phase,omitempty"`
+	Activity    string `json:"activity,omitempty"`
+	// SuspendReason is why a suspended agent was suspended (see
+	// state.SuspendReason), as on the agent; agents only.
+	SuspendReason string `json:"suspendReason,omitempty"`
+	// Message is the agent's freeform status detail, truncated to
+	// spaceMembersMessageRunes runes for tooltip display.
+	Message string `json:"message,omitempty"`
+	// LastActivityEvent is when the agent last changed state, RFC3339, with
+	// the record's update time as a fallback.
+	LastActivityEvent string `json:"lastActivityEvent,omitempty"`
+	// Deletion is the redacted client-facing deletion view when an async
+	// delete is active or failed within the display TTL; omitted otherwise.
+	Deletion *store.DeletionInfo `json:"deletion,omitempty"`
+	// CanAttach reports whether the requesting user may open a terminal on
+	// this agent, mirroring the ActionAttach decision the PTY route makes.
+	//
+	// Deliberately NOT omitempty: false is the value the client most needs to
+	// receive. With omitempty a denied agent serialises to nothing, the client
+	// cannot distinguish "not allowed" from "field absent", and the control it
+	// gates stays visible — which is the exact case this field exists for.
+	CanAttach bool `json:"canAttach"`
 }
 
 type chatSearchResponse struct {
@@ -6207,6 +6602,9 @@ type chatMemberEntry struct {
 	Phase         string `json:"phase,omitempty"`
 	Activity      string `json:"activity,omitempty"`
 	PresenceState string `json:"presenceState,omitempty"`
+	// SuspendReason is why a suspended agent was suspended (see
+	// state.SuspendReason), as on the agent; agents only.
+	SuspendReason string `json:"suspendReason,omitempty"`
 	// Agent-only fields. LastSeen is RFC3339; empty when the agent has
 	// never reported in.
 	LastSeen  string `json:"lastSeen,omitempty"`

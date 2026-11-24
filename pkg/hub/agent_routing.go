@@ -34,6 +34,11 @@ type RoutingPlan struct {
 	// UnresolvedMentions collects mention slugs that did not resolve to any
 	// agent in the project. Callers may surface these as diagnostics.
 	UnresolvedMentions []string
+
+	// HumanMentionNames collects prose @mention names (including mentions
+	// wrapped in punctuation or markdown) that do not match any project agent
+	// slug, for recording human mention dots without altering agent routing.
+	HumanMentionNames []string
 }
 
 // agentLister is the interface needed to list agents for routing resolution.
@@ -136,10 +141,21 @@ func resolveRoutingAgents(
 	content string,
 	defaultAgent *store.Agent,
 ) (RoutingPlan, error) {
+	return resolveRoutingAgentsWithOptions(ctx, lister, projectID, content, defaultAgent, messages.MentionOptions{})
+}
+
+func resolveRoutingAgentsWithOptions(
+	ctx context.Context,
+	lister agentLister,
+	projectID string,
+	content string,
+	defaultAgent *store.Agent,
+	opts messages.MentionOptions,
+) (RoutingPlan, error) {
 	plan := RoutingPlan{}
 
 	// Step 1: Extract @-mention tokens.
-	plan.MentionNames = messages.ExtractMentions(content)
+	plan.MentionNames = messages.ExtractMentionsWithOptions(content, opts)
 
 	// Step 2: List all project agents for mention resolution.
 	projectAgents, err := listAllProjectAgents(ctx, lister, projectID)
@@ -154,6 +170,11 @@ func resolveRoutingAgents(
 		a := &projectAgents[i]
 		agentInfos = append(agentInfos, messages.AgentInfo{Slug: a.Slug, Name: a.Name})
 		agentBySlug[strings.ToLower(a.Slug)] = a
+	}
+	for _, name := range messages.ExtractProseWrappedMentionsWithOptions(content, opts) {
+		if _, isAgent := agentBySlug[strings.ToLower(name)]; !isAgent {
+			plan.HumanMentionNames = append(plan.HumanMentionNames, name)
+		}
 	}
 
 	// Step 3: Resolve mentions against known agents.
@@ -179,7 +200,7 @@ func resolveRoutingAgents(
 	if len(mentionedAgents) > 0 {
 		isLeading := len(plan.MentionNames) > 0 &&
 			strings.EqualFold(mentionedAgents[0].Slug, plan.MentionNames[0]) &&
-			messages.IsLeadingMention(content, plan.MentionNames[0])
+			messages.IsLeadingMentionWithOptions(content, plan.MentionNames[0], opts)
 
 		if isLeading {
 			// Leading mention overrides the default: mentioned agents as-is,

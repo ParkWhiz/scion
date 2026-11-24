@@ -88,7 +88,7 @@ func startOutcomeOf(err error) startOutcome {
 	case errors.Is(err, ErrLaunchInFlight), errors.As(err, &incomplete), errors.As(err, &stillMissing),
 		errors.Is(err, ErrLaunchInvalidPhase),
 		errors.Is(err, errStartRunNotBegun), errors.Is(err, errPendingConfigFold),
-		errors.As(err, &tokenErr), errors.Is(err, errBrokerLacksEmptyPerAgent),
+		errors.As(err, &tokenErr), isUnsupportedWorkspaceModeError(err),
 		isBrokerRuntimeUnavailable(err), isBrokerDraining(err), errors.Is(err, errStartClaimLost), errors.Is(err, store.ErrDeleteInProgress):
 		return startReleased
 	}
@@ -357,7 +357,11 @@ type claimedDispatch func(ctx context.Context, fence func() error) (handoff bool
 // it records run intent running and runs dispatch as before.
 func (s *Server) withStartClaim(ctx context.Context, agent *store.Agent, kind store.StartClaimKind, existing *startClaimRun, dispatch claimedDispatch) error {
 	if !s.startClaimsEnabled() {
-		if _, err := s.recordRunIntent(ctx, agent, store.RunIntentRunning); err != nil {
+		if kind == store.StartClaimWake || kind == store.StartClaimRecovery {
+			if _, _, err := s.swapSystemRunIntent(ctx, agent, store.RunIntentRunning); err != nil {
+				return err
+			}
+		} else if _, err := s.recordRunIntent(ctx, agent, store.RunIntentRunning); err != nil {
 			return err
 		}
 		_, err := dispatch(ctx, func() error { return nil })
@@ -493,12 +497,38 @@ func (s *Server) startAgentCore(ctx context.Context, agent *store.Agent, opts St
 		}
 		return err
 	}
+	// Admin-managed broker policy pre-check (ptone/scion#7829 §4.3.D), with
+	// the same rollback semantics as checkPinnedPlacement above: undo any
+	// capacity hold and release any existing start claim before returning.
+	if err := s.checkBrokerPolicyForStart(ctx, agent); err != nil {
+		opts.Dispatch.rollback(ctx)
+		if opts.Existing != nil {
+			opts.Existing.finish(startReleased)
+		}
+		return err
+	}
+	// Refuse to launch an agent whose create-time HomeFiles (e.g. a trigger's
+	// .scion/trigger-event.json) have not yet been delivered by its create
+	// dispatch. Prevents a concurrent manual start from starting the agent
+	// without its event file (P1c-1 O-C / sec L2).
+	if agentHomeFilesPending(agent) {
+		opts.Dispatch.rollback(ctx)
+		if opts.Existing != nil {
+			opts.Existing.finish(startReleased)
+		}
+		return errHomeFilesNotDelivered
+	}
 	// The effective resting phase (ptone/scion#4669): an error row that
 	// remembers a created or provisioning phase a failed asynchronous start
 	// began from is still a provisioned agent that never ran. Read before
 	// the dispatch, while no launch is active.
 	rest := store.EffectiveRestingPhase(agent)
 	provisioned := rest == string(state.PhaseCreated) || rest == string(state.PhaseProvisioning)
+	resumedIdleFromRunID := ""
+	if opts.Resume && !opts.NewGeneration && opts.Kind != store.StartClaimRestart &&
+		((rest == string(state.PhaseSuspended) && agent.SuspendReason == string(state.SuspendReasonIdle)) || agent.IdleSuspendClaimActive) {
+		resumedIdleFromRunID = agent.RunID
+	}
 	// Taken before the dispatch, which may record a new placement: a start
 	// replacing a previous run's ephemeral workspace warns about it
 	// (ptone/scion#3819). A provisioned agent has no previous run, and a
@@ -597,6 +627,7 @@ func (s *Server) startAgentCore(ctx context.Context, agent *store.Agent, opts St
 			// no started status, and hand the claim to the launch, whose
 			// end settles it.
 			sd.settle()
+			s.rebindIdleSuspendedHeldMessages(ctx, agent, resumedIdleFromRunID)
 			accepted = true
 			if opts.OnLaunchAccepted != nil {
 				opts.OnLaunchAccepted(ctx, agent)
@@ -608,9 +639,17 @@ func (s *Server) startAgentCore(ctx context.Context, agent *store.Agent, opts St
 		sd.settle()
 		st := startedState{ClearRemnants: opts.NewGeneration || sd.wroteStarting(), EndOp: endOp}
 		if opts.AfterStart != nil {
-			return false, opts.AfterStart(ctx, st)
+			if err := opts.AfterStart(ctx, st); err != nil {
+				return false, err
+			}
+			s.rebindIdleSuspendedHeldMessages(ctx, agent, resumedIdleFromRunID)
+			return false, nil
 		}
-		return false, s.writeStartedStatus(ctx, agent, st.ClearRemnants)
+		if err := s.writeStartedStatus(ctx, agent, st.ClearRemnants); err != nil {
+			return false, err
+		}
+		s.rebindIdleSuspendedHeldMessages(ctx, agent, resumedIdleFromRunID)
+		return false, nil
 	})
 	if err != nil && !errors.Is(err, errStartedStatusWrite) {
 		// A start refused before its dispatch ran (a held or lost claim, a
@@ -622,6 +661,9 @@ func (s *Server) startAgentCore(ctx context.Context, agent *store.Agent, opts St
 	if err == nil || errors.Is(err, errStartedStatusWrite) {
 		s.addEphemeralWorkspaceStartWarning(ctx, agent, hadEphemeral)
 		s.noteStartPendingOutcome(ctx, agent, stillPending)
+		if !accepted && resumedIdleFromRunID != "" {
+			s.maybeScheduleHeldMessageRedriveIfConnected(agent.ID)
+		}
 	}
 	if supersedesQueuedStop && (err == nil || errors.Is(err, errStartedStatusWrite)) {
 		// A start handed off to an asynchronous launch is still launching:
@@ -655,6 +697,31 @@ func (s *Server) startAgentCore(ctx context.Context, agent *store.Agent, opts St
 		s.settleFailedProvisionedStart(ctx, agent.ID, *agent.RunIntentAt, refusedStartMessage(err))
 	}
 	return err
+}
+
+func (s *Server) rebindIdleSuspendedHeldMessages(ctx context.Context, agent *store.Agent, fromRunID string) {
+	if s == nil || s.store == nil || agent == nil || fromRunID == "" {
+		return
+	}
+	finCtx, finCancel := finalizationContext(ctx)
+	defer finCancel()
+	hasHold, err := s.store.HasAgentDeliveryHold(finCtx, agent.ID)
+	if err != nil || !hasHold {
+		return
+	}
+	toRunID := agent.RunID
+	if toRunID == "" || toRunID == fromRunID {
+		if fresh, gerr := s.store.GetAgent(finCtx, agent.ID); gerr == nil && fresh != nil && fresh.RunID != "" {
+			toRunID = fresh.RunID
+		}
+	}
+	if toRunID == "" || toRunID == fromRunID {
+		return
+	}
+	if _, err := s.store.RebindHeldMessagesLaunch(finCtx, agent.ID, fromRunID, toRunID); err != nil {
+		slog.Warn("message-hold: rebind held messages on idle resume failed",
+			"agent_id", agent.ID, "from_run_id", fromRunID, "to_run_id", toRunID, "error", err)
+	}
 }
 
 // startRefusedBeforeRun reports whether err is a start refused before
@@ -761,9 +828,9 @@ func startDidNotHappen(err error) bool {
 	var tokenErr *agentTokenIssueError
 	var incomplete *AgentCreateIncompleteError
 	return errors.As(err, &quotaErr) || errors.As(err, &stillMissing) || errors.As(err, &tokenErr) ||
-		errors.Is(err, errBrokerLacksEmptyPerAgent) || errors.As(err, &incomplete) ||
+		isUnsupportedWorkspaceModeError(err) || errors.As(err, &incomplete) ||
 		startRunNotBegunOutsideDelete(err) || pendingFoldRefusedOutsideDelete(err) ||
-		errors.Is(err, ErrLaunchInvalidPhase) || isConfirmedStartNotActedOnError(err)
+		errors.Is(err, ErrLaunchInvalidPhase) || isStartRefusedBeforeCreate(err)
 }
 
 // pendingFoldRefusedOutsideDelete reports whether err is a start refused by
@@ -1142,6 +1209,9 @@ func (s *Server) writeStartClaimError(ctx context.Context, w http.ResponseWriter
 		return true
 	case s.writeStartInProgress(w, err):
 		return true
+	case errors.Is(err, errHomeFilesNotDelivered):
+		Conflict(w, "the agent cannot be started yet: create-time home files have not been delivered yet; retry once creation completes; if creation failed, delete and re-create the agent")
+		return true
 	case errors.Is(err, store.ErrClaimPredicate):
 		Conflict(w, "the agent cannot be started now: it is being deleted or reincarnated")
 		return true
@@ -1192,14 +1262,18 @@ func (s *Server) createUnderClaim(ctx context.Context, agent *store.Agent, dispa
 // a queued stop's own stop-kind claim is kept. A holder still renewing
 // finds the claim gone and abandons its start.
 func (s *Server) releaseSupersededClaim(ctx context.Context, agentID, claimID string, stopIntentAt time.Time) {
-	if claimID == "" || stopIntentAt.IsZero() {
+	if claimID == "" || stopIntentAt.IsZero() || s == nil || s.store == nil {
 		return
 	}
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	if released, err := s.store.ReleaseSupersededStart(rctx, agentID, claimID, stopIntentAt); err != nil {
-		slog.Warn("Releasing a start claim superseded by a stop failed; the reaper will settle it", "agent_id", agentID, "error", err)
-	} else if released {
-		slog.Info("Released a start claim superseded by a stop", "agent_id", agentID, "claim_id", claimID)
-	}
+	_ = runBestEffortCleanupStep(ctx, 10*time.Second, nil,
+		"release_superseded_claim", "Recovered panic releasing superseded start claim",
+		[]any{"agent_id", agentID, "claim_id", claimID},
+		func(rctx context.Context) error {
+			if released, err := s.store.ReleaseSupersededStart(rctx, agentID, claimID, stopIntentAt); err != nil {
+				slog.Warn("Releasing a start claim superseded by a stop failed; the reaper will settle it", "agent_id", agentID, "error", err)
+			} else if released {
+				slog.Info("Released a start claim superseded by a stop", "agent_id", agentID, "claim_id", claimID)
+			}
+			return nil
+		})
 }

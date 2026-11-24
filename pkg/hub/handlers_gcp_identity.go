@@ -21,13 +21,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 	"github.com/google/uuid"
 	"google.golang.org/api/googleapi"
 )
@@ -362,6 +368,11 @@ type createGCPServiceAccountResponse struct {
 type gcpServiceAccountWithWarnings struct {
 	store.GCPServiceAccount
 	Warnings []string `json:"warnings,omitempty"`
+	// WorkloadIdentityBindings reports the Workload Identity grants a mint
+	// made or skipped (hub.k8s_workload_identity_setup; ptone/scion#3329
+	// phase 5). Absent on other responses, when the experiment is off, and
+	// when the project has no Kubernetes runtime target.
+	WorkloadIdentityBindings []api.WorkloadIdentityBinding `json:"workloadIdentityBindings,omitempty"`
 }
 
 func (s *Server) createGCPServiceAccount(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -382,8 +393,14 @@ func (s *Server) createGCPServiceAccount(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
+	req.Email = strings.TrimSpace(req.Email)
 	if req.Email == "" {
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "missing required field(s): email", nil)
+		return
+	}
+	if !isValidGCPServiceAccountEmail(req.Email) {
+		writeError(w, http.StatusBadRequest, ErrCodeValidationError,
+			"invalid service account email: must be an email address", nil)
 		return
 	}
 
@@ -418,6 +435,11 @@ func (s *Server) createGCPServiceAccount(w http.ResponseWriter, r *http.Request,
 	if !decision.Allowed {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden,
 			"You don't have permission to manage GCP service accounts in this project", nil)
+		return
+	}
+
+	if code, msg, refused := s.gcpServiceAccountEmailRefusal(req.Email); refused {
+		writeError(w, http.StatusBadRequest, code, msg, nil)
 		return
 	}
 
@@ -644,14 +666,14 @@ func (s *Server) listGCPServiceAccounts(w http.ResponseWriter, r *http.Request, 
 	if len(items) > 0 {
 		profiles = s.projectKubernetesProfileMappings(ctx, projectID)
 	}
-	annotateGCPSAMappings(items, profiles)
+	s.annotateGCPSAMappings(items, profiles)
 	s.annotateGCPSAAssignStatus(ctx, items, projectID, assignReq)
 
 	writeJSON(w, http.StatusOK, ListGCPServiceAccountsResponse{
 		Items:        items,
 		Capabilities: scopeCap,
 		MintQuota:    mintQuota,
-		Warnings: projectSAMappingWarningsFrom(projectID,
+		Warnings: s.projectSAMappingWarningsFrom(projectID,
 			func() projectSAMappingView { return projectSAMappingViewFrom(profiles) }, saPtrs...),
 	})
 }
@@ -766,6 +788,11 @@ func (s *Server) verifyGCPServiceAccount(w http.ResponseWriter, r *http.Request,
 // route, where a hub-scoped account is checked against every broker on the
 // hub (hubSAMappingWarnings) and other scopes get no warning.
 func (s *Server) runGCPServiceAccountVerification(w http.ResponseWriter, r *http.Request, sa *store.GCPServiceAccount, warnProjectID string) {
+	if code, msg, refused := s.gcpServiceAccountEmailRefusal(sa.Email); refused {
+		writeError(w, http.StatusBadRequest, code, msg, nil)
+		return
+	}
+
 	// Fail-closed: if no token generator is configured, we cannot verify.
 	if s.gcpTokenGenerator == nil {
 		writeError(w, http.StatusServiceUnavailable, "gcp_not_configured",
@@ -882,11 +909,12 @@ func slugifyAccountID(s string) string {
 // projectIDFromServiceAccountEmail extracts the GCP project ID from a
 // service account email of the form <name>@<project>.iam.gserviceaccount.com.
 func projectIDFromServiceAccountEmail(email string) string {
+	email = strings.TrimSpace(email)
 	at := strings.IndexByte(email, '@')
 	if at < 0 {
 		return ""
 	}
-	domain := email[at+1:]
+	domain := strings.ToLower(email[at+1:])
 	suffix := ".iam.gserviceaccount.com"
 	if !strings.HasSuffix(domain, suffix) {
 		return ""
@@ -1110,6 +1138,11 @@ func (s *Server) mintGCPServiceAccount(w http.ResponseWriter, r *http.Request, p
 		"project_id", projectID, "sa_email", saEmail, "hub_email", hubEmail,
 		"self_act_as", allowSelfActAs)
 
+	// Workload Identity bindings (hub.k8s_workload_identity_setup): best
+	// effort, after the required grants. A failed grant never fails the
+	// mint; it is reported in the response.
+	wiBindings, warningView := s.projectWorkloadIdentityBindings(r.Context(), projectID, saEmail)
+
 	// Store the SA record — only reached when ALL required IAM mutations succeeded.
 	sa := &store.GCPServiceAccount{
 		ID:                 uuid.New().String(),
@@ -1142,6 +1175,7 @@ func (s *Server) mintGCPServiceAccount(w http.ResponseWriter, r *http.Request, p
 	LogGCPTokenGeneration(r.Context(), s.auditLogger, GCPTokenEventMintSA,
 		"", projectID, saEmail, sa.ID, true, "")
 	s.logGCPServiceAccountRegisterAudit(r.Context(), sa)
+	s.logWorkloadIdentityBindingsAudit(r.Context(), projectID, sa, wiBindings)
 
 	slog.Info("GCP SA minted",
 		"project_id", projectID, "sa_id", sa.ID, "email", saEmail,
@@ -1149,8 +1183,9 @@ func (s *Server) mintGCPServiceAccount(w http.ResponseWriter, r *http.Request, p
 		"self_act_as", allowSelfActAs)
 
 	writeJSON(w, http.StatusCreated, gcpServiceAccountWithWarnings{
-		GCPServiceAccount: *sa,
-		Warnings:          s.projectSAMappingWarnings(r.Context(), projectID, sa),
+		GCPServiceAccount:        *sa,
+		Warnings:                 s.projectSAMappingWarningsFrom(projectID, warningView, sa),
+		WorkloadIdentityBindings: wiBindings,
 	})
 }
 
@@ -1265,6 +1300,9 @@ var (
 	// record that is not bound to the broker the agent runs on (bound to
 	// another broker, or carrying no broker binding).
 	errGCPSABrokerMismatch = errors.New("the assigned GCP service account is a broker host service account that is not bound to this agent's broker")
+	// errGCPSAReserved: the assigned service account matches a reserved
+	// platform identity (such as the Hub's own GCP service account).
+	errGCPSAReserved = errors.New("the assigned GCP service account matches the Hub's own identity and cannot be used by agents")
 )
 
 // isGCPAssignmentInadmissible reports whether err is one of the refusal
@@ -1272,7 +1310,7 @@ var (
 func isGCPAssignmentInadmissible(err error) bool {
 	return errors.Is(err, errGCPSANotAvailable) || errors.Is(err, errGCPSANotVerified) ||
 		errors.Is(err, errGCPSAEmailChanged) || errors.Is(err, errGCPSAHubModeOff) ||
-		errors.Is(err, errGCPSABrokerMismatch)
+		errors.Is(err, errGCPSABrokerMismatch) || errors.Is(err, errGCPSAReserved)
 }
 
 // checkGCPAssignmentAdmissible is the admissibility rule for an agent's
@@ -1307,6 +1345,9 @@ func (s *Server) admissibleGCPServiceAccount(ctx context.Context, gcpID *store.G
 	if gcpID == nil {
 		return nil, errGCPSANotAvailable
 	}
+	if s.isHubOwnServiceAccountEmail(gcpID.ServiceAccountEmail) {
+		return nil, errGCPSAReserved
+	}
 	sa, err := s.store.GetGCPServiceAccount(ctx, gcpID.ServiceAccountID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1316,6 +1357,9 @@ func (s *Server) admissibleGCPServiceAccount(ctx context.Context, gcpID *store.G
 	}
 	if sa == nil {
 		return nil, errGCPSANotAvailable
+	}
+	if s.isHubOwnServiceAccountEmail(sa.Email) {
+		return nil, errGCPSAReserved
 	}
 	if !gcpServiceAccountVerified(sa) {
 		return nil, errGCPSANotVerified
@@ -1401,6 +1445,10 @@ func (s *Server) gcpIdentityStartRefusal(ctx context.Context, w http.ResponseWri
 // changed-email case is fixed the same way.
 func gcpIdentityStartRefusalText(action string, err error) (int, string, string) {
 	switch {
+	case errors.Is(err, errGCPSAReserved):
+		return http.StatusBadRequest, ErrCodeIdentityReserved, fmt.Sprintf(
+			"Cannot %s agent: %s. Assign the agent a dedicated GCP service account, then retry.",
+			action, err.Error())
 	case errors.Is(err, errGCPSANotVerified):
 		return http.StatusBadRequest, ErrCodeIdentityNotVerified, fmt.Sprintf(
 			"Cannot %s agent: %s: the hub cannot obtain tokens for it. %s "+
@@ -1436,14 +1484,22 @@ func (s *Server) handleAgentGCPToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "agent authentication required", nil)
 		return
 	}
+	logging.SetRequestAgentID(r.Context(), agent.Subject)
 
 	// Rate limit check
-	if s.gcpTokenRateLimiter != nil && !s.gcpTokenRateLimiter.Allow(agent.Subject) {
-		if s.gcpTokenMetrics != nil {
-			s.gcpTokenMetrics.RecordRateLimitRejection()
+	if s.gcpTokenRateLimiter != nil {
+		if allowed, retryAfter := s.gcpTokenRateLimiter.AllowWithRetryAfter(agent.Subject); !allowed {
+			if s.gcpTokenMetrics != nil {
+				s.gcpTokenMetrics.RecordRateLimitRejection()
+			}
+			retryAfterSecs := max(1, int(math.Ceil(retryAfter.Seconds())))
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSecs))
+			slog.WarnContext(r.Context(), "GCP access token request rate limited",
+				"agent_id", agent.Subject,
+				"retry_after_seconds", retryAfterSecs)
+			writeError(w, http.StatusTooManyRequests, ErrCodeRateLimited, "rate limit exceeded for GCP token requests", nil)
+			return
 		}
-		writeError(w, http.StatusTooManyRequests, ErrCodeRateLimited, "rate limit exceeded for GCP token requests", nil)
-		return
 	}
 
 	// Look up agent's GCP identity assignment
@@ -1545,14 +1601,24 @@ func (s *Server) handleAgentGCPIdentityToken(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "agent authentication required", nil)
 		return
 	}
+	logging.SetRequestAgentID(r.Context(), agent.Subject)
 
 	// Rate limit check
-	if s.gcpTokenRateLimiter != nil && !s.gcpTokenRateLimiter.Allow(agent.Subject) {
-		if s.gcpTokenMetrics != nil {
-			s.gcpTokenMetrics.RecordRateLimitRejection()
+	if s.gcpTokenRateLimiter != nil {
+		if allowed, retryAfter := s.gcpTokenRateLimiter.AllowWithRetryAfter(agent.Subject); !allowed {
+			if s.gcpTokenMetrics != nil {
+				s.gcpTokenMetrics.RecordRateLimitRejection()
+			}
+			retryAfterSecs := max(1, int(math.Ceil(retryAfter.Seconds())))
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSecs))
+			audience := extractRateLimitedAudience(r)
+			slog.WarnContext(r.Context(), "GCP identity token request rate limited",
+				"agent_id", agent.Subject,
+				"audience", audience,
+				"retry_after_seconds", retryAfterSecs)
+			writeError(w, http.StatusTooManyRequests, ErrCodeRateLimited, "rate limit exceeded for GCP token requests", nil)
+			return
 		}
-		writeError(w, http.StatusTooManyRequests, ErrCodeRateLimited, "rate limit exceeded for GCP token requests", nil)
-		return
 	}
 
 	agentRecord, err := s.store.GetAgent(r.Context(), agent.Subject)
@@ -1621,8 +1687,8 @@ func (s *Server) handleAgentGCPIdentityToken(w http.ResponseWriter, r *http.Requ
 		if s.gcpTokenMetrics != nil {
 			s.gcpTokenMetrics.RecordIDTokenRequest(false, time.Since(start))
 		}
-		LogGCPTokenGeneration(r.Context(), s.auditLogger, GCPTokenEventIdentityToken,
-			agent.Subject, agentRecord.ProjectID, gcpID.ServiceAccountEmail, gcpID.ServiceAccountID, false, err.Error())
+		LogGCPIdentityTokenGeneration(r.Context(), s.auditLogger,
+			agent.Subject, agentRecord.ProjectID, gcpID.ServiceAccountEmail, gcpID.ServiceAccountID, truncateLoggedAudience(req.Audience), false, err.Error())
 		writeError(w, http.StatusBadGateway, "gcp_token_failed",
 			"identity token generation failed: "+err.Error(), nil)
 		return
@@ -1631,8 +1697,8 @@ func (s *Server) handleAgentGCPIdentityToken(w http.ResponseWriter, r *http.Requ
 	if s.gcpTokenMetrics != nil {
 		s.gcpTokenMetrics.RecordIDTokenRequest(true, time.Since(start))
 	}
-	LogGCPTokenGeneration(r.Context(), s.auditLogger, GCPTokenEventIdentityToken,
-		agent.Subject, agentRecord.ProjectID, gcpID.ServiceAccountEmail, gcpID.ServiceAccountID, true, "")
+	LogGCPIdentityTokenGeneration(r.Context(), s.auditLogger,
+		agent.Subject, agentRecord.ProjectID, gcpID.ServiceAccountEmail, gcpID.ServiceAccountID, truncateLoggedAudience(req.Audience), true, "")
 	writeJSON(w, http.StatusOK, token)
 }
 
@@ -1642,6 +1708,48 @@ type gcpTokenRequest struct {
 
 type gcpIdentityTokenRequest struct {
 	Audience string `json:"audience"`
+}
+
+const (
+	// maxRateLimitedBodyRead bounds how much of a rate-limited request body we
+	// inspect for attribution logging so rejected callers cannot force unbounded
+	// reads or JSON decoding.
+	maxRateLimitedBodyRead = 4096
+	maxLoggedAudienceLen   = 512
+)
+
+// truncateLoggedAudience bounds an audience string to at most
+// maxLoggedAudienceLen bytes on a UTF-8 rune boundary before writing it to
+// warning or audit logs so oversized caller-supplied audiences cannot bloat
+// log records or produce invalid UTF-8. The full audience is still passed to
+// GCP.
+func truncateLoggedAudience(audience string) string {
+	if len(audience) <= maxLoggedAudienceLen {
+		return audience
+	}
+	cut := maxLoggedAudienceLen
+	for cut > 0 && !utf8.RuneStart(audience[cut]) {
+		cut--
+	}
+	return audience[:cut]
+}
+
+// extractRateLimitedAudience performs a strictly bounded best-effort read of
+// the audience field from a rate-limited /gcp-identity-token request body so
+// the 429 warning log can attribute the target audience.
+func extractRateLimitedAudience(r *http.Request) string {
+	if r == nil || r.Body == nil {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, maxRateLimitedBodyRead))
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	var req gcpIdentityTokenRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return ""
+	}
+	return truncateLoggedAudience(req.Audience)
 }
 
 // mintCreateErrorMessage renders the error body for a failed

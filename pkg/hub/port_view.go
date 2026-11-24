@@ -330,7 +330,7 @@ func (s *Server) handlePortView(w http.ResponseWriter, r *http.Request) {
 	}
 	exposed := findExposedPort(agent.ExposedPorts, grant.Port)
 	if exposed == nil {
-		writePortNotExposed(w, r)
+		s.writePortNotExposed(w, r)
 		return
 	}
 	// The link without a trailing slash: GET and HEAD are answered with a
@@ -401,7 +401,7 @@ func (s *Server) portViewIdentity(ctx context.Context, userID string, agent *sto
 		}
 		return nil, false
 	}
-	base := NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, string(ClientTypeWeb))
+	base := applyViewAsMemberFromContext(ctx, NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, string(ClientTypeWeb)))
 	identity := NewScopedUserIdentity(base, agent.ProjectID, []string{portViewScope})
 	if !s.userPortAccessAllowed(ctx, identity, agent, ActionPortAccess) {
 		return nil, false

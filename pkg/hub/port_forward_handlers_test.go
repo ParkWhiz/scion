@@ -391,6 +391,8 @@ func TestAgentPortProxyResponseIsSandboxed(t *testing.T) {
 	assert.Equal(t, []string{"'none'"}, cspDirective(rec.Header().Get("Content-Security-Policy"), "frame-ancestors"), "hub-only frame-ancestors")
 	assert.Equal(t, untrustedContentPermissionsPolicy, rec.Header().Get("Permissions-Policy"),
 		"the hub's Permissions-Policy must replace the agent's own (camera=*)")
+	assert.Equal(t, "no-referrer", rec.Header().Get("Referrer-Policy"),
+		"proxied agent content must send Referrer-Policy: no-referrer")
 	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
 	assert.Empty(t, rec.Header().Values("Set-Cookie"), "the agent must not be able to set cookies on the hub origin")
 
@@ -402,6 +404,7 @@ func TestAgentPortProxyResponseIsSandboxed(t *testing.T) {
 	(&WebServer{}).securityHeadersMiddleware(srv.Handler()).ServeHTTP(webRec, req)
 	require.Equal(t, http.StatusOK, webRec.Code)
 	assert.Equal(t, []string{agentServedPageSandboxCSP}, webRec.Header().Values("Content-Security-Policy"), "tunnel response policies")
+	assert.Equal(t, []string{"no-referrer"}, webRec.Header().Values("Referrer-Policy"), "tunnel response Referrer-Policy headers")
 	assert.Equal(t, []string{"nosniff"}, webRec.Header().Values("X-Content-Type-Options"), "tunnel response nosniff headers")
 
 	// The hub's own page headers are not combined with the app's: each
@@ -658,10 +661,7 @@ func createPortForwardAgent(t *testing.T, srv *Server, s store.Store) (*store.Ag
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent))
 
-	tokenSvc := srv.GetAgentTokenService()
-	require.NotNil(t, tokenSvc)
-	token, err := tokenSvc.GenerateAgentToken(agent.ID, project.ID, []AgentTokenScope{ScopeAgentPortForward}, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent.ID, project.ID, []AgentTokenScope{ScopeAgentPortForward}, nil)
 	return agent, token
 }
 
@@ -732,9 +732,8 @@ func TestAgentPortProxyBareURLRedirect(t *testing.T) {
 			Phase:     string(state.PhaseRunning),
 		}
 		require.NoError(t, s.CreateAgent(ctx, other))
-		otherToken, err := srv.GetAgentTokenService().GenerateAgentToken(other.ID, agent.ProjectID,
+		otherToken := srv.generateRecordedAgentToken(t, other.ID, agent.ProjectID,
 			[]AgentTokenScope{ScopeAgentPortForward}, nil)
-		require.NoError(t, err)
 
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			bare := doAgentTokenRequest(t, srv, method, base+"?x=1", nil, otherToken)
@@ -887,16 +886,6 @@ func TestAgentPortProxyOtherCredentialsNotPlainText(t *testing.T) {
 	})
 	t.Run("federation_header", func(t *testing.T) {
 		w := serve(t, map[string]string{FederationTokenHeader: "x"})
-		notPlainText(t, w)
-	})
-	t.Run("trusted_proxy_user_headers", func(t *testing.T) {
-		prev := srv.authConfig.TrustedProxies
-		srv.authConfig.TrustedProxies = []string{"192.0.2.0/24"} // httptest.NewRequest's RemoteAddr
-		t.Cleanup(func() { srv.authConfig.TrustedProxies = prev })
-		w := serve(t, map[string]string{
-			"X-Forwarded-User-Id":    "proxy-user-1",
-			"X-Forwarded-User-Email": "proxy-user@example.com",
-		})
 		notPlainText(t, w)
 	})
 	t.Run("front_proxy_assertion_refused", func(t *testing.T) {
@@ -1086,9 +1075,8 @@ func TestAgentPortProxyBareURLWebSocketUnchanged(t *testing.T) {
 			Phase:     string(state.PhaseRunning),
 		}
 		require.NoError(t, s.CreateAgent(ctx, other))
-		otherToken, err := srv.GetAgentTokenService().GenerateAgentToken(other.ID, agent.ProjectID,
+		otherToken := srv.generateRecordedAgentToken(t, other.ID, agent.ProjectID,
 			[]AgentTokenScope{ScopeAgentPortForward}, nil)
-		require.NoError(t, err)
 
 		up, plain := send(base, otherToken, true), send(base, otherToken, false)
 		assert.Equal(t, http.StatusForbidden, up.Code, up.Body.String())
@@ -1163,4 +1151,5 @@ func TestUntrustedContentPermissionsPolicy(t *testing.T) {
 	setUntrustedContentHeaders(h, agentServedPageSandboxCSP)
 	assert.Equal(t, agentServedPageSandboxCSP, h.Get("Content-Security-Policy"))
 	assert.Equal(t, untrustedContentPermissionsPolicy, h.Get("Permissions-Policy"))
+	assert.Equal(t, "no-referrer", h.Get("Referrer-Policy"))
 }

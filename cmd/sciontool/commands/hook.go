@@ -326,6 +326,10 @@ func processHookData(data []byte) error {
 		markHarnessReadyFn(ev)
 		return nil
 	})
+	// Turn-start marker and pending model/tool error, read by sciontool
+	// init's harness_error watchdogs. Local file writes only.
+	turnMarks := &handlers.TurnMarkHandler{TurnEventsPath: turnEventsFilePath, PendingErrorPath: pendingHarnessErrorFilePath}
+	processor.AddHandler(turnMarks.Handle)
 	processor.AddHandler(loggingHandler.Handle)
 	processor.AddHandler(promptHandler.Handle)
 
@@ -457,8 +461,8 @@ func runAskUser(message string) {
 	loggingHandler := handlers.NewLoggingHandler()
 	hubHandler := handlers.NewHubHandler()
 
-	// Update activity to waiting_for_input (sticky)
-	if err := statusHandler.UpdateActivity(state.ActivityWaitingForInput, ""); err != nil {
+	// Update activity to waiting_for_input (sticky, marked as ask-user)
+	if err := statusHandler.UpdateActivityWithSource(state.ActivityWaitingForInput, "", handlers.ActivitySourceAskUser); err != nil {
 		log.Error("Failed to update status: %v", err)
 	}
 

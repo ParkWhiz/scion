@@ -113,11 +113,16 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if isReservedSchedulerChannel(req.Message.Channel) {
+		ValidationError(w, fmt.Sprintf("channel %q is reserved for internal use", req.Message.Channel), nil)
+		return
+	}
 
 	// #2257 P2 (design auto-offload-large-dm §4.2 item 1): strip hub-reserved
 	// offload metadata keys from plugin-supplied messages before any further
 	// processing, render, or dispatch.
 	req.Message.Metadata = messaging.StripReservedMetadata(req.Message.Metadata)
+	clearInboundClientEvent(req.Message)
 
 	// Parse topic to extract project ID and agent slug
 	projectID, agentSlug, err := parseAgentMessageTopic(req.Topic)
@@ -244,7 +249,19 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject messages to non-running agents.
+	// Shell execution containers cannot receive inbound bridge messages (S5).
+	if isShellAgent(agent) {
+		WriteAgentDMError(w, shellAgentNotMessageableError(agent))
+		return
+	}
+
+	// Reject messages to non-running agents (including running rows with an
+	// active idle-suspend claim, treated as suspended).
+	if agent.IdleSuspendClaimActive {
+		writeError(w, http.StatusConflict, ErrCodeAgentNotRunning,
+			fmt.Sprintf("Agent %q is suspended.", agent.Slug), nil)
+		return
+	}
 	if phase := state.Phase(agent.Phase); phase != state.PhaseRunning {
 		var msg string
 		switch phase {
@@ -287,7 +304,7 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, ErrCodeValidationError, err.Error(), nil)
 		return
 	}
-	// choice-prompt and choice-response are minted by the hub only; a
+	// decision-prompt and decision-response are minted by the hub only; a
 	// plugin relays user messages and never sets either.
 	if rejectHubMintedType(w, req.Message.Type) {
 		return
@@ -507,13 +524,14 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		return s.store.CreateMessage(r.Context(), storeMsg)
 	}
 
-	// Attachments stored as artifacts are bound to a stored message, and
-	// their delivery is redeemed against it, so a message that names them
-	// is persisted BEFORE dispatch, as the hub's other send paths do; a
-	// failed dispatch then marks the row failed. Its attachments are bound
-	// as the sender's, and planned for the recipient agent's inbox; plugin
-	// conversations are never projected into the scratchpad.
+	// When hub.conduit_deliver is enabled, persist BEFORE dispatch so Conduit
+	// row binding (withDispatchMessageID) and awaiting_session hold/re-drive
+	// cover all broker-inbound messages, not only messages carrying attachments
+	// (ptone/scion#7881, REQ-4). When hub.conduit_deliver is off, preserve
+	// exact Phase A dispatch-first ordering for non-attachment messages.
+	conduitDeliverOn := s.conduitDeliverEnabled()
 	persisted := false
+	var persistErr error
 	var boundAttachments []AttachmentRef
 	if len(attachRefs) > 0 {
 		if err := persistInbound(); err != nil {
@@ -528,6 +546,25 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 			s.bindProject(senderCtx, storeMsg, attachRefs), attachRefs)
 		req.Message.AttachmentDeliveries = attachmentDeliveries(storeMsg.ID, boundAttachments)
 		s.applyAttachmentPlan(r.Context(), agent, req.Message)
+	} else if conduitDeliverOn {
+		persistErr = persistInbound()
+		if persistErr == nil {
+			persisted = true
+		} else if agentReincarnating {
+			// F1 (p2a-r2 review): while the recipient is mid-`scion
+			// reincarnate`, dispatch is skipped below (agentReincarnating), so
+			// a persist failure means the message is neither saved nor
+			// dispatched — fail loudly so the caller can retry safely.
+			log.Error("Failed to persist inbound broker message",
+				"error", persistErr,
+				"message_id", storeMsg.ID,
+				"conversation_id", storeMsg.ConversationID,
+				"agent_id", agent.ID,
+			)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"failed to persist message; agent is reincarnating, retry", nil)
+			return
+		}
 	}
 
 	// Phase 9b(ii): render the delivery envelope before dispatch when the
@@ -584,16 +621,50 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 	}
 	logMessageRecord(s.recordLog(), agent, &recordMsg)
 	if !agentReincarnating {
-		retryCtx, retryCancel := context.WithTimeout(r.Context(), 30*time.Second)
+		dispatchParent := r.Context()
+		inboundMsgID := ""
+		var inboundStorePtr *store.Message
+		if persisted {
+			dispatchParent = withDispatchMessageID(r.Context(), storeMsg.ID)
+			inboundMsgID = storeMsg.ID
+			inboundStorePtr = storeMsg
+		}
+		retryCtx, retryCancel := context.WithTimeout(dispatchParent, 30*time.Second)
 		defer retryCancel()
 
-		if err := dispatchWithBrokerRetry(retryCtx, nil, dispatcher, agent, req.Message.Msg, req.Message.Urgent, req.Message); errors.Is(err, ErrBrokerTimeout) {
+		if _, err := s.holdOrDispatch(retryCtx, agent, inboundMsgID, inboundStorePtr, func() error {
+			return dispatchWithBrokerRetry(retryCtx, s.deliveryMarker(), nil, dispatcher, agent, req.Message.Msg, req.Message.Urgent, req.Message)
+		}); errors.Is(err, ErrBrokerTimeout) {
 			if persisted {
 				s.markInboundFailed(r.Context(), storeMsg.ID, err)
 			}
 			GatewayTimeout(w, "Broker unreachable after 30s deadline")
 			return
 		} else if err != nil {
+			var idleErr *errAgentIdleSuspending
+			if errors.As(err, &idleErr) {
+				susp := idleErr.asSuspendedAgent()
+				refusal := fmt.Sprintf("Agent %q is suspended.", agent.Slug)
+				if susp != nil {
+					switch state.Phase(susp.Phase) {
+					case state.PhaseSuspended:
+						refusal = fmt.Sprintf("Agent %q is suspended.", susp.Slug)
+					case state.PhaseStopped:
+						refusal = fmt.Sprintf("Agent %q is stopped.", susp.Slug)
+					case state.PhaseHalted:
+						refusal = fmt.Sprintf("Agent %q is halted.", susp.Slug)
+					case state.PhaseError:
+						refusal = fmt.Sprintf("Agent %q is in error state.", susp.Slug)
+					default:
+						refusal = fmt.Sprintf("Agent %q is not yet running (phase: %s).", susp.Slug, susp.Phase)
+					}
+				}
+				if persisted {
+					s.markInboundFailed(r.Context(), storeMsg.ID, errors.New(refusal))
+				}
+				writeError(w, http.StatusConflict, ErrCodeAgentNotRunning, refusal, nil)
+				return
+			}
 			if persisted {
 				s.markInboundFailed(r.Context(), storeMsg.ID, err)
 			}
@@ -613,10 +684,19 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 		"type", req.Message.Type,
 	)
 
-	// A message with attachments was persisted before dispatch (above).
-	var persistErr error
-	if !persisted {
+	if !persisted && persistErr == nil {
 		persistErr = persistInbound()
+		if persistErr != nil && agentReincarnating {
+			log.Error("Failed to persist inbound broker message",
+				"error", persistErr,
+				"message_id", storeMsg.ID,
+				"conversation_id", storeMsg.ConversationID,
+				"agent_id", agent.ID,
+			)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"failed to persist message; agent is reincarnating, retry", nil)
+			return
+		}
 	}
 	if err := persistErr; err != nil {
 		log.Error("Failed to persist inbound broker message",
@@ -625,18 +705,6 @@ func (s *Server) handleBrokerInbound(w http.ResponseWriter, r *http.Request) {
 			"conversation_id", storeMsg.ConversationID,
 			"agent_id", agent.ID,
 		)
-		// F1 (p2a-r2 review): while the recipient is mid-`scion
-		// reincarnate`, dispatch was skipped above (agentReincarnating), so
-		// a persist failure here means the message is neither saved nor
-		// dispatched — the "deferred ⇒ persisted" promise the gate makes
-		// would be a lie. Fail loudly instead. This is safe to retry (no
-		// dispatch happened, so a retry cannot double-deliver), unlike the
-		// non-fatal case below where the dispatch already succeeded.
-		if agentReincarnating {
-			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
-				"failed to persist message; agent is reincarnating, retry", nil)
-			return
-		}
 		// Non-fatal: the dispatch already succeeded, so the agent got the
 		// message. The agent now holds identifiers (message_id,
 		// conversation_id) that reference an unpersisted row. Failing the

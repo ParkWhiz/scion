@@ -48,9 +48,13 @@ func TestSessionOnlyGate_ReasonIsReported(t *testing.T) {
 	}{
 		{"own profile update", http.MethodPatch, "/api/v1/users/" + m.adminID, map[string]interface{}{"displayName": "x"}, authzop.ReasonInteractiveState},
 		{"orphaned agents", http.MethodGet, "/api/v1/admin/orphaned-agents", nil, authzop.ReasonGovernancePending},
+		{"runtime orphans", http.MethodGet, "/api/v1/admin/runtime-orphans", nil, authzop.ReasonGovernancePending},
 		{"revoke sessions", http.MethodPost, "/api/v1/users/" + f.user + "/revoke-sessions", map[string]interface{}{}, authzop.ReasonSessionRecovery},
 		{"terminal workspace read", http.MethodGet, "/api/v1/users/me/terminal-workspace", nil, authzop.ReasonInteractiveState},
 		{"terminal workspace write", http.MethodPut, "/api/v1/users/me/terminal-workspace", map[string]interface{}{"agentIds": []string{}}, authzop.ReasonInteractiveState},
+		{"exec container read", http.MethodGet, "/api/v1/users/me/exec-container", nil, authzop.ReasonInteractiveState},
+		{"exec container write", http.MethodPut, "/api/v1/users/me/exec-container", map[string]interface{}{"agentId": "00000000-0000-0000-0000-000000000000"}, authzop.ReasonInteractiveState},
+		{"exec container clear", http.MethodDelete, "/api/v1/users/me/exec-container", nil, authzop.ReasonInteractiveState},
 		{"token list", http.MethodGet, "/api/v1/auth/tokens", nil, authzop.ReasonCredentialManagement},
 		{"token read", http.MethodGet, "/api/v1/auth/tokens/" + f.uatRevokeDelete, nil, authzop.ReasonCredentialManagement},
 		{"token create", http.MethodPost, "/api/v1/auth/tokens", map[string]interface{}{"name": "x", "boundary": map[string]string{"kind": "hub"}, "scopes": []string{"agent:read"}}, authzop.ReasonCredentialManagement},

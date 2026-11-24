@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path"
@@ -915,6 +916,9 @@ func buildProvisionContext(ctx context.Context, opts api.StartOptions) (context.
 	if opts.BrokerMode {
 		ctx = api.ContextWithBrokerMode(ctx)
 	}
+	if opts.HostedMode {
+		ctx = api.ContextWithHostedMode(ctx)
+	}
 	if opts.GitClone != nil {
 		ctx = api.ContextWithGitClone(ctx, opts.GitClone)
 	}
@@ -975,8 +979,25 @@ func (m *AgentManager) finishProvision(opts api.StartOptions, agentDir, agentHom
 	// empty script removes any previously staged file, so a hook that no
 	// longer applies (e.g. deactivated between generations, or on a
 	// first-time resume) cannot survive on a reused agent home.
-	if err := harness.WriteProjectPreStartHook(agentHome, opts.ProjectPreStartHookScript); err != nil {
+	// Defence in depth (security audit H3 / ptone/scion#8812 I1): shell
+	// execution containers never stage a project/hub pre-start hook; forcing
+	// an empty script also clears any stale staged file.
+	preStartHookScript := opts.ProjectPreStartHookScript
+	if opts.HarnessConfig == config.ShellHarnessConfigName ||
+		(cfg != nil && (cfg.HarnessConfig == config.ShellHarnessConfigName || cfg.Harness == config.ShellHarnessConfigName)) {
+		preStartHookScript = ""
+	}
+	if err := harness.WriteProjectPreStartHook(agentHome, preStartHookScript); err != nil {
 		return fmt.Errorf("stage project pre-start hook: %w", err)
+	}
+
+	// Stage create-only HomeFiles under .scion/ in the newly provisioned agent
+	// home. Never written on resume or reprovision (opts.FreshProvision is
+	// false on both).
+	if opts.FreshProvision && !opts.Resume && len(opts.HomeFiles) > 0 {
+		if err := writeProvisionHomeFiles(agentHome, opts.HomeFiles); err != nil {
+			return fmt.Errorf("stage create home files: %w", err)
+		}
 	}
 
 	// Persist harness auth override to the on-disk config (for sciontool).
@@ -994,6 +1015,9 @@ func (m *AgentManager) finishProvision(opts api.StartOptions, agentDir, agentHom
 		}
 		if limits, ok := readPersistedAgentLimits(agentDir); ok {
 			persisted = withLimits(persisted, limits)
+		}
+		if ownEnvVars, ok := readPersistedAgentEnv(agentDir); ok {
+			persisted = withOwnEnv(persisted, ownEnvVars)
 		}
 		cfgData, marshalErr := json.MarshalIndent(persisted, "", "  ")
 		if marshalErr == nil {
@@ -1534,9 +1558,20 @@ type resolvedTemplate struct {
 // dir for provisioning, launch (Start's harness.Resolve) and the runtime
 // broker's policy gate.
 func resolveTemplateAndHarnessConfig(ctx context.Context, templateName, harnessConfig, projectPath, projectDir, profileName string, settings *config.VersionedSettings, inlineCfg *api.ScionConfig) (*resolvedTemplate, error) {
-	chain, err := templateChainFor(ctx, templateName, projectPath, settings)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load template: %w", err)
+	// Shell execution containers take no template (security audit H1 / H1-R):
+	// do not resolve or merge a local "default" or named template chain when
+	// the request or inline config already selects the reserved "shell"
+	// harness config.
+	isShellRequested := harnessConfig == config.ShellHarnessConfigName ||
+		(inlineCfg != nil && (inlineCfg.HarnessConfig == config.ShellHarnessConfigName || inlineCfg.Harness == config.ShellHarnessConfigName))
+
+	var chain []*config.Template
+	if !isShellRequested {
+		var err error
+		chain, err = templateChainFor(ctx, templateName, projectPath, settings)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load template: %w", err)
+		}
 	}
 
 	// Each template contributes its job keys only (ptone/scion#4524):
@@ -1577,6 +1612,19 @@ func resolveTemplateAndHarnessConfig(ctx context.Context, templateName, harnessC
 	}
 	harnessConfigName := hcResolution.Name
 
+	// If settings/profile resolved harnessConfigName to "shell" after a
+	// template chain was loaded, discard the template chain and rebuild
+	// finalScionCfg from inlineCfg only so no template job keys or paths reach
+	// a shell container.
+	if harnessConfigName == config.ShellHarnessConfigName && len(chain) > 0 {
+		chain = nil
+		templateWarnings = nil
+		finalScionCfg = &api.ScionConfig{}
+		if inlineCfg != nil {
+			finalScionCfg = config.MergeScionConfig(finalScionCfg, inlineCfg)
+		}
+	}
+
 	// Load harness-config from disk (check template dirs first)
 	var templatePaths []string
 	for _, tpl := range chain {
@@ -1587,6 +1635,10 @@ func resolveTemplateAndHarnessConfig(ctx context.Context, templateName, harnessC
 		return nil, fmt.Errorf("failed to find harness-config %q: %w", harnessConfigName, err)
 	}
 	if err := CheckHarnessConfigPolicy(ctx, harnessConfigName, harness.EffectiveConfig(harnessConfigName, hcDir, settings, profileName)); err != nil {
+		return nil, err
+	}
+	// The runtime is not known here; Start checks again with it.
+	if err := CheckHostedHarnessConfig(api.IsHostedModeFromContext(ctx), hcDir, ""); err != nil {
 		return nil, err
 	}
 
@@ -1608,7 +1660,32 @@ func resolveTemplateAndHarnessConfig(ctx context.Context, templateName, harnessC
 // during admission, for an async create: Manager.Start would otherwise raise
 // the same errors, but only from inside the launch goroutine.
 func (m *AgentManager) Preflight(ctx context.Context, opts api.StartOptions) error {
-	return PreflightResolve(ctx, opts)
+	rt, projectDir, profileName, settings, err := preflightResolveDetails(ctx, opts)
+	if err != nil {
+		return err
+	}
+	// If the agent already has persisted state on disk (scion-agent.json /
+	// prompt.md), defer command validation to Start, which loads those files.
+	if agentDir, _, dirErr := AgentStateDir(projectDir, opts.Name, opts.SharedWorkspace, opts.HubProjectID, opts.BrokerMode || opts.HubProjectID != ""); dirErr == nil && agentDir != "" {
+		if _, statErr := os.Stat(filepath.Join(agentDir, "scion-agent.json")); statErr == nil {
+			return nil
+		}
+	}
+	entry := harness.EffectiveConfig(rt.HarnessConfigName, rt.HarnessConfigDir, settings, profileName)
+	noAuth := opts.NoAuth || isNoAuthSelection(opts.HarnessAuth, rt.Config)
+	if noAuthModeActive(noAuth, entry.NoAuthConfig) {
+		return nil
+	}
+	var hcSource config.HarnessConfigSource
+	if rt.HarnessConfigDir != nil {
+		hcSource = rt.HarnessConfigDir.Source
+	}
+	var entryArgs []string
+	if harness.HonoursSettingsArgs(entry.Harness) {
+		entryArgs = entry.Args
+	}
+	runTask, baseCmdArgs := resolveBaseCommandInputs(rt.Config, entryArgs, opts.Task)
+	return harness.ValidateEntryCommand(hcSource, entry, runTask, harnessResume(opts), baseCmdArgs)
 }
 
 // PreflightResolve is Preflight's resolution as a package function: it
@@ -1619,11 +1696,16 @@ func (m *AgentManager) Preflight(ctx context.Context, opts api.StartOptions) err
 // refusal happens before a worktree, agent directory, staged bundle or
 // container exists.
 func PreflightResolve(ctx context.Context, opts api.StartOptions) error {
+	_, _, _, _, err := preflightResolveDetails(ctx, opts)
+	return err
+}
+
+func preflightResolveDetails(ctx context.Context, opts api.StartOptions) (*resolvedTemplate, string, string, *config.VersionedSettings, error) {
 	ctx, inlineCfg := buildProvisionContext(ctx, opts)
 
 	projectDir, err := config.GetResolvedProjectDir(opts.ProjectPath)
 	if err != nil {
-		return err
+		return nil, "", "", nil, err
 	}
 
 	settings, warnings, _ := config.LoadEffectiveSettingsFor(ctx, projectDir)
@@ -1645,8 +1727,8 @@ func PreflightResolve(ctx context.Context, opts api.StartOptions) error {
 
 	// The real provisioning repeats this resolution and reports any ignored
 	// template environment keys; stay quiet here so each is reported once.
-	_, err = resolveTemplateAndHarnessConfig(withQuietTemplateEnvWarnings(ctx), templateName, opts.HarnessConfig, opts.ProjectPath, projectDir, profileName, settings, inlineCfg)
-	return err
+	rt, err := resolveTemplateAndHarnessConfig(withQuietTemplateEnvWarnings(ctx), templateName, opts.HarnessConfig, opts.ProjectPath, projectDir, profileName, settings, inlineCfg)
+	return rt, projectDir, profileName, settings, err
 }
 
 // templateChainFor resolves the template chain for name. A name equal to the
@@ -2522,7 +2604,7 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		hcCfg.TaskFlag = hcDir.Config.TaskFlag
 	}
 	if hcDir.Config.Env != nil {
-		hcCfg.Env = hcDir.Config.Env
+		hcCfg.Env, _ = BundleEnvLayer(hcDir.Config.Env)
 	}
 	if hcDir.Config.Volumes != nil {
 		hcCfg.Volumes = hcDir.Config.Volumes
@@ -2548,24 +2630,47 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	// 2d. Compose agent home directory
 	homeCopyStart := time.Now()
 
+	// Each layer's home/ is read without following a symbolic link and
+	// written confined to the agent home (overlayHomeLayer).
+	agentHomeDir, err := agenthome.OpenCreate(agentHome, 0755)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to open agent home: %w", err)
+	}
+	defer func() { _ = agentHomeDir.Close() }()
+
 	// Step 1: Copy harness-config base home → agentHome
-	hcHome := filepath.Join(hcDir.Path, "home")
-	if info, err := os.Stat(hcHome); err == nil && info.IsDir() {
-		if err := util.CopyDir(hcHome, agentHome); err != nil {
-			return "", "", nil, fmt.Errorf("failed to copy harness-config home: %w", err)
-		}
+	if _, err := overlayHomeLayer(agentHomeDir, hcDir.OpenDir); err != nil {
+		return "", "", nil, fmt.Errorf("failed to copy harness-config home %q: %w", harnessConfigName, err)
+	}
+	hcHookRels, hcHooksSuppressed, err := reconcileBundleHooksOnProvision(ctx, agentName, harnessConfigName, hcDir, agentHome)
+	if err != nil {
+		return "", "", nil, err
 	}
 
-	// Step 2: Copy template home → agentHome (overlay; template files win on conflict)
+	// Step 2: Copy template home → agentHome (overlay; template files win on conflict).
+	// Defence in depth (security audit H1 / ptone/scion#8812 I1): shell
+	// execution containers never inherit template home files (such as .bashrc
+	// or .scion/hooks/pre-start.d); skip the template chain so they fall
+	// through to the embedded default home floor only.
 	templateHomeCopied := false
-	for _, tpl := range chain {
-		templateHome := filepath.Join(tpl.Path, "home")
-		if info, err := os.Stat(templateHome); err == nil && info.IsDir() {
-			if err := util.CopyDir(templateHome, agentHome); err != nil {
+	if harnessConfigName != config.ShellHarnessConfigName {
+		for _, tpl := range chain {
+			copied, err := overlayHomeLayer(agentHomeDir, tpl.OpenDir)
+			if err != nil {
 				return "", "", nil, fmt.Errorf("failed to copy template home %s: %w", templateRef(tpl), err)
 			}
-			templateHomeCopied = true
+			templateHomeCopied = templateHomeCopied || copied
 		}
+	}
+	bundleHookRels := hcHookRels
+	if !hcHooksSuppressed && len(hcHookRels) > 0 {
+		bundleHookRels, err = subtractTemplateHookPaths(hcHookRels, chain)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("failed to inspect template hooks: %w", err)
+		}
+	}
+	if err := writeBundleHooksRecord(agentDir, bundleHookRels); err != nil {
+		return "", "", nil, fmt.Errorf("failed to write harness-config hooks record: %w", err)
 	}
 
 	// Safety net: an agent must never come up without its base home files.
@@ -2665,6 +2770,7 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		HubEnabled:         hubEnabled,
 		ForceOverwrite:     api.IsReprovisionFromContext(ctx),
 		TemplateSkillNames: templateSkillNames,
+		ExperimentOn:       experimentOn(ctx, settings),
 	}
 	if skillsDir != "" {
 		if err := injectPlatformSkills(resources.PlatformSkillsFS(), agentHome, skillsDir, injCtx); err != nil {
@@ -2733,8 +2839,8 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		hConfig, err := settings.ResolveHarnessConfig(profileName, harnessConfigName)
 		if err == nil {
 			settingsCfg := &api.ScionConfig{}
-			if hConfig.Env != nil {
-				settingsCfg.Env = hConfig.Env
+			if hConfig.Env != nil && harnessConfigName != config.ShellHarnessConfigName {
+				settingsCfg.Env, _ = sanitizeHarnessConfigEnv(hConfig.Env, "settings", false)
 			}
 			if hConfig.Volumes != nil {
 				settingsCfg.Volumes = hConfig.Volumes
@@ -2833,7 +2939,12 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	// than the raw templateName which may be a cache path or remote URI. A
 	// content-hash cache directory is never recorded as the name; the slug
 	// carried in ctx is used instead when known.
-	displayTemplateName, templateHash := infoTemplateFields(ctx, templateName, chain)
+	// Shell execution containers record no template (security audit H1-R) so
+	// subsequent Starts never resolve a local "default" template chain.
+	var displayTemplateName, templateHash string
+	if harnessConfigName != config.ShellHarnessConfigName {
+		displayTemplateName, templateHash = infoTemplateFields(ctx, templateName, chain)
+	}
 	projectID, _ := config.ReadProjectID(projectDir)
 	info := &api.AgentInfo{
 		Project:               projectName,
@@ -2895,14 +3006,19 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	}
 
 	// scion-agent.json carries only the requester's own environment values
-	// (the inline image, kubernetes, resources and volumes) and the workspace
-	// mount resolved above. The harness-config file, settings, profile, hub
-	// default and built-in values merged into finalScionCfg are applied by
-	// Start from current settings on every start, so a later settings or
-	// profile change reaches the agent on its next start (ptone/scion#4561).
-	// The returned config keeps the merged values (see the reload below).
-	// Likewise it carries only the agent's own limits (ptone/scion#623).
-	persistedCfg := withLimits(withEnvironment(finalScionCfg, provisionedAgentEnvironment(inlineCfg, workspaceVolume)), ownLimits)
+	// (the inline image, kubernetes, resources and volumes), the workspace
+	// mount resolved above, the agent's own limits (ptone/scion#623), and
+	// the agent's own inline env (no bundle or settings harness-config env).
+	// The harness-config file, settings, profile, hub default and built-in
+	// values merged into finalScionCfg are applied by Start from current
+	// settings and bundle on every start, so later changes reach the agent on
+	// its next start (ptone/scion#4561). The returned config keeps the merged
+	// values (see the reload below).
+	var ownEnvVars map[string]string
+	if inlineCfg != nil {
+		ownEnvVars = inlineCfg.Env
+	}
+	persistedCfg := withOwnEnv(withLimits(withEnvironment(finalScionCfg, provisionedAgentEnvironment(inlineCfg, workspaceVolume)), ownLimits), ownEnvVars)
 	agentCfgData, err := json.MarshalIndent(persistedCfg, "", "  ")
 	if err != nil {
 		return "", "", nil, fmt.Errorf("failed to marshal agent config: %w", err)
@@ -2995,11 +3111,9 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 		}
 	}
 
-	// Write scion-services.yaml for sciontool to consume at container startup
-	if len(finalScionCfg.Services) > 0 {
-		if err := writeServicesFile(agentHome, finalScionCfg.Services); err != nil {
-			return "", "", nil, err
-		}
+	// Reconcile scion-services.yaml for sciontool to consume at container startup
+	if err := reconcileServicesFile(agentHome, finalScionCfg.Services); err != nil {
+		return "", "", nil, err
 	}
 
 	// 2f. Configure git credential helper for shared-workspace projects.
@@ -3068,13 +3182,10 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 
 	// Stage capture-auth assets (capture_auth.py + capture-auth-config.json)
 	// into the harness bundle so they are available at a known path in the
-	// container. Container-script harnesses stage these during their own
-	// Provision(); this path handles non-container-script fallbacks.
-	if _, isContainerScript := h.(*harness.ContainerScriptHarness); !isContainerScript && hcDir != nil {
-		if err := harness.StageCaptureAuthAssets(agentHome, hcDir.Path, hcDir.Config.Auth); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: capture-auth asset staging failed: %v\n", err)
-		}
-	}
+	// container when permitted by the context's harness-config policy.
+	// Container-script harnesses stage these during their own Provision();
+	// this path handles non-container-script fallbacks.
+	stageFallbackCaptureAuthAssets(ctx, agentName, h, harnessConfigName, hcDir, agentHome, nil)
 
 	// Reload config to get harness updates (e.g. Env vars injected by harness).
 	// The reloaded file holds only the agent's own environment values; the
@@ -3084,10 +3195,19 @@ func ProvisionAgent(ctx context.Context, agentName string, templateName string, 
 	// The same holds for the default limits (ptone/scion#623).
 	effectiveEnv := environmentOf(finalScionCfg)
 	effectiveLimits := limitsOf(finalScionCfg)
+	effectiveEnvVars := maps.Clone(finalScionCfg.Env)
 	reloadTpl := &config.Template{Path: agentDir}
 	if updatedCfg, err := reloadTpl.LoadConfig(); err == nil {
 		updatedCfg.Info = finalScionCfg.Info // Re-attach info
-		finalScionCfg = withLimits(withEnvironment(updatedCfg, effectiveEnv), effectiveLimits)
+		if len(updatedCfg.Env) > 0 {
+			if effectiveEnvVars == nil {
+				effectiveEnvVars = make(map[string]string, len(updatedCfg.Env))
+			}
+			for k, v := range updatedCfg.Env {
+				effectiveEnvVars[k] = v
+			}
+		}
+		finalScionCfg = withOwnEnv(withLimits(withEnvironment(updatedCfg, effectiveEnv), effectiveLimits), effectiveEnvVars)
 	} else {
 		fmt.Fprintf(os.Stderr, "Warning: failed to reload agent config after harness provisioning: %v\n", err)
 	}
@@ -3103,6 +3223,9 @@ type skillFrontmatter struct {
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`
 	InjectWhen  string `yaml:"inject_when"`
+	// Experiment names the experiment this file requires (skill_gate.go):
+	// on SKILL.md it gates the whole skill, on any other *.md the file.
+	Experiment string `yaml:"experiment"`
 }
 
 // parseSkillFrontmatter extracts YAML frontmatter from a SKILL.md file.
@@ -3141,6 +3264,10 @@ type workspaceSkillsInjectionContext struct {
 	// ForceOverwrite can still respect "template skills take precedence"
 	// rather than clobbering a template's intentional override.
 	TemplateSkillNames map[string]bool
+	// ExperimentOn reports whether an experiment is on for this agent
+	// (experimentOn). It drives the experiment gates of platform skills
+	// (skill_gate.go); nil means every gate is off.
+	ExperimentOn func(id string) bool
 }
 
 // platformSkillsHubEnabled reports whether hub_enabled platform skills are
@@ -3220,6 +3347,11 @@ func composeInstructions(preamble, templateContent []byte) []byte {
 // current template chain provides a skill with the same directory name
 // (injCtx.TemplateSkillNames), the platform skill is skipped.
 //
+// Experiment gates (skill_gate.go) are applied from injCtx.ExperimentOn: a
+// skill whose SKILL.md names an experiment that is off is skipped (and, on
+// ForceOverwrite, a platform-owned copy is removed), and the installed tree
+// is the gated view, so gated-off files and blocks never reach the agent.
+//
 // Otherwise, a platform skill whose directory already exists on disk is
 // normally left alone (idempotent restart/resume). injCtx.ForceOverwrite
 // (reincarnation reprovisioning) refreshes it instead, so a newer broker
@@ -3242,6 +3374,9 @@ func injectPlatformSkills(
 	}
 	defer func() { _ = home.Close() }()
 
+	gate := skillExperimentGate(injCtx.ExperimentOn)
+	view := gatedView(skillsFS, gate)
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -3257,6 +3392,20 @@ func injectPlatformSkills(
 		fm := parseSkillFrontmatter(skillMDData)
 		if !shouldInjectSkill(fm, injCtx) {
 			util.Debugf("provision: skipping platform skill %q (inject_when=%q not satisfied)", skillName, fm.InjectWhen)
+			continue
+		}
+
+		if fm.Experiment != "" && !gate(fm.Experiment) {
+			util.Debugf("provision: skipping platform skill %q (experiment %q is off)", skillName, fm.Experiment)
+			// Reincarnation reprovisions from the current state: a copy
+			// installed while the experiment was on is removed, unless the
+			// template chain owns that name. A Skill Bank skill of the same
+			// name is installed again by the next step.
+			if injCtx.ForceOverwrite && !injCtx.TemplateSkillNames[skillName] {
+				if err := home.RemoveAll(skillRel(skillsDir, skillName)); err != nil {
+					return fmt.Errorf("failed to remove gated-off platform skill %s: %w", skillName, homeSkillError(skillName, err))
+				}
+			}
 			continue
 		}
 
@@ -3287,7 +3436,7 @@ func injectPlatformSkills(
 		// keeps no stale file from an earlier generation. rel is
 		// platform-owned at this point: the TemplateSkillNames check above
 		// already exempted anything template-owned.
-		if err := home.InstallTreeFS(skillsFS, skillName, rel, skillTreeLimits); err != nil {
+		if err := home.InstallTreeFS(view, skillName, rel, skillTreeLimits); err != nil {
 			return fmt.Errorf("failed to copy platform skill %s: %w", skillName, homeSkillError(skillName, err))
 		}
 		util.Debugf("provision: injected platform skill %q into %s", skillName, rel)
@@ -5439,4 +5588,22 @@ func writeServicesFile(agentHome string, services []api.ServiceSpec) error {
 		return fmt.Errorf("failed to write %s: %w", servicesFileName, err)
 	}
 	return nil
+}
+
+// reconcileServicesFile writes scion-services.yaml when services are
+// configured or removes any stale copy in agentHome when empty, confined to
+// the agent home.
+func reconcileServicesFile(agentHome string, services []api.ServiceSpec) error {
+	if len(services) > 0 {
+		return writeServicesFile(agentHome, services)
+	}
+	h, err := agenthome.Open(agentHome)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer func() { _ = h.Close() }()
+	return h.RemoveAll(".scion/" + servicesFileName)
 }

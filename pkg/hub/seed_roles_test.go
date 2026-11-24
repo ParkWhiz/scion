@@ -205,12 +205,47 @@ func TestBuiltInRoles_HubAdminConstraintPermissions(t *testing.T) {
 }
 
 // TestBuiltInRoles_HubAdminRevision pins the hub-admin revision and its
-// latest additions: revision 10 adds agent.delegation.revoke_all
-// (ptone/scion#2132), revision 9 project.chat_post (ptone/scion#5518),
-// revision 8 project.manage_visitors (ptone/scion#4603).
+// latest additions: revision 15 adds project.manage_message_policies and
+// project.read_message_policies (ptone/scion#8047), revision 14 adds trigger.*
+// and webhook_endpoint.* (ptone/scion#8028), revision 13 adds
+// system_one_instance.{read,create,delete,execute}
+// (ptone/scion#8044), revision 12 adds template.create_global,
+// template.update_global, and template.delete_global while keeping plain
+// template.* out (ptone/scion#1713), revision 11 adds skill.update_global and
+// skill.delete_global (ptone/scion#1713), revision 10 adds
+// agent.delegation.revoke_all (ptone/scion#2132), revision 9
+// project.chat_post (ptone/scion#5518), revision 8 project.manage_visitors
+// (ptone/scion#4603).
 func TestBuiltInRoles_HubAdminRevision(t *testing.T) {
 	admin := builtInRoleByName(t, store.SystemRoleHubAdmin)
-	assert.Equal(t, 10, admin.Revision)
+	assert.Equal(t, 16, admin.Revision)
+	assert.Contains(t, admin.Permissions, "broker.manage")
+	assert.NotContains(t, admin.Permissions, "broker.update")
+	assert.NotContains(t, admin.Permissions, "broker.delete")
+	assert.NotContains(t, admin.Permissions, "broker.auto_provide")
+	assert.Contains(t, admin.Permissions, "project.manage_message_policies")
+	assert.Contains(t, admin.Permissions, "project.read_message_policies")
+	assert.Contains(t, admin.Permissions, "trigger.read")
+	assert.Contains(t, admin.Permissions, "trigger.list")
+	assert.Contains(t, admin.Permissions, "trigger.create")
+	assert.Contains(t, admin.Permissions, "trigger.delete")
+	assert.Contains(t, admin.Permissions, "trigger.update")
+	assert.Contains(t, admin.Permissions, "webhook_endpoint.read")
+	assert.Contains(t, admin.Permissions, "webhook_endpoint.list")
+	assert.Contains(t, admin.Permissions, "webhook_endpoint.create")
+	assert.Contains(t, admin.Permissions, "webhook_endpoint.delete")
+	assert.Contains(t, admin.Permissions, "system_one_instance.read")
+	assert.Contains(t, admin.Permissions, "system_one_instance.create")
+	assert.Contains(t, admin.Permissions, "system_one_instance.delete")
+	assert.Contains(t, admin.Permissions, "system_one_instance.execute")
+	assert.Contains(t, admin.Permissions, "template.create_global")
+	assert.Contains(t, admin.Permissions, "template.update_global")
+	assert.Contains(t, admin.Permissions, "template.delete_global")
+	assert.NotContains(t, admin.Permissions, "template.create")
+	assert.NotContains(t, admin.Permissions, "template.update")
+	assert.NotContains(t, admin.Permissions, "template.delete")
+	assert.Contains(t, admin.Permissions, "skill.update_global")
+	assert.Contains(t, admin.Permissions, "skill.delete_global")
 	assert.Contains(t, admin.Permissions, "agent.delegation.revoke_all")
 	assert.Contains(t, admin.Permissions, "project.manage_visitors")
 	assert.Contains(t, admin.Permissions, "project.chat_post")
@@ -1058,16 +1093,21 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 				"agent.delegation.credential.revoke", "agent.delegation.list",
 				"agent.delegation.read", "agent.delegation.revoke",
 				"gcp_service_account.assign",
+				"github_trigger.comment", "github_trigger.configure",
 				"harness_config.create", "harness_config.delete",
 				"harness_config.list", "harness_config.read", "harness_config.update",
-				"project.chat_post", "project.delete", "project.list", "project.manage", "project.manage_visitors",
-				"project.read", "project.secret_read", "project.set_messaging_policy", "project.update",
+				"project.chat_post", "project.delete", "project.list", "project.manage", "project.manage_message_policies", "project.manage_visitors",
+				"project.read", "project.read_message_policies", "project.secret_read", "project.set_messaging_policy", "project.update",
 				"scheduled_event.create", "scheduled_event.delete",
 				"scheduled_event.list", "scheduled_event.read", "scheduled_event.update",
 				"skill.create", "skill.delete", "skill.list", "skill.read",
 				"skill.register", "skill.update",
 				"template.create", "template.delete", "template.list",
 				"template.read", "template.update",
+				"trigger.create", "trigger.delete", "trigger.list",
+				"trigger.read", "trigger.update",
+				"webhook_endpoint.create", "webhook_endpoint.delete",
+				"webhook_endpoint.list", "webhook_endpoint.read",
 			},
 		},
 		{
@@ -1081,16 +1121,19 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 				"agent.delegation.credential.revoke", "agent.delegation.list",
 				"agent.delegation.read", "agent.delegation.revoke",
 				"gcp_service_account.assign",
+				"github_trigger.comment", "github_trigger.configure",
 				"harness_config.create",
 				"harness_config.list", "harness_config.read", "harness_config.update",
-				"project.chat_post", "project.list", "project.manage", "project.manage_visitors",
-				"project.read", "project.secret_read", "project.update",
+				"project.chat_post", "project.list", "project.manage", "project.manage_message_policies", "project.manage_visitors",
+				"project.read", "project.read_message_policies", "project.secret_read", "project.update",
 				"scheduled_event.create",
 				"scheduled_event.list", "scheduled_event.read", "scheduled_event.update",
 				"skill.create", "skill.list", "skill.read",
 				"skill.register", "skill.update",
 				"template.create", "template.list",
 				"template.read", "template.update",
+				"trigger.create", "trigger.list", "trigger.read", "trigger.update",
+				"webhook_endpoint.create", "webhook_endpoint.list", "webhook_endpoint.read",
 			},
 		},
 		{
@@ -1100,11 +1143,14 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 				"artifact.create", "artifact.read",
 				"agent.create", "agent.list", "agent.read",
 				"gcp_service_account.assign",
+				"github_trigger.comment",
 				"harness_config.create", "harness_config.list", "harness_config.read",
-				"project.chat_post", "project.list", "project.read",
+				"project.chat_post", "project.list", "project.read", "project.read_message_policies",
 				"scheduled_event.create", "scheduled_event.list", "scheduled_event.read",
 				"skill.list", "skill.read",
 				"template.create", "template.list", "template.read",
+				"trigger.create", "trigger.list", "trigger.read",
+				"webhook_endpoint.create", "webhook_endpoint.list", "webhook_endpoint.read",
 			},
 		},
 		{
@@ -1117,7 +1163,7 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 			// project.chat_post, agent.create or agent.message.
 			name:  "project-viewer",
 			perms: projectViewerPermissionIDs(),
-			want:  []string{"agent.list", "agent.read", "project.list", "project.read"},
+			want:  []string{"agent.list", "agent.read", "project.list", "project.read", "project.read_message_policies"},
 		},
 	}
 	for _, tt := range tests {
@@ -1131,11 +1177,11 @@ func TestProjectRoleExactPermissionSets(t *testing.T) {
 // TestProjectRoleRevisions verifies the current revision of each project role.
 func TestProjectRoleRevisions(t *testing.T) {
 	wantRevisions := map[string]int{
-		store.ProjectRoleOwner:   11,
-		store.ProjectRoleAdmin:   9,
-		store.ProjectRoleMember:  6,
+		store.ProjectRoleOwner:   14,
+		store.ProjectRoleAdmin:   12,
+		store.ProjectRoleMember:  9,
 		store.ProjectRoleVisitor: 1,
-		store.ProjectRoleViewer:  1,
+		store.ProjectRoleViewer:  2,
 	}
 	for _, role := range BuiltInRoles() {
 		if role.ScopeType != store.RoleScopeProject {
@@ -1158,11 +1204,11 @@ func TestProjectRoleReconciliationConverges(t *testing.T) {
 		revision    int
 		permissions func() []string
 	}{
-		{store.ProjectRoleOwner, 11, projectOwnerPermissionIDs},
-		{store.ProjectRoleAdmin, 9, projectAdminPermissionIDs},
-		{store.ProjectRoleMember, 6, projectMemberCuratedPermissionIDs},
+		{store.ProjectRoleOwner, 14, projectOwnerPermissionIDs},
+		{store.ProjectRoleAdmin, 12, projectAdminPermissionIDs},
+		{store.ProjectRoleMember, 9, projectMemberCuratedPermissionIDs},
 		{store.ProjectRoleVisitor, 1, projectVisitorPermissionIDs},
-		{store.ProjectRoleViewer, 1, projectViewerPermissionIDs},
+		{store.ProjectRoleViewer, 2, projectViewerPermissionIDs},
 	}
 
 	for _, pr := range projectRoles {

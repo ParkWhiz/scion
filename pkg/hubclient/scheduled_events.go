@@ -16,6 +16,7 @@ package hubclient
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"time"
@@ -30,6 +31,10 @@ type ScheduledEventService interface {
 
 	// Get retrieves a scheduled event by ID.
 	Get(ctx context.Context, id string) (*ScheduledEvent, error)
+
+	// GetOutput retrieves the captured output of an exec scheduled event.
+	// Requires scheduled_event.read and live agent.attach on the target agent.
+	GetOutput(ctx context.Context, id string) (*ExecOutput, error)
 
 	// List returns scheduled events matching the filter criteria.
 	List(ctx context.Context, opts *ListScheduledEventsOptions) (*ListScheduledEventsResponse, error)
@@ -50,44 +55,72 @@ func (s *scheduledEventService) basePath() string {
 
 // CreateScheduledEventRequest is the client-side request for creating a scheduled event.
 type CreateScheduledEventRequest struct {
-	EventType string `json:"eventType"`
-	FireAt    string `json:"fireAt,omitempty"`
-	FireIn    string `json:"fireIn,omitempty"`
-	AgentID   string `json:"agentId,omitempty"`
-	AgentName string `json:"agentName,omitempty"`
-	Message   string `json:"message,omitempty"`
-	Interrupt bool   `json:"interrupt,omitempty"`
-	Plain     bool   `json:"plain,omitempty"`
-	Wake      bool   `json:"wake,omitempty"`
-	Template  string `json:"template,omitempty"`
-	Task      string `json:"task,omitempty"`
-	Branch    string `json:"branch,omitempty"`
+	EventType      string   `json:"eventType"`
+	FireAt         string   `json:"fireAt,omitempty"`
+	FireIn         string   `json:"fireIn,omitempty"`
+	Payload        string   `json:"payload,omitempty"`
+	AgentID        string   `json:"agentId,omitempty"`
+	AgentName      string   `json:"agentName,omitempty"`
+	Message        string   `json:"message,omitempty"`
+	Interrupt      bool     `json:"interrupt,omitempty"`
+	Plain          bool     `json:"plain,omitempty"`
+	Wake           bool     `json:"wake,omitempty"`
+	Template       string   `json:"template,omitempty"`
+	Task           string   `json:"task,omitempty"`
+	Branch         string   `json:"branch,omitempty"`
+	Command        []string `json:"command,omitempty"`
+	TimeoutSeconds int      `json:"timeoutSeconds,omitempty"`
+	CaptureOutput  string   `json:"captureOutput,omitempty"`
+}
+
+// ExecSummary is the non-secret summary of a scheduled exec event's run.
+type ExecSummary struct {
+	Outcome      string     `json:"outcome"`
+	ExitCode     *int       `json:"exitCode,omitempty"`
+	DurationMS   *int64     `json:"durationMs,omitempty"`
+	OutputBytes  *int64     `json:"outputBytes,omitempty"`
+	CaptureMode  string     `json:"captureMode,omitempty"`
+	OutputStatus string     `json:"outputStatus,omitempty"`
+	StartedAt    time.Time  `json:"startedAt"`
+	FinishedAt   *time.Time `json:"finishedAt,omitempty"`
+}
+
+// ExecOutput is the attach-gated captured output returned by
+// GET /api/v1/projects/{projectId}/scheduled-events/{id}/output.
+type ExecOutput struct {
+	CaptureMode  string          `json:"captureMode"`
+	OutputStatus string          `json:"outputStatus,omitempty"`
+	Output       json.RawMessage `json:"output,omitempty"`
 }
 
 // ScheduledEvent represents a scheduled event returned by the Hub API.
 type ScheduledEvent struct {
-	ID         string     `json:"id"`
-	ProjectID  string     `json:"projectId"`
-	EventType  string     `json:"eventType"`
-	FireAt     time.Time  `json:"fireAt"`
-	Payload    string     `json:"payload"`
-	Status     string     `json:"status"`
-	CreatedAt  time.Time  `json:"createdAt"`
-	CreatedBy  string     `json:"createdBy"`
-	FiredAt    *time.Time `json:"firedAt,omitempty"`
-	Error      string     `json:"error,omitempty"`
-	ScheduleID string     `json:"scheduleId,omitempty"`
+	ID          string       `json:"id"`
+	ProjectID   string       `json:"projectId"`
+	EventType   string       `json:"eventType"`
+	FireAt      time.Time    `json:"fireAt"`
+	Payload     string       `json:"payload"`
+	Status      string       `json:"status"`
+	CreatedAt   time.Time    `json:"createdAt"`
+	CreatedBy   string       `json:"createdBy"`
+	FiredAt     *time.Time   `json:"firedAt,omitempty"`
+	Error       string       `json:"error,omitempty"`
+	ScheduleID  string       `json:"scheduleId,omitempty"`
+	ExecSummary *ExecSummary `json:"execSummary,omitempty"`
 }
 
 // ListScheduledEventsOptions configures scheduled event listing.
 type ListScheduledEventsOptions struct {
 	Status    string
+	Group     string
+	Sort      string
 	EventType string
 	Page      apiclient.PageOptions
 }
 
 // ListScheduledEventsResponse is the response from listing scheduled events.
 type ListScheduledEventsResponse struct {
+	Scope      string           `json:"scope,omitempty"`
 	Events     []ScheduledEvent `json:"events"`
 	NextCursor string           `json:"nextCursor,omitempty"`
 	TotalCount int              `json:"totalCount,omitempty"`
@@ -112,12 +145,27 @@ func (s *scheduledEventService) Get(ctx context.Context, id string) (*ScheduledE
 	return apiclient.DecodeRequired[ScheduledEvent](resp)
 }
 
+// GetOutput retrieves the captured output of an exec scheduled event.
+func (s *scheduledEventService) GetOutput(ctx context.Context, id string) (*ExecOutput, error) {
+	resp, err := s.c.get(ctx, s.basePath()+"/"+url.PathEscape(id)+"/output", nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ExecOutput](resp)
+}
+
 // List returns scheduled events matching the filter criteria.
 func (s *scheduledEventService) List(ctx context.Context, opts *ListScheduledEventsOptions) (*ListScheduledEventsResponse, error) {
 	query := url.Values{}
 	if opts != nil {
 		if opts.Status != "" {
 			query.Set("status", opts.Status)
+		}
+		if opts.Group != "" {
+			query.Set("group", opts.Group)
+		}
+		if opts.Sort != "" {
+			query.Set("sort", opts.Sort)
 		}
 		if opts.EventType != "" {
 			query.Set("eventType", opts.EventType)

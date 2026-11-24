@@ -28,7 +28,6 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { vi } from 'vitest';
-import '../../../utils/__fixtures__/sanitizer-node-name.js';
 
 interface SinkCall {
   sink: string;
@@ -267,7 +266,7 @@ describe('chat message markup boundary', () => {
   afterEach(() => {
     document.body.replaceChildren();
     // The choice card case turns the flag on; reset it even if that test failed.
-    delete window.__SCION_FEATURES__?.['web.chat_choices'];
+    delete window.__SCION_FEATURES__?.['web.decisions'];
   });
 
   it('renders a message with no plain-string markup parsing', async () => {
@@ -370,12 +369,12 @@ describe('chat message markup boundary', () => {
     // Choice cards (ptone/scion#7673, v4 #12): the question is full markdown
     // and a choice description inline markdown, both through the shared
     // renderer and DOMPurify, never a plain-string markup sink.
-    window.__SCION_FEATURES__ = { ...window.__SCION_FEATURES__, 'web.chat_choices': true };
+    window.__SCION_FEATURES__ = { ...window.__SCION_FEATURES__, 'web.decisions': true };
     const el = document.createElement('scion-chat-message') as ScionChatMessage;
     el.senderIsAgent = true;
     el.fromAgent = true;
-    el.messageType = 'choice-prompt';
-    el.choiceIntro = 'One call before I tag it.';
+    el.messageType = 'decision-prompt';
+    el.decisionIntro = 'One call before I tag it.';
     el.body = 'One call before I tag it.\n\nFallback text the card hides.';
     el.decisions = [
       {
@@ -399,13 +398,18 @@ describe('chat message markup boundary', () => {
           },
           { id: 'no', label: 'No', description: 'Wait for _owner/repo#812_.' },
         ],
+        other: {
+          label: 'Other <img src=x onerror="window.__pwned=1">',
+          description: 'Custom **region** <script>window.__pwned=1</script>',
+          placeholder: 'e.g. <script>window.__pwned=1</script>',
+        },
       },
     ];
     document.body.appendChild(el);
     let card: HTMLElement | null | undefined;
     await vi.waitFor(
       () => {
-        card = el.shadowRoot?.querySelector('scion-chat-choices');
+        card = el.shadowRoot?.querySelector('scion-chat-decisions');
         if (!card?.shadowRoot?.querySelector('.q strong')) {
           throw new Error('the choice question markdown has not rendered yet');
         }
@@ -431,9 +435,9 @@ describe('chat message markup boundary', () => {
     }
     expect((window as unknown as { __pwned?: number }).__pwned).toBeUndefined();
     expect(flagged()).toEqual([]);
-    // The question and both descriptions parse through DOMPurify's policy.
+    // The question, both choice descriptions, and other.description parse through DOMPurify's policy.
     expect(sinkState.calls.filter((c) => c.policy === 'dompurify').length).toBeGreaterThanOrEqual(
-      3
+      4
     );
   });
 
@@ -468,5 +472,51 @@ describe('chat message markup boundary', () => {
 
     expect(marker.shadowRoot?.querySelector('.ia-full-body strong')?.textContent).toBe('there');
     expect(flagged()).toEqual([]);
+  });
+
+  it('renders a dismissal decision-response reason with zero markup parsing (plain-text sink)', async () => {
+    window.__SCION_FEATURES__ = { ...window.__SCION_FEATURES__, 'web.decisions': true };
+    sinkState.calls.length = 0;
+
+    const payload = '<img src=x onerror="window.__pwned=1"><script>window.__pwned=1</script> **m**';
+    const el = document.createElement('scion-chat-message') as ScionChatMessage;
+    el.messageId = 'resp-dsm-1';
+    el.messageType = 'decision-response';
+    el.currentUserId = 'u-alice';
+    el.timestamp = '2026-11-16T09:12:00Z';
+    el.decisionResponseSet = {
+      promptMessageId: 'prompt-1',
+      batchId: 'batch-1',
+      answers: [
+        {
+          rowId: 'r1',
+          ref: 'D234',
+          key: 'D234',
+          version: 1,
+          question: 'Ship v0.9 today?',
+          choiceId: '$dismissed',
+          label: 'Dismissed',
+          provenance: 'direct',
+          outcome: 'dismiss',
+          dismissReason: payload,
+          matchedDefault: false,
+          answeredByUserId: 'u-alice',
+          answeredByName: 'alice',
+          promptMessageId: 'prompt-1',
+        },
+      ],
+    };
+    document.body.appendChild(el);
+    await el.updateComplete;
+    const inner = el.shadowRoot?.querySelector('scion-chat-decision-response');
+    await (inner as { updateComplete?: Promise<boolean> } | null)?.updateComplete;
+
+    const reasonEl = inner?.shadowRoot?.querySelector('[data-dismiss-reason]');
+    expect(reasonEl?.textContent).toBe(payload);
+    expect(reasonEl?.querySelector('img, script, strong')).toBeNull();
+    expect((window as unknown as { __pwned?: number }).__pwned).toBeUndefined();
+    expect(flagged()).toEqual([]);
+    // The dismissal line uses Lit text bindings only — not even DOMPurify parses it.
+    expect(sinkState.calls.filter((c) => c.policy === 'dompurify')).toEqual([]);
   });
 });

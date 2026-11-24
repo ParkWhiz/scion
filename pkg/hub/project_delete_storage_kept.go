@@ -35,6 +35,9 @@ import (
 const (
 	projectDeleteSharedStorageKeptCode    = "shared-project-storage"
 	projectDeleteSharedStorageKeptMessage = "The Hub cannot see the shared project storage, so the deleted project's shared tree was kept. Hub health reports the shared project storage as not ready on nfs while the Hub has projects, and as degraded on the other shared backends."
+
+	projectDeleteBrokerDirKeptCode    = "runtime-broker-project-directory"
+	projectDeleteBrokerDirKeptMessage = "One or more Runtime Brokers kept their local project directory because agents of the deleted project or another Runtime Broker instance on the same host still use it; cleanup on the Runtime Broker is deferred."
 )
 
 // projectDeleteSharedStorageKeptReason is the fixed reason of the ERROR audit
@@ -85,7 +88,8 @@ func (s *Server) projectDeleteStorageKept(ctx context.Context, projectID string)
 		return nil
 	}
 	done := make(chan error, 1)
-	go func() { done <- projectStorageTreeProbe(layout) }()
+	probe := projectStorageTreeProbe
+	go func() { done <- probe(layout) }()
 	timer := time.NewTimer(projectDeleteStorageCheckTimeout)
 	defer timer.Stop()
 	select {

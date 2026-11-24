@@ -44,12 +44,12 @@ var (
 
 	updateTriggers []string
 
-	subscriptionsProject string
-	subscriptionsJSON    bool
+	subscriptionsAll  bool
+	subscriptionsJSON bool
 )
 
 // Default trigger activities for subscriptions.
-var defaultTriggers = []string{"COMPLETED", "WAITING_FOR_INPUT", "LIMITS_EXCEEDED"}
+var defaultTriggers = []string{"COMPLETED", "IDLE", "WAITING_FOR_INPUT", "LIMITS_EXCEEDED"}
 
 // notificationsCmd is the top-level command group for notification management.
 var notificationsCmd = &cobra.Command{
@@ -69,6 +69,7 @@ Commands:
   scion notifications unsubscribe [id]        Remove a subscription
   scion notifications update [id]             Update a subscription's triggers
   scion notifications subscriptions           List your subscriptions`,
+	Args: cobra.NoArgs,
 	RunE: runNotificationsList,
 }
 
@@ -78,12 +79,13 @@ var notificationsAckCmd = &cobra.Command{
 	Short: "Acknowledge notification(s)",
 	Long: `Acknowledge one or all notifications.
 
-With an ID argument, acknowledges that specific notification.
+With an ID argument (full UUID or unique ID prefix), acknowledges that specific notification.
 With --all flag, acknowledges all unacknowledged notifications.
 
 Examples:
   scion notifications ack a1b2c3d4
   scion notifications ack --all`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runNotificationsAck,
 }
 
@@ -108,6 +110,7 @@ Examples:
 
   # Subscribe with specific triggers
   scion notifications subscribe --agent my-agent --triggers COMPLETED,WAITING_FOR_INPUT`,
+	Args: cobra.NoArgs,
 	RunE: runNotificationsSubscribe,
 }
 
@@ -115,11 +118,12 @@ Examples:
 var notificationsUnsubscribeCmd = &cobra.Command{
 	Use:   "unsubscribe [subscription-id]",
 	Short: "Remove a notification subscription",
-	Long: `Remove a notification subscription by ID, or remove all subscriptions in a project.
+	Long: `Remove a notification subscription by ID (full UUID or unique ID prefix), or remove all subscriptions in a project.
 
 Examples:
   scion notifications unsubscribe a1b2c3d4
   scion notifications unsubscribe --project my-project --all`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runNotificationsUnsubscribe,
 }
 
@@ -127,7 +131,7 @@ Examples:
 var notificationsUpdateCmd = &cobra.Command{
 	Use:   "update [subscription-id]",
 	Short: "Update a subscription's trigger activities",
-	Long: `Update the trigger activities for an existing subscription.
+	Long: `Update the trigger activities for an existing subscription by ID (full UUID or unique ID prefix).
 
 Examples:
   scion notifications update a1b2c3d4 --triggers COMPLETED,WAITING_FOR_INPUT,DELETED`,
@@ -142,10 +146,16 @@ var notificationsSubscriptionsCmd = &cobra.Command{
 	Short:   "List your notification subscriptions",
 	Long: `List notification subscriptions owned by you.
 
+Defaults to the active Hub project (from --project/-g, the agent environment,
+a linked directory project, or 'scion use'). Pass --all to list subscriptions
+across all projects.
+
 Examples:
   scion notifications subscriptions
+  scion notifications subscriptions --all
   scion notifications subscriptions --project my-project
   scion notifications subscriptions --json`,
+	Args: cobra.NoArgs,
 	RunE: runNotificationsSubscriptions,
 }
 
@@ -167,7 +177,7 @@ func init() {
 	// Subscribe flags
 	notificationsSubscribeCmd.Flags().StringVar(&subscribeAgent, "agent", "", "Agent name or ID to subscribe to")
 	notificationsSubscribeCmd.Flags().StringVar(&subscribeProject, "project", "", "Project to subscribe in (inferred from context if omitted)")
-	notificationsSubscribeCmd.Flags().StringArrayVar(&subscribeTriggers, "triggers", nil, "Trigger activity (repeatable; also accepts a comma-separated list) (default: COMPLETED,WAITING_FOR_INPUT,LIMITS_EXCEEDED)")
+	notificationsSubscribeCmd.Flags().StringArrayVar(&subscribeTriggers, "triggers", nil, "Trigger activity (repeatable; also accepts a comma-separated list) (default: COMPLETED,IDLE,WAITING_FOR_INPUT,LIMITS_EXCEEDED)")
 
 	// Unsubscribe flags
 	notificationsUnsubscribeCmd.Flags().BoolVar(&unsubscribeAll, "all", false, "Remove all subscriptions in the project")
@@ -177,8 +187,8 @@ func init() {
 	notificationsUpdateCmd.Flags().StringArrayVar(&updateTriggers, "triggers", nil, "Trigger activity (required, repeatable; also accepts a comma-separated list)")
 	_ = notificationsUpdateCmd.MarkFlagRequired("triggers")
 
-	// Subscriptions list flags
-	notificationsSubscriptionsCmd.Flags().StringVar(&subscriptionsProject, "project", "", "Filter by project")
+	// Subscriptions list flags (--project/-g is inherited from rootCmd)
+	notificationsSubscriptionsCmd.Flags().BoolVarP(&subscriptionsAll, "all", "a", false, "List subscriptions across all projects")
 	notificationsSubscriptionsCmd.Flags().BoolVar(&subscriptionsJSON, "json", false, "Output in JSON format")
 }
 
@@ -218,11 +228,7 @@ func resolveProjectID(settings *config.Settings, projectFlag string) (string, er
 		return projectFlag, nil
 	}
 
-	// Try hub project ID first, then local project ID
-	projectID := settings.GetHubProjectID()
-	if projectID == "" {
-		projectID = settings.ProjectID
-	}
+	projectID := targetProjectIDFromSettings(settings)
 	if projectID == "" {
 		return "", fmt.Errorf("cannot determine project ID. Use --project flag or link this project with 'scion hub link'")
 	}
@@ -339,6 +345,92 @@ func notificationArtifactRef(n hubclient.Notification) string {
 	return "scion://artifact/" + n.ResourceID
 }
 
+// resolveIDPrefix resolves ref against ids by case-insensitive exact match or
+// unique case-insensitive prefix match.
+func resolveIDPrefix(ref string, ids []string, noun, plural string) (string, error) {
+	lowerRef := strings.ToLower(ref)
+	var prefixMatches []string
+	for _, id := range ids {
+		if strings.EqualFold(id, ref) {
+			return id, nil
+		}
+		if strings.HasPrefix(strings.ToLower(id), lowerRef) {
+			prefixMatches = append(prefixMatches, id)
+		}
+	}
+	switch len(prefixMatches) {
+	case 0:
+		return "", fmt.Errorf("no %s found matching %q", noun, ref)
+	case 1:
+		return prefixMatches[0], nil
+	default:
+		return "", fmt.Errorf("ambiguous %s ID prefix %q matches %d %s: %s",
+			noun, ref, len(prefixMatches), plural, strings.Join(prefixMatches, ", "))
+	}
+}
+
+// resolveSubscriptionID resolves a subscription UUID or unique ID prefix to a
+// full subscription ID.
+func resolveSubscriptionID(ctx context.Context, client hubclient.Client, ref string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", newUsageError("subscription ID is required")
+	}
+	if uuid.Validate(ref) == nil {
+		return ref, nil
+	}
+	subs, err := client.Subscriptions().List(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to list subscriptions for ID resolution: %w", err)
+	}
+	ids := make([]string, len(subs))
+	for i, s := range subs {
+		ids[i] = s.ID
+	}
+	return resolveIDPrefix(ref, ids, "subscription", "subscriptions")
+}
+
+// resolveNotificationID resolves a notification UUID or unique ID prefix to a
+// full notification ID. It checks unacknowledged notifications first, falling
+// back to all notifications when no unacknowledged notification matches.
+func resolveNotificationID(ctx context.Context, client hubclient.Client, ref string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", newUsageError("notification ID is required")
+	}
+	if uuid.Validate(ref) == nil {
+		return ref, nil
+	}
+
+	unacked, err := client.Notifications().List(ctx, &hubclient.ListNotificationsOptions{
+		OnlyUnacknowledged: true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to list notifications for ID resolution: %w", err)
+	}
+	unackedIDs := make([]string, len(unacked))
+	for i, n := range unacked {
+		unackedIDs[i] = n.ID
+	}
+	if id, err := resolveIDPrefix(ref, unackedIDs, "notification", "notifications"); err == nil {
+		return id, nil
+	} else if strings.HasPrefix(err.Error(), "ambiguous ") {
+		return "", err
+	}
+
+	all, err := client.Notifications().List(ctx, &hubclient.ListNotificationsOptions{
+		OnlyUnacknowledged: false,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to list notifications for ID resolution: %w", err)
+	}
+	allIDs := make([]string, len(all))
+	for i, n := range all {
+		allIDs[i] = n.ID
+	}
+	return resolveIDPrefix(ref, allIDs, "notification", "notifications")
+}
+
 func runNotificationsAck(cmd *cobra.Command, args []string) error {
 	return runHubAllOrOne(
 		args,
@@ -352,7 +444,11 @@ func runNotificationsAck(cmd *cobra.Command, args []string) error {
 			fmt.Println("All notifications acknowledged.")
 			return nil
 		},
-		func(ctx context.Context, client hubclient.Client, notifID string) error {
+		func(ctx context.Context, client hubclient.Client, notifRef string) error {
+			notifID, err := resolveNotificationID(ctx, client, notifRef)
+			if err != nil {
+				return err
+			}
 			if err := client.Notifications().Acknowledge(ctx, notifID); err != nil {
 				return fmt.Errorf("failed to acknowledge notification: %w", err)
 			}
@@ -429,11 +525,14 @@ func runNotificationsUpdate(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	subID := args[0]
-
 	triggers := splitCommaList(updateTriggers)
 	if len(triggers) == 0 {
 		return newUsageError("--triggers must specify at least one trigger activity")
+	}
+
+	subID, err := resolveSubscriptionID(ctx, client, args[0])
+	if err != nil {
+		return err
 	}
 
 	req := &hubclient.UpdateSubscriptionRequest{
@@ -500,7 +599,10 @@ func runNotificationsUnsubscribe(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	subID := args[0]
+	subID, err := resolveSubscriptionID(ctx, client, args[0])
+	if err != nil {
+		return err
+	}
 	if err := client.Subscriptions().Delete(ctx, subID); err != nil {
 		return fmt.Errorf("failed to delete subscription: %w", err)
 	}
@@ -509,11 +611,16 @@ func runNotificationsUnsubscribe(cmd *cobra.Command, args []string) error {
 }
 
 func runNotificationsSubscriptions(cmd *cobra.Command, args []string) error {
+	explicitProject := projectPath != "" && projectSource != targetSourceContext
+	if subscriptionsAll && (explicitProject || globalMode) {
+		return newUsageError("cannot combine --all with --project or --global")
+	}
+
 	if subscriptionsJSON {
 		outputFormat = "json"
 	}
 
-	settings, client, err := requireHubClient()
+	client, uat, err := loadHubClientForProjectResolution()
 	if err != nil {
 		return err
 	}
@@ -522,16 +629,16 @@ func runNotificationsSubscriptions(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	opts := &hubclient.ListSubscriptionsOptions{}
-	if subscriptionsProject != "" {
-		opts.ProjectID = subscriptionsProject
-	} else {
-		// Default to current project if available
-		projectID := settings.GetHubProjectID()
-		if projectID == "" {
-			projectID = settings.ProjectID
+	var filterDisplay, unlinkedNote string
+	if !subscriptionsAll {
+		res, err := resolveHubProject(ctx, client, uat, false)
+		if err != nil {
+			return err
 		}
-		if projectID != "" {
-			opts.ProjectID = projectID
+		opts.ProjectID = res.ID
+		filterDisplay = res.Display
+		if res.UnlinkedDir != "" {
+			unlinkedNote = fmt.Sprintf("Note: directory project %s is not linked to a hub; listing subscriptions across all projects.", res.UnlinkedDir)
 		}
 	}
 
@@ -541,16 +648,30 @@ func runNotificationsSubscriptions(cmd *cobra.Command, args []string) error {
 	}
 
 	if isJSONOutput() {
-		return outputJSON(subs)
+		return writeJSONTo(cmd.OutOrStdout(), subs)
 	}
 
+	if unlinkedNote != "" {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), unlinkedNote)
+	}
+
+	out := cmd.OutOrStdout()
 	if len(subs) == 0 {
-		fmt.Println("No subscriptions")
+		if opts.ProjectID != "" {
+			_, _ = fmt.Fprintf(out, "No subscriptions in project %s; use --all to list across all projects\n", filterDisplay)
+			return nil
+		}
+		_, _ = fmt.Fprintln(out, "No subscriptions")
 		return nil
 	}
 
-	fmt.Printf("%-12s  %-6s  %-16s  %-16s  %-40s  %s\n", "ID", "SCOPE", "TARGET", "PROJECT", "TRIGGERS", "CREATED")
-	fmt.Printf("%-12s  %-6s  %-16s  %-16s  %-40s  %s\n", "------------", "------", "----------------", "----------------", "----------------------------------------", "--------------")
+	writeSubscriptionsTable(out, subs)
+	return nil
+}
+
+func writeSubscriptionsTable(w io.Writer, subs []hubclient.Subscription) {
+	_, _ = fmt.Fprintf(w, "%-12s  %-6s  %-16s  %-16s  %-40s  %s\n", "ID", "SCOPE", "TARGET", "PROJECT", "TRIGGERS", "CREATED")
+	_, _ = fmt.Fprintf(w, "%-12s  %-6s  %-16s  %-16s  %-40s  %s\n", "------------", "------", "----------------", "----------------", "----------------------------------------", "--------------")
 	for _, s := range subs {
 		shortID := s.ID
 		if len(shortID) > 12 {
@@ -559,6 +680,9 @@ func runNotificationsSubscriptions(cmd *cobra.Command, args []string) error {
 		target := "(all agents)"
 		if s.Scope == store.SubscriptionScopeAgent {
 			target = s.AgentID
+			if s.AgentSlug != "" {
+				target = safeText(s.AgentSlug)
+			}
 			if len(target) > 16 {
 				target = target[:13] + "..."
 			}
@@ -572,8 +696,6 @@ func runNotificationsSubscriptions(cmd *cobra.Command, args []string) error {
 			triggersStr = triggersStr[:37] + "..."
 		}
 		dateStr := clitime.Format(s.CreatedAt, clitime.Date)
-		fmt.Printf("%-12s  %-6s  %-16s  %-16s  %-40s  %s\n", shortID, s.Scope, target, projectDisplay, triggersStr, dateStr)
+		_, _ = fmt.Fprintf(w, "%-12s  %-6s  %-16s  %-16s  %-40s  %s\n", shortID, s.Scope, target, projectDisplay, triggersStr, dateStr)
 	}
-
-	return nil
 }

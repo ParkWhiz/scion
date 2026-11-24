@@ -110,7 +110,7 @@ type TargetScopeEvidence struct {
 //  3. r.Type == permissions.ResourceHub: TargetScopeHub.
 //  4. facts.hasProjectParent: TargetScopeProject.
 //  5. facts.hasSystemParent: TargetScopeHub.
-//  6. r.Type is "broker" or "runtime_broker": TargetScopeHub.
+//  6. r.Type == permissions.ResourceBroker: TargetScopeHub.
 //  7. facts.hasGlobalScope: TargetScopeHub.
 //  8. Anything else: TargetScopeUnknown. Never equate missing resource
 //     parent metadata with hub scope.
@@ -136,7 +136,7 @@ func ResolveTargetScope(r Resource, evidence TargetScopeEvidence) TargetScope {
 	if facts.hasSystemParent {
 		return TargetScope{Kind: TargetScopeHub}
 	}
-	if r.Type == "broker" || r.Type == "runtime_broker" {
+	if r.Type == permissions.ResourceBroker {
 		return TargetScope{Kind: TargetScopeHub}
 	}
 	if facts.hasGlobalScope {
@@ -241,7 +241,7 @@ func classesInclude(classes []permissions.TargetClassKind, want ...permissions.T
 type targetFacts struct {
 	hasProjectParent bool
 	hasSystemParent  bool
-	hasGlobalScope   bool // explicit global/core/user ScopeKind, reviewed types only
+	hasGlobalScope   bool // explicit global/user ScopeKind, reviewed types only
 	hasProjectScope  bool // explicit "project" ScopeKind, reviewed types only
 }
 
@@ -303,7 +303,7 @@ func computeTargetFacts(effectiveType string, r Resource) (targetFacts, bool) {
 	}
 	if hasScopeKindSemantics {
 		switch r.ScopeKind {
-		case store.SkillScopeGlobal, store.SkillScopeCore, store.SkillScopeUser:
+		case store.SkillScopeGlobal, store.SkillScopeUser:
 			facts.hasGlobalScope = true
 		case store.SkillScopeProject:
 			facts.hasProjectScope = true
@@ -335,7 +335,7 @@ func isReviewedScopeKindResourceType(resourceType string) bool {
 // contradiction; any other unrecognized value is.
 func isRecognizedScopeKindValue(scopeKind string) bool {
 	switch scopeKind {
-	case "", store.SkillScopeProject, store.SkillScopeGlobal, store.SkillScopeCore, store.SkillScopeUser:
+	case "", store.SkillScopeProject, store.SkillScopeGlobal, store.SkillScopeUser:
 		return true
 	default:
 		return false
@@ -869,7 +869,7 @@ type ProjectTargetClass struct {
 // ContemplatedProjectClass returns the definite project-scoped
 // ProjectTargetClass for permissionID, for use where a real project ID is
 // known but no real target instance exists yet (Project-boundary mint, and
-// SystemAuthorityProof's caller in general) — never global/core for the
+// SystemAuthorityProof's caller in general) — never global for the
 // scope-kind-split types (skill/template/harness_config), empty ScopeKind
 // for every other resource type.
 func ContemplatedProjectClass(permissionID string) ProjectTargetClass {
@@ -929,7 +929,7 @@ var validRealProjectScopeKinds = map[string][]string{
 	permissions.ResourceSkill:          {store.SkillScopeProject},
 	permissions.ResourceTemplate:       {store.TemplateScopeProject},
 	permissions.ResourceHarnessConfig:  {store.HarnessConfigScopeProject},
-	permissions.ResourceSecret:         {store.ScopeProject, store.ScopeHub, store.ScopeUser, store.ScopeRuntimeBroker},
+	permissions.ResourceSecret:         {store.ScopeProject, store.ScopeHub, store.ScopeUser, store.ScopeRuntimeBroker, store.ScopeAgent},
 	permissions.ResourceEnvVar:         {store.ScopeProject, store.ScopeHub, store.ScopeUser, store.ScopeRuntimeBroker},
 	permissions.ResourceSkillInjection: {store.ScopeProject, store.ScopeHub, store.ScopeUser, store.ScopeRuntimeBroker},
 }
@@ -1089,6 +1089,24 @@ func (a *AuthzService) activeSystemScopeCandidates(ctx context.Context, principa
 // uncached body, split out so the cache wrapper above never duplicates
 // this logic.
 func (a *AuthzService) loadActiveSystemScopeCandidates(ctx context.Context, principal PrincipalContext) ([]CandidateBinding, map[string]*RolePermissions, []store.PrincipalRef, error) {
+	refs, systemBindings, roleDefs, err := a.loadScopedActiveBindings(ctx, principal, time.Now(), func(b *store.RoleBinding) bool {
+		return b.ScopeType == ScopeTypeSystem
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return toCandidateBindings(systemBindings), roleDefs, refs, nil
+}
+
+// loadScopedActiveBindings resolves principal's group-expanded closure, loads
+// clamped role bindings in one batch, filters to active bindings matching
+// includeScope at evalTime, and batch-loads their role definitions.
+func (a *AuthzService) loadScopedActiveBindings(
+	ctx context.Context,
+	principal PrincipalContext,
+	evalTime time.Time,
+	includeScope func(*store.RoleBinding) bool,
+) ([]store.PrincipalRef, []*store.RoleBinding, map[string]*RolePermissions, error) {
 	refs, _, _, err := a.principalClosure(ctx, principal)
 	if err != nil {
 		return nil, nil, nil, projectAccessLookupFault(fmt.Errorf("%w: %v", ErrProjectAccessDenied, err))
@@ -1097,23 +1115,21 @@ func (a *AuthzService) loadActiveSystemScopeCandidates(ctx context.Context, prin
 	if err != nil {
 		return nil, nil, nil, projectAccessLookupFault(fmt.Errorf("%w: binding resolution failed: %v", ErrProjectAccessDenied, err))
 	}
-	now := time.Now()
-	var systemBindings []*store.RoleBinding
+	var active []*store.RoleBinding
 	for _, b := range bindings {
-		if b.ScopeType != ScopeTypeSystem {
+		if b == nil || !includeScope(b) {
 			continue
 		}
-		if !bindingActivationOK(b, now) {
+		if !bindingActivationOK(b, evalTime) {
 			continue
 		}
-		systemBindings = append(systemBindings, b)
+		active = append(active, b)
 	}
-	roleDefs, err := a.loadRoleDefinitions(ctx, collectRoleDefinitionIDs(systemBindings))
+	roleDefs, err := a.loadRoleDefinitions(ctx, collectRoleDefinitionIDs(active))
 	if err != nil {
 		return nil, nil, nil, projectAccessLookupFault(fmt.Errorf("%w: role resolution failed: %v", ErrProjectAccessDenied, err))
 	}
-	candidates := toCandidateBindings(systemBindings)
-	return candidates, roleDefs, refs, nil
+	return refs, active, roleDefs, nil
 }
 
 func candidateSetHasPermission(candidates []CandidateBinding, roleDefs map[string]*RolePermissions, permissionID string) bool {

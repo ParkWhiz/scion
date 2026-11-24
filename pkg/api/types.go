@@ -529,6 +529,12 @@ type ScionConfig struct {
 	Hub           *AgentHubConfig            `json:"hub,omitempty" yaml:"hub,omitempty"`
 	Telemetry     *TelemetryConfig           `json:"telemetry,omitempty" yaml:"telemetry,omitempty"`
 
+	// Persistence is the agent's environment lifetime (persistent or
+	// ephemeral; empty is persistent). The hub resolves it at create and
+	// stamps it on the agent; the broker takes it from the dispatch
+	// (StartOptions.Persistence), never from a merged config.
+	Persistence Persistence `json:"persistence,omitempty" yaml:"persistence,omitempty"`
+
 	// CloneDepth sets the git clone depth for a clone-per-agent
 	// workspace: "full" or a positive integer. It overrides a profile's
 	// clone_depth. Empty keeps the profile value, else the default
@@ -693,9 +699,9 @@ type AgentInfo struct {
 	// Start always sets it, so empty means an older broker (ptone/scion#620).
 	HarnessConfigSource string `json:"harnessConfigSource,omitempty"`
 	HarnessAuth         string `json:"harnessAuth,omitempty"` // Resolved harness auth method (api-key, oauth-token, auth-file, vertex-ai)
-	// Harness and Model are what Start resolved: the harness name and the
-	// effective model (resolveEffectiveModel), set only by Start. The hub
-	// records them as the run's effective configuration (WP1 slice 3).
+	// Harness and Model are the resolved harness name and effective model
+	// (set by Start and populated in Hub list responses from the stored
+	// agent config).
 	Harness string `json:"harness,omitempty"`
 	Model   string `json:"model,omitempty"`
 	// ConfigResolved marks an AgentInfo returned by one of Start's return
@@ -730,10 +736,18 @@ type AgentInfo struct {
 	Activity        string       `json:"activity,omitempty"`        // Runtime activity (working, thinking, executing, waiting_for_input, completed)
 	ExitCode        *int         `json:"exitCode,omitempty"`        // Structured exit code from runtime (nil = unknown)
 	ExitReason      string       `json:"exitReason,omitempty"`      // Terminal reason (see state.ExitReason), e.g. "crashed", "preempted", "oom_killed"; "signaled" is agent-reported
+	SuspendReason   string       `json:"suspendReason,omitempty"`   // Why a suspended agent was suspended (see state.SuspendReason): user, idle or stalled
 	Detail          *AgentDetail `json:"detail,omitempty"`          // Freeform context about the current activity
+	// StalledFromActivity is the activity the agent had when the Hub marked
+	// it stalled; empty when it is not stalled (Hub agents only).
+	StalledFromActivity string `json:"stalledFromActivity,omitempty"`
+	// Launch is the Hub's view of the agent's current or most recent launch
+	// (Hub agents only).
+	Launch *AgentLaunch `json:"launch,omitempty"`
 
 	// Runtime configuration
 	Image      string            `json:"image,omitempty"`
+	Generation int               `json:"generation,omitempty"` // Reincarnation generation (starts at 1; 0 when unknown)
 	Detached   bool              `json:"detached,omitempty"`
 	Runtime    string            `json:"runtime,omitempty"`
 	Profile    string            `json:"profile,omitempty"`
@@ -749,6 +763,15 @@ type AgentInfo struct {
 	// Authority is the agent's authority state as the Hub computed it.
 	// Set only for agents listed through a Hub that was asked for it.
 	Authority *AgentAuthority `json:"authority,omitempty"`
+	// ResolvedHarness is the underlying harness type the Hub resolved for
+	// the agent (for example "claude" or "generic"). Set for agents listed
+	// through a Hub that was asked for capabilities (scion list --format json).
+	ResolvedHarness string `json:"resolvedHarness,omitempty"`
+	// HarnessCapabilities describes the feature matrix of ResolvedHarness
+	// (including Resume.Support and Resume.Reason, which reflect Hub suspend
+	// eligibility and allow agents that name no harness). Set for agents
+	// listed through a Hub that was asked for capabilities.
+	HarnessCapabilities *HarnessAdvancedCapabilities `json:"harnessCapabilities,omitempty"`
 	// WorkspacePlacement is where the start that produced this info placed
 	// the agent's workspace: WorkspacePlacementExport or
 	// WorkspacePlacementLocal. Empty when this info did not come from a
@@ -815,6 +838,27 @@ type AgentInfo struct {
 
 	// Optimistic locking
 	StateVersion int64 `json:"stateVersion,omitempty"` // Version for concurrent update detection
+}
+
+// AgentLaunch is the Hub's view of an agent's current or most recent launch.
+type AgentLaunch struct {
+	ID        string `json:"id"`
+	State     string `json:"state"`  // "active" | "ended"
+	Active    bool   `json:"active"` // the launch is in flight
+	Kind      string `json:"kind"`   // create | start | restart
+	Step      string `json:"step,omitempty"`
+	Error     string `json:"error,omitempty"` // launch error code, e.g. image_pull_failed
+	Cause     string `json:"cause,omitempty"` // runtime cause code behind a runtime_error, e.g. runtime_forbidden
+	EndReason string `json:"endReason,omitempty"`
+	// ResumePhase is the resume memory of a failed start (ptone/scion#4669):
+	// the resting phase the agent is treated as being in for a later start or
+	// resume (store.EffectiveRestingPhase), set only when it differs from the
+	// agent's phase.
+	ResumePhase string `json:"resumePhase,omitempty"`
+	// Deadline and RemainingSeconds are present only while the launch is
+	// active. RemainingSeconds is never negative.
+	Deadline         *time.Time `json:"deadline,omitempty"`
+	RemainingSeconds *int       `json:"remainingSeconds,omitempty"`
 }
 
 // AgentDetail provides freeform context about the current activity.
@@ -1158,6 +1202,21 @@ func IsBrokerModeFromContext(ctx context.Context) bool {
 	return v
 }
 
+type hostedModeContextKey struct{}
+
+// ContextWithHostedMode returns a new context flagged as served by a hosted
+// Runtime Broker (StartOptions.HostedMode).
+func ContextWithHostedMode(ctx context.Context) context.Context {
+	return context.WithValue(ctx, hostedModeContextKey{}, true)
+}
+
+// IsHostedModeFromContext returns true if the context indicates a hosted
+// Runtime Broker.
+func IsHostedModeFromContext(ctx context.Context) bool {
+	v, _ := ctx.Value(hostedModeContextKey{}).(bool)
+	return v
+}
+
 type reprovisionContextKey struct{}
 
 // ContextWithReprovision returns a new context flagged as a reincarnation
@@ -1352,6 +1411,14 @@ type HubAgentDefaults struct {
 	// image_registry rewrite; an absent value leaves the image unchanged,
 	// which is also what a broker that predates the field does.
 	ImageTag string `json:"imageTag,omitempty"`
+	// CreateKSA authorizes the broker to create the conventional Kubernetes
+	// ServiceAccount (<gsa-account-id>) on GCP identity mode "assign" start
+	// when the broker's own create_service_accounts setting is also enabled
+	// (ptone/scion#7966). The Hub sets it only when
+	// hub.k8s_workload_identity_setup is on and the assigned GCP service
+	// account was minted by the Hub (Managed == true), never for BYO
+	// accounts.
+	CreateKSA bool `json:"createKSA,omitempty"`
 }
 
 // ResolvedImageTag returns the hub-resolved image tag, or "" when the hub
@@ -1393,7 +1460,7 @@ func (d *HubAgentDefaults) IsEmpty() bool {
 		return true
 	}
 	return d.MaxTurns == 0 && d.MaxModelCalls == 0 && d.MaxDuration == "" && d.Resources == nil &&
-		d.AutoExposePorts == nil && len(d.Experiments) == 0 && d.Telemetry == nil && d.ImageTag == ""
+		d.AutoExposePorts == nil && len(d.Experiments) == 0 && d.Telemetry == nil && d.ImageTag == "" && !d.CreateKSA
 }
 
 // EnvAutoExposePorts is the env key that enables in-container port
@@ -1432,9 +1499,20 @@ func HubAgentDefaultsFromContext(ctx context.Context) *HubAgentDefaults {
 	return v
 }
 
+// PriorStatus records the agent's last known activity status from the Hub
+// before a start, resume, or restart dispatch (ptone/scion#8900). It is used
+// to build status-aware resume/restart notices without overwriting prompt.md
+// or setting SCION_INITIAL_TASK=1.
+type PriorStatus struct {
+	Activity string    `json:"activity,omitempty"`
+	Summary  string    `json:"summary,omitempty"`
+	At       time.Time `json:"at,omitempty"`
+}
+
 type StartOptions struct {
 	Name              string
 	Task              string
+	PriorStatus       *PriorStatus
 	Template          string
 	TemplateName      string // Human-friendly template slug (overrides Template for labels when hydration replaces Template with a cache path)
 	Profile           string
@@ -1447,6 +1525,11 @@ type StartOptions struct {
 	Env               map[string]string
 	ResolvedSecrets   []ResolvedSecret
 	BrokerMode        bool // When true, auth gathering skips local sources (broker env + filesystem)
+	// HostedMode is true when the Runtime Broker serving this start runs
+	// on a hosted server (not workstation mode). Member-written config is
+	// then checked by pkg/hostedguard. Unlike BrokerMode, which is true for
+	// every Hub dispatch, it is false on a workstation.
+	HostedMode bool
 	// RecordedOriginURL is the broker-recorded origin for the project (the hub
 	// project's repository), captured from GitClone before the linked-checkout
 	// route clears GitClone. It is threaded to worktree creation so the git-lfs
@@ -1504,6 +1587,11 @@ type StartOptions struct {
 	// time. If non-empty, the broker writes it to pre-start.d/30-project-custom
 	// before the agent container starts.
 	ProjectPreStartHookScript string
+
+	// HomeFiles are create-only files written under .scion/ in the agent home
+	// directory during fresh provisioning before the harness starts. Ignored on
+	// resume, start, restart, and reprovision.
+	HomeFiles []HomeFile
 
 	// Checkpoint, when set, is called by the runtime immediately before each
 	// resource-creating call (an async launch's pre-create gate, design
@@ -1566,6 +1654,12 @@ type StartOptions struct {
 	// the runtime's configured account. It is per dispatch and never
 	// persisted, so it is recomputed on every start.
 	CloudRunIdentity *CloudRunIdentity `json:"-"`
+
+	// Persistence is the agent's stamped persistence, sent by the hub on
+	// every dispatch. Ephemeral gives the agent a fresh home and workspace
+	// at every start on a runtime that supports it; other runtimes refuse
+	// it. It is per dispatch and never persisted.
+	Persistence Persistence `json:"-"`
 
 	// ResolvedPlacement is the Kubernetes placement (node selector,
 	// tolerations, runtime class) the agent runtime server resolved for this
@@ -1639,10 +1733,10 @@ type KubernetesBlockIdentity struct {
 // refuses it (fail closed). See StartOptions.CloudRunIdentity.
 type CloudRunIdentity struct {
 	// ServiceAccount is the account the instance runs as (the assigned
-	// account, or the block account).
+	// account, the block account, or a flat instance's configured account).
 	ServiceAccount string
 	// Mode is the GCP identity mode as resolved, before the metadata env
-	// rewrite: "assign" or "block".
+	// rewrite: "assign", "block" or "passthrough".
 	Mode string
 }
 

@@ -377,6 +377,14 @@ func installClaudeViaHub(t *testing.T, srv *Server, s store.Store, sourceURL str
 	return after
 }
 
+// setWorkstationImports puts srv in workstation mode for tests that import from
+// a loopback http:// httptest source, which a hosted hub refuses
+// (checkImportSource). Those tests exercise import content handling, which
+// does not depend on the mode.
+func setWorkstationImports(srv *Server) {
+	srv.workstation = true
+}
+
 // testInstallSourceServer is a dev-auth hub with storage after one hosted
 // bootstrap, with the bundled claude row deleted (the ledger lists it, so
 // startup does not re-create it).
@@ -472,7 +480,9 @@ func runDispatchAgentEvent(t *testing.T, srv *Server, s store.Store, projectID, 
 	})
 	require.NoError(t, err)
 
-	handler := srv.dispatchAgentEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "dispatch_agent", evt)
+	}
 	require.NoError(t, handler(ctx, withSessionRevision(store.ScheduledEvent{
 		ID:        tid("sched-" + agentName + "-" + t.Name()),
 		ProjectID: projectID,

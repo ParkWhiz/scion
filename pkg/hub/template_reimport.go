@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -118,7 +119,10 @@ func (s *Server) handleTemplateReimport(w http.ResponseWriter, r *http.Request, 
 			writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required", nil)
 			return
 		}
-		decision := s.authzService.CheckAccess(ctx, userIdent, templateScopeResource(store.TemplateScopeGlobal, ""), ActionCreate)
+		decision := s.authzService.CheckAccessWithEvidence(ctx, userIdent,
+			templateScopeResource(store.TemplateScopeGlobal, ""),
+			catalogWriteAction(permissions.ResourceTemplate, store.TemplateScopeGlobal, ActionCreate),
+			hubCollectionEvidence("template.create_global"))
 		if !decision.Allowed {
 			writeError(w, http.StatusForbidden, ErrCodeForbidden, "You do not have permission to reimport global resources", nil)
 			return
@@ -145,6 +149,12 @@ func (s *Server) handleTemplateReimport(w http.ResponseWriter, r *http.Request, 
 		}
 	default:
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, "Reimport is not supported for this resource scope", nil)
+		return
+	}
+
+	if GetAgentIdentityFromContext(ctx) != nil && strings.TrimSpace(req.SourceURL) != "" {
+		writeError(w, http.StatusForbidden, "agent_source_override_forbidden",
+			"agents can refresh a template only from its stored source URL", nil)
 		return
 	}
 
@@ -181,6 +191,10 @@ func (s *Server) handleTemplateReimport(w http.ResponseWriter, r *http.Request, 
 		reasons := make([]string, len(failures))
 		for i, f := range failures {
 			reasons[i] = f.Name + ": " + f.Reason
+		}
+		if allFailuresHaveCode(failures, ErrCodeInvalidAgentConfig) {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeInvalidAgentConfig, strings.Join(reasons, "; "), nil)
+			return
 		}
 		writeError(w, http.StatusBadRequest, "reimport_failed", strings.Join(reasons, "; "), nil)
 		return

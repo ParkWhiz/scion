@@ -93,6 +93,9 @@ var RelationshipPolicies = []RelationshipPolicy{
 	// TestRelationshipCharacterization_OwnerProjectGrantsNothing pins this.
 	{
 		// owner/user/template (TestRelationshipCharacterization_Owner).
+		// template.create_global, template.update_global and template.delete_global
+		// are deliberately excluded: global templates record CreatedBy only, never
+		// OwnerID, and global catalog writes require explicit role authority.
 		Relationship:   "owner",
 		PrincipalKinds: []string{"user"},
 		ResourceType:   ResourceTemplate,
@@ -142,11 +145,15 @@ var RelationshipPolicies = []RelationshipPolicy{
 	},
 	{
 		// owner/user/skill (TestRelationshipCharacterization_Owner).
+		// Global-catalog twins (skill.*_global) are excluded: writes on a
+		// global record check skill.*_global, which no relationship row
+		// carries (Q5), so global catalog authorship is role-governed.
+		// OwnerID stays stamped on global records for audit only.
 		Relationship:   "owner",
 		PrincipalKinds: []string{"user"},
 		ResourceType:   ResourceSkill,
 		PermissionIDs: []string{
-			"skill.create", "skill.create_global", "skill.read", "skill.update", "skill.delete",
+			"skill.create", "skill.read", "skill.update", "skill.delete",
 			"skill.list", "skill.register",
 		},
 	},
@@ -188,9 +195,12 @@ var RelationshipPolicies = []RelationshipPolicy{
 		ReadOnly:       true,
 	},
 	{
-		// progeny/agent/secret (TestRelationshipCharacterization_Progeny). The
-		// Decide resource type is "secret"; the permission is registered on
-		// project (reviewed cross-type cell).
+		// progeny/agent/secret compatibility row
+		// (storeProgenyAdapter.ReadPermissions,
+		// TestRelationshipCharacterization_Progeny); dispatcher resolution
+		// authorizes user-scope progeny secrets via secret.use. The Decide
+		// resource type is "secret"; the permission is registered on project
+		// (reviewed cross-type cell).
 		Relationship:   "progeny",
 		PrincipalKinds: []string{"agent"},
 		ResourceType:   "secret",
@@ -274,6 +284,12 @@ var RelationshipPolicies = []RelationshipPolicy{
 		PrincipalKinds: []string{"agent"},
 		ResourceType:   "env_var",
 		PermissionIDs:  []string{"env_var.deliver"},
+	},
+	{
+		Relationship:   "agent_association",
+		PrincipalKinds: []string{"agent"},
+		ResourceType:   "secret",
+		PermissionIDs:  []string{"secret.deliver"},
 	},
 }
 

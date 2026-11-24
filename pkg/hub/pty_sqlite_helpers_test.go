@@ -70,6 +70,9 @@ type ptyConduitFixture struct {
 	// agentClock fires the timers of the sciontool agent started last
 	// (startSciontoolAgent); its time reads f.clock.
 	agentClock *clock.Fake
+	// controlFeatures, when non-nil, overrides Hello.capabilities.features
+	// for control agents started by startControlAgentWithOptions.
+	controlFeatures []string
 }
 
 // newPTYConduitFixture builds the fixture; mods adjust the relay options
@@ -195,9 +198,37 @@ func capturePTYLogs(t *testing.T) *lockedLogBuffer {
 // returns once the session is admitted.
 func (f *ptyConduitFixture) startControlAgent(t *testing.T, hubURL string, advertise bool, wrap func(conduit.RPCHandler) conduit.RPCHandler) *controlAgent {
 	t.Helper()
+	return f.startControlAgentWithDeliver(t, hubURL, advertise, nil, wrap)
+}
+
+// startControlAgentWithDeliver is startControlAgent with the
+// deliver-message route registered when deliver is not nil.
+func (f *ptyConduitFixture) startControlAgentWithDeliver(t *testing.T, hubURL string, advertise bool, deliver *control.DeliverOptions, wrap func(conduit.RPCHandler) conduit.RPCHandler) *controlAgent {
+	t.Helper()
+	return f.startControlAgentWithOptions(t, hubURL, advertise, control.Options{Deliver: deliver}, wrap)
+}
+
+// startControlAgentWithOptions is startControlAgent with the control
+// handler built from opts (KickTokenRefresh is the agent's kick counter).
+func (f *ptyConduitFixture) startControlAgentWithOptions(t *testing.T, hubURL string, advertise bool, opts control.Options, wrap func(conduit.RPCHandler) conduit.RPCHandler) *controlAgent {
+	t.Helper()
+	return f.startControlAgentAs(t, hubURL, f.launched.RunID, advertise, opts, wrap)
+}
+
+// startControlAgentAs is startControlAgentWithOptions with the session's
+// presented launch id set to launchID ("" admits it through the interim
+// generation fallback).
+func (f *ptyConduitFixture) startControlAgentAs(t *testing.T, hubURL, launchID string, advertise bool, opts control.Options, wrap func(conduit.RPCHandler) conduit.RPCHandler) *controlAgent {
+	t.Helper()
+	return f.startControlAgentAsWithFeatures(t, hubURL, launchID, advertise, advertise, opts, wrap)
+}
+
+func (f *ptyConduitFixture) startControlAgentAsWithFeatures(t *testing.T, hubURL, launchID string, advertiseRoutes, advertiseFeatures bool, opts control.Options, wrap func(conduit.RPCHandler) conduit.RPCHandler) *controlAgent {
+	t.Helper()
 	guardSciontoolLog()
 	ca := &controlAgent{paths: make(chan string, 16)}
-	ctl := control.New(control.Options{KickTokenRefresh: func() { ca.kicks.Add(1) }})
+	opts.KickTokenRefresh = func() { ca.kicks.Add(1) }
+	ctl := control.New(opts)
 	h := control.RPCHandler(ctl)
 	if wrap != nil {
 		h = wrap(h)
@@ -210,9 +241,12 @@ func (f *ptyConduitFixture) startControlAgent(t *testing.T, hubURL string, adver
 		}
 		return h.HandleRPC(ctx, req)
 	})
-	var routes []string
-	if advertise {
+	var routes, features []string
+	if advertiseRoutes {
 		routes = ctl.Routes()
+	}
+	if advertiseFeatures {
+		features = ctl.Features()
 	}
 	tok := f.agentToken(t, f.launched)
 	admitted := make(chan *conduitv1.Welcome, 4)
@@ -220,7 +254,7 @@ func (f *ptyConduitFixture) startControlAgent(t *testing.T, hubURL string, adver
 		HubURL:    hubURL,
 		AgentID:   f.launched.ID,
 		ProjectID: f.launched.ProjectID,
-		LaunchID:  f.launched.RunID,
+		LaunchID:  launchID,
 		Token:     func() string { return tok },
 		OnSession: func(w *conduitv1.Welcome) { admitted <- w },
 		Backoff:   &conduit.Backoff{Rand: func(int64) int64 { return 0 }},
@@ -228,6 +262,12 @@ func (f *ptyConduitFixture) startControlAgent(t *testing.T, hubURL string, adver
 		NoPTY:     true,
 		Session:   conduit.Config{RPCHandler: counted},
 		RPCRoutes: routes,
+		Features: func() []string {
+			if f.controlFeatures != nil {
+				return f.controlFeatures
+			}
+			return features
+		}(),
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -236,14 +276,18 @@ func (f *ptyConduitFixture) startControlAgent(t *testing.T, hubURL string, adver
 		defer close(exited)
 		_ = a.Run(ctx)
 	}()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-exited:
-		case <-time.After(10 * time.Second):
-			t.Error("conduit agent did not stop")
-		}
-	})
+	var stopOnce sync.Once
+	ca.stop = func() {
+		stopOnce.Do(func() {
+			cancel()
+			select {
+			case <-exited:
+			case <-time.After(10 * time.Second):
+				t.Error("conduit agent did not stop")
+			}
+		})
+	}
+	t.Cleanup(ca.stop)
 	select {
 	case <-admitted:
 	case <-time.After(10 * time.Second):

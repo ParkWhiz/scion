@@ -74,9 +74,9 @@ func convertHost(globalDir string) (colocatedHost, string, string, error) {
 	if ref != nil {
 		return colocatedHost{}, "", "", ref
 	}
-	launched := derr == nil
+	launched := derr == nil && host.ServerLaunch
 	if !launched {
-		// No saved launch backs the mode: the settings describe the host.
+		// No saved server launch backs the mode: the settings describe the host.
 		cfg, err := config.LoadGlobalConfig("")
 		if err != nil || cfg == nil {
 			return colocatedHost{}, "", "", brokerconvertRefusal(brokerconvert.RefuseColocatedUnknown)
@@ -84,7 +84,7 @@ func convertHost(globalDir string) (colocatedHost, string, string, error) {
 		host = colocatedHost{Config: cfg}
 		if mode == brokerconvert.HostModeColocated {
 			host.Colocated = true
-			host.Listeners = serverListenersFromArgs(nil, cfg, config.LoadServerMode(), func() error { return nil })
+			host.Listeners = serverListenersFromArgs(nil, cfg, config.LoadServerMode())
 		}
 	}
 	if mode == brokerconvert.HostModeColocated {
@@ -124,17 +124,30 @@ func hostEvidence(globalDir string, host colocatedHost, source string, launched 
 	return ev
 }
 
-// planHostModeLine is the human --plan line: the detected host mode, or
-// that --host-mode is required.
-func planHostModeLine(globalDir string) string {
+// planHostMode returns the fixed host-mode token (`colocated`, `remote`, or
+// `unknown`) for `--plan` JSON and human output (ptone/scion#7627). Only
+// compile-time constants are returned, so no path, endpoint, or settings value
+// can ever leak through it.
+func planHostMode(globalDir string) string {
 	host, err := convertDetectHost(globalDir)
 	switch {
 	case err != nil:
-		return "Host mode: unknown: --host-mode required"
+		return brokerconvert.HostModeUnknown
 	case host.Colocated:
-		return "Host mode: colocated"
+		return brokerconvert.HostModeColocated
 	default:
-		return "Host mode: remote"
+		return brokerconvert.HostModeRemote
+	}
+}
+
+// planHostModeLine is the human --plan line: the detected host mode, or
+// that --host-mode is required.
+func planHostModeLine(globalDir string) string {
+	switch mode := planHostMode(globalDir); mode {
+	case brokerconvert.HostModeColocated, brokerconvert.HostModeRemote:
+		return "Host mode: " + mode
+	default:
+		return "Host mode: unknown: --host-mode required"
 	}
 }
 
@@ -198,10 +211,15 @@ func colocatedQ7Input(ctx context.Context, cfg *config.GlobalConfig, j *brokerco
 	return in
 }
 
+// errColocatedAssertedHubEndpoint refuses a co-located precheck whose host
+// mode is asserted without a saved server launch and no configured
+// server.hub.endpoint.
+var errColocatedAssertedHubEndpoint = errors.New("no saved server launch; set server.hub.endpoint")
+
 // colocatedPrecheckHost is the shared activation precheck's host for a
 // co-located host's convert: ModeColocated, with the project storage
-// layout and the Hub endpoint the server derives from the same settings
-// (brokerStorageLayout, resolveHubEndpointWithSource). Settings that do
+// layout and the Hub endpoint resolved as the co-located server derives it
+// (brokerStorageLayout, colocatedResolveHubEndpoint). Settings that do
 // not load leave the layout unusable, so a cloudrun instance is refused.
 func colocatedPrecheckHost(host colocatedHost, settings *config.Settings) flatPrecheckHost {
 	hc := flatPrecheckHost{mode: brokerhost.ModeColocated}
@@ -214,10 +232,29 @@ func colocatedPrecheckHost(host colocatedHost, settings *config.Settings) flatPr
 	default:
 		hc.layout, _, hc.storageErr = brokerStorageLayout(vs)
 	}
-	if host.Config != nil && settings != nil {
-		hc.hubEndpoint, hc.hubEndpointSrc = resolveHubEndpointWithSource(host.Config, settings)
-	}
+	hc.hubEndpoint, hc.hubEndpointSrc, hc.hubEndpointErr = colocatedResolveHubEndpoint(host, settings)
 	return hc
+}
+
+// colocatedResolveHubEndpoint derives the Hub endpoint a co-located convert's
+// shared precheck validates (ptone/scion#7714). When a saved server launch
+// backs the host, it resolves with the server's own resolver from that
+// launch's components, ports and --base-url. When the mode is asserted with
+// no saved launch, only the configured server.hub.endpoint is used, and a
+// missing value fails with a "set server.hub.endpoint" message.
+func colocatedResolveHubEndpoint(host colocatedHost, settings *config.Settings) (string, hubEndpointSource, error) {
+	if !host.ServerLaunch {
+		ep := serverConfiguredHubEndpoint(host.Config)
+		if ep == "" {
+			return "", hubEndpointSourceNone, errColocatedAssertedHubEndpoint
+		}
+		return ep, hubEndpointSourceConfig, nil
+	}
+	if host.Config == nil {
+		return "", hubEndpointSourceNone, errColocatedUndetermined
+	}
+	ep, src := host.Listeners.resolveHubEndpoint(host.Config, settings)
+	return ep, src, nil
 }
 
 // colocatedPlansLocally reports whether this co-located apply runs a phase

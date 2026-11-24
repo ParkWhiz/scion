@@ -566,10 +566,11 @@ const agentSuspendedConflictMessage = "This agent is suspended. A hub admin can 
 // or not in good standing.
 func agentSuspendedRefusal(agentID string) *startRefusal {
 	return &startRefusal{
-		HTTPStatus: http.StatusConflict,
-		Code:       ErrCodeConflict,
-		Message:    agentSuspendedConflictMessage,
-		Details:    map[string]interface{}{"agentId": agentID},
+		HTTPStatus:      http.StatusConflict,
+		Code:            ErrCodeConflict,
+		Message:         agentSuspendedConflictMessage,
+		Details:         map[string]interface{}{"agentId": agentID},
+		StandingRefused: true,
 	}
 }
 
@@ -588,60 +589,6 @@ func standingStartRefusal(agentID string, err error) *startRefusal {
 		Code:       ErrCodeInternalError,
 		Message:    "could not verify the agent's standing",
 	}
-}
-
-// scheduledFireStanding refuses a scheduled event whose target agent is held
-// or whose authoring agent is not in good standing (ptone/scion#3433).
-// target is the message event's target agent, nil for an event with no
-// target (dispatch_agent). A user author is checked live by the event's own
-// authorization. A message event is refused with the one public scheduled
-// message refusal; the specific cause is logged.
-func (s *Server) scheduledFireStanding(ctx context.Context, evt store.ScheduledEvent, target *store.Agent) error {
-	refuse := func(cause string, err error) error {
-		slog.Warn("Scheduler: scheduled event refused at fire time",
-			"eventID", evt.ID, "eventType", evt.EventType, "projectID", evt.ProjectID,
-			"creator", evt.CreatedBy, "cause", cause, "error", err)
-		if target != nil {
-			return errScheduledMessageRefused
-		}
-		return fmt.Errorf("scheduled dispatch refused: %s", cause)
-	}
-	if target != nil {
-		held, err := s.agentHeld(ctx, target.ID)
-		if err != nil {
-			return refuse("target hold lookup failed", err)
-		}
-		if held {
-			return refuse("target agent is suspended", nil)
-		}
-	}
-	// The authoring principal is the event's recorded revision principal;
-	// CreatedBy (history) is checked too, so an agent named by either must
-	// be in good standing.
-	var authors []string
-	if init := s.scheduledInitiator(evt.InitiatorAttribution); !init.LegacyUnknown &&
-		init.PrincipalKind == store.DelegationPrincipalAgent && init.PrincipalID != "" {
-		authors = append(authors, init.PrincipalID)
-	}
-	if evt.CreatedBy != "" {
-		authors = append(authors, evt.CreatedBy)
-	}
-	for _, id := range authors {
-		creator, err := s.store.GetAgent(ctx, id)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-			return refuse("author lookup failed", err)
-		}
-		if creator == nil {
-			continue
-		}
-		if err := s.agentStanding(ctx, creator.ID); err != nil {
-			return refuse("authoring agent is not in good standing", err)
-		}
-	}
-	return nil
 }
 
 // ErrAgentNotInStanding is returned by the dispatcher when the standing
@@ -744,7 +691,8 @@ func (s *Server) agentSuspensionViews(ctx context.Context, agents []store.Agent)
 		for {
 			res, err := s.store.ListActiveAgentHoldsByProject(ctx, p, store.ListOptions{Limit: 500, Cursor: cursor})
 			if err != nil {
-				slog.Warn("agent suspension view: hold listing failed", "project_id", p, "error", err)
+				logAuthzCheckFault(ctx, nil, "agent_suspension_holds",
+					"agent suspension view: hold listing failed", err, "project_id", p)
 				break
 			}
 			for _, h := range res.Items {

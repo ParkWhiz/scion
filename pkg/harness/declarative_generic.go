@@ -36,7 +36,8 @@ import (
 // "Alternative C, partial adoption" path from the design doc and lets
 // external harness authors stand up a new harness with no code.
 type DeclarativeGenericHarness struct {
-	entry config.HarnessConfigEntry
+	entry   config.HarnessConfigEntry
+	builtin bool
 }
 
 // NewDeclarativeGenericHarness wraps a HarnessConfigEntry as an api.Harness.
@@ -136,14 +137,18 @@ func (d *DeclarativeGenericHarness) GetCommand(task string, resume bool, baseArg
 	return args
 }
 
+func (d *DeclarativeGenericHarness) validateCommand(task string, resume bool, baseArgs []string) error {
+	if !d.builtin {
+		return nil
+	}
+	if len(d.GetCommand(task, resume, baseArgs)) == 0 {
+		return ErrEmptyGenericCommand
+	}
+	return nil
+}
+
 func (d *DeclarativeGenericHarness) GetEnv(agentName, agentHome, unixUsername string) map[string]string {
-	out := map[string]string{
-		"SCION_AGENT_NAME": agentName,
-	}
-	for k, v := range d.entry.EnvTemplate {
-		out[k] = expandEnvTemplate(v, agentName, agentHome, unixUsername)
-	}
-	return out
+	return buildHarnessTemplateEnv(d.entry.EnvTemplate, agentName, agentHome, unixUsername)
 }
 
 func (d *DeclarativeGenericHarness) GetTelemetryEnv() map[string]string { return nil }
@@ -226,7 +231,7 @@ func (d *DeclarativeGenericHarness) InjectSystemPrompt(agentHome string, content
 		// "native" or empty → write to declared file or fall back.
 		target := d.entry.SystemPromptFile
 		if target == "" {
-			target = filepath.Join(".scion", "system_prompt.md")
+			target = filepath.FromSlash(GenericSystemPromptRel)
 		}
 		home, rel, err := openHomeTarget(agentHome, target, "system_prompt_file")
 		if err != nil {

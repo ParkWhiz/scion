@@ -19,6 +19,10 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import d2 from 'astro-d2';
 import starlightLinksValidator from 'starlight-links-validator';
+import { getBuildVersionConfig } from './src/lib/versioning.mjs';
+import { scionRewriteBaseIntegration } from './src/plugins/rewrite-scion-base.mjs';
+
+const buildVersion = getBuildVersionConfig();
 
 // The Hosted user journey is shared by both hosted tiers (Single-node and HA).
 // The pages live once under `hosted/user/`; both tiers reference the same slugs
@@ -32,6 +36,7 @@ const hostedUserGuide = {
 		{ label: 'User Access Tokens', slug: 'hosted/user/personal-access-tokens' },
 		{ label: 'Test Identities on Another Test Hub', slug: 'hosted/user/test-identity-target-hubs' },
 		{ label: 'CLI from a Coding Agent', slug: 'hosted/user/coding-agent-cli' },
+		{ label: 'Receiving Replies (Third-Party Agents)', slug: 'hosted/user/receiving-replies' },
 		{ label: 'Secrets & Environment', slug: 'hosted/user/secrets' },
 		{ label: 'Pre-Start Hooks', slug: 'hosted/user/pre-start-hooks' },
 		{ label: 'Agent Plugins (Experimental)', slug: 'local/agent-plugins' },
@@ -46,47 +51,56 @@ const hostedUserGuide = {
 	],
 };
 
+const legacyRedirectTargets = {
+	'/advanced-local/local-governance': '/local/local-governance/',
+	'/advanced-local/agent-lifecycle': '/local/agent-lifecycle/',
+	'/advanced-local/workspace': '/local/workspace/',
+	'/advanced-local/templates': '/local/templates/',
+	'/advanced-local/agent-credentials': '/local/agent-credentials/',
+	'/advanced-local/custom-images': '/local/custom-images/',
+	'/advanced-local/tmux': '/local/tmux/',
+	'/advanced-local/completions': '/local/completions/',
+	'/advanced-local/workstation-server': '/workstation/workstation-server/',
+	'/workspaces-and-sharing': '/local/workspaces-and-sharing/',
+	'/hub-user/dashboard': '/workstation/dashboard/',
+	'/hub-user/git-projects': '/workstation/git-projects/',
+	'/hub-user/hosted-user': '/hosted/user/hosted-user/',
+	'/hub-user/personal-access-tokens': '/hosted/user/personal-access-tokens/',
+	'/hub-user/secrets': '/hosted/user/secrets/',
+	'/hub-user/messaging': '/hosted/user/messaging/',
+	'/hub-user/external-channels': '/hosted/user/external-channels/',
+	'/hub-user/runtime-broker': '/hosted/ha/runtime-broker/',
+	'/hub-user/multi-broker': '/hosted/ha/multi-broker/',
+	'/hub-admin/hub-server': '/hosted/single-node/hub-server/',
+	'/hub-admin/hub-setup-gce': '/hosted/single-node/hub-setup-gce/',
+	'/hub-admin/auth': '/hosted/single-node/auth/',
+	'/hub-admin/observability': '/hosted/single-node/observability/',
+	'/hub-admin/metrics': '/hosted/single-node/metrics/',
+	'/hub-admin/kubernetes': '/hosted/ha/kubernetes/',
+	'/hub-admin/auth-proxy-iap': '/hosted/ha/auth-proxy-iap/',
+	'/hub-admin/permissions': '/hosted/ha/permissions/',
+	'/hub-admin/lifecycle-hooks': '/hosted/ha/lifecycle-hooks/',
+	'/development/logging': '/contributing/logging/',
+};
+
 // https://astro.build/config
 export default defineConfig({
 	site: 'https://googlecloudplatform.github.io',
-	base: '/scion',
+	base: buildVersion.base,
 	// Preserve old URLs after the mode-axis restructure so inbound links do not 404.
-	redirects: {
-		'/advanced-local/local-governance': '/local/local-governance',
-		'/advanced-local/agent-lifecycle': '/local/agent-lifecycle',
-		'/advanced-local/workspace': '/local/workspace',
-		'/advanced-local/templates': '/local/templates',
-		'/advanced-local/agent-credentials': '/local/agent-credentials',
-		'/advanced-local/custom-images': '/local/custom-images',
-		'/advanced-local/tmux': '/local/tmux',
-		'/advanced-local/completions': '/local/completions',
-		'/advanced-local/workstation-server': '/workstation/workstation-server',
-		'/workspaces-and-sharing': '/local/workspaces-and-sharing',
-		'/hub-user/dashboard': '/workstation/dashboard',
-		'/hub-user/git-projects': '/workstation/git-projects',
-		'/hub-user/hosted-user': '/hosted/user/hosted-user',
-		'/hub-user/personal-access-tokens': '/hosted/user/personal-access-tokens',
-		'/hub-user/secrets': '/hosted/user/secrets',
-		'/hub-user/messaging': '/hosted/user/messaging',
-		'/hub-user/external-channels': '/hosted/user/external-channels',
-		'/hub-user/runtime-broker': '/hosted/ha/runtime-broker',
-		'/hub-user/multi-broker': '/hosted/ha/multi-broker',
-		'/hub-admin/hub-server': '/hosted/single-node/hub-server',
-		'/hub-admin/hub-setup-gce': '/hosted/single-node/hub-setup-gce',
-		'/hub-admin/auth': '/hosted/single-node/auth',
-		'/hub-admin/observability': '/hosted/single-node/observability',
-		'/hub-admin/metrics': '/hosted/single-node/metrics',
-		'/hub-admin/kubernetes': '/hosted/ha/kubernetes',
-		'/hub-admin/auth-proxy-iap': '/hosted/ha/auth-proxy-iap',
-		'/hub-admin/permissions': '/hosted/ha/permissions',
-		'/hub-admin/lifecycle-hooks': '/hosted/ha/lifecycle-hooks',
-		'/development/logging': '/contributing/logging',
-	},
+	redirects: Object.fromEntries(
+		Object.entries(legacyRedirectTargets).map(([from, to]) => [from, `${buildVersion.base}${to}`]),
+	),
 	integrations: [
+		scionRewriteBaseIntegration({ base: buildVersion.base }),
 		d2(),
 		starlight({
 			plugins: [starlightLinksValidator()],
 			title: 'Scion',
+			components: {
+				Banner: './src/components/Banner.astro',
+				ThemeSelect: './src/components/ThemeSelect.astro',
+			},
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/GoogleCloudPlatform/scion' },
 			],
@@ -104,6 +118,10 @@ export default defineConfig({
 							label: 'Release Notes',
 							items: [
 								{ label: 'Overview', slug: 'release-notes' },
+								{ label: 'v0.4.0-preview.4', slug: 'release-notes/v0-4-0-preview-4' },
+								{ label: 'v0.4.0-preview.3', slug: 'release-notes/v0-4-0-preview-3' },
+								{ label: 'v0.4.0-preview.2', slug: 'release-notes/v0-4-0-preview-2' },
+								{ label: 'v0.4.0-preview.1', slug: 'release-notes/v0-4-0-preview-1' },
 								{ label: 'v0.3.0', slug: 'release-notes/v0-3-0' },
 								{ label: 'v0.3.0-preview.7', slug: 'release-notes/v0-3-0-preview-7' },
 								{ label: 'v0.3.0-preview.6', slug: 'release-notes/v0-3-0-preview-6' },
@@ -175,8 +193,11 @@ export default defineConfig({
 							        { label: 'Hub Setup', slug: 'hosted/single-node/hub-server' },
 							        { label: 'Deploy on a VM (GCE)', slug: 'hosted/single-node/hub-setup-gce' },
 							        { label: 'Deploy on a VM (Hardened Org)', slug: 'hosted/single-node/hub-setup-gce-hardened-org' },
+							        { label: 'Metadata Host Hardening', slug: 'hosted/single-node/metadata-host-hardening' },
 							        { label: 'Deploy on Cloud Run (Sandbox)', slug: 'hosted/single-node/hub-setup-cloudrun' },
 							        { label: 'Auth & Tenancy', slug: 'hosted/single-node/auth' },
+							        { label: 'Branding & White-Labeling', slug: 'hosted/single-node/branding' },
+							        { label: 'GitHub App Setup', slug: 'hosted/single-node/github-app' },
 							        { label: 'Managed Agents', slug: 'hosted/single-node/managed-agents' },
 								{ label: 'Skill Registry & Federation', slug: 'hosted/single-node/skill-registry' },
 								{ label: 'Observability', slug: 'hosted/single-node/observability' },
@@ -194,10 +215,12 @@ export default defineConfig({
 							label: 'Admin Guide',
 							items: [
 								{ label: 'HA Overview', slug: 'hosted/ha/overview' },
+								{ label: 'Sizing for Long-Lived Connections', slug: 'hosted/ha/sizing' },
 								{ label: 'Deploy on GCP (Cloud Run + GKE)', slug: 'hosted/ha/setup-gcp' },
 								{ label: 'Multi-Hub HA with Terraform', slug: 'hosted/ha/terraform' },
 								{ label: 'Deploy via Helm (GKE)', slug: 'hosted/ha/helm' },
 								{ label: 'Kubernetes Runtime', slug: 'hosted/ha/kubernetes' },
+								{ label: 'Metadata Host Hardening', slug: 'hosted/single-node/metadata-host-hardening' },
 								{ label: 'Runtime Brokers & Profiles', slug: 'hosted/ha/runtime-broker' },
 								{ label: 'Managed Agents', slug: 'hosted/single-node/managed-agents' },
 								{ label: 'Skill Registry & Federation', slug: 'hosted/single-node/skill-registry' },
@@ -206,6 +229,7 @@ export default defineConfig({
 								{ label: 'Proxy Auth (IAP)', slug: 'hosted/ha/auth-proxy-iap' },
 								{ label: 'Separate Conduit Relays', slug: 'hosted/ha/separate-relay' },
 								{ label: 'Lifecycle Hooks', slug: 'hosted/ha/lifecycle-hooks' },
+								{ label: 'Branding & White-Labeling', slug: 'hosted/single-node/branding' },
 								{ label: 'Observability', slug: 'hosted/single-node/observability' },
 								{ label: 'Metrics', slug: 'hosted/single-node/metrics' },
 								{ label: 'Hub Monitoring Dashboard', slug: 'hosted/single-node/hub-monitoring-dashboard' },

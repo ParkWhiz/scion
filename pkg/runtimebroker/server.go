@@ -599,6 +599,10 @@ type Server struct {
 	// policy, snapshotted when the server is built (flat_k8s_identity.go).
 	flatK8sIdentity flatKubernetesIdentityPolicy
 
+	// flatCloudRunIdentity is a flat instance's own Cloud Run GCP identity
+	// policy, snapshotted when the server is built (flat_cloudrun_identity.go).
+	flatCloudRunIdentity flatCloudRunIdentityPolicy
+
 	// flatPolicy is a flat instance's settings policy (its runtime_target
 	// defaults), snapshotted when the server is built and attached to
 	// every request it serves (flat_instance.go).
@@ -755,6 +759,7 @@ func New(cfg ServerConfig, mgr agent.Manager, rt scionrt.Runtime, rec config.Run
 	}
 	if fi := srv.flatInstance(); fi != nil {
 		srv.flatK8sIdentity = newFlatKubernetesIdentityPolicy(fi)
+		srv.flatCloudRunIdentity = newFlatCloudRunIdentityPolicy(fi)
 		srv.flatPolicy = config.NewFlatInstancePolicy(fi.Instance)
 	}
 	if fi := srv.flatInstance(); fi != nil {
@@ -1604,6 +1609,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		_ = s.Shutdown(context.Background())
 		return err
 	}
 	s.listening.mark()
@@ -1659,6 +1665,18 @@ func (s *Server) StartServices(ctx context.Context) error {
 	return s.startServices(ctx, false)
 }
 
+// warnIfVersionUnknown logs a warning when the broker binary carries no usable
+// build version ("", "unknown", or "dev"), because the hub will flag it with
+// broker_version_unknown rather than being able to verify version parity.
+func (s *Server) warnIfVersionUnknown() {
+	if s.version == "" || s.version == "unknown" || s.version == "dev" {
+		slog.Warn("Runtime Broker binary has no build version; the hub will report its version as unknown",
+			"version", s.version,
+			"hint", "rebuild with -buildvcs=true or -ldflags -X github.com/GoogleCloudPlatform/scion/pkg/version.Commit=<sha>",
+		)
+	}
+}
+
 // startServices is Start without serving; withListener also builds the
 // server's own http.Server.
 func (s *Server) startServices(ctx context.Context, withListener bool) error {
@@ -1704,6 +1722,7 @@ func (s *Server) startServices(ctx context.Context, withListener bool) error {
 		"host", s.config.Host,
 		"port", s.config.Port,
 	)
+	s.warnIfVersionUnknown()
 	if s.config.Debug {
 		slog.Debug("Broker details",
 			"brokerID", s.config.BrokerID,

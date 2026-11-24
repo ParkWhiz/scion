@@ -29,6 +29,7 @@ import (
 const (
 	ErrCodeIdentityNotMapped   = api.BrokerErrCodeIdentityNotMapped
 	ErrCodeIdentityKSAMismatch = api.BrokerErrCodeIdentityKSAMismatch
+	ErrCodeIdentityKSAConflict = api.BrokerErrCodeIdentityKSAConflict
 )
 
 // kubernetesIdentityMappingDocsURL links the docs section on mapping a GCP
@@ -67,7 +68,7 @@ func identityMappingDispatchError(err error) (identityMappingError, bool) {
 		return identityMappingError{}, false
 	}
 	code := se.brokerErrorCode()
-	if code != ErrCodeIdentityNotMapped && code != ErrCodeIdentityKSAMismatch {
+	if code != ErrCodeIdentityNotMapped && code != ErrCodeIdentityKSAMismatch && code != ErrCodeIdentityKSAConflict {
 		return identityMappingError{}, false
 	}
 	bd := se.brokerErrorDetails()
@@ -99,7 +100,8 @@ func identityMappingDispatchError(err error) (identityMappingError, bool) {
 	}
 
 	var msg string
-	if code == ErrCodeIdentityNotMapped {
+	switch code {
+	case ErrCodeIdentityNotMapped:
 		discovery := detail(api.BrokerErrDetailDiscovery)
 		namespace := detail(api.BrokerErrDetailNamespace)
 		discoveryText := identityDiscoveryText(discovery, namespace)
@@ -110,10 +112,52 @@ func identityMappingDispatchError(err error) (identityMappingError, bool) {
 			}
 			discoveryText += " "
 		}
-		msg = fmt.Sprintf("%s has no Kubernetes service account mapping on %s. %s"+
-			"A broker operator must add it to kubernetes_service_account_mappings in that broker's settings; see %s",
-			accountText, scope, discoveryText, kubernetesIdentityMappingDocsURL)
-	} else {
+		missingPerm := detail(api.BrokerErrDetailMissingPermission)
+		permText := identityMissingPermissionText(missingPerm, namespace)
+		if permText != "" {
+			details[api.BrokerErrDetailMissingPermission] = missingPerm
+			if namespace != "" {
+				details[api.BrokerErrDetailNamespace] = namespace
+			}
+			permText += " "
+		}
+		remedy := "A broker operator must add it to kubernetes_service_account_mappings in that broker's settings"
+		if permText != "" {
+			if discovery == "" {
+				remedy = "A broker operator must grant get and create on serviceaccounts in that namespace, or add an explicit entry to kubernetes_service_account_mappings in that broker's settings"
+			} else {
+				remedy = "A broker operator must grant get, list, and create on serviceaccounts in that namespace, or add an explicit entry to kubernetes_service_account_mappings in that broker's settings"
+			}
+		}
+		msg = fmt.Sprintf("%s has no Kubernetes service account mapping on %s. %s%s%s; see %s",
+			accountText, scope, discoveryText, permText, remedy, kubernetesIdentityMappingDocsURL)
+
+	case ErrCodeIdentityKSAConflict:
+		conflicting := detail(api.BrokerErrDetailConflictingKSA)
+		namespace := detail(api.BrokerErrDetailNamespace)
+		if conflicting != "" {
+			details[api.BrokerErrDetailConflictingKSA] = conflicting
+		}
+		where := "the agent's namespace"
+		if namespace != "" {
+			details[api.BrokerErrDetailNamespace] = namespace
+			where = fmt.Sprintf("namespace %q", namespace)
+		}
+		ksaText := "The conventional Kubernetes service account"
+		if conflicting != "" {
+			ksaText = fmt.Sprintf("Kubernetes service account %q", conflicting)
+		}
+		if profile == "" && runtimeEntry == "" {
+			msg = fmt.Sprintf("%s in %s already exists and cannot be reused for %s on %s; Scion never modifies an existing ServiceAccount. "+
+				"A broker operator must map %s to the intended ServiceAccount in kubernetes_service_account_mappings, or remove the conflicting ServiceAccount; see %s",
+				ksaText, where, accountText, scope, accountText, kubernetesIdentityMappingDocsURL)
+		} else {
+			msg = fmt.Sprintf("%s in %s already exists and is not annotated for %s on %s; Scion never modifies an existing ServiceAccount. "+
+				"A broker operator must annotate it with iam.gke.io/gcp-service-account, map %s to another ServiceAccount in kubernetes_service_account_mappings, or remove the conflicting ServiceAccount; see %s",
+				ksaText, where, accountText, scope, accountText, kubernetesIdentityMappingDocsURL)
+		}
+
+	default:
 		requested := detail(api.BrokerErrDetailRequestedKSA)
 		mapped := detail(api.BrokerErrDetailMappedKSA)
 		if requested != "" {
@@ -126,11 +170,17 @@ func identityMappingDispatchError(err error) (identityMappingError, bool) {
 		if requested != "" {
 			requestedText = fmt.Sprintf("The requested Kubernetes service account %q", requested)
 		}
-		discovered := detail(api.BrokerErrDetailKSASource) == api.BrokerKSASourceDiscovered
+		source := detail(api.BrokerErrDetailKSASource)
 		oneText, toText, remedy := "the one mapped", "to", "change kubernetes_service_account_mappings in that broker's settings"
-		if discovered {
+		switch source {
+		case api.BrokerKSASourceDiscovered:
 			details[api.BrokerErrDetailKSASource] = api.BrokerKSASourceDiscovered
 			oneText = "the one found by its iam.gke.io/gcp-service-account annotation"
+			toText = "for"
+			remedy = "add an entry to kubernetes_service_account_mappings in that broker's settings"
+		case api.BrokerKSASourceCreated:
+			details[api.BrokerErrDetailKSASource] = api.BrokerKSASourceCreated
+			oneText = "the conventional one that would be created"
 			toText = "for"
 			remedy = "add an entry to kubernetes_service_account_mappings in that broker's settings"
 		}
@@ -143,6 +193,19 @@ func identityMappingDispatchError(err error) (identityMappingError, bool) {
 			requestedText, mappedText, toText, accountText, scope, remedy, kubernetesIdentityMappingDocsURL)
 	}
 	return identityMappingError{Code: code, Message: msg, Details: details}, true
+}
+
+func identityMissingPermissionText(perm, namespace string) string {
+	where := "the agent's namespace"
+	if namespace != "" {
+		where = fmt.Sprintf("namespace %q", namespace)
+	}
+	switch perm {
+	case api.BrokerKSAPermissionCreate, api.BrokerKSAPermissionGet:
+		return fmt.Sprintf("Opt-in ServiceAccount creation could not proceed because the broker lacks %s permission in %s.", perm, where)
+	default:
+		return ""
+	}
 }
 
 // identityDiscoveryText is the fixed sentence the hub adds to an
@@ -190,11 +253,19 @@ func identityMappingScopeText(profile, runtimeEntry, broker string) string {
 // hub's message, instead of the generic 502 runtime_error, and reports
 // whether it did. For any other error it writes nothing and returns false.
 func relayIdentityMappingError(w http.ResponseWriter, err error) bool {
+	return relayIdentityMappingErrorWithDefaultTier(w, err, nil, "")
+}
+
+func relayIdentityMappingErrorWithDefaultTier(w http.ResponseWriter, err error, tier *defaultTier, mode string) bool {
 	ime, ok := identityMappingDispatchError(err)
 	if !ok {
 		return false
 	}
-	writeError(w, http.StatusBadRequest, ime.Code, ime.Message, ime.Details)
+	msg := ime.Message
+	if tier != nil {
+		msg += tier.brokerRejectionSuffix(mode)
+	}
+	writeError(w, http.StatusBadRequest, ime.Code, msg, ime.Details)
 	return true
 }
 
@@ -225,6 +296,10 @@ func identityMappingFailureText(err error) (string, bool) {
 // nothing is replaced and the result is err.Error(), which is body-free
 // because brokerStatusError.Error() is.
 func dispatchFailureText(err error) string {
+	return dispatchFailureTextWithDefaultTier(err, nil, "")
+}
+
+func dispatchFailureTextWithDefaultTier(err error, tier *defaultTier, mode string) string {
 	if err == nil {
 		return ""
 	}
@@ -235,6 +310,9 @@ func dispatchFailureText(err error) string {
 		return ""
 	}
 	if text, ok := identityMappingFailureText(err); ok {
+		if tier != nil {
+			text += tier.brokerRejectionSuffix(mode)
+		}
 		return text
 	}
 	if _, code, msg, ok := brokerProjectStorageRefusal(err); ok {
@@ -248,7 +326,11 @@ func dispatchFailureText(err error) string {
 	// A broker HTTP error answer: its code, filtered message and allowlisted
 	// current run, never its body. Text the hub wrapped around it is kept.
 	if se != nil {
-		return strings.Replace(err.Error(), se.Error(), brokerRecordText(se), 1)
+		out := strings.Replace(err.Error(), se.Error(), brokerRecordText(se), 1)
+		if tier != nil && se.StatusCode == http.StatusBadRequest && isBrokerGCPIdentityError(se.brokerErrorMessage()) {
+			out += tier.brokerRejectionSuffix(mode)
+		}
+		return out
 	}
 	return err.Error()
 }

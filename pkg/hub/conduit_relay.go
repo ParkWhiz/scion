@@ -273,6 +273,7 @@ func (s *Server) StartConduitRelay(ctx context.Context, opts ConduitRelayOptions
 			s.recordBrokerSessionsSuperseded(brokerID, brokerSupersededAtAdmission, closed)
 		},
 		OnBrokerIncarnationFlap: s.recordBrokerIncarnationFlap,
+		OnAgentSessionAdmitted:  s.onAgentConduitSessionAdmitted,
 		Logger:                  slog.Default().With("subsystem", "hub.conduit"),
 	})
 	if err != nil {
@@ -669,6 +670,9 @@ func (s *Server) decideConduitAgent(w http.ResponseWriter, r *http.Request, iden
 		return conduitAdmission{}, false
 	case err != nil:
 		writeErrorFromErr(w, errors.Unwrap(err), "") // the store error, as read
+		return conduitAdmission{}, false
+	}
+	if s.agentStandingForbidden(r.Context(), w, agent.ID) {
 		return conduitAdmission{}, false
 	}
 	if !isWebSocketUpgrade(r) {

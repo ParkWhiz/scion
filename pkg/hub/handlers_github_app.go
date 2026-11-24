@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,14 +45,53 @@ const (
 // GitHubAppConfigResponse is the API response for GitHub App configuration.
 // Sensitive fields (private key, webhook secret) are never returned.
 type GitHubAppConfigResponse struct {
-	AppID            int64                    `json:"app_id"`
-	APIBaseURL       string                   `json:"api_base_url,omitempty"`
-	WebhooksEnabled  bool                     `json:"webhooks_enabled"`
-	Configured       bool                     `json:"configured"`
-	HasPrivateKey    bool                     `json:"has_private_key"`
-	HasWebhookSecret bool                     `json:"has_webhook_secret"`
-	InstallationURL  string                   `json:"installation_url,omitempty"`
-	RateLimit        *githubapp.RateLimitInfo `json:"rate_limit,omitempty"`
+	AppID           int64  `json:"app_id"`
+	APIBaseURL      string `json:"api_base_url,omitempty"`
+	WebhooksEnabled bool   `json:"webhooks_enabled"`
+	Configured      bool   `json:"configured"`
+	HasPrivateKey   bool   `json:"has_private_key"`
+	// PrivateKeySource reports which private key source is active: "config", "file", or "secret".
+	PrivateKeySource string `json:"private_key_source,omitempty"`
+	// PrivateKeyOverridesSecret is true when a configured private key or private_key_path
+	// takes precedence over a stored GITHUB_APP_PRIVATE_KEY hub secret.
+	PrivateKeyOverridesSecret bool                     `json:"private_key_overrides_secret,omitempty"`
+	HasWebhookSecret          bool                     `json:"has_webhook_secret"`
+	InstallationURL           string                   `json:"installation_url,omitempty"`
+	RateLimit                 *githubapp.RateLimitInfo `json:"rate_limit,omitempty"`
+	Triggers                  *GitHubTriggersReadiness `json:"triggers,omitempty"`
+}
+
+const githubAppHealthCheckName = "github-app-health-check"
+
+// syncGitHubAppHealthCheckSchedule registers, reschedules, or unregisters the
+// periodic GitHub App health check on the scheduler to match the current
+// GitHubAppConfig (AppID and WebhooksEnabled). Safe to call at startup and on
+// live config updates without creating duplicate registrations.
+//
+// githubAppScheduleMu is held across the config read and scheduler mutation
+// (and acquired before s.mu) so concurrent updates cannot apply a stale state.
+func (s *Server) syncGitHubAppHealthCheckSchedule() {
+	s.githubAppScheduleMu.Lock()
+	defer s.githubAppScheduleMu.Unlock()
+
+	s.mu.RLock()
+	sched := s.scheduler
+	appConfigured := s.config.GitHubAppConfig.AppID != 0
+	webhooksEnabled := s.config.GitHubAppConfig.WebhooksEnabled
+	s.mu.RUnlock()
+
+	if sched == nil {
+		return
+	}
+	if !appConfigured {
+		sched.UnregisterRecurring(githubAppHealthCheckName)
+		return
+	}
+	interval := 360 // 6 hours in minutes when webhooks are disabled
+	if webhooksEnabled {
+		interval = 1440 // 24 hours when webhooks are enabled
+	}
+	sched.UpsertRecurringSingleton(githubAppHealthCheckName, interval, store.LockGitHubAppHealthCheck, s.githubAppHealthCheckHandler())
 }
 
 // GitHubAppConfigUpdateRequest is the API request to update GitHub App configuration.
@@ -65,39 +105,36 @@ type GitHubAppConfigUpdateRequest struct {
 }
 
 func (s *Server) handleGetGitHubApp(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	cfg, keyStatus := s.githubAppPrivateKeyStatus(ctx)
+	hasPrivateKey := keyStatus.hasPrivateKey
+	hasWebhookSecret := cfg.WebhookSecret != ""
+	if !hasWebhookSecret {
+		hasWebhookSecret = s.hasStoredGitHubAppSecret(ctx, GitHubAppSecretWebhookSecret)
+	}
+
+	var triggers *GitHubTriggersReadiness
+	if s.githubTriggersEnabled() {
+		readiness := s.computeGitHubTriggersReadiness(ctx, cfg, hasWebhookSecret)
+		triggers = &readiness
+	}
+
 	s.mu.RLock()
-	cfg := s.config.GitHubAppConfig
 	rateLimit := s.githubAppRateLimit
 	s.mu.RUnlock()
 
-	hasPrivateKey := cfg.PrivateKey != "" || cfg.PrivateKeyPath != ""
-	hasWebhookSecret := cfg.WebhookSecret != ""
-
-	// Also check secrets backend for stored credentials
-	if !hasPrivateKey || !hasWebhookSecret {
-		if s.secretBackend != nil {
-			if !hasPrivateKey {
-				if meta, err := s.secretBackend.GetMeta(r.Context(), GitHubAppSecretPrivateKey, store.ScopeHub, s.hubID); err == nil && meta != nil {
-					hasPrivateKey = true
-				}
-			}
-			if !hasWebhookSecret {
-				if meta, err := s.secretBackend.GetMeta(r.Context(), GitHubAppSecretWebhookSecret, store.ScopeHub, s.hubID); err == nil && meta != nil {
-					hasWebhookSecret = true
-				}
-			}
-		}
-	}
-
 	writeJSON(w, http.StatusOK, GitHubAppConfigResponse{
-		AppID:            cfg.AppID,
-		APIBaseURL:       cfg.APIBaseURL,
-		WebhooksEnabled:  cfg.WebhooksEnabled,
-		Configured:       cfg.AppID != 0 && hasPrivateKey,
-		HasPrivateKey:    hasPrivateKey,
-		HasWebhookSecret: hasWebhookSecret,
-		InstallationURL:  cfg.InstallationURL,
-		RateLimit:        rateLimit,
+		AppID:                     cfg.AppID,
+		APIBaseURL:                cfg.APIBaseURL,
+		WebhooksEnabled:           cfg.WebhooksEnabled,
+		Configured:                cfg.AppID != 0 && hasPrivateKey,
+		HasPrivateKey:             hasPrivateKey,
+		PrivateKeySource:          keyStatus.source,
+		PrivateKeyOverridesSecret: keyStatus.overridesSecret,
+		HasWebhookSecret:          hasWebhookSecret,
+		InstallationURL:           cfg.InstallationURL,
+		RateLimit:                 rateLimit,
+		Triggers:                  triggers,
 	})
 }
 
@@ -126,7 +163,21 @@ func (s *Server) handleUpdateGitHubApp(w http.ResponseWriter, r *http.Request) {
 		// Update in-memory config so it's immediately available
 		s.mu.Lock()
 		s.config.GitHubAppConfig.PrivateKey = *req.PrivateKey
+		s.githubAppPrivateKeyFromSecret = true
+		overrideSource := ""
+		if s.startupGitHubAppPrivateKey {
+			overrideSource = GitHubAppPrivateKeySourceConfig
+		} else if s.config.GitHubAppConfig.PrivateKeyPath != "" {
+			overrideSource = GitHubAppPrivateKeySourceFile
+		}
+		s.githubAppIdentity.reset()
 		s.mu.Unlock()
+		if overrideSource != "" {
+			slog.Warn("GitHub App private key saved to hub secrets, but a configured private key or private_key_path will take precedence after restart",
+				"override_source", overrideSource,
+				"secret_name", GitHubAppSecretPrivateKey,
+			)
+		}
 	}
 
 	if req.WebhookSecret != nil && *req.WebhookSecret != "" {
@@ -153,8 +204,15 @@ func (s *Server) handleUpdateGitHubApp(w http.ResponseWriter, r *http.Request) {
 	if req.InstallationURL != nil {
 		s.config.GitHubAppConfig.InstallationURL = *req.InstallationURL
 	}
+	if req.AppID != nil || req.APIBaseURL != nil {
+		s.githubAppIdentity.reset()
+	}
 	cfg := s.config.GitHubAppConfig
 	s.mu.Unlock()
+
+	if req.AppID != nil || req.WebhooksEnabled != nil {
+		s.syncGitHubAppHealthCheckSchedule()
+	}
 
 	// Persist the non-sensitive config. Whenever OperationalSettings is wired
 	// (every DB driver, SQLite included, since #1432) the durable home for
@@ -178,30 +236,25 @@ func (s *Server) handleUpdateGitHubApp(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("Failed to persist GitHub App config to settings.yaml (in-memory config updated successfully)", "error", err)
 	}
 
-	hasPrivateKey := cfg.PrivateKey != "" || cfg.PrivateKeyPath != ""
+	_, keyStatus := s.githubAppPrivateKeyStatus(ctx)
+	hasPrivateKey := keyStatus.hasPrivateKey
 	hasWebhookSecret := cfg.WebhookSecret != ""
-	// Check secrets backend too
-	if !hasPrivateKey && s.secretBackend != nil {
-		if meta, err := s.secretBackend.GetMeta(ctx, GitHubAppSecretPrivateKey, store.ScopeHub, s.hubID); err == nil && meta != nil {
-			hasPrivateKey = true
-		}
-	}
-	if !hasWebhookSecret && s.secretBackend != nil {
-		if meta, err := s.secretBackend.GetMeta(ctx, GitHubAppSecretWebhookSecret, store.ScopeHub, s.hubID); err == nil && meta != nil {
-			hasWebhookSecret = true
-		}
+	if !hasWebhookSecret {
+		hasWebhookSecret = s.hasStoredGitHubAppSecret(ctx, GitHubAppSecretWebhookSecret)
 	}
 
 	slog.Info("GitHub App configuration updated via admin API", "user", userID, "app_id", cfg.AppID)
 
 	writeJSON(w, http.StatusOK, GitHubAppConfigResponse{
-		AppID:            cfg.AppID,
-		APIBaseURL:       cfg.APIBaseURL,
-		WebhooksEnabled:  cfg.WebhooksEnabled,
-		Configured:       cfg.AppID != 0 && hasPrivateKey,
-		HasPrivateKey:    hasPrivateKey,
-		HasWebhookSecret: hasWebhookSecret,
-		InstallationURL:  cfg.InstallationURL,
+		AppID:                     cfg.AppID,
+		APIBaseURL:                cfg.APIBaseURL,
+		WebhooksEnabled:           cfg.WebhooksEnabled,
+		Configured:                cfg.AppID != 0 && hasPrivateKey,
+		HasPrivateKey:             hasPrivateKey,
+		PrivateKeySource:          keyStatus.source,
+		PrivateKeyOverridesSecret: keyStatus.overridesSecret,
+		HasWebhookSecret:          hasWebhookSecret,
+		InstallationURL:           cfg.InstallationURL,
 	})
 }
 
@@ -246,17 +299,28 @@ func (s *Server) persistGitHubAppConfigToDB(ctx context.Context, ops *Operationa
 	// who pre-staged the path in settings.yaml before creating the App would
 	// otherwise have it overwritten with "" by this first write. Fall back to
 	// the merged snapshot, which sees the path regardless of app_id.
+	snap := ops.Snapshot()
 	privateKeyPath := cfg.PrivateKeyPath
 	if privateKeyPath == "" {
-		privateKeyPath = ops.Snapshot().GitHubPrivateKeyPath
+		privateKeyPath = snap.GitHubPrivateKeyPath
+	}
+	appSlug := cfg.AppSlug
+	if appSlug == "" {
+		appSlug = snap.GitHubAppSlug
+	}
+	aliases := slices.Clone(cfg.CommandMentionAliases)
+	if len(aliases) == 0 {
+		aliases = slices.Clone(snap.GitHubCommandMentionAliases)
 	}
 
 	doc := &opsettings.GitHubAppSettings{
-		AppID:           cfg.AppID,
-		APIBaseURL:      cfg.APIBaseURL,
-		WebhooksEnabled: &webhooksEnabled,
-		InstallationURL: cfg.InstallationURL,
-		PrivateKeyPath:  privateKeyPath,
+		AppID:                 cfg.AppID,
+		APIBaseURL:            cfg.APIBaseURL,
+		WebhooksEnabled:       &webhooksEnabled,
+		InstallationURL:       cfg.InstallationURL,
+		PrivateKeyPath:        privateKeyPath,
+		AppSlug:               appSlug,
+		CommandMentionAliases: aliases,
 	}
 
 	docBytes, err := json.Marshal(doc)
@@ -318,6 +382,12 @@ func (s *Server) persistGitHubAppConfig(cfg GitHubAppServerConfig) error {
 	}
 	if cfg.InstallationURL != "" {
 		ghApp["installation_url"] = cfg.InstallationURL
+	}
+	if cfg.AppSlug != "" {
+		ghApp["app_slug"] = cfg.AppSlug
+	}
+	if len(cfg.CommandMentionAliases) > 0 {
+		ghApp["command_mention_aliases"] = slices.Clone(cfg.CommandMentionAliases)
 	}
 
 	if len(ghApp) > 0 {
@@ -774,21 +844,21 @@ func (s *Server) handleProjectGitHubPermissions(w http.ResponseWriter, r *http.R
 	switch r.Method {
 	case http.MethodGet:
 		perms := project.GitHubPermissions
-		if perms == nil {
-			// Return defaults
-			perms = &store.GitHubTokenPermissions{
-				Contents:     "write",
-				PullRequests: "write",
-				Metadata:     "read",
-				Issues:       "write",
+		if !hasUsableStoredGitHubPermissions(perms) {
+			// Return the same defaults token minting falls back to, capped at
+			// the App's granted permissions when App identity is available.
+			effective := githubapp.DefaultTokenPermissions()
+			if id, ok := s.GitHubAppIdentity(r.Context()); ok && id != nil {
+				effective = githubapp.IntersectTokenPermissions(effective, id.Permissions)
 			}
+			defaults := store.GitHubTokenPermissions(effective)
+			perms = &defaults
 		}
 		writeJSON(w, http.StatusOK, perms)
 
 	case http.MethodPut:
-		// Only the known fields, each "", "read" or "write". The mint
-		// never requests an empty set (githubTokenPermissionsForGrant), but
-		// an invalid body is refused here rather than stored.
+		// Only the known fields, each "", "read" or "write", with at least one
+		// non-empty permission. Use DELETE to reset to default permissions.
 		var perms store.GitHubTokenPermissions
 		if err := readJSONStrict(r, &perms); err != nil {
 			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid request body: only contents, pull_requests, issues, metadata, checks and actions are accepted", nil)
@@ -799,12 +869,18 @@ func (s *Server) handleProjectGitHubPermissions(w http.ResponseWriter, r *http.R
 				fmt.Sprintf("%s must be \"read\", \"write\" or empty", field), nil)
 			return
 		}
+		if perms == (store.GitHubTokenPermissions{}) {
+			writeError(w, http.StatusBadRequest, ErrCodeValidationError,
+				"at least one permission must be set; use DELETE to reset to default permissions", nil)
+			return
+		}
 
 		project.GitHubPermissions = &perms
 		if err := s.store.UpdateProject(r.Context(), project); err != nil {
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update project", nil)
 			return
 		}
+		s.githubTokenCache.invalidateProject(project.ID)
 
 		writeJSON(w, http.StatusOK, perms)
 
@@ -814,6 +890,7 @@ func (s *Server) handleProjectGitHubPermissions(w http.ResponseWriter, r *http.R
 			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to update project", nil)
 			return
 		}
+		s.githubTokenCache.invalidateProject(project.ID)
 
 		w.WriteHeader(http.StatusNoContent)
 
@@ -893,7 +970,8 @@ func (s *Server) handleGitHubAppSyncPermissions(w http.ResponseWriter, r *http.R
 
 	appPermissions, affectedProjects, err := s.syncAppPermissions(ctx)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, ErrCodeInternalError, err.Error(), nil)
+		slog.ErrorContext(ctx, "GitHub App permission sync failed", "error", upstreamText(err.Error()))
+		writeError(w, http.StatusBadGateway, ErrCodeInternalError, githubAppIdentityErrorMessage(err), nil)
 		return
 	}
 
@@ -909,54 +987,44 @@ func (s *Server) handleGitHubAppSyncPermissions(w http.ResponseWriter, r *http.R
 // permissions the app no longer has are set to degraded state.
 // Returns the app's current permissions and a list of affected projects.
 func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []map[string]interface{}, error) {
-	client, err := s.getGitHubAppClient()
+	identity, err := s.refreshGitHubAppIdentity(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("GitHub App not configured: %v", err)
+		return nil, nil, err
 	}
 
-	appInfo, err := client.GetApp(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to fetch app info from GitHub: %v", err)
-	}
-
-	// Extract permissions map from the app response
-	appPermissions := make(map[string]string)
-	if permsRaw, ok := appInfo["permissions"]; ok {
-		if permsMap, ok := permsRaw.(map[string]interface{}); ok {
-			for k, v := range permsMap {
-				if vs, ok := v.(string); ok {
-					appPermissions[k] = vs
-				}
-			}
-		}
-	}
+	appPermissions := identity.Permissions
 
 	slog.Info("Synced GitHub App permissions",
 		"permission_count", len(appPermissions),
 	)
 
-	// List all projects and check their requested permissions against the app's permissions
-	projects, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 10000})
-	if err != nil {
-		return appPermissions, nil, fmt.Errorf("failed to list projects: %v", err)
-	}
-
+	// Page through all projects and check their requested permissions against the app's permissions
 	var affectedProjects []map[string]interface{}
 	now := timeNow()
+	defaults := githubapp.DefaultTokenPermissions()
+	defaultsStore := store.GitHubTokenPermissions(defaults)
+	defaultIntersectionEmpty := githubapp.IntersectTokenPermissions(defaults, appPermissions) == (githubapp.TokenPermissions{})
 
-	for _, project := range projects.Items {
-		if project.GitHubInstallationID == nil || project.GitHubPermissions == nil {
-			continue
+	if err := s.forEachGitHubAppProject(ctx, func(project *store.Project) {
+		if project.GitHubInstallationID == nil {
+			return
 		}
 
-		// Compare each project's requested permissions against the app's permissions
-		missingPerms := comparePermissions(project.GitHubPermissions, appPermissions)
+		var missingPerms []string
+		if hasUsableStoredGitHubPermissions(project.GitHubPermissions) {
+			missingPerms = comparePermissions(project.GitHubPermissions, appPermissions)
+		} else if defaultIntersectionEmpty {
+			// No stored permissions: minting intersects defaults with the App's
+			// grant, so a non-empty intersection is healthy. Only mark degraded
+			// when the App grants none of the defaults and minting fails closed.
+			missingPerms = comparePermissions(&defaultsStore, appPermissions)
+		}
 		if len(missingPerms) == 0 {
-			continue
+			return
 		}
 
 		// Project requests permissions the app doesn't have — mark as degraded
-		msg := fmt.Sprintf("App is missing permissions requested by this project: %s. Update the GitHub App's permissions in the app settings.", strings.Join(missingPerms, ", "))
+		msg := formatMissingPermissionsMessage(missingPerms)
 
 		project.GitHubAppStatus = &store.GitHubAppProjectStatus{
 			State:        store.GitHubAppStateDegraded,
@@ -966,10 +1034,10 @@ func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []m
 			LastError:    &now,
 		}
 
-		if err := s.store.UpdateProject(ctx, &project); err != nil {
-			slog.Error("Failed to update project after permission sync",
+		if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
+			slog.ErrorContext(ctx, "Failed to update project after permission sync",
 				"project_id", project.ID, "error", err)
-			continue
+			return
 		}
 
 		affectedProjects = append(affectedProjects, map[string]interface{}{
@@ -982,16 +1050,27 @@ func (s *Server) syncAppPermissions(ctx context.Context) (map[string]string, []m
 			"project_id", project.ID, "project_name", project.Name,
 			"missing_permissions", missingPerms,
 		)
+	}); err != nil {
+		return appPermissions, nil, fmt.Errorf("failed to list projects: %w", err)
 	}
 
 	return appPermissions, affectedProjects, nil
 }
 
+// formatMissingPermissionsMessage builds a fixed-format, user-safe degraded
+// status message from validated permission labels returned by comparePermissions.
+func formatMissingPermissionsMessage(missingPerms []string) string {
+	return fmt.Sprintf("App is missing permissions requested by this project: %s. Update the GitHub App's permissions in the app settings.", strings.Join(missingPerms, ", "))
+}
+
 // comparePermissions checks each non-empty permission in the project's requested
 // permissions against the app's available permissions. Returns a list of
 // permission names that the project requests but the app does not have (or has
-// at a lower level).
+// at a lower level). Never includes raw/unknown upstream level strings.
 func comparePermissions(projectPerms *store.GitHubTokenPermissions, appPerms map[string]string) []string {
+	if projectPerms == nil {
+		return nil
+	}
 	var missing []string
 
 	checks := []struct {
@@ -1012,16 +1091,12 @@ func comparePermissions(projectPerms *store.GitHubTokenPermissions, appPerms map
 		}
 
 		appLevel, ok := appPerms[check.name]
-		if !ok {
-			// App doesn't have this permission at all
-			missing = append(missing, fmt.Sprintf("%s:%s", check.name, check.level))
-			continue
-		}
-
-		// Check if the app's level is sufficient
-		// "write" satisfies "read", but "read" does not satisfy "write"
-		if check.level == "write" && appLevel == "read" {
-			missing = append(missing, fmt.Sprintf("%s:%s (app has %s)", check.name, check.level, appLevel))
+		if !ok || !githubPermissionSatisfies(appLevel, check.level) {
+			if check.level == "write" && appLevel == "read" {
+				missing = append(missing, fmt.Sprintf("%s:%s (app has read)", check.name, check.level))
+			} else {
+				missing = append(missing, fmt.Sprintf("%s:%s", check.name, check.level))
+			}
 		}
 	}
 

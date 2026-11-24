@@ -32,6 +32,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
@@ -107,6 +108,8 @@ type Layer1Snapshot struct {
 	// Lifecycle
 	AutoSuspendStalled  bool
 	StalledThreshold    string // DB-backed snapshots only (see type comment)
+	AutoSuspendIdle     bool
+	IdleSuspendAfter    string // DB-backed snapshots only (see type comment)
 	SoftDeleteRetention string // DB-backed snapshots only (see type comment); "" = startup value
 	// SoftDeleteRetainFiles is nil when unset; ApplySnapshot then uses the
 	// startup value. DB-backed snapshots only (see type comment).
@@ -151,8 +154,16 @@ type Layer1Snapshot struct {
 	HubMetricsEnabled *bool
 	HubTracingEnabled *bool
 
+	// Branding (branding section: server.hub.branding); nil when unset.
+	Branding         *config.BrandingConfig
+	BrandingInDB     bool
+	BrandingFromFile bool
+
 	// Agent secrets
 	AgentSecretsUserScopeOnly *bool
+
+	// Broker policy (ptone/scion#7829)
+	BrokerPolicyAdminManagedOnly *bool
 
 	// Project defaults
 	DefaultScratchpad *bool
@@ -203,11 +214,13 @@ type Layer1Snapshot struct {
 	ContentURLAllowSameSite bool
 
 	// GitHub App (non-secret fields only)
-	GitHubAppID           int64
-	GitHubAPIBaseURL      string
-	GitHubWebhooksEnabled bool
-	GitHubInstallationURL string
-	GitHubPrivateKeyPath  string
+	GitHubAppID                 int64
+	GitHubAPIBaseURL            string
+	GitHubWebhooksEnabled       bool
+	GitHubInstallationURL       string
+	GitHubPrivateKeyPath        string
+	GitHubAppSlug               string
+	GitHubCommandMentionAliases []string
 
 	// Notifications
 	NotificationChannels []config.V1NotificationChannelConfig
@@ -729,6 +742,7 @@ func (o *OperationalSettings) Snapshot() Layer1Snapshot {
 	}
 
 	snap := buildSnapshotFromKoanf(merged)
+	_, snap.BrandingInDB = dbSections[opsettings.BrandingSectionName]
 	snap.FromOperationalSettings = true
 	snap.Revision = revision
 	snap.Seq = seq
@@ -1294,6 +1308,8 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 	// Lifecycle
 	snap.AutoSuspendStalled = k.Bool("server.hub.auto_suspend_stalled")
 	snap.StalledThreshold = k.String("server.hub.stalled_threshold")
+	snap.AutoSuspendIdle = k.Bool("server.hub.auto_suspend_idle")
+	snap.IdleSuspendAfter = k.String("server.hub.idle_suspend_after")
 	snap.SoftDeleteRetention = k.String("server.hub.soft_delete_retention")
 	if k.Exists("server.hub.soft_delete_retain_files") {
 		v := k.Bool("server.hub.soft_delete_retain_files")
@@ -1336,10 +1352,32 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 		snap.HubTracingEnabled = &v
 	}
 
+	// Branding
+	brandSub := k.Cut(config.BrandingSectionKey)
+	if brandSub != nil && len(brandSub.Keys()) > 0 {
+		data, err := json.Marshal(brandSub.Raw())
+		if err != nil {
+			slog.Error("operational settings: cannot encode branding settings", "error", err)
+		} else {
+			var bc config.BrandingConfig
+			if err := json.Unmarshal(data, &bc); err != nil {
+				slog.Error("operational settings: cannot decode branding settings; branding left unset", "error", err)
+			} else if !bc.IsZero() {
+				snap.Branding = &bc
+			}
+		}
+	}
+
 	// Agent secrets
 	if k.Exists("agent_secrets.user_scope_only") {
 		v := k.Bool("agent_secrets.user_scope_only")
 		snap.AgentSecretsUserScopeOnly = &v
+	}
+
+	// Broker policy
+	if k.Exists("broker_policy.admin_managed_only") {
+		v := k.Bool("broker_policy.admin_managed_only")
+		snap.BrokerPolicyAdminManagedOnly = &v
 	}
 
 	// Project defaults
@@ -1404,6 +1442,8 @@ func buildSnapshotFromKoanf(k *koanf.Koanf) Layer1Snapshot {
 	snap.GitHubWebhooksEnabled = k.Bool("server.github_app.webhooks_enabled")
 	snap.GitHubInstallationURL = k.String("server.github_app.installation_url")
 	snap.GitHubPrivateKeyPath = k.String("server.github_app.private_key_path")
+	snap.GitHubAppSlug = k.String("server.github_app.app_slug")
+	snap.GitHubCommandMentionAliases = k.Strings("server.github_app.command_mention_aliases")
 
 	// Notifications
 	if k.Exists("server.notification_channels") {
@@ -1486,6 +1526,7 @@ func BuildLayer1SnapshotFromFile(gc *config.GlobalConfig) Layer1Snapshot {
 		DefaultUserRole:    gc.Auth.DefaultUserRole,
 		AuthorizedDomains:  gc.Auth.AuthorizedDomains,
 		AutoSuspendStalled: gc.Hub.AutoSuspendStalled,
+		AutoSuspendIdle:    gc.Hub.AutoSuspendIdle,
 		TelemetryEnabled:   gc.TelemetryEnabled,
 		AdminMode:          gc.AdminMode,
 		MaintenanceMessage: gc.MaintenanceMessage,
@@ -1523,6 +1564,8 @@ func BuildLayer1SnapshotFromFile(gc *config.GlobalConfig) Layer1Snapshot {
 	snap.GitHubWebhooksEnabled = gc.GitHubApp.WebhooksEnabled
 	snap.GitHubInstallationURL = gc.GitHubApp.InstallationURL
 	snap.GitHubPrivateKeyPath = gc.GitHubApp.PrivateKeyPath
+	snap.GitHubAppSlug = gc.GitHubApp.AppSlug
+	snap.GitHubCommandMentionAliases = slices.Clone(gc.GitHubApp.CommandMentionAliases)
 
 	// Project defaults — read from settings.yaml project_defaults section
 	snap.DefaultScratchpad = gc.DefaultScratchpad
@@ -1536,9 +1579,17 @@ func BuildLayer1SnapshotFromFile(gc *config.GlobalConfig) Layer1Snapshot {
 	// section, so a file-mode admin save takes effect without a restart.
 	snap.AgentSecretsUserScopeOnly = gc.AgentSecretsUserScopeOnly
 
+	// Broker policy — read from settings.yaml top-level broker_policy
+	// section, so a file-mode admin save takes effect without a restart.
+	snap.BrokerPolicyAdminManagedOnly = gc.BrokerPolicyAdminManagedOnly
+
 	// Hub observability export switches — read at startup only.
 	snap.HubMetricsEnabled = gc.Hub.Observability.MetricsEnabled
 	snap.HubTracingEnabled = gc.Hub.Observability.TracingEnabled
+
+	// Branding — applied live in file mode too.
+	snap.Branding = gc.Hub.Branding.Clone()
+	snap.BrandingFromFile = true
 
 	// Agent defaults — read from settings.yaml top-level keys
 	snap.DefaultHarnessConfig = gc.DefaultHarnessConfig
@@ -1725,6 +1776,8 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		applied = append(applied, "telemetry_config")
 	}
 	s.config.TelemetryConfig = telemetryConfig
+	nextMetricsProject := s.effectiveMetricsProjectLocked(telemetryConfig)
+	s.config.TelemetryProjectID = nextMetricsProject
 
 	// Auto-expose ports. In a DB-backed snapshot an unset value (cleared,
 	// or the section removed) returns to the startup value
@@ -1775,6 +1828,14 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		applied = append(applied, "agent_secrets_user_scope_only")
 	}
 
+	// Broker policy. Like agent_secrets above, nil is a meaningful value
+	// (default false/permissive), so assign unconditionally.
+	oldBrokerPolicyAdminManagedOnly := s.config.BrokerPolicyAdminManagedOnly
+	s.config.BrokerPolicyAdminManagedOnly = snap.BrokerPolicyAdminManagedOnly
+	if !boolPtrEqual(oldBrokerPolicyAdminManagedOnly, snap.BrokerPolicyAdminManagedOnly) {
+		applied = append(applied, "broker_policy_admin_managed_only")
+	}
+
 	// Admin emails — sanitize (TrimSpace + ToLower, drop empties) to match
 	// the normalization the user store applies (D11-fix).
 	if len(snap.AdminEmails) > 0 {
@@ -1804,6 +1865,31 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 			s.config.StalledThreshold = d
 		} else {
 			slog.Warn("invalid stalled_threshold duration, keeping current value", "value", snap.StalledThreshold, "error", err)
+		}
+	}
+
+	// Auto-suspend idle
+	oldAutoSuspendIdle := s.config.AutoSuspendIdle
+	s.config.AutoSuspendIdle = snap.AutoSuspendIdle
+	if oldAutoSuspendIdle != snap.AutoSuspendIdle {
+		applied = append(applied, "auto_suspend_idle")
+	}
+
+	// Idle suspend after
+	if snap.IdleSuspendAfter != "" {
+		if d, err := time.ParseDuration(snap.IdleSuspendAfter); err == nil {
+			if d < MinIdleSuspendAfter {
+				defaultAfter := DefaultServerConfig().IdleSuspendAfter
+				slog.Warn("idle_suspend_after below minimum 5m, using default",
+					"configured", snap.IdleSuspendAfter, "default", defaultAfter)
+				d = defaultAfter
+			}
+			if s.config.IdleSuspendAfter != d {
+				applied = append(applied, "idle_suspend_after")
+			}
+			s.config.IdleSuspendAfter = d
+		} else {
+			slog.Warn("invalid idle_suspend_after duration, keeping current value", "value", snap.IdleSuspendAfter, "error", err)
 		}
 	}
 
@@ -1849,14 +1935,13 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		applied = append(applied, "user_access_mode")
 	}
 
-	// Default user role. Writes are validated (schema enum in DB mode,
-	// explicit check in the file-mode PUT), but a hand-edited settings.yaml
-	// or DB row can still hold garbage. Normalize anything other than
-	// member/viewer to member so the live config never grants an
-	// unexpected role at user creation (design D6). The rule itself lives in
-	// normalizedDefaultRole; "" stays unset here (clear semantics).
+	// Default user role. When hub.custom_default_user_role is enabled,
+	// preserve custom role names verbatim so runtime resolution can look up
+	// the role definition (and fall back with a warning if missing/ineligible).
+	// When the experiment is off, normalize anything other than member/viewer
+	// to member (design D6). "" stays unset here (clear semantics).
 	defaultRole := snap.DefaultUserRole
-	if defaultRole != "" {
+	if defaultRole != "" && !s.experimentEnabled(experiments.CustomDefaultUserRole) {
 		if n := normalizedDefaultRole(defaultRole); n != defaultRole {
 			slog.Warn("invalid default_user_role, using member",
 				"configured", defaultRole, "allowed", []string{store.UserRoleMember, store.UserRoleViewer})
@@ -1890,8 +1975,18 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		if snap.GitHubPrivateKeyPath != "" {
 			gh.PrivateKeyPath = snap.GitHubPrivateKeyPath
 		}
+		gh.AppSlug = snap.GitHubAppSlug
+		gh.CommandMentionAliases = slices.Clone(snap.GitHubCommandMentionAliases)
+	} else {
+		if snap.GitHubAppSlug != "" {
+			gh.AppSlug = snap.GitHubAppSlug
+		}
+		if len(snap.GitHubCommandMentionAliases) > 0 {
+			gh.CommandMentionAliases = slices.Clone(snap.GitHubCommandMentionAliases)
+		}
 	}
-	if s.setGitHubAppPublicLocked(gh) {
+	githubAppChanged := s.setGitHubAppPublicLocked(gh)
+	if githubAppChanged {
 		applied = append(applied, "github_app")
 	}
 
@@ -2019,7 +2114,29 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 	}
 	s.config.AgentDefaults = newDefaults
 
+	// Branding (server.hub.branding)
+	brandingCfg := s.config.Branding.Clone()
+	switch {
+	case snap.Branding != nil:
+		brandingCfg = snap.Branding.Clone()
+	case snap.FromOperationalSettings:
+		if snap.BrandingInDB {
+			brandingCfg = nil
+		} else {
+			brandingCfg = s.startupLayer1.Branding.Clone()
+		}
+	case snap.BrandingFromFile:
+		brandingCfg = nil
+	}
+	if s.applyBrandingLocked(brandingCfg) {
+		applied = append(applied, opsettings.BrandingSectionName)
+	}
+
 	s.mu.Unlock()
+
+	if githubAppChanged {
+		s.syncGitHubAppHealthCheckSchedule()
+	}
 
 	if iamChanged {
 		s.invalidateCallerPermissionCaches()
@@ -2031,6 +2148,13 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 	// (ptone/scion#3904).
 	if snap.FromOperationalSettings && s.applyNotificationChannels(snap.NotificationChannels) {
 		applied = append(applied, "notification_channels")
+	}
+
+	// Metrics dashboard: retarget or rebuild outside s.mu (creating a
+	// Cloud Monitoring client may perform credential discovery / I/O).
+	// Serialized by s.settingsApply.mu.
+	if s.applyMetricsDashboardProject(nextMetricsProject) {
+		applied = append(applied, "metrics_dashboard")
 	}
 
 	// Propagate hub_name to the GCP secret backend so new secrets get the
@@ -2171,8 +2295,9 @@ func ApplySnapshot(s *Server, snap Layer1Snapshot) map[string]interface{} {
 		"secrets.backend",
 	}
 
-	// hub.lifecycle_events is read on every apply (WP1).
+	// hub.lifecycle_events and hub.triggers are read on every apply.
 	s.reconcileLifecycleEvents(context.Background())
+	s.reconcileTriggerDrainer(context.Background())
 
 	return map[string]interface{}{
 		"applied":          applied,

@@ -31,10 +31,12 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
 	scionrt "github.com/GoogleCloudPlatform/scion/pkg/runtime"
+	"github.com/google/uuid"
 )
 
 // heartbeatAgentKey returns a key that uniquely identifies an agent within the
@@ -139,6 +141,12 @@ type HeartbeatService struct {
 	sentSAMappingsKey string
 	sentSAMappingsAt  time.Time
 	hubReadsSAHashes  bool
+
+	// workloadIdentityTargets, when set, returns the broker's Kubernetes
+	// runtime targets that have a Workload Identity pool or opt-in KSA
+	// creation, or nil when they cannot be read (ptone/scion#3329 phase 5).
+	// Sent on every legacy and flat heartbeat with Capabilities.WITargetsV1.
+	workloadIdentityTargets func() []hubclient.WorkloadIdentityTarget
 
 	// defaultProfile, when set, returns the broker's default (active)
 	// profile name, reported on every heartbeat. A nil func, or a nil
@@ -317,8 +325,20 @@ func (s *HeartbeatService) Stop() {
 // IsRunning returns true if the heartbeat service is currently running.
 func (s *HeartbeatService) IsRunning() bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stopCh != nil
+	stopCh := s.stopCh
+	doneCh := s.doneCh
+	s.mu.Unlock()
+	if stopCh == nil {
+		return false
+	}
+	if doneCh != nil {
+		select {
+		case <-doneCh:
+			return false
+		default:
+		}
+	}
+	return true
 }
 
 // run is the main heartbeat loop.
@@ -342,6 +362,11 @@ func (s *HeartbeatService) run(ctx context.Context) {
 
 	// Send initial heartbeat immediately
 	if err := s.sendHeartbeat(ctx); err != nil {
+		if apiclient.IsBrokerDeregisteredError(err) {
+			s.log.Error("Broker is deregistered on the Hub; stopping heartbeats. Re-register the broker to reconnect.",
+				"broker_id", s.brokerID, "error", err)
+			return
+		}
 		s.log.Error("Initial heartbeat failed", "error", err)
 	} else {
 		s.log.Info("Initial heartbeat sent to Hub")
@@ -354,6 +379,11 @@ func (s *HeartbeatService) run(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			if err := s.sendHeartbeat(ctx); err != nil {
+				if apiclient.IsBrokerDeregisteredError(err) {
+					s.log.Error("Broker is deregistered on the Hub; stopping heartbeats. Re-register the broker to reconnect.",
+						"broker_id", s.brokerID, "error", err)
+					return
+				}
 				s.log.Error("Failed to send heartbeat", "error", err)
 			}
 		case <-stopCh:
@@ -496,6 +526,13 @@ func (s *HeartbeatService) buildHeartbeat(ctx context.Context) *hubclient.Broker
 	}
 	if !s.flat && s.conversionPlan != nil {
 		heartbeat.ConversionPlanPresentation = s.conversionPlan()
+	}
+	if s.workloadIdentityTargets != nil {
+		// A nil list (settings unreadable) is sent as null and keeps the
+		// hub's stored targets; the capability tells the hub that an empty
+		// list means "no pool configured".
+		heartbeat.WorkloadIdentityTargets = s.workloadIdentityTargets()
+		heartbeat.Capabilities.WITargetsV1 = true
 	}
 
 	// Starts in flight are read BEFORE the agents are listed: a start that
@@ -858,6 +895,7 @@ func (s *HeartbeatService) gatherProjectAgents(ctx context.Context, startsBefore
 			ExitReason:      ag.ExitReason,
 			RuntimeTarget:   agentTargets[heartbeatAgentKey(ag)],
 			RunID:           ag.RunID,
+			AgentID:         heartbeatAgentID(ag),
 			// The resolved agent config, for a create the Hub kept after
 			// an unknown dispatch outcome (ptone/scion#4987).
 			Template:            ag.Template,
@@ -891,6 +929,21 @@ func (s *HeartbeatService) gatherProjectAgents(ctx context.Context, startsBefore
 	}
 
 	return projects, inventory
+}
+
+// heartbeatAgentID returns the Hub agent ID of a listed entry: the ID the
+// runtime reports, else its agent_id label, else "", in canonical UUID form. A value that is not a
+// UUID (a legacy container labels its name) is not an ID and gives "".
+func heartbeatAgentID(ag api.AgentInfo) string {
+	id := ag.ID
+	if id == "" {
+		id = ag.Labels[api.LabelAgentID]
+	}
+	u, err := uuid.Parse(id)
+	if err != nil {
+		return ""
+	}
+	return u.String() // canonical form
 }
 
 // dropVanishedPodReportsForStarts removes the entries a Kubernetes runtime

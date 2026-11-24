@@ -19,6 +19,8 @@ const (
 	FieldProjectID = "project_id"
 	// FieldConversationID holds the string denoting the conversation_id field in the database.
 	FieldConversationID = "conversation_id"
+	// FieldChatKey holds the string denoting the chat_key field in the database.
+	FieldChatKey = "chat_key"
 	// FieldMessageID holds the string denoting the message_id field in the database.
 	FieldMessageID = "message_id"
 	// FieldPosition holds the string denoting the position field in the database.
@@ -41,10 +43,20 @@ const (
 	FieldChoices = "choices"
 	// FieldDefaultChoiceID holds the string denoting the default_choice_id field in the database.
 	FieldDefaultChoiceID = "default_choice_id"
+	// FieldAllowOther holds the string denoting the allow_other field in the database.
+	FieldAllowOther = "allow_other"
+	// FieldOtherLabel holds the string denoting the other_label field in the database.
+	FieldOtherLabel = "other_label"
+	// FieldOtherDescription holds the string denoting the other_description field in the database.
+	FieldOtherDescription = "other_description"
+	// FieldOtherPlaceholder holds the string denoting the other_placeholder field in the database.
+	FieldOtherPlaceholder = "other_placeholder"
 	// FieldIntroLength holds the string denoting the intro_length field in the database.
 	FieldIntroLength = "intro_length"
 	// FieldStatus holds the string denoting the status field in the database.
 	FieldStatus = "status"
+	// FieldSettled holds the string denoting the settled field in the database.
+	FieldSettled = "settled"
 	// FieldReplacedByID holds the string denoting the replaced_by_id field in the database.
 	FieldReplacedByID = "replaced_by_id"
 	// FieldCreatedAt holds the string denoting the created_at field in the database.
@@ -53,6 +65,12 @@ const (
 	FieldDecidedAt = "decided_at"
 	// FieldReplacedAt holds the string denoting the replaced_at field in the database.
 	FieldReplacedAt = "replaced_at"
+	// FieldWithdrawnAt holds the string denoting the withdrawn_at field in the database.
+	FieldWithdrawnAt = "withdrawn_at"
+	// FieldWithdrawnReason holds the string denoting the withdrawn_reason field in the database.
+	FieldWithdrawnReason = "withdrawn_reason"
+	// FieldDismissedAt holds the string denoting the dismissed_at field in the database.
+	FieldDismissedAt = "dismissed_at"
 	// Table holds the table name of the decision in the database.
 	Table = "decisions"
 )
@@ -62,6 +80,7 @@ var Columns = []string{
 	FieldID,
 	FieldProjectID,
 	FieldConversationID,
+	FieldChatKey,
 	FieldMessageID,
 	FieldPosition,
 	FieldAskerAgentID,
@@ -73,12 +92,20 @@ var Columns = []string{
 	FieldQuestion,
 	FieldChoices,
 	FieldDefaultChoiceID,
+	FieldAllowOther,
+	FieldOtherLabel,
+	FieldOtherDescription,
+	FieldOtherPlaceholder,
 	FieldIntroLength,
 	FieldStatus,
+	FieldSettled,
 	FieldReplacedByID,
 	FieldCreatedAt,
 	FieldDecidedAt,
 	FieldReplacedAt,
+	FieldWithdrawnAt,
+	FieldWithdrawnReason,
+	FieldDismissedAt,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -92,6 +119,8 @@ func ValidColumn(column string) bool {
 }
 
 var (
+	// ChatKeyValidator is a validator for the "chat_key" field. It is called by the builders before save.
+	ChatKeyValidator func(string) error
 	// PositionValidator is a validator for the "position" field. It is called by the builders before save.
 	PositionValidator func(int) error
 	// KeyValidator is a validator for the "key" field. It is called by the builders before save.
@@ -100,10 +129,20 @@ var (
 	KeyNormValidator func(string) error
 	// VersionValidator is a validator for the "version" field. It is called by the builders before save.
 	VersionValidator func(int) error
+	// DefaultAllowOther holds the default value on creation for the "allow_other" field.
+	DefaultAllowOther bool
+	// OtherLabelValidator is a validator for the "other_label" field. It is called by the builders before save.
+	OtherLabelValidator func(string) error
+	// OtherDescriptionValidator is a validator for the "other_description" field. It is called by the builders before save.
+	OtherDescriptionValidator func(string) error
+	// OtherPlaceholderValidator is a validator for the "other_placeholder" field. It is called by the builders before save.
+	OtherPlaceholderValidator func(string) error
 	// DefaultIntroLength holds the default value on creation for the "intro_length" field.
 	DefaultIntroLength int
 	// IntroLengthValidator is a validator for the "intro_length" field. It is called by the builders before save.
 	IntroLengthValidator func(int) error
+	// DefaultSettled holds the default value on creation for the "settled" field.
+	DefaultSettled bool
 	// DefaultCreatedAt holds the default value on creation for the "created_at" field.
 	DefaultCreatedAt func() time.Time
 	// DefaultID holds the default value on creation for the "id" field.
@@ -141,9 +180,11 @@ const DefaultStatus = StatusPending
 
 // Status values.
 const (
-	StatusPending  Status = "pending"
-	StatusDecided  Status = "decided"
-	StatusReplaced Status = "replaced"
+	StatusPending   Status = "pending"
+	StatusDecided   Status = "decided"
+	StatusReplaced  Status = "replaced"
+	StatusWithdrawn Status = "withdrawn"
+	StatusDismissed Status = "dismissed"
 )
 
 func (s Status) String() string {
@@ -153,7 +194,7 @@ func (s Status) String() string {
 // StatusValidator is a validator for the "status" field enum values. It is called by the builders before save.
 func StatusValidator(s Status) error {
 	switch s {
-	case StatusPending, StatusDecided, StatusReplaced:
+	case StatusPending, StatusDecided, StatusReplaced, StatusWithdrawn, StatusDismissed:
 		return nil
 	default:
 		return fmt.Errorf("decision: invalid enum value for status field: %q", s)
@@ -176,6 +217,11 @@ func ByProjectID(opts ...sql.OrderTermOption) OrderOption {
 // ByConversationID orders the results by the conversation_id field.
 func ByConversationID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldConversationID, opts...).ToFunc()
+}
+
+// ByChatKey orders the results by the chat_key field.
+func ByChatKey(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldChatKey, opts...).ToFunc()
 }
 
 // ByMessageID orders the results by the message_id field.
@@ -228,6 +274,26 @@ func ByDefaultChoiceID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldDefaultChoiceID, opts...).ToFunc()
 }
 
+// ByAllowOther orders the results by the allow_other field.
+func ByAllowOther(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldAllowOther, opts...).ToFunc()
+}
+
+// ByOtherLabel orders the results by the other_label field.
+func ByOtherLabel(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldOtherLabel, opts...).ToFunc()
+}
+
+// ByOtherDescription orders the results by the other_description field.
+func ByOtherDescription(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldOtherDescription, opts...).ToFunc()
+}
+
+// ByOtherPlaceholder orders the results by the other_placeholder field.
+func ByOtherPlaceholder(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldOtherPlaceholder, opts...).ToFunc()
+}
+
 // ByIntroLength orders the results by the intro_length field.
 func ByIntroLength(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldIntroLength, opts...).ToFunc()
@@ -236,6 +302,11 @@ func ByIntroLength(opts ...sql.OrderTermOption) OrderOption {
 // ByStatus orders the results by the status field.
 func ByStatus(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldStatus, opts...).ToFunc()
+}
+
+// BySettled orders the results by the settled field.
+func BySettled(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldSettled, opts...).ToFunc()
 }
 
 // ByReplacedByID orders the results by the replaced_by_id field.
@@ -256,4 +327,19 @@ func ByDecidedAt(opts ...sql.OrderTermOption) OrderOption {
 // ByReplacedAt orders the results by the replaced_at field.
 func ByReplacedAt(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldReplacedAt, opts...).ToFunc()
+}
+
+// ByWithdrawnAt orders the results by the withdrawn_at field.
+func ByWithdrawnAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldWithdrawnAt, opts...).ToFunc()
+}
+
+// ByWithdrawnReason orders the results by the withdrawn_reason field.
+func ByWithdrawnReason(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldWithdrawnReason, opts...).ToFunc()
+}
+
+// ByDismissedAt orders the results by the dismissed_at field.
+func ByDismissedAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldDismissedAt, opts...).ToFunc()
 }

@@ -85,11 +85,11 @@ func grantContainmentMessageRole(ms *containmentMockStore, userID, projectID str
 // the send to agent, in the order messageEventHandler applies them.
 func authorizeScheduledMessageFireFor(srv *Server, evt store.ScheduledEvent, agent *store.Agent) error {
 	ctx := context.Background()
-	auth, identity, err := srv.resolveScheduledAuthority(ctx, evt)
+	auth, identity, err := resolveScheduledAuthorityForTest(ctx, srv, evt)
 	if err != nil {
 		return err
 	}
-	return srv.authorizeScheduledMessageFire(ctx, evt, auth, identity, agent)
+	return srv.authorizeMessageFire(ctx, evt.ProjectID, auth, identity, agent)
 }
 
 // mockDispatchesTo returns the recorded dispatches to slug.
@@ -222,7 +222,10 @@ func (d *containmentDispatchSpy) DispatchAgentExec(_ context.Context, _ *store.A
 func (d *containmentDispatchSpy) DispatchCheckAgentPrompt(_ context.Context, _ *store.Agent) (bool, error) {
 	return false, nil
 }
-func (d *containmentDispatchSpy) DispatchAgentCreateWithGather(_ context.Context, _ *store.Agent) (*CreateDispatchResult, error) {
+func (d *containmentDispatchSpy) DispatchAgentCreateWithGather(_ context.Context, agent *store.Agent) (*CreateDispatchResult, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = append(d.calls, containmentDispatchCall{Method: "DispatchAgentCreateWithGather", Agent: agent})
 	return nil, nil
 }
 func (d *containmentDispatchSpy) DispatchFinalizeEnv(_ context.Context, _ *store.Agent, _ map[string]string) (*CreateDispatchResult, error) {
@@ -235,6 +238,12 @@ func (d *containmentDispatchSpy) getCalls() []containmentDispatchCall {
 	cp := make([]containmentDispatchCall, len(d.calls))
 	copy(cp, d.calls)
 	return cp
+}
+
+func (d *containmentDispatchSpy) reset() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = nil
 }
 
 type containmentDispatchCall struct {

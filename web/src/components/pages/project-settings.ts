@@ -38,10 +38,34 @@ import type {
   ProjectMessagingPolicy,
 } from '../../shared/types.js';
 import { can, canAny } from '../../shared/types.js';
+import { current, projectTrail, projectsRoot, type Named } from '../../client/crumbs.js';
+import { brokerPolicyStyles, renderPolicyBlockedTag } from '../shared/broker-policy-badges.js';
+import { projectDisplayName, projectLabelNow } from '../../client/project-label.js';
+import '../shared/breadcrumb.js';
 import { projectVisitorsVisible } from '../../shared/project-visitors.js';
 import { isBrokerKubernetesOnly } from '../../shared/runtime-kind.js';
 import { KUBERNETES_BLOCK_HINT } from '../../shared/gcp-identity-state.js';
 import { projectServiceAccountListUrl } from '../../shared/gcp-sa-assign-status.js';
+import {
+  BROKER_DEFAULTS_FIELD,
+  brokerCollectionProblem,
+  brokerErrorsFromBody,
+  brokerMapFromRows,
+  brokerOptionsForRow,
+  brokerRowProblem,
+  brokerRowsFromMap,
+  brokersMissingDefault,
+  effectiveIdentityForBroker,
+  isBrokerDefaultMessage,
+  knownFlatBrokers,
+  sameBrokerMap,
+  serviceAccountOptionsForBroker,
+  splitBrokerWarnings,
+  type BrokerDefaultRow,
+  type BrokerEffectiveIdentity,
+  type BrokerMessages,
+  type KnownFlatBroker,
+} from '../../shared/gcp-broker-defaults.js';
 import {
   PROFILE_DEFAULTS_FIELD,
   effectiveIdentityForProfile,
@@ -60,6 +84,11 @@ import {
   type ProfileDefaultRow,
   type ProfileMessages,
 } from '../../shared/gcp-profile-defaults.js';
+import {
+  FEATURE_FLAGS_CHANGED_EVENT,
+  FLAT_BROKERS_FLAG,
+  isFeatureEnabled,
+} from '../../utils/feature-flags.js';
 import { normalizeModelAlias } from '../../shared/model-utils.js';
 import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
 import type { AccessBoundarySummary } from '../../shared/access-boundaries.js';
@@ -119,6 +148,7 @@ interface ProjectSettings {
   defaultGCPIdentityMode?: string | undefined;
   defaultGCPIdentityServiceAccountID?: string | undefined;
   defaultGCPIdentityServiceAccountIDByProfile?: Record<string, string> | undefined;
+  defaultGCPIdentityServiceAccountIDByBroker?: Record<string, string> | undefined;
   defaultModel?: string | undefined;
   defaultThinkingLevel?: number | null | undefined;
   maxAgentRole?: string | undefined;
@@ -364,6 +394,30 @@ export class ScionPageProjectSettings extends LitElement {
   @state()
   private profileDefaultWarnings: ProfileMessages = { byProfile: {}, general: [] };
 
+  /**
+   * Per-broker default service account rows for flat Runtime Brokers
+   * (defaultGCPIdentityServiceAccountIDByBroker, ptone/scion#8185).
+   */
+  @state()
+  private brokerDefaultRows: BrokerDefaultRow[] = [];
+
+  /** The stored per-broker map the rows were loaded from, to tell whether they changed. */
+  private brokerDefaultsStored: Record<string, string> = {};
+
+  private brokerDefaultRowKey = 0;
+
+  /** Inline errors from the last failed save, by broker ID and for the map. */
+  @state()
+  private brokerDefaultErrors: BrokerMessages = { byBroker: {}, general: [] };
+
+  /** Warnings from the last successful save, by broker ID and for the map. */
+  @state()
+  private brokerDefaultWarnings: BrokerMessages = { byBroker: {}, general: [] };
+
+  private readonly boundOnFeatureFlagsChanged = (): void => {
+    this.requestUpdate();
+  };
+
   // Agent authorization
   @state()
   private configMaxAgentRole = '';
@@ -433,9 +487,6 @@ export class ScionPageProjectSettings extends LitElement {
   private messagingPolicy: ProjectMessagingPolicy | null = null;
 
   @state()
-  private messagingPolicyLoading = true;
-
-  @state()
   private messagingPolicySaving = false;
 
   @state()
@@ -446,592 +497,589 @@ export class ScionPageProjectSettings extends LitElement {
 
   private stopBrokerRelativeTimeTick: (() => void) | null = null;
 
-  static override styles = css`
-    :host {
-      display: block;
-    }
-
-    .back-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-      color: var(--scion-text-muted, #64748b);
-      text-decoration: none;
-      font-size: 0.875rem;
-      margin-bottom: 1rem;
-    }
-
-    .back-link:hover {
-      color: var(--scion-primary, #3b82f6);
-    }
-
-    .header {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      margin-bottom: 2rem;
-    }
-
-    .header sl-icon {
-      color: var(--scion-primary, #3b82f6);
-      font-size: 1.5rem;
-    }
-
-    .header h1 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      color: var(--scion-text, #1e293b);
-      margin: 0;
-    }
-
-    .section {
-      background: var(--scion-surface, #ffffff);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-      padding: 1.5rem;
-      margin-bottom: 1.5rem;
-    }
-
-    .section h2 {
-      font-size: 1.125rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.25rem 0;
-    }
-
-    .section p {
-      font-size: 0.875rem;
-      color: var(--scion-text-muted, #64748b);
-      margin: 0 0 1rem 0;
-    }
-
-    .section-header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 1rem;
-    }
-
-    .section-header-text {
-      flex: 1;
-    }
-
-    .template-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-    }
-
-    .template-item {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      padding: 0.75rem 1rem;
-      background: var(--scion-bg-subtle, #f8fafc);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius, 0.5rem);
-    }
-
-    .template-item sl-icon {
-      color: var(--scion-primary, #3b82f6);
-      font-size: 1.125rem;
-      flex-shrink: 0;
-    }
-
-    .template-info {
-      flex: 1;
-      min-width: 0;
-    }
-
-    .template-name {
-      font-weight: 600;
-      font-size: 0.875rem;
-      color: var(--scion-text, #1e293b);
-    }
-
-    .template-meta {
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-      margin-top: 0.125rem;
-    }
-
-    .template-badge {
-      font-size: 0.6875rem;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      white-space: nowrap;
-    }
-
-    .empty-templates {
-      text-align: center;
-      padding: 2rem 1rem;
-      color: var(--scion-text-muted, #64748b);
-      font-size: 0.875rem;
-    }
-
-    .empty-templates sl-icon {
-      font-size: 2rem;
-      margin-bottom: 0.5rem;
-      display: block;
-    }
-
-    .sync-status {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.75rem 1rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      font-size: 0.8125rem;
-      margin-bottom: 1rem;
-    }
-
-    .sync-status.error {
-      background: var(--sl-color-danger-50, #fef2f2);
-      color: var(--sl-color-danger-700, #b91c1c);
-      border: 1px solid var(--sl-color-danger-200, #fecaca);
-    }
-
-    .sync-status.success {
-      background: var(--sl-color-success-50, #f0fdf4);
-      color: var(--sl-color-success-700, #15803d);
-      border: 1px solid var(--sl-color-success-200, #bbf7d0);
-    }
-
-    .sync-status.syncing {
-      background: var(--sl-color-primary-50, #eff6ff);
-      color: var(--sl-color-primary-700, #1d4ed8);
-      border: 1px solid var(--sl-color-primary-200, #bfdbfe);
-    }
-
-    .danger-section {
-      border-color: var(--sl-color-danger-200, #fecaca);
-    }
-
-    .danger-section h2 {
-      color: var(--sl-color-danger-600, #dc2626);
-    }
-
-    .leave-blocked-reason {
-      color: var(--sl-color-warning-700, #b45309);
-    }
-
-    .delete-area + .delete-area {
-      margin-top: 1rem;
-    }
-
-    .delete-area {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 1.5rem;
-      padding-top: 1rem;
-      border-top: 1px solid var(--scion-border, #e2e8f0);
-    }
-
-    .delete-info {
-      flex: 1;
-    }
-
-    .delete-info h3 {
-      font-size: 0.9375rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.25rem 0;
-    }
-
-    .delete-info p {
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-      margin: 0;
-    }
-
-    .delete-actions {
-      flex-shrink: 0;
-      display: flex;
-      flex-direction: column;
-      align-items: flex-end;
-      gap: 0.75rem;
-    }
-
-    .loading-state {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 4rem 2rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .loading-state sl-spinner {
-      font-size: 2rem;
-      margin-bottom: 1rem;
-    }
-
-    .error-state {
-      text-align: center;
-      padding: 3rem 2rem;
-      background: var(--scion-surface, #ffffff);
-      border: 1px solid var(--sl-color-danger-200, #fecaca);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-    }
-
-    .error-state sl-icon {
-      font-size: 3rem;
-      color: var(--sl-color-danger-500, #ef4444);
-      margin-bottom: 1rem;
-    }
-
-    .error-state h2 {
-      font-size: 1.25rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.5rem 0;
-    }
-
-    .error-state p {
-      color: var(--scion-text-muted, #64748b);
-      margin: 0 0 1rem 0;
-    }
-
-    .error-details {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.875rem;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      padding: 0.75rem 1rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      color: var(--sl-color-danger-700, #b91c1c);
-      margin-bottom: 1rem;
-    }
-
-    sl-tab-group {
-      --indicator-color: var(--scion-primary, #3b82f6);
-    }
-
-    sl-tab-group::part(base) {
-      background: transparent;
-    }
-
-    sl-tab-panel::part(base) {
-      padding: 1.5rem 0 0 0;
-    }
-
-    .config-form {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-
-    .config-field {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-    }
-
-    .config-field label {
-      font-size: 0.8125rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-    }
-
-    .config-field .field-help {
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .config-field .field-help-error {
-      color: var(--sl-color-danger-600, #dc2626);
-    }
-
-    .config-actions {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      justify-content: flex-end;
-      padding-top: 0.5rem;
-    }
-
-    .config-status {
-      font-size: 0.8125rem;
-    }
-
-    .config-status.error {
-      color: var(--sl-color-danger-600, #dc2626);
-    }
-
-    .config-status.success {
-      color: var(--sl-color-success-600, #16a34a);
-    }
-
-    /* Hub-default indicator: shown next to labels when a setting inherits from hub */
-    .hub-indicator-icon {
-      font-size: 0.75rem;
-      color: var(--sl-color-neutral-500, #64748b);
-      vertical-align: middle;
-      margin-left: 0.25rem;
-      cursor: help;
-    }
-
-    .profile-default-rows {
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
-    }
-
-    .profile-default-row {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-    }
-
-    .profile-default-inputs {
-      display: grid;
-      grid-template-columns: minmax(8rem, 1fr) minmax(12rem, 2fr) auto;
-      gap: 0.5rem;
-      align-items: end;
-    }
-
-    .profile-effective {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-      margin-top: 0.5rem;
-    }
-
-    .profile-effective-title {
-      font-size: 0.8125rem;
-      font-weight: 600;
-    }
-
-    .profile-effective-table {
-      border-collapse: collapse;
-      font-size: 0.8125rem;
-    }
-
-    .profile-effective-table th,
-    .profile-effective-table td {
-      text-align: left;
-      padding: 0.25rem 0.5rem;
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-    }
-
-    .config-field.hub-inherited {
-      border-left: 2px solid var(--sl-color-primary-300, #93c5fd);
-      padding-left: 0.5rem;
-    }
-
-    .config-field.hub-inherited > label {
-      color: var(--sl-color-neutral-600, #475569);
-    }
-
-    .done-footer {
-      display: flex;
-      justify-content: flex-start;
-      margin-top: 1rem;
-    }
-
-    /* GitHub App section styles */
-    .github-no-install {
-      text-align: center;
-      padding: 1.5rem;
-    }
-
-    .github-no-install p {
-      margin: 0.5rem 0;
-    }
-
-    .github-status-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 1.5rem;
-      margin-bottom: 1rem;
-    }
-
-    .github-status-item {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-    }
-
-    .github-status-value {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .github-status-dot {
-      display: inline-block;
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-    }
-
-    .github-status-dot.ok {
-      background: #16a34a;
-    }
-    .github-status-dot.degraded {
-      background: #eab308;
-    }
-    .github-status-dot.error {
-      background: #dc2626;
-    }
-    .github-status-dot.unchecked {
-      background: #94a3b8;
-    }
-
-    .github-permissions {
-      margin-top: 1rem;
-    }
-
-    .github-perm-grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.375rem;
-      margin-top: 0.375rem;
-    }
-
-    .github-perm-badge {
-      font-size: 0.75rem;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      border: 1px solid var(--scion-border, #e2e8f0);
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .github-perm-badge.write {
-      background: #dbeafe;
-      border-color: #93c5fd;
-      color: #1e40af;
-    }
-
-    .github-perm-badge.read {
-      background: #f0fdf4;
-      border-color: #86efac;
-      color: #166534;
-    }
-
-    .status-message.warning {
-      background: #fef3c7;
-      color: #92400e;
-      border: 1px solid #fcd34d;
-    }
-
-    /* Runtime Brokers tab */
-    .broker-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-    }
-
-    .broker-item {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      padding: 0.75rem 1rem;
-      background: var(--scion-bg-subtle, #f8fafc);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius, 0.5rem);
-    }
-
-    .broker-status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-
-    .broker-status-dot.online {
-      background: #16a34a;
-    }
-    .broker-status-dot.offline {
-      background: #94a3b8;
-    }
-    .broker-status-dot.degraded {
-      background: #eab308;
-    }
-
-    .broker-info {
-      flex: 1;
-      min-width: 0;
-    }
-
-    .broker-name-row {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      flex-wrap: wrap;
-    }
-
-    .broker-name {
-      font-weight: 600;
-      font-size: 0.875rem;
-      color: var(--scion-text, #1e293b);
-    }
-
-    .broker-default-badge {
-      font-size: 0.6875rem;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      background: var(--scion-primary, #3b82f6);
-      color: #fff;
-      white-space: nowrap;
-    }
-
-    .broker-meta-row {
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-      margin-top: 0.25rem;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.25rem 0.75rem;
-    }
-
-    .broker-profiles {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.25rem;
-      margin-top: 0.375rem;
-    }
-
-    .broker-profile-badge {
-      font-size: 0.6875rem;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      white-space: nowrap;
-    }
-
-    .broker-profile-badge.available {
-      background: var(--sl-color-success-50, #f0fdf4);
-      border-color: var(--sl-color-success-200, #86efac);
-      color: var(--sl-color-success-700, #166534);
-    }
-
-    .broker-actions {
-      display: flex;
-      align-items: center;
-      gap: 0.25rem;
-      flex-shrink: 0;
-    }
-
-    .empty-brokers {
-      text-align: center;
-      padding: 2rem 1rem;
-      color: var(--scion-text-muted, #64748b);
-      font-size: 0.875rem;
-    }
-
-    .empty-brokers sl-icon {
-      font-size: 2rem;
-      margin-bottom: 0.5rem;
-      display: block;
-    }
-  `;
+  static override styles = [
+    brokerPolicyStyles,
+    css`
+      :host {
+        display: block;
+      }
+
+      .header {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-bottom: 2rem;
+      }
+
+      .header sl-icon {
+        color: var(--scion-primary, #3b82f6);
+        font-size: 1.5rem;
+      }
+
+      .header h1 {
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: var(--scion-text, #1e293b);
+        margin: 0;
+      }
+
+      .section {
+        background: var(--scion-surface, #ffffff);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+      }
+
+      .section h2 {
+        font-size: 1.125rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.25rem 0;
+      }
+
+      .section p {
+        font-size: 0.875rem;
+        color: var(--scion-text-muted, #64748b);
+        margin: 0 0 1rem 0;
+      }
+
+      .section-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+
+      .section-header-text {
+        flex: 1;
+      }
+
+      .template-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+
+      .template-item {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        background: var(--scion-bg-subtle, #f8fafc);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius, 0.5rem);
+      }
+
+      .template-item sl-icon {
+        color: var(--scion-primary, #3b82f6);
+        font-size: 1.125rem;
+        flex-shrink: 0;
+      }
+
+      .template-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .template-name {
+        font-weight: 600;
+        font-size: 0.875rem;
+        color: var(--scion-text, #1e293b);
+      }
+
+      .template-meta {
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+        margin-top: 0.125rem;
+      }
+
+      .template-badge {
+        font-size: 0.6875rem;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        white-space: nowrap;
+      }
+
+      .empty-templates {
+        text-align: center;
+        padding: 2rem 1rem;
+        color: var(--scion-text-muted, #64748b);
+        font-size: 0.875rem;
+      }
+
+      .empty-templates sl-icon {
+        font-size: 2rem;
+        margin-bottom: 0.5rem;
+        display: block;
+      }
+
+      .sync-status {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.75rem 1rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        font-size: 0.8125rem;
+        margin-bottom: 1rem;
+      }
+
+      .sync-status.error {
+        background: var(--sl-color-danger-50, #fef2f2);
+        color: var(--sl-color-danger-700, #b91c1c);
+        border: 1px solid var(--sl-color-danger-200, #fecaca);
+      }
+
+      .sync-status.success {
+        background: var(--sl-color-success-50, #f0fdf4);
+        color: var(--sl-color-success-700, #15803d);
+        border: 1px solid var(--sl-color-success-200, #bbf7d0);
+      }
+
+      .sync-status.syncing {
+        background: var(--sl-color-primary-50, #eff6ff);
+        color: var(--sl-color-primary-700, #1d4ed8);
+        border: 1px solid var(--sl-color-primary-200, #bfdbfe);
+      }
+
+      .danger-section {
+        border-color: var(--sl-color-danger-200, #fecaca);
+      }
+
+      .danger-section h2 {
+        color: var(--sl-color-danger-600, #dc2626);
+      }
+
+      .leave-blocked-reason {
+        color: var(--sl-color-warning-700, #b45309);
+      }
+
+      .delete-area + .delete-area {
+        margin-top: 1rem;
+      }
+
+      .delete-area {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid var(--scion-border, #e2e8f0);
+      }
+
+      .delete-info {
+        flex: 1;
+      }
+
+      .delete-info h3 {
+        font-size: 0.9375rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.25rem 0;
+      }
+
+      .delete-info p {
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+        margin: 0;
+      }
+
+      .delete-actions {
+        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 0.75rem;
+      }
+
+      .loading-state {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 4rem 2rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .loading-state sl-spinner {
+        font-size: 2rem;
+        margin-bottom: 1rem;
+      }
+
+      .error-state {
+        text-align: center;
+        padding: 3rem 2rem;
+        background: var(--scion-surface, #ffffff);
+        border: 1px solid var(--sl-color-danger-200, #fecaca);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+      }
+
+      .error-state sl-icon {
+        font-size: 3rem;
+        color: var(--sl-color-danger-500, #ef4444);
+        margin-bottom: 1rem;
+      }
+
+      .error-state h2 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.5rem 0;
+      }
+
+      .error-state p {
+        color: var(--scion-text-muted, #64748b);
+        margin: 0 0 1rem 0;
+      }
+
+      .error-details {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.875rem;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        padding: 0.75rem 1rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        color: var(--sl-color-danger-700, #b91c1c);
+        margin-bottom: 1rem;
+      }
+
+      sl-tab-group {
+        --indicator-color: var(--scion-primary, #3b82f6);
+      }
+
+      sl-tab-group::part(base) {
+        background: transparent;
+      }
+
+      sl-tab-panel::part(base) {
+        padding: 1.5rem 0 0 0;
+      }
+
+      .config-form {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .config-field {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+      }
+
+      .config-field label {
+        font-size: 0.8125rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+      }
+
+      .config-field .field-help {
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .config-field .field-help-error {
+        color: var(--sl-color-danger-600, #dc2626);
+      }
+
+      .config-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        justify-content: flex-end;
+        padding-top: 0.5rem;
+      }
+
+      .config-status {
+        font-size: 0.8125rem;
+      }
+
+      .config-status.error {
+        color: var(--sl-color-danger-600, #dc2626);
+      }
+
+      .config-status.success {
+        color: var(--sl-color-success-600, #16a34a);
+      }
+
+      /* Hub-default indicator: shown next to labels when a setting inherits from hub */
+      .hub-indicator-icon {
+        font-size: 0.75rem;
+        color: var(--sl-color-neutral-500, #64748b);
+        vertical-align: middle;
+        margin-left: 0.25rem;
+        cursor: help;
+      }
+
+      .profile-default-rows,
+      .broker-default-rows {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+
+      .profile-default-row,
+      .broker-default-row {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+      }
+
+      .profile-default-inputs,
+      .broker-default-inputs {
+        display: grid;
+        grid-template-columns: minmax(8rem, 1fr) minmax(12rem, 2fr) auto;
+        gap: 0.5rem;
+        align-items: end;
+      }
+
+      .profile-effective,
+      .broker-effective {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        margin-top: 0.5rem;
+      }
+
+      .profile-effective-title,
+      .broker-effective-title {
+        font-size: 0.8125rem;
+        font-weight: 600;
+      }
+
+      .profile-effective-table,
+      .broker-effective-table {
+        border-collapse: collapse;
+        font-size: 0.8125rem;
+      }
+
+      .profile-effective-table th,
+      .profile-effective-table td,
+      .broker-effective-table th,
+      .broker-effective-table td {
+        text-align: left;
+        padding: 0.25rem 0.5rem;
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      }
+
+      .config-field.hub-inherited {
+        border-left: 2px solid var(--sl-color-primary-300, #93c5fd);
+        padding-left: 0.5rem;
+      }
+
+      .config-field.hub-inherited > label {
+        color: var(--sl-color-neutral-600, #475569);
+      }
+
+      .done-footer {
+        display: flex;
+        justify-content: flex-start;
+        margin-top: 1rem;
+      }
+
+      /* GitHub App section styles */
+      .github-no-install {
+        text-align: center;
+        padding: 1.5rem;
+      }
+
+      .github-no-install p {
+        margin: 0.5rem 0;
+      }
+
+      .github-status-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1.5rem;
+        margin-bottom: 1rem;
+      }
+
+      .github-status-item {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+      }
+
+      .github-status-value {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .github-status-dot {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+      }
+
+      .github-status-dot.ok {
+        background: var(--sl-color-success-600, #16a34a);
+      }
+      .github-status-dot.degraded {
+        background: var(--sl-color-yellow-500, #eab308);
+      }
+      .github-status-dot.error {
+        background: var(--sl-color-danger-600, #dc2626);
+      }
+      .github-status-dot.unchecked {
+        background: var(--scion-text-disabled, #94a3b8);
+      }
+
+      .github-permissions {
+        margin-top: 1rem;
+      }
+
+      .github-perm-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.375rem;
+        margin-top: 0.375rem;
+      }
+
+      .github-perm-badge {
+        font-size: 0.75rem;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        border: 1px solid var(--scion-border, #e2e8f0);
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .github-perm-badge.write {
+        background: var(--scion-badge-primary-bg, #dbeafe);
+        border-color: var(--sl-color-primary-300, #93c5fd);
+        color: var(--scion-badge-primary-text, #1e40af);
+      }
+
+      .github-perm-badge.read {
+        background: var(--sl-color-success-50, #f0fdf4);
+        border-color: var(--scion-success-border, #86efac);
+        color: var(--scion-success-text, #166534);
+      }
+
+      .status-message.warning {
+        background: var(--scion-badge-warning-bg, #fef3c7);
+        color: var(--scion-warning-text, #92400e);
+        border: 1px solid var(--scion-warning-border, #fcd34d);
+      }
+
+      /* Runtime Brokers tab */
+      .broker-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+
+      .broker-item {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        background: var(--scion-bg-subtle, #f8fafc);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius, 0.5rem);
+      }
+
+      .broker-status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+
+      .broker-status-dot.online {
+        background: var(--sl-color-success-600, #16a34a);
+      }
+      .broker-status-dot.offline {
+        background: var(--scion-text-disabled, #94a3b8);
+      }
+      .broker-status-dot.degraded {
+        background: var(--sl-color-yellow-500, #eab308);
+      }
+
+      .broker-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .broker-name-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+      }
+
+      .broker-name {
+        font-weight: 600;
+        font-size: 0.875rem;
+        color: var(--scion-text, #1e293b);
+      }
+
+      .broker-default-badge {
+        font-size: 0.6875rem;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        background: var(--scion-primary, #3b82f6);
+        color: var(--scion-primary-text, #ffffff);
+        white-space: nowrap;
+      }
+
+      .broker-meta-row {
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+        margin-top: 0.25rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.25rem 0.75rem;
+      }
+
+      .broker-profiles {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.25rem;
+        margin-top: 0.375rem;
+      }
+
+      .broker-profile-badge {
+        font-size: 0.6875rem;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        white-space: nowrap;
+      }
+
+      .broker-profile-badge.available {
+        background: var(--sl-color-success-50, #f0fdf4);
+        border-color: var(--sl-color-success-200, #86efac);
+        color: var(--sl-color-success-700, #166534);
+      }
+
+      .broker-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        flex-shrink: 0;
+      }
+
+      .empty-brokers {
+        text-align: center;
+        padding: 2rem 1rem;
+        color: var(--scion-text-muted, #64748b);
+        font-size: 0.875rem;
+      }
+
+      .empty-brokers sl-icon {
+        font-size: 2rem;
+        margin-bottom: 0.5rem;
+        display: block;
+      }
+    `,
+  ];
 
   override connectedCallback(): void {
     super.connectedCallback();
@@ -1044,6 +1092,7 @@ export class ScionPageProjectSettings extends LitElement {
     // Deep-link a specific Resources tab via ?tab= (e.g. ?tab=templates), used by
     // the resource detail pages' "back" links.
     if (typeof window !== 'undefined') {
+      window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
       const params = new URLSearchParams(window.location.search);
       const tab = params.get('tab');
       if (tab) {
@@ -1070,6 +1119,9 @@ export class ScionPageProjectSettings extends LitElement {
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
+    if (typeof window !== 'undefined') {
+      window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    }
     this.stopBrokerRelativeTimeTick?.();
     this.stopBrokerRelativeTimeTick = null;
   }
@@ -1153,7 +1205,6 @@ export class ScionPageProjectSettings extends LitElement {
   // ---------------------------------------------------------------------------
 
   private async loadMessagingPolicy(): Promise<void> {
-    this.messagingPolicyLoading = true;
     this.messagingPolicyError = null;
     try {
       const res = await apiFetch(`/api/v1/projects/${this.projectId}/messaging-policy`);
@@ -1162,8 +1213,6 @@ export class ScionPageProjectSettings extends LitElement {
       }
     } catch {
       // Non-critical — section won't render
-    } finally {
-      this.messagingPolicyLoading = false;
     }
   }
 
@@ -1270,22 +1319,14 @@ export class ScionPageProjectSettings extends LitElement {
   }
 
   private renderMessagingPolicySection() {
-    // Don't render until data is loaded (or if the endpoint is unavailable)
-    if (this.messagingPolicyLoading) {
-      return html`
-        <div class="section">
-          <h2>Cross-Project Messaging</h2>
-          <p>Controls which external agents can send messages to agents in this project.</p>
-          <div style="text-align: center; padding: 1rem;"><sl-spinner></sl-spinner></div>
-        </div>
-      `;
+    // Hide the section until policy data is loaded, if the endpoint is unavailable,
+    // or when cross-project messaging is disabled by Hub administrators.
+    if (!this.messagingPolicy || !this.messagingPolicy.hubCrossProjectEnabled) {
+      return nothing;
     }
-
-    if (!this.messagingPolicy) return nothing;
 
     const canEdit = can(this.project?._capabilities, 'manage');
     const policy = this.messagingPolicy;
-    const hubDisabled = !policy.hubCrossProjectEnabled;
     const currentValue = policy.crossProjectInbound;
 
     const policyLabels: Record<CrossProjectInboundPolicy, string> = {
@@ -1310,16 +1351,6 @@ export class ScionPageProjectSettings extends LitElement {
           destination project&rsquo;s consent.
         </p>
 
-        ${hubDisabled
-          ? html`
-              <sl-alert variant="warning" open>
-                <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
-                <strong>Disabled by Hub administrator.</strong> Cross-project messaging is turned
-                off at the Hub level. Your configured selection below is preserved and will take
-                effect when the Hub administrator enables cross-project messaging.
-              </sl-alert>
-            `
-          : ''}
         ${this.messagingPolicyError
           ? html`<div
               class="config-status error"
@@ -1370,7 +1401,7 @@ export class ScionPageProjectSettings extends LitElement {
               </p>
             `
           : ''}
-        ${currentValue !== 'none' && !hubDisabled
+        ${currentValue !== 'none'
           ? html`
               <p
                 style="margin-top: 0.5rem; font-size: 0.8125rem; color: var(--scion-text-muted, #64748b);"
@@ -1546,6 +1577,7 @@ export class ScionPageProjectSettings extends LitElement {
       this.configDefaultGCPIdentityMode = this.settings.defaultGCPIdentityMode || '';
       this.configDefaultGCPIdentitySAID = this.settings.defaultGCPIdentityServiceAccountID || '';
       this.loadProfileDefaultRows(this.settings.defaultGCPIdentityServiceAccountIDByProfile);
+      this.loadBrokerDefaultRows(this.settings.defaultGCPIdentityServiceAccountIDByBroker);
       this.configMaxAgentRole = this.settings.maxAgentRole || '';
       this.configDefaultAgentRole = this.settings.defaultAgentRole || '';
       if (this.settings.defaultModel) {
@@ -1877,7 +1909,10 @@ export class ScionPageProjectSettings extends LitElement {
     };
   }
 
-  private describeEffectiveIdentity(e: EffectiveIdentity, kubernetes: boolean): string {
+  private describeEffectiveIdentity(
+    e: EffectiveIdentity | BrokerEffectiveIdentity,
+    kubernetes: boolean
+  ): string {
     const what =
       e.mode === 'assign'
         ? `Assign ${this.serviceAccountLabel(e.serviceAccountId)}`
@@ -1889,6 +1924,8 @@ export class ScionPageProjectSettings extends LitElement {
               ? 'No identity set (the Kubernetes runtime applies its default)'
               : 'No identity set (the runtime applies its default)';
     switch (e.source) {
+      case 'broker':
+        return `${what} (this broker's default)`;
       case 'profile':
         return `${what} (this profile's default)`;
       case 'project':
@@ -1898,6 +1935,273 @@ export class ScionPageProjectSettings extends LitElement {
       default:
         return what;
     }
+  }
+
+  private loadBrokerDefaultRows(map: Record<string, string> | null | undefined): void {
+    this.brokerDefaultsStored = { ...(map ?? {}) };
+    this.brokerDefaultRows = brokerRowsFromMap(map, () => ++this.brokerDefaultRowKey);
+  }
+
+  /** Whether the per-broker rows differ from the stored map. */
+  private get brokerDefaultsDirty(): boolean {
+    const rows = this.brokerDefaultRows;
+    const complete = brokerMapFromRows(rows);
+    if (Object.keys(complete).length !== rows.length) return true;
+    return !sameBrokerMap(complete, this.brokerDefaultsStored);
+  }
+
+  /** The flat Runtime Brokers linked to / providing to this project. */
+  private get knownFlatProjectBrokers(): KnownFlatBroker[] {
+    return knownFlatBrokers(this.brokers);
+  }
+
+  private updateBrokerDefaultRow(key: number, patch: Partial<BrokerDefaultRow>): void {
+    this.brokerDefaultRows = this.brokerDefaultRows.map((row) =>
+      row.key === key ? { ...row, ...patch } : row
+    );
+  }
+
+  private addBrokerDefaultRow(): void {
+    const free = brokerOptionsForRow(
+      { key: -1, brokerId: '', serviceAccountId: '' },
+      this.brokerDefaultRows,
+      this.knownFlatProjectBrokers
+    );
+    this.brokerDefaultRows = [
+      ...this.brokerDefaultRows,
+      {
+        key: ++this.brokerDefaultRowKey,
+        brokerId: free.length === 1 ? (free[0]?.id ?? '') : '',
+        serviceAccountId: '',
+      },
+    ];
+  }
+
+  private removeBrokerDefaultRow(key: number): void {
+    this.brokerDefaultRows = this.brokerDefaultRows.filter((row) => row.key !== key);
+  }
+
+  private renderBrokerDefaultMessages(
+    messages: readonly string[],
+    kind: 'error' | 'warning'
+  ): TemplateResult[] {
+    return messages.map((m) =>
+      kind === 'error'
+        ? html`<span class="field-help field-help-error broker-default-error" role="alert"
+            >${m}</span
+          >`
+        : html`<sl-alert class="broker-default-warning" variant="warning" open>
+            <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+            ${m}
+          </sl-alert>`
+    );
+  }
+
+  /**
+   * The per-broker default service account editor for flat Runtime Brokers,
+   * shown only when `hub.flat_runtime_brokers` is enabled (ptone/scion#8185).
+   */
+  private renderBrokerDefaults(canEdit: boolean): TemplateResult | typeof nothing {
+    if (!isFeatureEnabled(FLAT_BROKERS_FLAG)) return nothing;
+
+    const rows = this.brokerDefaultRows;
+    const known = this.knownFlatProjectBrokers;
+    const knownIds = new Set(known.map((b) => b.id));
+    const errors = this.brokerDefaultErrors;
+    const warnings = this.brokerDefaultWarnings;
+    const missing = brokersMissingDefault(rows, known);
+    const dirty = this.brokerDefaultsDirty;
+    const canAdd =
+      canEdit &&
+      rows.length < 64 &&
+      brokerOptionsForRow({ key: -1, brokerId: '', serviceAccountId: '' }, rows, known).length > 0;
+    const project = {
+      mode: this.configDefaultGCPIdentityMode,
+      serviceAccountId:
+        this.configDefaultGCPIdentityMode === 'assign' ? this.configDefaultGCPIdentitySAID : '',
+    };
+    const hub = this.hubGCPIdentityDefault;
+    const currentMap = brokerMapFromRows(rows);
+    const effectiveBrokers: KnownFlatBroker[] = [
+      ...known,
+      ...rows
+        .filter((r) => r.brokerId && !knownIds.has(r.brokerId))
+        .map((r) => ({ id: r.brokerId, name: r.brokerId, targetLabel: '', kubernetes: false })),
+    ];
+
+    return html`
+      <div class="config-field broker-defaults" data-field=${BROKER_DEFAULTS_FIELD}>
+        <label id="broker-defaults-label">Per Runtime Broker default service accounts</label>
+        <span class="field-help"
+          >A default for one flat Runtime Broker wins over the project default above for agents
+          placed on that broker when no identity is explicitly chosen. Legacy profile-based brokers
+          use per-profile defaults below. Only verified service accounts are offered.</span
+        >
+        ${rows.length > 0
+          ? html`
+              <div class="broker-default-rows" role="group" aria-labelledby="broker-defaults-label">
+                ${rows.map((row) => this.renderBrokerDefaultRow(row, canEdit, dirty))}
+              </div>
+            `
+          : html`<span class="field-help broker-defaults-empty"
+              >No per-broker defaults. Every flat Runtime Broker uses the project default.</span
+            >`}
+        ${this.renderBrokerDefaultMessages(errors.general, 'error')}
+        ${this.renderBrokerDefaultMessages(warnings.general, 'warning')}
+        ${missing.length > 0
+          ? html`<sl-alert class="broker-default-sibling-warning" variant="warning" open>
+              <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+              ${missing.length === 1
+                ? html`Kubernetes Runtime Broker "${missing[0].name}" has no per-broker default
+                  while another flat broker has one, so its agents use the project default. That
+                  identity may not be mapped on that broker's cluster.`
+                : html`Kubernetes Runtime Brokers ${missing.map((b) => `"${b.name}"`).join(', ')}
+                  have no per-broker default while another flat broker has one, so their agents use
+                  the project default. That identity may not be mapped on those clusters.`}
+            </sl-alert>`
+          : nothing}
+        <div>
+          <sl-button
+            class="broker-default-add"
+            size="small"
+            ?disabled=${!canAdd}
+            @click=${() => this.addBrokerDefaultRow()}
+          >
+            <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+            Add Runtime Broker default
+          </sl-button>
+        </div>
+        ${effectiveBrokers.length > 0
+          ? html`
+              <div class="broker-effective">
+                <span class="broker-effective-title"
+                  >Effective default identity per flat Runtime Broker</span
+                >
+                <table class="broker-effective-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Runtime Broker</th>
+                      <th scope="col">New agents get</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${effectiveBrokers.map(
+                      (b) => html`
+                        <tr data-broker=${b.id}>
+                          <td>${b.name}</td>
+                          <td>
+                            ${this.describeEffectiveIdentity(
+                              effectiveIdentityForBroker(b.id, currentMap, project, hub),
+                              b.kubernetes
+                            )}
+                          </td>
+                        </tr>
+                      `
+                    )}
+                  </tbody>
+                </table>
+                <span class="field-help"
+                  >For agents on flat Runtime Brokers that choose no identity. Unsaved edits are
+                  included.</span
+                >
+              </div>
+            `
+          : nothing}
+      </div>
+    `;
+  }
+
+  private renderBrokerDefaultRow(
+    row: BrokerDefaultRow,
+    canEdit: boolean,
+    dirty: boolean
+  ): TemplateResult {
+    const rows = this.brokerDefaultRows;
+    const known = this.knownFlatProjectBrokers;
+    const problem = brokerRowProblem(row, rows);
+    const rowErrors = row.brokerId ? (this.brokerDefaultErrors.byBroker[row.brokerId] ?? []) : [];
+    const rowWarnings = row.brokerId
+      ? (this.brokerDefaultWarnings.byBroker[row.brokerId] ?? [])
+      : [];
+    const options = brokerOptionsForRow(row, rows, known);
+    const saOptions = serviceAccountOptionsForBroker(this.gcpServiceAccounts, row.brokerId);
+    const savedSAMissing =
+      row.serviceAccountId !== '' && !saOptions.some((sa) => sa.id === row.serviceAccountId);
+    const linked = known.some((b) => b.id === row.brokerId);
+    const selectedLabel = known.find((b) => b.id === row.brokerId)?.name || row.brokerId;
+    return html`
+      <div class="broker-default-row" data-broker=${row.brokerId}>
+        <div class="broker-default-inputs">
+          <sl-select
+            class="broker-default-broker"
+            label="Runtime Broker"
+            placeholder="Select a flat Runtime Broker"
+            value=${row.brokerId}
+            ?disabled=${!canEdit}
+            @sl-change=${(e: Event) => {
+              this.updateBrokerDefaultRow(row.key, {
+                brokerId: (e.target as HTMLSelectElement).value,
+              });
+            }}
+          >
+            ${options.map((opt) => {
+              const note = opt.stale
+                ? html` <small>(not linked to this project)</small>`
+                : opt.targetLabel
+                  ? html` <small>(${opt.targetLabel})</small>`
+                  : nothing;
+              return html`<sl-option value=${opt.id}>${opt.name}${note}</sl-option>`;
+            })}
+          </sl-select>
+          <sl-select
+            class="broker-default-sa"
+            label="Service account"
+            placeholder="Select a verified service account"
+            value=${row.serviceAccountId}
+            ?disabled=${!canEdit}
+            @sl-change=${(e: Event) => {
+              this.updateBrokerDefaultRow(row.key, {
+                serviceAccountId: (e.target as HTMLSelectElement).value,
+              });
+            }}
+          >
+            ${saOptions.map(
+              (sa) => html`
+                <sl-option value=${sa.id}>
+                  ${sa.displayName || sa.email}
+                  <small>(${sa.email})</small>${sa.scope === 'hub' ? ' (Hub)' : ''}
+                </sl-option>
+              `
+            )}
+            ${savedSAMissing
+              ? html`<sl-option value=${row.serviceAccountId}
+                  >${row.serviceAccountId}
+                  <small>(not a verified account in this project)</small></sl-option
+                >`
+              : nothing}
+          </sl-select>
+          <sl-icon-button
+            class="broker-default-remove"
+            name="trash"
+            label=${row.brokerId
+              ? `Remove the default for Runtime Broker ${selectedLabel}`
+              : 'Remove this row'}
+            ?disabled=${!canEdit}
+            @click=${() => this.removeBrokerDefaultRow(row.key)}
+          ></sl-icon-button>
+        </div>
+        ${row.brokerId && !linked
+          ? html`<span class="field-help"
+              >Runtime Broker "${row.brokerId}" is no longer linked to this project.</span
+            >`
+          : nothing}
+        ${problem && dirty
+          ? html`<span class="field-help field-help-error broker-default-problem">${problem}</span>`
+          : nothing}
+        ${this.renderBrokerDefaultMessages(rowErrors, 'error')}
+        ${this.renderBrokerDefaultMessages(rowWarnings, 'warning')}
+      </div>
+    `;
   }
 
   private renderProfileDefaultMessages(
@@ -2198,6 +2502,8 @@ export class ScionPageProjectSettings extends LitElement {
     this.settingsSuccess = null;
     this.profileDefaultErrors = { byProfile: {}, general: [] };
     this.profileDefaultWarnings = { byProfile: {}, general: [] };
+    this.brokerDefaultErrors = { byBroker: {}, general: [] };
+    this.brokerDefaultWarnings = { byBroker: {}, general: [] };
 
     this.countLimitWarnings = [];
     if (Object.keys(this.countLimitErrors).length > 0) {
@@ -2213,6 +2519,22 @@ export class ScionPageProjectSettings extends LitElement {
     ) {
       this.settingsError = 'Complete or remove the incomplete per-profile default rows.';
       return;
+    }
+
+    // Preserve contract: when hub.flat_runtime_brokers is off, never send
+    // defaultGCPIdentityServiceAccountIDByBroker so stored entries stay intact
+    // and the Hub's 412 experiment_disabled write check is never triggered.
+    const brokerDefaultsDirty = isFeatureEnabled(FLAT_BROKERS_FLAG) && this.brokerDefaultsDirty;
+    if (brokerDefaultsDirty) {
+      if (this.brokerDefaultRows.some((row) => brokerRowProblem(row, this.brokerDefaultRows))) {
+        this.settingsError = 'Complete or remove the incomplete per-broker default rows.';
+        return;
+      }
+      const collectionErr = brokerCollectionProblem(this.brokerDefaultRows);
+      if (collectionErr) {
+        this.settingsError = collectionErr;
+        return;
+      }
     }
 
     this.settingsSaving = true;
@@ -2286,6 +2608,9 @@ export class ScionPageProjectSettings extends LitElement {
       if (profileDefaultsDirty) {
         body.defaultGCPIdentityServiceAccountIDByProfile = mapFromRows(this.profileDefaultRows);
       }
+      if (brokerDefaultsDirty) {
+        body.defaultGCPIdentityServiceAccountIDByBroker = brokerMapFromRows(this.brokerDefaultRows);
+      }
 
       const response = await apiFetch(`/api/v1/projects/${this.projectId}/settings`, {
         method: 'PUT',
@@ -2294,9 +2619,18 @@ export class ScionPageProjectSettings extends LitElement {
       });
 
       if (!response.ok) {
-        if (profileDefaultsDirty) {
+        if (profileDefaultsDirty || brokerDefaultsDirty) {
           try {
-            this.profileDefaultErrors = profileErrorsFromBody(await response.clone().json());
+            const errBody: unknown = await response.clone().json();
+            if (profileDefaultsDirty) {
+              this.profileDefaultErrors = profileErrorsFromBody(errBody);
+            }
+            if (brokerDefaultsDirty) {
+              this.brokerDefaultErrors = brokerErrorsFromBody(
+                errBody,
+                this.knownFlatProjectBrokers
+              );
+            }
           } catch {
             // Not JSON: the page-level message below still reports it.
           }
@@ -2308,6 +2642,7 @@ export class ScionPageProjectSettings extends LitElement {
       const { warnings, ...savedSettings } = saved;
       this.settings = savedSettings;
       this.loadProfileDefaultRows(savedSettings.defaultGCPIdentityServiceAccountIDByProfile);
+      this.loadBrokerDefaultRows(savedSettings.defaultGCPIdentityServiceAccountIDByBroker);
       // The saved values are the new baseline, so the next save compares
       // against them and sends only what changes after this one.
       this.configDefaultMaxTurns = countLimitOrNull(savedSettings.defaultMaxTurns);
@@ -2319,8 +2654,16 @@ export class ScionPageProjectSettings extends LitElement {
       const otherWarnings = allWarnings.filter(
         (w): w is string => typeof w === 'string' && !isCountLimitWarning(w)
       );
-      this.profileDefaultWarnings = splitProfileWarnings(otherWarnings);
+      const brokerWarnings = otherWarnings.filter(isBrokerDefaultMessage);
+      const profileAndGeneralWarnings = otherWarnings.filter((w) => !isBrokerDefaultMessage(w));
+      this.brokerDefaultWarnings = splitBrokerWarnings(
+        brokerWarnings,
+        this.knownFlatProjectBrokers
+      );
+      this.profileDefaultWarnings = splitProfileWarnings(profileAndGeneralWarnings);
       const warningCount =
+        Object.values(this.brokerDefaultWarnings.byBroker).flat().length +
+        this.brokerDefaultWarnings.general.length +
         Object.values(this.profileDefaultWarnings.byProfile).flat().length +
         this.profileDefaultWarnings.general.length +
         this.countLimitWarnings.length;
@@ -2361,6 +2704,18 @@ export class ScionPageProjectSettings extends LitElement {
         );
       }
 
+      if (response.status === 200) {
+        const body = (await response.json().catch(() => null)) as {
+          storageKept?: Array<{ code?: string; message?: string }>;
+        } | null;
+        const keptMessages = (body?.storageKept ?? [])
+          .map((item) => item.message?.trim() ?? '')
+          .filter((msg) => msg.length > 0);
+        if (keptMessages.length > 0) {
+          showToast(`Project "${projectName}" deleted. ${keptMessages.join(' ')}`, 'warning');
+        }
+      }
+
       // Navigate back to projects list
       navigateTo('/projects');
     } catch (err) {
@@ -2369,6 +2724,24 @@ export class ScionPageProjectSettings extends LitElement {
     } finally {
       this.deleteLoading = false;
     }
+  }
+
+  private projectNamed(allowPending: boolean): Named | null {
+    const id = this.projectId.trim();
+    if (!id) return null;
+    if (this.project) {
+      return {
+        id,
+        label: projectDisplayName(this.project, id),
+      };
+    }
+    const cached = projectLabelNow(id);
+    return allowPending ? cached : { id: cached.id, label: cached.label };
+  }
+
+  private ancestorCrumbs(allowPending: boolean) {
+    const project = this.projectNamed(allowPending);
+    return project ? projectTrail(project) : [projectsRoot()];
   }
 
   override render() {
@@ -2380,15 +2753,16 @@ export class ScionPageProjectSettings extends LitElement {
       return this.renderError();
     }
 
+    const projectLabel = projectDisplayName(this.project);
+    const backLabel = projectLabel || 'Project';
+    const crumbs = [...this.ancestorCrumbs(false), current('Settings', false)];
+
     return html`
-      <a href="/projects/${this.projectId}" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        Back to Project
-      </a>
+      <scion-breadcrumb .crumbs=${crumbs}></scion-breadcrumb>
 
       <div class="header">
         <sl-icon name="gear"></sl-icon>
-        <h1>${this.project.name} Settings</h1>
+        <h1>${backLabel} Settings</h1>
       </div>
 
       ${this.renderConfigSection()} ${this.renderMembersSection()} ${this.renderResourcesSection()}
@@ -2429,9 +2803,9 @@ export class ScionPageProjectSettings extends LitElement {
           `}
 
       <div class="done-footer">
-        <sl-button variant="default" href="/projects/${this.projectId}">
+        <sl-button variant="default" href="/projects/${encodeURIComponent(this.projectId)}">
           <sl-icon slot="prefix" name="arrow-left"></sl-icon>
-          Back to ${this.project.name}
+          Back to ${backLabel}
         </sl-button>
       </div>
     `;
@@ -2790,7 +3164,7 @@ export class ScionPageProjectSettings extends LitElement {
             >Limits</sl-tab
           >
           <sl-tab slot="nav" panel="resources" ?active=${this.activeConfigTab === 'resources'}
-            >Resources</sl-tab
+            >Agent Resources</sl-tab
           >
           <sl-tab slot="nav" panel="brokers" ?active=${this.activeConfigTab === 'brokers'}
             >Runtime Brokers</sl-tab
@@ -3256,7 +3630,7 @@ export class ScionPageProjectSettings extends LitElement {
                     </div>
                   `
                 : ''}
-              ${this.renderProfileDefaults(canEdit)}
+              ${this.renderBrokerDefaults(canEdit)} ${this.renderProfileDefaults(canEdit)}
             </div>
           </sl-tab-panel>
 
@@ -3455,7 +3829,7 @@ export class ScionPageProjectSettings extends LitElement {
 
     return html`
       <div class="section">
-        <h2>Resources</h2>
+        <h2>Project Resources</h2>
         <p>Project-scoped resources available to agents.</p>
 
         <sl-tab-group
@@ -3647,6 +4021,7 @@ export class ScionPageProjectSettings extends LitElement {
 
         <sl-tab-group
           @sl-tab-show=${(e: CustomEvent) => {
+            if (e.target !== e.currentTarget) return;
             this.activeSchedulesTab = (e.detail as { name: string }).name;
           }}
         >
@@ -3782,6 +4157,7 @@ export class ScionPageProjectSettings extends LitElement {
           <div class="broker-name-row">
             <span class="broker-name">${broker.name}</span>
             ${isDefault ? html`<span class="broker-default-badge">Default</span>` : ''}
+            ${renderPolicyBlockedTag(broker)}
           </div>
           <div class="broker-meta-row">
             <span>${broker.status}</span>
@@ -3842,6 +4218,7 @@ export class ScionPageProjectSettings extends LitElement {
 
   private renderLoading() {
     return html`
+      <scion-breadcrumb .crumbs=${this.ancestorCrumbs(true)}></scion-breadcrumb>
       <div class="loading-state">
         <sl-spinner></sl-spinner>
         <p>Loading settings...</p>
@@ -3904,6 +4281,7 @@ export class ScionPageProjectSettings extends LitElement {
         </div>
         <div class="delete-actions">
           <sl-button
+            data-delete-project
             variant="danger"
             size="small"
             ?loading=${this.deleteLoading}
@@ -3946,10 +4324,7 @@ export class ScionPageProjectSettings extends LitElement {
   private renderError() {
     if (this.noAccess) {
       return html`
-        <a href="/projects" class="back-link">
-          <sl-icon name="arrow-left"></sl-icon>
-          Back to Projects
-        </a>
+        <scion-breadcrumb .crumbs=${[projectsRoot()]}></scion-breadcrumb>
 
         <div class="error-state" data-project-no-access>
           <sl-icon name="exclamation-triangle"></sl-icon>
@@ -3959,10 +4334,7 @@ export class ScionPageProjectSettings extends LitElement {
       `;
     }
     return html`
-      <a href="/projects/${this.projectId}" class="back-link">
-        <sl-icon name="arrow-left"></sl-icon>
-        Back to Project
-      </a>
+      <scion-breadcrumb .crumbs=${this.ancestorCrumbs(false)}></scion-breadcrumb>
 
       <div class="error-state">
         <sl-icon name="exclamation-triangle"></sl-icon>

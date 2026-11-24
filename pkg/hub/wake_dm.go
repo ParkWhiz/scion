@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -92,6 +94,14 @@ func wakeDeleteWonError(agentID string) *AgentDMError {
 // Returns (*WakeResult, nil) on success or (nil, *AgentDMError) on failure.
 // On failure, no message should be dispatched (AC-4).
 func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeResult, *AgentDMError) {
+	if isShellAgent(agent) {
+		return nil, shellAgentNotMessageableError(agent)
+	}
+	if agent != nil && agent.IdleSuspendClaimActive {
+		if err := s.waitForIdleSuspendToSettle(ctx, agent); err != nil {
+			return nil, startInProgressDMError(agent, err)
+		}
+	}
 	// The effective resting phase (ptone/scion#4669): an error row that
 	// remembers the suspended phase a failed asynchronous resume began from
 	// wakes as a suspended agent; a local only, agent.Phase is unchanged.
@@ -157,6 +167,18 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 		if err := s.checkPinnedPlacement(agent); err != nil {
 			return nil, runtimeTargetDMError(err)
 		}
+		// Admin-managed broker policy pre-check (ptone/scion#7829 §4.3.D):
+		// refused wake leaves the agent suspended with a non-retryable 403.
+		if err := s.checkBrokerPolicyForStart(ctx, agent); err != nil {
+			if dmErr := brokerPolicyDMError(ctx, err); dmErr != nil {
+				return nil, dmErr
+			}
+			return nil, &AgentDMError{
+				Code:       ErrCodeInternalError,
+				Message:    "Failed to wake agent: " + err.Error(),
+				HTTPStatus: http.StatusInternalServerError,
+			}
+		}
 
 		// Resume the suspended agent (continue=true restores its prior
 		// session) under a start claim of kind wake, which records run
@@ -185,16 +207,18 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 		// (SyncDispatchBound) and, when the caller has a deadline, by that
 		// deadline too (KeepCallerDeadline; the earlier wins). The caller's
 		// deadline also shortens the readiness wait below. This path is
-		// shared by the user and agent direct messages and the chat wake;
-		// only the chat wake carries a deadline today (its resume budget).
+		// shared by the user and agent direct messages and the live and
+		// scheduled chat wakes; only the chat wakes carry a deadline today
+		// (their resume budget).
 		//
 		// A wake request that already ended (cancelled, or its time budget
 		// ran out) during the admission checks or the start gate gets no
-		// resume. On the direct-message paths the message is persisted on
-		// the request after the wake, so nobody would receive it; the chat
-		// wake persists on a detached context but answers the sender with
-		// an error once its wake budget is spent. Either way the resume
-		// would serve nobody. Nothing is claimed, dispatched or written.
+		// resume. On the direct-message and scheduled-chat paths the
+		// message is persisted on the caller's context after the wake, so
+		// nobody would receive it; the live chat wake persists on a
+		// detached context (DetachWake) but answers the sender with an
+		// error once its wake budget is spent. Either way the resume would
+		// serve nobody. Nothing is claimed, dispatched or written.
 		if err := ctx.Err(); err != nil {
 			s.messageLog.Info("wake: skipped, the wake request ended or its time budget ran out before the resume",
 				"agent_id", agent.ID, "error", err)
@@ -253,6 +277,7 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 				return nil
 			}
 			agent.Phase = string(state.PhaseStarting)
+			agent.Activity = ""
 			// The dispatch leg is over. End the lifecycle op so the
 			// readiness wait sees a heartbeat-reported exit. Residual (as
 			// before ptone/scion#2014): a heartbeat gathered before the
@@ -306,9 +331,13 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 			}
 			agent.Phase = string(state.PhaseRunning)
 			agent.Activity = string(readyActivity)
+			agent.SuspendReason = ""
 			return nil
 		}})
 		if err != nil {
+			if dmErr := brokerPolicyDMError(launchCtx, err); dmErr != nil {
+				return nil, dmErr
+			}
 			var quotaErr *startQuotaError
 			if errors.As(err, &quotaErr) {
 				var conflict *ReservationScopeConflictError
@@ -388,11 +417,19 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 					HTTPStatus: http.StatusServiceUnavailable,
 				}
 			}
-			if errors.Is(err, errBrokerLacksEmptyPerAgent) {
-				// Fail closed like the other dispatch sites (design #2703 D3).
+			if isUnsupportedWorkspaceModeError(err) {
+				// Fail closed like the other dispatch sites (design #2703 D3, ptone/scion#7865).
 				return nil, &AgentDMError{
 					Code:       ErrCodeUnsupportedCapability,
 					Message:    "Failed to wake agent: " + err.Error(),
+					HTTPStatus: http.StatusPreconditionFailed,
+				}
+			}
+			var se *brokerStatusError
+			if errors.As(err, &se) && se.StatusCode == http.StatusPreconditionFailed && se.brokerErrorCode() == api.BrokerErrCodeUnsupportedCapability {
+				return nil, &AgentDMError{
+					Code:       ErrCodeUnsupportedCapability,
+					Message:    "Failed to wake agent: " + se.brokerErrorMessage(),
 					HTTPStatus: http.StatusPreconditionFailed,
 				}
 			}
@@ -471,7 +508,7 @@ func (s *Server) wakeAgentForDM(ctx context.Context, agent *store.Agent) (*WakeR
 	case state.PhaseHalted:
 		return nil, &AgentDMError{
 			Code:       ErrCodeValidationError,
-			Message:    "Agent was halted by the platform — use 'scion start' to restart it",
+			Message:    "Agent was halted by the platform — use 'scion resume' to restart it",
 			HTTPStatus: http.StatusBadRequest,
 		}
 
@@ -496,11 +533,72 @@ func validateGroupMemberDeliverable(agent *store.Agent) *AgentDMError {
 	return err
 }
 
-// validateAgentDeliverable checks that the target agent is in a state that
-// can accept message delivery when wake was NOT requested. Returns nil when
-// the agent is running, or a typed error describing why delivery is not
-// possible.
+// groupMemberDeliverableError is validateGroupMemberDeliverable aware of
+// server-side auto-wake: when shouldAutoWake(agent) holds (lifecycle.idle_suspend
+// enabled and suspend_reason is idle or stalled), a direct message wakes the
+// agent automatically without --wake, so the hint omits "--wake".
+func (s *Server) groupMemberDeliverableError(agent *store.Agent) *AgentDMError {
+	err := s.validateAgentDeliverable(agent)
+	claimSuspending := agent != nil && agent.IdleSuspendClaimActive
+	if err != nil && (state.Phase(store.EffectiveRestingPhase(agent)) == state.PhaseSuspended || claimSuspending) {
+		err.Message = fmt.Sprintf("agent %q is suspended; group messages do not wake agents — message it directly with --wake", agent.Slug)
+	}
+	if err != nil && (s.shouldAutoWake(agent) || (claimSuspending && s != nil && s.experimentEnabled(experiments.IdleSuspend))) {
+		err.Message = fmt.Sprintf("agent %q is suspended; group messages do not wake agents — message it directly to wake and deliver", agent.Slug)
+	}
+	return err
+}
+
+// validateAgentDeliverable checks target deliverability, always honouring an
+// active idle-suspend claim on the target row regardless of current settings.
+func (s *Server) validateAgentDeliverable(agent *store.Agent) *AgentDMError {
+	return validateAgentDeliverable(agent)
+}
+
+func agentTargetLabel(agent *store.Agent) string {
+	if agent == nil {
+		return ""
+	}
+	if agent.Slug != "" {
+		return agent.Slug
+	}
+	if agent.Name != "" {
+		return agent.Name
+	}
+	return agent.ID
+}
+
+// validateAgentDeliverable checks that the target agent can accept message
+// delivery when wake was NOT requested. Shell execution containers are always
+// refused with ErrCodeAgentNotMessageable (ptone/scion#8812 §3.4 S5).
+// Returns nil when the agent is running and messageable, or a typed error.
 func validateAgentDeliverable(agent *store.Agent) *AgentDMError {
+	if isShellAgent(agent) {
+		return shellAgentNotMessageableError(agent)
+	}
+	return validateAgentRunning(agent)
+}
+
+// validateAgentRunning checks only whether the target agent is in a running
+// phase (not suspended, stopped, etc.), without applying messageability rules.
+// Used by validateAgentDeliverable and by exec-action preflight (which is
+// allowed to target shell execution containers when authored by a human).
+func validateAgentRunning(agent *store.Agent) *AgentDMError {
+	if agent == nil {
+		return &AgentDMError{
+			Code:       ErrCodeAgentNotRunning,
+			Message:    "agent is not running",
+			HTTPStatus: http.StatusConflict,
+		}
+	}
+	label := agentTargetLabel(agent)
+	if agent.IdleSuspendClaimActive {
+		return &AgentDMError{
+			Code:       ErrCodeAgentNotRunning,
+			Message:    fmt.Sprintf("agent %q is suspended; use --wake to resume and deliver", label),
+			HTTPStatus: http.StatusConflict,
+		}
+	}
 	rest := store.EffectiveRestingPhase(agent)
 	phase := state.Phase(rest)
 	switch phase {
@@ -509,31 +607,31 @@ func validateAgentDeliverable(agent *store.Agent) *AgentDMError {
 	case state.PhaseSuspended:
 		return &AgentDMError{
 			Code:       ErrCodeAgentNotRunning,
-			Message:    fmt.Sprintf("agent %q is suspended; use --wake to resume and deliver", agent.Slug),
+			Message:    fmt.Sprintf("agent %q is suspended; use --wake to resume and deliver", label),
 			HTTPStatus: http.StatusConflict,
 		}
 	case state.PhaseStopped:
 		return &AgentDMError{
 			Code:       ErrCodeAgentNotRunning,
-			Message:    fmt.Sprintf("agent %q is stopped; use 'scion resume' to restart it with its previous state", agent.Slug),
+			Message:    fmt.Sprintf("agent %q is stopped; use 'scion resume' to restart it with its previous state", label),
 			HTTPStatus: http.StatusConflict,
 		}
 	case state.PhaseError:
 		return &AgentDMError{
 			Code:       ErrCodeAgentNotRunning,
-			Message:    fmt.Sprintf("agent %q is in error state; use 'scion resume' to restart", agent.Slug),
+			Message:    fmt.Sprintf("agent %q is in error state; use 'scion resume' to restart", label),
 			HTTPStatus: http.StatusConflict,
 		}
 	case state.PhaseHalted:
 		return &AgentDMError{
 			Code:       ErrCodeAgentNotRunning,
-			Message:    fmt.Sprintf("agent %q is halted; use 'scion start' to restart it", agent.Slug),
+			Message:    fmt.Sprintf("agent %q is halted; use 'scion resume' to restart it", label),
 			HTTPStatus: http.StatusConflict,
 		}
 	default:
 		return &AgentDMError{
 			Code:       ErrCodeAgentNotRunning,
-			Message:    fmt.Sprintf("agent %q is not yet running (phase: %s); wait for it to reach running state", agent.Slug, rest),
+			Message:    fmt.Sprintf("agent %q is not yet running (phase: %s); wait for it to reach running state", label, rest),
 			HTTPStatus: http.StatusConflict,
 		}
 	}
@@ -541,11 +639,14 @@ func validateAgentDeliverable(agent *store.Agent) *AgentDMError {
 
 // deferredReason is the note a deferred delivery reports: a migrating
 // recipient, or another start of the recipient already in progress.
-func deferredReason(agent *store.Agent) string {
+func (s *Server) deferredReason(agent *store.Agent) string {
 	if reincarnationInFlight(agent) {
 		return "agent is reincarnating"
 	}
-	if agent.StartClaimKind == store.StartClaimStop {
+	if agent != nil && agent.IdleSuspendClaimActive {
+		return "agent is suspending"
+	}
+	if agent != nil && agent.StartClaimKind == store.StartClaimStop {
 		return "a stop is in progress for the agent"
 	}
 	return "agent is already starting"

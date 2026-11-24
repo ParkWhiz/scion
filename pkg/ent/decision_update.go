@@ -43,6 +43,20 @@ func (_u *DecisionUpdate) SetNillableStatus(v *decision.Status) *DecisionUpdate 
 	return _u
 }
 
+// SetSettled sets the "settled" field.
+func (_u *DecisionUpdate) SetSettled(v bool) *DecisionUpdate {
+	_u.mutation.SetSettled(v)
+	return _u
+}
+
+// SetNillableSettled sets the "settled" field if the given value is not nil.
+func (_u *DecisionUpdate) SetNillableSettled(v *bool) *DecisionUpdate {
+	if v != nil {
+		_u.SetSettled(*v)
+	}
+	return _u
+}
+
 // SetReplacedByID sets the "replaced_by_id" field.
 func (_u *DecisionUpdate) SetReplacedByID(v uuid.UUID) *DecisionUpdate {
 	_u.mutation.SetReplacedByID(v)
@@ -103,6 +117,66 @@ func (_u *DecisionUpdate) ClearReplacedAt() *DecisionUpdate {
 	return _u
 }
 
+// SetWithdrawnAt sets the "withdrawn_at" field.
+func (_u *DecisionUpdate) SetWithdrawnAt(v time.Time) *DecisionUpdate {
+	_u.mutation.SetWithdrawnAt(v)
+	return _u
+}
+
+// SetNillableWithdrawnAt sets the "withdrawn_at" field if the given value is not nil.
+func (_u *DecisionUpdate) SetNillableWithdrawnAt(v *time.Time) *DecisionUpdate {
+	if v != nil {
+		_u.SetWithdrawnAt(*v)
+	}
+	return _u
+}
+
+// ClearWithdrawnAt clears the value of the "withdrawn_at" field.
+func (_u *DecisionUpdate) ClearWithdrawnAt() *DecisionUpdate {
+	_u.mutation.ClearWithdrawnAt()
+	return _u
+}
+
+// SetWithdrawnReason sets the "withdrawn_reason" field.
+func (_u *DecisionUpdate) SetWithdrawnReason(v string) *DecisionUpdate {
+	_u.mutation.SetWithdrawnReason(v)
+	return _u
+}
+
+// SetNillableWithdrawnReason sets the "withdrawn_reason" field if the given value is not nil.
+func (_u *DecisionUpdate) SetNillableWithdrawnReason(v *string) *DecisionUpdate {
+	if v != nil {
+		_u.SetWithdrawnReason(*v)
+	}
+	return _u
+}
+
+// ClearWithdrawnReason clears the value of the "withdrawn_reason" field.
+func (_u *DecisionUpdate) ClearWithdrawnReason() *DecisionUpdate {
+	_u.mutation.ClearWithdrawnReason()
+	return _u
+}
+
+// SetDismissedAt sets the "dismissed_at" field.
+func (_u *DecisionUpdate) SetDismissedAt(v time.Time) *DecisionUpdate {
+	_u.mutation.SetDismissedAt(v)
+	return _u
+}
+
+// SetNillableDismissedAt sets the "dismissed_at" field if the given value is not nil.
+func (_u *DecisionUpdate) SetNillableDismissedAt(v *time.Time) *DecisionUpdate {
+	if v != nil {
+		_u.SetDismissedAt(*v)
+	}
+	return _u
+}
+
+// ClearDismissedAt clears the value of the "dismissed_at" field.
+func (_u *DecisionUpdate) ClearDismissedAt() *DecisionUpdate {
+	_u.mutation.ClearDismissedAt()
+	return _u
+}
+
 // Mutation returns the DecisionMutation object of the builder.
 func (_u *DecisionUpdate) Mutation() *DecisionMutation {
 	return _u.mutation
@@ -160,11 +234,26 @@ func (_u *DecisionUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.ConversationIDCleared() {
 		_spec.ClearField(decision.FieldConversationID, field.TypeUUID)
 	}
+	if _u.mutation.ChatKeyCleared() {
+		_spec.ClearField(decision.FieldChatKey, field.TypeString)
+	}
 	if _u.mutation.DefaultChoiceIDCleared() {
 		_spec.ClearField(decision.FieldDefaultChoiceID, field.TypeString)
 	}
+	if _u.mutation.OtherLabelCleared() {
+		_spec.ClearField(decision.FieldOtherLabel, field.TypeString)
+	}
+	if _u.mutation.OtherDescriptionCleared() {
+		_spec.ClearField(decision.FieldOtherDescription, field.TypeString)
+	}
+	if _u.mutation.OtherPlaceholderCleared() {
+		_spec.ClearField(decision.FieldOtherPlaceholder, field.TypeString)
+	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(decision.FieldStatus, field.TypeEnum, value)
+	}
+	if value, ok := _u.mutation.Settled(); ok {
+		_spec.SetField(decision.FieldSettled, field.TypeBool, value)
 	}
 	if value, ok := _u.mutation.ReplacedByID(); ok {
 		_spec.SetField(decision.FieldReplacedByID, field.TypeUUID, value)
@@ -183,6 +272,24 @@ func (_u *DecisionUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.ReplacedAtCleared() {
 		_spec.ClearField(decision.FieldReplacedAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.WithdrawnAt(); ok {
+		_spec.SetField(decision.FieldWithdrawnAt, field.TypeTime, value)
+	}
+	if _u.mutation.WithdrawnAtCleared() {
+		_spec.ClearField(decision.FieldWithdrawnAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.WithdrawnReason(); ok {
+		_spec.SetField(decision.FieldWithdrawnReason, field.TypeString, value)
+	}
+	if _u.mutation.WithdrawnReasonCleared() {
+		_spec.ClearField(decision.FieldWithdrawnReason, field.TypeString)
+	}
+	if value, ok := _u.mutation.DismissedAt(); ok {
+		_spec.SetField(decision.FieldDismissedAt, field.TypeTime, value)
+	}
+	if _u.mutation.DismissedAtCleared() {
+		_spec.ClearField(decision.FieldDismissedAt, field.TypeTime)
 	}
 	if _node, err = sqlgraph.UpdateNodes(ctx, _u.driver, _spec); err != nil {
 		if _, ok := err.(*sqlgraph.NotFoundError); ok {
@@ -214,6 +321,20 @@ func (_u *DecisionUpdateOne) SetStatus(v decision.Status) *DecisionUpdateOne {
 func (_u *DecisionUpdateOne) SetNillableStatus(v *decision.Status) *DecisionUpdateOne {
 	if v != nil {
 		_u.SetStatus(*v)
+	}
+	return _u
+}
+
+// SetSettled sets the "settled" field.
+func (_u *DecisionUpdateOne) SetSettled(v bool) *DecisionUpdateOne {
+	_u.mutation.SetSettled(v)
+	return _u
+}
+
+// SetNillableSettled sets the "settled" field if the given value is not nil.
+func (_u *DecisionUpdateOne) SetNillableSettled(v *bool) *DecisionUpdateOne {
+	if v != nil {
+		_u.SetSettled(*v)
 	}
 	return _u
 }
@@ -275,6 +396,66 @@ func (_u *DecisionUpdateOne) SetNillableReplacedAt(v *time.Time) *DecisionUpdate
 // ClearReplacedAt clears the value of the "replaced_at" field.
 func (_u *DecisionUpdateOne) ClearReplacedAt() *DecisionUpdateOne {
 	_u.mutation.ClearReplacedAt()
+	return _u
+}
+
+// SetWithdrawnAt sets the "withdrawn_at" field.
+func (_u *DecisionUpdateOne) SetWithdrawnAt(v time.Time) *DecisionUpdateOne {
+	_u.mutation.SetWithdrawnAt(v)
+	return _u
+}
+
+// SetNillableWithdrawnAt sets the "withdrawn_at" field if the given value is not nil.
+func (_u *DecisionUpdateOne) SetNillableWithdrawnAt(v *time.Time) *DecisionUpdateOne {
+	if v != nil {
+		_u.SetWithdrawnAt(*v)
+	}
+	return _u
+}
+
+// ClearWithdrawnAt clears the value of the "withdrawn_at" field.
+func (_u *DecisionUpdateOne) ClearWithdrawnAt() *DecisionUpdateOne {
+	_u.mutation.ClearWithdrawnAt()
+	return _u
+}
+
+// SetWithdrawnReason sets the "withdrawn_reason" field.
+func (_u *DecisionUpdateOne) SetWithdrawnReason(v string) *DecisionUpdateOne {
+	_u.mutation.SetWithdrawnReason(v)
+	return _u
+}
+
+// SetNillableWithdrawnReason sets the "withdrawn_reason" field if the given value is not nil.
+func (_u *DecisionUpdateOne) SetNillableWithdrawnReason(v *string) *DecisionUpdateOne {
+	if v != nil {
+		_u.SetWithdrawnReason(*v)
+	}
+	return _u
+}
+
+// ClearWithdrawnReason clears the value of the "withdrawn_reason" field.
+func (_u *DecisionUpdateOne) ClearWithdrawnReason() *DecisionUpdateOne {
+	_u.mutation.ClearWithdrawnReason()
+	return _u
+}
+
+// SetDismissedAt sets the "dismissed_at" field.
+func (_u *DecisionUpdateOne) SetDismissedAt(v time.Time) *DecisionUpdateOne {
+	_u.mutation.SetDismissedAt(v)
+	return _u
+}
+
+// SetNillableDismissedAt sets the "dismissed_at" field if the given value is not nil.
+func (_u *DecisionUpdateOne) SetNillableDismissedAt(v *time.Time) *DecisionUpdateOne {
+	if v != nil {
+		_u.SetDismissedAt(*v)
+	}
+	return _u
+}
+
+// ClearDismissedAt clears the value of the "dismissed_at" field.
+func (_u *DecisionUpdateOne) ClearDismissedAt() *DecisionUpdateOne {
+	_u.mutation.ClearDismissedAt()
 	return _u
 }
 
@@ -365,11 +546,26 @@ func (_u *DecisionUpdateOne) sqlSave(ctx context.Context) (_node *Decision, err 
 	if _u.mutation.ConversationIDCleared() {
 		_spec.ClearField(decision.FieldConversationID, field.TypeUUID)
 	}
+	if _u.mutation.ChatKeyCleared() {
+		_spec.ClearField(decision.FieldChatKey, field.TypeString)
+	}
 	if _u.mutation.DefaultChoiceIDCleared() {
 		_spec.ClearField(decision.FieldDefaultChoiceID, field.TypeString)
 	}
+	if _u.mutation.OtherLabelCleared() {
+		_spec.ClearField(decision.FieldOtherLabel, field.TypeString)
+	}
+	if _u.mutation.OtherDescriptionCleared() {
+		_spec.ClearField(decision.FieldOtherDescription, field.TypeString)
+	}
+	if _u.mutation.OtherPlaceholderCleared() {
+		_spec.ClearField(decision.FieldOtherPlaceholder, field.TypeString)
+	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(decision.FieldStatus, field.TypeEnum, value)
+	}
+	if value, ok := _u.mutation.Settled(); ok {
+		_spec.SetField(decision.FieldSettled, field.TypeBool, value)
 	}
 	if value, ok := _u.mutation.ReplacedByID(); ok {
 		_spec.SetField(decision.FieldReplacedByID, field.TypeUUID, value)
@@ -388,6 +584,24 @@ func (_u *DecisionUpdateOne) sqlSave(ctx context.Context) (_node *Decision, err 
 	}
 	if _u.mutation.ReplacedAtCleared() {
 		_spec.ClearField(decision.FieldReplacedAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.WithdrawnAt(); ok {
+		_spec.SetField(decision.FieldWithdrawnAt, field.TypeTime, value)
+	}
+	if _u.mutation.WithdrawnAtCleared() {
+		_spec.ClearField(decision.FieldWithdrawnAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.WithdrawnReason(); ok {
+		_spec.SetField(decision.FieldWithdrawnReason, field.TypeString, value)
+	}
+	if _u.mutation.WithdrawnReasonCleared() {
+		_spec.ClearField(decision.FieldWithdrawnReason, field.TypeString)
+	}
+	if value, ok := _u.mutation.DismissedAt(); ok {
+		_spec.SetField(decision.FieldDismissedAt, field.TypeTime, value)
+	}
+	if _u.mutation.DismissedAtCleared() {
+		_spec.ClearField(decision.FieldDismissedAt, field.TypeTime)
 	}
 	_node = &Decision{config: _u.config}
 	_spec.Assign = _node.assignValues

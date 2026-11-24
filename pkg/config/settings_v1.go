@@ -364,9 +364,12 @@ func ValidateSharedDirSize(size string) error {
 // that need to distinguish "no mapping" from "settings error" should call
 // ResolveRuntime themselves first.
 //
-// Scion never creates, annotates, or binds the returned KSA: it must already
-// exist and already be bound to gsaEmail via Workload Identity, out of band,
-// by the operator (see docs-site/.../ha/setup-gcp.md).
+// Scion never creates, annotates, or binds a KSA returned from
+// kubernetes_service_account_mappings: an explicit mapping must already exist
+// and already be bound to gsaEmail via Workload Identity, out of band, by the
+// operator (see docs-site/.../ha/setup-gcp.md). Opt-in broker KSA creation
+// (CreateServiceAccounts) applies only to the conventional <gsa-account-id>
+// KSA when neither a mapping nor annotation discovery matches.
 //
 // This is the profileName-only convenience form: it resolves profileName's
 // own runtime entry name internally (via ResolveRuntime) before delegating
@@ -595,6 +598,33 @@ func ValidateKubernetesBlockServiceAccount(name string) error {
 	return nil
 }
 
+// WorkloadIdentityPoolSuffix ends every GKE Workload Identity pool name.
+const WorkloadIdentityPoolSuffix = ".svc.id.goog"
+
+// workloadIdentityPoolProject matches a GCP project ID: 6-30 characters,
+// lowercase letters, digits and hyphens, starting with a letter and not
+// ending with a hyphen. A domain-scoped project ("example.com:my-project")
+// has its own pool form and is not accepted.
+var workloadIdentityPoolProject = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
+
+// WorkloadIdentityPoolPattern is ValidateWorkloadIdentityPool as a JSON
+// schema pattern (the empty string allowed), shared by
+// settings-v1.schema.json and the admin settings registry.
+const WorkloadIdentityPoolPattern = `^$|^[a-z][a-z0-9-]{4,28}[a-z0-9]\.svc\.id\.goog$`
+
+// ValidateWorkloadIdentityPool checks that pool is a GKE Workload Identity
+// pool name, "<project-id>.svc.id.goog". An empty pool is valid (unset).
+func ValidateWorkloadIdentityPool(pool string) error {
+	if pool == "" {
+		return nil
+	}
+	project, ok := strings.CutSuffix(pool, WorkloadIdentityPoolSuffix)
+	if !ok || !workloadIdentityPoolProject.MatchString(project) {
+		return fmt.Errorf("workload_identity_pool: %q is not a Workload Identity pool; use <cluster-project-id>%s", pool, WorkloadIdentityPoolSuffix)
+	}
+	return nil
+}
+
 // ResolveKubernetesNamespace returns the namespace configured on the
 // runtimeEntryName entry of the runtimes: map, and whether one is set.
 // Profiles carry no namespace of their own: a profile that needs a
@@ -660,6 +690,57 @@ func ProjectSettingsHasKubernetesServiceAccountMappings(projectPath, runtimeEntr
 		}
 	}
 	return false
+}
+
+// ProjectSettingsHasWorkloadIdentityPool reports whether a project's OWN
+// settings.yaml sets workload_identity_pool on the named runtime entry.
+// Like ProjectSettingsHasKubernetesServiceAccountMappings it exists only so
+// a caller can warn that the setting has no effect there: the pool is read
+// only from the broker's global settings. Best-effort: an unreadable file
+// returns false.
+func ProjectSettingsHasWorkloadIdentityPool(projectPath, runtimeEntryName string) bool {
+	if runtimeEntryName == "" {
+		return false
+	}
+	raw, ok := readProjectOwnSettings(projectPath)
+	if !ok {
+		return false
+	}
+	var probe struct {
+		Runtimes map[string]struct {
+			WorkloadIdentityPool string `yaml:"workload_identity_pool" json:"workload_identity_pool"`
+		} `yaml:"runtimes" json:"runtimes"`
+	}
+	if err := unmarshalSettingsYAML(raw, &probe); err != nil {
+		return false
+	}
+	return probe.Runtimes[runtimeEntryName].WorkloadIdentityPool != ""
+}
+
+// ProjectSettingsHasCreateServiceAccounts reports whether a project's OWN
+// settings.yaml sets create_service_accounts (true or false) on the named
+// runtime entry. Like ProjectSettingsHasWorkloadIdentityPool it exists only so
+// a caller can warn that the setting has no effect there: KSA creation is read
+// only from the broker's global settings (with the hub settings overlay on a
+// co-located server), never from a project's settings. Best-effort: an
+// unreadable file returns false.
+func ProjectSettingsHasCreateServiceAccounts(projectPath, runtimeEntryName string) bool {
+	if runtimeEntryName == "" {
+		return false
+	}
+	raw, ok := readProjectOwnSettings(projectPath)
+	if !ok {
+		return false
+	}
+	var probe struct {
+		Runtimes map[string]struct {
+			CreateServiceAccounts *bool `yaml:"create_service_accounts" json:"create_service_accounts"`
+		} `yaml:"runtimes" json:"runtimes"`
+	}
+	if err := unmarshalSettingsYAML(raw, &probe); err != nil {
+		return false
+	}
+	return probe.Runtimes[runtimeEntryName].CreateServiceAccounts != nil
 }
 
 // readProjectOwnSettings returns the bytes of a project's OWN settings file,
@@ -1033,6 +1114,39 @@ func isKubernetesRuntimeEntry(name string, rt V1RuntimeConfig) bool {
 	return t == "kubernetes" || t == "k8s" || t == "remote"
 }
 
+// HarnessHonoursSettingsArgs reports whether settings.yaml's
+// harness_configs.<name>.args field is applied for the given harness type.
+// Only the "generic" harness honours settings-level harness args; other
+// harnesses ignore the field (ptone/scion#5082, ptone/scion#8490).
+func HarnessHonoursSettingsArgs(harnessName string) bool {
+	return harnessName == "generic"
+}
+
+// HarnessArgsIgnoredWarnings returns a warning for every harness_configs entry
+// that sets args for a harness type that ignores settings-level args. Only the
+// "generic" harness honours harness_configs.<name>.args; for other harnesses
+// the field is accepted and ignored. Results are sorted.
+func HarnessArgsIgnoredWarnings(harnessConfigs map[string]HarnessConfigEntry) []string {
+	var warnings []string
+	for name, hc := range harnessConfigs {
+		if len(hc.Args) == 0 {
+			continue
+		}
+		harnessName := hc.Harness
+		if harnessName == "" {
+			harnessName = name
+		}
+		if !HarnessHonoursSettingsArgs(harnessName) {
+			warnings = append(warnings, fmt.Sprintf(
+				"harness_configs.%s.args is set but harness %q ignores settings-level args; it is ignored (only the \"generic\" harness honours harness_configs.<name>.args)",
+				name, harnessName,
+			))
+		}
+	}
+	sort.Strings(warnings)
+	return warnings
+}
+
 // GetHubEndpoint returns the Hub endpoint from settings, or empty string if not configured.
 func (vs *VersionedSettings) GetHubEndpoint() string {
 	if vs.Hub != nil {
@@ -1392,6 +1506,9 @@ type VersionedSettings struct {
 	// AgentSecrets controls hub-level policy for secrets written by agents.
 	AgentSecrets *AgentSecretsSettings `json:"agent_secrets,omitempty" yaml:"agent_secrets,omitempty" koanf:"agent_secrets"`
 
+	// BrokerPolicy controls hub-level policy for Runtime Brokers.
+	BrokerPolicy *BrokerPolicySettings `json:"broker_policy,omitempty" yaml:"broker_policy,omitempty" koanf:"broker_policy"`
+
 	// ProjectID is the top-level project ID of a migrated legacy settings
 	// file, kept verbatim. hub.project_id is the canonical v1 key and takes
 	// precedence when set.
@@ -1425,6 +1542,15 @@ type AgentSecretsSettings struct {
 	// scope secrets only. Default false (nil is false): agents may write
 	// project scope as they do today.
 	UserScopeOnly *bool `json:"user_scope_only,omitempty" yaml:"user_scope_only,omitempty" koanf:"user_scope_only"`
+}
+
+// BrokerPolicySettings holds the hub-level policy for Runtime Brokers in
+// settings.yaml (ptone/scion#7829).
+type BrokerPolicySettings struct {
+	// AdminManagedOnly, when true (and experiment hub.admin_managed_brokers is
+	// enabled), restricts Runtime Broker registration, attachment, placement,
+	// and agent starts to admin-managed brokers. Default false (nil is false).
+	AdminManagedOnly *bool `json:"admin_managed_only,omitempty" yaml:"admin_managed_only,omitempty" koanf:"admin_managed_only"`
 }
 
 // ProjectDefaultsSettings holds project creation defaults in settings.yaml.
@@ -1568,13 +1694,15 @@ type V1ServerConfig struct {
 
 // V1GitHubAppConfig holds the GitHub App configuration in settings.yaml format.
 type V1GitHubAppConfig struct {
-	AppID           int64  `json:"app_id,omitempty" yaml:"app_id,omitempty" koanf:"app_id"`
-	PrivateKeyPath  string `json:"private_key_path,omitempty" yaml:"private_key_path,omitempty" koanf:"private_key_path"`
-	PrivateKey      string `json:"private_key,omitempty" yaml:"private_key,omitempty" koanf:"private_key"`
-	WebhookSecret   string `json:"webhook_secret,omitempty" yaml:"webhook_secret,omitempty" koanf:"webhook_secret"`
-	APIBaseURL      string `json:"api_base_url,omitempty" yaml:"api_base_url,omitempty" koanf:"api_base_url"`
-	WebhooksEnabled bool   `json:"webhooks_enabled,omitempty" yaml:"webhooks_enabled,omitempty" koanf:"webhooks_enabled"`
-	InstallationURL string `json:"installation_url,omitempty" yaml:"installation_url,omitempty" koanf:"installation_url"`
+	AppID                 int64    `json:"app_id,omitempty" yaml:"app_id,omitempty" koanf:"app_id"`
+	PrivateKeyPath        string   `json:"private_key_path,omitempty" yaml:"private_key_path,omitempty" koanf:"private_key_path"`
+	PrivateKey            string   `json:"private_key,omitempty" yaml:"private_key,omitempty" koanf:"private_key"`
+	WebhookSecret         string   `json:"webhook_secret,omitempty" yaml:"webhook_secret,omitempty" koanf:"webhook_secret"`
+	APIBaseURL            string   `json:"api_base_url,omitempty" yaml:"api_base_url,omitempty" koanf:"api_base_url"`
+	WebhooksEnabled       bool     `json:"webhooks_enabled,omitempty" yaml:"webhooks_enabled,omitempty" koanf:"webhooks_enabled"`
+	InstallationURL       string   `json:"installation_url,omitempty" yaml:"installation_url,omitempty" koanf:"installation_url"`
+	AppSlug               string   `json:"app_slug,omitempty" yaml:"app_slug,omitempty" koanf:"app_slug"`
+	CommandMentionAliases []string `json:"command_mention_aliases,omitempty" yaml:"command_mention_aliases,omitempty" koanf:"command_mention_aliases"`
 }
 
 // V1SchedulerConfig holds configuration for the Hub background task scheduler.
@@ -1785,6 +1913,11 @@ type V1ServerHubConfig struct {
 	// config.ValidateAgentEndpoint for the exact rules and the normalized
 	// form this field should hold.
 	AgentEndpoint string `json:"agent_endpoint,omitempty" yaml:"agent_endpoint,omitempty" koanf:"agent_endpoint"`
+	// InternalURL optionally sets the Hub URL hub-managed broker plugins
+	// call the Hub API on (their hub_url); see HubServerConfig.InternalURL.
+	// public_url stays the public URL of record. File/env only: the
+	// server-config API refuses it in every mode (HubInternalURLKey).
+	InternalURL string `json:"internal_url,omitempty" yaml:"internal_url,omitempty" koanf:"internal_url"`
 	// MonitoringDashboardURL is an optional absolute http(s) URL of an
 	// external monitoring dashboard; the Health page links to it when set.
 	// See ValidateMonitoringDashboardURL.
@@ -1793,11 +1926,18 @@ type V1ServerHubConfig struct {
 	WriteTimeout           string        `json:"write_timeout,omitempty" yaml:"write_timeout,omitempty" koanf:"write_timeout"`
 	CORS                   *V1CORSConfig `json:"cors,omitempty" yaml:"cors,omitempty" koanf:"cors"`
 	AdminEmails            []string      `json:"admin_emails,omitempty" yaml:"admin_emails,omitempty" koanf:"admin_emails"`
+	// AllowedImportSources is server.hub.allowed_import_sources (see
+	// HubServerConfig.AllowedImportSources). It is settings-file only (no env):
+	// the server-config API refuses it in every mode (AllowedImportSourcesKey).
+	AllowedImportSources []string `json:"allowed_import_sources,omitempty" yaml:"allowed_import_sources,omitempty" koanf:"allowed_import_sources"`
 
 	// SoftDeleteRetention is how long soft-deleted agents are retained (e.g., "72h").
 	SoftDeleteRetention string `json:"soft_delete_retention,omitempty" yaml:"soft_delete_retention,omitempty" koanf:"soft_delete_retention"`
 	// SoftDeleteRetainFiles controls whether workspace files are preserved during soft-delete.
 	SoftDeleteRetainFiles *bool `json:"soft_delete_retain_files,omitempty" yaml:"soft_delete_retain_files,omitempty" koanf:"soft_delete_retain_files"`
+	// AuditRetentionDays is the number of days to retain mutation audit records
+	// in the Hub database (default 90; 0 disables cleanup; negative rejected).
+	AuditRetentionDays *int `json:"audit_retention_days,omitempty" yaml:"audit_retention_days,omitempty" koanf:"audit_retention_days"`
 	// Chat holds web chat server limits (server.hub.chat).
 	Chat *V1ServerHubChatConfig `json:"chat,omitempty" yaml:"chat,omitempty" koanf:"chat"`
 	// GCPIAMCheckMode controls whether IAM actAs permission is checked when
@@ -1811,6 +1951,10 @@ type V1ServerHubConfig struct {
 	AutoSuspendStalled *bool `json:"auto_suspend_stalled,omitempty" yaml:"auto_suspend_stalled,omitempty" koanf:"auto_suspend_stalled"`
 	// StalledThreshold is how long before an agent is marked stalled (e.g., "5m", "10m").
 	StalledThreshold string `json:"stalled_threshold,omitempty" yaml:"stalled_threshold,omitempty" koanf:"stalled_threshold"`
+	// AutoSuspendIdle controls whether idle, completed, and harness-error agents are automatically suspended.
+	AutoSuspendIdle *bool `json:"auto_suspend_idle,omitempty" yaml:"auto_suspend_idle,omitempty" koanf:"auto_suspend_idle"`
+	// IdleSuspendAfter is how long an agent must hold a suspend-eligible activity before idle auto-suspend applies (default "15m", minimum "5m").
+	IdleSuspendAfter string `json:"idle_suspend_after,omitempty" yaml:"idle_suspend_after,omitempty" koanf:"idle_suspend_after"`
 	// MissingAgentGrace is how long a running agent must be absent from its
 	// runtime broker's complete heartbeat inventory before the Hub marks it
 	// as having no container (e.g., "3m"; minimum "1m").
@@ -1861,6 +2005,41 @@ type V1ServerHubConfig struct {
 	// Observability holds the hub's own metrics and trace export switches
 	// (server.hub.observability). Read at startup; changes need a restart.
 	Observability *V1ServerHubObservabilityConfig `json:"observability,omitempty" yaml:"observability,omitempty" koanf:"observability"`
+	// SystemOne holds Hub-wide System One rule evaluation settings
+	// (server.hub.system_one).
+	SystemOne *V1ServerHubSystemOneConfig `json:"system_one,omitempty" yaml:"system_one,omitempty" koanf:"system_one"`
+	// Branding holds Hub-wide UI branding settings (server.hub.branding).
+	Branding *BrandingConfig `json:"branding,omitempty" yaml:"branding,omitempty" koanf:"branding"`
+	// Schedules holds the limits on recurring schedules
+	// (server.hub.schedules). Read at startup.
+	Schedules *V1ServerHubSchedulesConfig `json:"schedules,omitempty" yaml:"schedules,omitempty" koanf:"schedules"`
+	// DefaultMessageMode is the message mode of a new agent when neither the
+	// create request, its template nor its parent agent sets one ("" =
+	// "project"; one of none, lineage, branch, project). Read at startup.
+	DefaultMessageMode string `json:"default_message_mode,omitempty" yaml:"default_message_mode,omitempty" koanf:"default_message_mode"`
+}
+
+// V1ServerHubSchedulesConfig holds the limits on recurring schedules
+// (server.hub.schedules).
+type V1ServerHubSchedulesConfig struct {
+	// MinInterval is the shortest interval a recurring schedule may fire at
+	// (e.g. "5m"; default "5m", "0s" turns the check off, at most "24h").
+	MinInterval string `json:"min_interval,omitempty" yaml:"min_interval,omitempty" koanf:"min_interval"`
+	// MaxActivePerProject caps the active recurring schedules of one
+	// project (default 100; 0 = no cap).
+	MaxActivePerProject *int `json:"max_active_per_project,omitempty" yaml:"max_active_per_project,omitempty" koanf:"max_active_per_project"`
+}
+
+// V1ServerHubSystemOneConfig holds Hub-wide System One rule evaluation
+// settings (server.hub.system_one).
+type V1ServerHubSystemOneConfig struct {
+	// MaxEvalTime bounds wall-clock evaluation of System One rules on a
+	// single message (e.g. "3s"; default "3s", hard max "30s").
+	MaxEvalTime string `json:"max_eval_time,omitempty" yaml:"max_eval_time,omitempty" koanf:"max_eval_time"`
+	// SecretNames maps System One adapter IDs to extra permitted named-secret
+	// keys (server.hub.system_one.secret_names). Startup/operator-only: never
+	// writable or echoed through the server-config API.
+	SecretNames map[string][]string `json:"secret_names,omitempty" yaml:"secret_names,omitempty" koanf:"secret_names"`
 }
 
 // V1ServerHubObservabilityConfig holds the switches for the hub's own
@@ -2169,6 +2348,19 @@ type V1RuntimeTargetConfig struct {
 	// descriptor or the persisted target identity. Kubernetes only.
 	KubernetesBlockServiceAccount    string            `json:"kubernetes_block_service_account,omitempty" yaml:"kubernetes_block_service_account,omitempty" koanf:"kubernetes_block_service_account"`
 	KubernetesServiceAccountMappings map[string]string `json:"kubernetes_service_account_mappings,omitempty" yaml:"kubernetes_service_account_mappings,omitempty" koanf:"kubernetes_service_account_mappings"`
+	// WorkloadIdentityPool is the flat counterpart of the runtime entry
+	// setting of the same name (V1RuntimeConfig.WorkloadIdentityPool).
+	// Local operator policy: never part of the runtime target descriptor,
+	// the persisted target identity or the presentation. Kubernetes only.
+	WorkloadIdentityPool string `json:"workload_identity_pool,omitempty" yaml:"workload_identity_pool,omitempty" koanf:"workload_identity_pool"`
+	// CreateServiceAccounts opts this flat Kubernetes instance into creating
+	// (or reusing a Scion-labeled) conventional Kubernetes ServiceAccount
+	// (<gsa-account-id>) via a single Get-by-name in the instance namespace
+	// when kubernetes_service_account_mappings misses and the Hub authorizes
+	// creation (ptone/scion#7967). Default false. Local operator policy:
+	// never part of the runtime target descriptor, the persisted target
+	// identity or the presentation. Kubernetes only.
+	CreateServiceAccounts bool `json:"create_service_accounts,omitempty" yaml:"create_service_accounts,omitempty" koanf:"create_service_accounts"`
 	// SharedDirStorageClass and SharedDirSize are this Kubernetes
 	// instance's defaults for the ReadWriteMany PVCs backing project shared
 	// dirs: the flat counterparts of the runtime entry and profile settings
@@ -2210,21 +2402,26 @@ type V1RuntimeTargetConfig struct {
 	SharedDirStorageBackends map[string]string `json:"shared_dir_storage_backends,omitempty" yaml:"shared_dir_storage_backends,omitempty" koanf:"shared_dir_storage_backends"`
 	HomeStorageBackend       string            `json:"home_storage_backend,omitempty" yaml:"home_storage_backend,omitempty" koanf:"home_storage_backend"`
 	HomeStorageLeaf          string            `json:"home_storage_leaf,omitempty" yaml:"home_storage_leaf,omitempty" koanf:"home_storage_leaf"`
-	// ProjectID, Region, ServiceAccount, Network, Subnetwork and
-	// CredentialsFile are a Cloud Run instance's target (contract amendment
-	// P5-CR, CR1). ProjectID selects the GCP project, whose probed project
-	// number plus Region is the target's identity. ServiceAccount (the
-	// identity agent instances run as), Network and Subnetwork (the VPC
-	// agents reach the NFS share over) are local operator policy.
-	// CredentialsFile is the absolute path of this instance's own GCP
-	// credentials file, its only credential source. None of them is sent to
-	// the Hub. Cloud Run only.
-	ProjectID       string `json:"project_id,omitempty" yaml:"project_id,omitempty" koanf:"project_id"`
-	Region          string `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
-	ServiceAccount  string `json:"service_account,omitempty" yaml:"service_account,omitempty" koanf:"service_account"`
-	Network         string `json:"network,omitempty" yaml:"network,omitempty" koanf:"network"`
-	Subnetwork      string `json:"subnetwork,omitempty" yaml:"subnetwork,omitempty" koanf:"subnetwork"`
-	CredentialsFile string `json:"credentials_file,omitempty" yaml:"credentials_file,omitempty" koanf:"credentials_file"`
+	// ProjectID, Region, ServiceAccount, BlockServiceAccount,
+	// AssignableServiceAccounts, Network, Subnetwork and CredentialsFile are a
+	// Cloud Run instance's target (contract amendment P5-CR, CR1; Identity Part
+	// B). ProjectID selects the GCP project, whose probed project number plus
+	// Region is the target's identity. ServiceAccount (the default passthrough
+	// identity), BlockServiceAccount (the required no-role identity agents with
+	// no GCP identity run as), AssignableServiceAccounts (the allow-list of
+	// user-managed service accounts agents may be assigned), Network and
+	// Subnetwork (the VPC agents reach the NFS share over) are local operator
+	// policy. CredentialsFile is the absolute path of this instance's own GCP
+	// credentials file, its only credential source. None of them (except Region)
+	// is sent to the Hub. Cloud Run only.
+	ProjectID                 string   `json:"project_id,omitempty" yaml:"project_id,omitempty" koanf:"project_id"`
+	Region                    string   `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
+	ServiceAccount            string   `json:"service_account,omitempty" yaml:"service_account,omitempty" koanf:"service_account"`
+	BlockServiceAccount       string   `json:"block_service_account,omitempty" yaml:"block_service_account,omitempty" koanf:"block_service_account"`
+	AssignableServiceAccounts []string `json:"assignable_service_accounts,omitempty" yaml:"assignable_service_accounts,omitempty" koanf:"assignable_service_accounts"`
+	Network                   string   `json:"network,omitempty" yaml:"network,omitempty" koanf:"network"`
+	Subnetwork                string   `json:"subnetwork,omitempty" yaml:"subnetwork,omitempty" koanf:"subnetwork"`
+	CredentialsFile           string   `json:"credentials_file,omitempty" yaml:"credentials_file,omitempty" koanf:"credentials_file"`
 }
 
 // KubernetesRuntimeConfig returns the runtime entry form of a Kubernetes
@@ -2249,6 +2446,10 @@ type V1DatabaseConfig struct {
 	// create a new table set that hides existing hub tables
 	// later on the search_path. See DatabaseConfig.AllowShadowedSchema.
 	AllowShadowedSchema bool `json:"allow_shadowed_schema,omitempty" yaml:"allow_shadowed_schema,omitempty" koanf:"allow_shadowed_schema"`
+	// RelayRole is an optional PostgreSQL role granted the minimum privileges
+	// needed by `scion server --role relay` after schema migration runs. See
+	// DatabaseConfig.RelayRole.
+	RelayRole string `json:"relay_role,omitempty" yaml:"relay_role,omitempty" koanf:"relay_role"`
 	// TxDiagnostics configures transaction-hold and lock-wait diagnostics.
 	// See TxDiagnosticsConfig.
 	TxDiagnostics *TxDiagnosticsConfig `json:"tx_diagnostics,omitempty" yaml:"tx_diagnostics,omitempty" koanf:"tx_diagnostics"`
@@ -2294,7 +2495,7 @@ type V1TransportConfig struct {
 
 // V1ProxyConfig holds proxy authentication settings (consulted when auth.mode == "proxy").
 type V1ProxyConfig struct {
-	// Provider selects the proxy auth provider: "iap", "jwt", or "header".
+	// Provider selects the proxy auth provider: "iap" or "jwt".
 	Provider string `json:"provider,omitempty" yaml:"provider,omitempty" koanf:"provider"`
 	// IAP holds Google IAP-specific settings.
 	IAP *V1IAPConfig `json:"iap,omitempty" yaml:"iap,omitempty" koanf:"iap"`
@@ -2325,14 +2526,15 @@ type V1IAPConfig struct {
 // V1JWTAuthConfig holds settings for the generic JWT proxy auth provider
 // (V1/snake_case settings.yaml equivalent of JWTAuthConfig).
 type V1JWTAuthConfig struct {
-	Header        string             `json:"header,omitempty" yaml:"header,omitempty" koanf:"header"`
-	Algorithm     string             `json:"algorithm,omitempty" yaml:"algorithm,omitempty" koanf:"algorithm"`
-	Issuer        string             `json:"issuer,omitempty" yaml:"issuer,omitempty" koanf:"issuer"`
-	Audience      string             `json:"audience,omitempty" yaml:"audience,omitempty" koanf:"audience"`
-	JWKSURL       string             `json:"jwks_url,omitempty" yaml:"jwks_url,omitempty" koanf:"jwks_url"`
-	JWKSFile      string             `json:"jwks_file,omitempty" yaml:"jwks_file,omitempty" koanf:"jwks_file"`
-	PublicKeyFile string             `json:"public_key_file,omitempty" yaml:"public_key_file,omitempty" koanf:"public_key_file"`
-	Claims        *V1JWTClaimsConfig `json:"claims,omitempty" yaml:"claims,omitempty" koanf:"claims"`
+	Header          string             `json:"header,omitempty" yaml:"header,omitempty" koanf:"header"`
+	IdentityHeaders []string           `json:"identity_headers,omitempty" yaml:"identity_headers,omitempty" koanf:"identity_headers"`
+	Algorithm       string             `json:"algorithm,omitempty" yaml:"algorithm,omitempty" koanf:"algorithm"`
+	Issuer          string             `json:"issuer,omitempty" yaml:"issuer,omitempty" koanf:"issuer"`
+	Audience        string             `json:"audience,omitempty" yaml:"audience,omitempty" koanf:"audience"`
+	JWKSURL         string             `json:"jwks_url,omitempty" yaml:"jwks_url,omitempty" koanf:"jwks_url"`
+	JWKSFile        string             `json:"jwks_file,omitempty" yaml:"jwks_file,omitempty" koanf:"jwks_file"`
+	PublicKeyFile   string             `json:"public_key_file,omitempty" yaml:"public_key_file,omitempty" koanf:"public_key_file"`
+	Claims          *V1JWTClaimsConfig `json:"claims,omitempty" yaml:"claims,omitempty" koanf:"claims"`
 }
 
 // V1JWTClaimsConfig maps JWT claim names to identity fields (V1/snake_case
@@ -3188,10 +3390,11 @@ type V1RuntimeConfig struct {
 	// to the Kubernetes ServiceAccount (KSA) name it is bound to via Workload
 	// Identity, when Type is "kubernetes". Used by GCP identity mode "assign"
 	// dispatches on Kubernetes (ptone/scion#2328) to set the pod's
-	// spec.serviceAccountName. Scion never creates, annotates, or binds these
-	// KSAs — the operator must pre-provision each one (KSA exists, is
+	// spec.serviceAccountName. Scion never creates or annotates KSAs listed in
+	// these mappings — the operator must pre-provision each mapped KSA (exists,
 	// annotated with iam.gke.io/gcp-service-account, and holds
-	// roles/iam.workloadIdentityUser for the named GSA) out of band. A
+	// roles/iam.workloadIdentityUser for the named GSA) out of band; for
+	// Hub-minted GSAs, see WorkloadIdentityPool and CreateServiceAccounts. A
 	// same-keyed entry in the active profile's own
 	// KubernetesServiceAccountMappings overrides this one; see
 	// VersionedSettings.ResolveKubernetesServiceAccountMapping.
@@ -3205,6 +3408,26 @@ type V1RuntimeConfig struct {
 	// ServiceAccount. A profile's own value wins over this one; see
 	// VersionedSettings.ResolveKubernetesBlockServiceAccountForSelection.
 	KubernetesBlockServiceAccount string `json:"kubernetes_block_service_account,omitempty" yaml:"kubernetes_block_service_account,omitempty" koanf:"kubernetes_block_service_account"`
+	// WorkloadIdentityPool is the GKE Workload Identity pool of the cluster
+	// this Kubernetes entry targets, "<cluster-project>.svc.id.goog"
+	// (ptone/scion#3329 phase 5). The broker reports it, with the entry's
+	// namespace, for each profile on this entry (heartbeat
+	// workloadIdentityTargets), so the hub can grant
+	// roles/iam.workloadIdentityUser on a GCP service account it mints to
+	// the conventional Kubernetes ServiceAccount in that namespace. Read
+	// only from the broker's own global settings (with the hub settings
+	// overlay on a co-located server), never from a project's settings.
+	// See ValidateWorkloadIdentityPool.
+	WorkloadIdentityPool string `json:"workload_identity_pool,omitempty" yaml:"workload_identity_pool,omitempty" koanf:"workload_identity_pool"`
+	// CreateServiceAccounts opts this Kubernetes runtime entry into creating
+	// the conventional Kubernetes ServiceAccount (<gsa-account-id>) in the
+	// agent namespace on GCP identity mode "assign" start when the Hub
+	// authorizes creation (hub.k8s_workload_identity_setup enabled and a
+	// Hub-minted GSA) and neither kubernetes_service_account_mappings nor
+	// annotation discovery matched (ptone/scion#7966). Default false. Read
+	// only from the broker's own global settings (with the hub settings
+	// overlay on a co-located server), never from a project's settings.
+	CreateServiceAccounts bool `json:"create_service_accounts,omitempty" yaml:"create_service_accounts,omitempty" koanf:"create_service_accounts"`
 }
 
 // V1RuntimeDefaultsConfig holds runtime-wide behaviour that is not specific to
@@ -3332,6 +3555,9 @@ const (
 	// ReadyStrategyDelay means the harness is ready once its tmux session has
 	// existed for the settle period.
 	ReadyStrategyDelay = state.ReadyStrategyDelay
+	// ReadyStrategyIdle means the harness settles into idle rather than working
+	// (used by the built-in execution container).
+	ReadyStrategyIdle = state.ReadyStrategyIdle
 )
 
 // Ready and delivery limits and delivery defaults. The ready defaults are
@@ -4491,6 +4717,9 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Hub.AgentEndpoint != "" {
 			gc.Hub.AgentEndpoint = v1.Hub.AgentEndpoint
 		}
+		if v1.Hub.InternalURL != "" {
+			gc.Hub.InternalURL = v1.Hub.InternalURL
+		}
 		if v1.Hub.MonitoringDashboardURL != "" {
 			gc.Hub.MonitoringDashboardURL = v1.Hub.MonitoringDashboardURL
 		}
@@ -4538,6 +4767,9 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Hub.AdminEmails != nil {
 			gc.Hub.AdminEmails = v1.Hub.AdminEmails
 		}
+		if v1.Hub.AllowedImportSources != nil {
+			gc.Hub.AllowedImportSources = v1.Hub.AllowedImportSources
+		}
 		if v1.Hub.SoftDeleteRetention != "" {
 			if d, err := time.ParseDuration(v1.Hub.SoftDeleteRetention); err == nil {
 				gc.Hub.SoftDeleteRetention = d
@@ -4545,6 +4777,10 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		}
 		if v1.Hub.SoftDeleteRetainFiles != nil {
 			gc.Hub.SoftDeleteRetainFiles = *v1.Hub.SoftDeleteRetainFiles
+		}
+		if v1.Hub.AuditRetentionDays != nil {
+			v := *v1.Hub.AuditRetentionDays
+			gc.Hub.AuditRetentionDays = &v
 		}
 		if v1.Hub.Chat != nil && v1.Hub.Chat.Search != nil {
 			cs := v1.Hub.Chat.Search
@@ -4565,6 +4801,14 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		if v1.Hub.StalledThreshold != "" {
 			if d, err := time.ParseDuration(v1.Hub.StalledThreshold); err == nil {
 				gc.Hub.StalledThreshold = d
+			}
+		}
+		if v1.Hub.AutoSuspendIdle != nil {
+			gc.Hub.AutoSuspendIdle = *v1.Hub.AutoSuspendIdle
+		}
+		if v1.Hub.IdleSuspendAfter != "" {
+			if d, err := time.ParseDuration(v1.Hub.IdleSuspendAfter); err == nil {
+				gc.Hub.IdleSuspendAfter = d
 			}
 		}
 		if v1.Hub.PerfTrace != nil {
@@ -4654,6 +4898,23 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 				TracingEnabled: copyBoolPtr(o.TracingEnabled),
 			}
 		}
+		if so := v1.Hub.SystemOne; so != nil {
+			gc.Hub.SystemOne = HubSystemOneConfig{
+				MaxEvalTime: so.MaxEvalTime,
+				SecretNames: cloneStringSliceMap(so.SecretNames),
+			}
+		}
+		if b := v1.Hub.Branding; b != nil {
+			gc.Hub.Branding = b.CloneValue()
+		}
+		if sc := v1.Hub.Schedules; sc != nil {
+			gc.Hub.Schedules = HubSchedulesConfig{MinInterval: sc.MinInterval}
+			if sc.MaxActivePerProject != nil {
+				n := *sc.MaxActivePerProject
+				gc.Hub.Schedules.MaxActivePerProject = &n
+			}
+		}
+		gc.Hub.DefaultMessageMode = v1.Hub.DefaultMessageMode
 	}
 
 	if r := v1.Relay; r != nil {
@@ -4741,6 +5002,9 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 			gc.Database.ConnMaxIdleTime = v1.Database.ConnMaxIdleTime
 		}
 		gc.Database.AllowShadowedSchema = v1.Database.AllowShadowedSchema
+		if v1.Database.RelayRole != "" {
+			gc.Database.RelayRole = v1.Database.RelayRole
+		}
 		if v1.Database.TxDiagnostics != nil {
 			gc.Database.TxDiagnostics = *v1.Database.TxDiagnostics
 		}
@@ -4779,13 +5043,14 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 			}
 			if v1.Auth.Proxy.JWT != nil {
 				gc.Auth.Proxy.JWT = &JWTAuthConfig{
-					Header:        v1.Auth.Proxy.JWT.Header,
-					Algorithm:     v1.Auth.Proxy.JWT.Algorithm,
-					Issuer:        v1.Auth.Proxy.JWT.Issuer,
-					Audience:      v1.Auth.Proxy.JWT.Audience,
-					JWKSURL:       v1.Auth.Proxy.JWT.JWKSURL,
-					JWKSFile:      v1.Auth.Proxy.JWT.JWKSFile,
-					PublicKeyFile: v1.Auth.Proxy.JWT.PublicKeyFile,
+					Header:          v1.Auth.Proxy.JWT.Header,
+					IdentityHeaders: append([]string(nil), v1.Auth.Proxy.JWT.IdentityHeaders...),
+					Algorithm:       v1.Auth.Proxy.JWT.Algorithm,
+					Issuer:          v1.Auth.Proxy.JWT.Issuer,
+					Audience:        v1.Auth.Proxy.JWT.Audience,
+					JWKSURL:         v1.Auth.Proxy.JWT.JWKSURL,
+					JWKSFile:        v1.Auth.Proxy.JWT.JWKSFile,
+					PublicKeyFile:   v1.Auth.Proxy.JWT.PublicKeyFile,
 				}
 				if v1.Auth.Proxy.JWT.Claims != nil {
 					gc.Auth.Proxy.JWT.Claims = &JWTClaimsConfig{
@@ -4912,6 +5177,8 @@ func ConvertV1ServerToGlobalConfig(v1 *V1ServerConfig) *GlobalConfig {
 		gc.GitHubApp.APIBaseURL = v1.GitHubApp.APIBaseURL
 		gc.GitHubApp.WebhooksEnabled = v1.GitHubApp.WebhooksEnabled
 		gc.GitHubApp.InstallationURL = v1.GitHubApp.InstallationURL
+		gc.GitHubApp.AppSlug = v1.GitHubApp.AppSlug
+		gc.GitHubApp.CommandMentionAliases = append([]string(nil), v1.GitHubApp.CommandMentionAliases...)
 	}
 
 	// Scheduler
@@ -4992,12 +5259,14 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		PublicURL:              gc.Hub.Endpoint,
 		ContentURL:             gc.Hub.ContentURL,
 		AgentEndpoint:          gc.Hub.AgentEndpoint,
+		InternalURL:            gc.Hub.InternalURL,
 		MonitoringDashboardURL: gc.Hub.MonitoringDashboardURL,
 		HubClass:               gc.Hub.HubClass,
 		GCPProjectID:           gc.Hub.GCPProjectID,
 		ReadTimeout:            gc.Hub.ReadTimeout.String(),
 		WriteTimeout:           gc.Hub.WriteTimeout.String(),
 		AdminEmails:            gc.Hub.AdminEmails,
+		AllowedImportSources:   gc.Hub.AllowedImportSources,
 		CORS: &V1CORSConfig{
 			Enabled:        gc.Hub.CORSEnabled,
 			AllowedOrigins: gc.Hub.CORSAllowedOrigins,
@@ -5029,6 +5298,13 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 	}
 	if gc.Hub.StalledThreshold > 0 {
 		v1Hub.StalledThreshold = gc.Hub.StalledThreshold.String()
+	}
+	if gc.Hub.AutoSuspendIdle {
+		autoSuspendIdle := true
+		v1Hub.AutoSuspendIdle = &autoSuspendIdle
+	}
+	if gc.Hub.IdleSuspendAfter > 0 {
+		v1Hub.IdleSuspendAfter = gc.Hub.IdleSuspendAfter.String()
 	}
 	if gc.Hub.MissingAgentGrace > 0 {
 		v1Hub.MissingAgentGrace = gc.Hub.MissingAgentGrace.String()
@@ -5079,6 +5355,23 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 			TracingEnabled: copyBoolPtr(o.TracingEnabled),
 		}
 	}
+	if so := gc.Hub.SystemOne; !so.IsZero() {
+		v1Hub.SystemOne = &V1ServerHubSystemOneConfig{
+			MaxEvalTime: so.MaxEvalTime,
+			SecretNames: so.CloneSecretNames(),
+		}
+	}
+	if b := gc.Hub.Branding; !b.IsZero() {
+		v1Hub.Branding = b.Clone()
+	}
+	if sc := gc.Hub.Schedules; !sc.IsZero() {
+		v1Hub.Schedules = &V1ServerHubSchedulesConfig{MinInterval: sc.MinInterval}
+		if sc.MaxActivePerProject != nil {
+			n := *sc.MaxActivePerProject
+			v1Hub.Schedules.MaxActivePerProject = &n
+		}
+	}
+	v1Hub.DefaultMessageMode = gc.Hub.DefaultMessageMode
 	if gc.Hub.StartClaimLeaseTTL > 0 {
 		v1Hub.StartClaimLeaseTTL = gc.Hub.StartClaimLeaseTTL.String()
 	}
@@ -5098,6 +5391,10 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 	if gc.Hub.SoftDeleteRetainFiles {
 		retainFiles := true
 		v1Hub.SoftDeleteRetainFiles = &retainFiles
+	}
+	if gc.Hub.AuditRetentionDays != nil {
+		days := *gc.Hub.AuditRetentionDays
+		v1Hub.AuditRetentionDays = &days
 	}
 	if gc.Hub.DisableLegacyStorageFallback {
 		disableLegacy := true
@@ -5160,6 +5457,7 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		ConnMaxIdleTime: gc.Database.ConnMaxIdleTime,
 
 		AllowShadowedSchema: gc.Database.AllowShadowedSchema,
+		RelayRole:           gc.Database.RelayRole,
 	}
 	if td := gc.Database.TxDiagnostics; td != (TxDiagnosticsConfig{}) {
 		v1.Database.TxDiagnostics = &td
@@ -5194,13 +5492,14 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 		}
 		if gc.Auth.Proxy.JWT != nil {
 			v1.Auth.Proxy.JWT = &V1JWTAuthConfig{
-				Header:        gc.Auth.Proxy.JWT.Header,
-				Algorithm:     gc.Auth.Proxy.JWT.Algorithm,
-				Issuer:        gc.Auth.Proxy.JWT.Issuer,
-				Audience:      gc.Auth.Proxy.JWT.Audience,
-				JWKSURL:       gc.Auth.Proxy.JWT.JWKSURL,
-				JWKSFile:      gc.Auth.Proxy.JWT.JWKSFile,
-				PublicKeyFile: gc.Auth.Proxy.JWT.PublicKeyFile,
+				Header:          gc.Auth.Proxy.JWT.Header,
+				IdentityHeaders: append([]string(nil), gc.Auth.Proxy.JWT.IdentityHeaders...),
+				Algorithm:       gc.Auth.Proxy.JWT.Algorithm,
+				Issuer:          gc.Auth.Proxy.JWT.Issuer,
+				Audience:        gc.Auth.Proxy.JWT.Audience,
+				JWKSURL:         gc.Auth.Proxy.JWT.JWKSURL,
+				JWKSFile:        gc.Auth.Proxy.JWT.JWKSFile,
+				PublicKeyFile:   gc.Auth.Proxy.JWT.PublicKeyFile,
 			}
 			if gc.Auth.Proxy.JWT.Claims != nil {
 				v1.Auth.Proxy.JWT.Claims = &V1JWTClaimsConfig{
@@ -5254,15 +5553,17 @@ func ConvertGlobalToV1ServerConfig(gc *GlobalConfig) *V1ServerConfig {
 	}
 
 	// GitHub App config
-	if gc.GitHubApp.AppID != 0 {
+	if gc.GitHubApp.AppID != 0 || gc.GitHubApp.AppSlug != "" || len(gc.GitHubApp.CommandMentionAliases) > 0 {
 		v1.GitHubApp = &V1GitHubAppConfig{
-			AppID:           gc.GitHubApp.AppID,
-			PrivateKeyPath:  gc.GitHubApp.PrivateKeyPath,
-			PrivateKey:      gc.GitHubApp.PrivateKey,
-			WebhookSecret:   gc.GitHubApp.WebhookSecret,
-			APIBaseURL:      gc.GitHubApp.APIBaseURL,
-			WebhooksEnabled: gc.GitHubApp.WebhooksEnabled,
-			InstallationURL: gc.GitHubApp.InstallationURL,
+			AppID:                 gc.GitHubApp.AppID,
+			PrivateKeyPath:        gc.GitHubApp.PrivateKeyPath,
+			PrivateKey:            gc.GitHubApp.PrivateKey,
+			WebhookSecret:         gc.GitHubApp.WebhookSecret,
+			APIBaseURL:            gc.GitHubApp.APIBaseURL,
+			WebhooksEnabled:       gc.GitHubApp.WebhooksEnabled,
+			InstallationURL:       gc.GitHubApp.InstallationURL,
+			AppSlug:               gc.GitHubApp.AppSlug,
+			CommandMentionAliases: append([]string(nil), gc.GitHubApp.CommandMentionAliases...),
 		}
 	}
 
@@ -5687,6 +5988,7 @@ func loadEffectiveSettings(projectPath string, withGlobalOverlay bool) (*Version
 	if o := globalOverlay; o != nil && withGlobalOverlay {
 		o.Apply(vs)
 	}
+	warnings = append(warnings, HarnessArgsIgnoredWarnings(vs.HarnessConfigs)...)
 	return vs, warnings, nil
 }
 

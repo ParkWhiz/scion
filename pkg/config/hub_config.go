@@ -70,6 +70,16 @@ type HubServerConfig struct {
 	// should be stored back into this field.
 	AgentEndpoint string `json:"agentEndpoint,omitempty" yaml:"agentEndpoint,omitempty" koanf:"agentEndpoint"`
 
+	// InternalURL (server.hub.internal_url) optionally sets the Hub URL
+	// that hub-managed broker plugins call the Hub API on (their hub_url),
+	// for deployments where the public URL (Endpoint) goes through an auth
+	// or reverse proxy the plugins cannot pass. Plugins keep building
+	// user-facing links from the public URL, handed to them as public_url.
+	// It is not a public endpoint and no other use reads it. When unset,
+	// hub_url is the public URL. Operator-only (file or environment); see
+	// ValidateHubInternalURL for the accepted form (ptone/scion#555).
+	InternalURL string `json:"internalUrl,omitempty" yaml:"internalUrl,omitempty" koanf:"internalUrl"`
+
 	// CORS settings
 	CORSEnabled        bool     `json:"corsEnabled" yaml:"corsEnabled" koanf:"corsEnabled"`
 	CORSAllowedOrigins []string `json:"corsAllowedOrigins" yaml:"corsAllowedOrigins" koanf:"corsAllowedOrigins"`
@@ -80,6 +90,14 @@ type HubServerConfig struct {
 	// AdminEmails is a list of email addresses to auto-promote to admin role.
 	AdminEmails []string `json:"adminEmails" yaml:"adminEmails" koanf:"adminEmails"`
 
+	// AllowedImportSources (server.hub.allowed_import_sources) lists the
+	// sources, beyond https://github.com URLs, that a hosted Hub may fetch when
+	// it imports or discovers templates and harness-configs: https:// URL
+	// prefixes and Cloud Storage prefixes (gs://<bucket>/<prefix>). See
+	// CheckHubImportSource and NormalizeAllowedImportSources. Operator-only
+	// (settings file only, no env); read once at startup.
+	AllowedImportSources []string `json:"allowedImportSources,omitempty" yaml:"allowedImportSources,omitempty" koanf:"allowedImportSources"`
+
 	// SoftDeleteRetention is how long soft-deleted agents are retained before purging.
 	// Zero means soft-delete is disabled (hard-delete immediately).
 	SoftDeleteRetention time.Duration `json:"softDeleteRetention" yaml:"softDeleteRetention" koanf:"softDeleteRetention"`
@@ -87,6 +105,12 @@ type HubServerConfig struct {
 	// SoftDeleteRetainFiles controls whether workspace files are preserved during soft-delete.
 	// When true, the broker skips file cleanup for soft-deleted agents.
 	SoftDeleteRetainFiles bool `json:"softDeleteRetainFiles" yaml:"softDeleteRetainFiles" koanf:"softDeleteRetainFiles"`
+
+	// AuditRetentionDays is the number of days to retain mutation audit records
+	// in the Hub database. Nil means unset (Hub defaults to 90 days); explicit
+	// 0 disables automatic cleanup (retain indefinitely); negative values are
+	// rejected at Hub startup.
+	AuditRetentionDays *int `json:"auditRetentionDays,omitempty" yaml:"auditRetentionDays,omitempty" koanf:"auditRetentionDays"`
 
 	// Chat holds web chat server limits (settings server.hub.chat).
 	Chat HubChatConfig `json:"chat" yaml:"chat" koanf:"chat"`
@@ -158,6 +182,16 @@ type HubServerConfig struct {
 	// StalledThreshold is how long an agent can go without activity events
 	// before being marked as stalled. Default: 5 minutes.
 	StalledThreshold time.Duration `json:"stalledThreshold" yaml:"stalledThreshold" koanf:"stalledThreshold"`
+
+	// AutoSuspendIdle controls whether agents holding a suspend-eligible
+	// activity (idle, completed, harness_error) are automatically suspended
+	// once IdleSuspendAfter has elapsed. Default: false.
+	AutoSuspendIdle bool `json:"autoSuspendIdle" yaml:"autoSuspendIdle" koanf:"autoSuspendIdle"`
+
+	// IdleSuspendAfter is how long an agent must hold a suspend-eligible
+	// activity before idle auto-suspend applies. Default: 15 minutes
+	// (minimum 5 minutes).
+	IdleSuspendAfter time.Duration `json:"idleSuspendAfter" yaml:"idleSuspendAfter" koanf:"idleSuspendAfter"`
 
 	// MissingAgentGrace is how long a running agent must be continuously
 	// absent from its runtime broker's complete heartbeat inventory before
@@ -240,6 +274,43 @@ type HubServerConfig struct {
 	// Observability holds the hub's own metrics and trace export switches
 	// (server.hub.observability). Read at startup; changes need a restart.
 	Observability HubObservabilityConfig `json:"observability" yaml:"observability" koanf:"observability"`
+
+	// SystemOne holds Hub-wide System One rule evaluation settings
+	// (server.hub.system_one).
+	SystemOne HubSystemOneConfig `json:"systemOne" yaml:"systemOne" koanf:"systemOne"`
+
+	// Branding holds Hub-wide UI branding settings (server.hub.branding).
+	// Reloadable at runtime via OperationalSettings.
+	Branding BrandingConfig `json:"branding,omitempty" yaml:"branding,omitempty" koanf:"branding"`
+
+	// Schedules holds the limits on recurring schedules
+	// (server.hub.schedules). Read at startup.
+	Schedules HubSchedulesConfig `json:"schedules" yaml:"schedules" koanf:"schedules"`
+
+	// DefaultMessageMode is server.hub.default_message_mode: the message
+	// mode of a new agent when neither the create request, its template nor
+	// its parent agent sets one. Empty means "project", the built-in
+	// default. See ValidateDefaultMessageMode for the accepted values.
+	DefaultMessageMode string `json:"defaultMessageMode,omitempty" yaml:"defaultMessageMode,omitempty" koanf:"defaultMessageMode"`
+}
+
+// defaultMessageModeValues are the values server.hub.default_message_mode
+// accepts. "hub" is not one of them: hub mode reaches agents in other
+// projects and must be granted per agent, never by a hub-wide default.
+var defaultMessageModeValues = []string{"none", "lineage", "branch", "project"}
+
+// ValidateDefaultMessageMode checks server.hub.default_message_mode. Empty
+// (unset) is valid and means "project".
+func ValidateDefaultMessageMode(mode string) error {
+	if mode == "" {
+		return nil
+	}
+	for _, v := range defaultMessageModeValues {
+		if mode == v {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid server.hub.default_message_mode %q: must be one of %s", mode, strings.Join(defaultMessageModeValues, ", "))
 }
 
 // DefaultHubID generates a deterministic hub instance ID from the machine hostname.
@@ -652,47 +723,69 @@ func isValidAgentEndpointHostname(host string) bool {
 // "http://h?token=secret" carries the secret in RawQuery — so every message
 // states the rule without echoing anything.
 func ValidateAgentEndpoint(raw string) (string, error) {
+	return validateHubOriginURL(AgentEndpointKey, raw)
+}
+
+// AgentEndpointKey is the settings key of HubServerConfig.AgentEndpoint.
+const AgentEndpointKey = "server.hub.agent_endpoint"
+
+// HubInternalURLKey is the settings key of HubServerConfig.InternalURL. It
+// is set only in the settings file or the environment
+// (SCION_SERVER_HUB_INTERNALURL): the server-config API refuses it in every
+// mode, so a web session cannot redirect the HMAC-signed plugin API traffic
+// to another host.
+const HubInternalURLKey = "server.hub.internal_url"
+
+// ValidateHubInternalURL checks server.hub.internal_url by the rules of
+// ValidateAgentEndpoint and returns its normalized form ("" when unset).
+func ValidateHubInternalURL(raw string) (string, error) {
+	return validateHubOriginURL(HubInternalURLKey, raw)
+}
+
+// validateHubOriginURL implements ValidateAgentEndpoint for the settings
+// key named key, which prefixes every error message.
+func validateHubOriginURL(key, raw string) (string, error) {
 	if raw == "" {
 		return "", nil
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("server.hub.agent_endpoint: invalid URL")
+		return "", fmt.Errorf("%s: invalid URL", key)
 	}
 	if u.Opaque != "" {
-		return "", fmt.Errorf("server.hub.agent_endpoint: must be an absolute http(s) URL of the form scheme://host[:port]")
+		return "", fmt.Errorf("%s: must be an absolute http(s) URL of the form scheme://host[:port]", key)
 	}
 	if u.User != nil {
-		return "", fmt.Errorf("server.hub.agent_endpoint: must not contain user credentials")
+		return "", fmt.Errorf("%s: must not contain user credentials", key)
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		return "", fmt.Errorf("server.hub.agent_endpoint: must be an absolute http(s) URL")
+		return "", fmt.Errorf("%s: must be an absolute http(s) URL", key)
 	}
 	if u.RawQuery != "" {
-		return "", fmt.Errorf("server.hub.agent_endpoint: must not contain a query string")
+		return "", fmt.Errorf("%s: must not contain a query string", key)
 	}
 	if u.Fragment != "" {
-		return "", fmt.Errorf("server.hub.agent_endpoint: must not contain a fragment")
+		return "", fmt.Errorf("%s: must not contain a fragment", key)
 	}
 	if u.Path != "" && u.Path != "/" {
-		return "", fmt.Errorf("server.hub.agent_endpoint: must not contain a path")
+		return "", fmt.Errorf("%s: must not contain a path", key)
 	}
 	host := u.Hostname()
 	if host == "" {
-		return "", fmt.Errorf("server.hub.agent_endpoint: must include a host")
+		return "", fmt.Errorf("%s: must include a host", key)
 	}
 	if strings.Contains(host, "%") {
-		return "", fmt.Errorf("server.hub.agent_endpoint: host must not contain an IPv6 zone")
+		return "", fmt.Errorf("%s: host must not contain an IPv6 zone", key)
 	}
 	if net.ParseIP(host) == nil && !isValidAgentEndpointHostname(host) {
-		return "", fmt.Errorf("server.hub.agent_endpoint: host must be an IP address or a hostname of letters, digits, '_', '-', and '.'")
+		return "", fmt.Errorf("%s: host must be an IP address or a hostname of letters, digits, '_', '-', and '.'", key)
 	}
 	authority := host
 	if portStr := u.Port(); portStr != "" {
 		port, err := strconv.Atoi(portStr)
 		if err != nil || port < 1 || port > 65535 {
-			return "", fmt.Errorf("server.hub.agent_endpoint: port must be between 1 and 65535")
+			return "", fmt.Errorf("%s: port must be between 1 and 65535", key)
 		}
 		authority = net.JoinHostPort(host, strconv.Itoa(port))
 	} else if strings.Contains(host, ":") {
@@ -784,6 +877,8 @@ type RuntimeTargetConfig struct {
 	// See V1RuntimeTargetConfig.
 	KubernetesBlockServiceAccount    string              `json:"kubernetesBlockServiceAccount,omitempty" yaml:"kubernetesBlockServiceAccount,omitempty" koanf:"kubernetesBlockServiceAccount"`
 	KubernetesServiceAccountMappings map[string]string   `json:"kubernetesServiceAccountMappings,omitempty" yaml:"kubernetesServiceAccountMappings,omitempty" koanf:"kubernetesServiceAccountMappings"`
+	WorkloadIdentityPool             string              `json:"workloadIdentityPool,omitempty" yaml:"workloadIdentityPool,omitempty" koanf:"workloadIdentityPool"`
+	CreateServiceAccounts            bool                `json:"createServiceAccounts,omitempty" yaml:"createServiceAccounts,omitempty" koanf:"createServiceAccounts"`
 	SharedDirStorageClass            string              `json:"sharedDirStorageClass,omitempty" yaml:"sharedDirStorageClass,omitempty" koanf:"sharedDirStorageClass"`
 	SharedDirSize                    string              `json:"sharedDirSize,omitempty" yaml:"sharedDirSize,omitempty" koanf:"sharedDirSize"`
 	GKE                              bool                `json:"gke,omitempty" yaml:"gke,omitempty" koanf:"gke"`
@@ -797,12 +892,14 @@ type RuntimeTargetConfig struct {
 	HomeStorageBackend               string              `json:"homeStorageBackend,omitempty" yaml:"homeStorageBackend,omitempty" koanf:"homeStorageBackend"`
 	HomeStorageLeaf                  string              `json:"homeStorageLeaf,omitempty" yaml:"homeStorageLeaf,omitempty" koanf:"homeStorageLeaf"`
 	// Cloud Run only. See V1RuntimeTargetConfig.
-	ProjectID       string `json:"projectId,omitempty" yaml:"projectId,omitempty" koanf:"projectId"`
-	Region          string `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
-	ServiceAccount  string `json:"serviceAccount,omitempty" yaml:"serviceAccount,omitempty" koanf:"serviceAccount"`
-	Network         string `json:"network,omitempty" yaml:"network,omitempty" koanf:"network"`
-	Subnetwork      string `json:"subnetwork,omitempty" yaml:"subnetwork,omitempty" koanf:"subnetwork"`
-	CredentialsFile string `json:"credentialsFile,omitempty" yaml:"credentialsFile,omitempty" koanf:"credentialsFile"`
+	ProjectID                 string   `json:"projectId,omitempty" yaml:"projectId,omitempty" koanf:"projectId"`
+	Region                    string   `json:"region,omitempty" yaml:"region,omitempty" koanf:"region"`
+	ServiceAccount            string   `json:"serviceAccount,omitempty" yaml:"serviceAccount,omitempty" koanf:"serviceAccount"`
+	BlockServiceAccount       string   `json:"blockServiceAccount,omitempty" yaml:"blockServiceAccount,omitempty" koanf:"blockServiceAccount"`
+	AssignableServiceAccounts []string `json:"assignableServiceAccounts,omitempty" yaml:"assignableServiceAccounts,omitempty" koanf:"assignableServiceAccounts"`
+	Network                   string   `json:"network,omitempty" yaml:"network,omitempty" koanf:"network"`
+	Subnetwork                string   `json:"subnetwork,omitempty" yaml:"subnetwork,omitempty" koanf:"subnetwork"`
+	CredentialsFile           string   `json:"credentialsFile,omitempty" yaml:"credentialsFile,omitempty" koanf:"credentialsFile"`
 }
 
 // DatabaseConfig holds database connection settings.
@@ -836,6 +933,14 @@ type DatabaseConfig struct {
 	// refuses to start (and those commands refuse to migrate); with this set
 	// it logs a warning and continues.
 	AllowShadowedSchema bool `json:"allowShadowedSchema" yaml:"allowShadowedSchema" koanf:"allowShadowedSchema"`
+
+	// RelayRole is an optional PostgreSQL role name (for example "<hub>-relay")
+	// granted the minimum privileges needed by `scion server --role relay`
+	// after schema migration runs (CONNECT on current_database() and USAGE on
+	// current_schema() when absent, plus table privileges on relay_instances,
+	// conduit_sessions, conduit_principal_epochs and SELECT on hub_settings).
+	// Ignored on SQLite and on `--role relay`.
+	RelayRole string `json:"relayRole,omitempty" yaml:"relayRole,omitempty" koanf:"relayRole"`
 
 	// TxDiagnostics configures the hub's transaction-hold and lock-wait
 	// diagnostics (WARN lines and metrics). See TxDiagnosticsSettings.
@@ -999,7 +1104,7 @@ type TransportAuthConfig struct {
 
 // ProxyAuthConfig holds proxy authentication settings.
 type ProxyAuthConfig struct {
-	// Provider selects the proxy auth provider: "iap", "jwt", or "header".
+	// Provider selects the proxy auth provider: "iap" or "jwt".
 	Provider string `json:"provider" yaml:"provider" koanf:"provider"`
 	// IAP holds Google IAP-specific settings.
 	IAP *IAPAuthConfig `json:"iap,omitempty" yaml:"iap,omitempty" koanf:"iap"`
@@ -1035,6 +1140,12 @@ type JWTAuthConfig struct {
 	// Header is the HTTP header containing the JWT assertion.
 	// Default: "X-Auth-Proxy-JWT"
 	Header string `json:"header,omitempty" yaml:"header,omitempty" koanf:"header"`
+
+	// IdentityHeaders lists additional HTTP headers the front proxy sets with
+	// user identity information (for example email or ID headers). They are
+	// stripped alongside the assertion header when proxying requests to an
+	// agent's exposed port.
+	IdentityHeaders []string `json:"identityHeaders,omitempty" yaml:"identityHeaders,omitempty" koanf:"identityHeaders"`
 
 	// Algorithm is the expected JWT signing algorithm (MANDATORY).
 	// Must be an asymmetric algorithm: RS256, RS384, RS512, ES256, ES384, ES512,
@@ -1335,6 +1446,14 @@ type GlobalConfig struct {
 	// applies.
 	AgentSecretsUserScopeOnly *bool `json:"-" yaml:"-" koanf:"-"`
 
+	// BrokerPolicyAdminManagedOnly controls whether Runtime Broker
+	// registration, attachment, placement, and starts are restricted to
+	// admin-managed brokers (gated by experiment hub.admin_managed_brokers;
+	// ptone/scion#7829). Populated from settings.yaml
+	// broker_policy.admin_managed_only in file/SQLite mode. nil means unset
+	// (default false).
+	BrokerPolicyAdminManagedOnly *bool `json:"-" yaml:"-" koanf:"-"`
+
 	// DefaultHarnessConfig is the hub-level default harness config name.
 	// Populated from the top-level default_harness_config key in settings.yaml
 	// in file/SQLite mode.
@@ -1419,13 +1538,15 @@ type SchedulerConfig struct {
 
 // GitHubAppConfig holds configuration for the Hub's GitHub App integration.
 type GitHubAppConfig struct {
-	AppID           int64  `json:"appId" yaml:"appId" koanf:"appId"`
-	PrivateKeyPath  string `json:"privateKeyPath,omitempty" yaml:"privateKeyPath,omitempty" koanf:"privateKeyPath"`
-	PrivateKey      string `json:"privateKey,omitempty" yaml:"privateKey,omitempty" koanf:"privateKey"`
-	WebhookSecret   string `json:"webhookSecret,omitempty" yaml:"webhookSecret,omitempty" koanf:"webhookSecret"`
-	APIBaseURL      string `json:"apiBaseUrl,omitempty" yaml:"apiBaseUrl,omitempty" koanf:"apiBaseUrl"`
-	WebhooksEnabled bool   `json:"webhooksEnabled,omitempty" yaml:"webhooksEnabled,omitempty" koanf:"webhooksEnabled"`
-	InstallationURL string `json:"installationUrl,omitempty" yaml:"installationUrl,omitempty" koanf:"installationUrl"`
+	AppID                 int64    `json:"appId" yaml:"appId" koanf:"appId"`
+	PrivateKeyPath        string   `json:"privateKeyPath,omitempty" yaml:"privateKeyPath,omitempty" koanf:"privateKeyPath"`
+	PrivateKey            string   `json:"privateKey,omitempty" yaml:"privateKey,omitempty" koanf:"privateKey"`
+	WebhookSecret         string   `json:"webhookSecret,omitempty" yaml:"webhookSecret,omitempty" koanf:"webhookSecret"`
+	APIBaseURL            string   `json:"apiBaseUrl,omitempty" yaml:"apiBaseUrl,omitempty" koanf:"apiBaseUrl"`
+	WebhooksEnabled       bool     `json:"webhooksEnabled,omitempty" yaml:"webhooksEnabled,omitempty" koanf:"webhooksEnabled"`
+	InstallationURL       string   `json:"installationUrl,omitempty" yaml:"installationUrl,omitempty" koanf:"installationUrl"`
+	AppSlug               string   `json:"appSlug,omitempty" yaml:"appSlug,omitempty" koanf:"appSlug"`
+	CommandMentionAliases []string `json:"commandMentionAliases,omitempty" yaml:"commandMentionAliases,omitempty" koanf:"commandMentionAliases"`
 }
 
 // SecretsConfig holds configuration for the secrets backend.
@@ -1571,7 +1692,11 @@ func applyDatabasePoolDefaults(db *DatabaseConfig) {
 // If both exist in the same directory, a deprecation warning is emitted to stderr.
 func LoadGlobalConfig(configPath string) (*GlobalConfig, error) {
 	// Try loading from settings.yaml first (versioned path)
-	if gc, ok := loadGlobalConfigFromSettings(configPath); ok {
+	gc, ok, err := loadGlobalConfigFromSettings(configPath)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
 		markTrustedProxiesSet(gc, nil)
 		return gc, nil
 	}
@@ -1580,7 +1705,7 @@ func LoadGlobalConfig(configPath string) (*GlobalConfig, error) {
 	// key, but a settings.yaml may still carry top-level hub sections
 	// (quotas, agent_secrets, default_timezone, ...); honour them so a
 	// file-mode reload does not reset those live values (ptone/scion#2284).
-	gc, err := loadGlobalConfigLegacy(configPath, findTopLevelSettingsRaw(configPath))
+	gc, err = loadGlobalConfigLegacy(configPath, findTopLevelSettingsRaw(configPath))
 	if err != nil {
 		return nil, err
 	}
@@ -1620,11 +1745,16 @@ func trustedProxiesEnvNames() []string {
 }
 
 // loadGlobalConfigFromSettings attempts to load server config from settings.yaml files.
-// Returns (config, true) if settings.yaml had a server key, (nil, false) otherwise.
-func loadGlobalConfigFromSettings(configPath string) (*GlobalConfig, bool) {
+// Returns (config, true, nil) if settings.yaml had a valid server key,
+// (nil, false, err) on a settings.yaml or server-section decode error, and
+// (nil, false, nil) when no settings.yaml has a server key.
+func loadGlobalConfigFromSettings(configPath string) (*GlobalConfig, bool, error) {
 	src := resolveServerSettingsSource(configPath)
+	if src.err != nil {
+		return nil, false, src.err
+	}
 	if src.globalDir == "" || src.legacy {
-		return nil, false
+		return nil, false, nil
 	}
 	globalDir := src.globalDir
 	gc := src.gc
@@ -1640,7 +1770,7 @@ func loadGlobalConfigFromSettings(configPath string) (*GlobalConfig, bool) {
 	// Apply environment variable overrides (SCION_SERVER_ prefix).
 	// Without this, env vars are ignored when config comes from settings.yaml.
 	if err := applyEnvOverrides(gc); err != nil {
-		return nil, false
+		return nil, false, err
 	}
 
 	// Apply database URL default if needed
@@ -1649,7 +1779,7 @@ func loadGlobalConfigFromSettings(configPath string) (*GlobalConfig, bool) {
 	}
 	applyDatabasePoolDefaults(&gc.Database)
 
-	return gc, true
+	return gc, true, nil
 }
 
 // serverSettingsSource is where the server's settings come from for a given
@@ -1673,8 +1803,13 @@ type serverSettingsSource struct {
 	// legacy reports that neither settings.yaml has a server key, so the
 	// server block comes from server.yaml (loadGlobalConfigLegacy).
 	legacy bool
-	// gc is the server config parsed from settingsDir (nil in legacy mode).
+	// gc is the server config parsed from settingsDir (nil in legacy mode or
+	// when err != nil).
 	gc *GlobalConfig
+	// err is non-nil when a candidate settings.yaml cannot be read/parsed or
+	// its server section fails to decode; resolution stops without falling
+	// back to --config or legacy server.yaml (ptone/scion#6187).
+	err error
 }
 
 // configPathDir returns the directory of configPath (configPath itself when
@@ -1705,13 +1840,23 @@ func resolveServerSettingsSource(configPath string) serverSettingsSource {
 	src.configDir, src.configFile = configPathDir(configPath)
 
 	if src.globalDir != "" {
-		if gc, found := loadServerFromSettingsFile(src.globalDir); found {
+		gc, found, err := loadServerFromSettingsFile(src.globalDir)
+		if err != nil {
+			src.settingsDir, src.err = src.globalDir, err
+			return src
+		}
+		if found {
 			src.settingsDir, src.gc = src.globalDir, gc
 			return src
 		}
 	}
-	if src.configDir != "" {
-		if gc, found := loadServerFromSettingsFile(src.configDir); found {
+	if src.configDir != "" && (src.globalDir == "" || !sameDir(src.configDir, src.globalDir)) {
+		gc, found, err := loadServerFromSettingsFile(src.configDir)
+		if err != nil {
+			src.settingsDir, src.err = src.configDir, err
+			return src
+		}
+		if found {
 			src.settingsDir, src.gc = src.configDir, gc
 			return src
 		}
@@ -2027,11 +2172,15 @@ func envKeyToConfigKey(envKey string) string {
 	if directServerEnvNames[strings.ToUpper(name)] {
 		return "" // read directly with os.Getenv, never a GlobalConfig field
 	}
+	if _, ok := parseSystemOneSecretNamesEnvRest(envKey); ok {
+		return "" // decoded by applySystemOneSecretNamesEnv after file load
+	}
 	// The residue takes one segment per GlobalConfig field (the collapsed
 	// spelling, as before the table): SCION_SERVER_ADMIN_MODE does not
 	// become adminMode.
 	segs := strings.Split(strings.ToLower(envKey), "_")
 	if p, end, ok := koanfTagPathEnd(reflect.TypeOf(GlobalConfig{}), segs); ok && !isObjectListType(end) &&
+		derefType(end).Kind() != reflect.Map &&
 		!ownsGlobalConfigEnvPath(strings.Join(p, ".")) {
 		return strings.Join(p, ".")
 	}
@@ -2058,6 +2207,12 @@ func serverEnvToOpsettingsKey(envKey string) string {
 	}
 	if directServerEnvNames[strings.ToUpper(name)] {
 		return ""
+	}
+	if adapter, ok := parseSystemOneSecretNamesEnvRest(envKey); ok {
+		if adapter == "" {
+			return SystemOneSecretNamesKey
+		}
+		return SystemOneSecretNamesKey + "." + adapter
 	}
 	return settingsEnvResidue(strings.Split(strings.ToLower(envKey), "_"), true, true)
 }
@@ -2161,7 +2316,7 @@ func LoadFileOnlyKoanf() *koanf.Koanf {
 	}
 	if globalDir != "" {
 		if _, err := loadSettingsFile(k, globalDir); err != nil {
-			slog.Warn("LoadFileOnlyKoanf: failed to load settings file", "dir", globalDir, "error", err)
+			slog.Warn("LoadFileOnlyKoanf: failed to load settings file", "dir", globalDir, "error", sanitizeSettingsDirLoadError(globalDir, err))
 		}
 	}
 
@@ -2283,7 +2438,7 @@ func loadBootstrapKoanf(configPath string, withSeed, withDefaults bool) *koanf.K
 	if globalDir != "" {
 		globalK := koanf.New(".")
 		if _, err := loadSettingsFile(globalK, globalDir); err != nil {
-			slog.Warn("LoadBootstrapKoanf: failed to load settings file", "dir", globalDir, "error", err)
+			slog.Warn("LoadBootstrapKoanf: failed to load settings file", "dir", globalDir, "error", sanitizeSettingsDirLoadError(globalDir, err))
 		}
 		if configSettingsWin(src, globalDir) {
 			// LoadGlobalConfig reads these only from the --config file.
@@ -2371,7 +2526,7 @@ func loadConfigPathFiles(k *koanf.Koanf, src serverSettingsSource, globalDir str
 	dirIsGlobal := globalDir != "" && sameDir(src.configDir, globalDir)
 	loadSettings := func() {
 		if _, err := loadSettingsFile(k, src.configDir); err != nil {
-			slog.Warn("LoadBootstrapKoanf: failed to load settings file", "dir", src.configDir, "error", err)
+			slog.Warn("LoadBootstrapKoanf: failed to load settings file", "dir", src.configDir, "error", sanitizeSettingsDirLoadError(src.configDir, err))
 		}
 	}
 	if !src.legacy {
@@ -2394,7 +2549,7 @@ func loadConfigPathFiles(k *koanf.Koanf, src serverSettingsSource, globalDir str
 		// A settings file is never a legacy server config.
 	default:
 		if err := k.Load(file.Provider(src.configFile), yaml.Parser()); err != nil {
-			slog.Warn("LoadBootstrapKoanf: failed to load config file", "path", src.configFile, "error", err)
+			slog.Warn("LoadBootstrapKoanf: failed to load config file", "path", src.configFile, "error", sanitizeYAMLFileLoadError(src.configFile, err))
 		}
 	}
 }
@@ -2551,6 +2706,9 @@ type globalConfigEnvOverlay struct {
 	AgentSecrets struct {
 		UserScopeOnly *bool `koanf:"user_scope_only"`
 	} `koanf:"agent_secrets"`
+	BrokerPolicy struct {
+		AdminManagedOnly *bool `koanf:"admin_managed_only"`
+	} `koanf:"broker_policy"`
 	DefaultHarnessConfig               *string `koanf:"default_harness_config"`
 	DefaultTimezone                    *string `koanf:"default_timezone"`
 	DefaultGCPIdentityMode             *string `koanf:"default_gcp_identity_mode"`
@@ -2568,6 +2726,9 @@ type globalConfigEnvOverlay struct {
 // does every koanf field. A variable leaves the rest of its section in
 // place. It runs after the file values are applied.
 func applyEnvToOutsideKoanfFields(gc *GlobalConfig) error {
+	if err := applySystemOneSecretNamesEnv(gc); err != nil {
+		return err
+	}
 	k := koanf.New(".")
 	_ = k.Load(nonEmptyEnvProvider(serverEnvPrefix, func(rest string) string {
 		if e, ok := resolveServerEnv(serverEnvPrefix+rest, false); ok {
@@ -2598,6 +2759,9 @@ func applyEnvToOutsideKoanfFields(gc *GlobalConfig) error {
 	}
 	if v := ov.AgentSecrets.UserScopeOnly; v != nil {
 		gc.AgentSecretsUserScopeOnly = v
+	}
+	if v := ov.BrokerPolicy.AdminManagedOnly; v != nil {
+		gc.BrokerPolicyAdminManagedOnly = v
 	}
 	for dst, src := range map[*string]*string{
 		&gc.DefaultHarnessConfig:               ov.DefaultHarnessConfig,
@@ -2749,27 +2913,58 @@ func loadServerConfigFile(k *koanf.Koanf, dir string) {
 // loadServerFromSettingsFile checks if settings.yaml in the given directory
 // contains a "server" key. If found, it loads the server section as a
 // V1ServerConfig and converts it to a GlobalConfig.
-// Returns (config, true) if settings.yaml had a server key, (nil, false) otherwise.
-func loadServerFromSettingsFile(dir string) (*GlobalConfig, bool) {
-	raw, ok := readSettingsFileRaw(dir)
-	if !ok {
-		return nil, false
-	}
-
-	serverRaw, ok := raw["server"]
-	if !ok || serverRaw == nil {
-		return nil, false
-	}
-
-	// Re-marshal just the server section, then unmarshal into V1ServerConfig
-	serverData, err := yamlv3.Marshal(serverRaw)
+// Returns (config, true, nil) if settings.yaml had a valid server key,
+// (nil, true, err) if settings.yaml had a server key that failed to parse or
+// decode, (nil, false, err) if settings.yaml existed and could not be read,
+// and (nil, false, nil) if settings.yaml was absent or had no server key.
+func loadServerFromSettingsFile(dir string) (*GlobalConfig, bool, error) {
+	settingsPath := filepath.Join(dir, "settings.yaml")
+	data, err := os.ReadFile(settingsPath)
 	if err != nil {
-		return nil, false
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("reading %s: %w", settingsPath, err)
+	}
+
+	var doc yamlv3.Node
+	if err := unmarshalSettingsYAML(data, &doc); err != nil {
+		if hasTopLevelServerKey(data) {
+			return nil, true, formatSettingsYAMLParseError(settingsPath, err)
+		}
+		return nil, false, nil
+	}
+	root := &doc
+	if root.Kind == yamlv3.DocumentNode {
+		if len(root.Content) == 0 {
+			return nil, false, nil
+		}
+		root = root.Content[0]
+	}
+	root = unwrapYAMLAlias(root)
+	if root == nil || root.Kind != yamlv3.MappingNode || !mappingHasServerOrMergeKey(root) {
+		return nil, false, nil
+	}
+
+	var env struct {
+		Server yamlv3.Node `yaml:"server"`
+	}
+	if err := decodeSettingsYAMLNode(root, &env); err != nil {
+		return nil, true, formatSettingsYAMLNodeDecodeError(settingsPath, root)
+	}
+	serverNode := unwrapYAMLAlias(&env.Server)
+	if serverNode == nil || serverNode.Kind == 0 || (serverNode.Kind == yamlv3.ScalarNode && serverNode.ShortTag() == "!!null") {
+		return nil, false, nil
 	}
 
 	var v1Server V1ServerConfig
-	if err := yamlv3.Unmarshal(serverData, &v1Server); err != nil {
-		return nil, false
+	if err := decodeSettingsYAMLNode(serverNode, &v1Server); err != nil {
+		return nil, true, formatServerDecodeError(settingsPath, serverNode)
+	}
+
+	var raw map[string]interface{}
+	if err := decodeSettingsYAMLNode(root, &raw); err != nil {
+		return nil, true, formatSettingsYAMLNodeDecodeError(settingsPath, root)
 	}
 
 	// ConvertV1ServerToGlobalConfig sets TrustedProxiesSet when the file
@@ -2778,7 +2973,478 @@ func loadServerFromSettingsFile(dir string) (*GlobalConfig, bool) {
 	gc := ConvertV1ServerToGlobalConfig(&v1Server)
 	applyTopLevelSettingsSections(gc, raw)
 
-	return gc, true
+	return gc, true, nil
+}
+
+// mappingHasServerOrMergeKey reports whether a top-level YAML MappingNode
+// defines a non-null "server" key, repeated "server" keys (which yaml.v3
+// rejects as duplicate mapping keys), or a "<<" merge key (which could expand a
+// "server" section). Every entry is inspected and aliases are unwrapped so a
+// leading null "server:" placeholder cannot mask a later "server:" or "<<"
+// entry and an aliased "server" key or value is honored.
+func mappingHasServerOrMergeKey(root *yamlv3.Node) bool {
+	serverKeys := 0
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		rawKey, rawVal := root.Content[i], root.Content[i+1]
+		if isYAMLMergeKey(rawKey) {
+			return true
+		}
+		kNode := unwrapYAMLAlias(rawKey)
+		vNode := unwrapYAMLAlias(rawVal)
+		if kNode == nil {
+			continue
+		}
+		switch kNode.Value {
+		case "server":
+			serverKeys++
+			if serverKeys > 1 || vNode == nil || vNode.Kind != yamlv3.ScalarNode || vNode.ShortTag() != "!!null" {
+				return true
+			}
+		case "<<":
+			return true
+		}
+	}
+	return false
+}
+
+func isYAMLMergeKey(node *yamlv3.Node) bool {
+	return node != nil && node.Kind == yamlv3.ScalarNode && node.Value == "<<" &&
+		(node.Tag == "" || node.Tag == "!" || node.ShortTag() == "!!merge")
+}
+
+// hasTopLevelServerKey reports whether unparseable YAML text plausibly declares
+// a top-level "server" key (at column 0, or as a JSON top-level "server": key),
+// so syntax errors in a server-bearing settings.yaml fail closed while
+// syntax errors in a server-less settings.yaml leave LoadGlobalConfig on the
+// legacy/default server path (allowing `scion server preflight` to inspect the
+// broken non-server sections).
+func hasTopLevelServerKey(data []byte) bool {
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimRight(rawLine, "\r")
+		if rest, ok := strings.CutPrefix(line, "server:"); ok {
+			if rest == "" || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '#' {
+				return true
+			}
+		}
+		trimmed := strings.TrimLeft(line, " \t{")
+		if strings.HasPrefix(trimmed, `"server"`) {
+			after := strings.TrimLeft(strings.TrimPrefix(trimmed, `"server"`), " \t")
+			if strings.HasPrefix(after, ":") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// unwrapYAMLAlias dereferences AliasNode hops with a fixed bound so malformed
+// cyclic aliases cannot spin indefinitely.
+func unwrapYAMLAlias(node *yamlv3.Node) *yamlv3.Node {
+	for hops := 0; node != nil && node.Kind == yamlv3.AliasNode && hops < 64; hops++ {
+		node = node.Alias
+	}
+	if node != nil && node.Kind == yamlv3.AliasNode {
+		return nil
+	}
+	return node
+}
+
+// formatSettingsYAMLParseError formats a YAML syntax/parser error from
+// unmarshalSettingsYAML(data, &doc) without echoing any scalar or anchor name
+// from settings.yaml. Scanner/parser messages carry only line numbers and
+// static grammar descriptions; unknown-anchor errors quote the alias token
+// (for example an unquoted leading-* secret) and are replaced with a static
+// message.
+func formatSettingsYAMLParseError(settingsPath string, err error) error {
+	msg := err.Error()
+	if strings.Contains(msg, "unknown anchor") {
+		return fmt.Errorf("parsing %s: yaml: unknown anchor referenced", settingsPath)
+	}
+	if !isValueFreeYAMLParserMessage(msg) {
+		return fmt.Errorf("parsing %s: invalid YAML syntax", settingsPath)
+	}
+	return fmt.Errorf("parsing %s: %s", settingsPath, msg)
+}
+
+// sanitizeSettingsDirLoadError converts a koanf settings-file load error into a
+// structural diagnostic that never quotes raw scalar values, map keys, tags, or
+// anchor/alias names from settings.yaml / settings.yml.
+func sanitizeSettingsDirLoadError(dir string, err error) error {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) || errors.Is(err, ErrSettingsFileRefused) {
+		return err
+	}
+	for _, name := range []string{"settings.yaml", "settings.yml"} {
+		p := filepath.Join(dir, name)
+		if _, statErr := os.Stat(p); statErr == nil {
+			return sanitizeYAMLFileLoadError(p, err)
+		}
+	}
+	if isValueFreeYAMLParserMessage(err.Error()) {
+		return err
+	}
+	return fmt.Errorf("parsing settings in %s: invalid settings syntax or structure", dir)
+}
+
+func sanitizeYAMLFileLoadError(path string, err error) error {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) || errors.Is(err, ErrSettingsFileRefused) {
+		return err
+	}
+	if data, readErr := os.ReadFile(path); readErr == nil {
+		var doc yamlv3.Node
+		if parseErr := unmarshalSettingsYAML(data, &doc); parseErr != nil {
+			return formatSettingsYAMLParseError(path, parseErr)
+		}
+		return formatSettingsYAMLNodeDecodeError(path, &doc)
+	}
+	if isValueFreeYAMLParserMessage(err.Error()) {
+		return err
+	}
+	return fmt.Errorf("parsing %s: invalid YAML value or structure", path)
+}
+
+// isValueFreeYAMLParserMessage reports whether msg is a static libyaml
+// scanner/parser diagnostic (which never contains backticks, double quotes, or
+// multi-character single-quoted spans).
+func isValueFreeYAMLParserMessage(msg string) bool {
+	if !strings.HasPrefix(msg, "yaml: ") {
+		return false
+	}
+	if strings.ContainsAny(msg, "`\"") {
+		return false
+	}
+	for rest := msg; ; {
+		start := strings.IndexByte(rest, '\'')
+		if start < 0 {
+			return true
+		}
+		rest = rest[start+1:]
+		end := strings.IndexByte(rest, '\'')
+		if end < 0 || end > 1 {
+			return false
+		}
+		rest = rest[end+1:]
+	}
+}
+
+// formatSettingsYAMLNodeDecodeError formats a non-server YAML node decode
+// failure without consulting yaml.v3's raw decoder error string (which quotes
+// scalar values and map keys verbatim) or interpolating any node.Value.
+func formatSettingsYAMLNodeDecodeError(settingsPath string, root *yamlv3.Node) error {
+	visited := make(map[*yamlv3.Node]bool)
+	if detail := findSettingsYAMLNodeDecodeError(root, visited); detail != "" {
+		return fmt.Errorf("parsing %s: %s", settingsPath, detail)
+	}
+	return fmt.Errorf("parsing %s: invalid YAML value or structure", settingsPath)
+}
+
+func findSettingsYAMLNodeDecodeError(node *yamlv3.Node, visited map[*yamlv3.Node]bool) string {
+	node = unwrapYAMLAlias(node)
+	if node == nil || visited[node] {
+		return ""
+	}
+	visited[node] = true
+
+	switch node.Kind {
+	case yamlv3.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			rawKey, rawVal := node.Content[i], node.Content[i+1]
+			kNode := unwrapYAMLAlias(rawKey)
+			vNode := unwrapYAMLAlias(rawVal)
+			if kNode == nil {
+				return fmt.Sprintf("line %d: cyclic YAML alias", rawKey.Line)
+			}
+			if kNode.Kind == yamlv3.SequenceNode || kNode.Kind == yamlv3.MappingNode {
+				return fmt.Sprintf("line %d: invalid non-scalar mapping key (%s)", kNode.Line, yamlNodeKindName(kNode))
+			}
+			if isYAMLMergeKey(rawKey) {
+				if !isValidYAMLMergeTarget(vNode) {
+					return fmt.Sprintf("line %d: map merge requires mapping or sequence of mappings", rawVal.Line)
+				}
+			}
+			for j := i + 2; j+1 < len(node.Content); j += 2 {
+				rawKeyJ := node.Content[j]
+				nj := unwrapYAMLAlias(rawKeyJ)
+				if nj != nil && kNode.Kind == nj.Kind && kNode.Value == nj.Value {
+					return fmt.Sprintf("line %d: duplicate mapping key (already defined at line %d)", rawKeyJ.Line, rawKey.Line)
+				}
+			}
+			if detail := findSettingsYAMLNodeDecodeError(rawKey, visited); detail != "" {
+				return detail
+			}
+			if detail := findSettingsYAMLNodeDecodeError(rawVal, visited); detail != "" {
+				return detail
+			}
+		}
+	case yamlv3.SequenceNode:
+		for _, elem := range node.Content {
+			if detail := findSettingsYAMLNodeDecodeError(elem, visited); detail != "" {
+				return detail
+			}
+		}
+	case yamlv3.ScalarNode:
+		var v interface{}
+		if decodeSettingsYAMLNode(node, &v) != nil {
+			return fmt.Sprintf("line %d: cannot decode scalar value as %s", node.Line, yamlNodeKindName(node))
+		}
+	}
+	return ""
+}
+
+func isValidYAMLMergeTarget(node *yamlv3.Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.Kind == yamlv3.MappingNode {
+		return true
+	}
+	if node.Kind == yamlv3.SequenceNode {
+		for _, elem := range node.Content {
+			e := unwrapYAMLAlias(elem)
+			if e == nil || e.Kind != yamlv3.MappingNode {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+const maxServerDecodeWalkDepth = 64
+
+// formatServerDecodeError locates the mistyped field(s) in serverNode by
+// walking the YAML node against V1ServerConfig and formats an error naming
+// each entry strictly by compile-time struct field path or integer index, never
+// by user-supplied key, scalar, tag, or anchor/alias name.
+func formatServerDecodeError(settingsPath string, serverNode *yamlv3.Node) error {
+	if details := findServerDecodeErrors(serverNode, reflect.TypeOf(V1ServerConfig{}), "server", 0); len(details) > 0 {
+		return fmt.Errorf("invalid server configuration in %s: %s", settingsPath, strings.Join(details, "; "))
+	}
+	return fmt.Errorf("invalid server configuration in %s: server: values do not decode into the server configuration structure", settingsPath)
+}
+
+type yamlStructField struct {
+	name string
+	typ  reflect.Type
+}
+
+// findServerDecodeErrors walks rawNode alongside Go type typ at dotted settings
+// path (starting at "server") and returns one structural diagnostic per failing
+// leaf or mapping. Path segments come exclusively from Go struct YAML tags and
+// integer slice/map-entry indices so untrusted keys and scalars are never echoed.
+func findServerDecodeErrors(rawNode *yamlv3.Node, typ reflect.Type, path string, depth int) []string {
+	if rawNode == nil {
+		return nil
+	}
+	if depth >= maxServerDecodeWalkDepth {
+		return []string{fmt.Sprintf("%s: cyclic YAML structure", path)}
+	}
+	node := unwrapYAMLAlias(rawNode)
+	if node == nil {
+		return []string{fmt.Sprintf("%s: cyclic YAML alias", path)}
+	}
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if decodeSettingsYAMLNode(node, reflect.New(typ).Interface()) == nil {
+		return nil
+	}
+
+	switch {
+	case typ.Kind() == reflect.Struct && typ != reflect.TypeOf(time.Time{}) && node.Kind == yamlv3.MappingNode:
+		fields := yamlStructFieldTypes(typ)
+		var out []string
+		var mergeNodes []*yamlv3.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			rawKey, vNode := node.Content[i], node.Content[i+1]
+			if isYAMLMergeKey(rawKey) {
+				mergeNodes = append(mergeNodes, vNode)
+				continue
+			}
+			kNode := unwrapYAMLAlias(rawKey)
+			if kNode == nil || kNode.Kind != yamlv3.ScalarNode {
+				continue
+			}
+			if field, ok := fields[kNode.Value]; ok {
+				out = append(out, findServerDecodeErrors(vNode, field.typ, path+"."+field.name, depth+1)...)
+			}
+		}
+		if len(out) == 0 {
+			for _, mn := range mergeNodes {
+				out = append(out, findMergedMappingDecodeErrors(mn, typ, path, depth+1)...)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	case (typ.Kind() == reflect.Slice || typ.Kind() == reflect.Array) && node.Kind == yamlv3.SequenceNode:
+		var out []string
+		for idx, elem := range node.Content {
+			out = append(out, findServerDecodeErrors(elem, typ.Elem(), fmt.Sprintf("%s[%d]", path, idx), depth+1)...)
+		}
+		if len(out) > 0 {
+			return out
+		}
+	case typ.Kind() == reflect.Map && node.Kind == yamlv3.MappingNode:
+		var out []string
+		var mergeNodes []*yamlv3.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			rawKey, vNode := node.Content[i], node.Content[i+1]
+			if isYAMLMergeKey(rawKey) {
+				mergeNodes = append(mergeNodes, vNode)
+				continue
+			}
+			entryPath := fmt.Sprintf("%s[entry %d]", path, i/2)
+			kNode := unwrapYAMLAlias(rawKey)
+			if kNode == nil || decodeSettingsYAMLNode(kNode, reflect.New(typ.Key()).Interface()) != nil {
+				out = append(out, fmt.Sprintf("%s: cannot decode map key %s into %s", entryPath, yamlNodeKindName(kNode), expectedYAMLTypeName(typ.Key())))
+				continue
+			}
+			out = append(out, findServerDecodeErrors(vNode, typ.Elem(), entryPath, depth+1)...)
+		}
+		if len(out) == 0 {
+			for _, mn := range mergeNodes {
+				out = append(out, findMergedMappingDecodeErrors(mn, typ, path, depth+1)...)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+
+	if node.Kind == yamlv3.MappingNode && expectedYAMLTypeName(typ) == "mapping" {
+		if detail := findSettingsYAMLNodeDecodeError(node, make(map[*yamlv3.Node]bool)); detail != "" {
+			return []string{fmt.Sprintf("%s: %s", path, detail)}
+		}
+	}
+
+	return []string{fmt.Sprintf("%s: cannot decode %s into %s", path, yamlNodeKindName(node), expectedYAMLTypeName(typ))}
+}
+
+func findMergedMappingDecodeErrors(mergeNode *yamlv3.Node, typ reflect.Type, path string, depth int) []string {
+	mn := unwrapYAMLAlias(mergeNode)
+	if !isValidYAMLMergeTarget(mn) {
+		return nil
+	}
+	if mn.Kind == yamlv3.MappingNode {
+		return findServerDecodeErrors(mn, typ, path, depth)
+	}
+	var out []string
+	for _, elem := range mn.Content {
+		out = append(out, findServerDecodeErrors(elem, typ, path, depth)...)
+	}
+	return out
+}
+
+// yamlStructFieldTypes maps each exported YAML field name on struct typ to its
+// compile-time tag name and Go reflect.Type, expanding inline struct fields.
+func yamlStructFieldTypes(typ reflect.Type) map[string]yamlStructField {
+	fields := make(map[string]yamlStructField, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		sf := typ.Field(i)
+		if !sf.IsExported() {
+			continue
+		}
+		tag := sf.Tag.Get("yaml")
+		if tag == "-" {
+			continue
+		}
+		name, opts, _ := strings.Cut(tag, ",")
+		if strings.Contains(","+opts+",", ",inline,") {
+			ft := sf.Type
+			for ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				for k, v := range yamlStructFieldTypes(ft) {
+					if _, exists := fields[k]; !exists {
+						fields[k] = v
+					}
+				}
+			}
+			continue
+		}
+		if name == "" {
+			name = strings.ToLower(sf.Name)
+		}
+		fields[name] = yamlStructField{name: name, typ: sf.Type}
+	}
+	return fields
+}
+
+func yamlNodeKindName(node *yamlv3.Node) string {
+	node = unwrapYAMLAlias(node)
+	if node == nil {
+		return "null"
+	}
+	switch node.Kind {
+	case yamlv3.MappingNode:
+		return "mapping"
+	case yamlv3.SequenceNode:
+		return "sequence"
+	case yamlv3.ScalarNode:
+		switch node.ShortTag() {
+		case "!!str":
+			return "string"
+		case "!!int":
+			return "integer"
+		case "!!float":
+			return "number"
+		case "!!bool":
+			return "boolean"
+		case "!!null":
+			return "null"
+		case "!!timestamp":
+			return "timestamp"
+		case "!!binary":
+			return "binary"
+		default:
+			return "scalar"
+		}
+	default:
+		return "value"
+	}
+}
+
+func expectedYAMLTypeName(typ reflect.Type) string {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	if typ == reflect.TypeOf(time.Duration(0)) {
+		return "duration"
+	}
+	switch typ.Kind() {
+	case reflect.Struct, reflect.Map:
+		return "mapping"
+	case reflect.Slice, reflect.Array:
+		elem := typ.Elem()
+		for elem.Kind() == reflect.Pointer {
+			elem = elem.Elem()
+		}
+		switch elem.Kind() {
+		case reflect.String:
+			return "list of strings"
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return "list of integers"
+		case reflect.Struct, reflect.Map:
+			return "list of mappings"
+		default:
+			return "list"
+		}
+	case reflect.String:
+		return "string"
+	case reflect.Bool:
+		return "boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return "integer"
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "unsigned integer"
+	case reflect.Float32, reflect.Float64:
+		return "number"
+	default:
+		return typ.String()
+	}
 }
 
 // readSettingsFileRaw reads settings.yaml in dir and parses it into a generic
@@ -2853,6 +3519,7 @@ var topLevelSettingsSectionKeys = []string{
 	"project_defaults",
 	"quotas",
 	"agent_secrets",
+	"broker_policy",
 	"default_harness_config",
 	"default_timezone",
 	"default_gcp_identity_mode",
@@ -2914,6 +3581,16 @@ func applyTopLevelSettingsSections(gc *GlobalConfig, raw map[string]interface{})
 	}
 	if decodeTopLevelSection(raw, "agent_secrets", &as) && as.UserScopeOnly != nil {
 		gc.AgentSecretsUserScopeOnly = as.UserScopeOnly
+	}
+
+	// Check for top-level "broker_policy" section — it lives outside
+	// "server" in settings.yaml and controls hub-level policy for Runtime
+	// Brokers (ptone/scion#7829).
+	var bp struct {
+		AdminManagedOnly *bool `yaml:"admin_managed_only"`
+	}
+	if decodeTopLevelSection(raw, "broker_policy", &bp) && bp.AdminManagedOnly != nil {
+		gc.BrokerPolicyAdminManagedOnly = bp.AdminManagedOnly
 	}
 
 	// Top-level default_harness_config — read from raw YAML.

@@ -17,6 +17,7 @@ package hub
 import (
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,38 +40,58 @@ type startupLayer1Values struct {
 	TelemetryDefault       *bool
 	AutoExposePortsDefault *bool
 	TelemetryConfig        *api.TelemetryConfig
+	// TelemetryProjectID is the startup metrics dashboard GCP project ID
+	// (from settings.yaml or the scion-telemetry-gcp-credentials secret).
+	TelemetryProjectID string
 	// GitHubApp holds the non-secret GitHub App fields only. The private
 	// key and webhook secret are never part of a snapshot.
 	GitHubApp githubAppPublicConfig
 	// AuthorizedDomains is the sign-in domain list from settings.yaml and
 	// SCION_SERVER_* (ptone/scion#6000).
 	AuthorizedDomains []string
+	// Branding is the Hub-wide UI branding from startup config.
+	Branding *config.BrandingConfig
 }
 
 // githubAppPublicConfig is the part of GitHubAppServerConfig that the
 // github_app settings section owns.
 type githubAppPublicConfig struct {
-	AppID           int64
-	APIBaseURL      string
-	WebhooksEnabled bool
-	InstallationURL string
-	PrivateKeyPath  string
+	AppID                 int64
+	APIBaseURL            string
+	WebhooksEnabled       bool
+	InstallationURL       string
+	PrivateKeyPath        string
+	AppSlug               string
+	CommandMentionAliases []string
+}
+
+func (a githubAppPublicConfig) equal(b githubAppPublicConfig) bool {
+	return a.AppID == b.AppID &&
+		a.APIBaseURL == b.APIBaseURL &&
+		a.WebhooksEnabled == b.WebhooksEnabled &&
+		a.InstallationURL == b.InstallationURL &&
+		a.PrivateKeyPath == b.PrivateKeyPath &&
+		a.AppSlug == b.AppSlug &&
+		slices.Equal(a.CommandMentionAliases, b.CommandMentionAliases)
 }
 
 func githubAppPublicFrom(c GitHubAppServerConfig) githubAppPublicConfig {
 	return githubAppPublicConfig{
-		AppID:           c.AppID,
-		APIBaseURL:      c.APIBaseURL,
-		WebhooksEnabled: c.WebhooksEnabled,
-		InstallationURL: c.InstallationURL,
-		PrivateKeyPath:  c.PrivateKeyPath,
+		AppID:                 c.AppID,
+		APIBaseURL:            c.APIBaseURL,
+		WebhooksEnabled:       c.WebhooksEnabled,
+		InstallationURL:       c.InstallationURL,
+		PrivateKeyPath:        c.PrivateKeyPath,
+		AppSlug:               c.AppSlug,
+		CommandMentionAliases: slices.Clone(c.CommandMentionAliases),
 	}
 }
 
 // setGitHubAppPublicLocked writes the non-secret GitHub App fields into
 // s.config. It reports whether anything changed. Callers hold s.mu.
 func (s *Server) setGitHubAppPublicLocked(g githubAppPublicConfig) bool {
-	if githubAppPublicFrom(s.config.GitHubAppConfig) == g {
+	prev := githubAppPublicFrom(s.config.GitHubAppConfig)
+	if prev.equal(g) {
 		return false
 	}
 	s.config.GitHubAppConfig.AppID = g.AppID
@@ -78,6 +99,11 @@ func (s *Server) setGitHubAppPublicLocked(g githubAppPublicConfig) bool {
 	s.config.GitHubAppConfig.WebhooksEnabled = g.WebhooksEnabled
 	s.config.GitHubAppConfig.InstallationURL = g.InstallationURL
 	s.config.GitHubAppConfig.PrivateKeyPath = g.PrivateKeyPath
+	s.config.GitHubAppConfig.AppSlug = g.AppSlug
+	s.config.GitHubAppConfig.CommandMentionAliases = slices.Clone(g.CommandMentionAliases)
+	if prev.AppID != g.AppID || prev.APIBaseURL != g.APIBaseURL || prev.PrivateKeyPath != g.PrivateKeyPath {
+		s.githubAppIdentity.reset()
+	}
 	return true
 }
 
@@ -90,9 +116,65 @@ func (s *Server) recordStartupLayer1Values() {
 		TelemetryDefault:       copyBoolPtr(s.config.TelemetryDefault),
 		AutoExposePortsDefault: copyBoolPtr(s.config.AutoExposePortsDefault),
 		TelemetryConfig:        s.config.TelemetryConfig,
+		TelemetryProjectID:     s.config.TelemetryProjectID,
 		GitHubApp:              githubAppPublicFrom(s.config.GitHubAppConfig),
 		AuthorizedDomains:      slices.Clone(s.config.AuthorizedDomains),
+		Branding:               s.config.Branding.Clone(),
 	}
+}
+
+// telemetryGCPProjectFromAPI returns the explicit telemetry.cloud.gcp_project_id
+// value from cfg, trimmed of surrounding whitespace, or "" if unset.
+func telemetryGCPProjectFromAPI(cfg *api.TelemetryConfig) string {
+	if cfg == nil || cfg.Cloud == nil || cfg.Cloud.GCPProjectID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*cfg.Cloud.GCPProjectID)
+}
+
+// effectiveMetricsProjectLocked returns the GCP project ID the metrics
+// dashboard should query for telemetryConfig, following the priority chain:
+//  1. Explicit telemetry.cloud.gcp_project_id in telemetryConfig
+//  2. Startup TelemetryProjectID (settings.yaml or SA credentials secret)
+//  3. Hub GCPProjectID fallback
+//
+// Callers hold s.mu (or run during single-goroutine Server init).
+func (s *Server) effectiveMetricsProjectLocked(telemetryConfig *api.TelemetryConfig) string {
+	if pid := telemetryGCPProjectFromAPI(telemetryConfig); pid != "" {
+		return pid
+	}
+	if pid := strings.TrimSpace(s.startupLayer1.TelemetryProjectID); pid != "" {
+		return pid
+	}
+	return strings.TrimSpace(s.config.GCPProjectID)
+}
+
+// ResolvedBranding returns the running Hub's validated UI branding snapshot.
+// Never returns nil; an uninitialized Server returns DefaultResolvedBranding().
+func (s *Server) ResolvedBranding() *config.ResolvedBranding {
+	if s != nil {
+		if r := s.resolvedBranding.Load(); r != nil {
+			return r
+		}
+	}
+	return config.DefaultResolvedBranding()
+}
+
+// applyBrandingLocked resolves next and updates s.config.Branding and
+// s.resolvedBranding, returning true when the effective branding config
+// changed. Malformed configs log a warning and fall back to stock Scion
+// defaults. Callers hold s.mu (or run during single-goroutine Server init).
+func (s *Server) applyBrandingLocked(next *config.BrandingConfig) bool {
+	cloned := next.Clone()
+	changed := !reflect.DeepEqual(s.config.Branding, cloned)
+	s.config.Branding = cloned
+	resolved, errs := config.ResolveBranding(cloned)
+	if len(errs) > 0 {
+		logging.Subsystem("hub.settings").Warn("invalid server.hub.branding configuration; falling back to default Scion branding",
+			"errors", errs)
+	}
+	s.resolvedBranding.Store(resolved)
+	return changed
 }
 
 // softDeleteSettings returns the running soft-delete retention and the

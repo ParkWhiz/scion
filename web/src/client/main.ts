@@ -26,7 +26,8 @@ import '@shoelace-style/shoelace/dist/themes/dark.css';
 
 import type { AuthMeResponse, PageData, User } from '../shared/types.js';
 import { stateManager } from './state.js';
-import { setDocumentTitle } from './page-title.js';
+import { getAppName, setDocumentTitle } from './page-title.js';
+import { applyBranding, BRANDING_STYLE_ID } from './branding.js';
 import { readInitialPageData, setInitialPageData, takeInitialPageData } from './ssr-page-data.js';
 import { configureReadinessMarks, readinessNavigationStarted } from './readiness-marks.js';
 import { legacyAgentRedirect } from './agent-routes.js';
@@ -53,6 +54,7 @@ import { resolveBrokerRoute } from './broker-routes.js';
 import { applyServerFeatureFlags } from './server-feature-flags.js';
 import { apiFetch } from './api.js';
 import { setPreferredTimeZone } from '../utils/time.js';
+import { setPreselectRecommendedChoices } from './decision-preferences.js';
 import { withTimeout } from './with-timeout.js';
 import {
   type AdminStatus,
@@ -62,6 +64,7 @@ import {
 } from '../lib/admin-permissions.js';
 import { ACCOUNT_TEARDOWN_EVENT, type AccountTeardownDetail } from '../utils/auth.js';
 import { clearAdminStatus, loadAdminStatus } from './admin-status.js';
+import { setAdminPathChecker } from './view-as-member.js';
 import { chatRecentFiles } from './chat-recent-files.js';
 import { isInPagePop, pushRouteEntry, type RouteShell } from './route-history.js';
 import {
@@ -92,7 +95,12 @@ const TZ_LOAD_BUDGET_MS = 1500;
 {
   const style = document.createElement('style');
   style.textContent = themeCSS;
-  document.head.appendChild(style);
+  const brandingStyle = document.getElementById(BRANDING_STYLE_ID);
+  if (brandingStyle?.parentNode === document.head) {
+    document.head.insertBefore(style, brandingStyle);
+  } else {
+    document.head.appendChild(style);
+  }
 }
 
 // Import Shoelace base path config (needed for icons).
@@ -108,8 +116,6 @@ setBasePath('/shoelace');
 // tag used in src/ must be imported here; shoelace-registration.test.ts
 // enforces it.
 import '@shoelace-style/shoelace/dist/components/badge/badge.js';
-import '@shoelace-style/shoelace/dist/components/breadcrumb/breadcrumb.js';
-import '@shoelace-style/shoelace/dist/components/breadcrumb-item/breadcrumb-item.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
 import '@shoelace-style/shoelace/dist/components/button-group/button-group.js';
 import '@shoelace-style/shoelace/dist/components/card/card.js';
@@ -147,7 +153,6 @@ import '@shoelace-style/shoelace/dist/components/tag/tag.js';
 import '../components/app-shell.js';
 import '../components/shared/nav.js';
 import '../components/shared/header.js';
-import '../components/shared/breadcrumb.js';
 import '../components/shared/status-badge.js';
 
 // Profile shell (lazy-loaded with profile routes)
@@ -414,6 +419,7 @@ async function fetchCurrentUser(): Promise<User | null> {
       testIdentity: data.testIdentity?.expiresAt
         ? { expiresAt: data.testIdentity.expiresAt }
         : undefined,
+      viewAsMember: data.viewAsMember === true ? true : undefined,
     };
   } catch {
     return null;
@@ -422,7 +428,8 @@ async function fetchCurrentUser(): Promise<User | null> {
 
 /**
  * Refreshes the display-timezone preference and applies it to the
- * effective-zone store (`setPreferredTimeZone`). Used when the SSR-injected
+ * effective-zone store (`setPreferredTimeZone`), and the decision-card
+ * preference (`setPreselectRecommendedChoices`). Used when the SSR-injected
  * user (`prefetchPageData`, `pkg/hub/web.go`) already supplied `currentUser`
  * without `preferences` — that field is deliberately never cached on the
  * session (`webSessionUser.Preferences`) and so is absent from SSR data,
@@ -454,6 +461,7 @@ async function loadPreferredTimeZone(): Promise<void> {
     if (!res.ok) return;
     const data = (await res.json()) as AuthMeResponse;
     setPreferredTimeZone(data.preferences?.timezone);
+    setPreselectRecommendedChoices(data.preferences?.preselectRecommendedChoices);
   } catch {
     // Non-critical — the effective zone falls back to the browser zone.
   }
@@ -625,9 +633,19 @@ const ROUTES: RouteConfig[] = [
     load: () => import('../components/pages/admin-integrations.js'),
   },
   {
+    pattern: /^\/admin\/system-one$/,
+    tag: 'scion-page-admin-system-one',
+    load: () => import('../components/pages/admin-system-one.js'),
+  },
+  {
     pattern: /^\/admin\/server-config$/,
     tag: 'scion-page-admin-server-config',
     load: () => import('../components/pages/admin-server-config.js'),
+  },
+  {
+    pattern: /^\/admin\/branding$/,
+    tag: 'scion-page-admin-branding',
+    load: () => import('../components/pages/admin-branding.js'),
   },
   {
     pattern: /^\/admin\/federation$/,
@@ -668,6 +686,16 @@ const ROUTES: RouteConfig[] = [
     pattern: /^\/settings\/service-accounts\/[^/]+$/,
     tag: 'scion-page-gcp-service-account-detail',
     load: () => import('../components/pages/gcp-service-account-detail.js'),
+  },
+  {
+    pattern: /^\/profile\/inbox$/,
+    tag: 'scion-page-profile-inbox',
+    load: () => import('../components/pages/profile-inbox.js'),
+  },
+  {
+    pattern: /^\/profile\/decisions$/,
+    tag: 'scion-page-profile-decisions',
+    load: () => import('../components/pages/profile-decisions.js'),
   },
   {
     pattern: /^\/profile\/env$/,
@@ -767,6 +795,12 @@ const ROUTES: RouteConfig[] = [
     load: () => import('../components/pages/project-schedules.js'),
   },
   {
+    // Project Decisions page (experiment web.decisions; renders 404 when off).
+    pattern: /^\/projects\/[^/]+\/decisions$/,
+    tag: 'scion-page-project-decisions',
+    load: () => import('../components/pages/project-decisions.js'),
+  },
+  {
     pattern: /^\/projects\/[^/]+\/metrics$/,
     tag: 'scion-page-project-metrics',
     load: () => import('../components/pages/metrics-dashboard.js'),
@@ -796,6 +830,12 @@ const ROUTES: RouteConfig[] = [
     pattern: /^\/agents\/[^/]+$/,
     tag: 'scion-page-agent-detail',
     load: () => import('../components/pages/agent-detail.js'),
+  },
+  {
+    // Standalone secret request page (experiment hub.agent_secrets; renders 404 when off).
+    pattern: /^\/secret-requests\/[^/]+$/,
+    tag: 'scion-page-secret-request',
+    load: () => import('../components/pages/secret-request.js'),
   },
   // Chat mode routes (Phase 5 — top-level chat)
   {
@@ -834,18 +874,21 @@ const ROUTES: RouteConfig[] = [
 ];
 
 /**
- * Routes that render without the app shell (full-page layout)
+ * Routes that render without the app shell (full-page layout), mapped to
+ * their document title segment.
  */
-const STANDALONE_ROUTES = new Set([
-  'scion-login-page',
-  'scion-page-invite',
-  'scion-page-onboarding',
+const STANDALONE_ROUTE_TITLES = new Map<string, string>([
+  ['scion-login-page', 'Login'],
+  ['scion-page-invite', 'Invite'],
+  ['scion-page-onboarding', 'Setup'],
 ]);
 
 /**
  * Routes that render inside the profile shell instead of the main app shell
  */
 const PROFILE_ROUTES = new Set([
+  'scion-page-profile-inbox',
+  'scion-page-profile-decisions',
   'scion-page-profile-env-vars',
   'scion-page-profile-secrets',
   'scion-page-profile-settings',
@@ -881,14 +924,18 @@ const ADMIN_ROUTES = new Set([
   'scion-page-admin-group-detail',
   'scion-page-admin-quotas',
   'scion-page-admin-server-config',
+  'scion-page-admin-branding',
   'scion-page-admin-federation',
   'scion-page-admin-integrations',
+  'scion-page-admin-system-one',
   'scion-page-admin-skill-registries',
   'scion-page-admin-skill-registry-detail',
   'scion-page-diagnostics',
   'scion-page-health-dashboard',
   'scion-page-metrics',
 ]);
+
+setAdminPathChecker((pathname) => ADMIN_ROUTES.has(resolveRoute(pathname).tag));
 
 // ---------------------------------------------------------------------------
 // Global error boundary — registered once so all shells share it.
@@ -945,6 +992,9 @@ async function init(): Promise<void> {
 
   // Get initial data from SSR
   const initialData = getInitialData();
+  if (initialData?.branding) {
+    applyBranding(initialData.branding);
+  }
   // Fixed for this document: a change of the setting applies on the next full load.
   configureReadinessMarks(initialData?.readinessMarks === true);
   if (initialData) {
@@ -975,6 +1025,7 @@ async function init(): Promise<void> {
     currentUser = await fetchCurrentUser();
     if (currentUser) {
       setPreferredTimeZone(currentUser.preferences?.timezone);
+      setPreselectRecommendedChoices(currentUser.preferences?.preselectRecommendedChoices);
     }
   } else {
     // SSR supplied the user without `preferences` (never cached on the
@@ -1025,7 +1076,6 @@ async function init(): Promise<void> {
     customElements.whenDefined('scion-app'),
     customElements.whenDefined('scion-nav'),
     customElements.whenDefined('scion-header'),
-    customElements.whenDefined('scion-breadcrumb'),
     customElements.whenDefined('scion-status-badge'),
   ]);
 
@@ -1142,7 +1192,7 @@ function resolveRoute(path: string): RouteConfig {
 type ShellType = 'standalone' | 'profile' | 'chat' | 'app';
 
 function getShellType(tag: string): ShellType {
-  if (STANDALONE_ROUTES.has(tag)) return 'standalone';
+  if (STANDALONE_ROUTE_TITLES.has(tag)) return 'standalone';
   if (PROFILE_ROUTES.has(tag)) return 'profile';
   if (CHAT_ROUTES.has(tag)) return 'chat';
   return 'app';
@@ -1192,13 +1242,18 @@ let activeShell: { type: ShellType; element: HTMLElement } | null = null;
 /** Navigation counter to cancel stale renders when rapid navigations occur */
 let navigationId = 0;
 
+interface RouteNavigationOptions {
+  /** Auto-open the "Jump to agent" picker when /terminals has no open terminals. */
+  openPickerWhenEmpty?: boolean;
+}
+
 /**
  * Renders the page component for the given path into #app.
  * Lazily imports the page module before creating the element.
  * Reuses the shell element (sidebar, header, etc.) when possible
  * to avoid full-page redraws on navigation.
  */
-async function renderRoute(path: string): Promise<void> {
+async function renderRoute(path: string, options?: RouteNavigationOptions): Promise<void> {
   const appContainer = ensureRoots();
   if (!appContainer) return;
   const thisNav = ++navigationId;
@@ -1337,16 +1392,23 @@ async function renderRoute(path: string): Promise<void> {
           if (!terminalMoveRunning) terminalWorkspace?.setStatusAction(null);
         }
       }
-    } else if (terminalPersistence && !terminalMoveRunning) {
-      // A bare /terminals in a window that does not own the terminals
-      // (for example a new window): show the same "open in another
-      // window" state as the other non-owner screens, not the empty one.
-      const elsewhere = await t.terminalsOpenElsewhere({
-        coordinator,
-        persistence: terminalPersistence,
-      });
-      if (elsewhere && thisNav === navigationId && !terminalMoveRunning) {
-        showTerminalsOpenElsewhere();
+    } else {
+      let elsewhere = false;
+      if (terminalPersistence && !terminalMoveRunning) {
+        // A bare /terminals in a window that does not own the terminals
+        // (for example a new window): show the same "open in another
+        // window" state as the other non-owner screens, not the empty one.
+        elsewhere = await t.terminalsOpenElsewhere({
+          coordinator,
+          persistence: terminalPersistence,
+        });
+        if (thisNav !== navigationId) return;
+        if (elsewhere && !terminalMoveRunning) {
+          showTerminalsOpenElsewhere();
+        }
+      }
+      if (options?.openPickerWhenEmpty && !elsewhere && !terminalMoveRunning && !accountTornDown) {
+        terminalWorkspace?.openPaletteIfEmpty();
       }
     }
     return;
@@ -1367,7 +1429,7 @@ async function renderRoute(path: string): Promise<void> {
   // takeInitialPageData) so page components can skip redundant API fetches.
   const pageData: PageData = {
     path,
-    title: 'Scion',
+    title: getAppName(),
     user: currentUser || undefined,
     data: initialData,
   };
@@ -1443,13 +1505,7 @@ async function renderRoute(path: string): Promise<void> {
     activeShell = null;
     const page = document.createElement(tag);
     appContainer.appendChild(page);
-    setDocumentTitle(
-      tag === 'scion-login-page'
-        ? 'Login'
-        : tag === 'scion-page-invite'
-          ? 'Invite'
-          : 'Page Not Found'
-    );
+    setDocumentTitle(STANDALONE_ROUTE_TITLES.get(tag) ?? 'Page Not Found');
   } else if (activeShell) {
     // Reuse existing shell — just update properties and swap page content
     const shell = activeShell.element as HTMLElement & {
@@ -1574,10 +1630,12 @@ function setupRouter(): void {
 
   // Handle nav-click events from shadow DOM components (e.g. sidebar nav)
   // These events use composed:true to cross shadow boundaries.
-  document.addEventListener('nav-click', ((e: CustomEvent<{ path: string }>) => {
+  document.addEventListener('nav-click', ((
+    e: CustomEvent<{ path: string; openPickerWhenEmpty?: boolean }>
+  ) => {
     const path = e.detail?.path;
     if (path) {
-      navigateTo(path);
+      navigateTo(path, e.detail?.openPickerWhenEmpty ? { openPickerWhenEmpty: true } : undefined);
     }
   }) as EventListener);
 
@@ -1649,10 +1707,10 @@ function leavesPage(path: string): boolean {
 /**
  * Navigates to a new path using the History API
  */
-function navigateTo(path: string): void {
+function navigateTo(path: string, options?: RouteNavigationOptions): void {
   const currentAppPath = stripBasePath(window.location.pathname);
   if (path === currentAppPath) {
-    if (path === '/terminals' || terminalAgentRoute.test(path)) void renderRoute(path);
+    if (path === '/terminals' || terminalAgentRoute.test(path)) void renderRoute(path, options);
     return;
   }
   // A page with unsaved changes may veto being removed.
@@ -1661,7 +1719,7 @@ function navigateTo(path: string): void {
   // Prefix app-relative paths with the base path for the browser URL bar
   window.history.pushState({}, '', browserPath(path));
   noteShownEntry();
-  void renderRoute(path);
+  void renderRoute(path, options);
 }
 
 /**

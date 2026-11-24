@@ -78,13 +78,13 @@ const ImageTagSettingPattern = `^(version|[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$`
 var imageTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 
 // releaseVersionPattern is the release version grammar: vX.Y.Z,
-// vX.Y.Z-preview.N or vX.Y.Z-rc.N, the tag forms the release process cuts
-// and publishes images under (hack/version.sh, without the nightly form).
-var releaseVersionPattern = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(preview|rc)\.(0|[1-9][0-9]*))?$`)
+// vX.Y.Z-preview.N, vX.Y.Z-rc.N or nightly-YYYYMMDD, the tag forms the
+// release process cuts and publishes images under (hack/version.sh).
+var releaseVersionPattern = regexp.MustCompile(`^(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(preview|rc)\.(0|[1-9][0-9]*))?|nightly-[0-9]{8})$`)
 
 // ReleaseImageTag returns v and true when v is a release version (vX.Y.Z,
-// vX.Y.Z-preview.N or vX.Y.Z-rc.N), else "" and false: an empty version,
-// "dev", a nightly, a Go pseudo-version, or any other form.
+// vX.Y.Z-preview.N, vX.Y.Z-rc.N or nightly-YYYYMMDD), else "" and false: an
+// empty version, "dev", a Go pseudo-version, or any other form.
 func ReleaseImageTag(v string) (string, bool) {
 	if releaseVersionPattern.MatchString(v) {
 		return v, true
@@ -188,6 +188,29 @@ func RewriteImageRef(image, registry, tag string) string {
 		}
 	}
 	return RewriteImageRegistry(RewriteImageTag(image, tag), registry)
+}
+
+// ImageBasename returns the last path component (e.g. "scion-claude:latest")
+// of a container image reference.
+func ImageBasename(ref string) string {
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		return ref[i+1:]
+	}
+	return ref
+}
+
+// IsShortFormImage reports whether ref is a non-empty short-form
+// (non-fully-qualified) image reference: its first path component contains
+// neither "." nor ":". This matches the qualification check used by
+// RewriteImageRegistry and RewriteImageTag.
+func IsShortFormImage(ref string) bool {
+	if ref == "" {
+		return false
+	}
+	if firstSlash := strings.Index(ref, "/"); firstSlash >= 0 {
+		return !strings.ContainsAny(ref[:firstSlash], ".:")
+	}
+	return true
 }
 
 // retagBasename sets the tag of image (whose last path component is the

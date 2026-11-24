@@ -761,10 +761,10 @@ Three wiring patterns, by how configurable your tool is:
 1. **Static config in `home/`** — claude and gemini-cli ship hook wiring in
    their seeded settings files, piping every lifecycle event to
    `sciontool hook --dialect=...` ([claude/home/.claude/settings.json](claude/home/.claude/settings.json)).
-2. **Notify/wrapper script in `home/`** — codex routes both its legacy
-   `notify` callback and its hooks through
-   [`scion_notify.sh`](codex/home/.codex/scion_notify.sh), which also turns
-   turn-completion into `sciontool status task_completed`.
+2. **Wrapper script in `home/`** — codex routes its registered hooks through
+   [`scion_notify.sh`](codex/home/.codex/scion_notify.sh), which filters the
+   event name and forwards known lifecycle payloads to
+   `sciontool hook --dialect=codex`.
 3. **Generated at provision time** — when hook config must contain runtime
    values or live in the workspace, write it from provision.py (antigravity
    generates `/workspace/.agents/hooks.json` wiring events through `jq` into
@@ -791,7 +791,26 @@ mappings:
 
 Map into the normalized event vocabulary: `session-start`, `session-end`,
 `prompt-submit`, `tool-start`, `tool-end`, `model-start`, `model-end`,
-`agent-end`, `subagent-end`, `response-complete`, `notification`.
+`agent-end`, `agent-error` (a turn that ended on an error, from a dedicated
+failure hook), `subagent-end`, `response-complete`, `notification`.
+
+Two optional per-mapping keys cover events that only sometimes mean what
+their name says:
+
+```yaml
+  Notification:
+    event: notification
+    skip_when:            # ignore the event when any condition holds
+      - field: notificationType   # dotted path; missing or non-string reads as ""
+        equals: agent_error       # or not_equals: <value>
+  errorOccurred:
+    event: model-end
+    uncounted: true       # not counted by max_model_calls, API-call metrics or usage
+```
+
+Use `uncounted` for a model-end the tool sends for only some calls (for
+example only failed ones); counting it would make `max_model_calls` count
+failures.
 Extractable fields include `prompt`, `tool_name`, `tool_input`,
 `tool_output`, `message`, `session_id`, `success`, `error`, `file_path`,
 and the token fields `input_tokens` (→ `input`), `output_tokens`
@@ -808,9 +827,12 @@ would sum them in Go instead.)
 Your `capabilities.limits` claims must match this wiring: `max_turns` needs
 `prompt-submit`, `max_model_calls` needs model start/end events.
 
-Agent-side status signaling (`sciontool status task_completed|blocked|ask_user`)
-is usually driven by agent instructions/templates, but a hook script may emit
-it directly where the tool has a reliable completion callback (codex).
+Agent-side status signaling (`sciontool status task_completed|blocked|idle|ask_user`)
+is usually driven by agent instructions/templates; a hook or bridge script may
+emit `task_completed` directly only from a run-settled callback (`pi`), never
+from a per-turn boundary, and never over a status set earlier in that run,
+whether the agent reported it (`ask_user`, `blocked`, `idle`) or limit
+enforcement set it (`limits_exceeded`).
 
 ## Dockerfile and image pipeline
 

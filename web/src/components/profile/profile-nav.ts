@@ -28,8 +28,36 @@ import {
   PENDING_SECRETS_CHANGED_EVENT,
   fetchPendingSecretCount,
 } from '../../client/pending-secrets.js';
+import {
+  PROFILE_DECISIONS_COUNT_CHANGED_EVENT,
+  fetchProfileDecisionProbe,
+  getInitialProfileDecisionVisibility,
+  isDecisionPromptMessageEvent,
+  resolveProfileDecisionVisibility,
+  scheduleSharedProfileDecisionProbeRefresh,
+  type ProfileDecisionVisibility,
+} from '../../client/profile-decisions.js';
+import { stateManager } from '../../client/state.js';
+import { INBOX_SUMMARY_CHANGED_EVENT, inboxSummaryStore } from '../../client/inbox-summary.js';
+import { loadAdminStatus } from '../../client/admin-status.js';
+import { toggleViewAsMember } from '../../client/view-as-member.js';
+import type { AdminStatus } from '../../lib/admin-permissions.js';
+import {
+  FEATURE_FLAGS_CHANGED_EVENT,
+  VIEW_AS_MEMBER_FLAG,
+  decisionsEnabled,
+  isFeatureEnabled,
+  isInboxDashboardEnabled,
+} from '../../utils/feature-flags.js';
+import { showToast } from '../../utils/toast.js';
 
 import type { User, Project } from '../../shared/types.js';
+import {
+  brandMarkStyles,
+  observeBranding,
+  renderAttribution,
+  renderSidebarBrand,
+} from '../shared/brand-mark.js';
 
 interface NavItem {
   path: string;
@@ -113,13 +141,118 @@ export class ScionProfileNav extends LitElement {
   @state()
   private pendingSecretCount = 0;
 
+  /** Whether `web.decisions` is enabled. */
+  @state()
+  private decisionsEnabled = false;
+
+  /** Whether `web.inbox_dashboard` is enabled. */
+  @state()
+  private inboxEnabled = false;
+
+  /** Formatted total badge for the Inbox nav link (`N` / `N+` / null). */
+  @state()
+  private inboxBadge: string | null = null;
+
+  /**
+   * Visibility of the top-level Decisions nav entry (§7):
+   * - `'unknown'`: initial probe has not resolved yet -> hidden (prevents flash on older 404 hubs)
+   * - `'visible'`: Hub supports `/api/v1/users/me/decisions` (or probe failed transiently per §7)
+   * - `'hidden'`: Hub returned 404 on `/api/v1/users/me/decisions`
+   */
+  @state()
+  private decisionsNavVisibility: ProfileDecisionVisibility = 'unknown';
+
+  /** Unfiltered `counts.waitingOnYou` across member projects (R1). */
+  @state()
+  private decisionsWaitingCount = 0;
+
+  /** Whether `hub.view_as_member` is enabled. */
+  @state()
+  private viewAsMemberFlagEnabled = false;
+
+  /** Loaded admin status for the current user (gates the "View as member" switch). */
+  @state()
+  private adminStatus: AdminStatus | null = null;
+
+  /** True while a POST /auth/view-as-member toggle request is in flight. */
+  @state()
+  private viewAsMemberBusy = false;
+
+  private adminStatusUserId: string | null = null;
+
   private boundOnPendingSecretsChanged = (e: Event): void => {
     const count = (e as CustomEvent<{ count?: number }>).detail?.count;
     if (typeof count === 'number') this.pendingSecretCount = count;
     else void this.loadPendingSecretCount();
   };
 
+  private boundOnInboxSummaryChanged = (): void => {
+    this.inboxBadge = inboxSummaryStore.formatBadge();
+  };
+
+  private boundOnFeatureFlagsChanged = (): void => {
+    const nextVam = isFeatureEnabled(VIEW_AS_MEMBER_FLAG);
+    if (nextVam !== this.viewAsMemberFlagEnabled) {
+      this.viewAsMemberFlagEnabled = nextVam;
+      if (nextVam) {
+        void this.loadAdminStatusForUser();
+      }
+    }
+    const nextDecisions = decisionsEnabled();
+    if (nextDecisions !== this.decisionsEnabled) {
+      this.decisionsEnabled = nextDecisions;
+      if (nextDecisions) {
+        this.ensureProfileStateScope();
+        this.syncOrProbeDecisionsCount();
+      } else {
+        this.decisionsWaitingCount = 0;
+        this.decisionsNavVisibility = 'unknown';
+      }
+    }
+    const nextInbox = isInboxDashboardEnabled();
+    if (nextInbox !== this.inboxEnabled) {
+      this.inboxEnabled = nextInbox;
+      if (nextInbox) {
+        this.ensureProfileStateScope();
+        inboxSummaryStore.ensureStarted(this.user?.id || undefined);
+        this.inboxBadge = inboxSummaryStore.formatBadge();
+      } else {
+        this.inboxBadge = null;
+      }
+    }
+  };
+
+  private boundOnProfileDecisionsCountChanged = (e: Event): void => {
+    const detail = (e as CustomEvent<{ available?: boolean; waitingOnYou?: number }>).detail;
+    if (detail?.available === false) {
+      this.decisionsNavVisibility = 'hidden';
+      this.decisionsWaitingCount = 0;
+      return;
+    }
+    if (typeof detail?.waitingOnYou === 'number') {
+      this.decisionsWaitingCount = Math.max(0, detail.waitingOnYou);
+      this.decisionsNavVisibility = 'visible';
+    } else {
+      scheduleSharedProfileDecisionProbeRefresh();
+    }
+  };
+
+  private boundOnDecisionUpdated = (): void => {
+    if (!this.decisionsEnabled || this.decisionsNavVisibility === 'hidden') return;
+    if (this.isActive('/profile/decisions')) return;
+    scheduleSharedProfileDecisionProbeRefresh();
+  };
+
+  private boundOnChatMessageReceived = (e: Event): void => {
+    if (!this.decisionsEnabled || this.decisionsNavVisibility === 'hidden') return;
+    if (this.isActive('/profile/decisions')) return;
+    if (!isDecisionPromptMessageEvent(e)) return;
+    scheduleSharedProfileDecisionProbeRefresh();
+  };
+
   static override styles = css`
+    ${brandMarkStyles}
+
     :host {
       display: flex;
       flex-direction: column;
@@ -176,7 +309,7 @@ export class ScionProfileNav extends LitElement {
       gap: 0.75rem;
       padding: 0.875rem 1rem;
       margin: 0.75rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       color: var(--scion-primary, #3b82f6);
       text-decoration: none;
       font-size: 0.875rem;
@@ -282,6 +415,24 @@ export class ScionProfileNav extends LitElement {
       color: var(--scion-text-muted, #64748b);
     }
 
+    .view-as-member-block {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+
+    .view-as-member-helper {
+      font-size: 0.75rem;
+      line-height: 1.3;
+      color: var(--scion-text-muted, #64748b);
+    }
+
+    :host([collapsed]) .view-as-member-block {
+      display: none;
+    }
+
     .nav-container {
       flex: 1;
       display: flex;
@@ -328,7 +479,7 @@ export class ScionProfileNav extends LitElement {
       align-items: center;
       gap: 0.75rem;
       padding: 0.625rem 0.75rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       color: var(--scion-text, #1e293b);
       text-decoration: none;
       font-size: 0.875rem;
@@ -342,7 +493,7 @@ export class ScionProfileNav extends LitElement {
 
     .nav-link.active {
       background: var(--scion-primary, #3b82f6);
-      color: white;
+      color: var(--scion-primary-text, #ffffff);
     }
 
     .nav-link.active:hover {
@@ -379,12 +530,32 @@ export class ScionProfileNav extends LitElement {
       display: none;
     }
 
+    .nav-section-decisions {
+      margin-bottom: 1rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid var(--scion-border, #e2e8f0);
+    }
+
+    .decisions-nav-badge {
+      margin-left: auto;
+    }
+
+    .nav-link.active .decisions-nav-badge::part(base) {
+      background: color-mix(in srgb, var(--scion-primary-text, #ffffff) 22%, transparent);
+      color: var(--scion-primary-text, #ffffff);
+      border-color: color-mix(in srgb, var(--scion-primary-text, #ffffff) 45%, transparent);
+    }
+
+    :host([collapsed]) .decisions-nav-badge {
+      display: none;
+    }
+
     .nav-link-external {
       display: flex;
       align-items: center;
       gap: 0.75rem;
       padding: 0.625rem 0.75rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       color: var(--scion-text, #1e293b);
       text-decoration: none;
       font-size: 0.875rem;
@@ -502,7 +673,7 @@ export class ScionProfileNav extends LitElement {
       margin: 0.5rem;
       padding: 0.5rem;
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius, 0.5rem);
       background: transparent;
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -539,18 +710,146 @@ export class ScionProfileNav extends LitElement {
       width: 0;
       pointer-events: none;
     }
+
+    .sidebar-attribution {
+      padding: 0.25rem 0.75rem;
+      font-size: 0.75rem;
+      color: var(--scion-text-muted, #64748b);
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .nav-item-sub .nav-link {
+      padding-left: 1.75rem;
+    }
+
+    :host([collapsed]) .nav-item-sub .nav-link {
+      padding-left: 0.75rem;
+    }
+
+    :host([collapsed]) .sidebar-attribution {
+      display: none;
+    }
   `;
+
+  constructor() {
+    super();
+    observeBranding(this);
+  }
 
   override connectedCallback(): void {
     super.connectedCallback();
     void this.checkGitHubApp();
     void this.loadPendingSecretCount();
+    this.viewAsMemberFlagEnabled = isFeatureEnabled(VIEW_AS_MEMBER_FLAG);
+    if (this.viewAsMemberFlagEnabled) {
+      void this.loadAdminStatusForUser();
+    }
+    this.decisionsEnabled = decisionsEnabled();
+    this.inboxEnabled = isInboxDashboardEnabled();
+    if (this.decisionsEnabled || this.inboxEnabled) {
+      this.ensureProfileStateScope();
+    }
+    if (this.decisionsEnabled) {
+      this.syncOrProbeDecisionsCount();
+    }
+    if (this.inboxEnabled) {
+      inboxSummaryStore.ensureStarted(this.user?.id || undefined);
+      this.inboxBadge = inboxSummaryStore.formatBadge();
+    }
     window.addEventListener(PENDING_SECRETS_CHANGED_EVENT, this.boundOnPendingSecretsChanged);
+    window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    window.addEventListener(INBOX_SUMMARY_CHANGED_EVENT, this.boundOnInboxSummaryChanged);
+    window.addEventListener(
+      PROFILE_DECISIONS_COUNT_CHANGED_EVENT,
+      this.boundOnProfileDecisionsCountChanged
+    );
+    stateManager.addEventListener('decision-updated', this.boundOnDecisionUpdated);
+    stateManager.addEventListener('chat-message-received', this.boundOnChatMessageReceived);
+  }
+
+  override updated(changedProperties: Map<string, unknown>): void {
+    if (changedProperties.has('user')) {
+      if (this.decisionsEnabled || this.inboxEnabled) {
+        this.ensureProfileStateScope();
+        if (this.inboxEnabled && this.user?.id) {
+          inboxSummaryStore.ensureStarted(this.user.id);
+        }
+      }
+      if (this.viewAsMemberFlagEnabled) {
+        void this.loadAdminStatusForUser();
+      }
+    }
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
     window.removeEventListener(PENDING_SECRETS_CHANGED_EVENT, this.boundOnPendingSecretsChanged);
+    window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    window.removeEventListener(INBOX_SUMMARY_CHANGED_EVENT, this.boundOnInboxSummaryChanged);
+    window.removeEventListener(
+      PROFILE_DECISIONS_COUNT_CHANGED_EVENT,
+      this.boundOnProfileDecisionsCountChanged
+    );
+    stateManager.removeEventListener('decision-updated', this.boundOnDecisionUpdated);
+    stateManager.removeEventListener('chat-message-received', this.boundOnChatMessageReceived);
+  }
+
+  private ensureProfileStateScope(): void {
+    const uid = this.user?.id || stateManager.getCurrentUserId();
+    if (uid) {
+      stateManager.setCurrentUserId(uid);
+    }
+    if (typeof EventSource !== 'undefined') {
+      stateManager.setScope(uid ? { type: 'profile', userId: uid } : { type: 'profile' });
+    }
+  }
+
+  private syncOrProbeDecisionsCount(): void {
+    const initial = getInitialProfileDecisionVisibility();
+    this.decisionsNavVisibility = initial.visibility;
+    this.decisionsWaitingCount = initial.waitingOnYou;
+    if (!initial.needsProbe) {
+      return;
+    }
+    if (this.isActive('/profile/decisions')) {
+      // Let <scion-page-profile-decisions> start its page fetch first in the same
+      // mount tick so the nav piggybacks on it instead of issuing a second ?limit=0 probe.
+      queueMicrotask(() => {
+        if (this.isConnected && this.decisionsEnabled) {
+          void this.loadProfileDecisionsCount();
+        }
+      });
+      return;
+    }
+    void this.loadProfileDecisionsCount();
+  }
+
+  private async loadProfileDecisionsCount(): Promise<void> {
+    if (!this.decisionsEnabled) return;
+    const probe = await fetchProfileDecisionProbe();
+    if (!this.isConnected || !this.decisionsEnabled) return;
+    const resolved = resolveProfileDecisionVisibility(this.decisionsNavVisibility, probe);
+    this.decisionsNavVisibility = resolved.visibility;
+    if (resolved.waitingOnYou !== null) {
+      this.decisionsWaitingCount = resolved.waitingOnYou;
+    }
+  }
+
+  private renderDecisionsBadge(): TemplateResult | typeof nothing {
+    if (this.decisionsWaitingCount <= 0) return nothing;
+    const n = this.decisionsWaitingCount;
+    const label = n === 1 ? '1 decision waiting on you' : `${n} decisions waiting on you`;
+    return html`<sl-badge
+      variant="primary"
+      pill
+      class="decisions-nav-badge"
+      data-decisions-nav-badge
+      title=${label}
+      aria-label=${label}
+      >${n}</sl-badge
+    >`;
   }
 
   private async loadPendingSecretCount(): Promise<void> {
@@ -612,14 +911,14 @@ export class ScionProfileNav extends LitElement {
     return false;
   }
 
-  override render() {
+  override render(): TemplateResult {
     return html`
       <div class="logo">
-        <div class="logo-icon">🌱</div>
-        <div class="logo-text">
-          <h1>Scion</h1>
-          <span>Profile &amp; Settings</span>
-        </div>
+        ${renderSidebarBrand({
+          collapsed: this.collapsed,
+          subtitleFallback: 'Profile & Settings',
+          alwaysShowSubtitle: true,
+        })}
       </div>
 
       <a href="/" class="return-link" aria-label="Return to Hub" title="Return to Hub">
@@ -639,10 +938,74 @@ export class ScionProfileNav extends LitElement {
                 ${this.renderRoleBadge(this.user.role)}
               </div>
             </div>
+            ${this.renderViewAsMemberToggle()}
           `
         : ''}
 
       <nav class="nav-container">
+        ${this.inboxEnabled
+          ? html`
+              <div class="nav-section nav-section-inbox" data-inbox-nav-section>
+                <div class="nav-section-title">Inbox</div>
+                <ul class="nav-list">
+                  <li class="nav-item">
+                    <a
+                      href="/profile/inbox"
+                      data-inbox-nav-link
+                      class="nav-link ${this.isActive('/profile/inbox') ? 'active' : ''}"
+                    >
+                      <sl-icon name="inbox"></sl-icon>
+                      <span class="nav-link-text">Inbox</span>
+                      ${this.inboxBadge
+                        ? html`<sl-badge
+                            variant="primary"
+                            pill
+                            class="decisions-nav-badge"
+                            data-inbox-nav-badge
+                            title=${`${this.inboxBadge} items waiting in Inbox`}
+                            aria-label=${`${this.inboxBadge} items waiting in Inbox`}
+                            >${this.inboxBadge}</sl-badge
+                          >`
+                        : nothing}
+                    </a>
+                  </li>
+                  ${this.decisionsEnabled && this.decisionsNavVisibility === 'visible'
+                    ? html`
+                        <li class="nav-item nav-item-sub">
+                          <a
+                            href="/profile/decisions"
+                            data-decisions-nav-link
+                            class="nav-link ${this.isActive('/profile/decisions') ? 'active' : ''}"
+                          >
+                            <sl-icon name="signpost-split"></sl-icon>
+                            <span class="nav-link-text">Decisions</span>
+                            ${this.renderDecisionsBadge()}
+                          </a>
+                        </li>
+                      `
+                    : nothing}
+                </ul>
+              </div>
+            `
+          : this.decisionsEnabled && this.decisionsNavVisibility === 'visible'
+            ? html`
+                <div class="nav-section nav-section-decisions">
+                  <ul class="nav-list">
+                    <li class="nav-item">
+                      <a
+                        href="/profile/decisions"
+                        data-decisions-nav-link
+                        class="nav-link ${this.isActive('/profile/decisions') ? 'active' : ''}"
+                      >
+                        <sl-icon name="signpost-split"></sl-icon>
+                        <span class="nav-link-text">Decisions</span>
+                        ${this.renderDecisionsBadge()}
+                      </a>
+                    </li>
+                  </ul>
+                </div>
+              `
+            : nothing}
         ${PROFILE_SECTIONS.map(
           (section) => html`
             <div class="nav-section">
@@ -684,6 +1047,7 @@ export class ScionProfileNav extends LitElement {
         )}
       </nav>
 
+      ${renderAttribution('sidebar-attribution')}
       ${this.hideCollapse
         ? ''
         : html`
@@ -700,6 +1064,63 @@ export class ScionProfileNav extends LitElement {
     `;
   }
 
+  private async loadAdminStatusForUser(): Promise<void> {
+    const userId = this.user?.id ?? null;
+    if (!userId) {
+      this.adminStatusUserId = null;
+      this.adminStatus = null;
+      return;
+    }
+    if (userId === this.adminStatusUserId) return;
+    this.adminStatusUserId = userId;
+    const status = await loadAdminStatus(userId);
+    if (this.adminStatusUserId === userId) {
+      this.adminStatus = status;
+    }
+  }
+
+  private renderViewAsMemberToggle(): TemplateResult | typeof nothing {
+    if (this.collapsed || !this.user) return nothing;
+    const active = this.user.viewAsMember === true;
+    const canShow = active || (this.viewAsMemberFlagEnabled && this.adminStatus?.isAdmin === true);
+    if (!canShow) return nothing;
+
+    return html`
+      <div class="view-as-member-block" data-testid="view-as-member-block">
+        <sl-switch
+          size="small"
+          class="view-as-member-switch"
+          data-testid="view-as-member-switch"
+          ?checked=${active}
+          ?disabled=${this.viewAsMemberBusy}
+          @sl-change=${this.handleViewAsMemberChange}
+          >View as member</sl-switch
+        >
+        <span class="view-as-member-helper">Drop hub admin access in this browser session</span>
+      </div>
+    `;
+  }
+
+  private handleViewAsMemberChange = async (e: Event): Promise<void> => {
+    const target = e.currentTarget as (HTMLElement & { checked?: boolean }) | null;
+    const next = Boolean(target?.checked);
+    const current = this.user?.viewAsMember === true;
+    if (next === current || this.viewAsMemberBusy) return;
+
+    this.viewAsMemberBusy = true;
+    try {
+      await toggleViewAsMember(next);
+    } catch (err) {
+      console.error('Failed to toggle View as member mode:', err);
+      if (target) target.checked = current;
+      this.viewAsMemberBusy = false;
+      showToast(
+        err instanceof Error ? err.message : 'Failed to toggle "View as member" mode',
+        'danger'
+      );
+    }
+  };
+
   /**
    * The user's own hub role as a badge, with its meaning in a tooltip.
    * Display only: no authorization decision reads the role string. Unknown or
@@ -708,6 +1129,15 @@ export class ScionProfileNav extends LitElement {
    */
   private renderRoleBadge(role: string | undefined): TemplateResult | typeof nothing {
     if (this.collapsed) return nothing;
+    if (this.user?.viewAsMember) {
+      const description =
+        'Viewing as a hub member in this browser session. Hub admin access is temporarily off.';
+      return html`
+        <sl-tooltip content=${description} placement="bottom-start" hoist>
+          <span class="role-badge member" tabindex="0">Hub Member (viewing as member)</span>
+        </sl-tooltip>
+      `;
+    }
     const info = role ? HUB_ROLE_BADGES.get(role) : undefined;
     if (!info) return nothing;
     return html`
@@ -727,7 +1157,8 @@ export class ScionProfileNav extends LitElement {
   }
 
   private isActive(path: string): boolean {
-    return this.currentPath === path || this.currentPath.startsWith(path + '/');
+    const pathname = this.currentPath.split(/[?#]/, 1)[0] || '';
+    return pathname === path || pathname.startsWith(path + '/');
   }
 }
 

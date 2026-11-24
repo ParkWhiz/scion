@@ -31,8 +31,10 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
@@ -110,8 +112,7 @@ func newGCPMintFixtureOn(t *testing.T, name string, srv *Server, s store.Store) 
 	require.NoError(t, err)
 	seedAssignment(t, s, agentRow, userID, saID)
 
-	token, err := srv.agentTokenService.GenerateAgentToken(agentID, projectID, []AgentTokenScope{GCPTokenScopeForSA(saID)}, []string{userID})
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agentID, projectID, []AgentTokenScope{GCPTokenScopeForSA(saID)}, []string{userID})
 
 	return &gcpMintFixture{Server: srv, Store: s, ProjectID: projectID, UserID: userID, AgentID: agentID, SA: sa, Token: token}
 }
@@ -172,8 +173,7 @@ func (f *gcpMintFixture) reassignSA(t *testing.T, scope, scopeID, email string) 
 	})
 	seedAssignment(t, f.Store, f.getAgent(t), f.UserID, saID)
 
-	token, err := f.Server.agentTokenService.GenerateAgentToken(f.AgentID, f.ProjectID, []AgentTokenScope{GCPTokenScopeForSA(saID)}, []string{f.UserID})
-	require.NoError(t, err)
+	token := f.Server.generateRecordedAgentToken(t, f.AgentID, f.ProjectID, []AgentTokenScope{GCPTokenScopeForSA(saID)}, []string{f.UserID})
 
 	f.SA = sa
 	f.Token = token
@@ -382,9 +382,8 @@ func TestAgentGCPToken_ServiceAccountLookupErrorDenied(t *testing.T) {
 // SA is current.
 func TestAgentGCPToken_AnotherServiceAccountScopeDenied(t *testing.T) {
 	f := newGCPMintFixture(t, "wrong-sa-scope")
-	otherToken, err := f.Server.agentTokenService.GenerateAgentToken(
+	otherToken := f.Server.generateRecordedAgentToken(t,
 		f.AgentID, f.ProjectID, []AgentTokenScope{GCPTokenScopeForSA(tid("some-other-sa"))}, []string{f.UserID})
-	require.NoError(t, err)
 	f.Token = otherToken
 	assertMintDenied(t, f)
 }
@@ -394,8 +393,7 @@ func TestAgentGCPToken_AnotherServiceAccountScopeDenied(t *testing.T) {
 // denies.
 func TestAgentGCPToken_NoServiceAccountScopeDenied(t *testing.T) {
 	f := newGCPMintFixture(t, "no-sa-scope")
-	noScopeToken, err := f.Server.agentTokenService.GenerateAgentToken(f.AgentID, f.ProjectID, nil, []string{f.UserID})
-	require.NoError(t, err)
+	noScopeToken := f.Server.generateRecordedAgentToken(t, f.AgentID, f.ProjectID, nil, []string{f.UserID})
 	f.Token = noScopeToken
 	assertMintDenied(t, f)
 }
@@ -474,4 +472,131 @@ func (f *gcpMintFailingStore) GetGCPServiceAccount(ctx context.Context, id strin
 		return nil, f.getGCPServiceAccountErr
 	}
 	return f.Store.GetGCPServiceAccount(ctx, id)
+}
+
+type recordingIDTokenGenerator struct {
+	mockGCPTokenGenerator
+	idErr        error
+	lastAudience string
+}
+
+func (g *recordingIDTokenGenerator) GenerateIDToken(_ context.Context, _ string, audience string) (*GCPIDToken, error) {
+	g.lastAudience = audience
+	if g.idErr != nil {
+		return nil, g.idErr
+	}
+	return &GCPIDToken{Token: "test-id-token"}, nil
+}
+
+// TestHandleAgentGCPIdentityToken_AuditRecordsAudience verifies that issuing
+// (or failing to issue) a GCP OIDC identity credential records the requested
+// audience (capped at maxLoggedAudienceLen) in the emitted GCP token audit
+// event without logging any token material, and that arbitrary audiences
+// continue to be served in full.
+func TestHandleAgentGCPIdentityToken_AuditRecordsAudience(t *testing.T) {
+	f := newGCPMintFixture(t, "id-audit-audience")
+	gen := &recordingIDTokenGenerator{
+		mockGCPTokenGenerator: mockGCPTokenGenerator{email: "hub-sa@test-hub-project.iam.gserviceaccount.com"},
+	}
+	f.Server.SetGCPTokenGenerator(gen)
+
+	for _, audience := range []string{
+		"https://service-a.example.com/api",
+		"api://custom-audience-b",
+	} {
+		t.Run("success/"+audience, func(t *testing.T) {
+			buf := captureAuditLogs(t)
+			f.Server.auditLogger = NewLogAuditLogger("[Test]", false)
+
+			rec := doRequestWithAgentToken(t, f.Server, http.MethodPost, "/api/v1/agent/gcp-identity-token",
+				map[string]string{"audience": audience}, f.Token)
+			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+			require.Equal(t, audience, gen.lastAudience)
+
+			auditRec := auditRecordWithMsg(t, buf, "GCP token audit event")
+			require.NotNil(t, auditRec, "expected GCP token audit event to be emitted")
+			require.Equal(t, string(GCPTokenEventIdentityToken), auditRec["event_type"])
+			require.Equal(t, true, auditRec["success"])
+			require.Equal(t, f.AgentID, auditRec["agent_id"])
+			require.Equal(t, f.ProjectID, auditRec["project_id"])
+			require.Equal(t, f.SA.Email, auditRec["sa_email"])
+			require.Equal(t, f.SA.ID, auditRec["sa_id"])
+			require.Equal(t, audience, auditRec["audience"])
+			require.NotContains(t, buf.String(), "test-id-token", "audit log must not contain token material")
+		})
+	}
+
+	overlong := "https://overlong.example.com/" + strings.Repeat("a", maxLoggedAudienceLen+100)
+
+	t.Run("success/overlong-truncated", func(t *testing.T) {
+		buf := captureAuditLogs(t)
+		f.Server.auditLogger = NewLogAuditLogger("[Test]", false)
+
+		rec := doRequestWithAgentToken(t, f.Server, http.MethodPost, "/api/v1/agent/gcp-identity-token",
+			map[string]string{"audience": overlong}, f.Token)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		require.Equal(t, overlong, gen.lastAudience, "full audience must still be passed to GenerateIDToken")
+
+		auditRec := auditRecordWithMsg(t, buf, "GCP token audit event")
+		require.NotNil(t, auditRec, "expected GCP token audit event to be emitted")
+		require.Equal(t, overlong[:maxLoggedAudienceLen], auditRec["audience"])
+		require.NotContains(t, buf.String(), "test-id-token", "audit log must not contain token material")
+	})
+
+	t.Run("success/overlong-multibyte-utf8-boundary", func(t *testing.T) {
+		// Place a 3-byte UTF-8 rune ("€", 0xE2 0x82 0xAC) starting at byte
+		// maxLoggedAudienceLen-1 so a naive byte slice would split it mid-rune.
+		prefix := strings.Repeat("a", maxLoggedAudienceLen-1)
+		multibyte := prefix + "€tail"
+		buf := captureAuditLogs(t)
+		f.Server.auditLogger = NewLogAuditLogger("[Test]", false)
+
+		rec := doRequestWithAgentToken(t, f.Server, http.MethodPost, "/api/v1/agent/gcp-identity-token",
+			map[string]string{"audience": multibyte}, f.Token)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		require.Equal(t, multibyte, gen.lastAudience, "full audience must still be passed to GenerateIDToken")
+
+		auditRec := auditRecordWithMsg(t, buf, "GCP token audit event")
+		require.NotNil(t, auditRec, "expected GCP token audit event to be emitted")
+		got, ok := auditRec["audience"].(string)
+		require.True(t, ok, "audience must be a string")
+		require.LessOrEqual(t, len(got), maxLoggedAudienceLen)
+		require.True(t, utf8.ValidString(got), "truncated audience must be valid UTF-8")
+		require.NotContains(t, got, "\ufffd", "truncated audience must not contain UTF-8 replacement chars")
+		require.Equal(t, prefix, got)
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		gen.idErr = errors.New("iam credentials unavailable")
+		buf := captureAuditLogs(t)
+		f.Server.auditLogger = NewLogAuditLogger("[Test]", false)
+		const audience = "https://failing.example.com"
+
+		rec := doRequestWithAgentToken(t, f.Server, http.MethodPost, "/api/v1/agent/gcp-identity-token",
+			map[string]string{"audience": audience}, f.Token)
+		require.Equal(t, http.StatusBadGateway, rec.Code, "body: %s", rec.Body.String())
+
+		auditRec := auditRecordWithMsg(t, buf, "GCP token audit event")
+		require.NotNil(t, auditRec, "expected GCP token audit event to be emitted on failure")
+		require.Equal(t, "WARN", auditRec["level"])
+		require.Equal(t, string(GCPTokenEventIdentityToken), auditRec["event_type"])
+		require.Equal(t, false, auditRec["success"])
+		require.Equal(t, audience, auditRec["audience"])
+	})
+
+	t.Run("failure/overlong-truncated", func(t *testing.T) {
+		gen.idErr = errors.New("iam credentials unavailable")
+		buf := captureAuditLogs(t)
+		f.Server.auditLogger = NewLogAuditLogger("[Test]", false)
+
+		rec := doRequestWithAgentToken(t, f.Server, http.MethodPost, "/api/v1/agent/gcp-identity-token",
+			map[string]string{"audience": overlong}, f.Token)
+		require.Equal(t, http.StatusBadGateway, rec.Code, "body: %s", rec.Body.String())
+		require.Equal(t, overlong, gen.lastAudience, "full audience must still be passed to GenerateIDToken")
+
+		auditRec := auditRecordWithMsg(t, buf, "GCP token audit event")
+		require.NotNil(t, auditRec, "expected GCP token audit event to be emitted on failure")
+		require.Equal(t, "WARN", auditRec["level"])
+		require.Equal(t, overlong[:maxLoggedAudienceLen], auditRec["audience"])
+	})
 }

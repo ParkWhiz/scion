@@ -309,7 +309,9 @@ type compactDeletionSeed struct {
 // neither do the rest, so null views are compared too.
 func compactDeletionSeeds(f *compactFixture) []compactDeletionSeed {
 	return []compactDeletionSeed{
-		{agentID: f.agentIDAt(1), seed: seedLiveDeleting},
+		// Use a local long lease rather than the shared 60s seedLiveDeleting so
+		// the row stays live-deleting throughout slow -race runs (~70s on 2 CPUs).
+		{agentID: f.agentIDAt(1), seed: deleteSeed{name: "live deleting", state: store.DeletionStateDeleting, leaseIn: time.Hour}},
 		{agentID: f.agentIDAt(3), seed: deleteSeed{state: store.DeletionStateFailed, leaseIn: -time.Minute, code: store.DeletionCodeRuntimeError}, errText: "broker said: container c-3 exited 137", detail: true},
 		{agentID: f.agentIDAt(4), seed: deleteSeed{state: store.DeletionStateFinalizing, leaseIn: time.Hour}},
 		{agentID: f.agentIDAt(5), seed: deleteSeed{state: store.DeletionStateFailed, leaseIn: -time.Minute, code: store.DeletionCodeInDoubt}, errText: "teardown on broker unconfirmed", detail: true},
@@ -430,11 +432,11 @@ var compactParityCells = map[string]compactParityCell{
 
 	"member global":        {http.StatusOK, true},
 	"member project":       {http.StatusOK, true},
-	"member other-project": {http.StatusForbidden, false},
+	"member other-project": {http.StatusNotFound, false},
 
 	"hub-admin-non-member global":        {http.StatusOK, false},
-	"hub-admin-non-member project":       {http.StatusForbidden, false},
-	"hub-admin-non-member other-project": {http.StatusForbidden, false},
+	"hub-admin-non-member project":       {http.StatusNotFound, false},
+	"hub-admin-non-member other-project": {http.StatusNotFound, false},
 
 	"super-admin global":        {http.StatusOK, true},
 	"super-admin project":       {http.StatusOK, true},
@@ -446,18 +448,18 @@ var compactParityCells = map[string]compactParityCell{
 
 	"scoped-uat global":        {http.StatusOK, true},
 	"scoped-uat project":       {http.StatusOK, true},
-	"scoped-uat other-project": {http.StatusForbidden, false},
+	"scoped-uat other-project": {http.StatusNotFound, false},
 
 	"project-constrained global":        {http.StatusOK, true},
 	"project-constrained project":       {http.StatusOK, true},
-	"project-constrained other-project": {http.StatusForbidden, false},
+	"project-constrained other-project": {http.StatusNotFound, false},
 
 	"relationship-grant global":        {http.StatusOK, true},
 	"relationship-grant project":       {http.StatusOK, true},
-	"relationship-grant other-project": {http.StatusForbidden, false},
+	"relationship-grant other-project": {http.StatusNotFound, false},
 
 	"other-project-member global":        {http.StatusOK, true},
-	"other-project-member project":       {http.StatusForbidden, false},
+	"other-project-member project":       {http.StatusNotFound, false},
 	"other-project-member other-project": {http.StatusOK, true},
 
 	"other-project-agent-jwt global":        {http.StatusOK, false},
@@ -527,13 +529,12 @@ func TestAgentCompactView_FieldParityPerCallerClass(t *testing.T) {
 
 	otherUser := compactUser(t, f.store, "other-only")
 	msgAuthzAddProjectMember(t, f.store, otherUser.ID, f.other.ID, f.other.Slug, store.GroupMemberRoleMember)
-	otherTok, err := f.srv.GetAgentTokenService().GenerateAgentToken(tid("cv-other-0"), f.other.ID, []AgentTokenScope{ScopeProjectRead}, nil)
-	require.NoError(t, err)
+	otherTok := f.srv.generateRecordedAgentToken(t, tid("cv-other-0"), f.other.ID, []AgentTokenScope{ScopeProjectRead}, nil)
 
 	// The agent principal of fixture agent 2 holds a project role binding
 	// that grants agent.list, so its token reads rows on the global list.
 	listRole := createTestRoleDefinition(t, f.store, "cv-agent-list", store.RoleScopeProject, []string{"agent.list"})
-	_, err = f.store.CreateRoleBinding(context.Background(), &store.RoleBinding{
+	_, err := f.store.CreateRoleBinding(context.Background(), &store.RoleBinding{
 		RoleDefinitionID: listRole.ID,
 		PrincipalType:    store.RoleBindingPrincipalAgent,
 		PrincipalID:      f.agentIDAt(2),
@@ -542,16 +543,14 @@ func TestAgentCompactView_FieldParityPerCallerClass(t *testing.T) {
 		CreatedBy:        "test",
 	})
 	require.NoError(t, err)
-	bindingTok, err := f.srv.GetAgentTokenService().GenerateAgentToken(f.agentIDAt(2), f.project.ID, []AgentTokenScope{ScopeProjectRead}, nil)
-	require.NoError(t, err)
+	bindingTok := f.srv.generateRecordedAgentToken(t, f.agentIDAt(2), f.project.ID, []AgentTokenScope{ScopeProjectRead}, nil)
 
 	hubKey, _, err := f.srv.uatService.CreateTokenWithParams(rs4MintContext(f.owner.ID), CreateTokenParams{
 		UserID: f.owner.ID, Name: "cv-hub-uat", Boundary: hubBoundary(), Scopes: []string{"agent:list"},
 	})
 	require.NoError(t, err)
 
-	noReadTok, err := f.srv.GetAgentTokenService().GenerateAgentToken(f.agentIDAt(0), f.project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
-	require.NoError(t, err)
+	noReadTok := f.srv.generateRecordedAgentToken(t, f.agentIDAt(0), f.project.ID, []AgentTokenScope{ScopeAgentStatusUpdate}, nil)
 
 	asAgent := func(tok string) func(t *testing.T, path string) *httptest.ResponseRecorder {
 		return func(t *testing.T, path string) *httptest.ResponseRecorder {
@@ -858,15 +857,15 @@ func TestAgentCompactView_DeletionDetailAdminClasses(t *testing.T) {
 	// and both enrichment functions with a federated admin identity.
 	//
 	// Pinned statuses, observed in a run: the project endpoints deny with
-	// 403 (principal resolution fails closed in the authorize check), and
+	// 404 (principal resolution fails closed in authorizeReadAction), and
 	// the global list answers 500 "unable to resolve authorization", because
 	// listAgents treats the same principal resolution error from
 	// ResolveListScopes as a server error. Both views answer the same (the
 	// harness compares status and body), and no rows are read either way.
 	federatedCells := map[string]int{
 		"federated-admin global":        http.StatusInternalServerError,
-		"federated-admin project":       http.StatusForbidden,
-		"federated-admin other-project": http.StatusForbidden,
+		"federated-admin project":       http.StatusNotFound,
+		"federated-admin other-project": http.StatusNotFound,
 	}
 	for cell, status := range federatedCells {
 		assert.Equal(t, map[int]bool{status: true}, tally.cellStatus[cell], "%s: first-page statuses", cell)

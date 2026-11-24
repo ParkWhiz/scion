@@ -14,6 +14,7 @@ import (
 	"entgo.io/ent/schema/field"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agenthold"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentsuspendscreen"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/brokerreportedrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/groupmembership"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/policybinding"
@@ -368,6 +369,26 @@ func (_u *AgentUpdate) SetNillableStalledFromActivity(v *string) *AgentUpdate {
 // ClearStalledFromActivity clears the value of the "stalled_from_activity" field.
 func (_u *AgentUpdate) ClearStalledFromActivity() *AgentUpdate {
 	_u.mutation.ClearStalledFromActivity()
+	return _u
+}
+
+// SetSuspendReason sets the "suspend_reason" field.
+func (_u *AgentUpdate) SetSuspendReason(v string) *AgentUpdate {
+	_u.mutation.SetSuspendReason(v)
+	return _u
+}
+
+// SetNillableSuspendReason sets the "suspend_reason" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableSuspendReason(v *string) *AgentUpdate {
+	if v != nil {
+		_u.SetSuspendReason(*v)
+	}
+	return _u
+}
+
+// ClearSuspendReason clears the value of the "suspend_reason" field.
+func (_u *AgentUpdate) ClearSuspendReason() *AgentUpdate {
+	_u.mutation.ClearSuspendReason()
 	return _u
 }
 
@@ -762,6 +783,46 @@ func (_u *AgentUpdate) SetNillableLastActivityEvent(v *time.Time) *AgentUpdate {
 // ClearLastActivityEvent clears the value of the "last_activity_event" field.
 func (_u *AgentUpdate) ClearLastActivityEvent() *AgentUpdate {
 	_u.mutation.ClearLastActivityEvent()
+	return _u
+}
+
+// SetLastLiveProcessAt sets the "last_live_process_at" field.
+func (_u *AgentUpdate) SetLastLiveProcessAt(v time.Time) *AgentUpdate {
+	_u.mutation.SetLastLiveProcessAt(v)
+	return _u
+}
+
+// SetNillableLastLiveProcessAt sets the "last_live_process_at" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableLastLiveProcessAt(v *time.Time) *AgentUpdate {
+	if v != nil {
+		_u.SetLastLiveProcessAt(*v)
+	}
+	return _u
+}
+
+// ClearLastLiveProcessAt clears the value of the "last_live_process_at" field.
+func (_u *AgentUpdate) ClearLastLiveProcessAt() *AgentUpdate {
+	_u.mutation.ClearLastLiveProcessAt()
+	return _u
+}
+
+// SetLastLiveWorkAt sets the "last_live_work_at" field.
+func (_u *AgentUpdate) SetLastLiveWorkAt(v time.Time) *AgentUpdate {
+	_u.mutation.SetLastLiveWorkAt(v)
+	return _u
+}
+
+// SetNillableLastLiveWorkAt sets the "last_live_work_at" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableLastLiveWorkAt(v *time.Time) *AgentUpdate {
+	if v != nil {
+		_u.SetLastLiveWorkAt(*v)
+	}
+	return _u
+}
+
+// ClearLastLiveWorkAt clears the value of the "last_live_work_at" field.
+func (_u *AgentUpdate) ClearLastLiveWorkAt() *AgentUpdate {
+	_u.mutation.ClearLastLiveWorkAt()
 	return _u
 }
 
@@ -1755,6 +1816,66 @@ func (_u *AgentUpdate) ClearSoftDeleteOpID() *AgentUpdate {
 	return _u
 }
 
+// SetActivitySince sets the "activity_since" field.
+func (_u *AgentUpdate) SetActivitySince(v time.Time) *AgentUpdate {
+	_u.mutation.SetActivitySince(v)
+	return _u
+}
+
+// SetNillableActivitySince sets the "activity_since" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableActivitySince(v *time.Time) *AgentUpdate {
+	if v != nil {
+		_u.SetActivitySince(*v)
+	}
+	return _u
+}
+
+// ClearActivitySince clears the value of the "activity_since" field.
+func (_u *AgentUpdate) ClearActivitySince() *AgentUpdate {
+	_u.mutation.ClearActivitySince()
+	return _u
+}
+
+// SetLastDeliveryAt sets the "last_delivery_at" field.
+func (_u *AgentUpdate) SetLastDeliveryAt(v time.Time) *AgentUpdate {
+	_u.mutation.SetLastDeliveryAt(v)
+	return _u
+}
+
+// SetNillableLastDeliveryAt sets the "last_delivery_at" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableLastDeliveryAt(v *time.Time) *AgentUpdate {
+	if v != nil {
+		_u.SetLastDeliveryAt(*v)
+	}
+	return _u
+}
+
+// ClearLastDeliveryAt clears the value of the "last_delivery_at" field.
+func (_u *AgentUpdate) ClearLastDeliveryAt() *AgentUpdate {
+	_u.mutation.ClearLastDeliveryAt()
+	return _u
+}
+
+// SetIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field.
+func (_u *AgentUpdate) SetIdleSuspendClaimUntil(v time.Time) *AgentUpdate {
+	_u.mutation.SetIdleSuspendClaimUntil(v)
+	return _u
+}
+
+// SetNillableIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field if the given value is not nil.
+func (_u *AgentUpdate) SetNillableIdleSuspendClaimUntil(v *time.Time) *AgentUpdate {
+	if v != nil {
+		_u.SetIdleSuspendClaimUntil(*v)
+	}
+	return _u
+}
+
+// ClearIdleSuspendClaimUntil clears the value of the "idle_suspend_claim_until" field.
+func (_u *AgentUpdate) ClearIdleSuspendClaimUntil() *AgentUpdate {
+	_u.mutation.ClearIdleSuspendClaimUntil()
+	return _u
+}
+
 // SetProject sets the "project" edge to the Project entity.
 func (_u *AgentUpdate) SetProject(v *Project) *AgentUpdate {
 	return _u.SetProjectID(v.ID)
@@ -1818,6 +1939,25 @@ func (_u *AgentUpdate) AddReportedRuns(v ...*BrokerReportedRun) *AgentUpdate {
 		ids[i] = v[i].ID
 	}
 	return _u.AddReportedRunIDs(ids...)
+}
+
+// SetSuspendScreenID sets the "suspend_screen" edge to the AgentSuspendScreen entity by ID.
+func (_u *AgentUpdate) SetSuspendScreenID(id uuid.UUID) *AgentUpdate {
+	_u.mutation.SetSuspendScreenID(id)
+	return _u
+}
+
+// SetNillableSuspendScreenID sets the "suspend_screen" edge to the AgentSuspendScreen entity by ID if the given value is not nil.
+func (_u *AgentUpdate) SetNillableSuspendScreenID(id *uuid.UUID) *AgentUpdate {
+	if id != nil {
+		_u = _u.SetSuspendScreenID(*id)
+	}
+	return _u
+}
+
+// SetSuspendScreen sets the "suspend_screen" edge to the AgentSuspendScreen entity.
+func (_u *AgentUpdate) SetSuspendScreen(v *AgentSuspendScreen) *AgentUpdate {
+	return _u.SetSuspendScreenID(v.ID)
 }
 
 // Mutation returns the AgentMutation object of the builder.
@@ -1913,6 +2053,12 @@ func (_u *AgentUpdate) RemoveReportedRuns(v ...*BrokerReportedRun) *AgentUpdate 
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveReportedRunIDs(ids...)
+}
+
+// ClearSuspendScreen clears the "suspend_screen" edge to the AgentSuspendScreen entity.
+func (_u *AgentUpdate) ClearSuspendScreen() *AgentUpdate {
+	_u.mutation.ClearSuspendScreen()
+	return _u
 }
 
 // Save executes the query and returns the number of nodes affected by the update operation.
@@ -2096,6 +2242,12 @@ func (_u *AgentUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.StalledFromActivityCleared() {
 		_spec.ClearField(agent.FieldStalledFromActivity, field.TypeString)
 	}
+	if value, ok := _u.mutation.SuspendReason(); ok {
+		_spec.SetField(agent.FieldSuspendReason, field.TypeString, value)
+	}
+	if _u.mutation.SuspendReasonCleared() {
+		_spec.ClearField(agent.FieldSuspendReason, field.TypeString)
+	}
 	if value, ok := _u.mutation.CurrentTurns(); ok {
 		_spec.SetField(agent.FieldCurrentTurns, field.TypeInt, value)
 	}
@@ -2220,6 +2372,18 @@ func (_u *AgentUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.LastActivityEventCleared() {
 		_spec.ClearField(agent.FieldLastActivityEvent, field.TypeTime)
+	}
+	if value, ok := _u.mutation.LastLiveProcessAt(); ok {
+		_spec.SetField(agent.FieldLastLiveProcessAt, field.TypeTime, value)
+	}
+	if _u.mutation.LastLiveProcessAtCleared() {
+		_spec.ClearField(agent.FieldLastLiveProcessAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.LastLiveWorkAt(); ok {
+		_spec.SetField(agent.FieldLastLiveWorkAt, field.TypeTime, value)
+	}
+	if _u.mutation.LastLiveWorkAtCleared() {
+		_spec.ClearField(agent.FieldLastLiveWorkAt, field.TypeTime)
 	}
 	if value, ok := _u.mutation.StartedAt(); ok {
 		_spec.SetField(agent.FieldStartedAt, field.TypeTime, value)
@@ -2520,6 +2684,24 @@ func (_u *AgentUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if _u.mutation.SoftDeleteOpIDCleared() {
 		_spec.ClearField(agent.FieldSoftDeleteOpID, field.TypeString)
 	}
+	if value, ok := _u.mutation.ActivitySince(); ok {
+		_spec.SetField(agent.FieldActivitySince, field.TypeTime, value)
+	}
+	if _u.mutation.ActivitySinceCleared() {
+		_spec.ClearField(agent.FieldActivitySince, field.TypeTime)
+	}
+	if value, ok := _u.mutation.LastDeliveryAt(); ok {
+		_spec.SetField(agent.FieldLastDeliveryAt, field.TypeTime, value)
+	}
+	if _u.mutation.LastDeliveryAtCleared() {
+		_spec.ClearField(agent.FieldLastDeliveryAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.IdleSuspendClaimUntil(); ok {
+		_spec.SetField(agent.FieldIdleSuspendClaimUntil, field.TypeTime, value)
+	}
+	if _u.mutation.IdleSuspendClaimUntilCleared() {
+		_spec.ClearField(agent.FieldIdleSuspendClaimUntil, field.TypeTime)
+	}
 	if _u.mutation.ProjectCleared() {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.M2O,
@@ -2722,6 +2904,35 @@ func (_u *AgentUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(brokerreportedrun.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.SuspendScreenCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   agent.SuspendScreenTable,
+			Columns: []string{agent.SuspendScreenColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(agentsuspendscreen.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.SuspendScreenIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   agent.SuspendScreenTable,
+			Columns: []string{agent.SuspendScreenColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(agentsuspendscreen.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {
@@ -3081,6 +3292,26 @@ func (_u *AgentUpdateOne) SetNillableStalledFromActivity(v *string) *AgentUpdate
 // ClearStalledFromActivity clears the value of the "stalled_from_activity" field.
 func (_u *AgentUpdateOne) ClearStalledFromActivity() *AgentUpdateOne {
 	_u.mutation.ClearStalledFromActivity()
+	return _u
+}
+
+// SetSuspendReason sets the "suspend_reason" field.
+func (_u *AgentUpdateOne) SetSuspendReason(v string) *AgentUpdateOne {
+	_u.mutation.SetSuspendReason(v)
+	return _u
+}
+
+// SetNillableSuspendReason sets the "suspend_reason" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableSuspendReason(v *string) *AgentUpdateOne {
+	if v != nil {
+		_u.SetSuspendReason(*v)
+	}
+	return _u
+}
+
+// ClearSuspendReason clears the value of the "suspend_reason" field.
+func (_u *AgentUpdateOne) ClearSuspendReason() *AgentUpdateOne {
+	_u.mutation.ClearSuspendReason()
 	return _u
 }
 
@@ -3475,6 +3706,46 @@ func (_u *AgentUpdateOne) SetNillableLastActivityEvent(v *time.Time) *AgentUpdat
 // ClearLastActivityEvent clears the value of the "last_activity_event" field.
 func (_u *AgentUpdateOne) ClearLastActivityEvent() *AgentUpdateOne {
 	_u.mutation.ClearLastActivityEvent()
+	return _u
+}
+
+// SetLastLiveProcessAt sets the "last_live_process_at" field.
+func (_u *AgentUpdateOne) SetLastLiveProcessAt(v time.Time) *AgentUpdateOne {
+	_u.mutation.SetLastLiveProcessAt(v)
+	return _u
+}
+
+// SetNillableLastLiveProcessAt sets the "last_live_process_at" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableLastLiveProcessAt(v *time.Time) *AgentUpdateOne {
+	if v != nil {
+		_u.SetLastLiveProcessAt(*v)
+	}
+	return _u
+}
+
+// ClearLastLiveProcessAt clears the value of the "last_live_process_at" field.
+func (_u *AgentUpdateOne) ClearLastLiveProcessAt() *AgentUpdateOne {
+	_u.mutation.ClearLastLiveProcessAt()
+	return _u
+}
+
+// SetLastLiveWorkAt sets the "last_live_work_at" field.
+func (_u *AgentUpdateOne) SetLastLiveWorkAt(v time.Time) *AgentUpdateOne {
+	_u.mutation.SetLastLiveWorkAt(v)
+	return _u
+}
+
+// SetNillableLastLiveWorkAt sets the "last_live_work_at" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableLastLiveWorkAt(v *time.Time) *AgentUpdateOne {
+	if v != nil {
+		_u.SetLastLiveWorkAt(*v)
+	}
+	return _u
+}
+
+// ClearLastLiveWorkAt clears the value of the "last_live_work_at" field.
+func (_u *AgentUpdateOne) ClearLastLiveWorkAt() *AgentUpdateOne {
+	_u.mutation.ClearLastLiveWorkAt()
 	return _u
 }
 
@@ -4468,6 +4739,66 @@ func (_u *AgentUpdateOne) ClearSoftDeleteOpID() *AgentUpdateOne {
 	return _u
 }
 
+// SetActivitySince sets the "activity_since" field.
+func (_u *AgentUpdateOne) SetActivitySince(v time.Time) *AgentUpdateOne {
+	_u.mutation.SetActivitySince(v)
+	return _u
+}
+
+// SetNillableActivitySince sets the "activity_since" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableActivitySince(v *time.Time) *AgentUpdateOne {
+	if v != nil {
+		_u.SetActivitySince(*v)
+	}
+	return _u
+}
+
+// ClearActivitySince clears the value of the "activity_since" field.
+func (_u *AgentUpdateOne) ClearActivitySince() *AgentUpdateOne {
+	_u.mutation.ClearActivitySince()
+	return _u
+}
+
+// SetLastDeliveryAt sets the "last_delivery_at" field.
+func (_u *AgentUpdateOne) SetLastDeliveryAt(v time.Time) *AgentUpdateOne {
+	_u.mutation.SetLastDeliveryAt(v)
+	return _u
+}
+
+// SetNillableLastDeliveryAt sets the "last_delivery_at" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableLastDeliveryAt(v *time.Time) *AgentUpdateOne {
+	if v != nil {
+		_u.SetLastDeliveryAt(*v)
+	}
+	return _u
+}
+
+// ClearLastDeliveryAt clears the value of the "last_delivery_at" field.
+func (_u *AgentUpdateOne) ClearLastDeliveryAt() *AgentUpdateOne {
+	_u.mutation.ClearLastDeliveryAt()
+	return _u
+}
+
+// SetIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field.
+func (_u *AgentUpdateOne) SetIdleSuspendClaimUntil(v time.Time) *AgentUpdateOne {
+	_u.mutation.SetIdleSuspendClaimUntil(v)
+	return _u
+}
+
+// SetNillableIdleSuspendClaimUntil sets the "idle_suspend_claim_until" field if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableIdleSuspendClaimUntil(v *time.Time) *AgentUpdateOne {
+	if v != nil {
+		_u.SetIdleSuspendClaimUntil(*v)
+	}
+	return _u
+}
+
+// ClearIdleSuspendClaimUntil clears the value of the "idle_suspend_claim_until" field.
+func (_u *AgentUpdateOne) ClearIdleSuspendClaimUntil() *AgentUpdateOne {
+	_u.mutation.ClearIdleSuspendClaimUntil()
+	return _u
+}
+
 // SetProject sets the "project" edge to the Project entity.
 func (_u *AgentUpdateOne) SetProject(v *Project) *AgentUpdateOne {
 	return _u.SetProjectID(v.ID)
@@ -4531,6 +4862,25 @@ func (_u *AgentUpdateOne) AddReportedRuns(v ...*BrokerReportedRun) *AgentUpdateO
 		ids[i] = v[i].ID
 	}
 	return _u.AddReportedRunIDs(ids...)
+}
+
+// SetSuspendScreenID sets the "suspend_screen" edge to the AgentSuspendScreen entity by ID.
+func (_u *AgentUpdateOne) SetSuspendScreenID(id uuid.UUID) *AgentUpdateOne {
+	_u.mutation.SetSuspendScreenID(id)
+	return _u
+}
+
+// SetNillableSuspendScreenID sets the "suspend_screen" edge to the AgentSuspendScreen entity by ID if the given value is not nil.
+func (_u *AgentUpdateOne) SetNillableSuspendScreenID(id *uuid.UUID) *AgentUpdateOne {
+	if id != nil {
+		_u = _u.SetSuspendScreenID(*id)
+	}
+	return _u
+}
+
+// SetSuspendScreen sets the "suspend_screen" edge to the AgentSuspendScreen entity.
+func (_u *AgentUpdateOne) SetSuspendScreen(v *AgentSuspendScreen) *AgentUpdateOne {
+	return _u.SetSuspendScreenID(v.ID)
 }
 
 // Mutation returns the AgentMutation object of the builder.
@@ -4626,6 +4976,12 @@ func (_u *AgentUpdateOne) RemoveReportedRuns(v ...*BrokerReportedRun) *AgentUpda
 		ids[i] = v[i].ID
 	}
 	return _u.RemoveReportedRunIDs(ids...)
+}
+
+// ClearSuspendScreen clears the "suspend_screen" edge to the AgentSuspendScreen entity.
+func (_u *AgentUpdateOne) ClearSuspendScreen() *AgentUpdateOne {
+	_u.mutation.ClearSuspendScreen()
+	return _u
 }
 
 // Where appends a list predicates to the AgentUpdate builder.
@@ -4839,6 +5195,12 @@ func (_u *AgentUpdateOne) sqlSave(ctx context.Context) (_node *Agent, err error)
 	if _u.mutation.StalledFromActivityCleared() {
 		_spec.ClearField(agent.FieldStalledFromActivity, field.TypeString)
 	}
+	if value, ok := _u.mutation.SuspendReason(); ok {
+		_spec.SetField(agent.FieldSuspendReason, field.TypeString, value)
+	}
+	if _u.mutation.SuspendReasonCleared() {
+		_spec.ClearField(agent.FieldSuspendReason, field.TypeString)
+	}
 	if value, ok := _u.mutation.CurrentTurns(); ok {
 		_spec.SetField(agent.FieldCurrentTurns, field.TypeInt, value)
 	}
@@ -4963,6 +5325,18 @@ func (_u *AgentUpdateOne) sqlSave(ctx context.Context) (_node *Agent, err error)
 	}
 	if _u.mutation.LastActivityEventCleared() {
 		_spec.ClearField(agent.FieldLastActivityEvent, field.TypeTime)
+	}
+	if value, ok := _u.mutation.LastLiveProcessAt(); ok {
+		_spec.SetField(agent.FieldLastLiveProcessAt, field.TypeTime, value)
+	}
+	if _u.mutation.LastLiveProcessAtCleared() {
+		_spec.ClearField(agent.FieldLastLiveProcessAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.LastLiveWorkAt(); ok {
+		_spec.SetField(agent.FieldLastLiveWorkAt, field.TypeTime, value)
+	}
+	if _u.mutation.LastLiveWorkAtCleared() {
+		_spec.ClearField(agent.FieldLastLiveWorkAt, field.TypeTime)
 	}
 	if value, ok := _u.mutation.StartedAt(); ok {
 		_spec.SetField(agent.FieldStartedAt, field.TypeTime, value)
@@ -5263,6 +5637,24 @@ func (_u *AgentUpdateOne) sqlSave(ctx context.Context) (_node *Agent, err error)
 	if _u.mutation.SoftDeleteOpIDCleared() {
 		_spec.ClearField(agent.FieldSoftDeleteOpID, field.TypeString)
 	}
+	if value, ok := _u.mutation.ActivitySince(); ok {
+		_spec.SetField(agent.FieldActivitySince, field.TypeTime, value)
+	}
+	if _u.mutation.ActivitySinceCleared() {
+		_spec.ClearField(agent.FieldActivitySince, field.TypeTime)
+	}
+	if value, ok := _u.mutation.LastDeliveryAt(); ok {
+		_spec.SetField(agent.FieldLastDeliveryAt, field.TypeTime, value)
+	}
+	if _u.mutation.LastDeliveryAtCleared() {
+		_spec.ClearField(agent.FieldLastDeliveryAt, field.TypeTime)
+	}
+	if value, ok := _u.mutation.IdleSuspendClaimUntil(); ok {
+		_spec.SetField(agent.FieldIdleSuspendClaimUntil, field.TypeTime, value)
+	}
+	if _u.mutation.IdleSuspendClaimUntilCleared() {
+		_spec.ClearField(agent.FieldIdleSuspendClaimUntil, field.TypeTime)
+	}
 	if _u.mutation.ProjectCleared() {
 		edge := &sqlgraph.EdgeSpec{
 			Rel:     sqlgraph.M2O,
@@ -5465,6 +5857,35 @@ func (_u *AgentUpdateOne) sqlSave(ctx context.Context) (_node *Agent, err error)
 			Bidi:    false,
 			Target: &sqlgraph.EdgeTarget{
 				IDSpec: sqlgraph.NewFieldSpec(brokerreportedrun.FieldID, field.TypeUUID),
+			},
+		}
+		for _, k := range nodes {
+			edge.Target.Nodes = append(edge.Target.Nodes, k)
+		}
+		_spec.Edges.Add = append(_spec.Edges.Add, edge)
+	}
+	if _u.mutation.SuspendScreenCleared() {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   agent.SuspendScreenTable,
+			Columns: []string{agent.SuspendScreenColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(agentsuspendscreen.FieldID, field.TypeUUID),
+			},
+		}
+		_spec.Edges.Clear = append(_spec.Edges.Clear, edge)
+	}
+	if nodes := _u.mutation.SuspendScreenIDs(); len(nodes) > 0 {
+		edge := &sqlgraph.EdgeSpec{
+			Rel:     sqlgraph.O2O,
+			Inverse: false,
+			Table:   agent.SuspendScreenTable,
+			Columns: []string{agent.SuspendScreenColumn},
+			Bidi:    false,
+			Target: &sqlgraph.EdgeTarget{
+				IDSpec: sqlgraph.NewFieldSpec(agentsuspendscreen.FieldID, field.TypeUUID),
 			},
 		}
 		for _, k := range nodes {

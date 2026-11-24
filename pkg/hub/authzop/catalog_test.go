@@ -280,6 +280,9 @@ func TestRegisteredPermissionsConsumed(t *testing.T) {
 		// Checked in the broker registration handler when a request turns
 		// auto-provide on; no route declares it.
 		"broker.auto_provide": "Broker registration handler check, no route declaration",
+		// Checked in the broker registration handler (and PATCH approval) when
+		// marking a broker admin-managed; no route declares it.
+		"broker.manage": "Broker registration handler check, no route declaration",
 
 		// Hub admin permissions — NonRouteUse only or Reserved (no route declaration)
 		"hub.settings.read":         "NonRouteUse only, no route declaration",
@@ -339,6 +342,10 @@ func TestRegisteredPermissionsConsumed(t *testing.T) {
 		// base permission. The agent GCP token
 		// mint (gcp.identity.mint) decides gcp_service_account.use instead.
 		"gcp_service_account.mint": "Creation of Hub-minted service accounts: inline policy check in the mint handler, not a catalog base permission",
+		// GitHub trigger comment permission — checked by the github.comment
+		// trigger action at rule save/update and fire time (Stage 3 G3-action,
+		// ptone/scion#8090), NonRouteUse only.
+		"github_trigger.comment": "Checked by the github.comment trigger action at rule save/update and fire time (Stage 3 G3-action, ptone/scion#8090), NonRouteUse only",
 	}
 
 	var unconsumed []string
@@ -1328,7 +1335,7 @@ var domainResourceCompatibility = map[string][]string{
 	"federation":          {"ResourceFederationToken"},
 	"gcp.identity":        {"ResourceGCPServiceAccount"},
 	"agent":               {"ResourceAgent"},
-	"project":             {"ResourceProject"},
+	"project":             {"ResourceProject", "ResourceGitHubTrigger"},
 	"agent.message":       {"ResourceAgent"},
 	"user.admin":          {"ResourceUser"},
 	"secret":              {"ResourceProject"},
@@ -1341,12 +1348,15 @@ var domainResourceCompatibility = map[string][]string{
 	"broker":              {"ResourceBroker"},
 	"quota":               {"ResourceQuota"},
 	"schedule":            {"ResourceScheduledEvent"},
+	"trigger":             {"ResourceTrigger"},
+	"webhookendpoint":     {"ResourceWebhookEndpoint"},
 	"chat":                {"ResourceProject", "ResourceInbox", "ResourceAgent"},
 	"env":                 {"ResourceProject", "ResourceHub"},
 	"artifact":            {"ResourceArtifact"},
 	"inbox":               {"ResourceInbox"},
 	"user.skillinjection": {"ResourceUserSkillInjection"},
 	"testidentity":        {"ResourceTestIdentity"},
+	"systemone.instance":  {"ResourceSystemOneInstance"},
 }
 
 // TestCatalogBasePermissionSemanticsAssertive validates that each operation's

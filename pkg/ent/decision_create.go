@@ -45,6 +45,20 @@ func (_c *DecisionCreate) SetNillableConversationID(v *uuid.UUID) *DecisionCreat
 	return _c
 }
 
+// SetChatKey sets the "chat_key" field.
+func (_c *DecisionCreate) SetChatKey(v string) *DecisionCreate {
+	_c.mutation.SetChatKey(v)
+	return _c
+}
+
+// SetNillableChatKey sets the "chat_key" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableChatKey(v *string) *DecisionCreate {
+	if v != nil {
+		_c.SetChatKey(*v)
+	}
+	return _c
+}
+
 // SetMessageID sets the "message_id" field.
 func (_c *DecisionCreate) SetMessageID(v uuid.UUID) *DecisionCreate {
 	_c.mutation.SetMessageID(v)
@@ -119,6 +133,62 @@ func (_c *DecisionCreate) SetNillableDefaultChoiceID(v *string) *DecisionCreate 
 	return _c
 }
 
+// SetAllowOther sets the "allow_other" field.
+func (_c *DecisionCreate) SetAllowOther(v bool) *DecisionCreate {
+	_c.mutation.SetAllowOther(v)
+	return _c
+}
+
+// SetNillableAllowOther sets the "allow_other" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableAllowOther(v *bool) *DecisionCreate {
+	if v != nil {
+		_c.SetAllowOther(*v)
+	}
+	return _c
+}
+
+// SetOtherLabel sets the "other_label" field.
+func (_c *DecisionCreate) SetOtherLabel(v string) *DecisionCreate {
+	_c.mutation.SetOtherLabel(v)
+	return _c
+}
+
+// SetNillableOtherLabel sets the "other_label" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableOtherLabel(v *string) *DecisionCreate {
+	if v != nil {
+		_c.SetOtherLabel(*v)
+	}
+	return _c
+}
+
+// SetOtherDescription sets the "other_description" field.
+func (_c *DecisionCreate) SetOtherDescription(v string) *DecisionCreate {
+	_c.mutation.SetOtherDescription(v)
+	return _c
+}
+
+// SetNillableOtherDescription sets the "other_description" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableOtherDescription(v *string) *DecisionCreate {
+	if v != nil {
+		_c.SetOtherDescription(*v)
+	}
+	return _c
+}
+
+// SetOtherPlaceholder sets the "other_placeholder" field.
+func (_c *DecisionCreate) SetOtherPlaceholder(v string) *DecisionCreate {
+	_c.mutation.SetOtherPlaceholder(v)
+	return _c
+}
+
+// SetNillableOtherPlaceholder sets the "other_placeholder" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableOtherPlaceholder(v *string) *DecisionCreate {
+	if v != nil {
+		_c.SetOtherPlaceholder(*v)
+	}
+	return _c
+}
+
 // SetIntroLength sets the "intro_length" field.
 func (_c *DecisionCreate) SetIntroLength(v int) *DecisionCreate {
 	_c.mutation.SetIntroLength(v)
@@ -143,6 +213,20 @@ func (_c *DecisionCreate) SetStatus(v decision.Status) *DecisionCreate {
 func (_c *DecisionCreate) SetNillableStatus(v *decision.Status) *DecisionCreate {
 	if v != nil {
 		_c.SetStatus(*v)
+	}
+	return _c
+}
+
+// SetSettled sets the "settled" field.
+func (_c *DecisionCreate) SetSettled(v bool) *DecisionCreate {
+	_c.mutation.SetSettled(v)
+	return _c
+}
+
+// SetNillableSettled sets the "settled" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableSettled(v *bool) *DecisionCreate {
+	if v != nil {
+		_c.SetSettled(*v)
 	}
 	return _c
 }
@@ -203,6 +287,48 @@ func (_c *DecisionCreate) SetNillableReplacedAt(v *time.Time) *DecisionCreate {
 	return _c
 }
 
+// SetWithdrawnAt sets the "withdrawn_at" field.
+func (_c *DecisionCreate) SetWithdrawnAt(v time.Time) *DecisionCreate {
+	_c.mutation.SetWithdrawnAt(v)
+	return _c
+}
+
+// SetNillableWithdrawnAt sets the "withdrawn_at" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableWithdrawnAt(v *time.Time) *DecisionCreate {
+	if v != nil {
+		_c.SetWithdrawnAt(*v)
+	}
+	return _c
+}
+
+// SetWithdrawnReason sets the "withdrawn_reason" field.
+func (_c *DecisionCreate) SetWithdrawnReason(v string) *DecisionCreate {
+	_c.mutation.SetWithdrawnReason(v)
+	return _c
+}
+
+// SetNillableWithdrawnReason sets the "withdrawn_reason" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableWithdrawnReason(v *string) *DecisionCreate {
+	if v != nil {
+		_c.SetWithdrawnReason(*v)
+	}
+	return _c
+}
+
+// SetDismissedAt sets the "dismissed_at" field.
+func (_c *DecisionCreate) SetDismissedAt(v time.Time) *DecisionCreate {
+	_c.mutation.SetDismissedAt(v)
+	return _c
+}
+
+// SetNillableDismissedAt sets the "dismissed_at" field if the given value is not nil.
+func (_c *DecisionCreate) SetNillableDismissedAt(v *time.Time) *DecisionCreate {
+	if v != nil {
+		_c.SetDismissedAt(*v)
+	}
+	return _c
+}
+
 // SetID sets the "id" field.
 func (_c *DecisionCreate) SetID(v uuid.UUID) *DecisionCreate {
 	_c.mutation.SetID(v)
@@ -252,6 +378,10 @@ func (_c *DecisionCreate) ExecX(ctx context.Context) {
 
 // defaults sets the default values of the builder before save.
 func (_c *DecisionCreate) defaults() {
+	if _, ok := _c.mutation.AllowOther(); !ok {
+		v := decision.DefaultAllowOther
+		_c.mutation.SetAllowOther(v)
+	}
 	if _, ok := _c.mutation.IntroLength(); !ok {
 		v := decision.DefaultIntroLength
 		_c.mutation.SetIntroLength(v)
@@ -259,6 +389,10 @@ func (_c *DecisionCreate) defaults() {
 	if _, ok := _c.mutation.Status(); !ok {
 		v := decision.DefaultStatus
 		_c.mutation.SetStatus(v)
+	}
+	if _, ok := _c.mutation.Settled(); !ok {
+		v := decision.DefaultSettled
+		_c.mutation.SetSettled(v)
 	}
 	if _, ok := _c.mutation.CreatedAt(); !ok {
 		v := decision.DefaultCreatedAt()
@@ -274,6 +408,11 @@ func (_c *DecisionCreate) defaults() {
 func (_c *DecisionCreate) check() error {
 	if _, ok := _c.mutation.ProjectID(); !ok {
 		return &ValidationError{Name: "project_id", err: errors.New(`ent: missing required field "Decision.project_id"`)}
+	}
+	if v, ok := _c.mutation.ChatKey(); ok {
+		if err := decision.ChatKeyValidator(v); err != nil {
+			return &ValidationError{Name: "chat_key", err: fmt.Errorf(`ent: validator failed for field "Decision.chat_key": %w`, err)}
+		}
 	}
 	if _, ok := _c.mutation.MessageID(); !ok {
 		return &ValidationError{Name: "message_id", err: errors.New(`ent: missing required field "Decision.message_id"`)}
@@ -330,6 +469,24 @@ func (_c *DecisionCreate) check() error {
 	if _, ok := _c.mutation.Choices(); !ok {
 		return &ValidationError{Name: "choices", err: errors.New(`ent: missing required field "Decision.choices"`)}
 	}
+	if _, ok := _c.mutation.AllowOther(); !ok {
+		return &ValidationError{Name: "allow_other", err: errors.New(`ent: missing required field "Decision.allow_other"`)}
+	}
+	if v, ok := _c.mutation.OtherLabel(); ok {
+		if err := decision.OtherLabelValidator(v); err != nil {
+			return &ValidationError{Name: "other_label", err: fmt.Errorf(`ent: validator failed for field "Decision.other_label": %w`, err)}
+		}
+	}
+	if v, ok := _c.mutation.OtherDescription(); ok {
+		if err := decision.OtherDescriptionValidator(v); err != nil {
+			return &ValidationError{Name: "other_description", err: fmt.Errorf(`ent: validator failed for field "Decision.other_description": %w`, err)}
+		}
+	}
+	if v, ok := _c.mutation.OtherPlaceholder(); ok {
+		if err := decision.OtherPlaceholderValidator(v); err != nil {
+			return &ValidationError{Name: "other_placeholder", err: fmt.Errorf(`ent: validator failed for field "Decision.other_placeholder": %w`, err)}
+		}
+	}
 	if _, ok := _c.mutation.IntroLength(); !ok {
 		return &ValidationError{Name: "intro_length", err: errors.New(`ent: missing required field "Decision.intro_length"`)}
 	}
@@ -345,6 +502,9 @@ func (_c *DecisionCreate) check() error {
 		if err := decision.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "Decision.status": %w`, err)}
 		}
+	}
+	if _, ok := _c.mutation.Settled(); !ok {
+		return &ValidationError{Name: "settled", err: errors.New(`ent: missing required field "Decision.settled"`)}
 	}
 	if _, ok := _c.mutation.CreatedAt(); !ok {
 		return &ValidationError{Name: "created_at", err: errors.New(`ent: missing required field "Decision.created_at"`)}
@@ -393,6 +553,10 @@ func (_c *DecisionCreate) createSpec() (*Decision, *sqlgraph.CreateSpec) {
 		_spec.SetField(decision.FieldConversationID, field.TypeUUID, value)
 		_node.ConversationID = &value
 	}
+	if value, ok := _c.mutation.ChatKey(); ok {
+		_spec.SetField(decision.FieldChatKey, field.TypeString, value)
+		_node.ChatKey = &value
+	}
 	if value, ok := _c.mutation.MessageID(); ok {
 		_spec.SetField(decision.FieldMessageID, field.TypeUUID, value)
 		_node.MessageID = value
@@ -437,6 +601,22 @@ func (_c *DecisionCreate) createSpec() (*Decision, *sqlgraph.CreateSpec) {
 		_spec.SetField(decision.FieldDefaultChoiceID, field.TypeString, value)
 		_node.DefaultChoiceID = &value
 	}
+	if value, ok := _c.mutation.AllowOther(); ok {
+		_spec.SetField(decision.FieldAllowOther, field.TypeBool, value)
+		_node.AllowOther = value
+	}
+	if value, ok := _c.mutation.OtherLabel(); ok {
+		_spec.SetField(decision.FieldOtherLabel, field.TypeString, value)
+		_node.OtherLabel = &value
+	}
+	if value, ok := _c.mutation.OtherDescription(); ok {
+		_spec.SetField(decision.FieldOtherDescription, field.TypeString, value)
+		_node.OtherDescription = &value
+	}
+	if value, ok := _c.mutation.OtherPlaceholder(); ok {
+		_spec.SetField(decision.FieldOtherPlaceholder, field.TypeString, value)
+		_node.OtherPlaceholder = &value
+	}
 	if value, ok := _c.mutation.IntroLength(); ok {
 		_spec.SetField(decision.FieldIntroLength, field.TypeInt, value)
 		_node.IntroLength = value
@@ -444,6 +624,10 @@ func (_c *DecisionCreate) createSpec() (*Decision, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.Status(); ok {
 		_spec.SetField(decision.FieldStatus, field.TypeEnum, value)
 		_node.Status = value
+	}
+	if value, ok := _c.mutation.Settled(); ok {
+		_spec.SetField(decision.FieldSettled, field.TypeBool, value)
+		_node.Settled = value
 	}
 	if value, ok := _c.mutation.ReplacedByID(); ok {
 		_spec.SetField(decision.FieldReplacedByID, field.TypeUUID, value)
@@ -460,6 +644,18 @@ func (_c *DecisionCreate) createSpec() (*Decision, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.ReplacedAt(); ok {
 		_spec.SetField(decision.FieldReplacedAt, field.TypeTime, value)
 		_node.ReplacedAt = &value
+	}
+	if value, ok := _c.mutation.WithdrawnAt(); ok {
+		_spec.SetField(decision.FieldWithdrawnAt, field.TypeTime, value)
+		_node.WithdrawnAt = &value
+	}
+	if value, ok := _c.mutation.WithdrawnReason(); ok {
+		_spec.SetField(decision.FieldWithdrawnReason, field.TypeString, value)
+		_node.WithdrawnReason = &value
+	}
+	if value, ok := _c.mutation.DismissedAt(); ok {
+		_spec.SetField(decision.FieldDismissedAt, field.TypeTime, value)
+		_node.DismissedAt = &value
 	}
 	return _node, _spec
 }
@@ -525,6 +721,18 @@ func (u *DecisionUpsert) UpdateStatus() *DecisionUpsert {
 	return u
 }
 
+// SetSettled sets the "settled" field.
+func (u *DecisionUpsert) SetSettled(v bool) *DecisionUpsert {
+	u.Set(decision.FieldSettled, v)
+	return u
+}
+
+// UpdateSettled sets the "settled" field to the value that was provided on create.
+func (u *DecisionUpsert) UpdateSettled() *DecisionUpsert {
+	u.SetExcluded(decision.FieldSettled)
+	return u
+}
+
 // SetReplacedByID sets the "replaced_by_id" field.
 func (u *DecisionUpsert) SetReplacedByID(v uuid.UUID) *DecisionUpsert {
 	u.Set(decision.FieldReplacedByID, v)
@@ -579,6 +787,60 @@ func (u *DecisionUpsert) ClearReplacedAt() *DecisionUpsert {
 	return u
 }
 
+// SetWithdrawnAt sets the "withdrawn_at" field.
+func (u *DecisionUpsert) SetWithdrawnAt(v time.Time) *DecisionUpsert {
+	u.Set(decision.FieldWithdrawnAt, v)
+	return u
+}
+
+// UpdateWithdrawnAt sets the "withdrawn_at" field to the value that was provided on create.
+func (u *DecisionUpsert) UpdateWithdrawnAt() *DecisionUpsert {
+	u.SetExcluded(decision.FieldWithdrawnAt)
+	return u
+}
+
+// ClearWithdrawnAt clears the value of the "withdrawn_at" field.
+func (u *DecisionUpsert) ClearWithdrawnAt() *DecisionUpsert {
+	u.SetNull(decision.FieldWithdrawnAt)
+	return u
+}
+
+// SetWithdrawnReason sets the "withdrawn_reason" field.
+func (u *DecisionUpsert) SetWithdrawnReason(v string) *DecisionUpsert {
+	u.Set(decision.FieldWithdrawnReason, v)
+	return u
+}
+
+// UpdateWithdrawnReason sets the "withdrawn_reason" field to the value that was provided on create.
+func (u *DecisionUpsert) UpdateWithdrawnReason() *DecisionUpsert {
+	u.SetExcluded(decision.FieldWithdrawnReason)
+	return u
+}
+
+// ClearWithdrawnReason clears the value of the "withdrawn_reason" field.
+func (u *DecisionUpsert) ClearWithdrawnReason() *DecisionUpsert {
+	u.SetNull(decision.FieldWithdrawnReason)
+	return u
+}
+
+// SetDismissedAt sets the "dismissed_at" field.
+func (u *DecisionUpsert) SetDismissedAt(v time.Time) *DecisionUpsert {
+	u.Set(decision.FieldDismissedAt, v)
+	return u
+}
+
+// UpdateDismissedAt sets the "dismissed_at" field to the value that was provided on create.
+func (u *DecisionUpsert) UpdateDismissedAt() *DecisionUpsert {
+	u.SetExcluded(decision.FieldDismissedAt)
+	return u
+}
+
+// ClearDismissedAt clears the value of the "dismissed_at" field.
+func (u *DecisionUpsert) ClearDismissedAt() *DecisionUpsert {
+	u.SetNull(decision.FieldDismissedAt)
+	return u
+}
+
 // UpdateNewValues updates the mutable fields using the new values that were set on create except the ID field.
 // Using this option is equivalent to using:
 //
@@ -601,6 +863,9 @@ func (u *DecisionUpsertOne) UpdateNewValues() *DecisionUpsertOne {
 		}
 		if _, exists := u.create.mutation.ConversationID(); exists {
 			s.SetIgnore(decision.FieldConversationID)
+		}
+		if _, exists := u.create.mutation.ChatKey(); exists {
+			s.SetIgnore(decision.FieldChatKey)
 		}
 		if _, exists := u.create.mutation.MessageID(); exists {
 			s.SetIgnore(decision.FieldMessageID)
@@ -634,6 +899,18 @@ func (u *DecisionUpsertOne) UpdateNewValues() *DecisionUpsertOne {
 		}
 		if _, exists := u.create.mutation.DefaultChoiceID(); exists {
 			s.SetIgnore(decision.FieldDefaultChoiceID)
+		}
+		if _, exists := u.create.mutation.AllowOther(); exists {
+			s.SetIgnore(decision.FieldAllowOther)
+		}
+		if _, exists := u.create.mutation.OtherLabel(); exists {
+			s.SetIgnore(decision.FieldOtherLabel)
+		}
+		if _, exists := u.create.mutation.OtherDescription(); exists {
+			s.SetIgnore(decision.FieldOtherDescription)
+		}
+		if _, exists := u.create.mutation.OtherPlaceholder(); exists {
+			s.SetIgnore(decision.FieldOtherPlaceholder)
 		}
 		if _, exists := u.create.mutation.IntroLength(); exists {
 			s.SetIgnore(decision.FieldIntroLength)
@@ -683,6 +960,20 @@ func (u *DecisionUpsertOne) SetStatus(v decision.Status) *DecisionUpsertOne {
 func (u *DecisionUpsertOne) UpdateStatus() *DecisionUpsertOne {
 	return u.Update(func(s *DecisionUpsert) {
 		s.UpdateStatus()
+	})
+}
+
+// SetSettled sets the "settled" field.
+func (u *DecisionUpsertOne) SetSettled(v bool) *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.SetSettled(v)
+	})
+}
+
+// UpdateSettled sets the "settled" field to the value that was provided on create.
+func (u *DecisionUpsertOne) UpdateSettled() *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.UpdateSettled()
 	})
 }
 
@@ -746,6 +1037,69 @@ func (u *DecisionUpsertOne) UpdateReplacedAt() *DecisionUpsertOne {
 func (u *DecisionUpsertOne) ClearReplacedAt() *DecisionUpsertOne {
 	return u.Update(func(s *DecisionUpsert) {
 		s.ClearReplacedAt()
+	})
+}
+
+// SetWithdrawnAt sets the "withdrawn_at" field.
+func (u *DecisionUpsertOne) SetWithdrawnAt(v time.Time) *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.SetWithdrawnAt(v)
+	})
+}
+
+// UpdateWithdrawnAt sets the "withdrawn_at" field to the value that was provided on create.
+func (u *DecisionUpsertOne) UpdateWithdrawnAt() *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.UpdateWithdrawnAt()
+	})
+}
+
+// ClearWithdrawnAt clears the value of the "withdrawn_at" field.
+func (u *DecisionUpsertOne) ClearWithdrawnAt() *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.ClearWithdrawnAt()
+	})
+}
+
+// SetWithdrawnReason sets the "withdrawn_reason" field.
+func (u *DecisionUpsertOne) SetWithdrawnReason(v string) *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.SetWithdrawnReason(v)
+	})
+}
+
+// UpdateWithdrawnReason sets the "withdrawn_reason" field to the value that was provided on create.
+func (u *DecisionUpsertOne) UpdateWithdrawnReason() *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.UpdateWithdrawnReason()
+	})
+}
+
+// ClearWithdrawnReason clears the value of the "withdrawn_reason" field.
+func (u *DecisionUpsertOne) ClearWithdrawnReason() *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.ClearWithdrawnReason()
+	})
+}
+
+// SetDismissedAt sets the "dismissed_at" field.
+func (u *DecisionUpsertOne) SetDismissedAt(v time.Time) *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.SetDismissedAt(v)
+	})
+}
+
+// UpdateDismissedAt sets the "dismissed_at" field to the value that was provided on create.
+func (u *DecisionUpsertOne) UpdateDismissedAt() *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.UpdateDismissedAt()
+	})
+}
+
+// ClearDismissedAt clears the value of the "dismissed_at" field.
+func (u *DecisionUpsertOne) ClearDismissedAt() *DecisionUpsertOne {
+	return u.Update(func(s *DecisionUpsert) {
+		s.ClearDismissedAt()
 	})
 }
 
@@ -938,6 +1292,9 @@ func (u *DecisionUpsertBulk) UpdateNewValues() *DecisionUpsertBulk {
 			if _, exists := b.mutation.ConversationID(); exists {
 				s.SetIgnore(decision.FieldConversationID)
 			}
+			if _, exists := b.mutation.ChatKey(); exists {
+				s.SetIgnore(decision.FieldChatKey)
+			}
 			if _, exists := b.mutation.MessageID(); exists {
 				s.SetIgnore(decision.FieldMessageID)
 			}
@@ -970,6 +1327,18 @@ func (u *DecisionUpsertBulk) UpdateNewValues() *DecisionUpsertBulk {
 			}
 			if _, exists := b.mutation.DefaultChoiceID(); exists {
 				s.SetIgnore(decision.FieldDefaultChoiceID)
+			}
+			if _, exists := b.mutation.AllowOther(); exists {
+				s.SetIgnore(decision.FieldAllowOther)
+			}
+			if _, exists := b.mutation.OtherLabel(); exists {
+				s.SetIgnore(decision.FieldOtherLabel)
+			}
+			if _, exists := b.mutation.OtherDescription(); exists {
+				s.SetIgnore(decision.FieldOtherDescription)
+			}
+			if _, exists := b.mutation.OtherPlaceholder(); exists {
+				s.SetIgnore(decision.FieldOtherPlaceholder)
 			}
 			if _, exists := b.mutation.IntroLength(); exists {
 				s.SetIgnore(decision.FieldIntroLength)
@@ -1020,6 +1389,20 @@ func (u *DecisionUpsertBulk) SetStatus(v decision.Status) *DecisionUpsertBulk {
 func (u *DecisionUpsertBulk) UpdateStatus() *DecisionUpsertBulk {
 	return u.Update(func(s *DecisionUpsert) {
 		s.UpdateStatus()
+	})
+}
+
+// SetSettled sets the "settled" field.
+func (u *DecisionUpsertBulk) SetSettled(v bool) *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.SetSettled(v)
+	})
+}
+
+// UpdateSettled sets the "settled" field to the value that was provided on create.
+func (u *DecisionUpsertBulk) UpdateSettled() *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.UpdateSettled()
 	})
 }
 
@@ -1083,6 +1466,69 @@ func (u *DecisionUpsertBulk) UpdateReplacedAt() *DecisionUpsertBulk {
 func (u *DecisionUpsertBulk) ClearReplacedAt() *DecisionUpsertBulk {
 	return u.Update(func(s *DecisionUpsert) {
 		s.ClearReplacedAt()
+	})
+}
+
+// SetWithdrawnAt sets the "withdrawn_at" field.
+func (u *DecisionUpsertBulk) SetWithdrawnAt(v time.Time) *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.SetWithdrawnAt(v)
+	})
+}
+
+// UpdateWithdrawnAt sets the "withdrawn_at" field to the value that was provided on create.
+func (u *DecisionUpsertBulk) UpdateWithdrawnAt() *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.UpdateWithdrawnAt()
+	})
+}
+
+// ClearWithdrawnAt clears the value of the "withdrawn_at" field.
+func (u *DecisionUpsertBulk) ClearWithdrawnAt() *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.ClearWithdrawnAt()
+	})
+}
+
+// SetWithdrawnReason sets the "withdrawn_reason" field.
+func (u *DecisionUpsertBulk) SetWithdrawnReason(v string) *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.SetWithdrawnReason(v)
+	})
+}
+
+// UpdateWithdrawnReason sets the "withdrawn_reason" field to the value that was provided on create.
+func (u *DecisionUpsertBulk) UpdateWithdrawnReason() *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.UpdateWithdrawnReason()
+	})
+}
+
+// ClearWithdrawnReason clears the value of the "withdrawn_reason" field.
+func (u *DecisionUpsertBulk) ClearWithdrawnReason() *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.ClearWithdrawnReason()
+	})
+}
+
+// SetDismissedAt sets the "dismissed_at" field.
+func (u *DecisionUpsertBulk) SetDismissedAt(v time.Time) *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.SetDismissedAt(v)
+	})
+}
+
+// UpdateDismissedAt sets the "dismissed_at" field to the value that was provided on create.
+func (u *DecisionUpsertBulk) UpdateDismissedAt() *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.UpdateDismissedAt()
+	})
+}
+
+// ClearDismissedAt clears the value of the "dismissed_at" field.
+func (u *DecisionUpsertBulk) ClearDismissedAt() *DecisionUpsertBulk {
+	return u.Update(func(s *DecisionUpsert) {
+		s.ClearDismissedAt()
 	})
 }
 

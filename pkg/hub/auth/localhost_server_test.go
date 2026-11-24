@@ -284,3 +284,223 @@ func TestGenerateRandomState(t *testing.T) {
 		t.Error("states should be unique")
 	}
 }
+
+func TestLocalhostAuthServer_CallbackBrandingAndSecurity(t *testing.T) {
+	t.Run("default unbranded uses theme variables without legacy gradients", func(t *testing.T) {
+		srv := NewLocalhostAuthServer()
+		srv.state = "st"
+		req := httptest.NewRequest(http.MethodGet, CallbackPath+"?state=st&code=abc", nil)
+		rec := httptest.NewRecorder()
+		srv.handleCallback(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+			t.Errorf("Content-Type = %q", ct)
+		}
+		if nosniff := rec.Header().Get("X-Content-Type-Options"); nosniff != "nosniff" {
+			t.Errorf("X-Content-Type-Options = %q", nosniff)
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("Cache-Control = %q", cc)
+		}
+		if rp := rec.Header().Get("Referrer-Policy"); rp != "no-referrer" {
+			t.Errorf("Referrer-Policy = %q, want no-referrer", rp)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, `<meta name="referrer" content="no-referrer">`) {
+			t.Errorf("expected no-referrer meta tag in callback HTML")
+		}
+		for _, legacy := range []string{"#667eea", "#764ba2", "#e74c3c", "#c0392b"} {
+			if strings.Contains(body, legacy) {
+				t.Errorf("callback HTML still contains legacy gradient color %s", legacy)
+			}
+		}
+		if !strings.Contains(body, "@media (prefers-color-scheme: dark)") {
+			t.Errorf("expected dark mode media query in callback HTML")
+		}
+		if !strings.Contains(body, `<span class="badge">scion</span>`) {
+			t.Errorf("expected stock scion badge:\n%s", body)
+		}
+		if strings.Contains(body, "Powered by Scion") {
+			t.Errorf("unbranded default must not show Powered by Scion")
+		}
+	})
+
+	t.Run("branded with attribution shown and light/dark logos", func(t *testing.T) {
+		srv := NewLocalhostAuthServer().WithBranding(&CallbackBranding{
+			Name:        "Acme Cloud",
+			Attribution: "shown",
+			LogoLight:   "https://hub.example.com/brand/logo-light?v=12345678",
+			LogoDark:    "https://hub.example.com/brand/logo-dark?v=87654321",
+			Light: CallbackColors{
+				Accent: "#0f766e",
+			},
+			Dark: CallbackColors{
+				Bg:     "#0c0a09",
+				Accent: "#2dd4bf",
+			},
+		})
+		srv.state = "st"
+		req := httptest.NewRequest(http.MethodGet, CallbackPath+"?state=st&code=abc", nil)
+		rec := httptest.NewRecorder()
+		srv.handleCallback(rec, req)
+
+		body := rec.Body.String()
+		for _, want := range []string{
+			"<title>Acme Cloud - Authentication Successful</title>",
+			"--accent: #0f766e;",
+			"--bg: #0c0a09;",
+			"--accent: #2dd4bf;",
+			`<source media="(prefers-color-scheme: dark)" srcset="https://hub.example.com/brand/logo-dark?v=87654321">`,
+			`<img class="brand-logo" src="https://hub.example.com/brand/logo-light?v=12345678" alt="Acme Cloud">`,
+			`<span class="badge">Acme Cloud · Powered by Scion</span>`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("body missing %q:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("branded with attribution hidden omits Powered by Scion", func(t *testing.T) {
+		srv := NewLocalhostAuthServer().WithBranding(&CallbackBranding{
+			Name:        "Acme Cloud",
+			Attribution: "hidden",
+		})
+		srv.state = "st"
+		req := httptest.NewRequest(http.MethodGet, CallbackPath+"?state=st&code=abc", nil)
+		rec := httptest.NewRecorder()
+		srv.handleCallback(rec, req)
+
+		body := rec.Body.String()
+		if !strings.Contains(body, `<span class="badge">Acme Cloud</span>`) {
+			t.Errorf("expected Acme Cloud badge without attribution:\n%s", body)
+		}
+		if strings.Contains(body, "Powered by Scion") {
+			t.Errorf("hidden attribution must omit Powered by Scion")
+		}
+	})
+
+	t.Run("sanitizes malicious colors, logo URLs, and HTML in brand name", func(t *testing.T) {
+		srv := NewLocalhostAuthServer().WithBranding(&CallbackBranding{
+			Name:      `<script>alert(1)</script>`,
+			LogoLight: `javascript:alert(1)`,
+			LogoDark:  `http://evil.example.com/logo.svg`,
+			Light: CallbackColors{
+				Bg:     `#fff; } body { background: url(https://evil.example/x); }`,
+				Accent: `red`,
+			},
+		})
+		srv.state = "st"
+		req := httptest.NewRequest(http.MethodGet, CallbackPath+"?state=st&code=abc", nil)
+		rec := httptest.NewRecorder()
+		srv.handleCallback(rec, req)
+
+		body := rec.Body.String()
+		for _, forbidden := range []string{"<script>", "javascript:", "evil.example", `<img class="brand-logo"`} {
+			if strings.Contains(body, forbidden) {
+				t.Errorf("body must not contain unsanitized %q:\n%s", forbidden, body)
+			}
+		}
+		if !strings.Contains(body, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+			t.Errorf("expected HTML-escaped brand name in body")
+		}
+		if !strings.Contains(body, "--bg: #f8fafc;") || !strings.Contains(body, "--accent: #3b82f6;") {
+			t.Errorf("invalid hex colors must fall back to stock defaults:\n%s", body)
+		}
+	})
+
+	t.Run("applies corner radius presets and sanitizes invalid values", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			corners string
+			want    string
+		}{
+			{name: "default empty", corners: "", want: "border-radius: 12px;"},
+			{name: "default explicit", corners: "default", want: "border-radius: 12px;"},
+			{name: "square", corners: "square", want: "border-radius: 0;"},
+			{name: "rounded", corners: "rounded", want: "border-radius: 16px;"},
+			{name: "invalid injection falls back", corners: "0; } body { display: none; }", want: "border-radius: 12px;"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				srv := NewLocalhostAuthServer().WithBranding(&CallbackBranding{Corners: tc.corners})
+				srv.state = "st"
+				req := httptest.NewRequest(http.MethodGet, CallbackPath+"?state=st&code=abc", nil)
+				rec := httptest.NewRecorder()
+				srv.handleCallback(rec, req)
+				body := rec.Body.String()
+				if !strings.Contains(body, tc.want) {
+					t.Errorf("body missing %q:\n%s", tc.want, body)
+				}
+				if !strings.Contains(body, "border-radius: 9999px;") {
+					t.Errorf("pill badge radius must remain 9999px:\n%s", body)
+				}
+				if strings.Contains(body, "display: none") {
+					t.Errorf("unsanitized corners value leaked into CSS:\n%s", body)
+				}
+			})
+		}
+	})
+
+	t.Run("applies font_sans presets, Google Font families, and sanitizes injection attempts", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			fontSans string
+			want     string
+		}{
+			{
+				name:     "default empty",
+				fontSans: "",
+				want:     "font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;",
+			},
+			{
+				name:     "default explicit",
+				fontSans: "default",
+				want:     "font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;",
+			},
+			{
+				name:     "system preset",
+				fontSans: "system",
+				want:     "font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;",
+			},
+			{
+				name:     "curated ibm-plex-sans",
+				fontSans: "ibm-plex-sans",
+				want:     "font-family: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;",
+			},
+			{
+				name:     "arbitrary Google Font family",
+				fontSans: "Work   Sans",
+				want:     "font-family: 'Work Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;",
+			},
+			{
+				name:     "leading or trailing whitespace falls back to default",
+				fontSans: " Work Sans ",
+				want:     "font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;",
+			},
+			{
+				name:     "injection attempt falls back to default",
+				fontSans: "Inter'; } body { display: none; }",
+				want:     "font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				srv := NewLocalhostAuthServer().WithBranding(&CallbackBranding{FontSans: tc.fontSans})
+				srv.state = "st"
+				req := httptest.NewRequest(http.MethodGet, CallbackPath+"?state=st&code=abc", nil)
+				rec := httptest.NewRecorder()
+				srv.handleCallback(rec, req)
+				body := rec.Body.String()
+				if !strings.Contains(body, tc.want) {
+					t.Errorf("body missing %q:\n%s", tc.want, body)
+				}
+				if strings.Contains(body, "display: none") {
+					t.Errorf("unsanitized fontSans value leaked into CSS:\n%s", body)
+				}
+			})
+		}
+	})
+}

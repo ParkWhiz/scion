@@ -33,7 +33,7 @@ import (
 // expectedTableCount is the number of domain tables in the hub schema
 // (excluding the schema_migrations bookkeeping table). The fixture must cover
 // every one of them.
-const expectedTableCount = 97
+const expectedTableCount = 114
 
 // TestFixtureCoverage is the CI coverage gate: it generates the fixture and
 // fails if any domain table has zero rows.
@@ -109,8 +109,17 @@ func TestFixtureLoadable(t *testing.T) {
 	// field.UUID("id", ...) column.
 	workspace, err := entadapter.NewUserTerminalWorkspaceStore(client).GetUserTerminalWorkspace(ctx, userID)
 	require.NoError(t, err, "user_terminal_workspaces fixture row must be readable via UserTerminalWorkspaceStore")
+	execContainer, err := entadapter.NewUserExecContainerStore(client).GetUserExecContainer(ctx, userID)
+	require.NoError(t, err, "user_exec_containers fixture row must be readable via UserExecContainerStore")
+	require.Equal(t, agentID, execContainer.AgentID)
 	assert.Equal(t, []string{agentID}, workspace.AgentIDs)
 	assert.Equal(t, agentID, workspace.FrontmostAgentID)
+
+	// The exec_run_outputs row must be readable through the real store adapter
+	// (field.UUID run_id and project_id columns).
+	execOut, err := entadapter.NewScheduleStore(client).GetScheduledExecRunOutput(ctx, "5e000000-0000-0000-0000-000000000002")
+	require.NoError(t, err, "exec_run_outputs fixture row must be readable via ScheduleStore")
+	assert.Equal(t, `{"ok":true}`, string(execOut))
 
 	// The thread group rows must be readable through the real store adapter
 	// (field.UUID ids, the stored name_key matching the Go helper, and the
@@ -173,6 +182,106 @@ func TestFixtureLoadable(t *testing.T) {
 	excluded, err = composite.IsProjectVisitorExcluded(ctx, visitorRuleID, federatedUserID)
 	require.NoError(t, err)
 	assert.False(t, excluded)
+
+	dqStats, err := composite.DurableQueueStats(ctx, "fixture.echo", projectID, baseTime)
+	require.NoError(t, err, "durable_queue_items fixture row must be readable via DurableQueueStore")
+	assert.Equal(t, int64(1), dqStats.Pending)
+	require.NotNil(t, dqStats.Oldest)
+	assert.True(t, dqStats.Oldest.Equal(baseTime))
+
+	soInst, err := composite.GetSystemOneInstanceByName(ctx, "typesafe-prod")
+	require.NoError(t, err, "system_one_instances fixture row must be readable via CompositeStore")
+	assert.Equal(t, "50100000-0000-0000-0000-000000000001", soInst.ID)
+	assert.Equal(t, "typesafe", soInst.Adapter)
+	assert.Equal(t, store.SystemOneAuthKindAPIKey, soInst.Auth.Kind)
+	assert.Equal(t, "TYPESAFE_API_KEY", soInst.Auth.SecretName)
+	assert.Equal(t, 5*time.Second, soInst.Limits.CallTimeout)
+
+	msgPol, err := composite.GetMessagePolicyByName(ctx, projectID, "no-prose-choices")
+	require.NoError(t, err, "message_policies fixture row must be readable via CompositeStore")
+	assert.Equal(t, "b1000000-0000-0000-0000-000000000001", msgPol.ID)
+	assert.Equal(t, store.MessagePolicyModeShadow, msgPol.Mode)
+	assert.Equal(t, store.MessagePolicyOutcomeAdmit, msgPol.OnFailed)
+	assert.Equal(t, map[string]string{"cost_limit": "reject"}, msgPol.OnFailedReasons)
+	assert.Equal(t, []string{"agent_to_user", "agent_to_conversation"}, msgPol.Scope.Surfaces)
+
+	msgDecs, err := composite.ListMessagePolicyDecisions(ctx, store.MessagePolicyDecisionFilter{ProjectID: projectID}, store.ListOptions{})
+	require.NoError(t, err, "message_policy_decisions fixture rows must be readable via CompositeStore")
+	require.Len(t, msgDecs.Items, 2)
+	assert.Equal(t, "b2000000-0000-0000-0000-000000000002", msgDecs.Items[0].ID)
+	assert.Equal(t, messageID, msgDecs.Items[0].MessageID)
+	assert.Equal(t, "b2000000-0000-0000-0000-000000000001", msgDecs.Items[1].ID)
+	assert.Empty(t, msgDecs.Items[1].MessageID)
+
+	// The agent_delivery_holds marker and awaiting_session message row
+	// (ptone/scion#7881) must decode through the real store adapters.
+	hasDeliveryHold, err := composite.HasAgentDeliveryHold(ctx, agentID)
+	require.NoError(t, err, "agent_delivery_holds fixture row must be readable via MessageHoldStore")
+	assert.True(t, hasDeliveryHold)
+
+	savedScreen, err := composite.GetAgentSuspendScreen(ctx, agentID)
+	require.NoError(t, err, "agent_suspend_screens fixture row must be readable via AgentSuspendScreenStore")
+	assert.Equal(t, agentID, savedScreen.AgentID)
+	assert.Equal(t, "\x1b[32mready>\x1b[0m last pane\n", savedScreen.Content)
+	assert.False(t, savedScreen.Truncated)
+	heldMsg, err := composite.GetMessage(ctx, "88888888-8888-8888-8888-888888888889")
+	require.NoError(t, err)
+	assert.Equal(t, store.MessageDispatchAwaitingSession, heldMsg.DispatchState)
+	require.NotNil(t, heldMsg.HoldUntil)
+	assert.Equal(t, "55555555-5555-5555-5555-5555555555aa", heldMsg.HoldLaunchID)
+
+	ep, err := composite.GetWebhookEndpoint(ctx, webhookEndpointID)
+	require.NoError(t, err, "webhook_endpoints fixture row must be readable via TriggerStore")
+	assert.Equal(t, "fixture-webhook", ep.Name)
+
+	tr, err := composite.GetTrigger(ctx, triggerID)
+	require.NoError(t, err, "triggers fixture row must be readable via TriggerStore")
+	assert.Equal(t, "fixture-trigger", tr.Name)
+	assert.Equal(t, []string{"webhook.received"}, tr.MatchTypes)
+	assert.Equal(t, []store.TriggerMatchRule{{Dialect: "cel", Expr: "true"}}, tr.MatchRules)
+
+	trEvt, err := composite.GetTriggerEvent(ctx, triggerEventID)
+	require.NoError(t, err, "trigger_events fixture row must be readable via TriggerStore")
+	assert.Equal(t, "webhook.received", trEvt.Type)
+
+	trFire, err := composite.GetTriggerFire(ctx, triggerFireID)
+	require.NoError(t, err, "trigger_fires fixture row must be readable via TriggerStore")
+	assert.Equal(t, store.TriggerFireStatusFired, trFire.Status)
+	assert.Equal(t, "1/1", trFire.MatchedThrough)
+	assert.Equal(t, "cel", trFire.DecidedDialect)
+	assert.Contains(t, trFire.RuleTrace, `"class":"matched"`)
+
+	trClaim, err := composite.GetActiveTriggerSubjectClaim(ctx, triggerID, "webhook:"+webhookEndpointID)
+	require.NoError(t, err, "trigger_subject_claims fixture row must be readable via TriggerStore")
+	assert.Equal(t, triggerSubjectClaimID, trClaim.ID)
+	assert.Equal(t, store.TriggerSubjectClaimStateActive, trClaim.State)
+	assert.Equal(t, agentID, trClaim.AgentID)
+
+	withdrawnDec, err := composite.GetDecision(ctx, "dc000000-0000-0000-0000-000000000003")
+	require.NoError(t, err)
+	assert.Equal(t, store.DecisionStatusWithdrawn, withdrawnDec.Status)
+	require.NotNil(t, withdrawnDec.WithdrawnAt)
+	assert.Equal(t, "Plan changed", withdrawnDec.WithdrawnReason)
+
+	dismissedDec, err := composite.GetDecision(ctx, "dc000000-0000-0000-0000-000000000004")
+	require.NoError(t, err)
+	assert.Equal(t, store.DecisionStatusDismissed, dismissedDec.Status)
+	require.NotNil(t, dismissedDec.DismissedAt)
+	assert.Nil(t, dismissedDec.EffectiveAnswer())
+	require.NotNil(t, dismissedDec.Dismissal())
+	assert.Equal(t, "$dismissed", dismissedDec.Dismissal().ChoiceID)
+	assert.Equal(t, store.DecisionOutcomeDismiss, dismissedDec.Dismissal().Outcome)
+	assert.Equal(t, "Already handled out of band", dismissedDec.Dismissal().DismissReason)
+
+	otherDec, err := composite.GetDecision(ctx, "dc000000-0000-0000-0000-000000000005")
+	require.NoError(t, err)
+	require.NotNil(t, otherDec.Other)
+	assert.Equal(t, "Another region", otherDec.Other.Label)
+	assert.Equal(t, "Any GCP region code", otherDec.Other.Description)
+	assert.Equal(t, "e.g. europe-west4", otherDec.Other.Placeholder)
+	require.NotNil(t, otherDec.EffectiveAnswer())
+	assert.Equal(t, "$other", otherDec.EffectiveAnswer().ChoiceID)
+	assert.Equal(t, "europe-west4 canary", otherDec.EffectiveAnswer().OtherText)
 }
 
 // TestFixtureDeterministic verifies the spec produces a stable set of row

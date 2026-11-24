@@ -11,18 +11,22 @@ Alpha: changing or removing behavior needs no deprecation path.
 | Go build, test or lint in a container; OOM, VCS-status or `fmt-check` failures | `docs-repo/agents/sandbox-go-toolchain.md` |
 | Code compiled into `./cmd/scion`: `*_unix.go`, private-file writes, path containment, lock files, new commands | `docs-repo/agents/windows-platform-seams.md` (CI enforces it) |
 | Anything under `web/`, including a new `<sl-icon>` | `web/AGENTS.md` |
+| Helm chart or Terraform under `deploy/` | `docs-repo/agents/deploy-gates.md` |
 | Documentation site | `docs-site/AGENTS.md` |
 | Naming a concept | `GLOSSARY.md` |
 | CLI command agent-mode availability | `.design/cli-modes.md` |
 | Experimental features | `docs-site/src/content/docs/reference/experiments.md` |
 | Workspace or worktree provisioning | `docs-site/src/content/docs/local/workspace.md` ("Linked git projects") |
+| Building on another unmerged branch (stacked PRs) | `docs-repo/agents/stacked-branches.md` |
+| Adding or changing a user-visible runtime launch failure | `docs-repo/agents/typed-launch-failures.md` |
+| Live verification runs, or hosted/production-mode hardening that removes a workstation convenience | `docs-repo/agents/live-verification-gates.md` |
 
 ## Sandbox
 
 - Build with `go build -buildvcs=false`; worktrees fail VCS stamping.
-- Never compile the whole `pkg/hub` test package (about 12 GiB). Use `make test-hub-shard SHARD=K`; `hack/hubshard/hubshard.sh -locate TestName` finds the shard.
-- Scope `golangci-lint` to touched packages: `GOGC=40 golangci-lint run --new-from-rev=main --concurrency=1 ./pkg/foo/...`.
-- Never open an editor: set the editor per command (`GIT_EDITOR=true git rebase --continue`, or `git -c core.editor=true <subcommand>`), `git merge main --no-edit`, `git commit -m`. Never write `core.editor`, `core.hooksPath` or any other key outside the repository git config allow-list (`pkg/util/git_config_policy.go`) into the repository config: brokers refuse to start or resume an agent whose checkout sets one. Pass such options per command (`git -c core.editor=true <subcommand>`).
+- Never compile the whole `pkg/hub` test package (about 12 GiB). `go test`, `go vet` and golangci-lint on `./pkg/hub` all do, and so do `make ci` and `make ci-full`. Use `make test-hub-shard SHARD=K`; `hack/hubshard/hubshard.sh -locate TestName` finds the shard.
+- Scope `golangci-lint` to touched packages: `GOGC=40 golangci-lint run --new-from-rev=main --concurrency=1 ./pkg/foo/...`; lint `./pkg/hub` itself in a separate `--tests=false` run (see `docs-repo/agents/sandbox-go-toolchain.md`).
+- Never open an editor: set `GIT_EDITOR=true` per command (`GIT_EDITOR=true git rebase --continue`), `git merge main --no-edit`, `git commit -m` (the `GIT_EDITOR` environment variable overrides `core.editor`). Never write `core.editor`, `core.hooksPath` or any other key outside the repository git config allow-list (`pkg/util/git_config_policy.go`) into the repository config: brokers refuse to start or resume an agent whose checkout sets one. Pass non-editor options per command (`git -c <key>=<val> <subcommand>`).
 - Local `main` is the source of truth. Don't check it out; use `git diff main...HEAD`, `git show main:path`, `git rebase main`. Use remotes only when asked; report remote failures instead of working around them.
 - In worktree-per-agent mode you work under `/repo-root`, not `/workspace`. Scripts use `$PWD` or `git rev-parse --show-toplevel`.
 - Project resolution: `--project`/`--global`, then the project `.scion`, then `scion use` (outside a project), then `~/.scion`.
@@ -30,25 +34,45 @@ Alpha: changing or removing behavior needs no deprecation path.
 
 ## Rules
 
-- **Templates:** edit `pkg/config/embeds/` (embedded by `pkg/config/init.go`), never `.scion/`.
+- **Bundled templates and skills:** edit `resources/` (`resources/templates/`, `resources/platform_skills/`, `resources/mandatory_boilerplate/`, embedded by `resources/embed.go`) and `pkg/config/embeds/` (default settings and `embeds/templates/default`, embedded by `pkg/config/init.go`), never `.scion/`.
 - **New CLI commands:** add in `cmd/` (one file per subcommand). Decide agent-mode availability (`agentAllowed`, `cmd/cli_mode.go`) and ask the developer to confirm. Windows hides them until listed in `windowsAllowed` (`cmd/platform_gate.go`).
 - **Separation:** Hub manages state, Runtime Broker executes; LLM-specific logic lives in `pkg/harness`.
-- **Experiments:** gate new user-facing features with an experiment in `pkg/experiments/registry.go`. Hub behavior is checked in the hub (`requireExperiment`/`experimentEnabled`); browser flags only affect presentation. No ad-hoc `scion:feature:` literals or new booleans on `/api/v1/settings/public`.
+- **Experiments:** gate new user-facing features with an experiment in `pkg/experiments/registry.go` and classify it in `pkg/hub/test_admin_policy.go`. Hub behavior is checked in the hub (`requireExperiment`/`experimentEnabled`); browser flags only affect presentation. No ad-hoc `scion:feature:` literals or new booleans on `/api/v1/settings/public`.
 - **Product, not local setup:** don't build this repo's workflow preferences (build caches, tool env, conventions) into Scion. Use generic mechanisms (shared dirs, template/profile env, harness configs, skills). Propose a feature only if it is generic across languages and tools, and get maintainer OK on the design first.
-- **Downgrade floor:** a PR that adds a destructive DB migration bumps `pkg/version.DowngradeFloor` to the first release that will contain it. Destructive means it drops a table or column, or makes a change older binaries can't ignore (for example the drop block in `pkg/ent/entc/client.go`). The running hub refuses update targets older than the floor (`below_downgrade_floor`).
+- **Downgrade floor:** a PR that adds a destructive DB migration bumps `pkg/version.DowngradeFloor` to a `nightly-YYYYMMDD` tag for the first nightly that will contain it (never a preview/stable tag, which lacks an embedded date for cross-channel checks, and never dated later than the earliest preview or stable release containing the migration — nightlies cut at ~03:00 UTC). Destructive means it drops a table or column, rewrites stored values into a form older binaries parse differently, loosens a constraint (`NOT NULL` to nullable, or dropping a `CHECK`/`UNIQUE`) once new rows rely on it (older binaries re-tighten it on `entc.AutoMigrate`), or makes any other change older binaries can't ignore (for example the drop block in `pkg/ent/entc/client.go`). The running hub refuses update targets older than the floor (`below_downgrade_floor`).
 - **Terminology:** `project`, never `grove`, in new code (`project_id`, not `grove_id`). Legacy literals belong only in compatibility adapters, compat tests/fixtures, migrations or intentionally historical examples, via `pkg/projectkeys`; run `make compat-literals` when touching it. Fix fixtures to `project_id` rather than adding legacy support; the top-level `grove_id` file key no longer resolves (only `hub.grove_id` does).
 - **Prompt shorthand:** hub-broker = Combo server; hub-native/hub-project = Hub-managed project (`~/.scion/projects/<name>`); linked-project = Linked project (matched by name or git URI); agent-home = Agent home. Write the canonical term.
 
 ## Workflow
 
 1. Finish the task with tests.
-2. Before committing run `make ci`, or `make ci-full` for the full GitHub Actions mirror.
-3. Commit as you go. At the end, rebase on `main` (favor main), re-test after conflicts, notify the user.
+2. Before committing run `make ci`, or `make ci-full` for the full GitHub Actions mirror. In an agent container, run the agent-safe split in `docs-repo/agents/sandbox-go-toolchain.md` instead and report which gates ran.
+3. Commit as you go. At the end, rebase on `main` (favor main), re-test after conflicts, notify the user. Upstream squash-merges PRs, so move a stacked branch with `git rebase --onto` (`docs-repo/agents/stacked-branches.md`).
 4. Raise adjacent cleanup you notice, with file/function, payoff and blast radius. Don't implement it unprompted.
+
+## Interim template overrides
+
+Mandatory while project-level template configuration overrides are in development: when launching a new agent (`scion start` or `scion create`) from one of the templates below, pass these explicit `--harness` and `--model` flags until the project-template override mechanism replaces this section.
+
+| Template (`-t` / `--type`) | Harness (`--harness`) | Model alias (`--model`) |
+|---|---|---|
+| `developer` | `antigravity` | `large` |
+| `investigator` | `antigravity` | `large` |
+| `coordinator` | `antigravity` | `medium` |
+| `researcher` | `antigravity` | `extra-large` |
+
+- Pass the named harness configuration to `--harness` (alias for `--harness-config`) and the size alias to `--model`; never pass a model name or alias to `--harness` or `--harness-config`.
+- Applies only when creating or starting new agents from these four templates. Leave other templates unchanged, and do not restart or recreate existing agents solely to apply these overrides.
+- **Stall fallback:** if a worker launched with `--harness antigravity` makes no model progress for 20 minutes or more and a `continue` nudge does not recover it, the agent that started it may start the replacement with `--harness claude --model medium` without asking first, and reports the swap in the workstream. This covers only the harness and model choice: stopping or deleting the stalled agent and preserving its work follow the usual rules. It does not cover an agent that holds children, open human questions or a standing role.
+
+```bash
+scion start <agent-name> -t developer --harness antigravity --model large \
+  "Read your brief at /path/to/brief.md and follow it."
+```
 
 ## Never commit
 
-Check `.gitignore` before staging. Binaries or media that aren't shipped UI (screenshots go in PR comments); agent state files (`.coordinator-state.md`, etc.); one-off scripts, test artifacts, generated data; PR review notes (`pr-*-review*.md`); force-added `.scratch/`, `.tasks/` or `downloads/` content. A new kind of ephemeral file gets a `.gitignore` entry in the same PR.
+Check `.gitignore` before staging. Binaries or media that aren't shipped UI (screenshots go in PR comments as uploaded images, never as local or shared-volume paths, which readers can't open; `gh` can't upload them, so without a browser session ask a human to attach them); agent state files (`.coordinator-state.md`, etc.); one-off scripts, test artifacts, generated data; PR review notes (`pr-*-review*.md`); force-added `.scratch/`, `.tasks/` or `downloads/` content. A new kind of ephemeral file gets a `.gitignore` entry in the same PR.
 
 ## Durable notes
 

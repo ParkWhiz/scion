@@ -19,6 +19,7 @@ package hub
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,8 +84,8 @@ func TestAgentStalledDetectionHandler_MarksStalledAgents(t *testing.T) {
 		t.Fatalf("failed to update agent status: %v", err)
 	}
 
-	// Make activity stale but keep heartbeat recent
-	staleActivity := time.Now().Add(-10 * time.Minute)
+	// Make activity stale (past the 20m thinking cap) but keep heartbeat recent
+	staleActivity := time.Now().Add(-25 * time.Minute)
 	recentHB := time.Now().Add(-30 * time.Second)
 	db := s.(*entadapter.CompositeStore).DB()
 	if _, err := db.ExecContext(ctx,
@@ -484,7 +485,7 @@ func TestAgentStalledDetectionHandler_AutoSuspendDisabled(t *testing.T) {
 		t.Fatalf("failed to update agent status: %v", err)
 	}
 
-	staleActivity := time.Now().Add(-10 * time.Minute)
+	staleActivity := time.Now().Add(-25 * time.Minute)
 	recentHB := time.Now().Add(-30 * time.Second)
 	db := s.(*entadapter.CompositeStore).DB()
 	if _, err := db.ExecContext(ctx,
@@ -549,7 +550,7 @@ func TestAgentStalledDetectionHandler_AutoSuspendEnabled(t *testing.T) {
 		t.Fatalf("failed to update agent status: %v", err)
 	}
 
-	staleActivity := time.Now().Add(-10 * time.Minute)
+	staleActivity := time.Now().Add(-25 * time.Minute)
 	recentHB := time.Now().Add(-30 * time.Second)
 	db := s.(*entadapter.CompositeStore).DB()
 	if _, err := db.ExecContext(ctx,
@@ -601,4 +602,433 @@ func TestAgentStalledDetectionHandler_SchedulerIntegration(t *testing.T) {
 	time.Sleep(130 * time.Millisecond)
 
 	scheduler.Stop()
+}
+
+func TestAgentStalledDetectionHandler_NoHookSinceStartHintAndHeartbeatRetention(t *testing.T) {
+	ctx := context.Background()
+	srv, s := testServer(t)
+	srv.config.StalledThreshold = 5 * time.Minute
+	pub := NewChannelEventPublisher()
+	t.Cleanup(pub.Close)
+	srv.SetEventPublisher(pub)
+
+	project := &store.Project{
+		ID:   api.NewUUID(),
+		Name: "No Hook Hint Project",
+		Slug: "no-hook-hint-project",
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+	broker := &store.RuntimeBroker{
+		ID:     api.NewUUID(),
+		Name:   "No Hook Hint Broker",
+		Slug:   "no-hook-hint-broker",
+		Status: store.BrokerStatusOnline,
+	}
+	if err := s.CreateRuntimeBroker(ctx, broker); err != nil {
+		t.Fatalf("failed to create broker: %v", err)
+	}
+
+	staleStart := time.Now().Add(-10 * time.Minute).UTC()
+	recentHB := time.Now().Add(-30 * time.Second).UTC()
+
+	noHookAgent := &store.Agent{
+		ID:                api.NewUUID(),
+		Slug:              "no-hook-agent",
+		Name:              "No Hook Agent",
+		Template:          "claude",
+		ProjectID:         project.ID,
+		RuntimeBrokerID:   broker.ID,
+		Phase:             string(state.PhaseRunning),
+		Activity:          string(state.ActivityWorking),
+		Message:           "Harness started",
+		StartedAt:         staleStart,
+		LastActivityEvent: staleStart.Add(8 * time.Second),
+		LastSeen:          recentHB,
+	}
+	if err := s.CreateAgent(ctx, noHookAgent); err != nil {
+		t.Fatalf("failed to create noHookAgent: %v", err)
+	}
+
+	activeThenStalled := &store.Agent{
+		ID:                api.NewUUID(),
+		Slug:              "active-then-stalled",
+		Name:              "Active Then Stalled",
+		Template:          "claude",
+		ProjectID:         project.ID,
+		RuntimeBrokerID:   broker.ID,
+		Phase:             string(state.PhaseRunning),
+		Activity:          string(state.ActivityWorking),
+		Message:           "Ready",
+		StartedAt:         staleStart,
+		LastActivityEvent: staleStart.Add(2 * time.Minute),
+		LastSeen:          recentHB,
+	}
+	if err := s.CreateAgent(ctx, activeThenStalled); err != nil {
+		t.Fatalf("failed to create activeThenStalled: %v", err)
+	}
+
+	subscriber := &store.Agent{
+		ID:                api.NewUUID(),
+		Slug:              "owner-agent",
+		Name:              "Owner Agent",
+		ProjectID:         project.ID,
+		RuntimeBrokerID:   broker.ID,
+		Phase:             string(state.PhaseRunning),
+		Activity:          string(state.ActivityBlocked),
+		LastActivityEvent: time.Now(),
+		LastSeen:          recentHB,
+	}
+	if err := s.CreateAgent(ctx, subscriber); err != nil {
+		t.Fatalf("failed to create subscriber: %v", err)
+	}
+
+	for _, target := range []*store.Agent{noHookAgent, activeThenStalled} {
+		sub := newNotifySubscription(project.ID, store.SubscriberTypeAgent, subscriber.Slug, "test")
+		sub.AgentID = target.ID
+		sub.CreatedAt = staleStart.Add(-time.Minute)
+		if err := s.CreateNotificationSubscription(ctx, sub); err != nil {
+			t.Fatalf("failed to create subscription for %s: %v", target.Slug, err)
+		}
+	}
+
+	recorder := &recordingDispatcher{}
+	nd := NewNotificationDispatcher(s, pub, func() AgentDispatcher { return recorder }, slog.Default())
+	nd.Start()
+	t.Cleanup(nd.Stop)
+
+	srv.agentStalledDetectionHandler()(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(recorder.getCalls()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	calls := recorder.getCalls()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 notification dispatches, got %d", len(calls))
+	}
+
+	gotNoHook, err := s.GetAgent(ctx, noHookAgent.ID)
+	if err != nil {
+		t.Fatalf("failed to get noHookAgent: %v", err)
+	}
+	if gotNoHook.Activity != string(state.ActivityStalled) {
+		t.Fatalf("noHookAgent activity = %q, want stalled", gotNoHook.Activity)
+	}
+	if gotNoHook.Message != state.StalledNoHookActivityHint {
+		t.Errorf("noHookAgent message = %q, want %q", gotNoHook.Message, state.StalledNoHookActivityHint)
+	}
+
+	gotActive, err := s.GetAgent(ctx, activeThenStalled.ID)
+	if err != nil {
+		t.Fatalf("failed to get activeThenStalled: %v", err)
+	}
+	if gotActive.Activity != string(state.ActivityStalled) {
+		t.Fatalf("activeThenStalled activity = %q, want stalled", gotActive.Activity)
+	}
+	if gotActive.Message != "Ready" {
+		t.Errorf("activeThenStalled message = %q, want Ready (no startup hint)", gotActive.Message)
+	}
+
+	notifs, err := s.GetNotifications(ctx, store.SubscriberTypeAgent, subscriber.Slug, false)
+	if err != nil {
+		t.Fatalf("failed to list notifications: %v", err)
+	}
+	notifByAgent := map[string]string{}
+	for _, n := range notifs {
+		notifByAgent[n.AgentID] = n.Message
+	}
+	if msg := notifByAgent[noHookAgent.ID]; msg == "" || !strings.Contains(msg, state.StalledNoHookActivityHint) {
+		t.Errorf("noHookAgent notification = %q, want substring %q", msg, state.StalledNoHookActivityHint)
+	}
+	if msg := notifByAgent[activeThenStalled.ID]; strings.Contains(msg, state.StalledNoHookActivityHint) || strings.Contains(msg, "Ready") {
+		t.Errorf("activeThenStalled notification = %q, must not include startup hint or stale Ready", msg)
+	}
+
+	// A broker heartbeat repeating the stale pre-stall activity/message from
+	// agent-info.json must not clobber the stall hint while still stalled.
+	if code := sendHeartbeat(t, srv, broker.ID, project.ID, brokerAgentHeartbeat{
+		Slug:     noHookAgent.Slug,
+		Phase:    string(state.PhaseRunning),
+		Activity: string(state.ActivityWorking),
+		Message:  "Harness started",
+	}); code != 200 {
+		t.Fatalf("sendHeartbeat code = %d, want 200", code)
+	}
+	afterHB, err := s.GetAgent(ctx, noHookAgent.ID)
+	if err != nil {
+		t.Fatalf("failed to get noHookAgent after heartbeat: %v", err)
+	}
+	if afterHB.Activity != string(state.ActivityStalled) {
+		t.Errorf("after heartbeat activity = %q, want stalled", afterHB.Activity)
+	}
+	if afterHB.Message != state.StalledNoHookActivityHint {
+		t.Errorf("after heartbeat message = %q, want %q", afterHB.Message, state.StalledNoHookActivityHint)
+	}
+
+	// A stalled agent that does NOT carry the startup hint still accepts
+	// broker heartbeat message updates (preserving base behavior).
+	if code := sendHeartbeat(t, srv, broker.ID, project.ID, brokerAgentHeartbeat{
+		Slug:     activeThenStalled.Slug,
+		Phase:    string(state.PhaseRunning),
+		Activity: string(state.ActivityWorking),
+		Message:  "Container detail updated",
+	}); code != 200 {
+		t.Fatalf("sendHeartbeat (activeThenStalled) code = %d, want 200", code)
+	}
+	afterActiveHB, err := s.GetAgent(ctx, activeThenStalled.ID)
+	if err != nil {
+		t.Fatalf("failed to get activeThenStalled after heartbeat: %v", err)
+	}
+	if afterActiveHB.Activity != string(state.ActivityStalled) {
+		t.Errorf("activeThenStalled after heartbeat activity = %q, want stalled", afterActiveHB.Activity)
+	}
+	if afterActiveHB.Message != "Container detail updated" {
+		t.Errorf("activeThenStalled after heartbeat message = %q, want %q", afterActiveHB.Message, "Container detail updated")
+	}
+}
+
+func TestAgentStalledDetectionHandler_ThinkingCutoff(t *testing.T) {
+	srv, s, ep := setupStalledTestServer(t)
+	ctx := context.Background()
+
+	project := &store.Project{
+		ID:   api.NewUUID(),
+		Name: "Thinking Cutoff Project",
+		Slug: "thinking-cutoff-project",
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	now := time.Now()
+	recentHB := now.Add(-30 * time.Second)
+	db := s.(*entadapter.CompositeStore).DB()
+
+	mkAgent := func(slug, activity string, age time.Duration) *store.Agent {
+		t.Helper()
+		a := &store.Agent{
+			ID:        api.NewUUID(),
+			Slug:      slug,
+			Name:      slug,
+			Template:  "claude",
+			ProjectID: project.ID,
+			Phase:     string(state.PhaseCreated),
+		}
+		if err := s.CreateAgent(ctx, a); err != nil {
+			t.Fatalf("failed to create agent %s: %v", slug, err)
+		}
+		if err := s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Phase:    string(state.PhaseRunning),
+			Activity: activity,
+		}); err != nil {
+			t.Fatalf("failed to update agent %s status: %v", slug, err)
+		}
+		if _, err := db.ExecContext(ctx,
+			"UPDATE agents SET last_activity_event = ?, last_seen = ? WHERE id = ?",
+			now.Add(-age), recentHB, a.ID); err != nil {
+			t.Fatalf("failed to set timestamps for %s: %v", slug, err)
+		}
+		return a
+	}
+
+	thinkingUnderCap := mkAgent("thinking-6m", string(state.ActivityThinking), 6*time.Minute)
+	thinkingNearCap := mkAgent("thinking-19m", string(state.ActivityThinking), 19*time.Minute)
+	thinkingOverCap := mkAgent("thinking-21m", string(state.ActivityThinking), 21*time.Minute)
+	workingStale := mkAgent("working-6m", string(state.ActivityWorking), 6*time.Minute)
+	executingStale := mkAgent("executing-6m", string(state.ActivityExecuting), 6*time.Minute)
+
+	srv.agentStalledDetectionHandler()(ctx)
+
+	published := ep.publishedAgents()
+	publishedIDs := make(map[string]bool, len(published))
+	for _, a := range published {
+		publishedIDs[a.ID] = true
+	}
+
+	for _, stay := range []*store.Agent{thinkingUnderCap, thinkingNearCap} {
+		if publishedIDs[stay.ID] {
+			t.Errorf("%s should not be marked stalled under the 20m thinking cap", stay.Slug)
+		}
+		got, err := s.GetAgent(ctx, stay.ID)
+		if err != nil {
+			t.Fatalf("failed to get %s: %v", stay.Slug, err)
+		}
+		if got.Activity != string(state.ActivityThinking) {
+			t.Errorf("%s activity = %q, want %q", stay.Slug, got.Activity, string(state.ActivityThinking))
+		}
+	}
+
+	for _, want := range []struct {
+		agent *store.Agent
+		from  state.Activity
+	}{
+		{thinkingOverCap, state.ActivityThinking},
+		{workingStale, state.ActivityWorking},
+		{executingStale, state.ActivityExecuting},
+	} {
+		if !publishedIDs[want.agent.ID] {
+			t.Errorf("%s should have been marked stalled", want.agent.Slug)
+		}
+		got, err := s.GetAgent(ctx, want.agent.ID)
+		if err != nil {
+			t.Fatalf("failed to get %s: %v", want.agent.Slug, err)
+		}
+		if got.Activity != string(state.ActivityStalled) {
+			t.Errorf("%s activity = %q, want %q", want.agent.Slug, got.Activity, string(state.ActivityStalled))
+		}
+		if got.StalledFromActivity != string(want.from) {
+			t.Errorf("%s stalled_from_activity = %q, want %q", want.agent.Slug, got.StalledFromActivity, string(want.from))
+		}
+	}
+}
+
+func TestAgentStalledDetectionHandler_ThinkingThresholdRespectsHigherStalledThreshold(t *testing.T) {
+	srv, s, _ := setupStalledTestServer(t)
+	srv.config.StalledThreshold = 30 * time.Minute
+	ctx := context.Background()
+
+	project := &store.Project{
+		ID:   api.NewUUID(),
+		Name: "High Stalled Threshold Project",
+		Slug: "high-stalled-threshold-project",
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	now := time.Now()
+	recentHB := now.Add(-30 * time.Second)
+	db := s.(*entadapter.CompositeStore).DB()
+
+	mkThinking := func(slug string, age time.Duration) *store.Agent {
+		t.Helper()
+		a := &store.Agent{
+			ID:        api.NewUUID(),
+			Slug:      slug,
+			Name:      slug,
+			Template:  "claude",
+			ProjectID: project.ID,
+			Phase:     string(state.PhaseCreated),
+		}
+		if err := s.CreateAgent(ctx, a); err != nil {
+			t.Fatalf("failed to create agent %s: %v", slug, err)
+		}
+		if err := s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Phase:    string(state.PhaseRunning),
+			Activity: string(state.ActivityThinking),
+		}); err != nil {
+			t.Fatalf("failed to update agent %s status: %v", slug, err)
+		}
+		if _, err := db.ExecContext(ctx,
+			"UPDATE agents SET last_activity_event = ?, last_seen = ? WHERE id = ?",
+			now.Add(-age), recentHB, a.ID); err != nil {
+			t.Fatalf("failed to set timestamps for %s: %v", slug, err)
+		}
+		return a
+	}
+
+	underConfigured := mkThinking("thinking-25m", 25*time.Minute)
+	overConfigured := mkThinking("thinking-31m", 31*time.Minute)
+
+	srv.agentStalledDetectionHandler()(ctx)
+
+	gotUnder, err := s.GetAgent(ctx, underConfigured.ID)
+	if err != nil {
+		t.Fatalf("failed to get underConfigured: %v", err)
+	}
+	if gotUnder.Activity != string(state.ActivityThinking) {
+		t.Errorf("thinking-25m with StalledThreshold=30m: activity = %q, want %q",
+			gotUnder.Activity, string(state.ActivityThinking))
+	}
+
+	gotOver, err := s.GetAgent(ctx, overConfigured.ID)
+	if err != nil {
+		t.Fatalf("failed to get overConfigured: %v", err)
+	}
+	if gotOver.Activity != string(state.ActivityStalled) {
+		t.Errorf("thinking-31m with StalledThreshold=30m: activity = %q, want %q",
+			gotOver.Activity, string(state.ActivityStalled))
+	}
+}
+
+func TestAgentStalledDetectionHandler_ThinkingPastCapAutoSuspends(t *testing.T) {
+	srv, s, ep := setupStalledTestServer(t)
+	srv.config.AutoSuspendStalled = true
+	ctx := context.Background()
+
+	project := &store.Project{
+		ID:   api.NewUUID(),
+		Name: "Thinking AutoSuspend Project",
+		Slug: "thinking-autosuspend-project",
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	now := time.Now()
+	recentHB := now.Add(-30 * time.Second)
+	db := s.(*entadapter.CompositeStore).DB()
+
+	mkThinking := func(slug string, age time.Duration) *store.Agent {
+		t.Helper()
+		a := &store.Agent{
+			ID:        api.NewUUID(),
+			Slug:      slug,
+			Name:      slug,
+			Template:  "claude",
+			ProjectID: project.ID,
+			Phase:     string(state.PhaseCreated),
+		}
+		if err := s.CreateAgent(ctx, a); err != nil {
+			t.Fatalf("failed to create agent %s: %v", slug, err)
+		}
+		if err := s.UpdateAgentStatus(ctx, a.ID, store.AgentStatusUpdate{
+			Phase:    string(state.PhaseRunning),
+			Activity: string(state.ActivityThinking),
+		}); err != nil {
+			t.Fatalf("failed to update agent %s status: %v", slug, err)
+		}
+		if _, err := db.ExecContext(ctx,
+			"UPDATE agents SET last_activity_event = ?, last_seen = ? WHERE id = ?",
+			now.Add(-age), recentHB, a.ID); err != nil {
+			t.Fatalf("failed to set timestamps for %s: %v", slug, err)
+		}
+		return a
+	}
+
+	underCap := mkThinking("thinking-under-cap", 6*time.Minute)
+	pastCap := mkThinking("thinking-past-cap", 21*time.Minute)
+
+	srv.agentStalledDetectionHandler()(ctx)
+	srv.waitAutoSuspendIdle()
+
+	gotUnder, err := s.GetAgent(ctx, underCap.ID)
+	if err != nil {
+		t.Fatalf("failed to get underCap: %v", err)
+	}
+	if gotUnder.Phase != string(state.PhaseRunning) || gotUnder.Activity != string(state.ActivityThinking) {
+		t.Errorf("underCap = (%q, %q), want (running, thinking)", gotUnder.Phase, gotUnder.Activity)
+	}
+
+	gotPast, err := s.GetAgent(ctx, pastCap.ID)
+	if err != nil {
+		t.Fatalf("failed to get pastCap: %v", err)
+	}
+	if gotPast.Phase != string(state.PhaseSuspended) {
+		t.Errorf("pastCap phase = %q, want %q", gotPast.Phase, string(state.PhaseSuspended))
+	}
+	if gotPast.ContainerStatus != "stopped" {
+		t.Errorf("pastCap container_status = %q, want %q", gotPast.ContainerStatus, "stopped")
+	}
+	if gotPast.SuspendReason != string(state.SuspendReasonStalled) {
+		t.Errorf("pastCap suspend_reason = %q, want %q", gotPast.SuspendReason, string(state.SuspendReasonStalled))
+	}
+
+	// 2 events for pastCap (stall + suspend), 0 for underCap.
+	published := ep.publishedAgents()
+	if len(published) != 2 {
+		t.Fatalf("expected 2 published events (stall + suspend for pastCap), got %d", len(published))
+	}
 }

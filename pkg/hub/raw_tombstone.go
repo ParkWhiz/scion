@@ -256,13 +256,27 @@ func (s *Server) validateScheduledEventPayloadJSON(w http.ResponseWriter, eventT
 	case "dispatch_agent":
 		var p DispatchAgentEventPayload
 		decodeErr = json.Unmarshal([]byte(payload), &p)
-		if decodeErr == nil && !templateRefAllowed(p.Template) {
-			ValidationError(w, templateRefRefusal, nil)
+		if decodeErr == nil {
+			if field := unsupportedScheduledDispatchField(p); field != "" {
+				ValidationError(w, field+" is not supported for schedules", nil)
+				return false
+			}
+			if !templateRefAllowed(p.Template) {
+				ValidationError(w, templateRefRefusal, nil)
+				return false
+			}
+		}
+	case scheduledEventTypeExec:
+		// Strict, bounded decode (ptone/scion#7883); the error text names
+		// the failing field, never a value.
+		if _, err := decodeScheduledExecPayload(payload); err != nil {
+			BadRequest(w, err.Error())
 			return false
 		}
+		return true
 	default:
 		// Every caller validates eventType against the closed
-		// {message, dispatch_agent} set before reaching here, so this branch
+		// {message, dispatch_agent, exec} set before reaching here, so this branch
 		// is unreachable in practice. Fail closed for an unrecognized event
 		// type rather than falling back to a lenient syntax-only check: if a
 		// future event type is ever added to the closed set without a
@@ -307,4 +321,30 @@ func (s *Server) validateAndRejectScheduledPayload(w http.ResponseWriter, r *htt
 		return false
 	}
 	return s.validateScheduledEventPayloadJSON(w, eventType, payload)
+}
+
+// unsupportedScheduledDispatchField returns the first Stage 2 trigger-only
+// field populated on a dispatch_agent payload when authored for a schedule
+// (Stage 2 design §5.1).
+func unsupportedScheduledDispatchField(p DispatchAgentEventPayload) string {
+	switch {
+	case p.NameConflict != "":
+		return "nameConflict"
+	case p.Labels != nil:
+		return "labels"
+	case p.Ephemeral:
+		return "ephemeral"
+	case p.GithubToken != "":
+		return "githubToken"
+	case p.AgentRole != "":
+		return "agentRole"
+	case p.ReuseMessage != "":
+		return "reuseMessage"
+	case p.AckComment != nil:
+		return "ackComment"
+	case p.UntrustedVars != nil:
+		return "untrustedVars"
+	default:
+		return ""
+	}
 }

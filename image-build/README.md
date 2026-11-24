@@ -120,6 +120,21 @@ own for the base's distro release; the script names the Playwright version it
 came from and how to regenerate it. Only Debian 13 (core-base) has a list, so
 thick-prep's Ubuntu 24.04 base does not get these libraries.
 
+Both foundations (`core-base` and `thick-prep`) also install the distro `ffmpeg`
+package (`--no-install-recommends` in `apt-common`) and bake an immutable
+`0755` seed tree at `/usr/local/share/scion-playwright-ffmpeg/ffmpeg-<rev>/`
+(`install-core-toolchain.sh playwright-ffmpeg`, covering baseline revisions
+`1009`–`1013` plus the `ffmpeg` revision declared by `@playwright/cli`).
+`PLAYWRIGHT_BROWSERS_PATH` is intentionally left unset so runtime browser
+downloads (`npx playwright install webkit firefox`) persist in the agent home
+(`~/.cache/ms-playwright`) across container restarts and suspend/resume; on
+every start, `sciontool init` idempotently symlinks the seeded `ffmpeg-<rev>`
+entries (and `.links` back-references) into `~/.cache/ms-playwright` while
+leaving any user-downloaded directories untouched. If a project bumps Playwright
+to a newer `ffmpeg` revision not yet in `PLAYWRIGHT_FFMPEG_REVISIONS`,
+Playwright falls back cleanly to downloading that revision into
+`~/.cache/ms-playwright` until the list is extended.
+
 ### Builders
 
 `build-images.sh` selects an execution backend with `--builder <name>`. Three are bundled:
@@ -153,6 +168,20 @@ Every image is tagged with both `:<tag>` (controlled by `--tag`, defaults to `la
 When two steps in the same run depend on each other, the orchestrator threads `BASE_IMAGE=...:<short-sha>` so chained builds are immune to concurrent overwrites of `:latest`. Standalone targets (e.g. `--target harnesses` on its own) reference the parent image as `:<tag>`.
 
 **Release tag warning.** When HEAD is exactly on a git tag (`git describe --tags --exact-match`) and `--tag` is not given, `build-images.sh` prints a warning that the images will be tagged `:latest`, not `:<git tag>`, and suggests `--tag <git tag>`. The default stays `latest`; passing `--tag latest` explicitly silences the warning.
+
+### Release binaries (`--binaries release`)
+
+By default (`--binaries source`), `scion-base` and `scion-omni` compile `scion` and `sciontool` from source inside the container build. Pass `--binaries release` to instead download the published Linux release tarballs (`scion-linux-<arch>.tar.gz`, `sciontool-linux-<arch>.tar.gz`) and `SHA256SUMS` from GitHub Releases, verify each tarball against its own `SHA256SUMS` line, and extract them directly into `/usr/local/bin` (still running `lib/assert-no-cgo.sh` on `sciontool`).
+
+- **Tag and checkout requirements:** `--tag` names the GitHub Release to download and must match `vX.Y.Z`, `vX.Y.Z-preview.N`, `vX.Y.Z-rc.N`, or `nightly-YYYYMMDD`. The git checkout must sit **exactly** on that tag (`exact_tag_version` equals `--tag`) so image OCI labels (`VERSION`, `GIT_COMMIT`) and files copied from the checkout match the downloaded binaries. If `HEAD` carries both a `v*` tag and a `nightly-*` tag, release mode requires the `v*` tag (`exact_tag_version` prefers `v*`).
+- **Older releases:** releases cut before `sciontool-linux-{amd64,arm64}.tar.gz` assets were added fail with an error stating that the release predates sciontool assets and directing you to re-run with `--binaries source`. There is no automatic fallback to source compilation.
+- **Trade-offs:** under BuildKit/buildah, release builds skip `go mod download`, `go build`, and (in `omni`) the web frontend build (the legacy Docker builder still runs the source stages and discards them). The images carry the exact bytes users download from GitHub Releases. The release `scion` binary embeds the web UI and is built with `CGO_ENABLED=0`, so `scion-base` (and images inheriting from it) grows by the size of the web bundle; no cgo functionality is lost because SQLite uses pure-Go `modernc.org/sqlite`.
+- **Scope:** applies to `image-build/scion-base/Dockerfile` (`scion` and `sciontool`; `scion-hub` inherits it) and `image-build/omni/Dockerfile` (`scion` only). The repo-root `Dockerfile` (`hub-gke`) is unchanged. Supported by `local-docker`, `local-podman`, and `cloud-build`.
+
+```bash
+git checkout vX.Y.Z-preview.N
+image-build/scripts/build-images.sh --target common --tag vX.Y.Z-preview.N --binaries release
+```
 
 ### Base guard, `--allow-stale-base` and `--strict-base`
 
@@ -409,10 +438,10 @@ Other behaviour:
 
 ### Making agents use release images: `--also-tag latest`
 
-A release build of the Hub (`vX.Y.Z`, `vX.Y.Z-preview.N` or `vX.Y.Z-rc.N`)
-runs `scion-<harness>:<its version>` when `image_tag` is unset (the
-`hub.image_tag_version_default` experiment, on by default). Development and
-nightly builds run `scion-<harness>:latest`, unless the `image_tag` setting
+A release build of the Hub (`vX.Y.Z`, `vX.Y.Z-preview.N`, `vX.Y.Z-rc.N` or
+`nightly-YYYYMMDD`) runs `scion-<harness>:<its version>` when `image_tag` is
+unset (the `hub.image_tag_version_default` experiment, on by default).
+Development builds run `scion-<harness>:latest`, unless the `image_tag` setting
 (behind the `hub.image_tag_setting` experiment) selects another tag. For
 those, or with `image_tag: latest`, add `--also-tag latest` so the release
 images are also tagged `:latest`:
@@ -527,7 +556,7 @@ lineages. The `cloud-build` path uses `gcloudignore-omni` to include web source
 files that the default `.gcloudignore` excludes (the omni Dockerfile runs
 `npm install && npm run build` to embed the web frontend).
 
-These YAMLs reference `$_TAG`, `$_SHORT_SHA`, `$_COMMIT_SHA`, `$_REGISTRY`, and (in the five that build `scion-base`: `all`, `common`, `scion-base`, `thick`/`thick-prep`, `omni`) `$_VERSION`, all forwarded by the orchestrator. `_TAG` defaults to `latest` in every YAML's `substitutions:` block; `_VERSION` defaults to `''` in the YAMLs that declare it, so a manual `gcloud builds submit` that omits either still works. The orchestrator itself only forwards a non-empty `_VERSION` when `HEAD` is on an exact git tag (see "Build provenance and stale sciontool" above) — off-tag, it relies on that yaml default.
+These YAMLs reference `$_TAG`, `$_SHORT_SHA`, `$_COMMIT_SHA`, `$_REGISTRY`, and (in the five that build `scion-base` or `scion-omni`: `all`, `common`, `scion-base`, `thick`/`thick-prep`, `omni`) `$_VERSION`, `$_BUILD_TIME`, `$_SCION_BINARIES` (default `'source'`), and `$_SCION_RELEASE_TAG` (default `''`), all forwarded by the orchestrator. `_TAG` defaults to `latest` in every YAML's `substitutions:` block; `_VERSION` defaults to `''` in the YAMLs that declare it, so a manual `gcloud builds submit` that omits either still works. The orchestrator itself only forwards a non-empty `_VERSION` when `HEAD` is on an exact git tag (see "Build provenance and stale sciontool" above) — off-tag, it relies on that yaml default — and only forwards `_SCION_BINARIES` and `_SCION_RELEASE_TAG` when `--binaries release` is set.
 
 The aggregate `cloudbuild-harnesses.yaml`, `cloudbuild-common.yaml`,
 `cloudbuild.yaml`, and `cloudbuild-thick.yaml` files are static snapshots of
@@ -552,9 +581,14 @@ targets; submit it directly from the repo root:
 gcloud builds submit \
   --config=image-build/cloudbuild-hub-gke.yaml \
   --ignore-file=image-build/gcloudignore-omni \
-  --substitutions=_REGISTRY=<registry>,_SHORT_SHA=$(git rev-parse --short HEAD) \
+  --substitutions=_REGISTRY=<registry>,_SHORT_SHA=$(git rev-parse --short HEAD),_COMMIT_SHA=$(git rev-parse HEAD) \
   .
 ```
+
+For a release build on an exact git tag, also append `,_VERSION=<tag>` (a
+`vX.Y.Z[-preview.N|-rc.N]` form; and optionally
+`,_BUILD_TIME=<YYYY-MM-DDTHH:MM:SSZ>`). Off-tag, `_VERSION` defaults to `''` so
+the binary reports version `dev` and `image_tag: version` resolves to `latest`.
 
 `--ignore-file` is required because the default `.gcloudignore` drops the web
 source the Dockerfile builds. hub-gke uses the omni ignore file,

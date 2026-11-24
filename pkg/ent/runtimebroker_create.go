@@ -218,6 +218,20 @@ func (_c *RuntimeBrokerCreate) SetNillableHealth(v *string) *RuntimeBrokerCreate
 	return _c
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (_c *RuntimeBrokerCreate) SetWorkloadIdentityTargets(v string) *RuntimeBrokerCreate {
+	_c.mutation.SetWorkloadIdentityTargets(v)
+	return _c
+}
+
+// SetNillableWorkloadIdentityTargets sets the "workload_identity_targets" field if the given value is not nil.
+func (_c *RuntimeBrokerCreate) SetNillableWorkloadIdentityTargets(v *string) *RuntimeBrokerCreate {
+	if v != nil {
+		_c.SetWorkloadIdentityTargets(*v)
+	}
+	return _c
+}
+
 // SetLabels sets the "labels" field.
 func (_c *RuntimeBrokerCreate) SetLabels(v map[string]string) *RuntimeBrokerCreate {
 	_c.mutation.SetLabels(v)
@@ -268,6 +282,20 @@ func (_c *RuntimeBrokerCreate) SetAutoProvide(v bool) *RuntimeBrokerCreate {
 func (_c *RuntimeBrokerCreate) SetNillableAutoProvide(v *bool) *RuntimeBrokerCreate {
 	if v != nil {
 		_c.SetAutoProvide(*v)
+	}
+	return _c
+}
+
+// SetAdminManaged sets the "admin_managed" field.
+func (_c *RuntimeBrokerCreate) SetAdminManaged(v bool) *RuntimeBrokerCreate {
+	_c.mutation.SetAdminManaged(v)
+	return _c
+}
+
+// SetNillableAdminManaged sets the "admin_managed" field if the given value is not nil.
+func (_c *RuntimeBrokerCreate) SetNillableAdminManaged(v *bool) *RuntimeBrokerCreate {
+	if v != nil {
+		_c.SetAdminManaged(*v)
 	}
 	return _c
 }
@@ -663,6 +691,10 @@ func (_c *RuntimeBrokerCreate) defaults() {
 		v := runtimebroker.DefaultAutoProvide
 		_c.mutation.SetAutoProvide(v)
 	}
+	if _, ok := _c.mutation.AdminManaged(); !ok {
+		v := runtimebroker.DefaultAdminManaged
+		_c.mutation.SetAdminManaged(v)
+	}
 	if _, ok := _c.mutation.GcpHostSource(); !ok {
 		v := runtimebroker.DefaultGcpHostSource
 		_c.mutation.SetGcpHostSource(v)
@@ -721,6 +753,9 @@ func (_c *RuntimeBrokerCreate) check() error {
 	}
 	if _, ok := _c.mutation.AutoProvide(); !ok {
 		return &ValidationError{Name: "auto_provide", err: errors.New(`ent: missing required field "RuntimeBroker.auto_provide"`)}
+	}
+	if _, ok := _c.mutation.AdminManaged(); !ok {
+		return &ValidationError{Name: "admin_managed", err: errors.New(`ent: missing required field "RuntimeBroker.admin_managed"`)}
 	}
 	if _, ok := _c.mutation.Created(); !ok {
 		return &ValidationError{Name: "created", err: errors.New(`ent: missing required field "RuntimeBroker.created"`)}
@@ -824,6 +859,10 @@ func (_c *RuntimeBrokerCreate) createSpec() (*RuntimeBroker, *sqlgraph.CreateSpe
 		_spec.SetField(runtimebroker.FieldHealth, field.TypeString, value)
 		_node.Health = value
 	}
+	if value, ok := _c.mutation.WorkloadIdentityTargets(); ok {
+		_spec.SetField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString, value)
+		_node.WorkloadIdentityTargets = value
+	}
 	if value, ok := _c.mutation.Labels(); ok {
 		_spec.SetField(runtimebroker.FieldLabels, field.TypeJSON, value)
 		_node.Labels = value
@@ -843,6 +882,10 @@ func (_c *RuntimeBrokerCreate) createSpec() (*RuntimeBroker, *sqlgraph.CreateSpe
 	if value, ok := _c.mutation.AutoProvide(); ok {
 		_spec.SetField(runtimebroker.FieldAutoProvide, field.TypeBool, value)
 		_node.AutoProvide = value
+	}
+	if value, ok := _c.mutation.AdminManaged(); ok {
+		_spec.SetField(runtimebroker.FieldAdminManaged, field.TypeBool, value)
+		_node.AdminManaged = value
 	}
 	if value, ok := _c.mutation.GcpHostServiceAccountEmail(); ok {
 		_spec.SetField(runtimebroker.FieldGcpHostServiceAccountEmail, field.TypeString, value)
@@ -1228,6 +1271,24 @@ func (u *RuntimeBrokerUpsert) ClearHealth() *RuntimeBrokerUpsert {
 	return u
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsert) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpsert {
+	u.Set(runtimebroker.FieldWorkloadIdentityTargets, v)
+	return u
+}
+
+// UpdateWorkloadIdentityTargets sets the "workload_identity_targets" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsert) UpdateWorkloadIdentityTargets() *RuntimeBrokerUpsert {
+	u.SetExcluded(runtimebroker.FieldWorkloadIdentityTargets)
+	return u
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsert) ClearWorkloadIdentityTargets() *RuntimeBrokerUpsert {
+	u.SetNull(runtimebroker.FieldWorkloadIdentityTargets)
+	return u
+}
+
 // SetLabels sets the "labels" field.
 func (u *RuntimeBrokerUpsert) SetLabels(v map[string]string) *RuntimeBrokerUpsert {
 	u.Set(runtimebroker.FieldLabels, v)
@@ -1309,6 +1370,18 @@ func (u *RuntimeBrokerUpsert) SetAutoProvide(v bool) *RuntimeBrokerUpsert {
 // UpdateAutoProvide sets the "auto_provide" field to the value that was provided on create.
 func (u *RuntimeBrokerUpsert) UpdateAutoProvide() *RuntimeBrokerUpsert {
 	u.SetExcluded(runtimebroker.FieldAutoProvide)
+	return u
+}
+
+// SetAdminManaged sets the "admin_managed" field.
+func (u *RuntimeBrokerUpsert) SetAdminManaged(v bool) *RuntimeBrokerUpsert {
+	u.Set(runtimebroker.FieldAdminManaged, v)
+	return u
+}
+
+// UpdateAdminManaged sets the "admin_managed" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsert) UpdateAdminManaged() *RuntimeBrokerUpsert {
+	u.SetExcluded(runtimebroker.FieldAdminManaged)
 	return u
 }
 
@@ -2045,6 +2118,27 @@ func (u *RuntimeBrokerUpsertOne) ClearHealth() *RuntimeBrokerUpsertOne {
 	})
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsertOne) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetWorkloadIdentityTargets(v)
+	})
+}
+
+// UpdateWorkloadIdentityTargets sets the "workload_identity_targets" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertOne) UpdateWorkloadIdentityTargets() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateWorkloadIdentityTargets()
+	})
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsertOne) ClearWorkloadIdentityTargets() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearWorkloadIdentityTargets()
+	})
+}
+
 // SetLabels sets the "labels" field.
 func (u *RuntimeBrokerUpsertOne) SetLabels(v map[string]string) *RuntimeBrokerUpsertOne {
 	return u.Update(func(s *RuntimeBrokerUpsert) {
@@ -2140,6 +2234,20 @@ func (u *RuntimeBrokerUpsertOne) SetAutoProvide(v bool) *RuntimeBrokerUpsertOne 
 func (u *RuntimeBrokerUpsertOne) UpdateAutoProvide() *RuntimeBrokerUpsertOne {
 	return u.Update(func(s *RuntimeBrokerUpsert) {
 		s.UpdateAutoProvide()
+	})
+}
+
+// SetAdminManaged sets the "admin_managed" field.
+func (u *RuntimeBrokerUpsertOne) SetAdminManaged(v bool) *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetAdminManaged(v)
+	})
+}
+
+// UpdateAdminManaged sets the "admin_managed" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertOne) UpdateAdminManaged() *RuntimeBrokerUpsertOne {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateAdminManaged()
 	})
 }
 
@@ -3110,6 +3218,27 @@ func (u *RuntimeBrokerUpsertBulk) ClearHealth() *RuntimeBrokerUpsertBulk {
 	})
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsertBulk) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetWorkloadIdentityTargets(v)
+	})
+}
+
+// UpdateWorkloadIdentityTargets sets the "workload_identity_targets" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertBulk) UpdateWorkloadIdentityTargets() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateWorkloadIdentityTargets()
+	})
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (u *RuntimeBrokerUpsertBulk) ClearWorkloadIdentityTargets() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.ClearWorkloadIdentityTargets()
+	})
+}
+
 // SetLabels sets the "labels" field.
 func (u *RuntimeBrokerUpsertBulk) SetLabels(v map[string]string) *RuntimeBrokerUpsertBulk {
 	return u.Update(func(s *RuntimeBrokerUpsert) {
@@ -3205,6 +3334,20 @@ func (u *RuntimeBrokerUpsertBulk) SetAutoProvide(v bool) *RuntimeBrokerUpsertBul
 func (u *RuntimeBrokerUpsertBulk) UpdateAutoProvide() *RuntimeBrokerUpsertBulk {
 	return u.Update(func(s *RuntimeBrokerUpsert) {
 		s.UpdateAutoProvide()
+	})
+}
+
+// SetAdminManaged sets the "admin_managed" field.
+func (u *RuntimeBrokerUpsertBulk) SetAdminManaged(v bool) *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.SetAdminManaged(v)
+	})
+}
+
+// UpdateAdminManaged sets the "admin_managed" field to the value that was provided on create.
+func (u *RuntimeBrokerUpsertBulk) UpdateAdminManaged() *RuntimeBrokerUpsertBulk {
+	return u.Update(func(s *RuntimeBrokerUpsert) {
+		s.UpdateAdminManaged()
 	})
 }
 

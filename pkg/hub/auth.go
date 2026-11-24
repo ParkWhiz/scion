@@ -26,7 +26,9 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/authctx"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/trigger"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
@@ -63,10 +65,7 @@ type AuthConfig struct {
 	// than passed through, because nothing further down the chain will ever
 	// establish an identity for it. See issue #591.
 	BrokerAuthSvc *BrokerAuthService
-	// TrustedProxies is a list of trusted proxy IPs/CIDRs
-	TrustedProxies []string
 	// ProxyAuthenticator is the configured proxy authenticator (for proxy auth mode).
-	// When set, it replaces the legacy IP-only extractProxyUser path.
 	ProxyAuthenticator ProxyAuthenticator
 	// ProxyUserProvisioner is a function that provisions a user from a verified
 	// proxy identity. It runs provisionUser and returns the stored user.
@@ -191,6 +190,9 @@ type AuthConfig struct {
 	// 401 on a port proxy route (Server.recordPortProxyNoCredentials).
 	// Nil counts nothing.
 	RecordPortProxyNoCredentials func()
+	// ResolvedBranding returns the current Hub branding snapshot for
+	// unauthenticated plain-text port proxy errors. Nil falls back to defaults.
+	ResolvedBranding func() *config.ResolvedBranding
 }
 
 // tokenType represents the type of authentication token.
@@ -306,10 +308,7 @@ func handlerAfterAuth(next http.Handler) http.Handler {
 // 3. Development tokens (scion_dev_* prefix)
 // 4. User access tokens (scion_pat_* prefix)
 // 5. User JWTs
-// 6. Trusted proxy headers
 func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
-	// Parse trusted proxy CIDRs
-	trustedNets := parseTrustedProxies(cfg.TrustedProxies)
 	devUsers := cfg.DevUser
 	if devUsers == nil {
 		devUsers = newDevUserSource(cfg.DevUserCfg)
@@ -528,29 +527,6 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 					// (nil, nil) = no assertion present, fall through
 				}
 
-				// Step 3b: Legacy trusted proxy headers (backward compat when no ProxyAuthenticator)
-				if cfg.ProxyAuthenticator == nil && len(trustedNets) > 0 && isTrustedProxy(r, trustedNets) {
-					if user := extractProxyUser(r); user != nil {
-						// This path builds an identity with no store row,
-						// so it never reaches the JWT row block: refuse
-						// the reserved test-identity domain outright.
-						if isReservedTestIdentityEmail(user.Email()) {
-							writeError(w, http.StatusForbidden, ErrCodeForbidden,
-								"access denied: email not authorized", nil)
-							return
-						}
-						ctx = context.WithValue(ctx, userContextKey{}, user)
-						ctx = contextWithIdentity(ctx, user)
-						ctx = contextWithCredentialContext(ctx, credentialContextForIdentity(user))
-						ctx = contextWithAuthType(ctx, AuthTypeProxy)
-						if cfg.Debug {
-							log.Debug("Proxy user authenticated (legacy)", "email", user.Email())
-						}
-						serveAfterAuth(w, next, r.WithContext(ctx))
-						return
-					}
-				}
-
 				// Step 3c: Skill file capability URL (#1792). A credential-less
 				// GET of /api/v1/skills/{id}/files/{path} carrying exp/sig
 				// parameters is passed through WITHOUT an identity. Only the
@@ -610,7 +586,11 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 				// one; placed below it, its port proxy requests would get
 				// this 401 instead.
 				if isProxyRoute(r.URL.Path) && !isBrowserRequest(r) {
-					hinted := writePortProxyNoCredentials(w, r)
+					var b *config.ResolvedBranding
+					if cfg.ResolvedBranding != nil {
+						b = cfg.ResolvedBranding()
+					}
+					hinted := writePortProxyNoCredentialsWithBranding(w, r, b)
 					if cfg.RecordPortProxyNoCredentials != nil {
 						cfg.RecordPortProxyNoCredentials()
 					}
@@ -768,6 +748,11 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 						"invalid access token: "+err.Error(), nil)
 					return
 				}
+				if !isBearerTokenType(claims.TokenType) {
+					writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+						"invalid access token: unsupported token type", nil)
+					return
+				}
 				// PRIMARY choke: see isReservedPlatformIdentity's invariant
 				// comment. This check applies to every self-contained user
 				// JWT that reaches this point, independent of which mint
@@ -894,6 +879,13 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 						}
 					}
 				}
+				if claims.ViewAsMember && claims.ClientType != ClientTypeWeb {
+					log.Warn("JWT auth rejected: view-as-member claim on non-web token",
+						"user_id", claims.UserID, "client_type", claims.ClientType)
+					writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
+						"invalid access token: view-as-member claim is only valid on web tokens", nil)
+					return
+				}
 				user := NewAuthenticatedUser(
 					claims.UserID,
 					claims.Email,
@@ -901,6 +893,10 @@ func UnifiedAuthMiddleware(cfg AuthConfig) func(http.Handler) http.Handler {
 					claims.Role,
 					string(claims.ClientType),
 				)
+				if claims.ViewAsMember {
+					user = user.WithViewAsMember()
+					ctx = contextWithViewAsMember(ctx, claims.UserID)
+				}
 				ctx = context.WithValue(ctx, userContextKey{}, user)
 				ctx = contextWithIdentity(ctx, user)
 				ctx = contextWithCredentialContext(ctx, credentialContextForIdentity(user))
@@ -1101,6 +1097,11 @@ func isUnauthenticatedEndpoint(path string) bool {
 	case "/api/v1/csp-reports": // Browser policy reports for the web pages (no sign-in; browsers send reports on their own)
 		return true
 	}
+	// Generic signed webhook ingress: exact ^/api/v1/hooks/[0-9a-f-]{36}$ match
+	// only (never prefix), so subpaths like /api/v1/hooks/x/y still require auth.
+	if trigger.IsHooksRequestPath(path) {
+		return true
+	}
 	return false
 }
 
@@ -1201,43 +1202,14 @@ func isTrustedProxy(r *http.Request, trustedNets []*net.IPNet) bool {
 	return false
 }
 
-// extractProxyUser extracts user information from trusted proxy headers.
-func extractProxyUser(r *http.Request) UserIdentity {
-	userID := r.Header.Get("X-Forwarded-User-Id")
-	email := r.Header.Get("X-Forwarded-User-Email")
-	name := r.Header.Get("X-Forwarded-User-Name")
-	role := r.Header.Get("X-Forwarded-User-Role")
-
-	// At minimum, we need user ID and email
-	if userID == "" || email == "" {
-		return nil
-	}
-
-	if role == "" {
-		role = "member"
-	}
-
-	return NewAuthenticatedUser(userID, email, name, role, string(ClientTypeWeb))
-}
-
 // agentCredentialIDContextKey stores the credential ID for a validated agent token.
 type agentCredentialIDContextKey struct{}
 
-// legacyTokenContextKey marks that the agent token is a legacy (pre-table) token.
-type legacyTokenContextKey struct{}
-
-// GetAgentCredentialIDFromContext returns the credential ID if the agent token
-// was found in the credential store, or "" if it's a legacy token.
+// GetAgentCredentialIDFromContext returns the credential ID for a validated
+// agent token, or "" if not set.
 func GetAgentCredentialIDFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(agentCredentialIDContextKey{}).(string)
 	return id
-}
-
-// IsLegacyTokenFromContext returns true if the agent token was not found in the
-// credential store (compatibility window for pre-table tokens).
-func IsLegacyTokenFromContext(ctx context.Context) bool {
-	v, _ := ctx.Value(legacyTokenContextKey{}).(bool)
-	return v
 }
 
 // RequireAuth is middleware that ensures a request is authenticated.

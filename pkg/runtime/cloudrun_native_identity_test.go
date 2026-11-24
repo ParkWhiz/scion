@@ -117,6 +117,8 @@ func TestBuildCloudRunInstance_CloudRunIdentity(t *testing.T) {
 			wantSA: nativeIDAssignedSA, wantLabel: cloudRunIdentityHash(nativeIDAssignedSA)},
 		{name: "block", id: &api.CloudRunIdentity{ServiceAccount: nativeIDBlockSA, Mode: "block"},
 			wantSA: nativeIDBlockSA, wantLabel: cloudRunIdentityHash(nativeIDBlockSA)},
+		{name: "passthrough", id: &api.CloudRunIdentity{ServiceAccount: nativeIDInstanceSA, Mode: "passthrough"},
+			wantSA: nativeIDInstanceSA, wantLabel: cloudRunIdentityHash(nativeIDInstanceSA)},
 		{name: "caller scion-identity label does not shadow the identity", id: &api.CloudRunIdentity{ServiceAccount: nativeIDAssignedSA, Mode: "assign"},
 			wantSA: nativeIDAssignedSA, wantLabel: cloudRunIdentityHash(nativeIDAssignedSA), callerLabel: "scion-identity"},
 		{name: "caller Scion-Identity label does not shadow the identity", id: &api.CloudRunIdentity{ServiceAccount: nativeIDAssignedSA, Mode: "assign"},
@@ -128,7 +130,10 @@ func TestBuildCloudRunInstance_CloudRunIdentity(t *testing.T) {
 			if tc.callerLabel != "" {
 				cfg.Labels[tc.callerLabel] = "caller-value"
 			}
-			inst := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+			inst, err := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+			if err != nil {
+				t.Fatalf("buildCloudRunInstance: %v", err)
+			}
 			if inst.GetServiceAccount() != tc.wantSA {
 				t.Errorf("ServiceAccount = %q, want %q", inst.GetServiceAccount(), tc.wantSA)
 			}
@@ -162,7 +167,10 @@ func TestBuildCloudRunInstance_GateOffUnchanged(t *testing.T) {
 	base.HomeDir = "/home/scion"
 	base.CommandArgs = []string{"sleep", "60"}
 
-	off := rt.buildCloudRunInstance(base, 1000, 1000, paths)
+	off, err := rt.buildCloudRunInstance(base, 1000, 1000, paths)
+	if err != nil {
+		t.Fatalf("buildCloudRunInstance(off): %v", err)
+	}
 	if off.GetServiceAccount() != nativeIDInstanceSA {
 		t.Errorf("gate off: ServiceAccount = %q, want the configured account", off.GetServiceAccount())
 	}
@@ -185,7 +193,10 @@ func TestBuildCloudRunInstance_GateOffUnchanged(t *testing.T) {
 		on.Labels[k] = v
 	}
 	on.CloudRunIdentity = &api.CloudRunIdentity{ServiceAccount: nativeIDAssignedSA, Mode: "assign"}
-	withID := rt.buildCloudRunInstance(on, 1000, 1000, paths)
+	withID, err := rt.buildCloudRunInstance(on, 1000, 1000, paths)
+	if err != nil {
+		t.Fatalf("buildCloudRunInstance(on): %v", err)
+	}
 	// Undo exactly the two documented differences; the rest must match.
 	withID.ServiceAccount = nativeIDInstanceSA
 	delete(withID.Labels, cloudRunIdentityLabel)
@@ -260,6 +271,7 @@ func TestCloudRunRun_IdentityCreate(t *testing.T) {
 func TestCloudRunRun_IdentityReplacesSameRunInstance(t *testing.T) {
 	assigned := &api.CloudRunIdentity{ServiceAccount: nativeIDAssignedSA, Mode: "assign"}
 	block := &api.CloudRunIdentity{ServiceAccount: nativeIDBlockSA, Mode: "block"}
+	passthrough := &api.CloudRunIdentity{ServiceAccount: nativeIDInstanceSA, Mode: "passthrough"}
 	tests := []struct {
 		name     string
 		id       *api.CloudRunIdentity
@@ -279,6 +291,7 @@ func TestCloudRunRun_IdentityReplacesSameRunInstance(t *testing.T) {
 		{name: "stopped instance, start or restart", id: assigned, label: cloudRunIdentityHash(nativeIDAssignedSA), state: recordedStopped()},
 		{name: "stopped instance, resume", id: assigned, label: cloudRunIdentityHash(nativeIDAssignedSA), state: recordedStopped(), resume: true},
 		{name: "revoked assignment, restart as block", id: block, label: cloudRunIdentityHash(nativeIDAssignedSA), state: recordedStopped()},
+		{name: "switch from assign to explicit passthrough", id: passthrough, label: cloudRunIdentityHash(nativeIDAssignedSA), state: recordedStopped()},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

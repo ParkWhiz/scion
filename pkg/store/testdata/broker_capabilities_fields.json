@@ -10,14 +10,18 @@
     "clearedFields",
     "clearedResourceSubfields",
     "emptyPerAgentWorkspace",
+    "ephemeralPersistence",
+    "homeFiles",
     "nodeImageRegistry",
     "reprovision",
     "reprovisionEmptyPerAgent",
     "reprovisionResetHomeRuntimes",
+    "restartingRuntimes",
     "startsInFlight",
     "sync",
     "templateTiers",
     "unlimitedCountLimits",
-    "webPty"
+    "webPty",
+    "wiTargetsV1"
   ]
 }

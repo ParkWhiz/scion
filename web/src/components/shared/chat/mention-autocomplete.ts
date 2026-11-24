@@ -38,6 +38,7 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import type { Agent } from '../../../shared/types.js';
+import { agentMentionSlug, toMentionSlug, userMentionSlug } from './prose-mentions.js';
 
 /** Maximum items shown in the dropdown. */
 const MAX_DROPDOWN_ITEMS = 8;
@@ -177,7 +178,7 @@ export class ScionMentionAutocomplete extends LitElement {
       z-index: 100;
       background: var(--scion-surface, #ffffff);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
       max-width: 280px;
       min-width: 200px;
@@ -200,7 +201,7 @@ export class ScionMentionAutocomplete extends LitElement {
 
     .dropdown-item:hover,
     .dropdown-item.highlighted {
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
     }
 
     .dropdown-item .slug {
@@ -491,8 +492,8 @@ export class ScionMentionAutocomplete extends LitElement {
     const slugs = new Set<string>();
 
     for (const agent of this.agents || []) {
-      const rawSlug = agent.slug || agent.name || '';
-      slugs.add(rawSlug.toLowerCase().replace(/\s+/g, '-'));
+      const rawSlug = agentMentionSlug(agent);
+      slugs.add(toMentionSlug(rawSlug));
       allCandidates.push({
         slug: rawSlug,
         name: agent.name || '',
@@ -503,12 +504,12 @@ export class ScionMentionAutocomplete extends LitElement {
 
     for (const member of this.members || []) {
       // Avoid duplicate entries if a member is also an agent
-      const slug = member.name.toLowerCase().replace(/\s+/g, '-');
-      if (!slugs.has(slug)) {
+      const slug = userMentionSlug(member);
+      if (slug && !slugs.has(slug)) {
         slugs.add(slug);
         allCandidates.push({
           slug,
-          name: member.name,
+          name: member.name || member.email,
           kind: member.kind === 'agent' ? 'agent' : 'user',
           avatarUrl: member.avatarUrl,
         });

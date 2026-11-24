@@ -64,6 +64,9 @@ type agentCreateWrite struct {
 	// required when Agent carries an assign-mode GCP identity, and is
 	// recorded on the assignment row only as a description.
 	SAOrigin store.SAAssignmentOrigin
+	// OnCommitTx, when non-nil, runs inside the same transaction as the agent
+	// row and create audit write (after Audit is written, before commit).
+	OnCommitTx func(ctx context.Context, tx store.Store) error
 }
 
 // agentAssignedServiceAccountID returns the service account ID of agent's
@@ -206,6 +209,11 @@ func (s *Server) commitAgentCreate(ctx context.Context, w agentCreateWrite) erro
 				return fmt.Errorf("agent create notification subscription: %w", err)
 			}
 		}
+		if w.OnCommitTx != nil {
+			if err := w.OnCommitTx(ctx, tx); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -216,6 +224,7 @@ func (s *Server) commitAgentCreate(ctx context.Context, w agentCreateWrite) erro
 // dispatch failure.
 const (
 	createStageStorage   = "storage"
+	createStageSecrets   = "secrets"
 	createStageUploadURL = "upload_url"
 	// createStageWorkspaceStorage: the project's workspace is on storage the
 	// target broker cannot reach (the remote-broker refusal, 409).
@@ -288,10 +297,10 @@ var errCreateRowDeleteHeld = errors.New("agent row is held by a delete")
 // compensateAgentCreate rolls back a committed create after a later step
 // failed, in one transaction: it deletes the agent row (identity keys
 // cascade), runs the hard-delete work with cause create_compensation
-// (agentHardDeleteWork: delegation edges, service-account assignments and
-// the hard-delete hooks), and writes an agent_create_dispatch_failed audit
-// record naming the create's audit record and the failed stage. A hook
-// error rolls the compensation back.
+// (agentHardDeleteWork: active credential revocation, delegation edges,
+// service-account assignments and the hard-delete hooks), and writes an
+// agent_create_dispatch_failed audit record naming the create's audit record
+// and the failed stage. A hook error rolls the compensation back.
 //
 // The row delete is conditional (ptone/scion#3557, ptone/scion#3958): the
 // row is removed only when no delete holds it (createRowHeldCheck), checked
@@ -304,8 +313,10 @@ var errCreateRowDeleteHeld = errors.New("agent row is held by a delete")
 // errCreateRowDeleteHeld.
 //
 // The caller passes a context detached from the request (see
-// cleanupFailedCreate). Credential revocation, the broker-side delete and
-// the quota release stay with the caller.
+// cleanupFailedCreate). Pre-delete credential revocation (for rollbacks that
+// keep the row), the broker-side delete and the quota release stay with the
+// caller; agentHardDeleteWork also revokes any remaining active credentials in
+// the row-delete transaction.
 func (s *Server) compensateAgentCreate(ctx context.Context, c createCompensation) error {
 	if c.Agent == nil {
 		return fmt.Errorf("%w: no agent to compensate", errAgentCreateWriteInvalid)
@@ -342,15 +353,15 @@ func (s *Server) compensateAgentCreate(ctx context.Context, c createCompensation
 	// edgesAndAudit runs in the compensation's transaction, after the row
 	// delete.
 	actor := auditActorFromContext(ctx)
-	edgesAndAudit := func(tx store.Store) error {
-		if _, _, err := s.agentHardDeleteWork(ctx, tx, c.Agent, actor, store.Deactivation{
+	edgesAndAudit := func(txCtx context.Context, tx store.Store) error {
+		if _, _, err := s.agentHardDeleteWork(txCtx, tx, c.Agent, actor, store.Deactivation{
 			Cause: store.EdgeDeactivationCreateCompensation,
 			At:    &now,
 			OpID:  opID,
 		}, "compensation"); err != nil {
 			return err
 		}
-		if err := tx.CreateMutationAudit(ctx, record); err != nil {
+		if err := tx.CreateMutationAudit(txCtx, record); err != nil {
 			return fmt.Errorf("compensation audit: %w", err)
 		}
 		return nil
@@ -361,8 +372,13 @@ func (s *Server) compensateAgentCreate(ctx context.Context, c createCompensation
 	// check rolls it all back. A delete claim that lands after the read
 	// bumps state_version, so the row delete misses and the attempt is
 	// retried from a fresh read, which then refuses.
-	n, err := s.store.FinalizeAgentDeletion(lifecycleCreateRollback(ctx, c.Stage), agentID, createRowCompensable(), store.DeletionFinalizeHard, store.DeletionFields{},
-		createRowHeldCheck(edgesAndAudit))
+	rbCtx := lifecycleCreateRollback(ctx, c.Stage)
+	n, err := s.withAgentSecretCleanupOnCompensation(rbCtx, agentID, func(txCtx context.Context) (int, error) {
+		return s.store.FinalizeAgentDeletion(txCtx, agentID, createRowCompensable(), store.DeletionFinalizeHard, store.DeletionFields{},
+			createRowHeldCheck(func(tx store.Store) error {
+				return edgesAndAudit(txCtx, tx)
+			}))
+	})
 	if errors.Is(err, errCreateRowDeleteHeld) {
 		return errCreateRowDeleteHeld
 	}

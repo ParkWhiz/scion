@@ -152,7 +152,7 @@ export const resourceStyles = css`
   .key-icon {
     width: 1.75rem;
     height: 1.75rem;
-    border-radius: 0.375rem;
+    border-radius: calc(var(--scion-radius) * 0.75);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -206,7 +206,7 @@ export const resourceStyles = css`
   }
 
   .version-badge-copyable:hover {
-    background: var(--scion-bg-hover, #e2e8f0);
+    background: var(--scion-border, #e2e8f0);
   }
 
   /* ── Empty / Loading / Error states ─────────────────────────────────── */

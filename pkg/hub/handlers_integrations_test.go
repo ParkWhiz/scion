@@ -972,14 +972,14 @@ func TestUpdateConfig_NoStoredConfigStoresNewKeys(t *testing.T) {
 		mgr.plugins["discord"] = map[string]string{}
 		mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
 
-		srv := &Server{dbDriver: "postgres"}
+		srv, _, adminCtx := integAdminServer(t, "nsc-pg")
+		srv.dbDriver = "postgres"
 		srv.pluginManager = mgr
 		srv.entClient = client
 
-		admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
 		body := `{"settings":{"guild_id":"12345"}}`
 		req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/integrations/discord/config", strings.NewReader(body))
-		req = req.WithContext(integSessionContext(req.Context(), admin))
+		req = req.WithContext(adminCtx)
 		rr := httptest.NewRecorder()
 		srv.handleAdminIntegrationByName(rr, req)
 		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
@@ -1387,6 +1387,161 @@ func TestUpdateIntegration_BuildError(t *testing.T) {
 	}
 }
 
+func TestUpdateIntegration_PermissionError_ExplicitPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	mgr := newMockIntegrationManager()
+	mgr.plugins["discord"] = map[string]string{}
+	mgr.updateErr = &plugin.PermissionError{
+		Plugin:       "discord",
+		BinaryPath:   "/usr/local/bin/scion-plugin-discord",
+		PluginsDir:   "/var/lib/scion/.scion/plugins",
+		ExplicitPath: true,
+		Err:          os.ErrPermission,
+	}
+
+	srv, admin, ctx := integAdminServer(t, "upd-perm-exp")
+	srv.config.MaintenanceConfig.RepoPath = "/opt/scion-src"
+	srv.pluginManager = mgr
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
+	req = req.WithContext(integSessionContext(ctx, admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	require.Equal(t, http.StatusUnprocessableEntity, rr.Code, rr.Body.String())
+
+	var errResp ErrorResponse
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&errResp))
+	assert.Equal(t, ErrCodeUnprocessable, errResp.Error.Code)
+	assert.Contains(t, errResp.Error.Message, "/usr/local/bin/scion-plugin-discord")
+	guidance, _ := errResp.Error.Details["guidance"].(string)
+	assert.Contains(t, guidance, "server.plugins.broker.discord.path")
+	assert.Contains(t, guidance, "scion server restart")
+	assert.Contains(t, guidance, "Install")
+	assert.Contains(t, guidance, "/var/lib/scion/.scion/plugins/broker")
+	assert.Contains(t, guidance, "mktemp -d")
+	assert.Contains(t, guidance, "sudo install -m 0755")
+	assert.NotContains(t, guidance, "/tmp/scion-plugin-")
+}
+
+func TestUpdateIntegration_ReportsRelocation(t *testing.T) {
+	t.Run("relocated", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		mgr := newMockIntegrationManager()
+		mgr.plugins["discord"] = map[string]string{}
+		mgr.updateResult = plugin.UpdateResult{
+			BinaryPath:   "/var/lib/scion/.scion/plugins/broker/scion-plugin-discord",
+			PreviousPath: "/usr/local/bin/scion-plugin-discord",
+			Relocated:    true,
+		}
+
+		srv, admin, ctx := integAdminServer(t, "upd-reloc")
+		srv.config.MaintenanceConfig.RepoPath = "/opt/scion-src"
+		srv.pluginManager = mgr
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
+		req = req.WithContext(integSessionContext(ctx, admin))
+		rr := httptest.NewRecorder()
+		srv.handleAdminIntegrationByName(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+		var body struct {
+			Status        string   `json:"status"`
+			RelocatedFrom string   `json:"relocated_from"`
+			BinaryPath    string   `json:"binary_path"`
+			Warnings      []string `json:"warnings"`
+		}
+		require.NoError(t, json.NewDecoder(rr.Body).Decode(&body))
+		assert.Equal(t, "ok", body.Status)
+		assert.Equal(t, "/usr/local/bin/scion-plugin-discord", body.RelocatedFrom)
+		assert.Equal(t, "/var/lib/scion/.scion/plugins/broker/scion-plugin-discord", body.BinaryPath)
+		require.Len(t, body.Warnings, 1)
+		assert.Contains(t, body.Warnings[0], "/usr/local/bin/scion-plugin-discord")
+		assert.Contains(t, body.Warnings[0], "/var/lib/scion/.scion/plugins/broker/scion-plugin-discord")
+	})
+
+	t.Run("in_place", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		mgr := newMockIntegrationManager()
+		mgr.plugins["discord"] = map[string]string{}
+		mgr.updateResult = plugin.UpdateResult{
+			BinaryPath: "/var/lib/scion/.scion/plugins/broker/scion-plugin-discord",
+			Relocated:  false,
+		}
+
+		srv, admin, ctx := integAdminServer(t, "upd-inplace")
+		srv.config.MaintenanceConfig.RepoPath = "/opt/scion-src"
+		srv.pluginManager = mgr
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
+		req = req.WithContext(integSessionContext(ctx, admin))
+		rr := httptest.NewRecorder()
+		srv.handleAdminIntegrationByName(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+		var body map[string]interface{}
+		require.NoError(t, json.NewDecoder(rr.Body).Decode(&body))
+		assert.Equal(t, "ok", body["status"])
+		assert.NotContains(t, body, "relocated_from")
+		assert.NotContains(t, body, "warnings")
+	})
+}
+
+func TestUpdateIntegration_PermissionError_PluginsDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	mgr := newMockIntegrationManager()
+	mgr.plugins["discord"] = map[string]string{}
+	mgr.updateErr = &plugin.PermissionError{
+		Plugin:       "discord",
+		BinaryPath:   "/var/lib/scion/.scion/plugins/broker/scion-plugin-discord",
+		ExplicitPath: false,
+		Err:          os.ErrPermission,
+	}
+
+	srv, admin, ctx := integAdminServer(t, "upd-perm-dir")
+	srv.config.MaintenanceConfig.RepoPath = "/opt/scion-src"
+	srv.pluginManager = mgr
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
+	req = req.WithContext(integSessionContext(ctx, admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	require.Equal(t, http.StatusUnprocessableEntity, rr.Code, rr.Body.String())
+
+	var errResp ErrorResponse
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&errResp))
+	assert.Equal(t, ErrCodeUnprocessable, errResp.Error.Code)
+	assert.Contains(t, errResp.Error.Message, "/var/lib/scion/.scion/plugins/broker")
+	guidance, _ := errResp.Error.Details["guidance"].(string)
+	assert.Contains(t, guidance, "sudo install -d -m 0755")
+}
+
+func TestInstallIntegration_OnPathDoesNotPinExplicitPath(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	binDir := t.TempDir()
+	fakeBin := filepath.Join(binDir, "scion-plugin-discord")
+	require.NoError(t, os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mgr := newMockIntegrationManager()
+	srv, admin, ctx := integAdminServer(t, "inst-path-nopin")
+	srv.pluginManager = mgr
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/install", nil)
+	req = req.WithContext(integSessionContext(ctx, admin))
+	rr := httptest.NewRecorder()
+	srv.handleAdminIntegrationByName(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.Len(t, mgr.loadOneEntries, 1)
+	assert.Empty(t, mgr.loadOneEntries[0].Path, "PATH-discovered install must not set an explicit Path in memory when settings.yaml omits path")
+}
+
 // --- Install endpoint ---
 
 func TestInstallIntegration_NilPluginManager(t *testing.T) {
@@ -1648,13 +1803,13 @@ func TestUpdateIntegration_HA_Accepted(t *testing.T) {
 	mgr.plugins["discord"] = map[string]string{}
 	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
 
-	srv := &Server{dbDriver: "postgres"}
+	srv, admin, ctx := integAdminServer(t, "ha-accepted")
+	srv.dbDriver = "postgres"
 	srv.pluginManager = mgr
 	srv.entClient = client
 
-	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
-	req = req.WithContext(integSessionContext(req.Context(), admin))
+	req = req.WithContext(ctx)
 	rr := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(rr, req)
 
@@ -1686,8 +1841,8 @@ func TestUpdateIntegration_HA_Accepted(t *testing.T) {
 	if string(row.State) != "requested" {
 		t.Errorf("expected state requested, got %s", row.State)
 	}
-	if row.RequestedBy != "u1" {
-		t.Errorf("expected requested_by u1, got %s", row.RequestedBy)
+	if row.RequestedBy != admin.ID() {
+		t.Errorf("expected requested_by %s, got %s", admin.ID(), row.RequestedBy)
 	}
 }
 
@@ -1701,15 +1856,14 @@ func TestGetUpdateStatus_ByID(t *testing.T) {
 	mgr.plugins["discord"] = map[string]string{}
 	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
 
-	srv := &Server{dbDriver: "postgres"}
+	srv, _, ctx := integAdminServer(t, "upd-byid")
+	srv.dbDriver = "postgres"
 	srv.pluginManager = mgr
 	srv.entClient = client
 
-	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
-
 	// First create an update via the HA flow
 	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
-	createReq = createReq.WithContext(integSessionContext(createReq.Context(), admin))
+	createReq = createReq.WithContext(ctx)
 	createRR := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(createRR, createReq)
 
@@ -1725,7 +1879,7 @@ func TestGetUpdateStatus_ByID(t *testing.T) {
 
 	// Now GET the update status by ID
 	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/integrations/discord/update/"+updateID, nil)
-	getReq = getReq.WithContext(integSessionContext(getReq.Context(), admin))
+	getReq = getReq.WithContext(ctx)
 	getRR := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(getRR, getReq)
 
@@ -1758,15 +1912,14 @@ func TestGetUpdateStatus_Latest(t *testing.T) {
 	mgr.plugins["discord"] = map[string]string{}
 	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
 
-	srv := &Server{dbDriver: "postgres"}
+	srv, _, ctx := integAdminServer(t, "upd-latest")
+	srv.dbDriver = "postgres"
 	srv.pluginManager = mgr
 	srv.entClient = client
 
-	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
-
 	// Create first update, then mark it completed so the 409 guard allows a second.
 	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
-	req1 = req1.WithContext(integSessionContext(req1.Context(), admin))
+	req1 = req1.WithContext(ctx)
 	rr1 := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(rr1, req1)
 	if rr1.Code != http.StatusAccepted {
@@ -1783,7 +1936,7 @@ func TestGetUpdateStatus_Latest(t *testing.T) {
 
 	// Create second update.
 	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
-	req2 = req2.WithContext(integSessionContext(req2.Context(), admin))
+	req2 = req2.WithContext(ctx)
 	rr2 := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(rr2, req2)
 	if rr2.Code != http.StatusAccepted {
@@ -1791,7 +1944,7 @@ func TestGetUpdateStatus_Latest(t *testing.T) {
 	}
 
 	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/integrations/discord/update/latest", nil)
-	getReq = getReq.WithContext(integSessionContext(getReq.Context(), admin))
+	getReq = getReq.WithContext(ctx)
 	getRR := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(getRR, getReq)
 
@@ -1880,20 +2033,21 @@ func TestUpdateConfig_HA_Integration(t *testing.T) {
 	if !enttest.Active() {
 		t.Skip("requires Postgres backend; set SCION_TEST_POSTGRES_URL and build with -tags integration")
 	}
+	t.Setenv("HOME", t.TempDir())
 	client := enttest.NewClient(t)
 
 	mgr := newMockIntegrationManager()
 	mgr.plugins["discord"] = map[string]string{}
 	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
 
-	srv := &Server{dbDriver: "postgres"}
+	srv, _, ctx := integAdminServer(t, "conf-ha")
+	srv.dbDriver = "postgres"
 	srv.pluginManager = mgr
 	srv.entClient = client
 
-	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
 	body := `{"settings":{"guild_id":"12345","application_id":"67890"}}`
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/integrations/discord/config", strings.NewReader(body))
-	req = req.WithContext(integSessionContext(req.Context(), admin))
+	req = req.WithContext(ctx)
 	rr := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(rr, req)
 
@@ -1960,15 +2114,14 @@ func TestGetUpdateStatus_CrossIntegrationRejected(t *testing.T) {
 	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
 	mgr.deploymentModes["telegram"] = plugin.DeploymentModeHA
 
-	srv := &Server{dbDriver: "postgres"}
+	srv, _, ctx := integAdminServer(t, "upd-cross")
+	srv.dbDriver = "postgres"
 	srv.pluginManager = mgr
 	srv.entClient = client
 
-	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
-
 	// Create an update for discord
 	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/integrations/discord/update", nil)
-	createReq = createReq.WithContext(integSessionContext(createReq.Context(), admin))
+	createReq = createReq.WithContext(ctx)
 	createRR := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(createRR, createReq)
 
@@ -1984,7 +2137,7 @@ func TestGetUpdateStatus_CrossIntegrationRejected(t *testing.T) {
 
 	// Try to GET that discord update via the telegram endpoint — should 404
 	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/integrations/telegram/update/"+discordUpdateID, nil)
-	getReq = getReq.WithContext(integSessionContext(getReq.Context(), admin))
+	getReq = getReq.WithContext(ctx)
 	getRR := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(getRR, getReq)
 
@@ -1997,20 +2150,21 @@ func TestUpdateConfig_HA_SetsUpdatedBy(t *testing.T) {
 	if !enttest.Active() {
 		t.Skip("requires Postgres backend; set SCION_TEST_POSTGRES_URL and build with -tags integration")
 	}
+	t.Setenv("HOME", t.TempDir())
 	client := enttest.NewClient(t)
 
 	mgr := newMockIntegrationManager()
 	mgr.plugins["discord"] = map[string]string{}
 	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
 
-	srv := &Server{dbDriver: "postgres"}
+	srv, admin, ctx := integAdminServer(t, "conf-ha-updby")
+	srv.dbDriver = "postgres"
 	srv.pluginManager = mgr
 	srv.entClient = client
 
-	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
 	body := `{"settings":{"guild_id":"99999"}}`
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/integrations/discord/config", strings.NewReader(body))
-	req = req.WithContext(integSessionContext(req.Context(), admin))
+	req = req.WithContext(ctx)
 	rr := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(rr, req)
 
@@ -2025,8 +2179,8 @@ func TestUpdateConfig_HA_SetsUpdatedBy(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
-	if rows[0].UpdatedBy != "u1" {
-		t.Errorf("expected updated_by u1, got %q", rows[0].UpdatedBy)
+	if rows[0].UpdatedBy != admin.ID() {
+		t.Errorf("expected updated_by %s, got %q", admin.ID(), rows[0].UpdatedBy)
 	}
 }
 
@@ -2130,20 +2284,21 @@ func TestUpdateConfig_HA_SkipsReconfigure(t *testing.T) {
 	if !enttest.Active() {
 		t.Skip("requires Postgres backend; set SCION_TEST_POSTGRES_URL and build with -tags integration")
 	}
+	t.Setenv("HOME", t.TempDir())
 	client := enttest.NewClient(t)
 
 	mgr := newMockIntegrationManager()
 	mgr.plugins["discord"] = map[string]string{}
 	mgr.deploymentModes["discord"] = plugin.DeploymentModeHA
 
-	srv := &Server{dbDriver: "postgres"}
+	srv, _, ctx := integAdminServer(t, "conf-ha-skip")
+	srv.dbDriver = "postgres"
 	srv.pluginManager = mgr
 	srv.entClient = client
 
-	admin := NewAuthenticatedUser("u1", "admin@example.com", "Admin", "admin", "cli")
 	body := `{"settings":{"guild_id":"12345"}}`
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/integrations/discord/config", strings.NewReader(body))
-	req = req.WithContext(integSessionContext(req.Context(), admin))
+	req = req.WithContext(ctx)
 	rr := httptest.NewRecorder()
 	srv.handleAdminIntegrationByName(rr, req)
 
@@ -2849,6 +3004,44 @@ func TestResolveIntegrationMergedConfig_TransportKeysComeFromHub(t *testing.T) {
 	merged = srv.resolveIntegrationMergedConfig(context.Background(), mgr, "discord")
 	assert.Equal(t, "iap", merged["transport_mode"])
 	assert.Equal(t, "/projects/1/global/backendServices/2", merged["transport_audience"])
+}
+
+func TestResolveIntegrationMergedConfig_NoConfigFileDropsStaleHubKeys(t *testing.T) {
+	mgr := newMockIntegrationManager()
+	mgr.plugins["discord"] = map[string]string{
+		"guild_id":           "inline-guild",
+		"transport_mode":     "stale-mode",
+		"transport_audience": "stale-audience",
+		"database_driver":    "stale-driver",
+		"database_url":       "stale-dsn",
+		"public_url":         "https://stale.example.com",
+		"plugin_name":        "stale-plugin",
+	}
+	srv, _ := testServer(t)
+
+	// No config file and empty live hub values: non-hub inline keys survive,
+	// stale hub-supplied keys are dropped rather than carried over from cache.
+	merged := srv.resolveIntegrationMergedConfig(context.Background(), mgr, "discord")
+	assert.Equal(t, "inline-guild", merged["guild_id"])
+	assert.NotContains(t, merged, "transport_mode")
+	assert.NotContains(t, merged, "transport_audience")
+	assert.NotContains(t, merged, "database_driver")
+	assert.NotContains(t, merged, "database_url")
+	assert.NotContains(t, merged, "public_url")
+	assert.Equal(t, "discord", merged["plugin_name"])
+	// Verify the manager's cached map was not mutated in place.
+	assert.Equal(t, "stale-mode", mgr.plugins["discord"]["transport_mode"])
+
+	// Live hub values are still applied when non-empty.
+	srv.transportMode = "iap"
+	srv.transportAudience = "/projects/1/global/backendServices/2"
+	merged = srv.resolveIntegrationMergedConfig(context.Background(), mgr, "discord")
+	assert.Equal(t, "inline-guild", merged["guild_id"])
+	assert.Equal(t, "iap", merged["transport_mode"])
+	assert.Equal(t, "/projects/1/global/backendServices/2", merged["transport_audience"])
+	assert.NotContains(t, merged, "database_driver")
+	assert.NotContains(t, merged, "database_url")
+	assert.NotContains(t, merged, "public_url")
 }
 
 // replayFailingBus is an EventBus whose Subscribe fails.

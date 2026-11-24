@@ -426,6 +426,15 @@ func SSHSessionEnv(cfg Config, base []string) ([]string, error) {
 	return childEnv(cfg, base, false, false)
 }
 
+// HarnessShellEnv is the environment of a scheduled exec run (the exec
+// control routes): exactly the harness child's (ChildEnv, secret overrides
+// included), so a scheduled command sees what a command typed in the
+// harness's tmux session sees. It runs for every run, so it writes none
+// of ChildEnv's debug lines.
+func HarnessShellEnv(cfg Config, base []string) ([]string, error) {
+	return childEnv(cfg, base, true, false)
+}
+
 // childEnv is ChildEnv, applying the secret overrides only when
 // applySecrets is set and writing its debug lines only when logSteps is
 // set.
@@ -640,10 +649,10 @@ func chownRecursive(root string, uid, gid int, requirePrivilegeDrop bool) error 
 
 // logChownEntryError logs one per-entry failure from chownRecursive's walk.
 // A hard-link-guard skip is a warning. EROFS is logged at debug only: the
-// home directory may hold a mount that is read-only by design (the Cloud Run
-// runtime mounts the agent secrets read-only at ~/.scion/secrets), so its
-// chown is expected to fail and is not an error (ptone/scion#7104). Every
-// other failure stays an error.
+// home directory may hold a mount that is read-only by design (for example a
+// read-only volume mounted inside the home directory), so its chown is
+// expected to fail and is not an error (ptone/scion#7104). Every other
+// failure stays an error.
 func logChownEntryError(name string, cerr error) {
 	switch {
 	case errors.Is(cerr, dirfd.ErrHardlinkedRegularFile):

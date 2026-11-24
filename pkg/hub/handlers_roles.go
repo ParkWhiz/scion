@@ -615,6 +615,35 @@ func (s *Server) updateRoleDefinition(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
+	// Guard against adding unsupported catalog permissions to a custom
+	// system-scope role that is currently configured as server.auth.default_user_role
+	// or still held by users via SystemDefaultRoleCreatedBy bindings
+	// (ptone/scion#8288, ptone/scion#7779). Compare against the configured
+	// custom role name (skipping built-in member/viewer so an unrelated custom
+	// role sharing a reserved name is unaffected) and check both existing.Name
+	// and req.Name so renaming an ineligible role onto the active name is also
+	// rejected. Checking existing sentinel bindings keeps the guard active even
+	// after a role is renamed away or default_user_role is changed to another role.
+	if existing.ScopeType == store.RoleScopeSystem {
+		if bad := unsupportedPermissionsForDefaultUserRole(req.Permissions); len(bad) > 0 {
+			if activeDefault := s.configuredCustomDefaultUserRole(); s.experimentEnabled(experiments.CustomDefaultUserRole) &&
+				activeDefault != "" &&
+				(existing.Name == activeDefault || req.Name == activeDefault) {
+				BadRequest(w, fmt.Sprintf("cannot add permissions %s to role %q while it is configured as server.auth.default_user_role", strings.Join(bad, ", "), activeDefault))
+				return
+			}
+			hasHolders, err := roleHasSystemDefaultRoleBindings(r.Context(), s.store, existing.ID)
+			if err != nil {
+				writeErrorFromErr(w, err, "")
+				return
+			}
+			if hasHolders {
+				BadRequest(w, fmt.Sprintf("cannot add permissions %s to role %q while users hold it as a default user role", strings.Join(bad, ", "), existing.Name))
+				return
+			}
+		}
+	}
+
 	// CanDelegate check: actor must hold all permissions in the updated role.
 	if s.authzService != nil {
 		decision := s.authzService.CanDelegate(r.Context(), user, GrantDescriptor{
@@ -1338,25 +1367,17 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 	// role_binding.create.
 	principalIsMembersGroup := false
 
-	// Verify group exists for group principals.
+	// Verify group exists and is visible to the caller for group principals.
 	// Try UUID first, fall back to slug lookup (mirrors email→UUID for users).
 	if req.PrincipalType == store.RoleBindingPrincipalGroup {
-		g, err := s.store.GetGroup(r.Context(), req.PrincipalID)
+		g, err := s.resolveVisibleGroupByIDOrSlug(r.Context(), user, req.PrincipalID)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
-				g, err = s.store.GetGroupBySlug(r.Context(), req.PrincipalID)
-				if err != nil {
-					if errors.Is(err, store.ErrNotFound) {
-						BadRequest(w, "group not found: "+req.PrincipalID)
-					} else {
-						writeErrorFromErr(w, err, "")
-					}
-					return
-				}
+				BadRequest(w, "group not found: "+req.PrincipalID)
 			} else {
 				writeErrorFromErr(w, err, "")
-				return
 			}
+			return
 		}
 		req.PrincipalID = g.ID
 		principalIsMembersGroup = store.IsProjectMembersGroup(g)
@@ -1541,6 +1562,9 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 	// The binding and its audit record commit or roll back together.
 	var created *store.RoleBinding
 	err := s.store.WithTx(r.Context(), func(tx store.Store) error {
+		if err := rejectInvitedHubRoleBinding(r.Context(), tx, rb); err != nil {
+			return err
+		}
 		c, err := tx.CreateRoleBinding(r.Context(), rb)
 		if err != nil {
 			return err
@@ -1556,6 +1580,10 @@ func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user 
 		})
 	})
 	if err != nil {
+		if errors.Is(err, errHubRoleOnInvitedUser) {
+			Conflict(w, errHubRoleOnInvitedUser.Error())
+			return
+		}
 		if errors.Is(err, store.ErrAlreadyExists) {
 			Conflict(w, "this role binding already exists")
 			return

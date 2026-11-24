@@ -110,7 +110,14 @@ func TestAdvisoryLockKeys_NonOverlapping(t *testing.T) {
 		LockTestIdentityReaper,
 		LockAgentDelegatedCredentialPurge,
 		LockChatRetention,
+		LockInvitedHubRoleGuard,
 		LockPendingSecretExpiry,
+		LockSecretRequestExpiry,
+		LockScheduledExecRunSweep,
+		LockScheduledExecPollClaim,
+		LockAgentIdleSuspend,
+		LockNFSOrphanScan,
+		LockAuditRecordCleanup,
 	}
 
 	seen := make(map[AdvisoryLockKey]bool, len(singletonKeys)+2)
@@ -125,6 +132,10 @@ func TestAdvisoryLockKeys_NonOverlapping(t *testing.T) {
 	classIDs := []AdvisoryLockKey{
 		LockQuotaEnforcement,
 		LockPendingSecretOwnerWrite,
+		LockScheduledEventQuota,
+		LockScheduledExecOverlap,
+		LockTriggerQuota,
+		LockTriggerSubjectOverlap,
 		testLockClassID,
 	}
 	for _, k := range classIDs {
@@ -212,9 +223,20 @@ func TestAdvisoryLockKeys_AllUnique(t *testing.T) {
 		{"LockTestIdentityReaper", LockTestIdentityReaper},
 		{"LockAgentDelegatedCredentialPurge", LockAgentDelegatedCredentialPurge},
 		{"LockChatRetention", LockChatRetention},
+		{"LockInvitedHubRoleGuard", LockInvitedHubRoleGuard},
 		{"LockHubSettingsGuardedBatch", LockHubSettingsGuardedBatch},
 		{"LockPendingSecretExpiry", LockPendingSecretExpiry},
+		{"LockSecretRequestExpiry", LockSecretRequestExpiry},
+		{"LockScheduledExecRunSweep", LockScheduledExecRunSweep},
+		{"LockScheduledExecPollClaim", LockScheduledExecPollClaim},
+		{"LockAgentIdleSuspend", LockAgentIdleSuspend},
+		{"LockNFSOrphanScan", LockNFSOrphanScan},
+		{"LockAuditRecordCleanup", LockAuditRecordCleanup},
 		{"LockPendingSecretOwnerWrite", LockPendingSecretOwnerWrite},
+		{"LockScheduledEventQuota", LockScheduledEventQuota},
+		{"LockScheduledExecOverlap", LockScheduledExecOverlap},
+		{"LockTriggerQuota", LockTriggerQuota},
+		{"LockTriggerSubjectOverlap", LockTriggerSubjectOverlap},
 	}
 
 	// --- Check 1: value uniqueness ---

@@ -28,11 +28,10 @@ import (
 
 // CreateScheduleRequest is the API request for creating a recurring schedule.
 //
-// NOTE (O-R2-3): This struct has no AgentID field — message targets are
-// specified via AgentName (convenience) or raw Payload (advanced). The
-// authoring-time validation in authorizeScheduledMessageAuthoring resolves
-// the target from whichever is present. If an AgentID field is added in the
-// future, the authoring call must be updated to forward it.
+// NOTE (O-R2-3): Message targets are specified via AgentName (convenience) or
+// raw Payload (advanced). AgentID, Command, and TimeoutSeconds are convenience
+// fields for "exec" schedules only (ptone/scion#7884) and are rejected on
+// non-exec schedules.
 type CreateScheduleRequest struct {
 	Name      string `json:"name"`
 	CronExpr  string `json:"cronExpr"`
@@ -51,6 +50,13 @@ type CreateScheduleRequest struct {
 	Template string `json:"template,omitempty"`
 	Task     string `json:"task,omitempty"`
 	Branch   string `json:"branch,omitempty"`
+	NoAuth   bool   `json:"noAuth,omitempty"`
+
+	// Convenience fields for "exec" events (ptone/scion#7884)
+	AgentID        string   `json:"agentId,omitempty"`
+	Command        []string `json:"command,omitempty"`
+	TimeoutSeconds int      `json:"timeoutSeconds,omitempty"`
+	CaptureOutput  string   `json:"captureOutput,omitempty"`
 }
 
 // UpdateScheduleRequest is the API request for updating a recurring schedule.
@@ -63,14 +69,26 @@ type UpdateScheduleRequest struct {
 	EventType string  `json:"eventType,omitempty"`
 	Payload   string  `json:"payload,omitempty"`
 	Status    string  `json:"status,omitempty"`
+
+	// Convenience fields for "exec" schedules (ptone/scion#7884).
+	AgentID        string   `json:"agentId,omitempty"`
+	AgentName      string   `json:"agentName,omitempty"`
+	Command        []string `json:"command,omitempty"`
+	TimeoutSeconds *int     `json:"timeoutSeconds,omitempty"`
+	CaptureOutput  *string  `json:"captureOutput,omitempty"`
 }
+
+// ScheduleListScopeCaller indicates that a list response is filtered to rows
+// held by the calling principal (an agent caller).
+const ScheduleListScopeCaller = "caller"
 
 // ListSchedulesResponse is the API response for listing schedules.
 type ListSchedulesResponse struct {
-	Schedules  []store.Schedule `json:"schedules"`
-	NextCursor string           `json:"nextCursor,omitempty"`
-	TotalCount int              `json:"totalCount,omitempty"`
-	ServerTime time.Time        `json:"serverTime"`
+	Scope      string             `json:"scope,omitempty"`
+	Schedules  []ScheduleResponse `json:"schedules"`
+	NextCursor string             `json:"nextCursor,omitempty"`
+	TotalCount int                `json:"totalCount,omitempty"`
+	ServerTime time.Time          `json:"serverTime"`
 }
 
 // handleSchedules routes requests under /api/v1/projects/{projectId}/schedules[/{id}[/{action}]]
@@ -159,8 +177,30 @@ func (s *Server) handleSchedules(w http.ResponseWriter, r *http.Request, project
 		return
 	}
 
+	// Pause and delete only stop future runs: when the project-level gate
+	// refuses them, the user who created the schedule may still do them
+	// (scheduleCreatorMayStop). The gate is decided once either way;
+	// everything else, and every other caller, gets the gate alone.
+	stopOnly := schedulePath != "" &&
+		(((len(pathParts) == 1 || pathParts[1] == "") && r.Method == http.MethodDelete) ||
+			(len(pathParts) > 1 && pathParts[1] == "pause"))
+	var creatorStop func() bool
+	// creatorRevision is set when the creator path allowed the request: the
+	// authorization revision it checked, which the handler compares with the
+	// row it reloads.
+	var creatorRevision *int
+	if stopOnly {
+		creatorStop = func() bool {
+			rev, ok := s.scheduleCreatorMayStop(r, projectID, pathParts[0])
+			if ok {
+				creatorRevision = &rev
+			}
+			return ok
+		}
+	}
+
 	// Authorize access — fail closed for all identity types.
-	if !s.authorizeScheduledEventAccess(w, r, projectID, authzAction) {
+	if !s.authorizeScheduledEventRowOr(w, r, projectID, authzAction, nil, creatorStop) {
 		return
 	}
 
@@ -191,10 +231,10 @@ func (s *Server) handleSchedules(w http.ResponseWriter, r *http.Request, project
 		case http.MethodPatch:
 			s.updateSchedule(w, r, projectID, scheduleID)
 		case http.MethodDelete:
-			s.deleteSchedule(w, r, projectID, scheduleID)
+			s.deleteSchedule(w, r, projectID, scheduleID, creatorRevision)
 		}
 	case "pause":
-		s.pauseSchedule(w, r, projectID, scheduleID)
+		s.pauseSchedule(w, r, projectID, scheduleID, creatorRevision)
 	case "resume":
 		s.resumeSchedule(w, r, projectID, scheduleID)
 	case "history":
@@ -205,6 +245,7 @@ func (s *Server) handleSchedules(w http.ResponseWriter, r *http.Request, project
 // createSchedule handles POST /api/v1/projects/{projectId}/schedules
 func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectID string) {
 	var req CreateScheduleRequest
+	r.Body = http.MaxBytesReader(w, r.Body, scheduleRequestBodyLimit)
 	if err := readJSON(r, &req); err != nil {
 		BadRequest(w, "Invalid request body: "+err.Error())
 		return
@@ -223,12 +264,28 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 		ValidationError(w, "eventType is required", nil)
 		return
 	}
-	if req.EventType != "message" && req.EventType != "dispatch_agent" {
-		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", req.EventType), nil)
+	if !s.scheduledEventTypeSupported(req.EventType) {
+		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: %s)", req.EventType, s.supportedScheduledEventTypes()), nil)
+		return
+	}
+	if req.NoAuth && req.EventType != "dispatch_agent" {
+		ValidationError(w, "noAuth applies to dispatch_agent events only", nil)
+		return
+	}
+	if req.EventType == scheduledEventTypeExec {
+		s.createExecSchedule(w, r, projectID, &req)
+		return
+	}
+	if req.AgentID != "" || req.Command != nil || req.TimeoutSeconds != 0 || req.CaptureOutput != "" {
+		ValidationError(w, "agentId, command, timeoutSeconds and captureOutput apply to exec schedules only", nil)
 		return
 	}
 	if req.Wake && req.EventType != "message" {
 		ValidationError(w, "wake applies to message events only", nil)
+		return
+	}
+	if req.NoAuth && req.Payload != "" {
+		ValidationError(w, "give either payload or noAuth, not both", nil)
 		return
 	}
 	// Recurring schedules accept (ptone/scion#2200)
@@ -248,17 +305,13 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 			return
 		}
 	}
-	// C1 containment: validate target agent project scope for message schedules.
-	if req.EventType == "message" {
-		if !s.authorizeScheduledMessageAuthoring(w, r, projectID, req.Payload, "", req.AgentName) {
-			return
-		}
-	}
-
 	// Validate the cron expression (standard 5-field, no zone prefix) and
 	// the time zone it is evaluated in (empty means UTC).
 	if _, err := parseScheduleCron(req.CronExpr); err != nil {
 		writeCronParseError(w, err)
+		return
+	}
+	if !s.checkScheduleFrequency(w, req.CronExpr) {
 		return
 	}
 	timeZone, err := normalizeScheduleTimeZone(req.TimeZone)
@@ -283,6 +336,7 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 			Template:  req.Template,
 			Task:      req.Task,
 			Branch:    req.Branch,
+			NoAuth:    req.NoAuth,
 		}
 		payloadBytes, marshalErr := json.Marshal(p)
 		if marshalErr != nil {
@@ -312,6 +366,13 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 			return
 		}
 		payload = string(payloadBytes)
+	}
+	// C1 containment: validate target agent resolution and authorization for
+	// message schedules.
+	if req.EventType == "message" {
+		if !s.authorizeScheduledMessageAuthoring(w, r, projectID, req.Payload, "", req.AgentName) {
+			return
+		}
 	}
 
 	// The revision's frozen ceiling is computed before any write.
@@ -360,7 +421,19 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 		return
 	}
 
-	if err := s.store.CreateSchedule(r.Context(), &schedule); err != nil {
+	// The per-project recurring schedule cap is checked in the same
+	// transaction as the insert, under the per-project quota lock.
+	maxActive := s.config.ScheduleMaxActivePerProject
+	if err := s.store.CreateScheduleChecked(r.Context(), &schedule, 1, func(snap store.ScheduledExecQuotaSnapshot) error {
+		return scheduleQuotaCheck(snap, maxActive)
+	}); err != nil {
+		if writeScheduleQuotaError(w, err) {
+			return
+		}
+		if errors.Is(err, store.ErrAlreadyExists) {
+			writeScheduleNameConflict(w, r, req.Name)
+			return
+		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
@@ -368,21 +441,70 @@ func (s *Server) createSchedule(w http.ResponseWriter, r *http.Request, projectI
 	// Fetch the created schedule to get the full record
 	created, err := s.store.GetSchedule(r.Context(), schedule.ID)
 	if err != nil {
-		writeJSON(w, http.StatusCreated, schedule)
+		writeJSON(w, http.StatusCreated, scheduleResponse(s.newExecRevealer(r.Context()), schedule))
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, created)
+	writeJSON(w, http.StatusCreated, scheduleResponse(s.newExecRevealer(r.Context()), *created))
+}
+
+// writeScheduleNameConflict writes the 409 Conflict response when creating or
+// renaming a recurring schedule collides with an existing (project_id, name).
+// The message interpolates only the caller's requested name and never loads or
+// discloses any field of the conflicting row (ID, holder, cron, status, or
+// payload).
+func writeScheduleNameConflict(w http.ResponseWriter, r *http.Request, name string) {
+	if isAgentCaller(r.Context()) {
+		Conflict(w, fmt.Sprintf(
+			"Schedule %q already exists in this project; if it does not appear in 'scion schedule list', it is held by another principal and not visible to this agent",
+			name))
+		return
+	}
+	Conflict(w, fmt.Sprintf("Schedule %q already exists in this project", name))
+}
+
+// writeScheduleNotFound writes the per-ID 404 response for schedules. Both
+// missing IDs (including non-UUID names) and cross-project IDs go through this
+// helper so the two cases return the exact same body.
+func writeScheduleNotFound(w http.ResponseWriter, r *http.Request) {
+	if isAgentCaller(r.Context()) {
+		writeError(w, http.StatusNotFound, ErrCodeNotFound,
+			"Schedule not found (per-ID schedule endpoints take a schedule ID, not a name; schedules held by another agent or user are hidden from agent lists and return 403 by ID)", nil)
+		return
+	}
+	NotFound(w, "Schedule")
+}
+
+func (s *Server) loadScheduleForProject(w http.ResponseWriter, r *http.Request, projectID, scheduleID string) (*store.Schedule, bool) {
+	schedule, err := s.store.GetSchedule(r.Context(), scheduleID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeScheduleNotFound(w, r)
+			return nil, false
+		}
+		writeErrorFromErr(w, err, "")
+		return nil, false
+	}
+	if schedule.ProjectID != projectID {
+		writeScheduleNotFound(w, r)
+		return nil, false
+	}
+	return schedule, true
 }
 
 // listSchedules handles GET /api/v1/projects/{projectId}/schedules
 func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request, projectID string) {
 	query := r.URL.Query()
+	scope := scheduleListScope(r.Context())
 
 	// An agent caller lists only the schedules it holds.
 	agentID, ok := agentListFilter(r.Context())
 	if !ok {
-		writeJSON(w, http.StatusOK, ListSchedulesResponse{Schedules: []store.Schedule{}, ServerTime: time.Now().UTC()})
+		writeJSON(w, http.StatusOK, ListSchedulesResponse{
+			Scope:      scope,
+			Schedules:  []ScheduleResponse{},
+			ServerTime: time.Now().UTC(),
+		})
 		return
 	}
 	filter := store.ScheduleFilter{
@@ -400,7 +522,8 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request, projectID
 
 	schedules, totalCount := visibleScheduledRows(r.Context(), s, projectID, result.Items, result.TotalCount, scheduleRow)
 	writeJSON(w, http.StatusOK, ListSchedulesResponse{
-		Schedules:  schedules,
+		Scope:      scope,
+		Schedules:  scheduleResponses(s.newExecRevealer(r.Context()), schedules),
 		NextCursor: result.NextCursor,
 		TotalCount: totalCount,
 		ServerTime: time.Now().UTC(),
@@ -409,32 +532,21 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request, projectID
 
 // getSchedule handles GET /api/v1/projects/{projectId}/schedules/{id}
 func (s *Server) getSchedule(w http.ResponseWriter, r *http.Request, projectID, scheduleID string) {
-	schedule, err := s.store.GetSchedule(r.Context(), scheduleID)
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
-	}
-
-	if schedule.ProjectID != projectID {
-		NotFound(w, "Schedule")
+	schedule, ok := s.loadScheduleForProject(w, r, projectID, scheduleID)
+	if !ok {
 		return
 	}
 	if !s.authorizeScheduledEventRow(w, r, projectID, ActionRead, scheduleRow(schedule)) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, schedule)
+	writeJSON(w, http.StatusOK, scheduleResponse(s.newExecRevealer(r.Context()), *schedule))
 }
 
 // updateSchedule handles PATCH /api/v1/projects/{projectId}/schedules/{id}
 func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectID, scheduleID string) {
-	schedule, err := s.store.GetSchedule(r.Context(), scheduleID)
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
-	}
-	if schedule.ProjectID != projectID {
-		NotFound(w, "Schedule")
+	schedule, ok := s.loadScheduleForProject(w, r, projectID, scheduleID)
+	if !ok {
 		return
 	}
 	if !s.authorizeScheduledEventRow(w, r, projectID, ActionUpdate, scheduleEditRow(schedule)) {
@@ -447,12 +559,13 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectI
 	originalPayload := schedule.Payload
 
 	var req UpdateScheduleRequest
+	r.Body = http.MaxBytesReader(w, r.Body, scheduleRequestBodyLimit)
 	if err := readJSON(r, &req); err != nil {
 		BadRequest(w, "Invalid request body: "+err.Error())
 		return
 	}
-	if req.EventType != "" && req.EventType != "message" && req.EventType != "dispatch_agent" {
-		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", req.EventType), nil)
+	if req.EventType != "" && !s.scheduledEventTypeSupported(req.EventType) {
+		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: %s)", req.EventType, s.supportedScheduledEventTypes()), nil)
 		return
 	}
 	// effectiveEventType is computed here, ahead of the payload
@@ -464,8 +577,22 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectI
 	if req.EventType != "" {
 		effectiveEventType = req.EventType
 	}
+	hasExecFields := req.AgentID != "" || req.AgentName != "" || req.Command != nil || req.TimeoutSeconds != nil || req.CaptureOutput != nil
+	isExecRow := originalEventType == scheduledEventTypeExec || effectiveEventType == scheduledEventTypeExec
+	if isExecRow && !s.execSchedulesEnabled() {
+		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: %s)", scheduledEventTypeExec, s.supportedScheduledEventTypes()), nil)
+		return
+	}
+	if req.EventType != "" && req.EventType != originalEventType && isExecRow {
+		ValidationError(w, "eventType cannot be changed to or from exec", nil)
+		return
+	}
+	if effectiveEventType != scheduledEventTypeExec && hasExecFields {
+		ValidationError(w, "agentId, agentName, command, timeoutSeconds and captureOutput apply to exec schedules only", nil)
+		return
+	}
 	// Tombstone a caller-supplied
-	// "raw" key in the advanced Payload JSON, for both supported event types
+	// "raw" key in the advanced Payload JSON, for all supported event types
 	// — not just "message". Checked whenever the caller supplies a
 	// replacement Payload in this request: an update that leaves Payload
 	// untouched must not retroactively fail on an existing stored value. A
@@ -476,7 +603,7 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectI
 		if !s.validateAndRejectScheduledPayload(w, r, effectiveEventType, req.Payload) {
 			return
 		}
-	} else if req.EventType != "" && req.EventType != schedule.EventType {
+	} else if req.EventType != "" && req.EventType != schedule.EventType && !hasExecFields {
 		// The caller is switching EventType
 		// without supplying a new Payload, so the existing stored Payload
 		// carries forward unchanged but will be reinterpreted as
@@ -493,25 +620,6 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectI
 			return
 		}
 		if !s.authorizeAgentCreate(w, r, projectID) {
-			return
-		}
-	}
-	// C1 containment: validate target agent project scope when the schedule
-	// is or becomes a message schedule. Check both the effective event type
-	// and the effective payload after the update is applied.
-	if effectiveEventType == "message" {
-		effectivePayload := schedule.Payload
-		if req.Payload != "" {
-			effectivePayload = req.Payload
-		}
-		// A replacement payload that names another target is authored like
-		// a new schedule; an update that keeps the stored target is
-		// re-checked against it.
-		if scheduledPayloadTargetChanged(schedule.Payload, effectivePayload) {
-			if !s.authorizeScheduledMessageAuthoring(w, r, projectID, effectivePayload, "", "") {
-				return
-			}
-		} else if !s.authorizeScheduledMessageReauthoring(w, r, projectID, effectivePayload) {
 			return
 		}
 	}
@@ -617,6 +725,39 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectI
 	// also writes it.
 	changesFutureDispatch := fields.CronExpr || fields.TimeZone || fields.EventType || fields.Payload || enabling
 
+	// C1 containment / ptone/scion#8588: validate message target resolution and
+	// authorization only for dispatch-changing updates (the revision-bump list:
+	// cron, time zone, event type, payload, or re-enabling). Metadata-only
+	// edits (such as name-only PATCH or pausing) stay accepted regardless of
+	// target state.
+	if effectiveEventType == "message" && changesFutureDispatch {
+		if !s.authorizeScheduledMessageAuthoring(w, r, projectID, schedule.Payload, "", "") {
+			return
+		}
+	}
+
+	// Any exec PATCH that supplies payload/exec fields or changes future
+	// dispatch runs full exec authoring (live agent.attach, managed runtime,
+	// rate limit, and active quota) before comparing encoded payload to
+	// originalPayload, so callers without attach get no argv-guessing oracle.
+	var execPayload *scheduledExecPayload
+	if isExecRow && (req.Payload != "" || hasExecFields || changesFutureDispatch) {
+		var encoded string
+		var ok bool
+		execPayload, encoded, ok = s.prepareExecScheduleUpdate(w, r, projectID, schedule, originalEventType, originalPayload, &req, hasExecFields)
+		if !ok {
+			return
+		}
+		if encoded != originalPayload {
+			schedule.Payload = encoded
+			fields.Payload = true
+		} else {
+			schedule.Payload = originalPayload
+			fields.Payload = false
+		}
+		changesFutureDispatch = fields.CronExpr || fields.TimeZone || fields.EventType || fields.Payload || enabling
+	}
+
 	// The write is conditioned on the revision this handler just read,
 	// regardless of whether this particular call replaces attribution: a
 	// stale read must never be able to apply any field once a newer,
@@ -642,31 +783,77 @@ func (s *Server) updateSchedule(w http.ResponseWriter, r *http.Request, projectI
 		attribution = &newAttr
 	}
 
-	if err := s.store.UpdateSchedule(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, attribution); err != nil {
-		if errors.Is(err, store.ErrRevisionConflict) {
+	// A schedule that is (re)armed with a new or re-enabled cron expression
+	// must respect the hub's minimum interval.
+	if (fields.CronExpr || enabling) && schedule.Status == store.ScheduleStatusActive &&
+		!s.checkScheduleFrequency(w, schedule.CronExpr) {
+		return
+	}
+
+	var updateErr error
+	maxActive := s.config.ScheduleMaxActivePerProject
+	if effectiveEventType == scheduledEventTypeExec && schedule.Status == store.ScheduleStatusActive && execPayload != nil {
+		targetID := execPayload.AgentID
+		scheduleID := schedule.ID
+		updateErr = s.store.UpdateScheduleChecked(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, attribution,
+			scheduledExecMaxPerProject+1, func(snap store.ScheduledExecQuotaSnapshot) error {
+				if err := scheduledExecQuotaCheck(snap, targetID, scheduleID); err != nil {
+					return err
+				}
+				if !enabling {
+					return nil
+				}
+				return scheduleQuotaCheck(snap, maxActive)
+			})
+	} else if enabling {
+		// Re-enabling counts against the per-project recurring cap.
+		updateErr = s.store.UpdateScheduleChecked(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, attribution,
+			1, func(snap store.ScheduledExecQuotaSnapshot) error {
+				return scheduleQuotaCheck(snap, maxActive)
+			})
+	} else {
+		updateErr = s.store.UpdateSchedule(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, attribution)
+	}
+	if updateErr != nil {
+		if writeScheduleQuotaError(w, updateErr) {
+			return
+		}
+		if errors.Is(updateErr, store.ErrRevisionConflict) {
 			writeError(w, http.StatusConflict, ErrCodeRevisionConflict,
 				"schedule was concurrently modified; refresh and retry", nil)
 			return
 		}
-		writeErrorFromErr(w, err, "")
+		if errors.Is(updateErr, store.ErrAlreadyExists) {
+			writeScheduleNameConflict(w, r, schedule.Name)
+			return
+		}
+		writeErrorFromErr(w, updateErr, "")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, schedule)
+	if schedule.EventType == scheduledEventTypeExec {
+		s.auditScheduleExecMutation(r.Context(), ScheduledExecAuditUpdate, *schedule)
+	} else if originalEventType == scheduledEventTypeExec {
+		prev := *schedule
+		prev.Payload = originalPayload
+		s.auditScheduleExecMutation(r.Context(), ScheduledExecAuditUpdate, prev)
+	}
+
+	writeJSON(w, http.StatusOK, scheduleResponse(s.newExecRevealer(r.Context()), *schedule))
 }
 
-// deleteSchedule handles DELETE /api/v1/projects/{projectId}/schedules/{id}
-func (s *Server) deleteSchedule(w http.ResponseWriter, r *http.Request, projectID, scheduleID string) {
-	schedule, err := s.store.GetSchedule(r.Context(), scheduleID)
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
-	}
-	if schedule.ProjectID != projectID {
-		NotFound(w, "Schedule")
+// deleteSchedule handles DELETE /api/v1/projects/{projectId}/schedules/{id}.
+// creatorRevision is non-nil when the creator path allowed it (see
+// creatorStopCurrent).
+func (s *Server) deleteSchedule(w http.ResponseWriter, r *http.Request, projectID, scheduleID string, creatorRevision *int) {
+	schedule, ok := s.loadScheduleForProject(w, r, projectID, scheduleID)
+	if !ok {
 		return
 	}
 	if !s.authorizeScheduledEventRow(w, r, projectID, ActionDelete, scheduleRow(schedule)) {
+		return
+	}
+	if !creatorStopCurrent(w, schedule, creatorRevision) {
 		return
 	}
 
@@ -675,30 +862,42 @@ func (s *Server) deleteSchedule(w http.ResponseWriter, r *http.Request, projectI
 	// transaction as the delete.
 	audit := newScheduleAudit(r.Context(), mutationTypeScheduleDelete, scheduleID)
 	if err := s.store.WithTx(r.Context(), func(tx store.Store) error {
+		if creatorRevision != nil {
+			if err := creatorStopGuard(r.Context(), tx, schedule, *creatorRevision); err != nil {
+				return err
+			}
+		}
 		if err := tx.DeleteSchedule(r.Context(), scheduleID); err != nil {
 			return err
 		}
 		return tx.CreateMutationAudit(r.Context(), audit)
 	}); err != nil {
+		if creatorRevision != nil && errors.Is(err, store.ErrRevisionConflict) {
+			writeCreatorStopConflict(w)
+			return
+		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
 
+	if schedule.EventType == scheduledEventTypeExec {
+		s.auditScheduleExecMutation(r.Context(), ScheduledExecAuditDelete, *schedule)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// pauseSchedule handles POST /api/v1/projects/{projectId}/schedules/{id}/pause
-func (s *Server) pauseSchedule(w http.ResponseWriter, r *http.Request, projectID, scheduleID string) {
-	schedule, err := s.store.GetSchedule(r.Context(), scheduleID)
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
-	}
-	if schedule.ProjectID != projectID {
-		NotFound(w, "Schedule")
+// pauseSchedule handles POST /api/v1/projects/{projectId}/schedules/{id}/pause.
+// creatorRevision is non-nil when the creator path allowed it (see
+// creatorStopCurrent).
+func (s *Server) pauseSchedule(w http.ResponseWriter, r *http.Request, projectID, scheduleID string, creatorRevision *int) {
+	schedule, ok := s.loadScheduleForProject(w, r, projectID, scheduleID)
+	if !ok {
 		return
 	}
 	if !s.authorizeScheduledEventRow(w, r, projectID, ActionUpdate, scheduleRow(schedule)) {
+		return
+	}
+	if !creatorStopCurrent(w, schedule, creatorRevision) {
 		return
 	}
 	if schedule.Status != store.ScheduleStatusActive {
@@ -711,28 +910,38 @@ func (s *Server) pauseSchedule(w http.ResponseWriter, r *http.Request, projectID
 	// transaction as the status change.
 	audit := newScheduleAudit(r.Context(), mutationTypeSchedulePause, scheduleID)
 	if err := s.store.WithTx(r.Context(), func(tx store.Store) error {
-		if err := tx.UpdateScheduleStatus(r.Context(), scheduleID, store.ScheduleStatusPaused, store.ScheduleStatusReasonNone); err != nil {
+		if creatorRevision != nil {
+			// The creator path checked this revision: pause only while it
+			// is still current, so a re-authorization since then wins.
+			paused := *schedule
+			paused.Status, paused.StatusReason = store.ScheduleStatusPaused, store.ScheduleStatusReasonNone
+			if err := tx.UpdateSchedule(r.Context(), &paused, store.ScheduleFieldMask{Status: true}, *creatorRevision, true, nil); err != nil {
+				return err
+			}
+		} else if err := tx.UpdateScheduleStatus(r.Context(), scheduleID, store.ScheduleStatusPaused, store.ScheduleStatusReasonNone); err != nil {
 			return err
 		}
 		return tx.CreateMutationAudit(r.Context(), audit)
 	}); err != nil {
+		if creatorRevision != nil && errors.Is(err, store.ErrRevisionConflict) {
+			writeCreatorStopConflict(w)
+			return
+		}
 		writeErrorFromErr(w, err, "")
 		return
 	}
 
 	schedule.Status, schedule.StatusReason = store.ScheduleStatusPaused, store.ScheduleStatusReasonNone
-	writeJSON(w, http.StatusOK, schedule)
+	if schedule.EventType == scheduledEventTypeExec {
+		s.auditScheduleExecMutation(r.Context(), ScheduledExecAuditPause, *schedule)
+	}
+	writeJSON(w, http.StatusOK, scheduleResponse(s.newExecRevealer(r.Context()), *schedule))
 }
 
 // resumeSchedule handles POST /api/v1/projects/{projectId}/schedules/{id}/resume
 func (s *Server) resumeSchedule(w http.ResponseWriter, r *http.Request, projectID, scheduleID string) {
-	schedule, err := s.store.GetSchedule(r.Context(), scheduleID)
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
-	}
-	if schedule.ProjectID != projectID {
-		NotFound(w, "Schedule")
+	schedule, ok := s.loadScheduleForProject(w, r, projectID, scheduleID)
+	if !ok {
 		return
 	}
 	if !s.authorizeScheduledEventRow(w, r, projectID, ActionUpdate, scheduleRow(schedule)) {
@@ -742,6 +951,7 @@ func (s *Server) resumeSchedule(w http.ResponseWriter, r *http.Request, projectI
 	// revision's authority, so the resumer is re-authorized as the author
 	// of the stored schedule, for every event type, before any write. On a
 	// denial the attribution, ceiling and revision are left unchanged.
+	var execPayload *scheduledExecPayload
 	switch schedule.EventType {
 	case "dispatch_agent":
 		if !s.authorizeScheduledDispatchAgentAuthoring(w, r) {
@@ -751,11 +961,28 @@ func (s *Server) resumeSchedule(w http.ResponseWriter, r *http.Request, projectI
 			return
 		}
 	case "message":
-		if !s.authorizeScheduledMessageReauthoring(w, r, projectID, schedule.Payload) {
+		if !s.authorizeScheduledMessageAuthoring(w, r, projectID, schedule.Payload, "", "") {
+			return
+		}
+	case scheduledEventTypeExec:
+		if !s.execSchedulesEnabled() {
+			ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: %s)", schedule.EventType, s.supportedScheduledEventTypes()), nil)
+			return
+		}
+		var err error
+		execPayload, err = decodeScheduledExecPayload(schedule.Payload)
+		if err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
+		if execPayload.AgentID != "" {
+			execPayload.AgentName = ""
+		}
+		if _, ok := s.authorizeScheduledExecAuthoringOpts(w, r, projectID, execPayload, schedule.ID, true); !ok {
 			return
 		}
 	default:
-		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: message, dispatch_agent)", schedule.EventType), nil)
+		ValidationError(w, fmt.Sprintf("unsupported event type: %s (supported: %s)", schedule.EventType, s.supportedScheduledEventTypes()), nil)
 		return
 	}
 	if schedule.Status != store.ScheduleStatusPaused {
@@ -770,6 +997,11 @@ func (s *Server) resumeSchedule(w http.ResponseWriter, r *http.Request, projectI
 	nextRunAt, err := scheduleNextRun(schedule.CronExpr, schedule.TimeZone, time.Now().UTC())
 	if err != nil {
 		writeScheduleTimingError(w, err)
+		return
+	}
+	// A schedule created before the hub's minimum interval (or under a
+	// lower one) must be edited before it can be resumed.
+	if !s.checkScheduleFrequency(w, schedule.CronExpr) {
 		return
 	}
 
@@ -797,28 +1029,50 @@ func (s *Server) resumeSchedule(w http.ResponseWriter, r *http.Request, projectI
 	schedule.AuthorityCeiling = ceiling
 
 	fields := store.ScheduleFieldMask{Status: true, NextRunAt: true}
-	if err := s.store.UpdateSchedule(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, &newAttr); err != nil {
-		if errors.Is(err, store.ErrRevisionConflict) {
+	maxActive := s.config.ScheduleMaxActivePerProject
+	var resumeErr error
+	if execPayload != nil {
+		if encoded, encErr := execPayload.encode(); encErr == nil && encoded != schedule.Payload {
+			schedule.Payload = encoded
+			fields.Payload = true
+		}
+		targetID := execPayload.AgentID
+		resumeErr = s.store.UpdateScheduleChecked(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, &newAttr,
+			scheduledExecMaxPerProject+1, func(snap store.ScheduledExecQuotaSnapshot) error {
+				if err := scheduledExecQuotaCheck(snap, targetID, scheduleID); err != nil {
+					return err
+				}
+				return scheduleQuotaCheck(snap, maxActive)
+			})
+	} else {
+		resumeErr = s.store.UpdateScheduleChecked(r.Context(), schedule, fields, prevRevision, prevRevisionKnown, &newAttr,
+			1, func(snap store.ScheduledExecQuotaSnapshot) error {
+				return scheduleQuotaCheck(snap, maxActive)
+			})
+	}
+	if resumeErr != nil {
+		if writeScheduleQuotaError(w, resumeErr) {
+			return
+		}
+		if errors.Is(resumeErr, store.ErrRevisionConflict) {
 			writeError(w, http.StatusConflict, ErrCodeRevisionConflict,
 				"schedule was concurrently modified; refresh and retry", nil)
 			return
 		}
-		writeErrorFromErr(w, err, "")
+		writeErrorFromErr(w, resumeErr, "")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, schedule)
+	if execPayload != nil {
+		s.auditScheduledExec(r.Context(), newScheduleExecAuthoringAudit(r.Context(), ScheduledExecAuditResume, *schedule, execPayload))
+	}
+	writeJSON(w, http.StatusOK, scheduleResponse(s.newExecRevealer(r.Context()), *schedule))
 }
 
 // getScheduleHistory handles GET /api/v1/projects/{projectId}/schedules/{id}/history
 func (s *Server) getScheduleHistory(w http.ResponseWriter, r *http.Request, projectID, scheduleID string) {
-	schedule, err := s.store.GetSchedule(r.Context(), scheduleID)
-	if err != nil {
-		writeErrorFromErr(w, err, "")
-		return
-	}
-	if schedule.ProjectID != projectID {
-		NotFound(w, "Schedule")
+	schedule, ok := s.loadScheduleForProject(w, r, projectID, scheduleID)
+	if !ok {
 		return
 	}
 	if !s.authorizeScheduledEventRow(w, r, projectID, ActionRead, scheduleRow(schedule)) {
@@ -838,7 +1092,7 @@ func (s *Server) getScheduleHistory(w http.ResponseWriter, r *http.Request, proj
 	}
 
 	writeJSON(w, http.StatusOK, ListScheduledEventsResponse{
-		Events:     result.Items,
+		Events:     s.scheduledEventResponses(r.Context(), s.newExecRevealer(r.Context()), result.Items),
 		NextCursor: result.NextCursor,
 		TotalCount: result.TotalCount,
 		ServerTime: time.Now().UTC(),

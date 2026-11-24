@@ -55,8 +55,8 @@ ARG GIT_IMAGE=chainguard/git:latest
 # Floor and pin, as in core-base. The Workstations base ships 1.27.1, which
 # clears the floor, so GO_VERSION is never actually used on this chain today —
 # it exists so the two Dockerfiles stay literally comparable.
-ARG GO_MIN_VERSION=1.26.1
-ARG GO_VERSION=1.26.1
+ARG GO_MIN_VERSION=1.26.11
+ARG GO_VERSION=1.26.11
 
 ARG GH_VERSION=2.100.0
 
@@ -173,7 +173,8 @@ ARG PIP_INDEX_URL=https://pypi.org/simple
 ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 
 RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=false \
-    /opt/scion-image-build/lib/install-core-toolchain.sh npm-tools
+    /opt/scion-image-build/lib/install-core-toolchain.sh npm-tools \
+    && /opt/scion-image-build/lib/install-core-toolchain.sh playwright-ffmpeg
 
 # Identical closing line to core-base. That is the whole point: whichever base
 # scion-base is built on, it has passed the same assertion.

@@ -47,6 +47,8 @@ func sealDispatchMetadataEnv(ctx context.Context, agent *store.Agent, env map[st
 	mode := ""
 	if gcpID != nil {
 		mode = gcpID.MetadataMode
+	} else if isShellAgent(agent) {
+		mode = store.GCPMetadataModeBlock
 	}
 	sealMetadataEnv(ctx, env, cls, mode, gcpID)
 }
@@ -106,6 +108,11 @@ func clearMergedMetadataEnv(env map[string]string, cls *map[string]api.EnvKind) 
 
 // sendCreate seals req's resolved env and sends the create.
 func (d *HTTPAgentDispatcher) sendCreate(ctx context.Context, agent *store.Agent, endpoint string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, error) {
+	if req != nil {
+		if err := d.gateCreateHomeFiles(ctx, agent, req.HomeFiles, req.Reprovision); err != nil {
+			return nil, err
+		}
+	}
 	sealCreateRequest(ctx, req)
 	return d.client.CreateAgent(ctx, agent.RuntimeBrokerID, endpoint, req)
 }
@@ -113,6 +120,11 @@ func (d *HTTPAgentDispatcher) sendCreate(ctx context.Context, agent *store.Agent
 // sendCreateWithGather seals req's resolved env and sends the create with
 // env gathering.
 func (d *HTTPAgentDispatcher) sendCreateWithGather(ctx context.Context, agent *store.Agent, endpoint string, req *RemoteCreateAgentRequest) (*RemoteAgentResponse, *RemoteEnvRequirementsResponse, error) {
+	if req != nil {
+		if err := d.gateCreateHomeFiles(ctx, agent, req.HomeFiles, req.Reprovision); err != nil {
+			return nil, nil, err
+		}
+	}
 	sealCreateRequest(ctx, req)
 	return d.client.CreateAgentWithGather(ctx, agent.RuntimeBrokerID, endpoint, req)
 }

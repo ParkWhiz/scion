@@ -308,6 +308,9 @@ func copyBrokerEcho(dst, src *store.AgentAppliedConfig, includeImage bool) {
 	}
 	if src.Profile != "" {
 		dst.Profile = src.Profile
+		if dst.CreateInputs != nil && dst.CreateInputs.Profile == "" {
+			dst.CreateInputs.Profile = src.Profile
+		}
 	}
 	if includeImage && src.Image != "" {
 		dst.Image = src.Image
@@ -842,6 +845,13 @@ func (s *Server) runReincarnationWorker(ctx context.Context, agentID, reincarnat
 		return
 	}
 
+	// startCtx is used for this reincarnation's provision/reprovision leg
+	// and its start leg only. For every reincarnation (in-place reprovision,
+	// with or without a home reset, and cross-broker moves), it carries the
+	// as_needed names the gather resolved to DispatchAgentStart
+	// (reprovisionGatheredEnv, ptone/scion#7757, ptone/scion#7909).
+	startCtx := withReprovisionGatheredEnv(ctx)
+
 	// A move links the target to the project if needed and provisions
 	// the agent fresh there. The target first confirms the agent's
 	// workspace on its own mount of the export (409 when it is missing),
@@ -856,7 +866,7 @@ func (s *Server) runReincarnationWorker(ctx context.Context, agentID, reincarnat
 		if move.recreates() {
 			moveMarkerID = reincarnationID
 		}
-		if err := md.DispatchAgentProvisionForMove(ctx, agent, move.expectedNFSWorkspace(), moveMarkerID); err != nil {
+		if err := md.DispatchAgentProvisionForMove(startCtx, agent, move.expectedNFSWorkspace(), moveMarkerID); err != nil {
 			// A forced move removes the target's files only when the
 			// provision may have created them: an error marked sent that
 			// is not the target's own refusal (moveTargetUntouched).
@@ -877,7 +887,7 @@ func (s *Server) runReincarnationWorker(ctx context.Context, agentID, reincarnat
 	// fresh one, under the reincarnation ID.
 	if move != nil {
 		// Provisioned on the target above.
-	} else if err := dispatcher.DispatchAgentReprovision(ctx, agent, ReprovisionOptions{ResetHome: homeReset, ResetID: reincarnationID}); err != nil {
+	} else if err := dispatcher.DispatchAgentReprovision(startCtx, agent, ReprovisionOptions{ResetHome: homeReset, ResetID: reincarnationID}); err != nil {
 		if homeReset && !reprovisionLeftHomeIntact(err) {
 			// D-b (fail forward): the home may already be gone, so a
 			// re-render of `previous` cannot restore it. The row keeps the
@@ -965,7 +975,7 @@ func (s *Server) runReincarnationWorker(ctx context.Context, agentID, reincarnat
 		return
 	}
 	beforeStart := agentStartEchoFields(agent)
-	if err := dispatcher.DispatchAgentStart(ctx, agent, preamble, false); err != nil {
+	if err := dispatcher.DispatchAgentStart(startCtx, agent, preamble, false); err != nil {
 		errMsg := "start failed: " + dispatchFailureText(err)
 		// A move follows the same rule: on an ambiguous outcome the agent
 		// stays assigned to the target at gen N+1, with its reservation
@@ -1122,11 +1132,10 @@ const reincarnationRerenderTimeout = 2*brokerRequestTimeout + time.Minute
 
 // reincarnationStartLeftNoContainer reports whether a DispatchAgentStart
 // error is a definitive outcome that leaves no gen N+1 container: the broker
-// never acted on the request or explicitly refused it
-// (isConfirmedStartNotActedOnError, the classification DispatchAgentStart's
-// own start-failure revoke uses), and did not report a failure from inside
-// Manager.Start (brokerStartAttempted, by which point a container may have
-// been created). This is the pair shouldRevertRun uses. The worker's stop
+// never acted on the request or explicitly refused it before creating a
+// container (isStartRefusedBeforeCreate), and did not report a failure from
+// inside Manager.Start (brokerStartAttempted, by which point a container may
+// have been created). This is the pair shouldRevertRun uses. The worker's stop
 // step already confirmed the previous container is gone, so no container
 // is running for the agent. Every other error is ambiguous.
 //
@@ -1154,7 +1163,7 @@ func reincarnationStartLeftNoContainer(err error) bool {
 	if startRunNotBegunOutsideDelete(err) || pendingFoldRefusedOutsideDelete(err) || errors.Is(err, ErrHubShuttingDown) {
 		return true
 	}
-	return isConfirmedStartNotActedOnError(err) && !brokerStartAttempted(err)
+	return isStartRefusedBeforeCreate(err) && !brokerStartAttempted(err)
 }
 
 // rerenderPreviousConfig makes one best-effort reprovision dispatch with the
@@ -1231,27 +1240,34 @@ func (s *Server) failHomeResetForward(ctx context.Context, agentID, reincarnatio
 }
 
 // homeResetRecoveryHint is the recovery text of a home-resetting
-// reincarnation that failed after the reset. When the reprovision itself
-// failed (homeComposed false), the fresh home may be missing or half-built,
-// and a start does not compose it (provisioning on start runs only for a
-// missing agent directory), so the hint names a plain reincarnate, which
-// reprovisions the new config; after a successful reprovision a start is
-// enough.
+// reincarnation that failed after the reset. Every variant names a plain
+// `scion reincarnate`, the one command an agent in this state accepts that
+// also rebuilds it: the agent is left at phase error, where `scion start`
+// is refused as a duplicate (409) and `scion resume --force` restarts the
+// container without reprovisioning, with the harness resume flag on an
+// empty home and with no stop of a container an ambiguous start may have
+// left. The reincarnation stops the agent, reprovisions the new config
+// (composing a home the failed reprovision left missing or half-built:
+// homeComposed false) and starts it. It replays the image and model this
+// reincarnation recorded, so the hint names -i and --model for replacing a
+// bad one. Switching back with --harness drops them.
 func homeResetRecoveryHint(agentSlug string, plan *ReincarnationPlan, homeComposed bool) string {
 	oldHC, newHC := "", ""
 	if plan != nil && plan.Harness != nil {
 		oldHC, newHC = plan.Harness.Old, plan.Harness.New
 	}
-	retry := fmt.Sprintf("`scion start %s`", agentSlug)
+	hint := "the home was already reset"
 	if !homeComposed {
-		retry = fmt.Sprintf("`scion reincarnate %s`", agentSlug)
+		hint += " and may be incomplete"
 	}
-	hint := "the home was already reset; fix the cause and run " + retry
+	hint += "; to retry"
 	if newHC != "" {
-		hint += fmt.Sprintf(" (harness config %s)", newHC)
+		hint += fmt.Sprintf(" on harness config %s", newHC)
 	}
+	hint += fmt.Sprintf(", fix the cause and run `scion reincarnate %s`"+
+		" (it reuses the recorded image and model; add `-i <image>` or `--model <model>` to replace them)", agentSlug)
 	if oldHC != "" {
-		hint += fmt.Sprintf(" or `scion reincarnate %s --harness %s`", agentSlug, oldHC)
+		hint += fmt.Sprintf(", or switch back with `scion reincarnate %s --harness %s`", agentSlug, oldHC)
 	}
 	return hint
 }
@@ -1401,11 +1417,12 @@ func (s *Server) finishFailReincarnation(ctx context.Context, agentID, reincarna
 // callers' doc comments for why that ordering is required.
 //
 // When restoreConfig is non-nil, the same transaction restores the
-// service-account assignment the reincarnation reincarnationID replaced
-// (restoreReincarnationAssignment), recording cause on the replacement, so
-// the active assignment and the restored configuration change together.
-// Without restoreConfig the disk keeps the new generation's configuration,
-// and the assignment recorded for it stays.
+// service-account assignment (restoreReincarnationAssignment) and delegation
+// edge (restoreReincarnationDelegationEdge) that reincarnationID replaced,
+// recording cause on the replacement, so the active authority records and
+// the restored configuration change together. Without restoreConfig the disk
+// keeps the new generation's configuration, and the authority records
+// written for it stay.
 func (s *Server) writeFailedAgent(ctx context.Context, agentID, reincarnationID string, cause store.EdgeDeactivationCause, errMsg string, restoreConfig *store.AgentAppliedConfig, now time.Time) {
 	upd := reincarnationStepUpdate{
 		reincarnationState: store.ReincarnationStateFailed,
@@ -1420,6 +1437,9 @@ func (s *Server) writeFailedAgent(ctx context.Context, agentID, reincarnationID 
 			if err := restoreReincarnationAssignment(ctx, tx, agent, reincarnationID, cause, now); err != nil {
 				return fmt.Errorf("assignment restore: %w", err)
 			}
+			if err := restoreReincarnationDelegationEdge(ctx, tx, agent, reincarnationID, cause, now); err != nil {
+				return fmt.Errorf("delegation edge restore: %w", err)
+			}
 			return nil
 		}
 	}
@@ -1427,12 +1447,12 @@ func (s *Server) writeFailedAgent(ctx context.Context, agentID, reincarnationID 
 	// here leaves the agent in its in-flight state, refused with 409, with
 	// no worker left to retry it, until the sweep's orphaned agent-state
 	// reset marks it failed (without restoring the configuration). With a
-	// restore, the assignment restore is lost with it: both roll back
-	// together.
+	// restore, the assignment and delegation edge restores are lost with it:
+	// all roll back together.
 	agent, err := s.updateReincarnationStep(ctx, agentID, upd, reincarnationStepMaxAttempts+3)
 	if err != nil {
 		if restoreConfig != nil {
-			s.agentLifecycleLog.Error("failReincarnation: failed to update agent after retries; the agent write and the assignment restore are not applied, and the agent is left for the orphaned agent-state sweep",
+			s.agentLifecycleLog.Error("failReincarnation: failed to update agent after retries; the agent write and authority restores are not applied, and the agent is left for the orphaned agent-state sweep",
 				"agent_id", agentID, "reincarnation_id", reincarnationID, "error", err)
 		} else {
 			s.agentLifecycleLog.Error("failReincarnation: failed to update agent after retries",
@@ -1775,15 +1795,18 @@ func (s *Server) buildReincarnationPreambleWith(agent *store.Agent, toGeneration
 		// template) is authoritative on who to tell; the resolved creator
 		// (if any, and not the agent itself) is only a hint for when the
 		// handoff names no one, rendered as its own sentence (A26.3 N2).
-		fmt.Fprintf(&b, " 3. Message the owner named in your handoff's \"Authority and ownership\" section that generation %d is up, and state your next action.", toGeneration)
+		// Step 3 defers to the handoff's "Immediate active work" section so
+		// a handoff that instructs the new generation to stay idle or quiet
+		// is not contradicted (ptone/scion#8830).
+		fmt.Fprintf(&b, " 3. Unless your handoff's \"Immediate active work\" section says otherwise, message the owner named in your handoff's \"Authority and ownership\" section that generation %d is up, and state your next action.", toGeneration)
 		if requester.CreatorResolved {
 			fmt.Fprintf(&b, " If the handoff names none, message %s.", requester.CreatorHandle)
 		}
 		b.WriteString("\n")
 	case requester.Resolved:
-		fmt.Fprintf(&b, " 3. Message %s that generation %d is up, and state your next action.\n", requester.Handle, toGeneration)
+		fmt.Fprintf(&b, " 3. Unless your handoff's \"Immediate active work\" section says otherwise, message %s that generation %d is up, and state your next action.\n", requester.Handle, toGeneration)
 	default:
-		fmt.Fprintf(&b, " 3. Message %s that generation %d is up, and state your next action.\n", reincarnationRequesterFallback, toGeneration)
+		fmt.Fprintf(&b, " 3. Unless your handoff's \"Immediate active work\" section says otherwise, message %s that generation %d is up, and state your next action.\n", reincarnationRequesterFallback, toGeneration)
 	}
 	b.WriteString(" 4. Continue from the handoff's \"Immediate active work\" section below (its next action). Do not redo anything listed under \"Do not redo\".\n")
 	b.WriteString("The handoff from your previous generation follows.\n---\n")

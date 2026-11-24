@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -262,6 +263,25 @@ func (s *Server) githubBindingUserIsAdmin(ctx context.Context, userID string) (b
 	return decision.Allowed, nil
 }
 
+// lookupCreatorGitHubToken returns the project creator's own user-scope
+// GITHUB_TOKEN value, used solely for GitHub App association proof/cache-key
+// checks and never delivered or logged. It returns ("", false, nil) when no
+// creator, secret backend, or non-empty stored token exists, and a non-nil
+// error only on a secret-backend failure other than store.ErrNotFound.
+func (s *Server) lookupCreatorGitHubToken(ctx context.Context, project *store.Project) (string, bool, error) {
+	if project == nil || project.CreatedBy == "" || s.secretBackend == nil {
+		return "", false, nil
+	}
+	sv, err := s.secretBackend.Get(ctx, "GITHUB_TOKEN", "user", project.CreatedBy)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return "", false, err
+	}
+	if err != nil || sv == nil || sv.Value == "" {
+		return "", false, nil
+	}
+	return sv.Value, true, nil
+}
+
 // githubCreatorRepoAccess asks GitHub, with the project creator's own
 // user-scope GITHUB_TOKEN, what the creator may do on owner/repo. No creator,
 // no secret backend or no stored token is a definitive refusal; a secret
@@ -270,16 +290,16 @@ func (s *Server) githubCreatorRepoAccess(ctx context.Context, project *store.Pro
 	if project.CreatedBy == "" || s.secretBackend == nil {
 		return githubapp.RepoAccess{}, fmt.Errorf("%w: no admin binding and no creator GitHub identity to verify", errGitHubAssociationUnauthorized)
 	}
-	sv, err := s.secretBackend.Get(ctx, "GITHUB_TOKEN", "user", project.CreatedBy)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	creatorToken, hasToken, err := s.lookupCreatorGitHubToken(ctx, project)
+	if err != nil {
 		return githubapp.RepoAccess{}, fmt.Errorf("%w: creator GitHub token lookup: %w", errGitHubAssociationCheckFailed, err)
 	}
-	if err != nil || sv == nil || sv.Value == "" {
+	if !hasToken {
 		return githubapp.RepoAccess{}, fmt.Errorf("%w: no admin binding and the project creator has no GitHub token to verify repository access", errGitHubAssociationUnauthorized)
 	}
 
 	apiBase := s.githubAppAPIBase()
-	key := githubAccessCacheKey(project.ID, installationID, apiBase, owner, repo, project.CreatedBy, sv.Value)
+	key := githubAccessCacheKey(project.ID, installationID, apiBase, owner, repo, project.CreatedBy, creatorToken)
 	if access, denied, ok := s.githubAccessCache.get(key); ok {
 		if denied {
 			return githubapp.RepoAccess{}, fmt.Errorf("%w: the project creator's GitHub identity has no access to %s/%s", errGitHubAssociationUnauthorized, owner, repo)
@@ -291,7 +311,7 @@ func (s *Server) githubCreatorRepoAccess(ctx context.Context, project *store.Pro
 	if check == nil {
 		check = githubapp.CheckUserRepoAccess
 	}
-	access, err := check(ctx, apiBase, sv.Value, owner, repo)
+	access, err := check(ctx, apiBase, creatorToken, owner, repo)
 	if errors.Is(err, githubapp.ErrRepoAccessDenied) {
 		s.githubAccessCache.put(key, project.ID, githubapp.RepoAccess{}, true)
 		return githubapp.RepoAccess{}, fmt.Errorf("%w: the project creator's GitHub identity has no access to %s/%s", errGitHubAssociationUnauthorized, owner, repo)
@@ -381,20 +401,48 @@ func (c *githubRepoAccessCache) invalidateProject(projectID string) {
 	}
 }
 
+// hasUsableStoredGitHubPermissions reports whether stored names at least one
+// known permission field with a valid level ("read" or "write").
+func hasUsableStoredGitHubPermissions(stored *store.GitHubTokenPermissions) bool {
+	if stored == nil {
+		return false
+	}
+	for _, v := range []string{
+		stored.Contents,
+		stored.PullRequests,
+		stored.Issues,
+		stored.Metadata,
+		stored.Checks,
+		stored.Actions,
+	} {
+		if v == "read" || v == "write" {
+			return true
+		}
+	}
+	return false
+}
+
 // githubTokenPermissionsForGrant returns the permission set to request for
-// a token minted under grant, from the project's stored permissions:
+// a token minted under grant, from the project's stored permissions or (when
+// nothing usable is stored) DefaultTokenPermissions intersected with the App's
+// granted permissions:
 //
 //   - Only the six known fields are ever requested, each as "read" or
 //     "write"; any other stored value is dropped.
 //   - "write" survives only when grant.WriteAllowed; otherwise it is
-//     lowered to "read". Nothing is ever added above the stored value
-//     except by the fallback below.
-//   - The result is NEVER empty: GitHub grants every installation
-//     permission when a token request carries no permissions. With nothing
-//     usable stored, DefaultTokenPermissions intersected with the proven
-//     level is used (write fields lowered to read for a pull-only grant),
-//     and metadata:read if even that were empty.
-func githubTokenPermissionsForGrant(stored *store.GitHubTokenPermissions, grant githubAssociationGrant) githubapp.TokenPermissions {
+//     lowered to "read". Nothing is ever added above the stored value.
+//   - When nothing usable is stored, DefaultTokenPermissions is intersected
+//     with appPermissions (and write fields lowered to read for a pull-only
+//     grant). If appPermissions is nil/empty or shares no permissions with
+//     the defaults, ok is false with an empty TokenPermissions so the caller
+//     fails closed rather than minting an empty-permissions token (which
+//     GitHub treats as every installation permission) or requesting more than
+//     the App was granted.
+func githubTokenPermissionsForGrant(
+	stored *store.GitHubTokenPermissions,
+	grant githubAssociationGrant,
+	appPermissions map[string]string,
+) (perms githubapp.TokenPermissions, usedDefaults bool, ok bool) {
 	level := func(v string) string {
 		switch v {
 		case "write":
@@ -418,7 +466,6 @@ func githubTokenPermissionsForGrant(stored *store.GitHubTokenPermissions, grant 
 			Actions:      level(p.Actions),
 		}
 	}
-	var perms githubapp.TokenPermissions
 	if stored != nil {
 		perms = scope(githubapp.TokenPermissions{
 			Contents:     stored.Contents,
@@ -429,13 +476,14 @@ func githubTokenPermissionsForGrant(stored *store.GitHubTokenPermissions, grant 
 			Actions:      stored.Actions,
 		})
 	}
-	if perms == (githubapp.TokenPermissions{}) {
-		perms = scope(githubapp.DefaultTokenPermissions())
+	if perms != (githubapp.TokenPermissions{}) {
+		return perms, false, true
 	}
+	perms = scope(githubapp.IntersectTokenPermissions(githubapp.DefaultTokenPermissions(), appPermissions))
 	if perms == (githubapp.TokenPermissions{}) {
-		perms = githubapp.TokenPermissions{Metadata: "read"}
+		return githubapp.TokenPermissions{}, true, false
 	}
-	return perms
+	return perms, true, true
 }
 
 // validGitHubTokenPermissionLevel reports whether v may be stored for a
@@ -609,11 +657,13 @@ func (c *githubAssociationReportCache) invalidate(projectID string) {
 }
 
 // invalidateGitHubAssociation drops every cached association outcome for
-// projectID: the mint path's access checks and the admin report's entry.
-// Every association change goes through here.
+// projectID: the mint path's access checks, cached installation tokens, and
+// the admin report's entry. Every association change goes through here.
 func (s *Server) invalidateGitHubAssociation(projectID string) {
 	s.githubAccessCache.invalidateProject(projectID)
+	s.githubTokenCache.invalidateProject(projectID)
 	s.githubAssociationReportCache.invalidate(projectID)
+	s.githubAssociationRefusalLog.clear(projectID)
 }
 
 // githubAssociationReportEntryFor evaluates p against
@@ -655,7 +705,8 @@ func (s *Server) githubAssociationReport(ctx context.Context, refresh bool) (git
 
 	now := timeNow()
 	c.mu.Lock()
-	fresh := c.valid && now.Before(c.generatedAt.Add(githubAssociationReportTTL))
+	valid := c.valid
+	fresh := valid && now.Before(c.generatedAt.Add(githubAssociationReportTTL))
 	nextBuild := c.lastFullBuild.Add(githubAssociationReportMinRebuildInterval)
 	limited := !c.lastFullBuild.IsZero() && now.Before(nextBuild)
 	startSeq := c.seq
@@ -667,7 +718,7 @@ func (s *Server) githubAssociationReport(ctx context.Context, refresh bool) (git
 
 	switch {
 	case refresh || !fresh:
-		if limited && (refresh || !c.valid) {
+		if limited && (refresh || !valid) {
 			return githubAssociationReport{}, nextBuild.Sub(now), errGitHubAssociationReportRateLimited
 		}
 		if !limited {
@@ -818,4 +869,238 @@ func (c *githubAssociationReportCache) snapshot() githubAssociationReport {
 		return entries[i].ProjectID < entries[j].ProjectID
 	})
 	return githubAssociationReport{Entries: entries, GeneratedAt: c.generatedAt, Truncated: c.truncated}
+}
+
+// lookupFreshProject returns a fresh, non-dirty cached association report
+// entry for projectID and installationID when one is present, without
+// triggering a report build.
+func (c *githubAssociationReportCache) lookupFreshProject(projectID string, installationID int64, now time.Time) (githubAssociationReportEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.valid || !now.Before(c.generatedAt.Add(githubAssociationReportTTL)) {
+		return githubAssociationReportEntry{}, false
+	}
+	if c.dirty[projectID] != 0 {
+		return githubAssociationReportEntry{}, false
+	}
+	e, ok := c.entries[projectID]
+	if !ok || e.InstallationID != installationID {
+		return githubAssociationReportEntry{}, false
+	}
+	return e, true
+}
+
+// hasAuthorizedGitHubAssociationCached evaluates whether project has an
+// authorized GitHub App installation association for Stage 3 trigger authoring
+// (create, dispatch-affecting PATCH, and resume; design §4.2) WITHOUT making
+// any outbound GitHub HTTP call:
+//
+//  1. When githubAssociationReportCache holds a fresh, non-dirty entry for
+//     project.ID on its current installation, entry.Authorized answers directly.
+//  2. Otherwise, local checks run in-process: installation ID present,
+//     project.GitHubAppStatus not showing association_unauthorized, git remote
+//     on the configured GitHub host, active installation whose account matches
+//     the remote owner, and either a valid admin binding or a creator
+//     user-scope GITHUB_TOKEN.
+//  3. When a creator GITHUB_TOKEN is stored and githubAccessCache has an entry,
+//     a cached grant authorizes and a cached denial refuses. When both caches
+//     are cold (for example right after autoAssociateGitHubInstallation, which
+//     calls invalidateGitHubAssociation, or after a hub restart before any
+//     mint/report), authoring accepts without calling GitHub: this check is a
+//     UX guard ("otherwise rules silently never fire", §4.2), and the trigger
+//     drainer runs full authorizeGitHubAppAssociation before any fire.
+func (s *Server) hasAuthorizedGitHubAssociationCached(ctx context.Context, project *store.Project) (bool, error) {
+	if project == nil || project.GitHubInstallationID == nil || *project.GitHubInstallationID <= 0 {
+		return false, nil
+	}
+	instID := *project.GitHubInstallationID
+
+	if entry, ok := s.githubAssociationReportCache.lookupFreshProject(project.ID, instID, timeNow()); ok {
+		return entry.Authorized, nil
+	}
+
+	if project.GitHubAppStatus != nil &&
+		project.GitHubAppStatus.State == store.GitHubAppStateError &&
+		project.GitHubAppStatus.ErrorCode == githubAppErrAssociationUnauthorized {
+		return false, nil
+	}
+
+	host := s.githubAppWebHost()
+	owner, repo, ok := githubapp.RemoteOwnerRepo(project.GitRemote, host)
+	if !ok {
+		return false, nil
+	}
+
+	inst, err := s.store.GetGitHubInstallation(ctx, instID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if inst == nil || inst.Status != store.GitHubInstallationStatusActive {
+		return false, nil
+	}
+	if inst.AccountLogin == "" || !strings.EqualFold(inst.AccountLogin, owner) {
+		return false, nil
+	}
+
+	bound, err := s.githubAdminBindingValid(ctx, project, instID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
+	}
+	if bound {
+		return true, nil
+	}
+
+	creatorToken, hasToken, err := s.lookupCreatorGitHubToken(ctx, project)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
+	}
+	if !hasToken {
+		return false, nil
+	}
+
+	key := githubAccessCacheKey(project.ID, instID, s.githubAppAPIBase(), owner, repo, project.CreatedBy, creatorToken)
+	if access, denied, cached := s.githubAccessCache.get(key); cached {
+		if denied || (!access.Push && !access.Pull) {
+			return false, nil
+		}
+		return true, nil
+	}
+
+	// Narrow cold-cache creator-proof case: all local checks passed and the
+	// creator holds a stored GITHUB_TOKEN, so accept without calling GitHub;
+	// AuthorizeEventSource re-checks full authorizeGitHubAppAssociation at fire time.
+	return true, nil
+}
+
+// clearProjectGitHubAssociationErrorStatus resets project.GitHubAppStatus back
+// to ok when a live association check succeeds on a project whose stored status
+// still carries an association_* error, matching a successful token mint so a
+// stale association_unauthorized no longer blocks cold-cache trigger authoring.
+func (s *Server) clearProjectGitHubAssociationErrorStatus(ctx context.Context, project *store.Project) {
+	if project == nil || project.GitHubAppStatus == nil {
+		return
+	}
+	if !strings.HasPrefix(project.GitHubAppStatus.ErrorCode, "association_") {
+		return
+	}
+	now := timeNow()
+	project.GitHubAppStatus = &store.GitHubAppProjectStatus{
+		State:         store.GitHubAppStateOK,
+		LastTokenMint: project.GitHubAppStatus.LastTokenMint,
+		LastChecked:   now,
+	}
+	if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
+		slog.WarnContext(ctx, "Failed to clear project GitHub App association error status",
+			"project_id", project.ID, "error", err)
+		return
+	}
+	if s.events != nil {
+		s.events.PublishProjectUpdated(ctx, project)
+	}
+}
+
+const (
+	// githubAssociationRefusalLogMaxEntries caps the number of projects tracked
+	// for association-refusal log deduplication so memory stays bounded.
+	githubAssociationRefusalLogMaxEntries = 4096
+	// githubAssociationRefusalLogTTL prunes refusal state for projects that have
+	// stopped polling, preventing unbounded per-project retention.
+	githubAssociationRefusalLogTTL = 24 * time.Hour
+)
+
+type githubAssociationRefusalEntry struct {
+	installationID int64
+	reason         string
+	lastSeen       time.Time
+}
+
+// githubAssociationRefusalLog suppresses repeated identical association-refusal
+// warnings for the same (project, installation, reason) while logging on every
+// state change (first refusal, changed installation or reason, or re-refusal
+// after recovery/invalidation). The zero value is ready to use.
+type githubAssociationRefusalLog struct {
+	mu      sync.Mutex
+	entries map[string]githubAssociationRefusalEntry
+
+	// maxEntries and ttl override the package defaults when positive (tests).
+	maxEntries int
+	ttl        time.Duration
+}
+
+// shouldLog reports whether a refusal warning for (projectID, installationID, reason)
+// should be emitted now and updates the tracked state.
+func (l *githubAssociationRefusalLog) shouldLog(projectID string, installationID int64, reason string) bool {
+	now := timeNow()
+	maxEntries := l.maxEntries
+	if maxEntries <= 0 {
+		maxEntries = githubAssociationRefusalLogMaxEntries
+	}
+	ttl := l.ttl
+	if ttl <= 0 {
+		ttl = githubAssociationRefusalLogTTL
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if e, ok := l.entries[projectID]; ok {
+		if e.installationID == installationID && e.reason == reason && now.Sub(e.lastSeen) < ttl {
+			e.lastSeen = now
+			l.entries[projectID] = e
+			return false
+		}
+	}
+
+	if l.entries == nil {
+		l.entries = make(map[string]githubAssociationRefusalEntry)
+	}
+
+	// Prune idle entries on state-change writes so inactive/deleted projects
+	// do not accumulate indefinitely.
+	for k, e := range l.entries {
+		if now.Sub(e.lastSeen) >= ttl {
+			delete(l.entries, k)
+		}
+	}
+
+	// If still at capacity for a new project key, evict the least-recently-seen entry.
+	if _, exists := l.entries[projectID]; !exists && len(l.entries) >= maxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, e := range l.entries {
+			if first || e.lastSeen.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = e.lastSeen
+				first = false
+			}
+		}
+		if !first {
+			delete(l.entries, oldestKey)
+		}
+	}
+
+	l.entries[projectID] = githubAssociationRefusalEntry{
+		installationID: installationID,
+		reason:         reason,
+		lastSeen:       now,
+	}
+	return true
+}
+
+// clear removes any tracked refusal state for projectID so a subsequent refusal
+// is logged again.
+func (l *githubAssociationRefusalLog) clear(projectID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.entries, projectID)
 }

@@ -17,8 +17,11 @@ package hubclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 )
@@ -43,6 +46,10 @@ type ProjectService interface {
 	// Delete removes a project and its agent records. Without opts.Force
 	// the hub refuses (409) while the project has agents not yet deleted.
 	Delete(ctx context.Context, projectID string, opts *DeleteProjectOptions) error
+
+	// DeleteWithResult removes a project like Delete and returns any kept
+	// storage items when the Hub answers 200 OK instead of 204 No Content.
+	DeleteWithResult(ctx context.Context, projectID string, opts *DeleteProjectOptions) (*DeleteProjectResult, error)
 
 	// Leave removes the caller's own direct roles on the project
 	// (POST /api/v1/projects/{id}/leave). With dryRun the hub computes the
@@ -100,6 +107,15 @@ type ProjectService interface {
 
 	// Clone creates a new project seeded from an existing project's configuration.
 	Clone(ctx context.Context, sourceID string, req CloneProjectRequest) (*Project, error)
+
+	// GetGitHubTriggerSettings retrieves the project's GitHub trigger source
+	// settings, readiness, and repository routing status
+	// (GET /api/v1/projects/{id}/trigger-sources/github).
+	GetGitHubTriggerSettings(ctx context.Context, projectID string) (*ProjectGitHubTriggerSettings, error)
+
+	// UpdateGitHubTriggerSettings updates the project's GitHub trigger source
+	// settings (PUT /api/v1/projects/{id}/trigger-sources/github).
+	UpdateGitHubTriggerSettings(ctx context.Context, projectID string, req *UpdateProjectGitHubTriggerSettingsRequest) (*ProjectGitHubTriggerSettings, error)
 }
 
 // projectService is the implementation of ProjectService.
@@ -311,18 +327,44 @@ type DeleteProjectOptions struct {
 	Force bool
 }
 
+// StorageKeptItem describes a storage location kept when deleting a project
+// (for example shared project storage unreachable by the Hub, or a Runtime
+// Broker project directory kept with 409 because another instance or agent
+// still uses it).
+type StorageKeptItem struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// DeleteProjectResult is the decoded outcome of DELETE /api/v1/projects/{id}.
+// StorageKept is empty when the Hub answered 204 No Content.
+type DeleteProjectResult struct {
+	StorageKept []StorageKeptItem `json:"storageKept,omitempty"`
+}
+
 // Delete removes a project and its agent records. Without opts.Force the
 // hub refuses while the project has agents that are not deleted yet.
 func (s *projectService) Delete(ctx context.Context, projectID string, opts *DeleteProjectOptions) error {
+	_, err := s.DeleteWithResult(ctx, projectID, opts)
+	return err
+}
+
+// DeleteWithResult removes a project and returns any kept-storage items
+// reported when the Hub responds 200 OK instead of 204 No Content.
+func (s *projectService) DeleteWithResult(ctx context.Context, projectID string, opts *DeleteProjectOptions) (*DeleteProjectResult, error) {
 	path := "/api/v1/projects/" + url.PathEscape(projectID)
 	if opts != nil && opts.Force {
 		path += "?force=true"
 	}
 	resp, err := s.c.delete(ctx, path, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return apiclient.CheckResponse(resp)
+	if resp.StatusCode == http.StatusNoContent {
+		_ = resp.Body.Close()
+		return &DeleteProjectResult{}, nil
+	}
+	return apiclient.DecodeRequired[DeleteProjectResult](resp)
 }
 
 // LeaveProjectResult is the response of POST /api/v1/projects/{id}/leave.
@@ -601,4 +643,81 @@ func (s *projectService) AssignableRoles(ctx context.Context, projectID string) 
 		return nil, err
 	}
 	return out.Items, nil
+}
+
+// GitHubTriggersProjectReadiness is the project-scoped GitHub App readiness
+// summary returned on trigger source settings.
+type GitHubTriggersProjectReadiness struct {
+	Ready              bool       `json:"ready"`
+	MissingEvents      []string   `json:"missing_events"`
+	MissingPermissions []string   `json:"missing_permissions"`
+	AppSlug            string     `json:"app_slug,omitempty"`
+	CheckedAt          *time.Time `json:"checked_at,omitempty"`
+	Error              string     `json:"error,omitempty"`
+}
+
+// ProjectGitHubTriggerPrimaryRef identifies the active primary project for a
+// shared repository.
+type ProjectGitHubTriggerPrimaryRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ProjectGitHubTriggerRoutingView is the project-scoped repository routing
+// status returned on trigger source settings.
+type ProjectGitHubTriggerRoutingView struct {
+	PrimaryProject *ProjectGitHubTriggerPrimaryRef `json:"primary_project"`
+	IsPrimary      bool                            `json:"is_primary"`
+	OtherProjects  []string                        `json:"other_projects"`
+	Status         string                          `json:"status,omitempty"`
+}
+
+// ProjectGitHubTriggerSettings is the response payload of
+// GET/PUT /api/v1/projects/{id}/trigger-sources/github.
+type ProjectGitHubTriggerSettings struct {
+	UnmatchedCommandReply bool                            `json:"unmatched_command_reply"`
+	UnmatchedCommandText  string                          `json:"unmatched_command_text"`
+	Readiness             GitHubTriggersProjectReadiness  `json:"readiness"`
+	Routing               ProjectGitHubTriggerRoutingView `json:"routing"`
+	Warnings              []string                        `json:"warnings,omitempty"`
+}
+
+// UpdateProjectGitHubTriggerSettingsRequest is the request body for
+// PUT /api/v1/projects/{id}/trigger-sources/github.
+type UpdateProjectGitHubTriggerSettingsRequest struct {
+	UnmatchedCommandReply bool   `json:"unmatched_command_reply"`
+	UnmatchedCommandText  string `json:"unmatched_command_text"`
+}
+
+func projectGitHubTriggerSettingsPath(projectID string) string {
+	return "/api/v1/projects/" + url.PathEscape(projectID) + "/trigger-sources/github"
+}
+
+// GetGitHubTriggerSettings retrieves the project's GitHub trigger source
+// settings, readiness, and repository routing status.
+func (s *projectService) GetGitHubTriggerSettings(ctx context.Context, projectID string) (*ProjectGitHubTriggerSettings, error) {
+	if projectID == "" {
+		return nil, errors.New("project ID is required")
+	}
+	resp, err := s.c.get(ctx, projectGitHubTriggerSettingsPath(projectID), nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ProjectGitHubTriggerSettings](resp)
+}
+
+// UpdateGitHubTriggerSettings updates the project's GitHub trigger source
+// settings.
+func (s *projectService) UpdateGitHubTriggerSettings(ctx context.Context, projectID string, req *UpdateProjectGitHubTriggerSettingsRequest) (*ProjectGitHubTriggerSettings, error) {
+	if projectID == "" {
+		return nil, errors.New("project ID is required")
+	}
+	if req == nil {
+		return nil, errors.New("github trigger settings update request is required")
+	}
+	resp, err := s.c.put(ctx, projectGitHubTriggerSettingsPath(projectID), req, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[ProjectGitHubTriggerSettings](resp)
 }

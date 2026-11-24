@@ -285,14 +285,13 @@ func TestArtifactGrantsStayWithinAgentReadScope(t *testing.T) {
 			noRead = append(noRead, sc)
 		}
 	}
-	withoutScope, err := srv.GetAgentTokenService().GenerateAgentToken(grantee.ID, p2.ID, noRead, nil)
-	require.NoError(t, err)
+	withoutScope := srv.generateRecordedAgentToken(t, grantee.ID, p2.ID, noRead, nil)
 
 	// Publish as the owner, with a principal read grant for the grantee.
 	content := []byte("granted")
 	sum := sha256.Sum256(content)
 	digest := hex.EncodeToString(sum[:])
-	_, err = blobs.Upload(ctx, artifacts.BlobPath(srv.HubID(), digest), bytes.NewReader(content), storage.UploadOptions{})
+	_, err := blobs.Upload(ctx, artifacts.BlobPath(srv.HubID(), digest), bytes.NewReader(content), storage.UploadOptions{})
 	require.NoError(t, err)
 	now := time.Now()
 	a := &artifacts.Artifact{ID: tid("grant-artifact"), ScopeKind: artifacts.ScopeKindProject, ScopeRef: p1.ID,
@@ -402,8 +401,7 @@ func TestArtifactsPreArtifactCeilingTokenOnRoutes(t *testing.T) {
 	child := &store.Agent{ID: tid("art-preart-child"), Slug: "preart-child", Name: "preart-child", ProjectID: p1.ID, Phase: "running"}
 	require.NoError(t, s.CreateAgent(context.Background(), child))
 	issued := filterScopes(ScopesForRole(AgentRoleBaseline), preArtifactReadCeiling(), ScopeCeilings{})
-	childTok, err := srv.GetAgentTokenService().GenerateAgentToken(child.ID, p1.ID, issued, nil)
-	require.NoError(t, err)
+	childTok := srv.generateRecordedAgentToken(t, child.ID, p1.ID, issued, nil)
 
 	rec := doRawAgentRequest(t, srv, http.MethodPost, "/api/v1/artifacts?name=a.txt", []byte("a"), ownerTok)
 	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
@@ -858,4 +856,87 @@ func TestArtifactsHTMLViewOnRoutes(t *testing.T) {
 	off = httptest.NewRecorder()
 	srv.Handler().ServeHTTP(off, httptest.NewRequest(http.MethodGet, view.URL, nil))
 	assert.Equal(t, http.StatusNotFound, off.Code, "experiment off")
+}
+
+// TestArtifactsPublishExpiresIn exercises publish-time retention (--expires-in)
+// through the real hub routes for an agent with project:artifact:write and a
+// live delegation chain (ptone/scion#8155).
+func TestArtifactsPublishExpiresIn(t *testing.T) {
+	srv, s := testServer(t)
+	enableArtifactsForTest(t, srv)
+	srv.SetOperationalSettings(artifactsOps(t, `{"default_retention_days":30}`))
+	hub := httptest.NewServer(srv.Handler())
+	t.Cleanup(hub.Close)
+
+	p1 := artifactProject(t, s, "exp-p1")
+	agentA, tokA := artifactAgent(t, srv, s, p1.ID, "exp-agent", AgentRoleBaseline)
+	c := agentClient(t, hub.URL, tokA)
+	ctx := context.Background()
+
+	// Valid single-file publish with 720h (30d == default_retention_days).
+	content := []byte("# Demo take\n")
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	before := time.Now().UTC()
+	pub, err := c.Artifacts().Publish(ctx, &hubclient.PublishArtifactRequest{
+		Name: "demo.md", Content: bytes.NewReader(content), Size: int64(len(content)), SHA256: digest,
+		ExpiresIn: "720h",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, pub.Artifact.ExpiresAt)
+	assert.False(t, pub.Artifact.ExpiresAt.Before(before.Add(720*time.Hour-time.Second)))
+
+	// Verify GET returns the expiry and the store recorded an agent-owned event.
+	got, err := c.Artifacts().Get(ctx, pub.Artifact.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.Artifact.ExpiresAt)
+	assert.True(t, got.Artifact.ExpiresAt.Equal(*pub.Artifact.ExpiresAt))
+	events, err := srv.artifactStore.ListEvents(ctx, pub.Artifact.ID)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	assert.Equal(t, artifacts.EventExpirySet, events[0].Action)
+	assert.Equal(t, artifacts.PrincipalKindAgent, events[0].ActorKind)
+	assert.Equal(t, agentA.ID, events[0].ActorRef)
+	assert.Equal(t, artifacts.AuthorityOwner, events[0].Authority)
+
+	// Below 24h is refused; above default_retention_days and "never" are refused.
+	for _, bad := range []string{"12h", "721h", "never"} {
+		_, err = c.Artifacts().Publish(ctx, &hubclient.PublishArtifactRequest{
+			Name: "bad.md", Content: bytes.NewReader(content), Size: int64(len(content)), SHA256: digest,
+			ExpiresIn: bad,
+		})
+		requireHubStatus(t, err, http.StatusBadRequest)
+	}
+
+	// Two-step keyed publish updates expiry on a new version of an existing key.
+	pend1, err := c.Artifacts().CreateVersion(ctx, "", &hubclient.CreateVersionRequest{
+		Key: "demo-key", Entry: "demo.md", ExpiresIn: "720h",
+		Files: []hubclient.ManifestFile{{Path: "demo.md", Size: int64(len(content)), SHA256: digest}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, pend1.Artifact.ExpiresAt)
+	require.NoError(t, c.Artifacts().UploadFile(ctx, pend1.Artifact.ID, pend1.Version.Seq, "demo.md", bytes.NewReader(content), int64(len(content)), digest))
+	_, err = c.Artifacts().FinalizeVersion(ctx, pend1.Artifact.ID, pend1.Version.Seq)
+	require.NoError(t, err)
+
+	content2 := []byte("# Demo take v2\n")
+	sum2 := sha256.Sum256(content2)
+	digest2 := hex.EncodeToString(sum2[:])
+	pend2, err := c.Artifacts().CreateVersion(ctx, "", &hubclient.CreateVersionRequest{
+		Key: "demo-key", Entry: "demo.md", ExpiresIn: "48h",
+		Files: []hubclient.ManifestFile{{Path: "demo.md", Size: int64(len(content2)), SHA256: digest2}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, pend2.Artifact.ExpiresAt)
+	assert.Equal(t, pend1.Artifact.ID, pend2.Artifact.ID)
+	assert.True(t, pend2.Artifact.ExpiresAt.Before(*pend1.Artifact.ExpiresAt))
+
+	// When default_retention_days is 0, agent can set "never" or longer retention.
+	srv.SetOperationalSettings(artifactsOps(t, `{"default_retention_days":0}`))
+	pubNever, err := c.Artifacts().Publish(ctx, &hubclient.PublishArtifactRequest{
+		Name: "keep.md", Content: bytes.NewReader(content), Size: int64(len(content)), SHA256: digest,
+		ExpiresIn: "never",
+	})
+	require.NoError(t, err)
+	assert.Nil(t, pubNever.Artifact.ExpiresAt)
 }

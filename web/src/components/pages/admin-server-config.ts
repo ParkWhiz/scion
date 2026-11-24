@@ -27,7 +27,7 @@ import type { TemplateResult } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
 import { apiFetch, extractApiError } from '../../client/api.js';
-import { invalidatePublicSettings } from '../../client/server-feature-flags.js';
+import { getPublicSettings, invalidatePublicSettings } from '../../client/server-feature-flags.js';
 import { KNOWN_HARNESS_NAMES, harnessDisplayName } from '../../shared/harness-utils.js';
 import { normalizeModelAlias } from '../../shared/model-utils.js';
 import { isKubernetesRuntimeType } from '../../shared/runtime-kind.js';
@@ -72,6 +72,8 @@ import {
 } from '../../shared/resource-quantity.js';
 import {
   validateK8sRuntimeFields,
+  validateK8sRuntimeFieldsAt,
+  type K8sRuntimeFields,
   type PlacementIssue,
   type Toleration,
 } from '../../shared/k8s-placement.js';
@@ -100,6 +102,13 @@ import {
   renderEnvValuesList as envValuesListView,
   renderKeysEnvBadge,
 } from '../shared/env-badge-views.js';
+import {
+  ADMIN_MANAGED_BROKERS_FLAG,
+  CUSTOM_DEFAULT_USER_ROLE_FLAG,
+  FEATURE_FLAGS_CHANGED_EVENT,
+  FLAT_BROKERS_FLAG,
+  isFeatureEnabled,
+} from '../../utils/feature-flags.js';
 
 /** GET /api/v1/admin/server-config returns this in place of each secret. */
 const MASKED_VALUE = '********';
@@ -192,6 +201,8 @@ interface V1ServerHubConfig {
   soft_delete_retain_files?: boolean;
   auto_suspend_stalled?: boolean;
   stalled_threshold?: string;
+  auto_suspend_idle?: boolean;
+  idle_suspend_after?: string;
   start_claim_lease_ttl?: string;
   start_max_duration?: string;
   start_unconfirmed_hold?: string;
@@ -212,6 +223,22 @@ interface V1ServerHubObservabilityConfig {
   tracing_enabled?: boolean | null;
 }
 
+interface V1RuntimeTargetConfig extends K8sRuntimeFields {
+  type?: string;
+  display_name?: string;
+  context?: string;
+  namespace?: string;
+  [key: string]: unknown;
+}
+
+interface V1RuntimeBrokerInstanceConfig {
+  key?: string;
+  name?: string;
+  runtime_target?: V1RuntimeTargetConfig;
+  agent_defaults?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 interface V1BrokerConfig {
   enabled?: boolean;
   port?: number;
@@ -226,6 +253,7 @@ interface V1BrokerConfig {
   broker_token?: string;
   auto_provide?: boolean;
   cors?: V1CORSConfig;
+  instances?: V1RuntimeBrokerInstanceConfig[];
 }
 
 interface V1DatabaseConfig {
@@ -480,6 +508,8 @@ interface ServerConfigResponse {
 
   agent_secrets?: { user_scope_only?: boolean };
 
+  broker_policy?: { admin_managed_only?: boolean };
+
   // Settings-DB metadata (DB-backed hubs, any driver; absent when the hub has no operational settings)
   settings_tier?: 'db' | 'file';
   // True on workstation hubs: Layer-0 and file-only settings are editable and
@@ -502,6 +532,21 @@ interface ServerConfigResponse {
   section_metadata?: Record<string, SectionMetadataInfo>;
   superseded_keys?: Record<string, SupersededKeyInfo[]>;
   deprecated_env_keys?: DeprecatedEnvKeyInfo[];
+  default_user_role_warning?: DefaultUserRoleWarning;
+  eligible_default_roles?: EligibleDefaultRole[];
+}
+
+interface DefaultUserRoleWarning {
+  code: string;
+  configured_role: string;
+  effective_role: string;
+  message: string;
+}
+
+interface EligibleDefaultRole {
+  id: string;
+  name: string;
+  description?: string;
 }
 
 interface HarnessConfigEntry {
@@ -687,6 +732,8 @@ interface GitHubAppConfigData {
   webhooks_enabled: boolean;
   configured: boolean;
   has_private_key: boolean;
+  private_key_source?: 'config' | 'file' | 'secret' | '';
+  private_key_overrides_secret?: boolean;
   has_webhook_secret: boolean;
   installation_url?: string;
   rate_limit?: RateLimitInfo;
@@ -707,6 +754,8 @@ const KOANF_KEY_LABELS: Record<string, string> = {
   // lifecycle section
   'server.hub.auto_suspend_stalled': 'Auto-Suspend Stalled Agents',
   'server.hub.stalled_threshold': 'Stalled Threshold',
+  'server.hub.auto_suspend_idle': 'Auto-Suspend Idle Agents',
+  'server.hub.idle_suspend_after': 'Idle Suspend After',
   'server.hub.start_claim_lease_ttl': 'Start Claim Lease',
   'server.hub.start_max_duration': 'Start Deadline',
   'server.hub.start_unconfirmed_hold': 'Unconfirmed Start Hold',
@@ -725,6 +774,8 @@ const KOANF_KEY_LABELS: Record<string, string> = {
   'quotas.enforce_broker_quotas': 'Enforce Broker Agent Quotas',
   // agent_secrets section
   'agent_secrets.user_scope_only': 'Agent Secrets: Profile Scope Only',
+  // broker_policy section
+  'broker_policy.admin_managed_only': 'Runtime Broker Policy: Admin-Managed Only',
   // telemetry section
   'telemetry.enabled': 'Telemetry Enabled',
   'telemetry.cloud.enabled': 'Cloud Export Enabled',
@@ -1040,6 +1091,47 @@ export function stripRemovedStorageOverrides<T extends object>(
   return entries;
 }
 
+const RUNTIME_BROKER_INSTANCE_KEY_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+const INSTANCE_KUBERNETES_ONLY_TARGET_KEYS = [
+  'context',
+  'namespace',
+  'kubeconfig',
+  'kubernetes_block_service_account',
+  'shared_dir_storage_class',
+  'shared_dir_size',
+  'priority_class_name',
+  'runtime_class_name',
+  'kubernetes_service_account_mappings',
+  'gke',
+  'safe_to_evict',
+  'node_selector',
+  'tolerations',
+] as const;
+
+const INSTANCE_CLOUDRUN_ONLY_TARGET_KEYS = [
+  'project_id',
+  'region',
+  'service_account',
+  'network',
+  'subnetwork',
+  'credentials_file',
+] as const;
+
+function stripInstanceRemovedStorageOverrides(
+  instances: V1RuntimeBrokerInstanceConfig[]
+): V1RuntimeBrokerInstanceConfig[] {
+  for (const inst of instances) {
+    const rt = inst?.runtime_target;
+    if (rt && typeof rt === 'object') {
+      for (const key of REMOVED_STORAGE_OVERRIDE_KEYS) {
+        delete rt[key];
+      }
+    }
+  }
+  return instances;
+}
+
 @customElement('scion-page-admin-server-config')
 export class ScionPageAdminServerConfig extends LitElement {
   /** Re-renders absolute times when the display timezone changes. */
@@ -1153,6 +1245,8 @@ export class ScionPageAdminServerConfig extends LitElement {
   @state() private hubSoftDeleteRetainFiles = false;
   @state() private hubAutoSuspendStalled = false;
   @state() private hubStalledThreshold = '';
+  @state() private hubAutoSuspendIdle = false;
+  @state() private hubIdleSuspendAfter = '';
   // Agent start timing (server.hub.start_*, lifecycle section;
   // ptone/scion#3925). "" is unset: the hub's coded default applies.
   @state() private hubStartTimings: Record<StartTimingKey, string> = emptyStartTimings();
@@ -1174,6 +1268,13 @@ export class ScionPageAdminServerConfig extends LitElement {
   @state() private brokerName = '';
   @state() private brokerNickname = '';
   @state() private brokerAutoProvide = true; // absent means on
+  @state() private brokerInstances: V1RuntimeBrokerInstanceConfig[] = [];
+  private loadedBrokerInstances: V1RuntimeBrokerInstanceConfig[] = [];
+  @state() private brokerInstancesTouched = false;
+  private brokerInstanceRowIds: number[] = [];
+  private loadedBrokerInstanceRowIds = new Set<number>();
+  private nextBrokerInstanceRowId = 1;
+  private brokerInstanceNodeSelectorRows = new Map<number, Array<[string, string]>>();
 
   // Database
   @state() private dbDriver = '';
@@ -1185,6 +1286,8 @@ export class ScionPageAdminServerConfig extends LitElement {
   @state() private authAuthorizedDomains = '';
   @state() private authUserAccessMode = 'open';
   @state() private authDefaultUserRole = 'member';
+  @state() private defaultUserRoleWarning: DefaultUserRoleWarning | null = null;
+  @state() private eligibleDefaultRoles: EligibleDefaultRole[] = [];
 
   // Storage
   @state() private storageProvider = '';
@@ -1213,6 +1316,10 @@ export class ScionPageAdminServerConfig extends LitElement {
   // Agent Secrets (unset means permissive)
   @state() private agentSecretsUserScopeOnly: boolean | null = null;
   private loadedAgentSecretsUserScopeOnly: boolean | null = null;
+
+  // Runtime Broker Policy (unset means permissive)
+  @state() private brokerPolicyAdminManagedOnly: boolean | null = null;
+  private loadedBrokerPolicyAdminManagedOnly: boolean | null = null;
 
   // Telemetry
   @state() private telemetryEnabled: boolean | null = null;
@@ -1279,6 +1386,8 @@ export class ScionPageAdminServerConfig extends LitElement {
   @state() private githubAppApiBaseUrl = '';
   @state() private githubAppWebhooksEnabled = false;
   @state() private githubAppHasPrivateKey = false;
+  @state() private githubAppPrivateKeySource = '';
+  @state() private githubAppPrivateKeyOverridesSecret = false;
   @state() private githubAppHasWebhookSecret = false;
   @state() private githubAppPrivateKey = '';
   @state() private githubAppWebhookSecret = '';
@@ -1560,7 +1669,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.8125rem;
       background: var(--scion-bg, #f8fafc);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       border: 1px solid var(--scion-border, #e2e8f0);
     }
 
@@ -1642,6 +1751,12 @@ export class ScionPageAdminServerConfig extends LitElement {
       background: var(--scion-error-bg, #fef2f2);
       color: var(--scion-error-text, #991b1b);
       border: 1px solid var(--scion-error-border, #fca5a5);
+    }
+
+    .status-message.warning {
+      background: var(--scion-warning-bg, #fefce8);
+      color: var(--scion-warning-text, #854d0e);
+      border: 1px solid var(--scion-warning-border, #fde047);
     }
 
     .reload-info {
@@ -1733,7 +1848,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-warning-100, #fef3c7);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     /* ── Settings-DB: section metadata caption ── */
@@ -1849,7 +1964,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-primary-100, #dbeafe);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     .superseded-source {
@@ -1896,7 +2011,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-warning-100, #fef3c7);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     /* ── Settings-DB: reset confirm dialog ── */
@@ -1953,7 +2068,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-neutral-100, #f1f5f9);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     /* ── Structured error handling (§3.6) ── */
@@ -2003,7 +2118,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: var(--sl-color-neutral-100, #f1f5f9);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
     }
 
     .validation-errors {
@@ -2054,7 +2169,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       font-size: 0.75rem;
       background: rgba(0, 0, 0, 0.05);
       padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       margin-right: 0.25rem;
     }
 
@@ -2080,8 +2195,13 @@ export class ScionPageAdminServerConfig extends LitElement {
     }
   `;
 
+  private readonly onFlagsChanged = (): void => {
+    this.requestUpdate();
+  };
+
   override connectedCallback(): void {
     super.connectedCallback();
+    window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.onFlagsChanged);
     void this.loadConfig();
     void this.loadHarnessConfigs();
     void this.loadRuntimeBrokers();
@@ -2089,6 +2209,11 @@ export class ScionPageAdminServerConfig extends LitElement {
     void this.loadGitHubAppInstallations();
     void this.loadMessagingSettings();
     void this.loadUpdateStatus();
+  }
+
+  override disconnectedCallback(): void {
+    window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.onFlagsChanged);
+    super.disconnectedCallback();
   }
 
   private async loadConfig(): Promise<void> {
@@ -2258,6 +2383,8 @@ export class ScionPageAdminServerConfig extends LitElement {
     this.hubSoftDeleteRetainFiles = hubBlock.soft_delete_retain_files || false;
     this.hubAutoSuspendStalled = hubBlock.auto_suspend_stalled || false;
     this.hubStalledThreshold = hubBlock.stalled_threshold || '';
+    this.hubAutoSuspendIdle = hubBlock.auto_suspend_idle || false;
+    this.hubIdleSuspendAfter = hubBlock.idle_suspend_after || '';
     this.hubStartTimings = startTimingsFrom(hubBlock);
     this.loadedStartTimings = { ...this.hubStartTimings };
     this.hubGcpIamCheckMode = hubBlock.gcp_iam_check_mode || 'off';
@@ -2276,6 +2403,19 @@ export class ScionPageAdminServerConfig extends LitElement {
     this.brokerNickname = brokerBlock.broker_nickname || '';
     // Absent means on (the server auto-provides when the key is unset).
     this.brokerAutoProvide = brokerBlock.auto_provide ?? true;
+    const rawInstances = Array.isArray(brokerBlock.instances)
+      ? stripInstanceRemovedStorageOverrides(
+          JSON.parse(JSON.stringify(brokerBlock.instances)) as V1RuntimeBrokerInstanceConfig[]
+        )
+      : [];
+    this.brokerInstances = rawInstances;
+    this.loadedBrokerInstances = JSON.parse(
+      JSON.stringify(rawInstances)
+    ) as V1RuntimeBrokerInstanceConfig[];
+    this.brokerInstancesTouched = false;
+    this.brokerInstanceNodeSelectorRows.clear();
+    this.brokerInstanceRowIds = rawInstances.map(() => this.nextBrokerInstanceRowId++);
+    this.loadedBrokerInstanceRowIds = new Set(this.brokerInstanceRowIds);
 
     // Database
     const dbBlock = srv.database ?? {};
@@ -2289,6 +2429,10 @@ export class ScionPageAdminServerConfig extends LitElement {
     this.authAuthorizedDomains = (authBlock.authorized_domains || []).join(', ');
     this.authUserAccessMode = authBlock.user_access_mode || 'open';
     this.authDefaultUserRole = authBlock.default_user_role || 'member';
+    this.defaultUserRoleWarning = data.default_user_role_warning ?? null;
+    this.eligibleDefaultRoles = Array.isArray(data.eligible_default_roles)
+      ? data.eligible_default_roles
+      : [];
 
     // Storage
     const storageBlock = srv.storage ?? {};
@@ -2338,6 +2482,10 @@ export class ScionPageAdminServerConfig extends LitElement {
     // Agent Secrets — absent means permissive (agents may write project scope).
     this.agentSecretsUserScopeOnly = data.agent_secrets?.user_scope_only ?? null;
     this.loadedAgentSecretsUserScopeOnly = this.agentSecretsUserScopeOnly;
+
+    // Runtime Broker Policy — absent means permissive (members may register brokers).
+    this.brokerPolicyAdminManagedOnly = data.broker_policy?.admin_managed_only ?? null;
+    this.loadedBrokerPolicyAdminManagedOnly = this.brokerPolicyAdminManagedOnly;
 
     // Hub observability export switches — absent means unset.
     const obs = data.server?.hub?.observability;
@@ -2921,6 +3069,8 @@ export class ScionPageAdminServerConfig extends LitElement {
     if (ok('server.hub.auto_suspend_stalled'))
       hub.auto_suspend_stalled = this.hubAutoSuspendStalled;
     if (ok('server.hub.stalled_threshold')) hub.stalled_threshold = this.hubStalledThreshold;
+    if (ok('server.hub.auto_suspend_idle')) hub.auto_suspend_idle = this.hubAutoSuspendIdle;
+    if (ok('server.hub.idle_suspend_after')) hub.idle_suspend_after = this.hubIdleSuspendAfter;
     for (const t of START_TIMINGS) {
       if (ok(`server.hub.${t.key}`)) hub[t.key] = this.hubStartTimings[t.key];
     }
@@ -3052,6 +3202,13 @@ export class ScionPageAdminServerConfig extends LitElement {
         this.agentSecretsUserScopeOnly,
         this.loadedAgentSecretsUserScopeOnly,
       ],
+      [
+        'broker_policy',
+        'admin_managed_only',
+        'broker_policy.admin_managed_only',
+        this.brokerPolicyAdminManagedOnly,
+        this.loadedBrokerPolicyAdminManagedOnly,
+      ],
     ];
     for (const [section, field, key, value, loaded] of sections) {
       if (!ok(key)) continue;
@@ -3174,6 +3331,8 @@ export class ScionPageAdminServerConfig extends LitElement {
     if (ok('server.broker.broker_name')) broker.broker_name = this.brokerName || '';
     if (ok('server.broker.broker_nickname')) broker.broker_nickname = this.brokerNickname || '';
     if (ok('server.broker.auto_provide')) broker.auto_provide = this.brokerAutoProvide;
+    const layer0BrokerInstances = this.brokerInstancesForPayload(ok);
+    if (layer0BrokerInstances !== undefined) broker.instances = layer0BrokerInstances;
     if (Object.keys(broker).length > 0) server.broker = broker;
 
     const database: Record<string, unknown> = {};
@@ -3333,6 +3492,8 @@ export class ScionPageAdminServerConfig extends LitElement {
     if (ok('server.hub.auto_suspend_stalled'))
       hub.auto_suspend_stalled = this.hubAutoSuspendStalled;
     if (ok('server.hub.stalled_threshold')) hub.stalled_threshold = this.hubStalledThreshold;
+    if (ok('server.hub.auto_suspend_idle')) hub.auto_suspend_idle = this.hubAutoSuspendIdle;
+    if (ok('server.hub.idle_suspend_after')) hub.idle_suspend_after = this.hubIdleSuspendAfter;
     // Only a start timing the user changed is sent: a settings.yaml save
     // that sends any start key is range-checked on the merged values, so
     // sending them all would let a stored out-of-range value block an
@@ -3358,6 +3519,8 @@ export class ScionPageAdminServerConfig extends LitElement {
     if (ok('server.broker.broker_name')) broker.broker_name = this.brokerName || '';
     if (ok('server.broker.broker_nickname')) broker.broker_nickname = this.brokerNickname || '';
     if (ok('server.broker.auto_provide')) broker.auto_provide = this.brokerAutoProvide;
+    const fileBrokerInstances = this.brokerInstancesForPayload(ok);
+    if (fileBrokerInstances !== undefined) broker.instances = fileBrokerInstances;
     server.broker = broker;
 
     // Database
@@ -3540,6 +3703,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       // toggle, telemetry and auto-expose defaults, hub agent defaults,
       // agent_secrets.user_scope_only); drop this tab's cached copy.
       invalidatePublicSettings();
+      void getPublicSettings();
 
       const result = (await res.json()) as {
         reload?: ReloadResult;
@@ -4028,6 +4192,7 @@ export class ScionPageAdminServerConfig extends LitElement {
       }
       // Like a save, a reset can change GET /api/v1/settings/public.
       invalidatePublicSettings();
+      void getPublicSettings();
       this.resetConfirmSection = null;
       await this.loadConfig();
       this.successMessage = `Section "${sectionName}" has been reset to deployment configuration.`;
@@ -4366,6 +4531,12 @@ export class ScionPageAdminServerConfig extends LitElement {
                   (${this.placementIssues.errors.map((e) => e.path).join(', ')}).
                 </div>`
               : nothing}
+            ${this.hasBrokerInstanceErrors
+              ? html`<div class="error broker-instances-blocked" style="margin-bottom:0.75rem;">
+                  Cannot save: fix the Runtime Broker instance values marked as invalid
+                  (${this.brokerInstanceIssues.errors.map((e) => e.path).join(', ')}).
+                </div>`
+              : nothing}
             ${this.hasResourceQuantityErrors
               ? html`<div class="error resource-quantity-blocked" style="margin-bottom:0.75rem;">
                   Cannot save: fix the resource values marked as invalid
@@ -4378,7 +4549,8 @@ export class ScionPageAdminServerConfig extends LitElement {
                 ?loading=${this.saving}
                 ?disabled=${this.hasHarnessConfigErrors ||
                 this.hasResourceQuantityErrors ||
-                this.hasPlacementErrors}
+                this.hasPlacementErrors ||
+                this.hasBrokerInstanceErrors}
                 @click=${() => {
                   void this.handleSave();
                 }}
@@ -5141,6 +5313,54 @@ export class ScionPageAdminServerConfig extends LitElement {
           </div>
         </div>
       </div>
+
+      ${this.renderBrokerPolicySection()}
+    `;
+  }
+
+  private renderBrokerPolicySection() {
+    const expEnabled = isFeatureEnabled(ADMIN_MANAGED_BROKERS_FLAG);
+    if (!expEnabled) {
+      if (this.brokerPolicyAdminManagedOnly !== true) {
+        return nothing;
+      }
+      return html`
+        <div class="section" data-section="broker-policy-mismatch">
+          <h3 class="section-title">Runtime Broker Policy</h3>
+          <sl-alert variant="warning" open data-broker-policy-mismatch>
+            <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+            <code>broker_policy.admin_managed_only</code> is stored as <strong>true</strong>, but
+            experiment <code>${ADMIN_MANAGED_BROKERS_FLAG}</code> is off. The admin-managed-only
+            Runtime Broker policy is not currently enforced. Enable the experiment on
+            <a href="/admin/experiments">Admin &gt; Experiments</a> to activate enforcement.
+          </sl-alert>
+        </div>
+      `;
+    }
+    return html`
+      <!-- Card: Runtime Broker Policy -->
+      <div class="section" data-section="broker-policy">
+        <h3 class="section-title">Runtime Broker Policy</h3>
+        <div class="form-grid">
+          <div class="form-field full-width">
+            ${this.renderTriStateSwitch({
+              key: 'broker_policy.admin_managed_only',
+              label: 'Require admin-managed Runtime Brokers only',
+              value: this.brokerPolicyAdminManagedOnly,
+              loaded: this.loadedBrokerPolicyAdminManagedOnly,
+              unsetChecked: false,
+              unsetLabel: 'Not set (default: off)',
+              set: (v) => (this.brokerPolicyAdminManagedOnly = v),
+            })}
+            <span class="hint"
+              >When on, only hub administrators may register new Runtime Brokers (using
+              <code>--admin-managed</code>), non-approved brokers cannot be registered or used for
+              new workloads, and existing agents on non-approved brokers cannot be started, resumed,
+              restarted, or woken. Embedded and auto-provide brokers remain eligible.</span
+            >
+          </div>
+        </div>
+      </div>
     `;
   }
 
@@ -5399,6 +5619,45 @@ export class ScionPageAdminServerConfig extends LitElement {
                   placeholder="5m"
                   @sl-input=${(e: Event) => {
                     this.hubStalledThreshold = (e.target as HTMLInputElement).value;
+                  }}
+                ></sl-input>`
+            )}
+          </div>
+          <div class="form-field">
+            ${this.renderFieldValue(
+              'server.hub.auto_suspend_idle',
+              this.hubAutoSuspendIdle ? 'Enabled' : 'Disabled',
+              html`${this.renderEnvBadge('server.hub.auto_suspend_idle')}<sl-switch
+                  ?checked=${this.hubAutoSuspendIdle}
+                  @sl-change=${(e: Event) => {
+                    this.hubAutoSuspendIdle = (e.target as HTMLInputElement).checked;
+                  }}
+                  >Auto-suspend idle agents</sl-switch
+                >`
+            )}
+            <span class="hint" data-testid="auto-suspend-idle-hint"
+              >When enabled, agents that report idle or completed (or a harness error) for longer
+              than Idle Suspend After are suspended (container stopped, session preserved). A
+              message, mention, notification or scheduled message for an agent the hub suspended
+              resumes it. Takes effect only while the lifecycle.idle_suspend experiment is on. An
+              idle suspend that does not finish is completed or abandoned by the hub
+              automatically.</span
+            >
+          </div>
+          <div class="form-field">
+            <label>Idle Suspend After</label>
+            <span class="hint" data-testid="idle-suspend-after-hint"
+              >How long an agent stays idle or completed before it is suspended (e.g. 15m, 1h).
+              Minimum 5m; a shorter value is ignored and the 15m default applies.</span
+            >
+            ${this.renderFieldValue(
+              'server.hub.idle_suspend_after',
+              this.hubIdleSuspendAfter || '15m (default)',
+              html`${this.renderEnvBadge('server.hub.idle_suspend_after')}<sl-input
+                  value=${this.hubIdleSuspendAfter}
+                  placeholder="15m"
+                  @sl-input=${(e: Event) => {
+                    this.hubIdleSuspendAfter = (e.target as HTMLInputElement).value;
                   }}
                 ></sl-input>`
             )}
@@ -6945,7 +7204,742 @@ export class ScionPageAdminServerConfig extends LitElement {
           </div>
         </div>
       </div>
+      ${this.renderBrokerInstancesSection()}
     `;
+  }
+
+  private brokerInstancesForPayload(
+    ok: (key: string) => boolean
+  ): V1RuntimeBrokerInstanceConfig[] | null | undefined {
+    if (!ok('server.broker.instances') || !this.brokerInstancesTouched) {
+      return undefined;
+    }
+    if (this.brokerInstances.length === 0) {
+      return this.loadedBrokerInstances.length > 0 ? null : undefined;
+    }
+    if (JSON.stringify(this.brokerInstances) === JSON.stringify(this.loadedBrokerInstances)) {
+      return undefined;
+    }
+    return this.brokerInstances;
+  }
+
+  private brokerInstanceMapRows(rowId: number, rt: V1RuntimeTargetConfig): Array<[string, string]> {
+    let rows = this.brokerInstanceNodeSelectorRows.get(rowId);
+    if (!rows) {
+      rows = Object.entries(rt.node_selector ?? {});
+      this.brokerInstanceNodeSelectorRows.set(rowId, rows);
+    }
+    return rows;
+  }
+
+  private setBrokerInstanceMapRows(
+    idx: number,
+    rowId: number,
+    rows: Array<[string, string]>
+  ): void {
+    this.brokerInstanceNodeSelectorRows.set(rowId, rows);
+    const map: Record<string, string> = {};
+    for (const [k, v] of rows) if (k !== '') map[k] = v;
+    this.updateBrokerInstanceTargetValue(
+      idx,
+      'node_selector',
+      Object.keys(map).length > 0 ? map : undefined
+    );
+  }
+
+  private isLoadedBrokerInstanceRow(idx: number): boolean {
+    const rowId = this.brokerInstanceRowIds[idx];
+    return rowId !== undefined && this.loadedBrokerInstanceRowIds.has(rowId);
+  }
+
+  private updateBrokerInstanceTopField(idx: number, field: 'key' | 'name', value: string): void {
+    if (field === 'key' && this.isLoadedBrokerInstanceRow(idx)) {
+      return;
+    }
+    const next = this.brokerInstances.map((inst, i) =>
+      i === idx ? { ...inst, [field]: value } : inst
+    );
+    this.brokerInstances = next;
+    this.brokerInstancesTouched = true;
+  }
+
+  private updateBrokerInstanceTargetValue(idx: number, field: string, value: unknown): void {
+    if (field === 'namespace' && this.isLoadedBrokerInstanceRow(idx)) {
+      return;
+    }
+    const next = this.brokerInstances.map((inst, i) => {
+      if (i !== idx) return inst;
+      const rt: V1RuntimeTargetConfig = { ...(inst.runtime_target ?? { type: 'docker' }) };
+      if (value === undefined || value === '') {
+        delete rt[field];
+      } else {
+        rt[field] = value;
+      }
+      return { ...inst, runtime_target: rt };
+    });
+    this.brokerInstances = next;
+    this.brokerInstancesTouched = true;
+  }
+
+  private async changeBrokerInstanceType(
+    idx: number,
+    rowId: number,
+    select: HTMLSelectElement
+  ): Promise<void> {
+    const nextType = select.value;
+    const inst = this.brokerInstances[idx];
+    if (!inst) return;
+    const prevType = inst.runtime_target?.type || '';
+    if (this.loadedBrokerInstanceRowIds.has(rowId)) {
+      select.value = prevType;
+      return;
+    }
+    if (prevType === nextType) return;
+
+    const rt = inst.runtime_target ?? {};
+    const keysToDrop: string[] = [];
+    if (nextType === 'docker') {
+      keysToDrop.push(
+        ...INSTANCE_KUBERNETES_ONLY_TARGET_KEYS,
+        ...INSTANCE_CLOUDRUN_ONLY_TARGET_KEYS
+      );
+    } else if (isKubernetesRuntimeType(nextType)) {
+      keysToDrop.push(...INSTANCE_CLOUDRUN_ONLY_TARGET_KEYS);
+    } else if (nextType === 'cloudrun') {
+      keysToDrop.push(...INSTANCE_KUBERNETES_ONLY_TARGET_KEYS);
+    }
+
+    const cleared = keysToDrop.filter((k) => {
+      const v = rt[k];
+      if (v === undefined || v === null || v === '') return false;
+      if (v === false && k !== 'safe_to_evict') return false;
+      if (typeof v === 'object' && Object.keys(v).length === 0) return false;
+      return true;
+    });
+
+    if (cleared.length > 0) {
+      const label = inst.key || inst.name || `#${idx + 1}`;
+      const confirmed = await showConfirm(
+        `Changing instance "${label}" to ${nextType} clears these runtime_target fields:\n${cleared.join(', ')}\n\nThey are removed when you save.`,
+        { title: 'Change runtime target type?', confirmText: 'Change type' }
+      );
+      if (!confirmed) {
+        select.value = prevType;
+        return;
+      }
+    }
+
+    const updatedRt: V1RuntimeTargetConfig = { ...(inst.runtime_target ?? {}), type: nextType };
+    for (const k of keysToDrop) {
+      delete updatedRt[k];
+    }
+    if (nextType !== 'kubernetes') {
+      this.brokerInstanceNodeSelectorRows.delete(rowId);
+    }
+
+    const next = this.brokerInstances.map((item, i) =>
+      i === idx ? { ...item, runtime_target: updatedRt } : item
+    );
+    this.brokerInstances = next;
+    this.brokerInstancesTouched = true;
+  }
+
+  private addBrokerInstance(): void {
+    const newInst: V1RuntimeBrokerInstanceConfig = {
+      key: '',
+      name: '',
+      runtime_target: { type: 'docker' },
+    };
+    this.brokerInstances = [...this.brokerInstances, newInst];
+    this.brokerInstanceRowIds = [...this.brokerInstanceRowIds, this.nextBrokerInstanceRowId++];
+    this.brokerInstancesTouched = true;
+  }
+
+  private removeBrokerInstance(idx: number): void {
+    const rowId = this.brokerInstanceRowIds[idx];
+    if (rowId !== undefined) {
+      this.brokerInstanceNodeSelectorRows.delete(rowId);
+      this.loadedBrokerInstanceRowIds.delete(rowId);
+    }
+    this.brokerInstances = this.brokerInstances.filter((_, i) => i !== idx);
+    this.brokerInstanceRowIds = this.brokerInstanceRowIds.filter((_, i) => i !== idx);
+    this.brokerInstancesTouched = true;
+  }
+
+  private get brokerInstanceIssues(): { errors: PlacementIssue[]; warnings: PlacementIssue[] } {
+    const errors: PlacementIssue[] = [];
+    const warnings: PlacementIssue[] = [];
+    if (this.readOnlyReason('server.broker.instances') !== null || !this.brokerInstancesTouched) {
+      return { errors, warnings };
+    }
+    const seenKeys = new Set<string>();
+    this.brokerInstances.forEach((inst, i) => {
+      const p = `server.broker.instances[${i}]`;
+      const key = inst.key ?? '';
+      if (!key || !RUNTIME_BROKER_INSTANCE_KEY_RE.test(key)) {
+        errors.push({
+          path: `${p}.key`,
+          message:
+            'instance key is required (lowercase letters, digits, hyphens; must start and end with alphanumeric, max 63 chars)',
+        });
+      } else if (seenKeys.has(key)) {
+        errors.push({
+          path: `${p}.key`,
+          message: `duplicate instance key "${key}"`,
+        });
+      } else {
+        seenKeys.add(key);
+      }
+
+      if (!inst.name || !inst.name.trim()) {
+        errors.push({
+          path: `${p}.name`,
+          message: 'name is required',
+        });
+      }
+
+      const rt = inst.runtime_target;
+      const rtType = rt?.type ?? '';
+      if (!rtType) {
+        errors.push({
+          path: `${p}.runtime_target.type`,
+          message: 'runtime_target.type is required',
+        });
+        return;
+      }
+
+      if (isKubernetesRuntimeType(rtType) && rt) {
+        const loadedRt = this.loadedBrokerInstances.find((x) => x.key === key)?.runtime_target;
+        const rtPrefix = `${p}.runtime_target`;
+        for (const issue of validateK8sRuntimeFieldsAt(rtPrefix, rt)) {
+          const field = issue.path.slice(`${rtPrefix}.`.length) as keyof K8sRuntimeFields;
+          const same =
+            loadedRt !== undefined && JSON.stringify(loadedRt[field]) === JSON.stringify(rt[field]);
+          (same ? warnings : errors).push(issue);
+        }
+
+        const rowId = this.brokerInstanceRowIds[i];
+        const rows =
+          rowId !== undefined ? this.brokerInstanceNodeSelectorRows.get(rowId) : undefined;
+        if (rows) {
+          const keys = rows.map(([k]) => k);
+          if (keys.some((k, rIdx) => k === '' && rows[rIdx][1] !== '')) {
+            errors.push({
+              path: `${rtPrefix}.node_selector`,
+              message: 'a row has a value but no key',
+            });
+          }
+          if (new Set(keys.filter((k) => k !== '')).size !== keys.filter((k) => k !== '').length) {
+            errors.push({
+              path: `${rtPrefix}.node_selector`,
+              message: 'the same key appears twice',
+            });
+          }
+        }
+      }
+    });
+    return { errors, warnings };
+  }
+
+  private get hasBrokerInstanceErrors(): boolean {
+    return this.brokerInstanceIssues.errors.length > 0;
+  }
+
+  private renderBrokerInstanceIssues(path: string): typeof nothing | TemplateResult {
+    const { errors, warnings } = this.brokerInstanceIssues;
+    const e = errors.filter((i) => i.path === path);
+    const w = warnings.filter((i) => i.path === path);
+    if (e.length === 0 && w.length === 0) return nothing;
+    return html`${e.map(
+      (i) => html`<span class="field-error" data-broker-instance-error=${path}>${i.message}</span>`
+    )}${w.map(
+      (i) =>
+        html`<span class="hint field-warning" data-broker-instance-warning=${path}
+          >${i.message} (stored value; the hub saves it with a warning)</span
+        >`
+    )}`;
+  }
+
+  private instanceK8sPlacementHasValues(rt: V1RuntimeTargetConfig): boolean {
+    return (
+      Object.keys(rt.node_selector ?? {}).length > 0 ||
+      (rt.tolerations ?? []).length > 0 ||
+      !!rt.runtime_class_name
+    );
+  }
+
+  private renderDefaultUserRoleControl() {
+    const customDefaultRoleEnabled = isFeatureEnabled(CUSTOM_DEFAULT_USER_ROLE_FLAG);
+    const eligibleRoles = customDefaultRoleEnabled ? this.eligibleDefaultRoles : [];
+    const isBuiltinRole =
+      !this.authDefaultUserRole ||
+      this.authDefaultUserRole === 'member' ||
+      this.authDefaultUserRole === 'viewer';
+    const hasUnavailableConfiguredRole =
+      !isBuiltinRole && !eligibleRoles.some((r) => r.name === this.authDefaultUserRole);
+
+    return html`
+      ${this.renderFieldValue(
+        'server.auth.default_user_role',
+        this.authDefaultUserRole,
+        html`${this.renderEnvBadge('server.auth.default_user_role')}<sl-select
+            class="default-user-role-select"
+            value=${this.authDefaultUserRole}
+            @sl-change=${(e: Event) => {
+              this.authDefaultUserRole = (e.target as HTMLSelectElement).value;
+            }}
+          >
+            <sl-option value="member">Member</sl-option>
+            <sl-option value="viewer">Viewer</sl-option>
+            ${eligibleRoles.length > 0 || hasUnavailableConfiguredRole
+              ? html`<sl-divider></sl-divider>`
+              : nothing}
+            ${eligibleRoles.map(
+              (role) => html`
+                <sl-option value=${role.name}>
+                  ${role.name}${role.description ? ` — ${role.description}` : ''}
+                </sl-option>
+              `
+            )}
+            ${hasUnavailableConfiguredRole
+              ? html`
+                  <sl-option value=${this.authDefaultUserRole} disabled>
+                    ${this.authDefaultUserRole} (unavailable)
+                  </sl-option>
+                `
+              : nothing}
+          </sl-select>`
+      )}
+      ${this.defaultUserRoleWarning
+        ? html`<sl-alert
+            class="default-user-role-warning"
+            variant="warning"
+            open
+            style="margin-top: 0.75rem"
+          >
+            <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+            <strong>Fallback active:</strong> ${this.defaultUserRoleWarning.message}
+          </sl-alert>`
+        : nothing}
+    `;
+  }
+
+  private renderBrokerInstancesSection() {
+    if (
+      !isFeatureEnabled(FLAT_BROKERS_FLAG) &&
+      this.brokerInstances.length === 0 &&
+      this.loadedBrokerInstances.length === 0
+    ) {
+      return nothing;
+    }
+    const readOnlyReason = this.readOnlyReason('server.broker.instances');
+    const readOnly = readOnlyReason !== null;
+    return html`
+      <div class="section" data-broker-instances-section>
+        <h3 class="section-title">Runtime Broker Instances</h3>
+        <p class="hint" style="margin-top:-0.5rem;margin-bottom:0.75rem;">
+          Flat Runtime Broker instances configured under <code>server.broker.instances</code>. Each
+          instance registers one Runtime Broker for a single runtime target. Requires restart.
+        </p>
+        ${readOnlyReason ? html`${this.renderReadOnlyBadge(readOnlyReason)}` : nothing}
+        ${this.renderEnvBadgeUnder('server.broker.instances')}
+        ${this.renderFieldErrors('server.broker.instances')}
+        ${this.brokerInstances.length === 0
+          ? html`<p class="hint">No flat Runtime Broker instances configured.</p>`
+          : this.brokerInstances.map((inst, idx) =>
+              this.renderBrokerInstanceCard(inst, idx, readOnly)
+            )}
+        ${!readOnly
+          ? html`
+              <div class="add-entry-row">
+                <sl-button
+                  size="small"
+                  variant="default"
+                  data-add-broker-instance
+                  @click=${() => this.addBrokerInstance()}
+                >
+                  <sl-icon slot="prefix" name="plus-circle"></sl-icon>
+                  Add Instance
+                </sl-button>
+              </div>
+            `
+          : nothing}
+      </div>
+    `;
+  }
+
+  private renderBrokerInstanceCard(
+    inst: V1RuntimeBrokerInstanceConfig,
+    idx: number,
+    readOnly: boolean
+  ) {
+    const rowId = this.brokerInstanceRowIds[idx] ?? idx;
+    const isSavedInstance = this.loadedBrokerInstanceRowIds.has(rowId);
+    const identityLocked = readOnly || isSavedInstance;
+    const loadedRt = isSavedInstance
+      ? this.loadedBrokerInstances.find((x) => x.key === inst.key)?.runtime_target
+      : undefined;
+    const rt = inst.runtime_target ?? { type: 'docker' };
+    const rtType = rt.type || 'docker';
+    const isK8s = isKubernetesRuntimeType(rtType);
+    const p = `server.broker.instances[${idx}]`;
+    const title = inst.name || inst.key || `Instance #${idx + 1}`;
+    return html`
+      <sl-card class="runtime-card" data-broker-instance-card=${inst.key || String(idx)}>
+        <div slot="header" style="display:flex;align-items:center;justify-content:space-between;">
+          <div style="display:flex;align-items:center;gap:0.5rem;">
+            <strong>${title}</strong>
+            ${inst.key && inst.name ? html`<code>${inst.key}</code>` : nothing}
+          </div>
+          ${!readOnly
+            ? html`<sl-button
+                size="small"
+                variant="danger"
+                data-remove-broker-instance
+                @click=${() => this.removeBrokerInstance(idx)}
+              >
+                <sl-icon slot="prefix" name="trash"></sl-icon>
+                Remove
+              </sl-button>`
+            : nothing}
+        </div>
+        <div class="form-grid">
+          <div class="form-field">
+            <label>Instance Key</label>
+            <sl-input
+              data-instance-field="key"
+              value=${inst.key || ''}
+              placeholder="e.g. local-docker, cluster-a-agents"
+              ?disabled=${identityLocked}
+              @sl-input=${(e: Event) => {
+                this.updateBrokerInstanceTopField(idx, 'key', (e.target as HTMLInputElement).value);
+              }}
+            ></sl-input>
+            <span class="hint">
+              ${isSavedInstance
+                ? 'Fixed once saved (remove and add a new instance to replace).'
+                : 'Immutable local instance key (lowercase letters, digits, hyphens).'}
+            </span>
+            ${this.renderBrokerInstanceIssues(`${p}.key`)} ${this.renderFieldErrors(`${p}.key`)}
+          </div>
+          <div class="form-field">
+            <label>Broker Name</label>
+            <sl-input
+              data-instance-field="name"
+              value=${inst.name || ''}
+              placeholder="e.g. Workstation Docker"
+              ?disabled=${readOnly}
+              @sl-input=${(e: Event) => {
+                this.updateBrokerInstanceTopField(
+                  idx,
+                  'name',
+                  (e.target as HTMLInputElement).value
+                );
+              }}
+            ></sl-input>
+            <span class="hint">Runtime Broker name registered with the Hub.</span>
+            ${this.renderBrokerInstanceIssues(`${p}.name`)} ${this.renderFieldErrors(`${p}.name`)}
+          </div>
+          <div class="form-field">
+            <label>Runtime Target Type</label>
+            <sl-select
+              data-instance-field="type"
+              value=${rtType}
+              ?disabled=${identityLocked}
+              @sl-change=${(e: Event) => {
+                void this.changeBrokerInstanceType(idx, rowId, e.target as HTMLSelectElement);
+              }}
+            >
+              <sl-option value="docker">docker</sl-option>
+              <sl-option value="kubernetes">kubernetes</sl-option>
+              ${rtType !== 'docker' && rtType !== 'kubernetes'
+                ? html`<sl-option value=${rtType}>${rtType}</sl-option>`
+                : nothing}
+            </sl-select>
+            <span class="hint">
+              ${isSavedInstance
+                ? 'Fixed once saved (changing target type requires a new instance key).'
+                : 'Runtime target substrate for this instance.'}
+            </span>
+            ${this.renderBrokerInstanceIssues(`${p}.runtime_target.type`)}
+            ${this.renderFieldErrors(`${p}.runtime_target.type`)}
+          </div>
+          <div class="form-field">
+            <label>Display Name</label>
+            <sl-input
+              data-instance-field="display_name"
+              value=${rt.display_name || ''}
+              placeholder="e.g. Cluster A"
+              ?disabled=${readOnly}
+              @sl-input=${(e: Event) => {
+                this.updateBrokerInstanceTargetValue(
+                  idx,
+                  'display_name',
+                  (e.target as HTMLInputElement).value
+                );
+              }}
+            ></sl-input>
+            <span class="hint">Optional target label shown in picker and broker views.</span>
+          </div>
+          ${isK8s
+            ? html`
+                <div class="form-field">
+                  <label>Context</label>
+                  <sl-input
+                    data-instance-field="context"
+                    value=${rt.context || ''}
+                    placeholder="e.g. gke_project_region_cluster"
+                    ?disabled=${readOnly}
+                    @sl-input=${(e: Event) => {
+                      this.updateBrokerInstanceTargetValue(
+                        idx,
+                        'context',
+                        (e.target as HTMLInputElement).value
+                      );
+                    }}
+                  ></sl-input>
+                  <span class="hint">
+                    ${isSavedInstance
+                      ? 'Kubernetes context from kubeconfig (must resolve to the same cluster UID; add a new instance key to target another cluster).'
+                      : 'Kubernetes context from kubeconfig (leave empty for current/in-cluster).'}
+                  </span>
+                  ${isSavedInstance && (rt.context || '') !== (loadedRt?.context || '')
+                    ? html`<span
+                        class="hint field-warning"
+                        data-broker-instance-identity-warning="context"
+                        >Pointing context at a different cluster changes target identity and causes
+                        startup refusal; add a new instance key unless this context resolves to the
+                        same cluster UID.</span
+                      >`
+                    : nothing}
+                </div>
+                <div class="form-field">
+                  <label>Namespace</label>
+                  <sl-input
+                    data-instance-field="namespace"
+                    value=${rt.namespace || ''}
+                    placeholder="e.g. agents"
+                    ?disabled=${identityLocked}
+                    @sl-input=${(e: Event) => {
+                      this.updateBrokerInstanceTargetValue(
+                        idx,
+                        'namespace',
+                        (e.target as HTMLInputElement).value
+                      );
+                    }}
+                  ></sl-input>
+                  <span class="hint">
+                    ${isSavedInstance
+                      ? 'Fixed once saved (namespace is part of target identity; add a new instance key to target another namespace).'
+                      : 'Kubernetes namespace for agent pods.'}
+                  </span>
+                </div>
+              `
+            : nothing}
+        </div>
+        ${isK8s ? this.renderBrokerInstanceK8sPlacement(idx, rowId, rt, readOnly) : nothing}
+      </sl-card>
+    `;
+  }
+
+  private renderBrokerInstanceK8sPlacement(
+    idx: number,
+    rowId: number,
+    rt: V1RuntimeTargetConfig,
+    readOnly: boolean
+  ): TemplateResult {
+    const p = `server.broker.instances[${idx}].runtime_target`;
+    const tolerations = rt.tolerations ?? [];
+    const currentTolerations = (): Toleration[] =>
+      (this.brokerInstances[idx]?.runtime_target?.tolerations ?? []).map((x) => ({ ...x }));
+    const setTolerations = (next: Toleration[]) =>
+      this.updateBrokerInstanceTargetValue(idx, 'tolerations', next.length > 0 ? next : undefined);
+    const rows = this.brokerInstanceMapRows(rowId, rt);
+
+    return html`<details class="k8s-placement" ?open=${this.instanceK8sPlacementHasValues(rt)}>
+      <summary>Kubernetes placement</summary>
+      <p class="hint" style="margin:0 0 0.75rem 0;">
+        Kubernetes only. Applies to every agent started on this Runtime Broker instance on its next
+        start.
+      </p>
+      <div class="form-grid">
+        <div class="form-field full-width">
+          <label>Node selector</label>
+          <span class="hint">Node labels agent pods must match (label key to value).</span>
+          <div class="k8s-rows" data-k8s-field="node_selector">
+            ${rows.map(
+              ([k, v], i) =>
+                html`<div class="k8s-row">
+                  <sl-input
+                    class="k8s-key"
+                    size="small"
+                    value=${k}
+                    placeholder="e.g. scion.dev/pool"
+                    ?disabled=${readOnly}
+                    @sl-input=${(e: Event) => {
+                      const next = this.brokerInstanceMapRows(rowId, rt).map(
+                        (r) => [...r] as [string, string]
+                      );
+                      next[i][0] = (e.target as HTMLInputElement).value;
+                      this.setBrokerInstanceMapRows(idx, rowId, next);
+                    }}
+                  ></sl-input>
+                  <sl-input
+                    class="k8s-value"
+                    size="small"
+                    value=${v}
+                    placeholder="e.g. agents"
+                    ?disabled=${readOnly}
+                    @sl-input=${(e: Event) => {
+                      const next = this.brokerInstanceMapRows(rowId, rt).map(
+                        (r) => [...r] as [string, string]
+                      );
+                      next[i][1] = (e.target as HTMLInputElement).value;
+                      this.setBrokerInstanceMapRows(idx, rowId, next);
+                    }}
+                  ></sl-input>
+                  ${!readOnly
+                    ? html`<sl-icon-button
+                        class="k8s-remove"
+                        name="x-lg"
+                        label="Remove"
+                        @click=${() =>
+                          this.setBrokerInstanceMapRows(
+                            idx,
+                            rowId,
+                            this.brokerInstanceMapRows(rowId, rt).filter((_, j) => j !== i)
+                          )}
+                      ></sl-icon-button>`
+                    : nothing}
+                </div>`
+            )}
+            ${!readOnly
+              ? html`<sl-button
+                  class="k8s-add"
+                  size="small"
+                  @click=${() =>
+                    this.setBrokerInstanceMapRows(idx, rowId, [
+                      ...this.brokerInstanceMapRows(rowId, rt),
+                      ['', ''],
+                    ])}
+                  >Add</sl-button
+                >`
+              : nothing}
+          </div>
+          ${this.renderBrokerInstanceIssues(`${p}.node_selector`)}
+          ${this.renderFieldErrors(`${p}.node_selector`)}
+        </div>
+        <div class="form-field full-width">
+          <label>Tolerations</label>
+          <span class="hint">Taints agent pods tolerate. Exists matches any value.</span>
+          <div class="k8s-rows" data-k8s-field="tolerations">
+            ${tolerations.map(
+              (t, i) =>
+                html`<div class="k8s-row">
+                  <sl-input
+                    class="tol-key"
+                    size="small"
+                    value=${t.key ?? ''}
+                    placeholder="key"
+                    ?disabled=${readOnly}
+                    @sl-input=${(e: Event) => {
+                      const next = currentTolerations();
+                      const v = (e.target as HTMLInputElement).value;
+                      if (v) next[i].key = v;
+                      else delete next[i].key;
+                      setTolerations(next);
+                    }}
+                  ></sl-input>
+                  <sl-select
+                    class="tol-operator"
+                    size="small"
+                    value=${t.operator || 'Equal'}
+                    ?disabled=${readOnly}
+                    @sl-change=${(e: Event) => {
+                      const next = currentTolerations();
+                      next[i].operator = (e.target as HTMLSelectElement).value;
+                      if (next[i].operator === 'Exists') delete next[i].value;
+                      setTolerations(next);
+                    }}
+                  >
+                    <sl-option value="Equal">Equal</sl-option>
+                    <sl-option value="Exists">Exists</sl-option>
+                  </sl-select>
+                  <sl-input
+                    class="tol-value"
+                    size="small"
+                    value=${t.value ?? ''}
+                    placeholder="value"
+                    ?disabled=${readOnly || t.operator === 'Exists'}
+                    @sl-input=${(e: Event) => {
+                      const next = currentTolerations();
+                      const v = (e.target as HTMLInputElement).value;
+                      if (v) next[i].value = v;
+                      else delete next[i].value;
+                      setTolerations(next);
+                    }}
+                  ></sl-input>
+                  <sl-select
+                    class="tol-effect"
+                    size="small"
+                    value=${t.effect || 'any'}
+                    ?disabled=${readOnly}
+                    @sl-change=${(e: Event) => {
+                      const next = currentTolerations();
+                      const v = (e.target as HTMLSelectElement).value;
+                      if (v && v !== 'any') next[i].effect = v;
+                      else delete next[i].effect;
+                      setTolerations(next);
+                    }}
+                  >
+                    <sl-option value="any">any effect</sl-option>
+                    <sl-option value="NoSchedule">NoSchedule</sl-option>
+                    <sl-option value="PreferNoSchedule">PreferNoSchedule</sl-option>
+                    <sl-option value="NoExecute">NoExecute</sl-option>
+                  </sl-select>
+                  ${!readOnly
+                    ? html`<sl-icon-button
+                        class="k8s-remove"
+                        name="x-lg"
+                        label="Remove"
+                        @click=${() =>
+                          setTolerations(currentTolerations().filter((_, j) => j !== i))}
+                      ></sl-icon-button>`
+                    : nothing}
+                </div>`
+            )}
+            ${!readOnly
+              ? html`<sl-button
+                  class="k8s-add"
+                  size="small"
+                  @click=${() => setTolerations([...currentTolerations(), { operator: 'Equal' }])}
+                  >Add</sl-button
+                >`
+              : nothing}
+          </div>
+          ${this.renderBrokerInstanceIssues(`${p}.tolerations`)}
+          ${this.renderFieldErrors(`${p}.tolerations`)}
+        </div>
+        <div class="form-field">
+          <label>Runtime class</label>
+          <sl-input
+            class="k8s-runtime_class_name"
+            value=${rt.runtime_class_name ?? ''}
+            placeholder="e.g. gvisor"
+            ?disabled=${readOnly}
+            @sl-input=${(e: Event) =>
+              this.updateBrokerInstanceTargetValue(
+                idx,
+                'runtime_class_name',
+                (e.target as HTMLInputElement).value
+              )}
+          ></sl-input>
+          <span class="hint">Set sandbox RuntimeClasses such as gVisor here, not on agents.</span>
+          ${this.renderBrokerInstanceIssues(`${p}.runtime_class_name`)}
+          ${this.renderFieldErrors(`${p}.runtime_class_name`)}
+        </div>
+      </div>
+    </details>`;
   }
 
   private renderDataTab() {
@@ -7157,25 +8151,24 @@ export class ScionPageAdminServerConfig extends LitElement {
                   <strong>cannot create projects</strong> (including cloning). Viewers can still be
                   added to projects and work there according to their project role.
                 </li>
+                ${isFeatureEnabled(CUSTOM_DEFAULT_USER_ROLE_FLAG)
+                  ? html`
+                      <li>
+                        <strong>Custom system roles:</strong> eligible custom system-scope roles can
+                        be selected instead of Member or Viewer. A custom default role replaces the
+                        built-in <code>hub-member</code> grant rather than adding to it. If a
+                        configured custom role is removed or becomes ineligible, new users fall back
+                        to Member.
+                      </li>
+                    `
+                  : nothing}
               </ul>
               <p>
                 This is also the role given to an admin who is removed from Admin Emails. Change an
                 individual user's role on <a href="/admin/users">Admin &gt; Users</a>.
               </p>
             </div>
-            ${this.renderFieldValue(
-              'server.auth.default_user_role',
-              this.authDefaultUserRole,
-              html`${this.renderEnvBadge('server.auth.default_user_role')}<sl-select
-                  value=${this.authDefaultUserRole}
-                  @sl-change=${(e: Event) => {
-                    this.authDefaultUserRole = (e.target as HTMLSelectElement).value;
-                  }}
-                >
-                  <sl-option value="member">Member</sl-option>
-                  <sl-option value="viewer">Viewer</sl-option>
-                </sl-select>`
-            )}
+            ${this.renderDefaultUserRoleControl()}
           </div>
         </div>
       </div>
@@ -7633,9 +8626,29 @@ export class ScionPageAdminServerConfig extends LitElement {
             ></sl-textarea>
             ${this.renderFieldErrors('server.github_app.private_key')}
             ${this.githubAppHasPrivateKey
-              ? html`<span style="font-size: 0.75rem; color: var(--scion-success-text, #166534);"
-                  >Stored as hub secret: GITHUB_APP_PRIVATE_KEY</span
+              ? html`<span
+                  data-github-app-key-source
+                  style="font-size: 0.75rem; color: var(--scion-success-text, #166534);"
+                  >${this.githubAppPrivateKeySource === 'config'
+                    ? 'Active key source: server configuration / environment'
+                    : this.githubAppPrivateKeySource === 'file'
+                      ? 'Active key source: private key file (private_key_path)'
+                      : 'Stored as hub secret: GITHUB_APP_PRIVATE_KEY'}</span
                 >`
+              : ''}
+            ${this.githubAppPrivateKeyOverridesSecret
+              ? html`<div
+                  class="status-message warning"
+                  data-github-app-key-override-warning
+                  style="margin-top: 0.5rem; margin-bottom: 0;"
+                >
+                  A configured private key
+                  (${this.githubAppPrivateKeySource === 'file'
+                    ? 'private_key_path'
+                    : 'server configuration / environment'})
+                  is overriding the stored hub secret (GITHUB_APP_PRIVATE_KEY). Remove the
+                  configured private key or private_key_path to use the key uploaded here.
+                </div>`
               : ''}
           </div>
           <div class="form-field">
@@ -7665,7 +8678,11 @@ export class ScionPageAdminServerConfig extends LitElement {
           </div>
           <div class="form-field">
             <label>Webhooks</label>
-            <span class="hint">Enable to receive installation lifecycle events from GitHub</span>
+            <span class="hint"
+              >Indicates webhooks are configured on GitHub: adjusts background installation health
+              checks from every 6 hours to every 24 hours. Incoming webhooks are accepted whenever a
+              webhook secret is configured.</span
+            >
             ${this.renderFieldValue(
               'server.github_app.webhooks_enabled',
               this.githubAppWebhooksEnabled ? 'Enabled' : 'Disabled',
@@ -7802,10 +8819,11 @@ export class ScionPageAdminServerConfig extends LitElement {
                               <span
                                 style="font-size: 0.6875rem; padding: 0.125rem 0.5rem; border-radius: 9999px; background: ${inst.status ===
                                 'active'
-                                  ? '#dcfce7'
-                                  : '#fef2f2'}; color: ${inst.status === 'active'
-                                  ? '#166534'
-                                  : '#991b1b'};"
+                                  ? 'var(--scion-badge-success-bg, #dcfce7)'
+                                  : 'var(--scion-error-bg, #fef2f2)'}; color: ${inst.status ===
+                                'active'
+                                  ? 'var(--scion-badge-success-text, #166534)'
+                                  : 'var(--scion-error-text, #991b1b)'};"
                               >
                                 ${inst.status}
                               </span>
@@ -7879,6 +8897,8 @@ export class ScionPageAdminServerConfig extends LitElement {
         this.githubAppApiBaseUrl = data.api_base_url || '';
         this.githubAppWebhooksEnabled = data.webhooks_enabled;
         this.githubAppHasPrivateKey = data.has_private_key;
+        this.githubAppPrivateKeySource = data.private_key_source || '';
+        this.githubAppPrivateKeyOverridesSecret = Boolean(data.private_key_overrides_secret);
         this.githubAppHasWebhookSecret = data.has_webhook_secret;
         this.githubAppInstallationUrl = data.installation_url || '';
         this.githubAppRateLimit = data.rate_limit || null;

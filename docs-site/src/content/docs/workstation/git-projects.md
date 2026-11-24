@@ -52,6 +52,8 @@ A `scion.dev/clone-url` label must use `https`, `ssh` or `git`. Agents of a proj
 
 When creating a project, Scion associates it with a matching GitHub App installation when the association is authorized: the project's git remote must be on the configured GitHub host (`github.com`, or the host of `github_app.api_base_url` for GitHub Enterprise), the installation must be active and its account must match the remote's owner, and either a Hub admin binds the installation to the project (`PUT /api/v1/projects/{id}/github-installation`) or your user-scope `GITHUB_TOKEN` secret has at least `pull` access to that repository on GitHub (`pull`-only proof yields a read-only installation token; `push` access is required for write permissions). This authorization is checked both when the association is recorded and at every token mint. The system maintains a background refresh loop for installation tokens, and the `sciontool` credential helper provides fresh tokens to `git` on-demand inside the agent container.
 
+Hub admins setting up the App for the first time should follow [GitHub App Setup](/scion/hosted/single-node/github-app/).
+
 ### Option B: Personal Access Tokens
 
 Scion uses a GitHub **fine-grained Personal Access Token (PAT)** to clone repositories over HTTPS inside agent containers. Fine-grained PATs are preferred over classic tokens because they can be scoped to specific repositories.
@@ -127,8 +129,9 @@ Once your project is created, you can configure its settings via the Web Dashboa
 3. Click the **Settings** gear icon to configure:
    - **General**: Update the project description or default branch.
    - **Limits**: Set maximum concurrency, maximum execution duration, and workspace storage limits. These limits automatically prepopulate the agent creation form.
-   - **Resources**: Manage runtime brokers and message broker plugins available to agents in this project.
-   - **Secrets**: Manage project-scoped secrets, such as API keys and PATs.
+   - **Agent Resources**: Set default CPU, memory, and disk requests and limits for new agents.
+   - **Runtime Brokers**: Manage Runtime Brokers available to agents in this project.
+   - **Project Resources** (**Secrets** tab): Manage project-scoped secrets, such as API keys and PATs.
 
 ---
 
@@ -244,7 +247,7 @@ Or create a Pull Request directly from the branch on GitHub.
 
 If you link a local checkout to a **remote** Hub, the workspace strategy changes: even if the broker machine has the repository on disk, agents use clone-based provisioning, unless the project was created with worktree-per-agent mode (requires git 2.48+ on the broker). This means you need a `GITHUB_TOKEN` secret set on the project for private repositories, just like a project created from a URL.
 
-On the local workstation Hub, a git project that `scion hub link` (or the automatic link) creates gets workspace mode `worktree-per-agent`, so new agents get a git worktree of your checkout. A project that already existed on the Hub keeps its mode. This needs git 2.48 or later. If git is older, or the checkout's `origin` does not match the project's repository, agent creation fails with an error instead of falling back to a clone. Agents on a Kubernetes runtime do not use the checkout. A repository linked there before local worktrees existed keeps cloning until it is re-linked. See [Linked git projects](/scion/local/workspace/#linked-git-projects).
+On the local workstation Hub, a git project that `scion hub link` (or the automatic link) creates gets workspace mode `worktree-per-agent`, so new agents get a git worktree of your checkout. A project that already existed on the Hub keeps its mode. This needs git 2.48 or later. If git is older, or the checkout's `origin` does not match the project's repository, agent creation fails with an error instead of falling back to a clone. Agents on a Kubernetes runtime do not use the checkout, and Cloud Run Instances refuses `worktree-per-agent` (`412 Precondition Failed`). A repository linked there before local worktrees existed keeps cloning until it is re-linked. See [Linked git projects](/scion/local/workspace/#linked-git-projects).
 
 ---
 

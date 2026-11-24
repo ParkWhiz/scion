@@ -76,6 +76,16 @@ func flatTargetTypeCheck(targetType string) (experiment string, canonical bool) 
 	return "", true
 }
 
+// flatCloudRunBroker reports whether broker is a flat Runtime Broker bound to
+// a canonical Cloud Run runtime target, via flatTargetTypeCheck.
+func flatCloudRunBroker(broker *store.RuntimeBroker) bool {
+	if broker == nil || !broker.IsFlat() || broker.RuntimeTarget == nil {
+		return false
+	}
+	exp, canonical := flatTargetTypeCheck(broker.RuntimeTarget.Type)
+	return exp == experiments.FlatCloudRunTarget && canonical
+}
+
 // maxEchoedRuntimeTargetType bounds the runtime target type a refusal echoes:
 // the value is untrusted Runtime Broker input.
 const maxEchoedRuntimeTargetType = 64
@@ -516,6 +526,9 @@ func (s *Server) registerEmbeddedFlat(ctx context.Context, id *brokeridentity.Id
 			b.Endpoint = o.Endpoint
 			b.AutoProvide = o.AutoProvide
 			b.LastHeartbeat = time.Now()
+			if b.Health != nil && b.Health.Checks["activation"] == api.BrokerHealthUnavailable {
+				b.Health = nil
+			}
 			// The embedded broker runs in the hub binary, so its version is
 			// the hub's build token, written on every registration.
 			b.Version = hubBuildToken()
@@ -539,10 +552,54 @@ func (s *Server) registerEmbeddedFlat(ctx context.Context, id *brokeridentity.Id
 	if err := brokeridentity.CheckActivationAck(id, "embedded", row.ID, row.RuntimeTarget); err != nil {
 		return nil, err
 	}
-	if o.HostIdentity != nil {
+	if flatCloudRunBroker(row) {
+		// Flat Cloud Run agents in passthrough mode run as
+		// runtime_target.service_account, never the Hub host process's own
+		// metadata identity. Write that account as the detected GCP host pair
+		// (admin-pinned values set or cleared via PATCH win with a warning),
+		// clear any pre-I5a stored HostObservation so upgraded rows do not
+		// retain a stale mismatch, and skip recording HostIdentity.
+		if row.HostObservation != nil {
+			if err := s.store.RecordRuntimeBrokerHostObservation(ctx, row.ID, store.HostIdentityObservation{}); err != nil {
+				slog.Warn("failed to clear host identity observation on flat Cloud Run Runtime Broker",
+					"runtime_broker_id", row.ID, "error", err)
+			} else if stored, err := s.store.GetRuntimeBroker(ctx, row.ID); err == nil {
+				row = stored
+			}
+		}
+		if email, projectID := config.FlatCloudRunGCPHostPair(inst); email != "" {
+			applied, err := s.store.SetRuntimeBrokerGCPHostDetected(ctx, row.ID, email, projectID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to update flat Cloud Run Runtime Broker %s GCP host fields: %w", row.ID, err)
+			}
+			if !applied {
+				if !strings.EqualFold(email, row.GCPHostServiceAccountEmail) || projectID != row.GCPHostProjectID {
+					slog.Warn("embedded flat Cloud Run Runtime Broker keeping admin-pinned GCP host pair over configured runtime_target.service_account",
+						"runtime_broker_id", row.ID,
+						"broker_name", row.Name,
+						"configured_email", row.GCPHostServiceAccountEmail,
+						"configured_project_id", row.GCPHostProjectID,
+						"target_service_account", email,
+						"target_project_id", projectID,
+					)
+				}
+			} else if stored, err := s.store.GetRuntimeBroker(ctx, row.ID); err == nil {
+				row = stored
+			}
+		}
+	} else if o.HostIdentity != nil {
 		s.recordHostObservation(ctx, row.ID, *o.HostIdentity)
 		if stored, err := s.store.GetRuntimeBroker(ctx, row.ID); err == nil {
 			row = stored
+		}
+	}
+	if existing != nil {
+		if providers, err := s.store.GetBrokerProjects(ctx, row.ID); err == nil {
+			for _, provider := range providers {
+				if provider.Status != store.BrokerStatusOnline {
+					_ = s.store.UpdateProviderStatus(ctx, provider.ProjectID, row.ID, store.BrokerStatusOnline)
+				}
+			}
 		}
 	}
 	return row, nil
@@ -887,12 +944,12 @@ func checkAgentPinnedPlacement(ctx context.Context, st store.Store, agent *store
 }
 
 // profileDefaultSAUnlessPinned is projectProfileDefaultSA for the create
-// paths: a pinned agent never gets a profile written onto it (the flat
-// contract), so the per-profile default lookup is skipped for it. It reads
-// the in-memory pin set before this point (applyPinnedPlacement), with no
-// broker read, so it cannot fail open.
+// paths: a pinned agent or a hub-direct managed agent never gets a Runtime
+// Broker profile written onto it, so the per-profile default lookup is skipped.
+// It reads the in-memory pin set before this point (applyPinnedPlacement) and
+// the managed-create context marker, with no broker read, so it cannot fail open.
 func (s *Server) profileDefaultSAUnlessPinned(ctx context.Context, agent *store.Agent, runtimeBrokerID string, project *store.Project) (profile, saID string) {
-	if agent.IsPinned() {
+	if agent.IsPinned() || managedAgentCreateFrom(ctx) || isManagedAgentRuntime(agent.Runtime) {
 		return "", ""
 	}
 	requestProfile := ""
@@ -999,6 +1056,11 @@ func brokerRuntimeTargetRefusal(err error) (*brokerStatusError, string, map[stri
 // restart error switch passes through verbatim instead of mapping them to
 // 502: flat Runtime Broker refusals and required-skill resolution failures.
 func relayDispatchRefusal(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, ErrBrokerLacksHomeFiles) || errors.Is(err, ErrHomeFilesEnvGatherDeferred) ||
+		errors.Is(err, ErrHomeFilesCreateNotDeferrable) {
+		writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError, err.Error(), nil)
+		return true
+	}
 	return relayRuntimeTargetError(w, err) || relaySkillResolutionError(w, err)
 }
 
@@ -1053,4 +1115,104 @@ func (s *Server) settleRuntimeTargetRefusal(ctx context.Context, agent *store.Ag
 		return
 	}
 	agent.Message = msg
+}
+
+// MarkEmbeddedFlatRuntimeBrokerOffline marks a previously registered co-located
+// flat Runtime Broker row offline, disconnected, and unhealthy when this host
+// owns the instance and refused activation on startup (ptone/scion#7820).
+// Non-existent, legacy, or non-embedded rows are ignored.
+func (s *Server) MarkEmbeddedFlatRuntimeBrokerOffline(ctx context.Context, brokerID string) error {
+	if s.store == nil || brokerID == "" {
+		return nil
+	}
+	existing, err := s.store.GetRuntimeBroker(ctx, brokerID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if !existing.IsFlat() || existing.Labels[brokerownership.LabelBrokerRole] != brokerownership.BrokerRoleEmbedded {
+		return nil
+	}
+	existing.Status = store.BrokerStatusOffline
+	existing.ConnectionState = "disconnected"
+	existing.ConnectedHubID = nil
+	existing.ConnectedSessionID = nil
+	existing.ConnectedAt = nil
+	existing.Health = &api.BrokerHealthReport{
+		Status: api.BrokerHealthUnhealthy,
+		Checks: map[string]string{"activation": api.BrokerHealthUnavailable},
+	}
+	if err := s.store.UpdateRuntimeBroker(ctx, existing); err != nil {
+		return err
+	}
+	providers, err := s.store.GetBrokerProjects(ctx, brokerID)
+	if err != nil {
+		slog.Warn("Failed to query broker projects on flat instance refusal", "brokerID", brokerID, "error", err)
+		return nil
+	}
+	projectIDs := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		projectIDs = append(projectIDs, provider.ProjectID)
+		if uerr := s.store.UpdateProviderStatus(ctx, provider.ProjectID, brokerID, store.BrokerStatusOffline); uerr != nil {
+			slog.Warn("Failed to mark project provider offline on flat instance refusal", "brokerID", brokerID, "project_id", provider.ProjectID, "error", uerr)
+		}
+	}
+	if s.events != nil {
+		s.events.PublishBrokerDisconnected(ctx, brokerID, projectIDs)
+	}
+	return nil
+}
+
+// brokerDefaultSA returns the project's per-broker default GCP service account
+// ID (ProjectSettings.DefaultGCPIdentityServiceAccountIDByBroker) for an agent
+// targeting runtimeBrokerID. It applies only when experiments.FlatRuntimeBrokers
+// is enabled, the agent is not a hub-direct managed agent, and the target
+// Runtime Broker exists and is flat. Stale entries for deleted (ErrNotFound) or
+// non-flat brokers are ignored at read ("", nil); transient store errors are
+// returned so callers fail closed rather than falling through to a broader default.
+func (s *Server) brokerDefaultSA(ctx context.Context, agent *store.Agent, runtimeBrokerID string, project *store.Project) (string, error) {
+	if agent == nil || project == nil || runtimeBrokerID == "" {
+		return "", nil
+	}
+	if !s.experimentEnabled(experiments.FlatRuntimeBrokers) {
+		return "", nil
+	}
+	if managedAgentCreateFrom(ctx) || isManagedAgentRuntime(agent.Runtime) {
+		return "", nil
+	}
+	byBroker := projectSettingsFromAnnotations(project).DefaultGCPIdentityServiceAccountIDByBroker
+	if len(byBroker) == 0 {
+		return "", nil
+	}
+	saID := strings.TrimSpace(byBroker[runtimeBrokerID])
+	if saID == "" {
+		return "", nil
+	}
+	broker, err := s.store.GetRuntimeBroker(ctx, runtimeBrokerID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	if broker == nil || !broker.IsFlat() {
+		return "", nil
+	}
+	return saID, nil
+}
+
+// brokerDefaultTierFor builds the defaultTier for runtimeBrokerID, using
+// knownBroker's Name when already loaded and otherwise reading it best-effort.
+func (s *Server) brokerDefaultTierFor(ctx context.Context, runtimeBrokerID string, knownBroker *store.RuntimeBroker) defaultTier {
+	if knownBroker != nil && knownBroker.ID == runtimeBrokerID {
+		return brokerDefaultTier(runtimeBrokerID, strings.TrimSpace(knownBroker.Name))
+	}
+	if runtimeBrokerID != "" {
+		if b, err := s.store.GetRuntimeBroker(ctx, runtimeBrokerID); err == nil && b != nil {
+			return brokerDefaultTier(runtimeBrokerID, strings.TrimSpace(b.Name))
+		}
+	}
+	return brokerDefaultTier(runtimeBrokerID, "")
 }

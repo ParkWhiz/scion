@@ -320,7 +320,8 @@ notifications without implementing a separate release-discovery path.
 [`build-release.yml`](../.github/workflows/build-release.yml) runs when a stable, preview,
 release-candidate, or nightly tag is pushed. It:
 
-1. Builds the web UI and cross-compiles Scion for all supported platforms.
+1. Builds the web UI, cross-compiles Scion for all supported platforms, and builds `sciontool`
+   for Linux.
 2. Builds the Linux plugin binaries.
 3. Packages and uploads the build artifacts.
 4. Generates a `SHA256SUMS` checksums file covering every published asset.
@@ -329,11 +330,74 @@ release-candidate, or nightly tag is pushed. It:
    since the previous release in the same channel (see [Release notes](#release-notes)).
 6. Force-updates the matching `stable`, `preview`, or `nightly` channel branch.
 7. Updates the corresponding channel in `LATEST.json` on `main`.
-8. For preview tags only, calls [`publish-homebrew.yml`](../.github/workflows/publish-homebrew.yml)
+8. Calls [`docs-snapshot.yml`](../.github/workflows/docs-snapshot.yml) to build and attach a
+   versioned documentation tarball (`scion-docs-<tag>.tar.gz` and `.sha256`) to the GitHub
+   release (see [Versioned documentation snapshots](#versioned-documentation-snapshots)).
+9. For preview tags only, calls [`publish-homebrew.yml`](../.github/workflows/publish-homebrew.yml)
    (see [Homebrew publishing](#homebrew-publishing)).
 
 Release-candidate tags route to the preview branch and preview manifest entry. They are not
 published to Homebrew.
+
+### Versioned documentation snapshots
+
+The documentation site (`https://googlecloudplatform.github.io/scion/`) serves `main` at the root
+`/scion/<slug>/` path alongside immutable tag snapshots under `/scion/<tag>/<slug>/`:
+
+| Path | Content |
+|------|---------|
+| `/scion/<slug>/` | Latest documentation from `main` (default channel) |
+| `/scion/<tag>/<slug>/` | Immutable snapshot built from `<tag>` (`DOCS_BASE=/scion/<tag>`) |
+| `/scion/main/`, `/scion/stable/`, `/scion/preview/`, `/scion/nightly/` | HTML redirects to the latest `/overview/` page in each channel |
+| `/scion/versions.json` | Channel and version manifest read by the header selectors and outdated-version banner |
+| `/scion/release-notes/**`, `/scion/landing/` | Global pages served from `main` so links in GitHub Release bodies never 404 |
+
+Publishing a versioned snapshot splits across two workflows because the `github-pages` environment
+accepts deployments only from `refs/heads/main`:
+
+1. **Snapshot build (`docs-snapshot.yml`):** Called by `build-release.yml` after creating the
+   GitHub release (or dispatched manually). [`build-release-snapshot.sh`](../scripts/docs/build-release-snapshot.sh)
+   extracts `docs-site/` from `refs/tags/<tag>`, builds the static site with
+   `DOCS_BASE=/scion/<tag> DOCS_CHANNEL=<channel> DOCS_VERSION=<tag>`, verifies with
+   `verify-snapshot-links.mjs` that no unprefixed `/scion/` internal links leaked into the HTML, and
+   uploads `scion-docs-<tag>.tar.gz` and `scion-docs-<tag>.tar.gz.sha256` to the tag's GitHub
+   release.
+2. **Pages assembly (`docs.yml`):** Triggered on pushes to `main` touching `docs-site/` or
+   `scripts/docs/`, on `workflow_dispatch`, and via `workflow_run` when `Build Multi-Arch Release`,
+   `Nightly Release`, `Weekly Preview Release`, or `Build Docs Snapshot` completes with a
+   succeeded `Build and Upload Docs Snapshot` job. [`assemble-pages.mjs`](../docs-site/scripts/assemble-pages.mjs)
+   builds `main`, downloads and verifies SHA-256 checksums and tar paths for all retained release
+   snapshots, writes `/scion/versions.json` and `/scion/{main,stable,preview,nightly}/index.html`,
+   and deploys the combined artifact from `main`.
+
+**Retention policy.** `assemble-pages.mjs` retains:
+
+- **Stable:** all non-draft `vX.Y.Z` releases that carry snapshot assets.
+- **Preview:** the single most recent active `vX.Y.Z-preview.N` or `vX.Y.Z-rc.N` release overall,
+  across all unreleased lines (`maxActivePreviews = 1`). Pre-releases are pruned automatically once
+  their target `vX.Y.Z` is promoted to `stable` (or when a `.0` preview line is superseded by a stable
+  release on the same or higher minor line), even if the older stable release predates docs snapshots.
+- **Nightly:** `nightly-YYYYMMDD` releases from the last 14 days (matching nightly release cleanup).
+
+**Backfilling or rerunning snapshots.** `assemble-pages.mjs` fails closed if a retained release's
+tarball and `.sha256` checksum do not match. To attach snapshots to historical releases (such as
+`v0.3.0` and `v0.4.0-preview.2`) or repair an interrupted asset upload, dispatch
+`docs-snapshot.yml` from `main` with one or more space- or comma-separated tags:
+
+```bash
+gh workflow run docs-snapshot.yml -R GoogleCloudPlatform/scion \
+  -f tags="v0.3.0 v0.4.0-preview.2"
+```
+
+For tags created before native docs versioning landed,
+[`prepare-legacy-snapshot.mjs`](../docs-site/scripts/prepare-legacy-snapshot.mjs) automatically
+overlays the current versioning UI and Sätteri link-rewriter shell onto the extracted tag while
+preserving that tag's own Markdown content, sidebar, and redirects. To test a snapshot build
+locally:
+
+```bash
+./scripts/docs/build-release-snapshot.sh --tag v0.3.0 --out-dir /tmp/scion-docs-out
+```
 
 ### Nightly scheduling workflow
 
@@ -384,7 +448,9 @@ After `build-release.yml` publishes a `vX.Y.Z-preview.N` release, its `publish-h
 [`publish-homebrew.yml`](../.github/workflows/publish-homebrew.yml), which:
 
 1. Checks that the tag is a preview tag and that the `HOMEBREW_SCION_TOKEN` secret is set. Without
-   the secret it skips both steps below with a notice and does not fail the release.
+   the secret the job fails with an error and skips both steps below. The release itself is
+   already published, so only the `Publish to Homebrew` job is red; see "Rerunning a failed
+   publish" below.
 2. Checks out the release tag. The "Verify checkout is the release tag" step fails the job unless
    `git describe --tags --exact-match` prints exactly the tag and the tree's `hack/version.sh`
    stamps exactly that tag, so the images never carry binaries that report `dev`. The job then
@@ -404,10 +470,10 @@ the onboarding wizard on first start.
 Images are tagged only with the release tag, for example
 `ghcr.io/homebrew-scion/scion-claude:v0.3.0-preview.5`, plus the immutable `:<short-sha>` tag that
 `build-images.sh` always adds. Preview publishing never moves `:latest` and adds no `:preview` tag.
-A release build of Scion (`vX.Y.Z`, `vX.Y.Z-preview.N` or `vX.Y.Z-rc.N`) pulls the images tagged
-with its own version when `image_tag` is unset (the `hub.image_tag_version_default` experiment, on
-by default), so a Homebrew install pulls exactly the images this job pushes. Development and
-nightly builds, and an `image_tag` of `latest`, keep `:latest`, which in `ghcr.io/homebrew-scion`
+A release build of Scion (`vX.Y.Z`, `vX.Y.Z-preview.N`, `vX.Y.Z-rc.N` or `nightly-YYYYMMDD`) pulls
+the images tagged with its own version when `image_tag` is unset (the `hub.image_tag_version_default`
+experiment, on by default), so a Homebrew install pulls exactly the images this job pushes. Development
+builds, and an `image_tag` of `latest`, keep `:latest`, which in `ghcr.io/homebrew-scion`
 is an old v0.2 image (harnesses added since have no `:latest` there at all). The version comes
 from the build's version stamp only: a build of a tagged commit with local changes counts as that
 release. The formula caveats name the release-tagged images.
@@ -430,6 +496,15 @@ an edited branch cannot read the secret:
 - **Environment secret only:** jobs in an environment also see repository secrets, so a
   `HOMEBREW_SCION_TOKEN` repository secret would bypass the branch and tag rules. Never add it at
   repository level.
+- **Callers pass the secret:** a reusable workflow sees an environment secret only when its caller
+  passes that secret, at every level of nesting. `build-preview-weekly.yml` calls
+  `build-release.yml` and `build-release.yml` calls `publish-homebrew.yml`, both passing
+  `HOMEBREW_SCION_TOKEN` by name (declared under `on.workflow_call.secrets`; the environment's
+  value takes precedence; `publish-homebrew.yml` marks it required). A new caller on the preview
+  path must pass it too. A direct caller of `publish-homebrew.yml` that omits it fails before any
+  job starts. A caller higher up the chain that omits it passes an empty value, and the gate job
+  fails. Pass it by name rather than with `secrets: inherit`, which the GitHub Actions scan flags.
+  A manual run of `publish-homebrew.yml` from `main` is not nested, so it always sees the secret.
 - **Required reviewers (optional):** GitHub applies them to every run that uses the environment,
   not only to manual dispatches, so each of the three jobs then waits for approval, including on
   the scheduled weekly run.
@@ -510,6 +585,13 @@ The main `scion` binary is published for:
 Linux and macOS artifacts are gzip-compressed tar archives (`.tar.gz`) containing `scion`. Windows
 artifacts are zip archives (`.zip`) containing `scion.exe`. The Telegram, Discord, Slack, and Teams
 plugins are built for Linux on both amd64 and arm64; plugin builds are not published for macOS.
+
+`sciontool`, the in-container helper that runs as PID 1 in agent images, is published for Linux
+only, as `sciontool-linux-amd64.tar.gz` and `sciontool-linux-arm64.tar.gz` (each containing
+`sciontool`). It is built the same way `image-build/scion-base/Dockerfile` builds it: without cgo,
+with `-tags no_embed_web`, stamped with the release version, and checked by
+`image-build/lib/assert-no-cgo.sh`, so it can stand in for the `sciontool` that image builds
+compile. Releases cut before this asset was added do not have it.
 
 ## Release notes
 

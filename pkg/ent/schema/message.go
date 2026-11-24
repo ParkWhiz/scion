@@ -66,13 +66,17 @@ func (Message) Fields() []ent.Field {
 		field.String("group_id").
 			Optional(),
 		// dispatch_state tracks cross-node delivery:
-		// pending|dispatched|failed|deferred|no_recipient (see the
-		// store.MessageDispatch* constants).
+		// pending|dispatched|failed|deferred|no_recipient, plus
+		// delivering|delivered|partial|awaiting_session for a delivery over
+		// conduit (see the store.MessageDispatch* constants).
 		// After Phase 4 (no-queuing delivery), every writer sets the state
 		// explicitly. Only ExecuteAgentDM writes "pending", for the length of its
-		// dispatch; a row stays pending only after a deadline-ambiguous dispatch,
-		// by design (AC-4 of #1689), and brokerMessageSweepHandler reports and
-		// expires it. The schema default applies only to a writer that leaves
+		// dispatch (or background auto-wake), then marks it dispatched or failed —
+		// including when a dispatch deadline expires with an unknown outcome
+		// (ptone/scion#5111). A row stays pending past the threshold only while
+		// queued behind a slow auto-wake or after a fault (AC-3 MarkMessageDispatched
+		// failure or an interrupted dispatch), and brokerMessageSweepHandler reports
+		// and expires it. The schema default applies only to a writer that leaves
 		// the state empty, which the store logs (ptone/scion#4827).
 		field.String("dispatch_state").
 			Default("pending"),
@@ -80,6 +84,42 @@ func (Message) Fields() []ent.Field {
 			Optional().
 			Nillable(),
 		field.Time("dispatched_at").
+			Optional().
+			Nillable(),
+		// delivery_id, delivering_at and delivery_outcome bind the row to
+		// one deliver-message flush over the agent's conduit session
+		// (dispatch_state delivering, delivered or partial; design
+		// .design/conduit/v2.22-deliver-message.md §2.6). delivery_outcome
+		// is the stored answer JSON ({"outcome","stage"}), never text.
+		field.String("delivery_id").
+			Optional().
+			Nillable().
+			MaxLen(64),
+		field.Time("delivering_at").
+			Optional().
+			Nillable(),
+		field.String("delivery_outcome").
+			Optional().
+			Nillable().
+			MaxLen(256),
+		// hold_until, hold_launch_id, not_reached and not_reached_at track
+		// hold-until-session re-drive for deliver-message (ptone/scion#7881,
+		// .design/conduit/v2.22-deliver-message.md §2.5/§2.6). hold_until is
+		// set once via COALESCE and never extended; hold_launch_id pins the
+		// target agent's run_id at send time; not_reached/not_reached_at
+		// record the hub's own proof that /deliver saw router.ErrNoSession.
+		field.Time("hold_until").
+			Optional().
+			Nillable(),
+		field.String("hold_launch_id").
+			Optional().
+			Nillable().
+			MaxLen(128),
+		field.String("not_reached").
+			Optional().
+			Nillable().
+			MaxLen(32),
+		field.Time("not_reached_at").
 			Optional().
 			Nillable(),
 		// channel identifies the integration that originated or targets
@@ -95,6 +135,13 @@ func (Message) Fields() []ent.Field {
 		// conversation_id links this message to a Conversation record.
 		// Populated by backfill (Phase 4) and dual-write (Phase 5).
 		field.UUID("conversation_id", uuid.UUID{}).
+			Optional().
+			Nillable(),
+		// conversation_seq is a commit-ordered, per-conversation monotonic
+		// sequence allocated under the conversation row lock in CreateMessage
+		// (ptone/scion#8136). Nullable for legacy/non-conversation rows;
+		// backfilled on startup for existing conversation messages.
+		field.Int64("conversation_seq").
 			Optional().
 			Nillable(),
 		// sender_project_id / recipient_project_id carry server-derived
@@ -124,6 +171,17 @@ func (Message) Fields() []ent.Field {
 			Optional().
 			Nillable().
 			Immutable(),
+		// scheduled_event_id records the server-derived ScheduledEvent ID for
+		// a message persisted by the scheduler's messageEventHandler
+		// (ptone/scion#7881). Nullable: every client, agent, chat, choice or
+		// broker-inbound message leaves it NULL. Immutable and omitted from
+		// JSON so client-supplied fields (channel, thread_id) can never select
+		// scheduled-authority re-validation.
+		field.String("scheduled_event_id").
+			Optional().
+			Nillable().
+			Immutable().
+			MaxLen(64),
 		field.Time("created").
 			Default(time.Now).
 			Immutable(),
@@ -137,6 +195,12 @@ func (Message) Indexes() []ent.Index {
 		index.Fields("recipient", "recipient_id"),
 		index.Fields("created"),
 		index.Fields("conversation_id"),
+		// Per-conversation commit-ordered sequence for conversation watch
+		// feeds (ptone/scion#8136). Non-unique so older binaries re-stamping
+		// conversation_id after a downgrade cannot hit a unique violation
+		// (preserving additive-only compatibility with no DowngradeFloor bump);
+		// uniqueness is enforced by the transactional allocator and re-stampers.
+		index.Fields("conversation_id", "conversation_seq"),
 		// Native chat tail and history reads must not sort the entire DM on
 		// every unread refresh. Both read-switch paths order by created, id.
 		index.Fields("conversation_id", "channel", "created", "id"),
@@ -178,6 +242,23 @@ func (Message) Indexes() []ent.Index {
 		index.Fields("created", "id").
 			StorageKey("message_failed_created_id").
 			Annotations(entsql.IndexWhere("dispatch_state = 'failed'")),
+		// The stale-delivery sweep finds rows left in delivering (a hub
+		// restart mid-delivery) by delivering_at. Such rows are rare and
+		// short-lived, so a partial index keeps the sweep tiny.
+		index.Fields("delivering_at").
+			StorageKey("message_delivering_at").
+			Annotations(entsql.IndexWhere("dispatch_state = 'delivering'")),
+		// Hold-until-session re-drive (ptone/scion#7881): claims and expiry
+		// sweeps filter on dispatch_state = 'awaiting_session' and order by
+		// created, id (or recipient_id, created, id). Held rows are transient,
+		// so partial indexes keep claims and the 30 s sweep proportional to
+		// held rows rather than the full table.
+		index.Fields("created", "id").
+			StorageKey("message_awaiting_session_created_id").
+			Annotations(entsql.IndexWhere("dispatch_state = 'awaiting_session'")),
+		index.Fields("recipient_id", "created", "id").
+			StorageKey("message_awaiting_session_recipient_created_id").
+			Annotations(entsql.IndexWhere("dispatch_state = 'awaiting_session'")),
 		// The conversation consistency check reads the latest messages of a
 		// DM pair, one query per direction, filtering on sender_id and
 		// recipient_id and ordering by created, id. The single-column

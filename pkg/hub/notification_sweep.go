@@ -53,6 +53,11 @@ func (s *Server) notificationDispatchSweepHandler() func(ctx context.Context) {
 				"count", expired, "maxAge", notificationRetryMaxAge)
 		}
 
+		// Parked notifications of subscribers the hub suspended: wake them
+		// in the background (a primary dispatch's wake may have failed, or
+		// the hub restarted meanwhile); the drain after each wake delivers.
+		s.autoWakeParkedNotificationSubscribers(ctx)
+
 		notifs, err := s.store.GetUndispatchedAgentNotifications(ctx, "")
 		if err != nil {
 			s.agentLifecycleLog.Error("notification-dispatch-sweep: query failed", "error", err)
@@ -430,6 +435,7 @@ func (nd *NotificationDispatcher) retryDispatch(ctx context.Context, notif *stor
 		nd.log.Debug("retry: subscriber is suspended, reverting claim",
 			"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
 		nd.revertClaim(ctx, notif.ID)
+		nd.offerAutoWake(subscriber)
 		return retryNotAttempted, ""
 	}
 
@@ -490,8 +496,33 @@ func (nd *NotificationDispatcher) retryDispatch(ctx context.Context, notif *stor
 	attemptCtx, cancel := context.WithTimeout(ctx, retryDispatchAttemptTimeout)
 	defer cancel()
 	brokerID = subscriber.RuntimeBrokerID
-	nd.recordAttempt(ctx, notif.ID)
-	if err := dispatchWithBrokerRetry(attemptCtx, nd.messageLog, dispatcher, subscriber, notif.Message, false, structuredMsg); err != nil {
+	err = dispatchWithBrokerRetry(
+		attemptCtx,
+		nd.deliveryMarker(),
+		nd.messageLog,
+		dispatcher,
+		subscriber,
+		notif.Message,
+		false,
+		structuredMsg,
+		withBeforeBrokerAttempt(func() { nd.recordAttempt(ctx, notif.ID) }),
+	)
+	if err != nil {
+		var idleErr *errAgentIdleSuspending
+		if errors.As(err, &idleErr) {
+			nd.log.Debug("retry: subscriber is suspending or suspended, reverting claim",
+				"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+			nd.revertClaim(ctx, notif.ID)
+			nd.offerAutoWake(subscriber)
+			return retryNotAttempted, ""
+		}
+		var markErr *errDeliveryMarkFailed
+		if errors.As(err, &markErr) {
+			nd.log.Warn("retry: delivery mark failed before dispatch, reverting claim",
+				"notificationID", notif.ID, "subscriberID", sub.SubscriberID, "error", err)
+			nd.revertClaim(ctx, notif.ID)
+			return retryNotAttempted, ""
+		}
 		outcome = retryFailed
 		// ErrBrokerTimeout: deferred (unroutable) until the attempt timed out.
 		// DeadlineExceeded: the broker call itself ran out the attempt.

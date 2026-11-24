@@ -272,9 +272,9 @@ func (s *Server) listGCPServiceAccountsScoped(w http.ResponseWriter, r *http.Req
 		if len(items) > 0 {
 			profiles = s.projectKubernetesProfileMappings(ctx, req.scopeID)
 		}
-		annotateGCPSAMappings(items, profiles)
+		s.annotateGCPSAMappings(items, profiles)
 		s.annotateGCPSAAssignStatus(ctx, items, req.scopeID, assignReq)
-		warnings = projectSAMappingWarningsFrom(req.scopeID,
+		warnings = s.projectSAMappingWarningsFrom(req.scopeID,
 			func() projectSAMappingView { return projectSAMappingViewFrom(profiles) }, saPtrs...)
 	} else {
 		warnings = s.hubSAMappingWarnings(ctx, saPtrs...)
@@ -613,8 +613,14 @@ func (s *Server) createHubScopedGCPServiceAccount(w http.ResponseWriter, r *http
 		return
 	}
 
+	req.Email = strings.TrimSpace(req.Email)
 	if req.Email == "" {
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "missing required field(s): email", nil)
+		return
+	}
+	if !isValidGCPServiceAccountEmail(req.Email) {
+		writeError(w, http.StatusBadRequest, ErrCodeValidationError,
+			"invalid service account email: must be an email address", nil)
 		return
 	}
 
@@ -643,6 +649,11 @@ func (s *Server) createHubScopedGCPServiceAccount(w http.ResponseWriter, r *http
 				"You must be a hub member to register a hub-scoped service account", nil)
 			return
 		}
+	}
+
+	if code, msg, refused := s.gcpServiceAccountEmailRefusal(req.Email); refused {
+		writeError(w, http.StatusBadRequest, code, msg, nil)
+		return
 	}
 
 	sa := &store.GCPServiceAccount{
@@ -930,6 +941,11 @@ func (s *Server) mintHubScopedGCPServiceAccount(w http.ResponseWriter, r *http.R
 	slog.Info("GCP SA mint (hub scope): SA created and IAM grants succeeded",
 		"sa_email", saEmail, "hub_email", hubEmail, "self_act_as", allowSelfActAs)
 
+	// Workload Identity bindings (hub.k8s_workload_identity_setup): best
+	// effort, after the required grants. A failed grant never fails the
+	// mint; it is reported in the response.
+	wiBindings, warningView := s.hubWorkloadIdentityBindings(r.Context(), saEmail)
+
 	// Store the SA record — only reached when ALL required IAM mutations succeeded.
 	sa := &store.GCPServiceAccount{
 		ID:                 uuid.New().String(),
@@ -962,6 +978,7 @@ func (s *Server) mintHubScopedGCPServiceAccount(w http.ResponseWriter, r *http.R
 	LogGCPTokenGeneration(r.Context(), s.auditLogger, GCPTokenEventMintSA,
 		"", "", saEmail, sa.ID, true, "")
 	s.logGCPServiceAccountRegisterAudit(r.Context(), sa)
+	s.logWorkloadIdentityBindingsAudit(r.Context(), "", sa, wiBindings)
 
 	slog.Info("GCP SA minted (hub scope)",
 		"sa_id", sa.ID, "email", saEmail,
@@ -969,7 +986,8 @@ func (s *Server) mintHubScopedGCPServiceAccount(w http.ResponseWriter, r *http.R
 		"self_act_as", allowSelfActAs)
 
 	writeJSON(w, http.StatusCreated, gcpServiceAccountWithWarnings{
-		GCPServiceAccount: *sa,
-		Warnings:          s.hubSAMappingWarnings(r.Context(), sa),
+		GCPServiceAccount:        *sa,
+		Warnings:                 s.hubSAMappingWarningsFrom(warningView, sa),
+		WorkloadIdentityBindings: wiBindings,
 	})
 }

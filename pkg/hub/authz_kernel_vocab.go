@@ -58,6 +58,13 @@ const (
 	// ActionSetMessagingPolicy covers changing a project's cross-project
 	// inbound messaging policy (project.set_messaging_policy).
 	ActionSetMessagingPolicy Action = "set_messaging_policy"
+	// ActionManageMessagePolicies covers creating, editing, deleting, dry-run
+	// testing, and listing content-free decisions for a project's message
+	// policies (project.manage_message_policies).
+	ActionManageMessagePolicies Action = "manage_message_policies"
+	// ActionReadMessagePolicies covers listing and reading a project's message
+	// policies and surface coverage (project.read_message_policies).
+	ActionReadMessagePolicies Action = "read_message_policies"
 	// ActionManageVisitors covers granting, changing and revoking project
 	// visitor access for federated accounts (project.manage_visitors).
 	ActionManageVisitors Action = "manage_visitors"
@@ -73,6 +80,8 @@ const (
 	// so a system-scoped binding carrying only these IDs does not
 	// silently grant project-level authority.
 	ActionCreateGlobal Action = "create_global"
+	ActionUpdateGlobal Action = "update_global"
+	ActionDeleteGlobal Action = "delete_global"
 
 	// ActionAutoProvide gates turning on a broker's auto-provide setting
 	// (broker.auto_provide).
@@ -106,7 +115,7 @@ type Resource struct {
 
 	// ScopeKind is the resource's own scope classification for resource
 	// types whose records are themselves partitioned by scope: "skill"
-	// (store.SkillScopeGlobal/Core/Project/User), "template"
+	// (store.SkillScopeGlobal/Project/User), "template"
 	// (store.TemplateScopeGlobal/Project/User), and "harness_config"
 	// (store.HarnessConfigScopeGlobal/Project/User). It is distinct from
 	// ParentType/ParentID, which describe project containment for the

@@ -2,7 +2,7 @@
 
 *Generated from Go-native OperationSpec definitions. Do not edit manually.*
 
-**Operations:** 386
+**Operations:** 435
 
 ## Table of Contents
 
@@ -11,6 +11,7 @@
 - [agent.lifecycle.control](#agentlifecyclecontrol) — Start, stop, suspend or restart an agent
 - [agent.lifecycle.restore](#agentlifecyclerestore) — Restore a soft-deleted agent
 - [agent.lifecycle.exec](#agentlifecycleexec) — Run a command in an agent's container
+- [agent.screen.read](#agentscreenread) — Read the terminal screen saved before an agent's most recent suspend
 - [agent.lifecycle.env](#agentlifecycleenv) — Submit environment values to an agent
 - [agent.lifecycle.resetauth](#agentlifecycleresetauth) — Reset an agent's harness authentication
 - [agent.hold.lift](#agentholdlift) — Lift the holds of a suspended agent whose owners are admitted to its project again (hub admin)
@@ -36,7 +37,7 @@
 - [agent.token.refresh](#agenttokenrefresh) — Refresh the calling agent's own hub token
 - [agent.outbound.message](#agentoutboundmessage) — Deliver an outbound message from the calling agent
 - [agent.metrics.report](#agentmetricsreport) — Report runtime metrics for the calling agent
-- [agent.secrets.access](#agentsecretsaccess) — List, read and write the secrets available to the calling agent: its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
+- [agent.secrets.access](#agentsecretsaccess) — List, read, write and delete the secrets available to the calling agent: its own agent-scoped secrets, its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
 - [agent.stopall](#agentstopall) — Stop all running agents on the hub
 - [agent.stopall.project](#agentstopallproject) — Stop all running agents in a project
 - [project.membership.add](#projectmembershipadd) — Add a member to a project with a specified role
@@ -70,7 +71,19 @@
 - [schedule.event.update](#scheduleeventupdate) — Update or resume a recurring schedule of any event type. A user access token needs scheduled_event:update and passes the event type's target checks
 - [schedule.event.pause](#scheduleeventpause) — Pause a recurring schedule. Pausing only stops future runs, so a token with scheduled_event:update is admitted
 - [schedule.event.delete](#scheduleeventdelete) — Cancel a scheduled event or delete a recurring schedule
-- [schedule.event.fire](#scheduleeventfire) — Fire a scheduled message or dispatch_agent event, one-shot or materialized from a recurring schedule, under the authority its revision recorded
+- [schedule.event.fire](#scheduleeventfire) — Fire a scheduled message, dispatch_agent or exec event, one-shot or materialized from a recurring schedule, under the authority its revision recorded. An exec fire (ptone/scion#7883) re-checks agent.attach on the target under the revision's ceiling before its one exec-start; exec-start and exec-status are reached only from the scheduler's exec fire, run tracker and sweeper, never from a request
+- [webhookendpoint.list](#webhookendpointlist) — List webhook endpoints in a project. Agent callers see only webhook endpoints they own (scope=caller)
+- [webhookendpoint.read](#webhookendpointread) — Read a webhook endpoint in a project (never returns the signing secret). An agent caller reading another principal's endpoint receives the same 404 as not-found
+- [webhookendpoint.create](#webhookendpointcreate) — Create a webhook endpoint in a project, minting its one-time HMAC signing secret into a hub-scoped internal secret row. When defaultTrigger is supplied, also creates a default message trigger in the same transaction under trigger.create, webhook_endpoint.read, and message-target authoring checks
+- [webhookendpoint.delete](#webhookendpointdelete) — Delete a webhook endpoint, removing its hub-scoped internal signing secret rows and pausing dependent triggers with status_reason=source_deleted. An agent caller targeting another principal's endpoint receives the same 404 as not-found
+- [trigger.list](#triggerlist) — List triggers or trigger events in a project. Agent callers see only triggers they hold and events received on endpoints they own or fired by triggers they hold (scope=caller)
+- [trigger.read](#triggerread) — Read a trigger definition, a trigger's fire history, or a trigger event in a project. An agent caller reading an event it neither received on its own endpoint nor fired through a trigger it holds receives the same 404 as not-found
+- [trigger.render](#triggerrender) — Dry-run compile and render a trigger's template slots against a stored trigger event without firing or exercising recorded authority. Requires trigger.read on the trigger and read visibility on the event (agents without visibility on the event receive 404)
+- [trigger.create](#triggercreate) — Create an event trigger in a project. Webhook triggers resolve source.id through webhookEndpointAccessDecision(read); GitHub triggers (source.kind=github, source.id="") require hub.github_triggers and an authorized GitHub App association on the project; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents cannot author github.comment triggers or ackComment because github_trigger.comment has no agent scope); all actions pass their target checks
+- [trigger.update](#triggerupdate) — Update or resume a trigger in a project. Agents cannot PATCH triggers; resume and dispatch-affecting updates re-validate the source (webhook endpoint read access or authorized GitHub App association) and action target (a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment, users only in Stage 3) and record the caller's attribution and frozen ceiling
+- [trigger.pause](#triggerpause) — Pause an event trigger. Pausing only stops future fires, so a user access token with trigger:update is admitted
+- [trigger.delete](#triggerdelete) — Delete an event trigger in a project
+- [trigger.fire](#triggerfire) — Fire a matched event trigger's message, dispatch_agent, or github.comment action through the shared fire core under the authority recorded by the trigger's current revision; a dispatch_agent fire re-checks agent.create, CanDelegate, the frozen ceiling and standing, and creates the agent under the recorded principal
 - [artifact.read](#artifactread) — Read an artifact's metadata or file bytes, one by one or as a zip of a version (owner, home-project readers via the scope grant, or principal grants); unreadable artifacts answer 404
 - [artifact.list](#artifactlist) — List the artifacts the caller owns, holds a grant on, or that are shared to a project it is a member of (?mine=1); each row passes the artifact.read check, so an artifact the caller cannot read is omitted, never denied
 - [artifact.create](#artifactcreate) — Create an artifact homed in a project (the caller's own, or ?scope=): a single file published at once (?name=), or a manifest that starts a pending first version (JSON body), whose files are then uploaded and finalized through the artifact.version.upload and artifact.version.finalize routes
@@ -85,6 +98,8 @@
 - [artifact.delete](#artifactdelete) — Delete an artifact with its grants and share links (its files are removed after the hub's grace period); allowed for its managers (the owner or an admin grantee), on an artifact owned by an agent for its stewards (an owner of its home project, or the agent's delegating user who reads there), and, as custodian, for an admin of its home project (project.manage there), each a user whose credential permits artifact.manage in the home project
 - [artifact.version.create](#artifactversioncreate) — Start a pending version of an artifact from a manifest; a review grantee may start review versions only
 - [artifact.review.session.write](#artifactreviewsessionwrite) — Record or end the caller's own review session of an artifact (the heartbeat of a review tab, ptone/scion#6849); 404 while the hub.artifacts_open_review_check experiment is off; any caller who may start a review version passes (the write check of artifact.version.create); rate limited per principal after authorization; the row is always the caller's own; a DELETE that deletes the caller's session row writes a review_session_ended decision-log entry; the Hub keeps the row until the reaper deletes it, at least an hour after its last beat, so this includes a session that no longer counts as open; a DELETE when no such row exists writes none (both answer 204)
+- [artifact.review.draft.read](#artifactreviewdraftread) — Read the caller's own saved draft review of an artifact (200 with draft null when none exists, plus currentSeq; ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); the row is always keyed by the caller's own principal with no administrator, steward, owner or publisher override
+- [artifact.review.draft.write](#artifactreviewdraftwrite) — Create, replace or delete the caller's own saved draft review of an artifact with optimistic rev concurrency (ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); rate limited per principal (LimitDraftWrite) after authorization and before reading the request body; the row is always keyed by the caller's own principal with no override; a DELETE that deletes the caller's draft row writes a review_draft_deleted decision-log entry without content, while a DELETE when no draft exists writes none (both answer 204); draft saves never trigger review notifications
 - [artifact.version.upload](#artifactversionupload) — Upload one manifest file of a pending version; only the principal that started the version may upload to it
 - [artifact.version.finalize](#artifactversionfinalize) — Finalize a pending version once every file has arrived, making it ready (and current unless a later one is); only the principal that started it may finalize it, and a review is checked against its base
 - [artifact.version.view](#artifactversionview) — Get a view URL for a ready version whose entry is HTML: a capability, valid for a limited time, that serves only that version's files under /api/v1/artifacts/view/ in the sandboxed viewer (see the view exemption); the caller needs only the read check
@@ -108,6 +123,12 @@
 - [project.settings.update](#projectsettingsupdate) — Replace a project's settings
 - [project.messagingpolicy.read](#projectmessagingpolicyread) — Read a project's cross-project inbound messaging policy
 - [project.messagingpolicy.update](#projectmessagingpolicyupdate) — Set a project's cross-project inbound messaging policy. The caller also must be an active direct project owner or a local unscoped hub admin
+- [project.messagepolicy.read](#projectmessagepolicyread) — List or read a project's configured message policies and surface coverage declaration (ptone/scion#8047; 404 while hub.message_policies is off)
+- [project.messagepolicy.create](#projectmessagepolicycreate) — Create a message policy on covered outbound surfaces in a project. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+- [project.messagepolicy.update](#projectmessagepolicyupdate) — Update a project message policy, bump its revision, and invalidate its compiled rule cache entry. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+- [project.messagepolicy.delete](#projectmessagepolicydelete) — Delete a project message policy and invalidate its compiled rule cache entry. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+- [project.messagepolicy.test](#projectmessagepolicytest) — Dry-run an inline or stored project message policy against synthetic sample send facts without persisting or echoing message content. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+- [project.messagepolicy.decisions](#projectmessagepolicydecisions) — List content-free message policy evaluation decisions for a project or a single policy. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
 - [project.template.set](#projecttemplateset) — Mark or unmark a project as a template. The caller needs project.update and project.clone on the project
 - [template.project.import](#templateprojectimport) — Discover or import templates into a project
 - [harnessconfig.project.import](#harnessconfigprojectimport) — Discover or import harness configs into a project
@@ -117,7 +138,10 @@
 - [project.github.installation.bind](#projectgithubinstallationbind) — Bind a GitHub App installation to a project (admin only: also requires hub.github_app.update)
 - [project.github.write](#projectgithubwrite) — Change a project's GitHub installation, status check, GitHub permissions and git identity
 - [project.members.assignableroles](#projectmembersassignableroles) — List the roles the caller may assign in a project
+- [project.triggersources.github.read](#projecttriggersourcesgithubread) — Read a project's GitHub trigger source settings, readiness, and repository routing status
+- [project.triggersources.github.update](#projecttriggersourcesgithubupdate) — Update a project's GitHub trigger source unmatched-command reply settings
 - [agent.message.send](#agentmessagesend) — Send a message to an agent
+- [inbox.summary.read](#inboxsummaryread) — Read the caller's aggregated inbox summary across categories (approvals, waiting agents, artifact reviews, chat, decisions). Interactive web sessions and dev credentials receive the full view; user access tokens with inbox:read receive the token view (approvals marked unavailable, excluded from total). Agents, visitors, federated users, and UATs without inbox:read get 403; unsupported methods get 405; 404 while web.inbox_dashboard is off
 - [inbox.message.read](#inboxmessageread) — List and read the caller's own inbox messages. A project token lists only messages of its boundary project
 - [inbox.message.write](#inboxmessagewrite) — Mark the caller's own inbox messages read. Mark-all by a project token touches only messages of its boundary project
 - [inbox.channels.list](#inboxchannelslist) — List the registered message channels: static capability metadata with no records
@@ -199,9 +223,15 @@
 - [chat.attachment.probe](#chatattachmentprobe) — Answer where the caller's attachment uploads go (artifact or legacy) and the delivery budget (ptone/scion#4596). Reads and writes nothing
 - [chat.attachment.download.project](#chatattachmentdownloadproject) — Download a chat attachment of a project. Needs project:read on the project; a session also reads its own uploads and files attached to messages it can read
 - [chat.conversation.promote](#chatconversationpromote) — Promote one of the caller's DMs with an agent into a thread of the agent's space. Needs DM participation, project:read on the agent's project, and the create_thread action of chat-space-access (project.chat_post; 403 chat_post_denied without it); a token also needs inbox:write under the DM rule, and project.chat_post is checked on its holder's account (the project:chat_post selector is not needed)
-- [chat.decision.read](#chatdecisionread) — Read one version of a choice prompt decision. Needs read access to the prompt's conversation (project:read for a thread; the caller in a user slot of a DM key). Agents, visitors and tokens get 403; a missing or unreadable decision is 404. 404 while web.chat_choices is off
-- [chat.decision.answer](#chatdecisionanswer) — Answer a choice prompt decision by choice id (the label is copied from the stored row). Needs the right to send in the prompt's conversation (project:read and project.chat_post for a thread; for a DM, only the user in its key). Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a choice-response message, delivers it to the asking agent and publishes choice.updated. 404 while web.chat_choices is off
-- [chat.choiceprompt.answer](#chatchoicepromptanswer) — Answer every actionable decision of a choice prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows). Needs the right to send in the prompt's conversation (project:read and project.chat_post for a thread; for a DM, only the user in its key). Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one choice-response message in one transaction, delivers it to the asking agent and publishes choice.updated per row. 404 while web.chat_choices is off
+- [chat.decision.read](#chatdecisionread) — Read one version of a decision prompt decision. Needs read access to the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read for a thread; the caller in a user slot of a DM key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403; a missing or unreadable decision is 404. 404 while web.decisions is off
+- [chat.decision.answer](#chatdecisionanswer) — Answer a decision prompt decision by choice id (the label is copied from the stored row) with optional surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a decision-response message, delivers it to the asking agent and publishes decision.updated. 404 while web.decisions is off
+- [chat.decisionprompt.answer](#chatdecisionpromptanswer) — Answer every actionable decision of a decision prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows) with optional surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one decision-response message in one transaction, delivers it to the asking agent and publishes decision.updated per row. 404 while web.decisions is off
+- [chat.secretrequest.read](#chatsecretrequestread) — Read a secret-request card (metadata and per-key status, never secret values) plus canRespond and reason. Requires a signed-in user session, recipient membership on the prompt's conversation, and agent.read on the requesting agent. 404 while hub.agent_secrets is off
+- [chat.secretrequest.fulfill](#chatsecretrequestfulfill) — Fulfill all pending keys of a secret-request card, storing each value at agent scope in the secret backend, notifying the requesting agent via a secret-response message, and emitting fulfilled audit events (never values). Requires a signed-in user session, same-origin browser check, recipient membership, and agent.attach on the requesting agent. 404 while hub.agent_secrets is off
+- [chat.secretrequest.dismiss](#chatsecretrequestdismiss) — Dismiss all or a subset of pending keys on a secret-request card with an optional reason, notifying the requesting agent via a secret-response message and emitting dismissed audit events. Requires a signed-in user session, same-origin browser check, recipient membership, and agent.attach on the requesting agent. 404 while hub.agent_secrets is off
+- [chat.decisionprompt.dismiss](#chatdecisionpromptdismiss) — Dismiss open decisions of a decision prompt without answering, once the version is at least 5 minutes old, with an optional plain-text reason (up to 500 characters) and surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key; a UAT also needs inbox:write and the prompt's project inside its boundary), surviving chat retention purge of the prompt message. Agents get 403 users_only, visitors and non-session/non-UAT credentials get 403, and a user a live asking agent takes no messages from gets 403 MESSAGE_DENIED. A missing or unreadable prompt is 404; a too-recent version is 409 too_recent with details.availableAt; an already-settled prompt is 409 dismiss_changed (with details.availableAt when a listed row is too recent). Records one outcome=dismiss ($dismissed) answer row per dismissed decision with a shared batch id and one decision-response message in one transaction, delivers it to a live asking agent, and reports deliveryStatus: delivered, held (for the agent's next session), gone (stored without failure, not sent), unreachable (a suspended or stopped asker: stored failed, not sent), failed, or none when nothing new was dismissed; and publishes decision.updated per row. 404 while web.decisions is off
+- [chat.projectdecisions.list](#chatprojectdecisionslist) — List pending decision prompts or the append-only recorded answer log for a project, with live waitingOnYou and waitingOnOthers counts and filter facets. Needs project:read on the project, then scopes every prompt, log entry, count, and facet to conversations the caller can read (project topics plus the caller's own canonical DMs with project agents; a UAT token includes DMs only with inbox:read). Agents, visitors and non-session/non-UAT credentials get 403; unsupported methods get 405; 404 while web.decisions is off
+- [chat.userdecisions.list](#chatuserdecisionslist) — List pending decision prompts or recorded decision answers across every project the caller is a member of and can read, with live waitingOnYou and waitingOnOthers counts, sort=project|recent, optional project narrowing, and filter facets (capped at 200 readable member projects with truncatedProjects). Filters candidate member projects by project:read (a project-bounded UAT sees only its boundary project; a UAT without project:read gets 200 with empty results), then scopes every prompt, log entry, group, count, and facet to conversations the caller can read (project topics plus the caller's own canonical DMs with project agents; a UAT includes DMs only with inbox:read). Non-member projects and project-visitor bindings are excluded even for hub admins. Agents, visitors and non-session/non-UAT credentials get 403; unsupported methods get 405; 404 while web.decisions is off
 - [role.definition.create](#roledefinitioncreate) — Create a custom role definition (create, import, duplicate). A token needs role:create and role:read on a hub boundary and the holder's live role.create authority; the holder must hold every permission of the role within the token's selectors. A project-scoped definition can be bound in every project, so it is judged on the holder's system-scope authority; a system-scoped definition is refused to every token
 - [role.definition.update](#roledefinitionupdate) — Update a custom role definition. A token needs role:update and role:read on a hub boundary and the holder's live role.update authority; the holder must hold every permission of the updated role within the token's selectors, judged as for create
 - [role.definition.delete](#roledefinitiondelete) — Delete a custom role definition. A token needs role:delete and role:read on a hub boundary and the holder's live role.delete authority; system roles and roles that are still bound are kept
@@ -218,7 +248,7 @@
 - [credential.token.create](#credentialtokencreate) — Create a user access token (UAT)
 - [credential.token.revoke](#credentialtokenrevoke) — Revoke or delete a user access token
 - [federation.token.mint](#federationtokenmint) — Obtain a short-lived user access credential for the caller, signed with the hub's OIDC key, for one peer hub audience listed in server.oidc.user_token_audiences. Only a local human user with status active; a user access token needs federation_token:mint on a hub boundary. 404 while federation.project_visitors is off
-- [user.admin.suspend](#useradminsuspend) — Suspend or reactivate a user account (dispatched from PATCH /api/v1/users/{id} when status field is present). A token needs user:suspend on a hub boundary, checked on the hub-level user record. The caller's own status and activating an invited user are refused for every credential
+- [user.admin.suspend](#useradminsuspend) — Suspend or reactivate a user account (dispatched from PATCH /api/v1/users/{id} when status field is present). A token needs user:suspend on a hub boundary, checked on the hub-level user record. The caller's own status and changing an invited user's status are refused for every credential
 - [user.admin.invite](#useradmininvite) — Invite users to the platform (single or bulk) and manage invitation codes (list, create, read stats, read, revoke, delete). The invited record has status invited, the placeholder role member and no role binding or group membership; an invitation code names no role. A token needs user:invite on the hub boundary and the holder's live user.invite authority
 - [user.admin.provision](#useradminprovision) — Pre-register a user (status invited) through POST /api/v1/users; invitation-equivalent, shares the invite creation core; no role, no grants. A token needs user:invite on the hub boundary and the holder's live user.invite authority, checked at the hub user collection; the user_provision audit records the token as the credential. Refused for every caller on a hub running with dev authentication
 - [user.admin.promote](#useradminpromote) — Promote or demote a user's administrative level (dispatched from PATCH /api/v1/users/{id} when role field is present). A token needs user:promote on a hub boundary, checked on the hub-level user record. CanDelegate applies to every change that involves a super-admin binding, so a token never creates or removes one; the last super-admin, self-demotion, invited-user and binding-drift guards apply to every credential, and a token's own role is session-only
@@ -235,11 +265,13 @@
 - [user.self.update](#userselfupdate) — Update the caller's own profile (display name and preferences) through PATCH /api/v1/users/{id} naming the caller's own record. A status field on the caller's own record is refused by the self-status guard
 - [role.read](#roleread) — Read role definitions and the permission registry. A token needs role:read on a hub boundary; the write methods on the same routes also need their own selector
 - [role.binding.read](#rolebindingread) — Read role binding assignments
+- [role.binding.effectivepermissions](#rolebindingeffectivepermissions) — Resolve a user principal's effective permissions and grant provenance. A token needs role_binding:read on a hub boundary; HEAD answers whether the caller may read it
 - [access.constraint.read](#accessconstraintread) — Read access constraint definitions and the principals a constraint affects. A token needs access_constraint:read on a hub boundary; the write methods on the same routes also need access_constraint:admin
 - [hub.audit.constraint](#hubauditconstraint) — Read one access constraint's audit history. hub.audit.read is a hub-level permission: a token needs hub_audit:read on a hub boundary and is checked against the hub-level constraint record; a denied caller gets the same not-found answer as for a missing constraint
 - [user.session.logout](#usersessionlogout) — Sign-in flow logout step; the hub holds no server-side session state for it to change
 - [user.session.revoke](#usersessionrevoke) — Revoke every cookie session of a user (platform admin only)
 - [user.terminalworkspace](#userterminalworkspace) — Read or replace the caller's own terminal workspace
+- [user.execcontainer](#userexeccontainer) — Read, set, or clear the caller's own execution container registration
 - [user.skillinjection.update](#userskillinjectionupdate) — Add, replace or remove the skills injected into the caller's own agents. A user access token needs user_skill_injection:update on a hub boundary
 - [user.skillinjection.read](#userskillinjectionread) — List the skills injected into the caller's own agents. Any token of the holder reads its own entries; the entries belong to no project
 - [template.user.read](#templateuserread) — List, read or download the caller's own user-scope templates. A user access token needs template:read on a hub boundary
@@ -273,6 +305,7 @@
 - [hub.allowlist.update](#huballowlistupdate) — Manage the platform email allow list: add and import create invited records (status invited, placeholder role member, no role binding or group membership); delete removes an invited record under the last-project-owner guard and binding cascade of user.admin.delete. The route guard checks hub.allow_list.read, so a token needs hub_allow_list:read and hub_allow_list:update on the hub boundary
 - [hub.health.read](#hubhealthread) — Read platform health summary and GCP quota status
 - [hub.orphanedagents.read](#huborphanedagentsread) — List the hub's agents whose authority state is orphaned or revoked: the non-deleted agents, paged, filtered by computed state (an operator diagnostic under the permission of the health summary; session only until its token admission is governed)
+- [hub.runtimeorphans.read](#hubruntimeorphansread) — List the runtime objects no hub agent owns, as recorded from broker heartbeat inventories, filtered by broker, project and kind (an operator diagnostic under the permission of the health summary; session only until its token admission is governed)
 - [hub.diagnostics.read](#hubdiagnosticsread) — Read diagnostic logs, the diagnostic log stream and messaging divergence data. The log stream re-checks a token credential on every heartbeat and ends once the token stops validating or loses hub.diagnostics.read
 - [hub.scheduler.read](#hubschedulerread) — Read scheduler status and configuration
 - [hub.projectdefaults.read](#hubprojectdefaultsread) — Read project default settings
@@ -299,34 +332,47 @@
 - [hub.profiling.read](#hubprofilingread) — Read the client profiling switch. Any signed-in identity (user, agent or broker) reads it, and any user access token reads it
 - [hub.injectedskills.read](#hubinjectedskillsread) — Read the hub injected skill references. Any signed-in identity reads them, and any token reads them
 - [hub.conduitgrantkeys.read](#hubconduitgrantkeysread) — Read the conduit grant verification keys (public halves only). Any signed-in identity reads them, and any token reads them; 404 while the hub.conduit experiment is off
+- [hub.triggerpresets.read](#hubtriggerpresetsread) — List static trigger rule preset field schemas. Any signed-in user or agent identity reads them, and any token reads them; 404 while the hub.github_triggers experiment is off
+- [hub.triggerpresets.compile](#hubtriggerpresetscompile) — Compile a trigger rule preset form into match types, ordered CEL rules, subject policy, and suggested action without persisting anything. Any signed-in user or agent identity calls it, and any token calls it; 404 while the hub.github_triggers experiment is off
 - [hub.prestarthooks.read](#hubprestarthooksread) — Read hub pre-start hooks. Any signed-in user reads them; the script body is returned only to a holder of hub.lifecycle_hooks.read on an interactive session or dev credential; every other credential, a user access token included, gets it redacted
 - [hub.policies.removed](#hubpoliciesremoved) — Removed policy API; every method and sub-path answers 410 Gone and points callers to role bindings
+- [systemone.instance.read](#systemoneinstanceread) — List and read hub-scoped System One provider instances (redacted; stored API keys are never returned); interactive session only
+- [systemone.instance.create](#systemoneinstancecreate) — Create a hub-scoped System One provider instance and store its API key as an internal hub secret; interactive session only
+- [systemone.instance.delete](#systemoneinstancedelete) — Delete a hub-scoped System One provider instance and remove its internal secret; interactive session only
+- [systemone.instance.execute](#systemoneinstanceexecute) — Probe a hub-scoped System One provider instance with a model list query or a stateless inline portable spec evaluation; interactive session only
 - [skill.list](#skilllist) — List skills; each row is filtered by skill read. A user access token needs skill:list on either boundary; its page, total and cursor count only the rows it may read. An agent delegated credential lists project-scoped skills only: its scope is the authorizing user's skill list scope within the grant boundary, and each item is also decided for skill.read
 - [skill.read](#skillread) — Read a skill, its versions, its download URLs, its resolved version and its files. A record the caller may not read answers as not found
 - [skill.create](#skillcreate) — Create a skill in a project named by the request body. A user access token needs skill:create on a boundary that contains the project
-- [skill.update](#skillupdate) — Update a skill: its metadata, version publishing and deprecation, file uploads and finalize. A user-scope skill refuses a federated caller (requireProfileWriter)
-- [skill.delete](#skilldelete) — Delete a skill definition. A user-scope skill refuses a federated caller (requireProfileWriter)
+- [skill.update](#skillupdate) — Update a project- or user-scope skill: its metadata, version publishing and deprecation, file uploads and finalize (global catalog skills use skill.global.update). A user-scope skill refuses a federated caller (requireProfileWriter)
+- [skill.delete](#skilldelete) — Delete a project- or user-scope skill definition (global catalog skills use skill.global.delete). A user-scope skill refuses a federated caller (requireProfileWriter)
 - [skill.register](#skillregister) — Manage skill registries and their pinned hashes. The route guard checks skill.register on the hub-scoped registry target, so a user access token needs skill:register on a hub boundary
 - [template.list](#templatelist) — List templates; each row is filtered by template read. The unfiltered list is used only with hub-level evidence for template.list: a user access token needs template:list on a hub boundary and hub-wide list authority for it. Every other token, project tokens included, gets the per-row template read scan. An agent delegated credential lists project-scoped templates only: its scope is the authorizing user's template list scope within the grant boundary, and each item is also decided for template.read
 - [template.read](#templateread) — Read a template, its download URLs, its storage validation and its files. A record the caller may not read answers as not found
-- [template.create](#templatecreate) — Create a template in the global, project or caller's own user scope the request body names. A user-scope create refuses a federated caller (requireProfileWriter)
-- [template.update](#templateupdate) — Update a template: its definition and metadata, file uploads, finalize and file writes. A user-scope template refuses a federated caller (requireProfileWriter)
-- [template.delete](#templatedelete) — Delete a global or project template. A user-scope template is template.user.delete
+- [template.create](#templatecreate) — Create a template in a project or the caller's own user scope the request body names (global catalog templates use template.global.create). A user-scope create refuses a federated caller (requireProfileWriter)
+- [template.update](#templateupdate) — Update a project- or user-scope template: its definition and metadata, file uploads, finalize and file writes (global catalog templates use template.global.update). A user-scope template refuses a federated caller (requireProfileWriter)
+- [template.delete](#templatedelete) — Delete a project template (global catalog templates use template.global.delete; a user-scope template is template.user.delete)
 - [harnessconfig.list](#harnessconfiglist) — List harness configurations; each row is filtered by harness config read. The unfiltered list is used only with hub-level evidence for harness_config.list: a user access token needs harness_config:list on a hub boundary and hub-wide list authority for it. Every other token, project tokens included, gets the per-row harness config read scan
 - [harnessconfig.read](#harnessconfigread) — Read a harness configuration, its download URLs, its storage validation, its image status and its files. A record the caller may not read answers as not found
 - [harnessconfig.create](#harnessconfigcreate) — Create a harness configuration in the global, project or caller's own user scope the request body names; a user-scope config's scope and owner are the caller. A user-scope harness config refuses a federated caller (requireProfileWriter)
 - [harnessconfig.update](#harnessconfigupdate) — Update a harness configuration: its definition and metadata, file uploads, finalize, the image check and file writes. On a user-scope harness config the existing route gate (authorizeHarnessConfigRoute) already refuses a federated caller, with requireProfileWriter behind it
 - [harnessconfig.delete](#harnessconfigdelete) — Delete a global or project harness configuration. The route gate needs harness_config read and the delete needs harness_config delete on the owning scope. A user-scope config is harnessconfig.user.delete
-- [skill.global.create](#skillglobalcreate) — Create a skill in the global catalog (global or core scope). The check is skill.create_global on a collection-level request at the hub scope, so a user access token needs skill:create_global on a hub boundary
+- [skill.global.create](#skillglobalcreate) — Create a skill in the global catalog (scope=global). The check is skill.create_global on a collection-level request at the hub scope, so a user access token needs skill:create_global on a hub boundary
+- [skill.global.update](#skillglobalupdate) — Update a global-catalog skill (scope=global): its metadata, version publishing and deprecation, file uploads and finalize. Selected by the stored skill record's scope via catalogWriteAction, requiring skill.update_global (skill:update_global on a hub boundary)
+- [skill.global.delete](#skillglobaldelete) — Delete a global-catalog skill definition (scope=global). Selected by the stored skill record's scope via catalogWriteAction, requiring skill.delete_global (skill:delete_global on a hub boundary)
 - [skill.discover.project](#skilldiscoverproject) — Discover the skills in a remote GitHub directory for a project named by the request body, spending that project's GitHub credentials. A user access token needs skill:create on a boundary that contains the project
 - [skill.discover.global](#skilldiscoverglobal) — Discover the skills in a public remote GitHub directory with no project named. A user access token needs skill:create_global on a hub boundary
 - [skill.resolve.local](#skillresolvelocal) — Resolve skill:// references against the hub catalog. Each candidate is checked for skill read; a candidate the caller may not read answers as not found
 - [skill.resolve.github.project](#skillresolvegithubproject) — Resolve gh:// references with a project named by the request body, using that project's GitHub credentials. The caller needs skill read on the project, so a user access token needs skill:read on a boundary that contains the project; a refused reference answers forbidden
 - [skill.resolve.github.public](#skillresolvegithubpublic) — Resolve gh:// references from public repositories with no project named; the hub fetches them and writes its resolution cache. A user access token needs skill:read on the global catalog, on a hub boundary; a refused reference answers forbidden
 - [skill.file.signedread](#skillfilesignedread) — Read one skill version file through a signed URL issued by the skill download. The signature alone authorizes exactly the skill, version and file it was issued for; no principal is evaluated
-- [template.clone](#templateclone) — Clone a readable template into the global scope or a project the request body names. The source needs template read; the destination needs template create on its scope, so a user access token needs template:read and template:create on a boundary that contains both
-- [template.reimport](#templatereimport) — Reimport a global or project template from its source. The template needs template read and the reimport needs template create on the owning scope, as import does
-- [template.import.global](#templateimportglobal) — Import or discover templates for the global catalog. The check is template create on a collection-level request at the hub scope, so a user access token needs template:create on a hub boundary
+- [template.global.create](#templateglobalcreate) — Create a template in the global catalog (scope=global). The check is template.create_global on a collection-level request at the hub scope, so a user access token needs template:create_global on a hub boundary
+- [template.global.update](#templateglobalupdate) — Update a global-catalog template (scope=global): its definition and metadata, file uploads, finalize and file writes. Selected by the stored template record's scope via catalogWriteAction, requiring template.update_global (template:update_global on a hub boundary)
+- [template.global.delete](#templateglobaldelete) — Delete a global-catalog template (scope=global). Selected by the stored template record's scope via catalogWriteAction, requiring template.delete_global (template:delete_global on a hub boundary)
+- [template.clone](#templateclone) — Clone a readable template into a project the request body names (global destination is template.global.clone; user destination is template.user.clone). The source needs template read; the destination needs template create on its project, so a user access token needs template:read and template:create on a boundary that contains both
+- [template.global.clone](#templateglobalclone) — Clone a readable template into the global catalog (scope=global). The source needs template read; the destination checks template.create_global on a collection-level request at the hub scope, so a user access token needs template:read and template:create_global on a hub boundary
+- [template.reimport](#templatereimport) — Reimport a project template from its source (global templates use template.global.reimport; user templates use template.user.reimport). The template needs template read and the reimport needs template create on the owning project, as import does
+- [template.global.reimport](#templateglobalreimport) — Reimport a global-catalog template (scope=global) from its source. The template needs template read and the reimport checks template.create_global on a collection-level request at the hub scope, so a user access token needs template:read and template:create_global on a hub boundary
+- [template.import.global](#templateimportglobal) — Import or discover templates for the global catalog. The check is template.create_global on a collection-level request at the hub scope, so a user access token needs template:create_global on a hub boundary
 - [template.import.project](#templateimportproject) — Import or discover templates for a project named by the request body. The check is template create on a collection-level request inside that project
 - [harnessconfig.clone](#harnessconfigclone) — Clone a readable harness configuration into the global scope or a project the request body names. The route gate needs harness_config read on the source; the destination needs harness_config create on its scope
 - [harnessconfig.reimport](#harnessconfigreimport) — Reimport a global or project harness configuration from its source. The route gate needs harness_config read and the reimport needs harness_config create on the owning scope, as import does
@@ -347,6 +393,7 @@
 - [broker.delete](#brokerdelete) — Deregister a runtime broker: unlink it from every project, clear project defaults that name it, and remove its credentials. A user needs an interactive session and broker.delete on the broker
 - [broker.heartbeat](#brokerheartbeat) — Record a broker heartbeat: broker liveness and the state of the agents it runs. The broker sends its own; a user needs an interactive session and broker.update on the broker from a role binding (the owner relationship does not apply)
 - [broker.agent.launchreport](#brokeragentlaunchreport) — Record a broker's launch report for an agent it runs
+- [broker.agent.deliver](#brokeragentdeliver) — Relay one deliver-message flush from a broker to an agent it runs, over the agent's conduit session (design v2.22 deliver-message)
 - [broker.agent.workspacedownload](#brokeragentworkspacedownload) — Issue signed download URLs for the uploaded workspace files of an agent the broker runs
 - [broker.messagefailures.report](#brokermessagefailuresreport) — Record buffered message delivery failures reported by a broker
 - [broker.attachment.redeem](#brokerattachmentredeem) — Redeem an attachment delivery capability (ptone/scion#4596): the broker the hub issued it to downloads one attachment, once, before it expires, to write it into the recipient agent's home
@@ -357,6 +404,8 @@
 - [gcp.identity.mint](#gcpidentitymint) — Mint a GCP access or identity token for the agent's assigned service account
 - [secret.read](#secretread) — Read project or broker secrets (scope=project or runtime_broker). User and hub scope are the session-only operations secret.user.read and secret.hub.read
 - [secret.write](#secretwrite) — Create, update or delete project or broker secrets (scope=project or runtime_broker). User and hub scope are the session-only operations secret.user.write and secret.hub.write
+- [agent.secret.read](#agentsecretread) — Read agent-scoped secret metadata (scope=agent&scopeId=<agentID>). Values are never readable by humans; gated on hub.agent_secrets.
+- [agent.secret.write](#agentsecretwrite) — Create, update or delete agent-scoped secrets (scope=agent&scopeId=<agentID>). Values are write-only for humans; gated on hub.agent_secrets.
 - [gcp.identity.read](#gcpidentityread) — Read GCP service account details or list accounts. A project's list requires project.read on it (members, and agents of that project only); the hub-scoped list requires gcp_service_account.list at hub scope (hub members)
 - [gcp.identity.verify](#gcpidentityverify) — Verify a GCP service account's IAM configuration
 - [env.read](#envread) — Read project or broker environment variables (scope=project or runtime_broker). User and hub scope are the session-only operations env.user.read, env.hub.read and env.hub.list
@@ -579,6 +628,39 @@
 **Resource Resolver:** agent-from-url
 
 **Effects:** `update-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestAgentSubRoute_CatalogDrift`
+
+---
+
+## agent.screen.read
+
+**Domain:** agent
+
+**Description:** Read the terminal screen saved before an agent's most recent suspend
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/agents/{id}/screen` |
+| http_route | GET | `/api/v1/projects/{projectId}/agents/{id}/screen` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `agent_record`; boundaries `project`, `hub`)
+
+**Base Permission:** `agent.attach`
+
+**Resource Resolver:** agent-from-url
+
+**Effects:** `read-one`
 
 **Denial Codes:** `forbidden`
 
@@ -1481,7 +1563,7 @@
 
 **Domain:** agent
 
-**Description:** List, read and write the secrets available to the calling agent: its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
+**Description:** List, read, write and delete the secrets available to the calling agent: its own agent-scoped secrets, its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
 
 ### Entry Points
 
@@ -1490,6 +1572,7 @@
 | http_route | GET | `/api/v1/agents/{id}/secrets` |
 | http_route | GET | `/api/v1/agents/{id}/secrets/{key}` |
 | http_route | PUT | `/api/v1/agents/{id}/secrets/{key}` |
+| http_route | DELETE | `/api/v1/agents/{id}/secrets/{key}` |
 
 **Principals:** `agent`
 
@@ -1499,7 +1582,7 @@
 
 **Resource Resolver:** agent-self
 
-**Effects:** `read-secret`, `update-resource`
+**Effects:** `read-secret`, `update-resource`, `delete-resource`
 
 ### Audit
 
@@ -2867,6 +2950,7 @@
 | Kind | Method | Pattern |
 |------|--------|---------|
 | http_route | GET | `/api/v1/projects/{projectId}/scheduled-events/{id}` |
+| http_route | GET | `/api/v1/projects/{projectId}/scheduled-events/{id}/output` |
 | http_route | GET | `/api/v1/projects/{projectId}/schedules/{id}` |
 | http_route | GET | `/api/v1/projects/{projectId}/schedules/{id}/history` |
 
@@ -3058,16 +3142,20 @@
 
 **Domain:** schedule
 
-**Description:** Fire a scheduled message or dispatch_agent event, one-shot or materialized from a recurring schedule, under the authority its revision recorded
+**Description:** Fire a scheduled message, dispatch_agent or exec event, one-shot or materialized from a recurring schedule, under the authority its revision recorded. An exec fire (ptone/scion#7883) re-checks agent.attach on the target under the revision's ceiling before its one exec-start; exec-start and exec-status are reached only from the scheduler's exec fire, run tracker and sweeper, never from a request
 
 ### Entry Points
 
 | Kind | Method | Pattern |
 |------|--------|---------|
 | scheduler_job | — | `executeSchedule:dispatch_agent` |
+| scheduler_job | — | `executeSchedule:exec` |
 | scheduler_job | — | `executeSchedule:message` |
 | scheduler_job | — | `fireEvent:dispatch_agent` |
 | scheduler_job | — | `fireEvent:message` |
+| scheduler_job | — | `fireEvent:exec` |
+| internal_dispatch | — | `StartAgentExecRun:exec-start` |
+| internal_dispatch | — | `AgentExecRunStatus:exec-status` |
 
 **Principals:** `system`
 
@@ -3085,10 +3173,467 @@
 
 - `pkg/hub:TestScheduledFire_UsesRecordedTokenCeiling`
 - `pkg/hub:TestScheduledFire_UsesRecordedTokenBoundary`
+- `pkg/hub:TestScheduledExecFire_AuthzMatrix`
+- `pkg/hub:TestScheduledExecFire_HubGate`
 
 ### Exemptions
 
-- **internal_only:** The scheduler fires the event with no request credential. resolveScheduledAuthority resolves the revision's recorded principal and credential, and the fire is bounded by the revision's recorded ceiling and boundary (scope: scheduler fire) — waives: `base_permission`
+- **internal_only:** The scheduler fires the event with no request credential. resolveRecordedAuthority resolves the revision's recorded principal and credential, and the fire is bounded by the revision's recorded ceiling and boundary. The exec control routes are internal-only call sites of the exec fire: exec-start follows the full fire-time authorization; exec-status only recovers the outcome of a run already admitted, on its recorded launch (scope: scheduler fire) — waives: `base_permission`
+
+---
+
+## webhookendpoint.list
+
+**Domain:** webhookendpoint
+
+**Description:** List webhook endpoints in a project. Agent callers see only webhook endpoints they own (scope=caller)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/projects/{projectId}/webhook-endpoints` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `webhook_endpoint.list`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## webhookendpoint.read
+
+**Domain:** webhookendpoint
+
+**Description:** Read a webhook endpoint in a project (never returns the signing secret). An agent caller reading another principal's endpoint receives the same 404 as not-found
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/projects/{projectId}/webhook-endpoints/{id}` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `webhook_endpoint.read`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## webhookendpoint.create
+
+**Domain:** webhookendpoint
+
+**Description:** Create a webhook endpoint in a project, minting its one-time HMAC signing secret into a hub-scoped internal secret row. When defaultTrigger is supplied, also creates a default message trigger in the same transaction under trigger.create, webhook_endpoint.read, and message-target authoring checks
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/projects/{projectId}/webhook-endpoints` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `webhook_endpoint.create`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `create-resource`
+
+### Delegation
+
+- **Kind:** `non_amplification`
+- Creating a bare webhook endpoint records only ownership and grants no deferred authority. When defaultTrigger is supplied, the default message trigger records the caller's initiator attribution and frozen effect ceiling (triggerRevisionAuthorityCeiling) in the same transaction, identical to trigger.create
+
+### Audit
+
+- **Event Type:** `webhook_endpoint_create`
+- **Context Fields:** actor_id, project_id
+- **After Fields:** endpoint_id
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestWebhookEndpointCRUD_SecretLifecycleAndCascadePause`
+- `pkg/hub:TestWebhookEndpointCreate_DefaultTrigger`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## webhookendpoint.delete
+
+**Domain:** webhookendpoint
+
+**Description:** Delete a webhook endpoint, removing its hub-scoped internal signing secret rows and pausing dependent triggers with status_reason=source_deleted. An agent caller targeting another principal's endpoint receives the same 404 as not-found
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | DELETE | `/api/v1/projects/{projectId}/webhook-endpoints/{id}` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `webhook_endpoint.delete`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `delete-resource`
+
+### Audit
+
+- **Event Type:** `webhook_endpoint_delete`
+- **Context Fields:** actor_id, project_id
+- **Before Fields:** endpoint_id
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestWebhookEndpointCRUD_SecretLifecycleAndCascadePause`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## trigger.list
+
+**Domain:** trigger
+
+**Description:** List triggers or trigger events in a project. Agent callers see only triggers they hold and events received on endpoints they own or fired by triggers they hold (scope=caller)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/projects/{projectId}/triggers` |
+| http_route | GET | `/api/v1/projects/{projectId}/trigger-events` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `trigger.list`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestTriggerEventsAndHistory_AuthzMatrix`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## trigger.read
+
+**Domain:** trigger
+
+**Description:** Read a trigger definition, a trigger's fire history, or a trigger event in a project. An agent caller reading an event it neither received on its own endpoint nor fired through a trigger it holds receives the same 404 as not-found
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/projects/{projectId}/triggers/{id}` |
+| http_route | GET | `/api/v1/projects/{projectId}/triggers/{id}/history` |
+| http_route | GET | `/api/v1/projects/{projectId}/trigger-events/{id}` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `trigger.read`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestTriggerEventsAndHistory_AuthzMatrix`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## trigger.render
+
+**Domain:** trigger
+
+**Description:** Dry-run compile and render a trigger's template slots against a stored trigger event without firing or exercising recorded authority. Requires trigger.read on the trigger and read visibility on the event (agents without visibility on the event receive 404)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/projects/{projectId}/triggers/{id}/render` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `trigger.read`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestTriggerRender`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## trigger.create
+
+**Domain:** trigger
+
+**Description:** Create an event trigger in a project. Webhook triggers resolve source.id through webhookEndpointAccessDecision(read); GitHub triggers (source.kind=github, source.id="") require hub.github_triggers and an authorized GitHub App association on the project; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents cannot author github.comment triggers or ackComment because github_trigger.comment has no agent scope); all actions pass their target checks
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/projects/{projectId}/triggers` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `trigger.create`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `create-resource`
+
+### Delegation
+
+- **Kind:** `non_amplification`
+- Authoring a trigger records the author's initiator attribution and frozen effect ceiling (triggerRevisionAuthorityCeiling) on the trigger row. A message trigger grants no authority; a dispatch_agent trigger requires agent.create and CanDelegate within the caller's role ceiling and creates agents bounded by the recorded principal's current authority and frozen ceiling; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents are refused because github_trigger.comment has no agent scope)
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## trigger.update
+
+**Domain:** trigger
+
+**Description:** Update or resume a trigger in a project. Agents cannot PATCH triggers; resume and dispatch-affecting updates re-validate the source (webhook endpoint read access or authorized GitHub App association) and action target (a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment, users only in Stage 3) and record the caller's attribution and frozen ceiling
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PATCH | `/api/v1/projects/{projectId}/triggers/{id}` |
+| http_route | POST | `/api/v1/projects/{projectId}/triggers/{id}/resume` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `trigger.update`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `update-resource`
+
+### Delegation
+
+- **Kind:** `non_amplification`
+- A resume, and an update that changes the source, match rules, action, subject rules or status, records the caller's initiator attribution and frozen effect ceiling (triggerRevisionAuthorityCeiling) in place of the stored ones; a metadata-only update changes neither. A message trigger grants no authority; a dispatch_agent trigger requires agent.create and CanDelegate within the caller's role ceiling; a github.comment action or a dispatch_agent action with ackComment requires github_trigger.comment (users only in Stage 3; agents have no github_trigger.comment scope)
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## trigger.pause
+
+**Domain:** trigger
+
+**Description:** Pause an event trigger. Pausing only stops future fires, so a user access token with trigger:update is admitted
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/projects/{projectId}/triggers/{id}/pause` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `trigger.update`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `update-resource`
+
+### Audit
+
+- **Event Type:** `trigger_pause`
+- **Context Fields:** actor_id, project_id
+- **Before Fields:** trigger_id
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## trigger.delete
+
+**Domain:** trigger
+
+**Description:** Delete an event trigger in a project
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | DELETE | `/api/v1/projects/{projectId}/triggers/{id}` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `trigger.delete`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `delete-resource`
+
+### Audit
+
+- **Event Type:** `trigger_delete`
+- **Context Fields:** actor_id, project_id
+- **Before Fields:** trigger_id
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestTriggersAuthzMatrix`
+- `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## trigger.fire
+
+**Domain:** trigger
+
+**Description:** Fire a matched event trigger's message, dispatch_agent, or github.comment action through the shared fire core under the authority recorded by the trigger's current revision; a dispatch_agent fire re-checks agent.create, CanDelegate, the frozen ceiling and standing, and creates the agent under the recorded principal
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| scheduler_job | — | `triggerDrainer:message` |
+| scheduler_job | — | `triggerDrainer:dispatch_agent` |
+| scheduler_job | — | `triggerDrainer:exec` |
+| scheduler_job | — | `triggerDrainer:github.comment` |
+
+**Principals:** `system`
+
+**Credentials:** `system_internal`
+
+**Bearer:** `non_user` (pinned by `TestScheduledFire_UsesRecordedTokenCeiling`)
+
+**Resource Resolver:** event-project
+
+**Effects:** `create-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestTriggerDispatchE2E_RevokedAuthorityRecordsRefusedFire`
+- `pkg/hub:TestScheduledFire_UsesRecordedTokenCeiling`
+- `pkg/hub:TestTriggerDispatchAgent_EndToEndWebhookToAgent`
+- `pkg/hub:TestTriggerDispatchAgent_RenderRefusalAndCollisionMatrix`
+
+### Exemptions
+
+- **internal_only:** The trigger.event durable queue drainer fires matched triggers with no request credential. fireAction resolves the trigger revision's recorded principal and credential via resolveRecordedAuthority, and every fire is bounded by the revision's recorded ceiling, boundary, and live standing (scope: trigger drainer fire) — waives: `base_permission`
 
 ---
 
@@ -3560,7 +4105,7 @@
 
 - **Event Type:** `artifact_event (deleted)`
 - **Context Fields:** artifact_id, actor_kind, actor_ref, authority
-- **Before Fields:** grantsRemoved, linksRevoked
+- **Before Fields:** grantsRemoved, linksRevoked, draftsRemoved
 - **Atomic:** Yes
 
 **Denial Codes:** `not_found`, `forbidden`
@@ -3647,6 +4192,84 @@
 - `pkg/hub:TestArtifactsOpenReviewOnRoutes`
 - `pkg/artifacts:TestReviewSessionAuthorization`
 - `pkg/artifacts:TestReviewSessionEndLogged`
+
+---
+
+## artifact.review.draft.read
+
+**Domain:** artifact
+
+**Description:** Read the caller's own saved draft review of an artifact (200 with draft null when none exists, plus currentSeq; ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); the row is always keyed by the caller's own principal with no administrator, steward, owner or publisher override
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/artifacts/{id}/review-draft` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `artifact_record`; boundaries `project`, `hub`; pinned by `TestArtifactsManageAndVersionRoutesUserAccessTokensAreBounded`)
+
+**Base Permission:** `artifact.create`
+
+**Resource Resolver:** artifact-home-project
+
+**Effects:** `read-one`
+
+**Denial Codes:** `not_found`, `forbidden`
+
+### Tests
+
+- `pkg/hub:TestArtifactsReviewDraftsOnRoutes`
+- `pkg/hub:TestArtifactsReviewDraftsAgentCreatorAndScopedTokenIsolation`
+- `pkg/artifacts:TestReviewDraftAuthorizationOrder`
+
+---
+
+## artifact.review.draft.write
+
+**Domain:** artifact
+
+**Description:** Create, replace or delete the caller's own saved draft review of an artifact with optimistic rev concurrency (ptone/scion#7116, ptone/scion#8470); 404 while the hub.artifacts_review_drafts experiment is off; requires review access (the readableArtifact and canWriteErr checks of artifact.version.create); rate limited per principal (LimitDraftWrite) after authorization and before reading the request body; the row is always keyed by the caller's own principal with no override; a DELETE that deletes the caller's draft row writes a review_draft_deleted decision-log entry without content, while a DELETE when no draft exists writes none (both answer 204); draft saves never trigger review notifications
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PUT | `/api/v1/artifacts/{id}/review-draft` |
+| http_route | DELETE | `/api/v1/artifacts/{id}/review-draft` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `artifact_record`; boundaries `project`, `hub`; pinned by `TestArtifactsManageAndVersionRoutesUserAccessTokensAreBounded`)
+
+**Base Permission:** `artifact.create`
+
+**Resource Resolver:** artifact-home-project
+
+**Effects:** `create-resource`, `update-resource`, `delete-resource`
+
+### Audit
+
+- **Event Type:** `artifact decision log (review_draft_deleted)`
+- **Context Fields:** route, principal_kind, principal_id, project_id
+- **Before Fields:** artifact_id
+- **Atomic:** No
+- **Non-Atomic Justification:** The entry is written after the store deletes the caller's draft row, outside its transaction, as for every artifact decision-log entry (version creates and finalizes included; artifact_event records only artifact lifetime, home and access changes, and never records a reviewer's private draft activity on the artifact). A draft is the caller's own private, 30-day-TTL scratch state rather than a shared resource or authority grant, and is routinely deleted by the caller immediately after submitting a review
+
+**Denial Codes:** `not_found`, `forbidden`, `rate_limited`, `too_many_drafts`
+
+### Tests
+
+- `pkg/hub:TestArtifactsReviewDraftsOnRoutes`
+- `pkg/hub:TestArtifactsReviewDraftsAgentCreatorAndScopedTokenIsolation`
+- `pkg/artifacts:TestReviewDraftAuthorizationOrder`
+- `pkg/artifacts:TestReviewDraftNoContentInLogsOrErrors`
 
 ---
 
@@ -4449,6 +5072,209 @@
 
 ---
 
+## project.messagepolicy.read
+
+**Domain:** project
+
+**Description:** List or read a project's configured message policies and surface coverage declaration (ptone/scion#8047; 404 while hub.message_policies is off)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/projects/{id}/message-policies` |
+| http_route | GET | `/api/v1/projects/{id}/message-policies/{policyId}` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`; pinned by `TestMessagePolicyAuthz_Target7_CredentialMatrix`)
+
+**Base Permission:** `project.read_message_policies`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `list-scoped`, `read-one`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestMessagePolicyAuthz_Target7_CredentialMatrix`
+
+---
+
+## project.messagepolicy.create
+
+**Domain:** project
+
+**Description:** Create a message policy on covered outbound surfaces in a project. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/projects/{id}/message-policies` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`; pinned by `TestMessagePolicyAuthz_Target7_CredentialMatrix`)
+
+**Base Permission:** `project.manage_message_policies`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `create-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestMessagePolicyAuthz_Target7_CredentialMatrix`
+
+---
+
+## project.messagepolicy.update
+
+**Domain:** project
+
+**Description:** Update a project message policy, bump its revision, and invalidate its compiled rule cache entry. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PATCH | `/api/v1/projects/{id}/message-policies/{policyId}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`; pinned by `TestMessagePolicyAuthz_Target7_CredentialMatrix`)
+
+**Base Permission:** `project.manage_message_policies`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `update-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestMessagePolicyAuthz_Target7_CredentialMatrix`
+
+---
+
+## project.messagepolicy.delete
+
+**Domain:** project
+
+**Description:** Delete a project message policy and invalidate its compiled rule cache entry. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | DELETE | `/api/v1/projects/{id}/message-policies/{policyId}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`; pinned by `TestMessagePolicyAuthz_Target7_CredentialMatrix`)
+
+**Base Permission:** `project.manage_message_policies`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `delete-resource`
+
+### Audit
+
+- **Event Type:** `project_message_policy_delete`
+- **Context Fields:** actor_id, project_id
+- **Before Fields:** policy_id, policy_name, mode, revision
+- **Atomic:** No
+- **Non-Atomic Justification:** Policy deletion commits in the store and emits a structured mutation audit record immediately afterward via emitMutationAudit
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestMessagePolicyAuthz_Target7_CredentialMatrix`
+
+---
+
+## project.messagepolicy.test
+
+**Domain:** project
+
+**Description:** Dry-run an inline or stored project message policy against synthetic sample send facts without persisting or echoing message content. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/projects/{id}/message-policies/test` |
+| http_route | POST | `/api/v1/projects/{id}/message-policies/{policyId}/test` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`; pinned by `TestMessagePolicyAuthz_Target7_CredentialMatrix`)
+
+**Base Permission:** `project.manage_message_policies`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestMessagePolicyAuthz_Target7_CredentialMatrix`
+
+---
+
+## project.messagepolicy.decisions
+
+**Domain:** project
+
+**Description:** List content-free message policy evaluation decisions for a project or a single policy. The caller must also be an active project owner, project admin, or local unscoped hub admin (ptone/scion#8047; 404 while hub.message_policies is off)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/projects/{id}/message-policies/decisions` |
+| http_route | GET | `/api/v1/projects/{id}/message-policies/{policyId}/decisions` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`; pinned by `TestMessagePolicyAuthz_Target7_CredentialMatrix`)
+
+**Base Permission:** `project.manage_message_policies`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestMessagePolicyAuthz_Target7_CredentialMatrix`
+
+---
+
 ## project.template.set
 
 **Domain:** project
@@ -4774,6 +5600,78 @@
 
 ---
 
+## project.triggersources.github.read
+
+**Domain:** project
+
+**Description:** Read a project's GitHub trigger source settings, readiness, and repository routing status
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/projects/{id}/trigger-sources/github` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `project.read`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestProjectGitHubTriggerSettings_ScopedTokens`
+
+---
+
+## project.triggersources.github.update
+
+**Domain:** project
+
+**Description:** Update a project's GitHub trigger source unmatched-command reply settings
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PUT | `/api/v1/projects/{id}/trigger-sources/github` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`)
+
+**Base Permission:** `github_trigger.configure`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `update-resource`
+
+### Audit
+
+- **Event Type:** `project.github_trigger_settings.update`
+- **Context Fields:** actor_id, project_id
+- **Before Fields:** unmatched_command_reply, unmatched_command_text_bytes
+- **After Fields:** unmatched_command_reply, unmatched_command_text_bytes
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestProjectGitHubTriggerSettings_ScopedTokens`
+
+---
+
 ## agent.message.send
 
 **Domain:** agent.message
@@ -4819,6 +5717,38 @@
 ### Tests
 
 - `pkg/hub/authzop:TestCatalogValidation`
+
+---
+
+## inbox.summary.read
+
+**Domain:** inbox
+
+**Description:** Read the caller's aggregated inbox summary across categories (approvals, waiting agents, artifact reviews, chat, decisions). Interactive web sessions and dev credentials receive the full view; user access tokens with inbox:read receive the token view (approvals marked unavailable, excluded from total). Agents, visitors, federated users, and UATs without inbox:read get 403; unsupported methods get 405; 404 while web.inbox_dashboard is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/users/me/inbox/summary` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `self_record`; boundaries `project`, `hub`; pinned by `TestUserMeInboxSummary_AuthAndValidation`)
+
+**Base Permission:** `inbox.read`
+
+**Resource Resolver:** self-principal
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestUserMeInboxSummary_AuthAndValidation`
 
 ---
 
@@ -5039,6 +5969,7 @@
 | http_route | GET | `/api/v1/conversations/{id}` |
 | http_route | GET | `/api/v1/conversations/{id}/messages` |
 | http_route | GET | `/api/v1/conversations/{id}/messages/{messageId}` |
+| http_route | GET | `/api/v1/conversations/{id}/watch` |
 
 **Principals:** `user`, `agent`
 
@@ -5057,6 +5988,7 @@
 ### Tests
 
 - `pkg/hub:TestGroupConversationToken_ProjectlessGroupRequiresHubBoundary`
+- `pkg/hub:TestConversationWatch_AuthzParity`
 
 ---
 
@@ -5073,6 +6005,7 @@
 | http_route | GET | `/api/v1/conversations/{id}` |
 | http_route | GET | `/api/v1/conversations/{id}/messages` |
 | http_route | GET | `/api/v1/conversations/{id}/messages/{messageId}` |
+| http_route | GET | `/api/v1/conversations/{id}/watch` |
 
 **Principals:** `user`, `agent`
 
@@ -5091,6 +6024,7 @@
 ### Tests
 
 - `pkg/hub:TestDirectConversationToken_PeerAgentMustBeInsideBoundary`
+- `pkg/hub:TestConversationWatch_AuthzParity`
 
 ---
 
@@ -7537,7 +8471,7 @@
 
 **Domain:** chat
 
-**Description:** Read one version of a choice prompt decision. Needs read access to the prompt's conversation (project:read for a thread; the caller in a user slot of a DM key). Agents, visitors and tokens get 403; a missing or unreadable decision is 404. 404 while web.chat_choices is off
+**Description:** Read one version of a decision prompt decision. Needs read access to the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read for a thread; the caller in a user slot of a DM key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403; a missing or unreadable decision is 404. 404 while web.decisions is off
 
 ### Entry Points
 
@@ -7569,7 +8503,7 @@
 
 **Domain:** chat
 
-**Description:** Answer a choice prompt decision by choice id (the label is copied from the stored row). Needs the right to send in the prompt's conversation (project:read and project.chat_post for a thread; for a DM, only the user in its key). Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a choice-response message, delivers it to the asking agent and publishes choice.updated. 404 while web.chat_choices is off
+**Description:** Answer a decision prompt decision by choice id (the label is copied from the stored row) with optional surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a decision-response message, delivers it to the asking agent and publishes decision.updated. 404 while web.decisions is off
 
 ### Entry Points
 
@@ -7616,17 +8550,17 @@
 
 ---
 
-## chat.choiceprompt.answer
+## chat.decisionprompt.answer
 
 **Domain:** chat
 
-**Description:** Answer every actionable decision of a choice prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows). Needs the right to send in the prompt's conversation (project:read and project.chat_post for a thread; for a DM, only the user in its key). Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one choice-response message in one transaction, delivers it to the asking agent and publishes choice.updated per row. 404 while web.chat_choices is off
+**Description:** Answer every actionable decision of a decision prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows) with optional surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key), surviving chat retention purge of the prompt message. Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one decision-response message in one transaction, delivers it to the asking agent and publishes decision.updated per row. 404 while web.decisions is off
 
 ### Entry Points
 
 | Kind | Method | Pattern |
 |------|--------|---------|
-| http_route | POST | `/api/v1/choice-prompts/{messageId}/answers` |
+| http_route | POST | `/api/v1/decision-prompts/{messageId}/answers` |
 
 **Principals:** `user`
 
@@ -7642,7 +8576,7 @@
 
 ### Audit
 
-- **Event Type:** `chat.choiceprompt.answer`
+- **Event Type:** `chat.decisionprompt.answer`
 - **Context Fields:** actor_id, prompt_message_id, batch_id
 - **After Fields:** response_message_id
 - **Atomic:** No
@@ -7660,9 +8594,253 @@
 
 ### Tests
 
-- `pkg/hub:TestChoiceSetAnswer_RecordsAndDeliversOneResponse`
-- `pkg/hub:TestChoiceSetAnswer_ChangedSet409`
-- `pkg/hub:TestChoiceSetAnswer_Authorization`
+- `pkg/hub:TestDecisionSetAnswer_RecordsAndDeliversOneResponse`
+- `pkg/hub:TestDecisionSetAnswer_ChangedSet409`
+- `pkg/hub:TestDecisionSetAnswer_Authorization`
+
+---
+
+## chat.secretrequest.read
+
+**Domain:** chat
+
+**Description:** Read a secret-request card (metadata and per-key status, never secret values) plus canRespond and reason. Requires a signed-in user session, recipient membership on the prompt's conversation, and agent.read on the requesting agent. 404 while hub.agent_secrets is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/secret-requests/{messageId}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Base Permission:** `agent.read`
+
+**Resource Resolver:** agent
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestSecretRequests_EndToEnd`
+
+---
+
+## chat.secretrequest.fulfill
+
+**Domain:** chat
+
+**Description:** Fulfill all pending keys of a secret-request card, storing each value at agent scope in the secret backend, notifying the requesting agent via a secret-response message, and emitting fulfilled audit events (never values). Requires a signed-in user session, same-origin browser check, recipient membership, and agent.attach on the requesting agent. 404 while hub.agent_secrets is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/secret-requests/{messageId}/fulfill` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Base Permission:** `agent.attach`
+
+**Resource Resolver:** agent
+
+**Effects:** `create-resource`, `update-resource`, `emit-external-effect`
+
+### Audit
+
+- **Event Type:** `chat.secretrequest.fulfill`
+- **Context Fields:** actor_id, message_id, agent_id, key
+- **After Fields:** secret_version
+- **Atomic:** No
+- **Non-Atomic Justification:** Claim CAS, backend.Set, finish CAS with response message, then fire-and-forget agent delivery
+
+### External Effect Policy
+
+- **Delivery:** `fire_and_forget`
+- **Failure Mode:** `log_and_continue`
+- **Idempotency:** idempotencyKey (optional)
+- **Retry:** repeating the call with the same idempotencyKey from the same user replays the fulfilled result
+- **Auth Before Emit:** Yes
+
+**Denial Codes:** `forbidden`, `not_found`, `conflict`
+
+### Tests
+
+- `pkg/hub:TestSecretRequests_EndToEnd`
+
+---
+
+## chat.secretrequest.dismiss
+
+**Domain:** chat
+
+**Description:** Dismiss all or a subset of pending keys on a secret-request card with an optional reason, notifying the requesting agent via a secret-response message and emitting dismissed audit events. Requires a signed-in user session, same-origin browser check, recipient membership, and agent.attach on the requesting agent. 404 while hub.agent_secrets is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/secret-requests/{messageId}/dismiss` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Base Permission:** `agent.attach`
+
+**Resource Resolver:** agent
+
+**Effects:** `create-resource`, `update-resource`, `emit-external-effect`
+
+### Audit
+
+- **Event Type:** `chat.secretrequest.dismiss`
+- **Context Fields:** actor_id, message_id, agent_id, key
+- **After Fields:** response_message_id
+- **Atomic:** No
+- **Non-Atomic Justification:** Dismiss CAS and response message are stored in one transaction before fire-and-forget agent delivery
+
+### External Effect Policy
+
+- **Delivery:** `fire_and_forget`
+- **Failure Mode:** `log_and_continue`
+- **Idempotency:** idempotencyKey (optional)
+- **Retry:** repeating the call with the same idempotencyKey from the same user replays the dismissed result
+- **Auth Before Emit:** Yes
+
+**Denial Codes:** `forbidden`, `not_found`, `conflict`
+
+### Tests
+
+- `pkg/hub:TestSecretRequests_EndToEnd`
+
+---
+
+## chat.decisionprompt.dismiss
+
+**Domain:** chat
+
+**Description:** Dismiss open decisions of a decision prompt without answering, once the version is at least 5 minutes old, with an optional plain-text reason (up to 500 characters) and surface (native or decisions_page). Needs the right to send in the prompt's conversation (stored chat_key, falling back to messages.thread_id: project:read and project.chat_post for a thread; for a DM, only the user in its key; a UAT also needs inbox:write and the prompt's project inside its boundary), surviving chat retention purge of the prompt message. Agents get 403 users_only, visitors and non-session/non-UAT credentials get 403, and a user a live asking agent takes no messages from gets 403 MESSAGE_DENIED. A missing or unreadable prompt is 404; a too-recent version is 409 too_recent with details.availableAt; an already-settled prompt is 409 dismiss_changed (with details.availableAt when a listed row is too recent). Records one outcome=dismiss ($dismissed) answer row per dismissed decision with a shared batch id and one decision-response message in one transaction, delivers it to a live asking agent, and reports deliveryStatus: delivered, held (for the agent's next session), gone (stored without failure, not sent), unreachable (a suspended or stopped asker: stored failed, not sent), failed, or none when nothing new was dismissed; and publishes decision.updated per row. 404 while web.decisions is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/decision-prompts/{messageId}/dismiss` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `conversation_record`; boundaries `project`, `hub`; pinned by `TestDecisionPromptDismiss_Authorization`)
+
+**Base Permission:** `inbox.write`
+
+**Resource Resolver:** conversation-project
+
+**Effects:** `create-resource`, `update-resource`, `emit-external-effect`
+
+### Audit
+
+- **Event Type:** `chat.decisionprompt.dismiss`
+- **Context Fields:** actor_id, prompt_message_id, batch_id
+- **After Fields:** response_message_id
+- **Atomic:** No
+- **Non-Atomic Justification:** The dismissal answer rows and response message are stored in one transaction before agent delivery, which is fire-and-forget
+
+### External Effect Policy
+
+- **Delivery:** `fire_and_forget`
+- **Failure Mode:** `log_and_continue`
+- **Idempotency:** idempotencyKey (optional); prompt message ID otherwise
+- **Retry:** repeating the call on an already-dismissed prompt returns alreadyDismissed and stores nothing new
+- **Auth Before Emit:** Yes
+
+**Denial Codes:** `forbidden`, `not_found`, `conflict`
+
+### Tests
+
+- `pkg/hub:TestDecisionPromptDismiss_Authorization`
+- `pkg/hub:TestDecisionPromptDismiss_MinimumAgeAndDelivery`
+- `pkg/hub:TestDecisionPromptDismiss_GoneAsker`
+
+---
+
+## chat.projectdecisions.list
+
+**Domain:** chat
+
+**Description:** List pending decision prompts or the append-only recorded answer log for a project, with live waitingOnYou and waitingOnOthers counts and filter facets. Needs project:read on the project, then scopes every prompt, log entry, count, and facet to conversations the caller can read (project topics plus the caller's own canonical DMs with project agents; a UAT token includes DMs only with inbox:read). Agents, visitors and non-session/non-UAT credentials get 403; unsupported methods get 405; 404 while web.decisions is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/projects/{id}/decisions` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_path`; boundaries `project`, `hub`; pinned by `TestProjectDecisions_TokenAndCallerAuthz`)
+
+**Base Permission:** `project.read`
+
+**Resource Resolver:** project-from-url
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestProjectDecisions_TokenAndCallerAuthz`
+- `pkg/hub:TestProjectDecisions_DMPrivacyAcrossTabsCountsAndFacets`
+
+---
+
+## chat.userdecisions.list
+
+**Domain:** chat
+
+**Description:** List pending decision prompts or recorded decision answers across every project the caller is a member of and can read, with live waitingOnYou and waitingOnOthers counts, sort=project|recent, optional project narrowing, and filter facets (capped at 200 readable member projects with truncatedProjects). Filters candidate member projects by project:read (a project-bounded UAT sees only its boundary project; a UAT without project:read gets 200 with empty results), then scopes every prompt, log entry, group, count, and facet to conversations the caller can read (project topics plus the caller's own canonical DMs with project agents; a UAT includes DMs only with inbox:read). Non-member projects and project-visitor bindings are excluded even for hub admins. Agents, visitors and non-session/non-UAT credentials get 403; unsupported methods get 405; 404 while web.decisions is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/users/me/decisions` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `project_collection`; boundaries `project`, `hub`; pinned by `TestUserMeDecisions_TokenAndCallerAuthz`)
+
+**Base Permission:** `project.read`
+
+**Resource Resolver:** project-collection
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`, `not_found`
+
+### Tests
+
+- `pkg/hub:TestUserMeDecisions_TokenAndCallerAuthz`
+- `pkg/hub:TestUserMeDecisions_DMPrivacyAndMembershipScope`
 
 ---
 
@@ -8392,7 +9570,7 @@
 
 **Domain:** user.admin
 
-**Description:** Suspend or reactivate a user account (dispatched from PATCH /api/v1/users/{id} when status field is present). A token needs user:suspend on a hub boundary, checked on the hub-level user record. The caller's own status and activating an invited user are refused for every credential
+**Description:** Suspend or reactivate a user account (dispatched from PATCH /api/v1/users/{id} when status field is present). A token needs user:suspend on a hub boundary, checked on the hub-level user record. The caller's own status and changing an invited user's status are refused for every credential
 
 ### Entry Points
 
@@ -8427,6 +9605,7 @@
 - `pkg/hub/authzop:TestCatalogValidation`
 - `pkg/hub:TestUserPatchToken_StatusRequiresSuspendSelector`
 - `pkg/hub:TestUserPatchToken_SelfStatusGuardStillApplies`
+- `pkg/hub:TestUpdateUser_SuspendInvitedUserConflict`
 
 ---
 
@@ -9032,6 +10211,40 @@
 
 ---
 
+## role.binding.effectivepermissions
+
+**Domain:** role.binding
+
+**Description:** Resolve a user principal's effective permissions and grant provenance. A token needs role_binding:read on a hub boundary; HEAD answers whether the caller may read it
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/admin/effective-permissions` |
+| http_route | HEAD | `/api/v1/admin/effective-permissions` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `hub_instance`; boundaries `hub`)
+
+**Base Permission:** `role_binding.read`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestAdminEffectivePermissions_CallerGates`
+
+---
+
 ## access.constraint.read
 
 **Domain:** access.constraint
@@ -9205,6 +10418,52 @@
 ### Exemptions
 
 - **authentication_only:** The path names no user; the subject is always the caller, so no resource permission applies (scope: caller's own terminal workspace) — waives: `base_permission`
+
+---
+
+## user.execcontainer
+
+**Domain:** user
+
+**Description:** Read, set, or clear the caller's own execution container registration
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/users/me/exec-container` |
+| http_route | PUT | `/api/v1/users/me/exec-container` |
+| http_route | DELETE | `/api/v1/users/me/exec-container` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Resource Resolver:** self-principal
+
+**Effects:** `read-one`, `update-resource`, `delete-resource`
+
+### Audit
+
+- **Event Type:** `user.exec_container.set, user.exec_container.clear`
+- **Context Fields:** actor_id
+- **Before Fields:** agent_id
+- **After Fields:** agent_id
+- **Atomic:** No
+- **Non-Atomic Justification:** Single-row per-user upsert/delete; best-effort synchronous mutation audit follows PutUserExecContainer and DeleteUserExecContainer
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestSessionOnlyGate_ReasonIsReported`
+
+### Exemptions
+
+- **authentication_only:** The path names no user; the subject is always the caller, so no resource permission applies (scope: caller's own execution container registration) — waives: `base_permission`
 
 ---
 
@@ -10180,6 +11439,7 @@
 | http_route | GET | `/api/v1/admin/maintenance/update-available` |
 | http_route | DELETE | `/api/v1/admin/maintenance/update-available` |
 | http_route | GET | `/api/v1/admin/maintenance/update-status` |
+| http_route | PUT | `/api/v1/admin/maintenance/auto-update` |
 | http_route | GET | `/api/v1/admin/maintenance/releases` |
 
 **Principals:** `user`
@@ -10394,6 +11654,39 @@
 
 - `pkg/hub/authzop:TestCatalogValidation`
 - `pkg/hub:TestAdminOrphanedAgents_Access`
+
+---
+
+## hub.runtimeorphans.read
+
+**Domain:** hub
+
+**Description:** List the runtime objects no hub agent owns, as recorded from broker heartbeat inventories, filtered by broker, project and kind (an operator diagnostic under the permission of the health summary; session only until its token admission is governed)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/admin/runtime-orphans` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `GOV_PENDING`)
+
+**Base Permission:** `hub.health.read`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestAdminRuntimeOrphans`
 
 ---
 
@@ -10844,6 +12137,7 @@
 | http_route | GET | `/api/v1/github-app` |
 | http_route | GET | `/api/v1/github-app/installations` |
 | http_route | GET | `/api/v1/github-app/installations/{id}` |
+| http_route | GET | `/api/v1/github-app/repo-routing` |
 
 **Principals:** `user`
 
@@ -10880,6 +12174,8 @@
 | http_route | DELETE | `/api/v1/github-app/installations/{id}` |
 | http_route | POST | `/api/v1/github-app/installations/discover` |
 | http_route | POST | `/api/v1/github-app/sync-permissions` |
+| http_route | PUT | `/api/v1/github-app/repo-routing/{owner}/{repo}` |
+| http_route | DELETE | `/api/v1/github-app/repo-routing/{owner}/{repo}` |
 
 **Principals:** `user`
 
@@ -11284,6 +12580,76 @@
 
 ---
 
+## hub.triggerpresets.read
+
+**Domain:** hub
+
+**Description:** List static trigger rule preset field schemas. Any signed-in user or agent identity reads them, and any token reads them; 404 while the hub.github_triggers experiment is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/trigger-presets` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit_self` (self filter `none`; pinned by `TestTriggerPresets_AnyTokenReadsAndCompiles`)
+
+**Resource Resolver:** none
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestTriggerPresets_Routes`
+- `pkg/hub:TestTriggerPresets_AnyTokenReadsAndCompiles`
+
+### Exemptions
+
+- **authentication_only:** Static server-side preset schemas only; reads no tenant records, mutates no state, and carries no authority (scope: trigger preset schemas) — waives: `base_permission`
+
+---
+
+## hub.triggerpresets.compile
+
+**Domain:** hub
+
+**Description:** Compile a trigger rule preset form into match types, ordered CEL rules, subject policy, and suggested action without persisting anything. Any signed-in user or agent identity calls it, and any token calls it; 404 while the hub.github_triggers experiment is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/trigger-presets/compile` |
+
+**Principals:** `user`, `agent`
+
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
+
+**Bearer:** `admit_self` (self filter `none`; pinned by `TestTriggerPresets_AnyTokenReadsAndCompiles`)
+
+**Resource Resolver:** none
+
+**Effects:** `read-one`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestTriggerPresets_Routes`
+- `pkg/hub:TestTriggerPresets_AnyTokenReadsAndCompiles`
+
+### Exemptions
+
+- **authentication_only:** Pure stateless preset-to-CEL compiler; reads no tenant records, mutates no state, and exercises no authority (scope: stateless trigger preset compiler) — waives: `base_permission`
+
+---
+
 ## hub.prestarthooks.read
 
 **Domain:** hub
@@ -11350,6 +12716,164 @@
 ### Exemptions
 
 - **authentication_only:** The handler answers 410 Gone for every caller and reads or changes nothing; no resource permission applies (scope: removed policy API) — waives: `base_permission`, `denial_codes`
+
+---
+
+## systemone.instance.read
+
+**Domain:** systemone.instance
+
+**Description:** List and read hub-scoped System One provider instances (redacted; stored API keys are never returned); interactive session only
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/admin/system-one/adapters` |
+| http_route | GET | `/api/v1/admin/system-one/instances` |
+| http_route | GET | `/api/v1/admin/system-one/instances/{name}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `CREDENTIAL_MANAGEMENT`)
+
+**Base Permission:** `system_one_instance.read`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `read-one`, `list-scoped`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestSystemOneInstances_AuthzAndGating`
+- `pkg/hub:TestSystemOneInstances_CRUDAndProbe`
+
+---
+
+## systemone.instance.create
+
+**Domain:** systemone.instance
+
+**Description:** Create a hub-scoped System One provider instance and store its API key as an internal hub secret; interactive session only
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/admin/system-one/instances` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `CREDENTIAL_MANAGEMENT`)
+
+**Base Permission:** `system_one_instance.create`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `create-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestSystemOneInstances_AuthzAndGating`
+- `pkg/hub:TestSystemOneInstances_CRUDAndProbe`
+
+---
+
+## systemone.instance.delete
+
+**Domain:** systemone.instance
+
+**Description:** Delete a hub-scoped System One provider instance and remove its internal secret; interactive session only
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | DELETE | `/api/v1/admin/system-one/instances/{name}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `CREDENTIAL_MANAGEMENT`)
+
+**Base Permission:** `system_one_instance.delete`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `delete-resource`
+
+### Audit
+
+- **Event Type:** `systemone.instance.delete`
+- **Context Fields:** actor_id
+- **Before Fields:** instance_id, instance_name
+- **Atomic:** No
+- **Non-Atomic Justification:** Instance row deletion in the store and internal secret removal in the secret backend span two stores; structured audit log is emitted on completion
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestSystemOneInstances_AuthzAndGating`
+- `pkg/hub:TestSystemOneInstances_CredentialSeparationAndSecretIsolation`
+
+---
+
+## systemone.instance.execute
+
+**Domain:** systemone.instance
+
+**Description:** Probe a hub-scoped System One provider instance with a model list query or a stateless inline portable spec evaluation; interactive session only
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/admin/system-one/instances/{name}/probe` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `CREDENTIAL_MANAGEMENT`)
+
+**Base Permission:** `system_one_instance.execute`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `emit-external-effect`
+
+### Audit
+
+- **Event Type:** `systemone.instance.probe`
+- **Context Fields:** actor_id
+- **After Fields:** instance_name, result_class
+- **Atomic:** No
+- **Non-Atomic Justification:** Stateless outbound provider probe mutates no hub database state; structured provenance log is emitted by the runtime
+
+### External Effect Policy
+
+- **Delivery:** `at_least_once`
+- **Failure Mode:** `fail_operation`
+- **Idempotency:** ephemeral probe invocation (stateless evaluation)
+- **Retry:** single bounded attempt within max_eval_time (no automatic retries in P1)
+- **Auth Before Emit:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestSystemOneInstances_AuthzAndGating`
+- `pkg/hub:TestSystemOneInstances_CRUDAndProbe`
 
 ---
 
@@ -11463,7 +12987,7 @@
 
 **Domain:** skill
 
-**Description:** Update a skill: its metadata, version publishing and deprecation, file uploads and finalize. A user-scope skill refuses a federated caller (requireProfileWriter)
+**Description:** Update a project- or user-scope skill: its metadata, version publishing and deprecation, file uploads and finalize (global catalog skills use skill.global.update). A user-scope skill refuses a federated caller (requireProfileWriter)
 
 ### Entry Points
 
@@ -11501,7 +13025,7 @@
 
 **Domain:** skill
 
-**Description:** Delete a skill definition. A user-scope skill refuses a federated caller (requireProfileWriter)
+**Description:** Delete a project- or user-scope skill definition (global catalog skills use skill.global.delete). A user-scope skill refuses a federated caller (requireProfileWriter)
 
 ### Entry Points
 
@@ -11661,7 +13185,7 @@
 
 **Domain:** template
 
-**Description:** Create a template in the global, project or caller's own user scope the request body names. A user-scope create refuses a federated caller (requireProfileWriter)
+**Description:** Create a template in a project or the caller's own user scope the request body names (global catalog templates use template.global.create). A user-scope create refuses a federated caller (requireProfileWriter)
 
 ### Entry Points
 
@@ -11694,7 +13218,7 @@
 
 **Domain:** template
 
-**Description:** Update a template: its definition and metadata, file uploads, finalize and file writes. A user-scope template refuses a federated caller (requireProfileWriter)
+**Description:** Update a project- or user-scope template: its definition and metadata, file uploads, finalize and file writes (global catalog templates use template.global.update). A user-scope template refuses a federated caller (requireProfileWriter)
 
 ### Entry Points
 
@@ -11733,7 +13257,7 @@
 
 **Domain:** template
 
-**Description:** Delete a global or project template. A user-scope template is template.user.delete
+**Description:** Delete a project template (global catalog templates use template.global.delete; a user-scope template is template.user.delete)
 
 ### Entry Points
 
@@ -11957,7 +13481,7 @@
 
 **Domain:** skill
 
-**Description:** Create a skill in the global catalog (global or core scope). The check is skill.create_global on a collection-level request at the hub scope, so a user access token needs skill:create_global on a hub boundary
+**Description:** Create a skill in the global catalog (scope=global). The check is skill.create_global on a collection-level request at the hub scope, so a user access token needs skill:create_global on a hub boundary
 
 ### Entry Points
 
@@ -11982,6 +13506,84 @@
 ### Tests
 
 - `pkg/hub:TestGlobalSkillCreate_RequiresCreateGlobalSelectorAndHubBoundary`
+
+---
+
+## skill.global.update
+
+**Domain:** skill
+
+**Description:** Update a global-catalog skill (scope=global): its metadata, version publishing and deprecation, file uploads and finalize. Selected by the stored skill record's scope via catalogWriteAction, requiring skill.update_global (skill:update_global on a hub boundary)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PATCH | `/api/v1/skills/{id}` |
+| http_route | POST | `/api/v1/skills/{id}/versions` |
+| http_route | POST | `/api/v1/skills/{id}/versions/{vid}/deprecate` |
+| http_route | POST | `/api/v1/skills/{id}/upload` |
+| http_route | POST | `/api/v1/skills/{id}/finalize` |
+| http_route | PUT | `/api/v1/skills/{id}/files/{path}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `catalog_record`; boundaries `hub`)
+
+**Base Permission:** `skill.update_global`
+
+**Resource Resolver:** skill-from-url
+
+**Effects:** `update-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestGlobalSkillWrite_RequiresTwinSelectorAndHubBoundary`
+
+---
+
+## skill.global.delete
+
+**Domain:** skill
+
+**Description:** Delete a global-catalog skill definition (scope=global). Selected by the stored skill record's scope via catalogWriteAction, requiring skill.delete_global (skill:delete_global on a hub boundary)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | DELETE | `/api/v1/skills/{id}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `catalog_record`; boundaries `hub`)
+
+**Base Permission:** `skill.delete_global`
+
+**Resource Resolver:** skill-from-url
+
+**Effects:** `delete-resource`
+
+### Audit
+
+- **Event Type:** `skill.delete`
+- **Context Fields:** actor_id, project_id
+- **Before Fields:** skill_id, skill_name
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestGlobalSkillWrite_RequiresTwinSelectorAndHubBoundary`
 
 ---
 
@@ -12173,11 +13775,123 @@
 
 ---
 
+## template.global.create
+
+**Domain:** template
+
+**Description:** Create a template in the global catalog (scope=global). The check is template.create_global on a collection-level request at the hub scope, so a user access token needs template:create_global on a hub boundary
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/templates` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `hub_collection`; boundaries `hub`)
+
+**Base Permission:** `template.create_global`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `create-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestGlobalTemplateWrite_RequiresTwinSelectorAndHubBoundary`
+
+---
+
+## template.global.update
+
+**Domain:** template
+
+**Description:** Update a global-catalog template (scope=global): its definition and metadata, file uploads, finalize and file writes. Selected by the stored template record's scope via catalogWriteAction, requiring template.update_global (template:update_global on a hub boundary)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PUT | `/api/v1/templates/{id}` |
+| http_route | PATCH | `/api/v1/templates/{id}` |
+| http_route | POST | `/api/v1/templates/{id}/upload` |
+| http_route | POST | `/api/v1/templates/{id}/finalize` |
+| http_route | POST | `/api/v1/templates/{id}/files` |
+| http_route | PUT | `/api/v1/templates/{id}/files/{path}` |
+| http_route | DELETE | `/api/v1/templates/{id}/files/{path}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `catalog_record`; boundaries `hub`)
+
+**Base Permission:** `template.update_global`
+
+**Resource Resolver:** template-from-url
+
+**Effects:** `update-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestGlobalTemplateWrite_RequiresTwinSelectorAndHubBoundary`
+
+---
+
+## template.global.delete
+
+**Domain:** template
+
+**Description:** Delete a global-catalog template (scope=global). Selected by the stored template record's scope via catalogWriteAction, requiring template.delete_global (template:delete_global on a hub boundary)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | DELETE | `/api/v1/templates/{id}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `catalog_record`; boundaries `hub`)
+
+**Base Permission:** `template.delete_global`
+
+**Resource Resolver:** template-from-url
+
+**Effects:** `delete-resource`
+
+### Audit
+
+- **Event Type:** `template.delete`
+- **Context Fields:** actor_id, project_id
+- **Before Fields:** template_id, template_name
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestGlobalTemplateWrite_RequiresTwinSelectorAndHubBoundary`
+
+---
+
 ## template.clone
 
 **Domain:** template
 
-**Description:** Clone a readable template into the global scope or a project the request body names. The source needs template read; the destination needs template create on its scope, so a user access token needs template:read and template:create on a boundary that contains both
+**Description:** Clone a readable template into a project the request body names (global destination is template.global.clone; user destination is template.user.clone). The source needs template read; the destination needs template create on its project, so a user access token needs template:read and template:create on a boundary that contains both
 
 ### Entry Points
 
@@ -12205,11 +13919,43 @@
 
 ---
 
+## template.global.clone
+
+**Domain:** template
+
+**Description:** Clone a readable template into the global catalog (scope=global). The source needs template read; the destination checks template.create_global on a collection-level request at the hub scope, so a user access token needs template:read and template:create_global on a hub boundary
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/templates/{id}/clone` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `hub_collection`; boundaries `hub`)
+
+**Base Permission:** `template.create_global`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `create-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestCatalogCloneToken_RequiresReadAndCreate`
+
+---
+
 ## template.reimport
 
 **Domain:** template
 
-**Description:** Reimport a global or project template from its source. The template needs template read and the reimport needs template create on the owning scope, as import does
+**Description:** Reimport a project template from its source (global templates use template.global.reimport; user templates use template.user.reimport). The template needs template read and the reimport needs template create on the owning project, as import does
 
 ### Entry Points
 
@@ -12217,9 +13963,9 @@
 |------|--------|---------|
 | http_route | POST | `/api/v1/templates/{id}/reimport` |
 
-**Principals:** `user`
+**Principals:** `user`, `agent`
 
-**Credentials:** `session_jwt`, `scoped_uat`
+**Credentials:** `session_jwt`, `scoped_uat`, `agent_jwt`
 
 **Bearer:** `admit` (target `catalog_record`; boundaries `project`, `hub`)
 
@@ -12237,11 +13983,43 @@
 
 ---
 
+## template.global.reimport
+
+**Domain:** template
+
+**Description:** Reimport a global-catalog template (scope=global) from its source. The template needs template read and the reimport checks template.create_global on a collection-level request at the hub scope, so a user access token needs template:read and template:create_global on a hub boundary
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/templates/{id}/reimport` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `hub_collection`; boundaries `hub`)
+
+**Base Permission:** `template.create_global`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `update-resource`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub:TestCatalogReimportToken_RequiresReadAndCreate`
+
+---
+
 ## template.import.global
 
 **Domain:** template
 
-**Description:** Import or discover templates for the global catalog. The check is template create on a collection-level request at the hub scope, so a user access token needs template:create on a hub boundary
+**Description:** Import or discover templates for the global catalog. The check is template.create_global on a collection-level request at the hub scope, so a user access token needs template:create_global on a hub boundary
 
 ### Entry Points
 
@@ -12256,7 +14034,7 @@
 
 **Bearer:** `admit` (target `hub_collection`; boundaries `hub`)
 
-**Base Permission:** `template.create`
+**Base Permission:** `template.create_global`
 
 **Resource Resolver:** hub-scoped
 
@@ -12957,6 +14735,41 @@
 
 ---
 
+## broker.agent.deliver
+
+**Domain:** broker
+
+**Description:** Relay one deliver-message flush from a broker to an agent it runs, over the agent's conduit session (design v2.22 deliver-message)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/runtime-brokers/{id}/agents/{agentId}/deliver` |
+
+**Principals:** `broker`
+
+**Credentials:** `broker_token`
+
+**Bearer:** `non_user`
+
+**Resource Resolver:** broker-self
+
+**Effects:** `update-resource`
+
+**Denial Codes:** `forbidden`, `conflict`
+
+### Tests
+
+- `pkg/hub:TestBearerDisposition_EveryRoutePatternCovered`
+- `pkg/hub:TestBrokerAgentDeliver_Authorization`
+
+### Exemptions
+
+- **internal_only:** The broker authenticates with its own HMAC credential for an agent assigned to it; the user's authority was checked at the message route (agent.message) before the bound message rows were written (scope: broker self access, agent assigned to the broker) — waives: `base_permission`
+
+---
+
 ## broker.agent.workspacedownload
 
 **Domain:** broker
@@ -13334,6 +15147,86 @@
 
 - **Event Type:** `secret.write`
 - **Context Fields:** actor_id, project_id
+- **Before Fields:** secret_key
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+
+---
+
+## agent.secret.read
+
+**Domain:** agent
+
+**Description:** Read agent-scoped secret metadata (scope=agent&scopeId=<agentID>). Values are never readable by humans; gated on hub.agent_secrets.
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/secrets` |
+| http_route | GET | `/api/v1/secrets/{key}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `agent_record`; boundaries `project`, `hub`)
+
+**Base Permission:** `agent.read`
+
+**Resource Resolver:** agent-from-query
+
+**Effects:** `read-secret`
+
+### Audit
+
+- **Event Type:** `agent.secret.read`
+- **Context Fields:** actor_id, agent_id
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+
+---
+
+## agent.secret.write
+
+**Domain:** agent
+
+**Description:** Create, update or delete agent-scoped secrets (scope=agent&scopeId=<agentID>). Values are write-only for humans; gated on hub.agent_secrets.
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | PUT | `/api/v1/secrets/{key}` |
+| http_route | PATCH | `/api/v1/secrets/{key}` |
+| http_route | DELETE | `/api/v1/secrets/{key}` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`, `scoped_uat`
+
+**Bearer:** `admit` (target `agent_record`; boundaries `project`, `hub`)
+
+**Base Permission:** `agent.update`
+
+**Resource Resolver:** agent-from-query
+
+**Effects:** `create-resource`, `update-resource`, `delete-resource`
+
+### Audit
+
+- **Event Type:** `agent.secret.write`
+- **Context Fields:** actor_id, agent_id
 - **Before Fields:** secret_key
 - **Atomic:** Yes
 

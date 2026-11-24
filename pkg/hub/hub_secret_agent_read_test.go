@@ -84,8 +84,7 @@ func newHubSecretReadFixture(t *testing.T) *hubSecretReadFixture {
 		Created: time.Now(), Updated: time.Now(),
 	}
 	require.NoError(t, s.CreateAgent(ctx, agent))
-	token, err := srv.agentTokenService.GenerateAgentToken(agent.ID, project.ID, nil, nil)
-	require.NoError(t, err)
+	token := srv.generateRecordedAgentToken(t, agent.ID, project.ID, nil, nil)
 	return &hubSecretReadFixture{srv: srv, agentToken: token}
 }
 
@@ -175,10 +174,11 @@ func TestHubSecretAgentRead_ListAndGet(t *testing.T) {
 }
 
 // TestHubSecretAgentRead_AdminUnchanged: an admin session still lists and
-// gets every hub-scope secret.
+// gets every non-internal hub-scope secret, while SecretTypeInternal rows
+// remain hidden from all user-facing list/get endpoints.
 func TestHubSecretAgentRead_AdminUnchanged(t *testing.T) {
 	f := newHubSecretReadFixture(t)
-	all := append([]string{hsrEnvAlways}, hsrHidden...)
+	all := []string{hsrEnvAlways, hsrEnvAsNeeded, hsrVariable, hsrFile, hsrTelemetry}
 	sort.Strings(all)
 
 	code, body := f.adminGet(t, "/api/v1/secrets?scope=hub")
@@ -188,6 +188,8 @@ func TestHubSecretAgentRead_AdminUnchanged(t *testing.T) {
 		code, body := f.adminGet(t, "/api/v1/secrets/"+name+"?scope=hub")
 		assert.Equal(t, http.StatusOK, code, "%s: %s", name, body)
 	}
+	code, body = f.adminGet(t, "/api/v1/secrets/"+hsrInternal+"?scope=hub")
+	assert.Equal(t, http.StatusNotFound, code, body)
 
 	code, body = f.adminGet(t, "/api/v1/env?scope=hub")
 	require.Equal(t, http.StatusOK, code, body)

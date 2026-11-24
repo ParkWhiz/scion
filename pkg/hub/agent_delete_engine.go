@@ -289,7 +289,11 @@ func (s *Server) claimAgentDeletion(ctx context.Context, agentID string, p agent
 			// Capture prior once per delete attempt: a re-claim of an
 			// abandoned row keeps the original prior.
 			if cur.DeletionState == store.DeletionStateNone || cur.DeletionState == store.DeletionStateFailed {
-				prior := store.DeletionPriorState{Phase: cur.Phase, Activity: cur.Activity}
+				prior := store.DeletionPriorState{
+					Phase:     cur.Phase,
+					Activity:  cur.Activity,
+					RunIntent: string(cur.RunIntent),
+				}
 				if cur.LaunchState == store.LaunchStateActive {
 					prior.LaunchID = cur.LaunchID
 				}
@@ -389,6 +393,7 @@ func (s *Server) claimAgentDeletion(ctx context.Context, agentID string, p agent
 			s.agentLifecycleLog.Warn("delete claim: finalizing row has no stored request; using the current retention setting",
 				"agent_id", agentID, "claim", claim)
 		}
+		s.expireHeldMessagesForAgent(ctx, agentID, holdFailReasonAgentStopped)
 		return &agentDeletionPlan{
 			claim:        claim,
 			snapshot:     row,
@@ -408,9 +413,8 @@ func (s *Server) claimAgentDeletion(ctx context.Context, agentID string, p agent
 // dispatch, ptone/scion#2890). A deleting row is skipped too: it reaches
 // the claim only once its lease has expired (an abandoned engine), and the
 // re-claim's dispatch check then refuses it with a rollback that restores
-// its prior phase (the run intent the abandoned engine recorded stays
-// stopped), where a refusal here would leave it stuck in deleting and
-// stopping. A row that is gone is left to the claim,
+// its prior phase and run intent (ptone/scion#4961), where a refusal here
+// would leave it stuck in deleting and stopping. A row that is gone is left to the claim,
 // which then affects nothing. An unpinned agent with no Runtime Broker
 // passes, as before (checkAgentPinnedPlacement).
 func (s *Server) deletePlacementPreCheck(ctx context.Context, agentID string) error {
@@ -778,7 +782,7 @@ func (e *deletionEngine) run() deletionOutcome {
 		})
 	}()
 
-	// Cancel scheduled events targeting the agent.
+	// Cancel pending scheduled events targeting or created by the agent.
 	func() {
 		ctx, cancel := e.step(deleteStepTimeout)
 		defer cancel()
@@ -826,13 +830,44 @@ func (e *deletionEngine) run() deletionOutcome {
 		defer cancel()
 		s.ClearTopicDefaultAgent(ctx, agent.ID, agent.Slug, agent.ProjectID)
 	})
-	// Pause the schedules whose authority is this agent, with status
-	// reason creator_deleted (ptone/scion#5403). Run only after the delete
-	// committed; the schedule evaluator pauses any it misses.
+	// Pause recurring exec and message schedules and triggers targeting this
+	// agent with target_deleted (ptone/scion#7884, ptone/scion#8927,
+	// Stage 1 §5.6) before pausing definitions authored by this agent, so
+	// self-targeted schedules and triggers record target_deleted.
+	e.tailStep("pause targeted schedules", func() {
+		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
+		defer cancel()
+		s.pauseSchedulesTargetingAgent(ctx, agent)
+	})
+	e.tailStep("pause targeted triggers", func() {
+		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
+		defer cancel()
+		s.pauseTriggersTargetingAgent(ctx, agent)
+	})
+	// Pause the schedules and triggers whose authority is this agent, with
+	// status reason creator_deleted (ptone/scion#5403, Stage 1 §5.6). Each
+	// runs in its own tail step with an independent budget so schedules cannot
+	// starve trigger pausing; the schedule evaluator and trigger fire-time
+	// standing check remain the backstops.
 	e.tailStep("pause authored schedules", func() {
 		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
 		defer cancel()
 		s.pauseSchedulesAuthoredByAgent(ctx, agent)
+	})
+	e.tailStep("pause authored triggers", func() {
+		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
+		defer cancel()
+		s.pauseTriggersAuthoredByAgent(ctx, agent)
+	})
+	// Release active trigger subject claims bound to this agent (Stage 2 §4.2, §5.6).
+	// Idempotent on retry; hourly trigger maintenance also sweeps claims for deleted agents.
+	e.tailStep("release trigger subject claims", func() {
+		ctx, cancel := context.WithTimeout(e.base, deleteStepTimeout)
+		defer cancel()
+		if _, err := s.store.ReleaseTriggerSubjectClaimsForAgent(ctx, agent.ID, time.Now().UTC()); err != nil {
+			s.agentLifecycleLog.Warn("Failed to release trigger subject claims for deleted agent",
+				"agent_id", agent.ID, "error", err)
+		}
 	})
 
 	return deletionOutcome{kind: deletionOutcomeDeleted}
@@ -1158,7 +1193,7 @@ func retriedRunMismatchMessage(first, second *DeleteRunMismatchError) string {
 //     the row (see finish).
 //   - a stale dispatch: abandon, as for the first dispatch.
 //   - a placement refusal: rollbackPlacement, as for the first dispatch.
-//     The stored code stays conflict, and the answer carries the
+//     The stored code is placement_conflict, and the answer carries the
 //     refusal's own code and details.
 //   - another run mismatch, whichever run it names: conflict. There is
 //     no second retry, so a run that keeps changing cannot loop the
@@ -1350,9 +1385,11 @@ func (e *deletionEngine) rollback(code, msg string) deletionOutcome {
 			}
 		},
 	}
-	// The run intent dispatch recorded (stopped) is put back to what it
-	// replaced, with a compare-and-set on the time dispatch wrote, so an
-	// agent restored to a live phase keeps a matching intent (the hub stops
+	// The run intent dispatch recorded (stopped) is put back to the pre-delete
+	// intent stored in DeletionPriorState (falling back to what this engine's
+	// dispatch replaced when a legacy prior carries no runIntent,
+	// ptone/scion#4961), with a compare-and-set on the time dispatch wrote, so
+	// an agent restored to a live phase keeps a matching intent (the hub stops
 	// an agent that runs with intent stopped) and a newer start or stop
 	// recorded meanwhile wins.
 	n, err := e.s.store.UpdateAgentDeletion(ctx, e.agentID(), e.claimPred(store.DeletionStateDeleting), set)
@@ -1364,8 +1401,12 @@ func (e *deletionEngine) rollback(code, msg string) deletionOutcome {
 	if n == 0 {
 		return e.lost()
 	}
-	if e.intentRecorded && e.priorIntent.Valid() && e.priorIntent != store.RunIntentStopped {
-		if _, err := e.s.store.RevertRunIntent(ctx, e.agentID(), store.RunIntentStopped, e.intentAt, e.priorIntent); err != nil {
+	restoreIntent := e.priorIntent
+	if priorIntent := store.RunIntent(prior.RunIntent); priorIntent.Valid() {
+		restoreIntent = priorIntent
+	}
+	if e.intentRecorded && restoreIntent.Valid() && restoreIntent != store.RunIntentStopped {
+		if _, err := e.s.store.RevertRunIntent(ctx, e.agentID(), store.RunIntentStopped, e.intentAt, restoreIntent); err != nil {
 			e.s.agentLifecycleLog.Warn("delete engine: restoring the run intent failed",
 				"agent_id", e.agentID(), "error", err)
 		}
@@ -1377,16 +1418,16 @@ func (e *deletionEngine) rollback(code, msg string) deletionOutcome {
 // rollbackPlacement fails the delete for a placement refusal (the claimed
 // snapshot's check, the dispatcher's backstop on the first dispatch, or its
 // backstop on the delete of the run the broker reported holding,
-// retryReportedRunDelete): nothing was deleted, so it rolls back as a
-// conflict and restores the prior phase. The stored deletion code stays
-// conflict; the outcome carries the refusal, so the answer names the
-// specific placement code, as the claim's pre-check does
+// retryReportedRunDelete): nothing was deleted, so it rolls back with
+// placement_conflict (force does not override it, ptone/scion#4844) and
+// restores the prior phase. The outcome carries the refusal, so the answer
+// names the specific placement code, as the claim's pre-check does
 // (writeDeletionFailureWithRefusal). The refusal is remembered for this
 // claim before the rollback publishes, so a joiner on this hub process
 // woken by that event already finds it (deletionPlacementRefusals).
 func (e *deletionEngine) rollbackPlacement(refusal *RuntimeTargetRefusal) deletionOutcome {
 	deletionPlacementRefusals.Store(e.agentID(), deletionPlacementRefusalEntry{claim: e.plan.claim, refusal: refusal})
-	out := e.rollback(store.DeletionCodeConflict, refusal.Message)
+	out := e.rollback(store.DeletionCodePlacementConflict, refusal.Message)
 	if out.kind == deletionOutcomeFailed {
 		out.refusal = refusal
 	}
@@ -1550,8 +1591,9 @@ func (e *deletionEngine) finish() (deletionOutcome, bool) {
 		return deletionOutcome{}, true
 	}
 
-	// Hard delete: publish deleted BEFORE removing the record (the
-	// documented order), then delete, retried once.
+	// Hard delete: publish deleted BEFORE removing the record (the documented
+	// order), then delete, retried once. Post-commit external (GCP) cleanup of
+	// agent-scope secrets runs structurally inside finalizeAgentDeletion.
 	e.stopRenewal()
 	s.events.PublishAgentDeleted(e.base, agent.ID, agent.ProjectID)
 	var err error
@@ -1599,7 +1641,13 @@ var agentDeletionFinalizeSeam store.DeletionFinalizeHook = func(context.Context,
 // agentDeletionFinalizeSeam var first, then the Server's lifecycle finalize,
 // agent_lifecycle_tx.go).
 func (s *Server) finalizeAgentDeletion(ctx context.Context, agentID string, pred store.DeletionPredicate, mode store.DeletionFinalizeMode, set store.DeletionFields) (int, error) {
-	return s.store.FinalizeAgentDeletion(ctx, agentID, pred, mode, set, s.agentFinalizeHook)
+	run := func(txCtx context.Context) (int, error) {
+		return s.store.FinalizeAgentDeletion(txCtx, agentID, pred, mode, set, s.agentFinalizeHook)
+	}
+	if mode == store.DeletionFinalizeHard {
+		return s.withAgentSecretCleanup(ctx, agentID, run)
+	}
+	return run(ctx)
 }
 
 // --- Request side (design §2.4) ---
@@ -1655,7 +1703,7 @@ func writeDeletionFailure(w http.ResponseWriter, agentID, code, message, retryAf
 // deletionCode for platform admins only. Any other failure is
 // writeDeletionFailure's answer.
 func writeDeletionFailureWithRefusal(w http.ResponseWriter, agentID, code, message, retryAfter string, refusal *RuntimeTargetRefusal, isAdmin bool) {
-	if refusal != nil && code == store.DeletionCodeConflict {
+	if refusal != nil && (code == store.DeletionCodePlacementConflict || code == store.DeletionCodeConflict) {
 		slog.Warn("agent delete failed", "agent_id", agentID, "deletion_code", code,
 			"placement_code", refusal.Code, "message", refusal.Message)
 		details := map[string]interface{}{}
@@ -1682,7 +1730,7 @@ func writeDeletionFailureWithRefusal(w http.ResponseWriter, agentID, code, messa
 	} else {
 		message = genericDeleteFailedMessage
 	}
-	if code == store.DeletionCodeConflict {
+	if code == store.DeletionCodeConflict || code == store.DeletionCodePlacementConflict {
 		writeError(w, http.StatusConflict, ErrCodeConflict, message, details)
 		return
 	}

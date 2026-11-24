@@ -83,12 +83,14 @@ const (
 	// workspaceDownloadMode this broker does not know (422).
 	ErrCodeWorkspaceDownloadModeUnsupported = api.BrokerErrCodeWorkspaceDownloadModeUnsupported
 
-	// ErrCodeIdentityNotMapped and ErrCodeIdentityKSAMismatch mark a GCP
-	// identity "assign" dispatch on Kubernetes refused for a missing or
-	// conflicting kubernetes_service_account_mappings entry (400). The hub
-	// translates them into its own message (ptone/scion#4024).
+	// ErrCodeIdentityNotMapped, ErrCodeIdentityKSAMismatch, and
+	// ErrCodeIdentityKSAConflict mark a GCP identity "assign" dispatch on
+	// Kubernetes refused for a missing, mismatched, or conflicting Kubernetes
+	// ServiceAccount (400). The hub translates them into its own message
+	// (ptone/scion#4024, ptone/scion#7966).
 	ErrCodeIdentityNotMapped   = api.BrokerErrCodeIdentityNotMapped
 	ErrCodeIdentityKSAMismatch = api.BrokerErrCodeIdentityKSAMismatch
+	ErrCodeIdentityKSAConflict = api.BrokerErrCodeIdentityKSAConflict
 
 	// ErrCodeAgentIdentityUnknown marks a delete/stop that could not be
 	// verified as safe because a runtime process restart dropped the
@@ -113,6 +115,12 @@ const (
 	// for a linked checkout (resolveLinkedCheckout); see
 	// api.BrokerErrCodeLocalWorktreeRefused.
 	ErrCodeLocalWorktreeRefused = api.BrokerErrCodeLocalWorktreeRefused
+
+	// ErrCodeUnsupportedCapability marks a create, start or restart refused
+	// (412) because the resolved runtime does not support a required capability
+	// such as the project's workspace sharing mode; see
+	// api.BrokerErrCodeUnsupportedCapability.
+	ErrCodeUnsupportedCapability = api.BrokerErrCodeUnsupportedCapability
 
 	// ErrCodeStaleDispatch marks a delete refused because it arrived after
 	// the deadline the hub sent with it (notAfter, ptone/scion#2906): the

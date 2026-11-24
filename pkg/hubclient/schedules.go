@@ -62,18 +62,21 @@ func (s *scheduleService) basePath() string {
 
 // CreateScheduleRequest is the client-side request for creating a recurring schedule.
 type CreateScheduleRequest struct {
-	Name      string `json:"name"`
-	CronExpr  string `json:"cronExpr"`
-	TimeZone  string `json:"timeZone,omitempty"` // IANA zone for CronExpr; empty means UTC
-	EventType string `json:"eventType"`
-	Payload   string `json:"payload,omitempty"`
-	AgentName string `json:"agentName,omitempty"`
-	Message   string `json:"message,omitempty"`
-	Interrupt bool   `json:"interrupt,omitempty"`
-	Wake      bool   `json:"wake,omitempty"`
-	Template  string `json:"template,omitempty"`
-	Task      string `json:"task,omitempty"`
-	Branch    string `json:"branch,omitempty"`
+	Name           string   `json:"name"`
+	CronExpr       string   `json:"cronExpr"`
+	TimeZone       string   `json:"timeZone,omitempty"` // IANA zone for CronExpr; empty means UTC
+	EventType      string   `json:"eventType"`
+	Payload        string   `json:"payload,omitempty"`
+	AgentName      string   `json:"agentName,omitempty"`
+	Message        string   `json:"message,omitempty"`
+	Interrupt      bool     `json:"interrupt,omitempty"`
+	Wake           bool     `json:"wake,omitempty"`
+	Template       string   `json:"template,omitempty"`
+	Task           string   `json:"task,omitempty"`
+	Branch         string   `json:"branch,omitempty"`
+	Command        []string `json:"command,omitempty"`
+	TimeoutSeconds int      `json:"timeoutSeconds,omitempty"`
+	CaptureOutput  string   `json:"captureOutput,omitempty"`
 }
 
 // UpdateScheduleRequest is the client-side request for updating a schedule.
@@ -81,10 +84,15 @@ type UpdateScheduleRequest struct {
 	Name     string `json:"name,omitempty"`
 	CronExpr string `json:"cronExpr,omitempty"`
 	// TimeZone: nil leaves the zone unchanged; "" sets it back to UTC.
-	TimeZone  *string `json:"timeZone,omitempty"`
-	EventType string  `json:"eventType,omitempty"`
-	Payload   string  `json:"payload,omitempty"`
-	Status    string  `json:"status,omitempty"`
+	TimeZone       *string  `json:"timeZone,omitempty"`
+	EventType      string   `json:"eventType,omitempty"`
+	Payload        string   `json:"payload,omitempty"`
+	Status         string   `json:"status,omitempty"`
+	AgentID        string   `json:"agentId,omitempty"`
+	AgentName      string   `json:"agentName,omitempty"`
+	Command        []string `json:"command,omitempty"`
+	TimeoutSeconds *int     `json:"timeoutSeconds,omitempty"`
+	CaptureOutput  *string  `json:"captureOutput,omitempty"`
 }
 
 // Schedule represents a recurring schedule returned by the Hub API.
@@ -117,8 +125,13 @@ type ListSchedulesOptions struct {
 	Page   apiclient.PageOptions
 }
 
+// ScheduleListScopeCaller indicates that a schedule or scheduled-event list
+// response is filtered to rows held by the calling principal (e.g. an agent).
+const ScheduleListScopeCaller = "caller"
+
 // ListSchedulesResponse is the response from listing schedules.
 type ListSchedulesResponse struct {
+	Scope      string     `json:"scope,omitempty"`
 	Schedules  []Schedule `json:"schedules"`
 	NextCursor string     `json:"nextCursor,omitempty"`
 	TotalCount int        `json:"totalCount,omitempty"`

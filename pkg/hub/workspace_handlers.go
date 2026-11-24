@@ -563,7 +563,7 @@ func (s *Server) handleWorkspaceSyncToFinalize(w http.ResponseWriter, r *http.Re
 			if writeSecretResolutionError(w, err) {
 				return
 			}
-			if writeEmptyPerAgentCapabilityError(w, err) {
+			if writeWorkspaceModeCapabilityError(w, err) {
 				return
 			}
 			if relayDispatchRefusal(w, err) {
@@ -576,6 +576,9 @@ func (s *Server) handleWorkspaceSyncToFinalize(w http.ResponseWriter, r *http.Re
 				return
 			}
 			if relayBrokerRefusal(w, err) {
+				return
+			}
+			if s.writeFinalizeBrokerRuntimeUnavailable(ctx, w, agent, err) {
 				return
 			}
 			RuntimeError(w, "Failed to dispatch agent: "+err.Error())

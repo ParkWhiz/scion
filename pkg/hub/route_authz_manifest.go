@@ -161,6 +161,15 @@ var routeAuthzManifest = map[string]string{
 	// ── User-scoped terminal workspace ─────────────────────────────────
 	"/api/v1/users/me/terminal-workspace": "authenticated", // GET/PUT: caller's own list; session/dev credential only (requireSessionCredentialFor)
 
+	// ── User-scoped execution container registration ─────────────────────
+	"/api/v1/users/me/exec-container": "authenticated", // GET/PUT/DELETE: caller's own registration; session/dev credential only (requireSessionCredentialFor)
+
+	// ── Profile decisions roll-up ──────────────────────────────────────
+	"/api/v1/users/me/decisions": "authenticated", // GET: caller's decisions across member projects; session or scoped UAT (project:read + inbox:read for DMs)
+
+	// ── Profile inbox summary ──────────────────────────────────────────
+	"/api/v1/users/me/inbox/summary": "authenticated", // GET: caller's inbox summary across categories; session or UAT with inbox:read
+
 	// ── Hub-scoped injected skills ─────────────────────────────────────
 	"/api/v1/hub/settings/injected-skills": "authenticated", // GET: authenticated (any user), PUT: admin (role check in handler)
 
@@ -186,6 +195,7 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/admin/maintenance/update-available": "admin", // Update availability status
 	"/api/v1/admin/maintenance/restart":          "admin", // Restart hub
 	"/api/v1/admin/maintenance/update-status":    "admin", // Update status (version, installer, last update)
+	"/api/v1/admin/maintenance/auto-update":      "admin", // Daily auto-update setting
 	"/api/v1/admin/maintenance/releases":         "admin", // Release catalog per channel
 	"/api/v1/admin/scheduler":                    "admin", // Scheduler status
 	"/api/v1/admin/allow-list":                   "admin", // Allow list management
@@ -213,11 +223,15 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/admin/diagnostics/logs":             "admin", // Diagnostics logs
 	"/api/v1/admin/health/summary":               "admin", // Health summary
 	"/api/v1/admin/orphaned-agents":              "admin", // Orphaned and revoked agents (session only)
+	"/api/v1/admin/runtime-orphans":              "admin", // Runtime objects with no hub agent (session only)
 	"/api/v1/admin/messaging":                    "admin", // Admin messaging
 	"/api/v1/admin/messaging/divergence":         "admin", // Admin messaging divergence check
 	"/api/v1/admin/experiments":                  "admin", // Admin experiment overrides
 	"/api/v1/admin/profiling":                    "admin", // Admin profiling switches (session only)
 	"/api/v1/admin/chat-retention":               "admin", // Admin chat retention settings (session only)
+	"/api/v1/admin/system-one/adapters":          "admin", // System One provider adapter capabilities (session only; 404 when hub.system_one is off)
+	"/api/v1/admin/system-one/instances":         "admin", // System One provider instances (session only; 404 when hub.system_one is off)
+	"/api/v1/admin/system-one/instances/":        "admin", // System One provider instance by name and probe (session only; 404 when hub.system_one is off)
 	"/api/v1/admin/conduit/grant-keys/rotate":    "admin", // POST: rotate the conduit grant signing key; returns kids and timestamps only; 404 when hub.conduit is off
 	"/api/v1/admin/conduit/grant-keys/revoke":    "admin", // POST {kid}: revoke a conduit grant key at once; returns the kid only; 404 when hub.conduit is off
 	"/api/v1/admin/keys/status":                  "admin", // GET: this instance's server key status report (IDs, deadlines, counts; never key material); platform admin only; 404 when server.secret_rotation is off
@@ -238,6 +252,7 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/admin/access-constraint-previews":   "admin", // Admin access constraint previews
 	"/api/v1/admin/access-constraint-previews/":  "admin", // Admin access constraint preview by ID
 	"/api/v1/admin/effective-access":             "admin", // Admin effective access
+	"/api/v1/admin/effective-permissions":        "admin", // Admin effective permissions
 
 	// ── Access constraint audit (method-scoped) ────────────────────────
 	"GET /api/v1/admin/access-constraints/{id}/audit": "admin", // Constraint audit history — hub.audit.read (super-admin) via Decide in handler; denials return 404
@@ -275,8 +290,9 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/chat/user-prefs":            "authenticated", // Chat user preferences
 	"/api/v1/chat/presence":              "authenticated", // Chat presence
 	"/api/v1/chat/search":                "authenticated", // Chat search
-	"/api/v1/decisions/":                 "authenticated", // Choice prompt decisions (read, answer)
-	"/api/v1/choice-prompts/":            "authenticated", // Choice prompt set answers
+	"/api/v1/decisions/":                 "authenticated", // Decision prompt decisions (read, answer)
+	"/api/v1/decision-prompts/":          "authenticated", // Decision prompt set answers and dismissal
+	"/api/v1/secret-requests/":           "authenticated", // Secret request card read, fulfill, and dismiss (session-only; agent.read / agent.attach)
 	"/api/v1/chat/stars":                 "authenticated", // Caller's starred messages in one conversation; 404 when the experiment is off
 	"/api/v1/chat/stars/":                "authenticated", // Star state, star detail, star add/remove (caller's own); 404 when the experiment is off
 	"/api/v1/chat/starred-conversations": "authenticated", // Caller's conversations with starred messages (the Starred rail); 404 when the experiment is off
@@ -303,6 +319,11 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/agent/gcp-token":          "agent-token", // Agent GCP access token
 	"/api/v1/agent/gcp-identity-token": "agent-token", // Agent GCP identity token
 	"POST /api/v1/agent/secrets":       "agent-token", // Agent secret fetch
+	"GET /api/v1/agent/hub":            "agent-token", // Agent hub metadata (hub_id)
+	"/api/v1/agent/decisions":          "agent-token", // Agent decision list (self-scoped; 404 when web.decisions is off)
+	"/api/v1/agent/decisions/":         "agent-token", // Agent decision show, interpreted answers, and withdraw (self-scoped; 404 when web.decisions is off)
+	"/api/v1/agent/secret-requests":    "agent-token", // Agent secret-request list (self-scoped; 404 when hub.agent_secrets is off)
+	"/api/v1/agent/secret-requests/":   "agent-token", // Agent secret-request withdraw (self-scoped; 404 when hub.agent_secrets is off)
 
 	// ── Public settings ────────────────────────────────────────────────
 	"/api/v1/settings/public":       "authenticated", // Public settings — requires session despite name
@@ -312,15 +333,20 @@ var routeAuthzManifest = map[string]string{
 	"/api/v1/profiling":             "authenticated", // Profiling switches the web client acts on — any signed-in identity
 
 	// ── GitHub App integration (method-scoped) ────────────────────────
-	"GET /api/v1/github-app":                         "authenticated", // Get GitHub App config
-	"PUT /api/v1/github-app":                         "authenticated", // Update GitHub App config
-	"GET /api/v1/github-app/installations":           "authenticated", // List GitHub App installations
-	"POST /api/v1/github-app/installations":          "authenticated", // Create GitHub App installation
-	"GET /api/v1/github-app/installations/":          "authenticated", // Get GitHub App installation by ID
-	"PUT /api/v1/github-app/installations/":          "authenticated", // Update GitHub App installation by ID
-	"DELETE /api/v1/github-app/installations/":       "authenticated", // Delete GitHub App installation by ID
-	"POST /api/v1/github-app/installations/discover": "authenticated", // GitHub App discovery
-	"POST /api/v1/github-app/sync-permissions":       "authenticated", // GitHub App permission sync
+	"GET /api/v1/github-app":                                "authenticated", // Get GitHub App config
+	"PUT /api/v1/github-app":                                "authenticated", // Update GitHub App config
+	"GET /api/v1/github-app/installations":                  "authenticated", // List GitHub App installations
+	"POST /api/v1/github-app/installations":                 "authenticated", // Create GitHub App installation
+	"GET /api/v1/github-app/installations/":                 "authenticated", // Get GitHub App installation by ID
+	"PUT /api/v1/github-app/installations/":                 "authenticated", // Update GitHub App installation by ID
+	"DELETE /api/v1/github-app/installations/":              "authenticated", // Delete GitHub App installation by ID
+	"POST /api/v1/github-app/installations/discover":        "authenticated", // GitHub App discovery
+	"POST /api/v1/github-app/sync-permissions":              "authenticated", // GitHub App permission sync
+	"GET /api/v1/github-app/repo-routing":                   "authenticated", // List GitHub App trigger repo routing
+	"PUT /api/v1/github-app/repo-routing/{owner}/{repo}":    "authenticated", // Set GitHub App trigger repo primary project
+	"DELETE /api/v1/github-app/repo-routing/{owner}/{repo}": "authenticated", // Delete GitHub App trigger repo primary project
+	"GET /api/v1/trigger-presets":                           "authenticated", // List trigger rule preset schemas (stateless; 404 when hub.github_triggers is off)
+	"POST /api/v1/trigger-presets/compile":                  "authenticated", // Compile trigger rule preset form (stateless; 404 when hub.github_triggers is off)
 
 	// ── Hub test identities (test_identity.issue; 404 unless enabled) ──
 	"POST /api/v1/test-identities":                     "authenticated", // Issue a test identity
@@ -354,6 +380,7 @@ var routeAuthzManifest = map[string]string{
 
 	// ── Webhooks ───────────────────────────────────────────────────────
 	"/api/v1/webhooks/github": "webhook", // GitHub webhook — signature verification
+	"/api/v1/hooks/{id}":      "webhook", // Generic webhook ingress — scion_v1 HMAC verification
 	"/github-app/setup":       "public",  // GitHub App post-install callback — browser redirect
 
 	// ── Workstation-only system endpoints ──────────────────────────────

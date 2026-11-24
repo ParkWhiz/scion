@@ -27,6 +27,11 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 )
 
+// ShellHarnessName is the reserved name of the built-in shell execution
+// container harness (ptone/scion#8812). Defined in pkg/agent/state so
+// sciontool PID-1 paths can share it without importing pkg/config.
+const ShellHarnessName = "shell"
+
 // HarnessExitCodeFile is the container-local path where the tmux agent-window
 // wrapper records the harness's real exit code, read by `sciontool init`.
 // There is one agent per container, so a fixed path is safe. It is a shared
@@ -34,6 +39,14 @@ import (
 // recover the authoritative harness exit code (the harness runs as a tmux
 // grandchild whose exit code is otherwise invisible to the supervisor).
 const HarnessExitCodeFile = "/tmp/scion-harness-exit-code"
+
+// HarnessTailFile is the container-local path where the tmux agent-window
+// wrapper saves the last lines of the harness pane once the harness exits,
+// before it writes HarnessExitCodeFile. `sciontool init` appends the last
+// non-empty lines to the crash reason ("Agent crashed with exit code N:
+// <tail>"), so a reader that waits on the exit-code file also sees the
+// tail. Like HarnessExitCodeFile it is a shared runtime/init contract.
+const HarnessTailFile = "/tmp/scion-harness-tail"
 
 // HarnessInitRunFile is the container-local path where `sciontool init`
 // records the current init run, written at the start of each run before the
@@ -75,6 +88,9 @@ const (
 	// ReadySettleHook is how long the runtime waits after a fresh hook-mode
 	// ready marker before pasting, so the harness's input has mounted.
 	ReadySettleHook = 1500 * time.Millisecond
+	// ReadySettleIdle is how long an idle-strategy harness (e.g. the built-in
+	// execution container) settles before transitioning initializing -> idle.
+	ReadySettleIdle = 1 * time.Second
 )
 
 // Ready strategies, the values of a harness-config ready block's strategy
@@ -84,8 +100,12 @@ const (
 	// current run is written (by a session-start hook) plus the settle.
 	ReadyStrategyHook = "hook"
 	// ReadyStrategyDelay: the harness is ready once its tmux session has
-	// existed for the settle period.
+	// existed for the settle period (transitions initializing -> working).
 	ReadyStrategyDelay = "delay"
+	// ReadyStrategyIdle: the harness is ready once its tmux session has
+	// existed for the settle period, and transitions initializing -> idle
+	// rather than working (used by the built-in execution container).
+	ReadyStrategyIdle = "idle"
 )
 
 // Limits on ready spec values, shared by harness-config validation and by
@@ -101,14 +121,33 @@ const (
 // FormatReadySpecEnv.
 const HarnessReadyEnv = "SCION_HARNESS_READY"
 
+// LivenessHarnessRootDepthEnv names the environment variable a harness
+// config sets (in its env map) when the harness's TUI is not the direct
+// child of the agent window's wrapper: it is how many process levels below
+// the wrapper the liveness sampler treats as the harness itself (default 1).
+// Codex sets 2: its npm launcher (node bin/codex.js) spawns the native TUI
+// as a child. It travels in the existing env map, not a new config.yaml
+// key, so the bundled config still validates on older binaries
+// (ptone/scion#5196).
+const LivenessHarnessRootDepthEnv = "SCION_LIVENESS_HARNESS_ROOT_DEPTH"
+
+// LivenessHarnessRootDepthHintEnv is the harness-publishable hint equivalent
+// of LivenessHarnessRootDepthEnv. When both are set, LivenessHarnessRootDepthEnv
+// wins.
+const LivenessHarnessRootDepthHintEnv = "HARNESS_HINT_LIVENESS_ROOT_DEPTH"
+
 // DefaultReadySpec returns the ready spec used for strategy when no value is
 // configured: the readiness constants above. An unknown strategy gets the
 // delay defaults.
 func DefaultReadySpec(strategy string) api.ReadySpec {
-	if strategy == ReadyStrategyHook {
+	switch strategy {
+	case ReadyStrategyHook:
 		return api.ReadySpec{Strategy: ReadyStrategyHook, Settle: ReadySettleHook, Timeout: ReadyDeadline}
+	case ReadyStrategyIdle:
+		return api.ReadySpec{Strategy: ReadyStrategyIdle, Settle: ReadySettleIdle}
+	default:
+		return api.ReadySpec{Strategy: ReadyStrategyDelay, Settle: ReadySettleSession}
 	}
-	return api.ReadySpec{Strategy: ReadyStrategyDelay, Settle: ReadySettleSession}
 }
 
 // ReadyModeForStrategy returns the init-run line 1 mode for a ready
@@ -129,9 +168,9 @@ func CheckReadySpec(spec api.ReadySpec) error {
 		if spec.Timeout < MinReadyTimeout || spec.Timeout > MaxReadyTimeout {
 			return fmt.Errorf("ready timeout %s out of range [%s, %s]", spec.Timeout, MinReadyTimeout, MaxReadyTimeout)
 		}
-	case ReadyStrategyDelay:
+	case ReadyStrategyDelay, ReadyStrategyIdle:
 		if spec.Timeout != 0 {
-			return fmt.Errorf("ready timeout %s not allowed with strategy %q", spec.Timeout, ReadyStrategyDelay)
+			return fmt.Errorf("ready timeout %s not allowed with strategy %q", spec.Timeout, spec.Strategy)
 		}
 	default:
 		return fmt.Errorf("unknown ready strategy %q", spec.Strategy)
@@ -267,7 +306,7 @@ func ParseInitRunSpec(content string) (InitRunSpec, bool) {
 		}
 	}
 	res.HasSpec = strings.TrimSpace(line2) != ""
-	if s := fields["strategy"]; s == ReadyStrategyHook || s == ReadyStrategyDelay {
+	if s := fields["strategy"]; s == ReadyStrategyHook || s == ReadyStrategyDelay || s == ReadyStrategyIdle {
 		if ReadyModeForStrategy(s) == mode {
 			strategy = s
 		}
@@ -460,6 +499,21 @@ const (
 	ActivityStalled         Activity = "stalled"
 	ActivityOffline         Activity = "offline"
 	ActivityCrashed         Activity = "crashed"
+
+	// ActivityIdle is agent-reported only (`sciontool status idle`): the
+	// agent has no known future action until new work arrives, for example
+	// between assignments or after answering a message when no task was
+	// assigned. Unlike blocked it waits on no specific event. The platform
+	// never infers it.
+	ActivityIdle Activity = "idle"
+
+	// ActivityHarnessError means the harness process is alive at its prompt
+	// but reported that a model, API or auth error ended its turn. The
+	// reason is in Detail.Message. It is sticky and is cleared by the next
+	// turn-progress hook (a new message makes the harness retry). Only
+	// sciontool sets it, from a harness signal; a dead harness is
+	// PhaseError instead. Displayed as "harness error".
+	ActivityHarnessError Activity = "harness_error"
 )
 
 // ExitReason describes why an agent process terminated. Unlike Activity
@@ -554,11 +608,13 @@ var allActivities = []Activity{
 	ActivityExecuting,
 	ActivityWaitingForInput,
 	ActivityBlocked,
+	ActivityIdle,
 	ActivityCompleted,
 	ActivityLimitsExceeded,
 	ActivityStalled,
 	ActivityOffline,
 	ActivityCrashed,
+	ActivityHarnessError,
 }
 
 // Activities returns a copy of all valid Activity values.
@@ -595,13 +651,104 @@ func (a Activity) Validate() error {
 
 // IsSticky reports whether this activity resists being overwritten by normal
 // event-driven updates. Sticky activities are only cleared by "new work" events
-// (prompt-submit, agent-start, session-start).
+// (prompt-submit, agent-start, session-start); harness_error is also cleared
+// by any other turn-progress event (model-start, tool-start).
 func (a Activity) IsSticky() bool {
 	switch a {
-	case ActivityWaitingForInput, ActivityBlocked, ActivityCompleted, ActivityLimitsExceeded, ActivityCrashed:
+	case ActivityWaitingForInput, ActivityBlocked, ActivityIdle, ActivityCompleted, ActivityLimitsExceeded, ActivityCrashed,
+		ActivityHarnessError:
 		return true
 	}
 	return false
+}
+
+// IsSuspendEligible reports whether an agent holding this activity may be
+// auto-suspended by the hub's idle policy once the grace period has passed.
+// It is the only list of suspend-eligible activities: blocked and
+// waiting_for_input wait on a specific event and are never eligible.
+// harness_error is eligible because an idle-suspended agent auto-wakes on
+// new work so a message still makes the harness retry.
+func (a Activity) IsSuspendEligible() bool {
+	switch a {
+	case ActivityIdle, ActivityCompleted, ActivityHarnessError:
+		return true
+	}
+	return false
+}
+
+// SuspendEligibleActivities returns the string values of all Activity
+// constants for which IsSuspendEligible reports true.
+func SuspendEligibleActivities() []string {
+	var out []string
+	for _, a := range allActivities {
+		if a.IsSuspendEligible() {
+			out = append(out, string(a))
+		}
+	}
+	return out
+}
+
+// IsRetainedOnSuspend reports whether this activity survives a transition to
+// PhaseSuspended so that operators can tell what state the agent was in when
+// suspended. All other activities are cleared on suspend. Comparison is
+// case-insensitive.
+func (a Activity) IsRetainedOnSuspend() bool {
+	switch Activity(strings.ToLower(string(a))) {
+	case ActivityIdle, ActivityCompleted, ActivityHarnessError:
+		return true
+	}
+	return false
+}
+
+// RetainedSuspendActivity returns the canonical lowercase activity to preserve
+// on transition to PhaseSuspended, or "" when the activity should be cleared.
+// For a stalled agent, the candidate is stalledFrom rather than stalled itself.
+func RetainedSuspendActivity(activity, stalledFrom Activity) Activity {
+	candidate := Activity(strings.ToLower(string(activity)))
+	if candidate == ActivityStalled {
+		candidate = Activity(strings.ToLower(string(stalledFrom)))
+	}
+	if candidate.IsRetainedOnSuspend() {
+		return candidate
+	}
+	return ""
+}
+
+// IsRetainedOnStop reports whether this non-terminal activity survives a
+// transition to PhaseStopped so a subsequent resume or restart knows the prior
+// run completed (ptone/scion#8900). Comparison is case-insensitive.
+func (a Activity) IsRetainedOnStop() bool {
+	return Activity(strings.ToLower(string(a))) == ActivityCompleted
+}
+
+// RetainedStopActivity returns the canonical lowercase activity to preserve on
+// transition to PhaseStopped (terminal activities or completed; computed from
+// stalledFrom when stalled), or "" when the activity should be cleared.
+func RetainedStopActivity(activity, stalledFrom Activity) Activity {
+	candidate := Activity(strings.ToLower(string(activity)))
+	if candidate == ActivityStalled {
+		candidate = Activity(strings.ToLower(string(stalledFrom)))
+	}
+	if candidate.IsTerminal() || candidate.IsRetainedOnStop() {
+		return candidate
+	}
+	return ""
+}
+
+// RetainedHaltActivity returns ActivityCompleted when the agent's prior
+// activity (or stalledFrom when stalled) was completed, or "" otherwise.
+// Terminal activities (crashed, limits_exceeded) are cleared on halt because
+// the halt exit reason explains how the run ended; completed is retained so a
+// subsequent resume or restart knows the prior run finished (ptone/scion#8900).
+func RetainedHaltActivity(activity, stalledFrom Activity) Activity {
+	candidate := Activity(strings.ToLower(string(activity)))
+	if candidate == ActivityStalled {
+		candidate = Activity(strings.ToLower(string(stalledFrom)))
+	}
+	if candidate.IsRetainedOnStop() {
+		return candidate
+	}
+	return ""
 }
 
 // IsTerminal reports whether this activity represents a terminal outcome that
@@ -621,7 +768,7 @@ func (a Activity) IsTerminal() bool {
 func (a Activity) ImpliesRunning() bool {
 	switch a {
 	case ActivityWorking, ActivityThinking, ActivityExecuting,
-		ActivityWaitingForInput, ActivityBlocked, ActivityCompleted:
+		ActivityWaitingForInput, ActivityBlocked, ActivityIdle, ActivityCompleted, ActivityHarnessError:
 		return true
 	}
 	return false
@@ -664,12 +811,16 @@ func (s AgentState) AcceptsInput() bool {
 }
 
 // DisplayLabel returns the user-facing label for an activity. It differs
-// from the raw value only for initializing, which is shown as "starting".
-// Use it in display code keyed on activity; the legacy Status string comes
-// from DisplayStatus instead.
+// from the raw value only for initializing, which is shown as "starting",
+// and harness_error, which is shown as "harness error". Use it in display
+// code keyed on activity; the legacy Status string comes from DisplayStatus
+// instead.
 func (a Activity) DisplayLabel() string {
-	if a == ActivityInitializing {
+	switch a {
+	case ActivityInitializing:
 		return "starting"
+	case ActivityHarnessError:
+		return "harness error"
 	}
 	return string(a)
 }
@@ -694,9 +845,31 @@ func (s AgentState) DisplayStatus() string {
 	return string(s.Phase)
 }
 
+// StalledNoHookActivityHint is the status message set by the Hub stall
+// detector when an agent stalls without having reported any harness hook
+// event since start (ptone/scion#4556).
+// Keep in sync with STALLED_NO_HOOK_ACTIVITY_HINT in web/src/shared/agent-state-display.ts.
+const StalledNoHookActivityHint = "no harness activity since start; check harness credentials/task"
+
+// IsPreHookStartupMessage reports whether msg is one of the startup status
+// messages emitted by sciontool init or its readiness watcher before any
+// harness hook event has been observed.
+func IsPreHookStartupMessage(msg string) bool {
+	switch msg {
+	case "Agent started",
+		"Harness started",
+		"Harness readiness not confirmed by deadline; assuming ready":
+		return true
+	default:
+		return false
+	}
+}
+
 // Validate checks cross-field constraints on the agent state.
-// Activity is only meaningful when phase is running; setting an activity
-// with a non-running phase is invalid.
+// Activity is meaningful when phase is running, when phase is stopped with a
+// terminal or retained-on-stop activity, when phase is halted with a
+// retained-on-stop activity, or when phase is suspended with a retained
+// activity.
 func (s AgentState) Validate() error {
 	if err := s.Phase.Validate(); err != nil {
 		return err
@@ -705,7 +878,10 @@ func (s AgentState) Validate() error {
 		return err
 	}
 	if s.Activity != "" && s.Phase != PhaseRunning {
-		if s.Phase != PhaseStopped || !s.Activity.IsTerminal() {
+		validStopped := s.Phase == PhaseStopped && (s.Activity.IsTerminal() || s.Activity.IsRetainedOnStop())
+		validHalted := s.Phase == PhaseHalted && s.Activity.IsRetainedOnStop()
+		validSuspended := s.Phase == PhaseSuspended && s.Activity.IsRetainedOnSuspend()
+		if !validStopped && !validHalted && !validSuspended {
 			return fmt.Errorf("activity %q is not valid when phase is %q (must be %q)", s.Activity, s.Phase, PhaseRunning)
 		}
 	}

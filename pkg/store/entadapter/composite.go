@@ -29,6 +29,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentdeliveryhold"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentidentitykey"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/agentrecovery"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/delegationedge"
@@ -125,9 +126,15 @@ type CompositeStore struct {
 	*ExternalIdentityStore
 	*AgentReincarnationStore
 	*UserTerminalWorkspaceStore
+	*UserExecContainerStore
 	*HubInstanceStore
 	*TestIdentityDelegationStore
 	*UserDeletionStore
+	*DurableQueueStore
+	*SystemOneInstanceStore
+	*TriggerStore
+	*MessagePolicyStore
+	*AgentSuspendScreenStore
 
 	client *ent.Client
 	inTx   bool // true when this CompositeStore wraps a transaction
@@ -182,6 +189,28 @@ type CompositeStore struct {
 	// beforeFKReconcile is passed to entc.AutoMigrate by Migrate; see
 	// SetBeforeFKReconcile.
 	beforeFKReconcile entc.BeforeFKReconcileFunc
+
+	// relayRole, when non-empty on PostgreSQL, names the role Migrate grants
+	// least-privilege conduit relay table permissions to right after
+	// entc.AutoMigrate; see SetRelayRole.
+	relayRole string
+}
+
+// SetRelayRole configures an optional PostgreSQL role name (from
+// server.database.relay_role) that Migrate grants least-privilege conduit
+// relay permissions to immediately after entc.AutoMigrate completes. Hub
+// startup sets this (`scion server migrate` calls EnsureRelayRoleGrants
+// directly); maintenance commands that omit it leave existing table grants in
+// place until the next Hub boot. On non-PostgreSQL dialects Migrate still
+// validates the role string and skips the SQL grants.
+func (c *CompositeStore) SetRelayRole(role string) {
+	c.relayRole = role
+}
+
+// SetMessagePublisher attaches a post-commit MessagePublisher to the embedded
+// MessageStore using MessageStore.WithPublisher (ptone/scion#8136).
+func (c *CompositeStore) SetMessagePublisher(p MessagePublisher) {
+	c.MessageStore = c.MessageStore.WithPublisher(p)
 }
 
 // SetBeforeFKReconcile makes Migrate pass fn to entc.AutoMigrate, which
@@ -236,6 +265,10 @@ func (c *CompositeStore) WithTx(ctx context.Context, fn func(tx store.Store) err
 		return markTransient(fmt.Errorf("begin transaction: %w", err))
 	}
 	txStore := c.newTxStore(tx)
+	var pendingMsgs []*store.Message
+	if c.MessageStore.publisher != nil {
+		txStore.pendingPublish = &pendingMsgs
+	}
 
 	defer func() {
 		// Safety net: if Commit was not called (i.e. fn panicked or returned
@@ -253,6 +286,11 @@ func (c *CompositeStore) WithTx(ctx context.Context, fn func(tx store.Store) err
 	if err := tx.Commit(); err != nil {
 		return markTransient(fmt.Errorf("commit transaction: %w", err))
 	}
+	if c.MessageStore.publisher != nil {
+		for _, m := range pendingMsgs {
+			_ = c.MessageStore.publisher.PublishUserMessage(ctx, m)
+		}
+	}
 	return nil
 }
 
@@ -262,14 +300,23 @@ func newTxCompositeStore(tx *ent.Tx) *CompositeStore {
 	txStore := NewCompositeStore(tx.Client())
 	txStore.inTx = true
 	txStore.AgentStore.inTx = true
+	txStore.GroupStore.inTx = true
+	txStore.BrokerDispatchStore.inTx = true
 	txStore.AccessConstraintStore.inTx = true
 	txStore.MembershipLossCheckStore.inTx = true
 	txStore.AgentHoldStore.inTx = true
 	txStore.ConversationStore.inTx = true
+	txStore.MessageStore.inTx = true
 	txStore.ThreadGroupStore.inTx = true
+	txStore.ScheduleStore.inTx = true
 	txStore.SecretStore.inTx = true
 	txStore.PendingSecretStore.inTx = true
 	txStore.PendingSecretStore.txFencedWrite = &txStore.SecretStore.txFencedWrite
+	txStore.DurableQueueStore.inTx = true
+	txStore.SystemOneInstanceStore.inTx = true
+	txStore.ExternalStore.inTx = true
+	txStore.TriggerStore.inTx = true
+	txStore.MessagePolicyStore.inTx = true
 	return txStore
 }
 
@@ -319,9 +366,15 @@ func NewCompositeStore(client *ent.Client) *CompositeStore {
 		ExternalIdentityStore:       NewExternalIdentityStore(client),
 		AgentReincarnationStore:     NewAgentReincarnationStore(client),
 		UserTerminalWorkspaceStore:  NewUserTerminalWorkspaceStore(client),
+		UserExecContainerStore:      NewUserExecContainerStore(client),
 		HubInstanceStore:            NewHubInstanceStore(client),
 		TestIdentityDelegationStore: NewTestIdentityDelegationStore(client),
 		UserDeletionStore:           NewUserDeletionStore(client),
+		DurableQueueStore:           NewDurableQueueStore(client),
+		SystemOneInstanceStore:      NewSystemOneInstanceStore(client),
+		TriggerStore:                NewTriggerStore(client),
+		MessagePolicyStore:          NewMessagePolicyStore(client),
+		AgentSuspendScreenStore:     NewAgentSuspendScreenStore(client),
 		client:                      client,
 	}
 }
@@ -423,9 +476,14 @@ func (c *CompositeStore) deleteAgentDependents(ctx context.Context, id string) e
 	if err := c.DeleteAgentIdentityKeys(ctx, id); err != nil {
 		return err
 	}
-	// agent_recovery is keyed by the agent ID with no FK; cascade explicitly.
+	// agent_recovery and agent_delivery_holds are keyed by the agent ID with no
+	// FK; cascade explicitly.
 	if _, err := c.client.AgentRecovery.Delete().
 		Where(agentrecovery.IDEQ(uid.String())).Exec(ctx); err != nil {
+		return err
+	}
+	if _, err := c.client.AgentDeliveryHold.Delete().
+		Where(agentdeliveryhold.IDEQ(uid.String())).Exec(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -512,6 +570,10 @@ func (c *CompositeStore) DeleteProject(ctx context.Context, id string) error {
 			Where(agentrecovery.IDIn(ids...)).Exec(ctx); err != nil {
 			return err
 		}
+		if _, err := c.client.AgentDeliveryHold.Delete().
+			Where(agentdeliveryhold.IDIn(ids...)).Exec(ctx); err != nil {
+			return err
+		}
 		// Before the agent rows go (agent_id is ON DELETE SET NULL; see
 		// DeleteAgent).
 		if _, err := c.DeleteGroupMembershipsForAgents(ctx, ids); err != nil {
@@ -549,16 +611,31 @@ func (c *CompositeStore) DeleteProject(ctx context.Context, id string) error {
 	if err := c.DeleteThreadGroupsForProject(ctx, id); err != nil {
 		return err
 	}
-	// Choice prompt decisions, answers and the deleted agents' key counters
+	// Decision prompt decisions, answers and the deleted agents' key counters
 	// go with the project (they have no DB-level FK either).
 	if err := deleteProjectDecisions(ctx, c.client, uid, agentIDs); err != nil {
+		return err
+	}
+	// Secret request rows go with the project (§4.7).
+	if err := deleteProjectSecretRequests(ctx, c.client, uid); err != nil {
+		return err
+	}
+	// Primary-project trigger routing entries in github_installations.trigger_routing
+	// carry project IDs inside JSON with no DB-level FK; scrub them when the
+	// project is deleted (§8.4).
+	if _, err := c.DeleteGitHubTriggerRoutesByProject(ctx, id); err != nil {
+		return err
+	}
+	// Message policies and their decision records carry project_id with no
+	// DB-level FK edge; cascade them explicitly in the same transaction.
+	if err := deleteProjectMessagePolicies(ctx, c.client, uid); err != nil {
 		return err
 	}
 	return c.ProjectStore.DeleteProject(ctx, id)
 }
 
 // DeleteUser removes a user, in one transaction with the clearing of the
-// user id on the user's choice answers (UserStore.DeleteUser does both):
+// user id on the user's decision answers (UserStore.DeleteUser does both):
 // a failed delete leaves the answers as they were. Called inside WithTx it
 // joins that transaction.
 func (c *CompositeStore) DeleteUser(ctx context.Context, id string) error {
@@ -791,8 +868,20 @@ func (c *CompositeStore) purgeDeletedAgents(ctx context.Context, cutoff time.Tim
 				Where(agentrecovery.IDIn(removed...)).Exec(ctx); err != nil {
 				return 0, err
 			}
+			if _, err := tx.AgentDeliveryHold.Delete().
+				Where(agentdeliveryhold.IDIn(removed...)).Exec(ctx); err != nil {
+				return 0, err
+			}
 			if err := deactivatePurgedAgentAuthority(ctx, txStore, removed, deactivation); err != nil {
 				return 0, err
+			}
+			for _, id := range removed {
+				if _, err := txStore.DeleteSecretsByScope(ctx, store.ScopeAgent, id); err != nil {
+					return 0, err
+				}
+				if _, err := txStore.WithdrawAgentSecretRequestsOnDelete(ctx, id, now); err != nil {
+					return 0, err
+				}
 			}
 			for _, id := range removedIDs {
 				if row := lifecycleBefore[id]; row != nil {
@@ -908,6 +997,10 @@ func (c *CompositeStore) Migrate(ctx context.Context) error {
 		return err
 	}
 
+	if err := ensureRelayRoleGrants(ctx, c.Dialect(), c.DB(), c.relayRole, nil); err != nil {
+		return err
+	}
+
 	// Must run before pkg/hub/storage_migration.go's namespacing migration
 	// (called later, outside CompositeStore.Migrate, once the hub boots)
 	// walks stored templates, harness configs and skills: that migration and
@@ -982,6 +1075,12 @@ func (c *CompositeStore) Migrate(ctx context.Context) error {
 	}
 	if err := c.MigrateGitHubTokenInjectionMode(ctx); err != nil {
 		return fmt.Errorf("github token injection mode migration: %w", err)
+	}
+	if err := c.BackfillDecisionChatKeys(ctx); err != nil {
+		return fmt.Errorf("decision chat_key backfill: %w", err)
+	}
+	if err := c.BackfillConversationMessageSeqs(ctx); err != nil {
+		return fmt.Errorf("conversation message seq backfill: %w", err)
 	}
 	return c.SeedMaintenanceOperations(ctx)
 }

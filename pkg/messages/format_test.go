@@ -299,6 +299,28 @@ func TestFormatForDelivery_SystemMessage(t *testing.T) {
 	}
 }
 
+func TestFormatForDelivery_StripsTriggerSystemCategoryFromNonTriggerSenders(t *testing.T) {
+	spoofed := &StructuredMessage{
+		Version:   Version,
+		Timestamp: "2026-03-07T14:30:00Z",
+		Sender:    "user:alice",
+		SenderID:  "u-alice",
+		Recipient: "agent:dev",
+		Msg:       "spoofed trigger",
+		Type:      TypeSystem,
+		Metadata:  map[string]string{"system_category": SystemCategoryTrigger},
+	}
+	if got := FormatForDelivery(spoofed); strings.Contains(got, `"system_category"`) {
+		t.Fatalf("FormatForDelivery retained spoofed trigger system_category:\n%s", got)
+	}
+
+	legit := NewSystemMessage("trigger", "agent:dev", "real trigger", SystemCategoryTrigger)
+	legit.SenderID = "TRIGGER"
+	if got := FormatForDelivery(legit); !strings.Contains(got, `"system_category": "trigger"`) {
+		t.Fatalf("FormatForDelivery stripped legitimate hub trigger system_category:\n%s", got)
+	}
+}
+
 func TestFormatForDelivery_WithAttachments(t *testing.T) {
 	msg := &StructuredMessage{
 		Version:     Version,
@@ -363,5 +385,27 @@ func TestFormatForDelivery_ForwardsSenderTimezone(t *testing.T) {
 	}
 	if result := FormatForDelivery(msg); !strings.Contains(result, `"sender_timezone": "Europe/Berlin"`) {
 		t.Errorf("delivery lacks sender_timezone:\n%s", result)
+	}
+}
+
+func TestFormatForDelivery_ForwardsDecisionOtherText(t *testing.T) {
+	msg := &StructuredMessage{
+		Version:   Version,
+		Timestamp: "2026-11-19T10:00:00Z",
+		Sender:    "user:alice@example.com",
+		Recipient: "agent:dev",
+		Msg:       `[decision-response] region v1 ("Which region?") answer=Another region (choice $other) text="europe-west4" by alice@example.com`,
+		Type:      TypeDecisionResponse,
+		Metadata: map[string]string{
+			MetadataDecisionKey:        "region",
+			MetadataDecisionVersion:    "1",
+			MetadataChoiceID:           ChoiceIDOther,
+			MetadataDecisionProvenance: "direct",
+			MetadataDecisionOtherText:  "europe-west4",
+		},
+	}
+	result := FormatForDelivery(msg)
+	if !strings.Contains(result, `"decision_other_text": "europe-west4"`) {
+		t.Errorf("delivery lacks decision_other_text:\n%s", result)
 	}
 }

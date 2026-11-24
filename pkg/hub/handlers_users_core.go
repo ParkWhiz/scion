@@ -466,6 +466,8 @@ type userPreferencesPatch struct {
 	DefaultProfile  *string
 	Theme           *string
 	Timezone        *string
+
+	PreselectRecommendedChoices *bool
 }
 
 // decodeStringPref unmarshals one preferences sub-field's raw JSON value
@@ -478,6 +480,18 @@ func decodeStringPref(key string, rv json.RawMessage) (string, error) {
 	var v string
 	if err := json.Unmarshal(rv, &v); err != nil {
 		return "", fmt.Errorf("invalid preferences.%s: %w", key, err)
+	}
+	return v, nil
+}
+
+// decodeBoolPref unmarshals one boolean preferences sub-field for the
+// per-key preferences PATCH merge. A JSON null decodes to false, which
+// clears the preference like decodeStringPref's ""; a non-boolean JSON value
+// is a decode error, which the caller reports as a 400.
+func decodeBoolPref(key string, rv json.RawMessage) (bool, error) {
+	var v bool
+	if err := json.Unmarshal(rv, &v); err != nil {
+		return false, fmt.Errorf("invalid preferences.%s: %w", key, err)
 	}
 	return v, nil
 }
@@ -626,6 +640,14 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 						return
 					}
 					patch.Timezone = &v
+					hasFields = true
+				case "preselectRecommendedChoices":
+					v, err := decodeBoolPref(key, rv)
+					if err != nil {
+						BadRequest(w, err.Error())
+						return
+					}
+					patch.PreselectRecommendedChoices = &v
 					hasFields = true
 				default:
 					// Unknown preferences keys are silently ignored (200, no
@@ -779,16 +801,17 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 	// Invited users have no real role yet: the stored role is a placeholder and
 	// the role is assigned at first sign-in (see determineUserRole). Reject role
 	// changes so an admin cannot set a role that activation would silently
-	// overwrite. Suspending an invited user remains allowed; activation is rejected below.
+	// overwrite.
 	if needsPromote && user.Status == store.UserStatusInvited {
 		writeError(w, http.StatusConflict, ErrCodeConflict, errRoleOnInvitedUser.Error(), nil)
 		return
 	}
-	// Likewise, activating an invited user directly would leave the placeholder
-	// role in place and skip the invited->active branch at first sign-in, so
-	// the hub default would never be applied. Suspending remains allowed.
-	if activatesInvitedUser(updates.Status, user.Status) {
-		writeError(w, http.StatusConflict, ErrCodeConflict, errActivateInvitedUser.Error(), nil)
+	// Reject any status change on an invited user: activating directly would
+	// skip determineUserRole at first sign-in, and suspending would move the row
+	// off UserStatusInvited so invited-user guards stop applying and a later
+	// reactivation skips first sign-in. Revoking a pending invite deletes the user.
+	if statusErr := rejectInvitedStatusChange(updates.Status, user.Status); statusErr != nil {
+		writeError(w, http.StatusConflict, ErrCodeConflict, statusErr.Error(), nil)
 		return
 	}
 
@@ -817,8 +840,8 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 		if needsPromote && beforeStatus == store.UserStatusInvited {
 			return errRoleOnInvitedUser
 		}
-		if activatesInvitedUser(updates.Status, beforeStatus) {
-			return errActivateInvitedUser
+		if statusErr := rejectInvitedStatusChange(updates.Status, beforeStatus); statusErr != nil {
+			return statusErr
 		}
 
 		// Suspension must not leave a scope with no active constraint
@@ -864,6 +887,9 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 			}
 			if prefsPatch.Timezone != nil {
 				txUser.Preferences.Timezone = *prefsPatch.Timezone
+			}
+			if prefsPatch.PreselectRecommendedChoices != nil {
+				txUser.Preferences.PreselectRecommendedChoices = *prefsPatch.PreselectRecommendedChoices
 			}
 		}
 
@@ -937,7 +963,7 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, id string) {
 			writeUserDeletionInProgress(w, userDeletionInProgressFor(ctx, s.store, user.ID))
 			return
 		}
-		if errors.Is(err, errLastSuperAdmin) || errors.Is(err, errSelfDemotion) || errors.Is(err, errRoleOnInvitedUser) || errors.Is(err, errActivateInvitedUser) || errors.Is(err, errRoleOnTestFixture) {
+		if errors.Is(err, errLastSuperAdmin) || errors.Is(err, errSelfDemotion) || errors.Is(err, errRoleOnInvitedUser) || errors.Is(err, errActivateInvitedUser) || errors.Is(err, errSuspendInvitedUser) || errors.Is(err, errRoleOnTestFixture) {
 			writeError(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil)
 		} else if errors.Is(err, errBindingStateDrift) {
 			writeBindingStateDrift(w, err)
@@ -1105,10 +1131,22 @@ var errRoleOnInvitedUser = errors.New("role is assigned when the user first sign
 // invited user.
 var errActivateInvitedUser = errors.New("invited users are activated at first sign-in")
 
-// activatesInvitedUser reports whether a PATCH status would move an invited
-// user straight to active, bypassing first sign-in.
-func activatesInvitedUser(newStatus *string, currentStatus string) bool {
-	return newStatus != nil && *newStatus == store.UserStatusActive && currentStatus == store.UserStatusInvited
+// errSuspendInvitedUser is returned when PATCH sets status=suspended on an
+// invited user.
+var errSuspendInvitedUser = errors.New("invited users cannot be suspended; remove the pending invite instead")
+
+// rejectInvitedStatusChange returns a conflict sentinel when a PATCH status
+// targets an invited user. Any transition out of UserStatusInvited via PATCH
+// (either straight to active or via suspended -> active) would bypass first
+// sign-in and the invited-user guards.
+func rejectInvitedStatusChange(newStatus *string, currentStatus string) error {
+	if newStatus == nil || currentStatus != store.UserStatusInvited {
+		return nil
+	}
+	if *newStatus == store.UserStatusSuspended {
+		return errSuspendInvitedUser
+	}
+	return errActivateInvitedUser
 }
 
 // bindingMutationKind describes what happened to super-admin bindings during
@@ -1834,10 +1872,11 @@ func (s *Server) afterUserDeleted(ctx context.Context, userID string) {
 	// grant never blocks the delete, and exchange and use deny a missing
 	// issuer (.design/agent-delegation.md §16.3).
 	s.revokeAgentDelegationGrantsBestEffort(ctx, store.AgentDelegationGrantFilter{IssuerUserID: userID}, revokeReasonIssuerDeleted)
-	// The user's schedules would be refused at every fire: pause them with
-	// creator_deleted (they never block the delete). The evaluator
-	// backstop pauses any left active.
+	// The user's schedules and triggers would be refused at every fire: pause
+	// them with creator_deleted (they never block the delete). The evaluator
+	// backstop and trigger fire-time standing check cover any left active.
 	s.pauseSchedulesAuthoredByUser(ctx, userID)
+	s.pauseTriggersAuthoredByUser(ctx, userID)
 }
 
 // lastOwnerProjectRef identifies a project that deleting a user would leave

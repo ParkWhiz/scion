@@ -83,8 +83,11 @@ type colocatedHost struct {
 	// Colocated: the server runs the Hub and embeds the Runtime Broker, so
 	// the legacy embedded registration runs (colocatedBrokerRegisters).
 	Colocated bool
-	Listeners serverListeners
-	Config    *config.GlobalConfig
+	// ServerLaunch: a saved server launch (server-args.json) backs this
+	// host, so Listeners carries the server's launch options.
+	ServerLaunch bool
+	Listeners    serverListeners
+	Config       *config.GlobalConfig
 }
 
 // detectColocatedHost evaluates colocatedBrokerRegisters from the server's
@@ -128,12 +131,13 @@ func detectColocatedHost(globalDir string) (colocatedHost, error) {
 	if err != nil || cfg == nil {
 		return colocatedHost{}, errColocatedUndetermined
 	}
-	noRegistryCheck := func() error { return nil }
-	l := serverListenersFromArgs(args, cfg, config.LoadServerMode(), noRegistryCheck)
+	l := serverListenersFromArgs(args, cfg, config.LoadServerMode())
+	cfg.Hub.Port = l.HubPort
 	return colocatedHost{
-		Colocated: l.Hub && l.Broker && !argsSimulateRemoteBroker(args),
-		Listeners: l,
-		Config:    cfg,
+		Colocated:    l.Hub && l.Broker && !argsSimulateRemoteBroker(args),
+		ServerLaunch: true,
+		Listeners:    l,
+		Config:       cfg,
 	}, nil
 }
 

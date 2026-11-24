@@ -137,8 +137,17 @@ export default defineConfig([
     rules: sharedRules,
   },
 
-  // Checks the Playwright configs, so it needs their TS project.
-  project(['src/utils/playwright-forbid-only.test.ts'], './tsconfig.e2e-configs.json'),
+  // Checks the Playwright configs and shared Chromium launch helper, so they
+  // need their TS project.
+  project(
+    [
+      'playwright-chromium.ts',
+      'playwright.config.ts',
+      'src/utils/playwright-chromium.test.ts',
+      'src/utils/playwright-forbid-only.test.ts',
+    ],
+    './tsconfig.e2e-configs.json'
+  ),
   // Playwright suites. The suites that load src share one lint-only TS
   // project (e2e/tsconfig.eslint.json) so ESLint builds one program for
   // them, not one per suite. Each suite's tsconfig.json still owns its
@@ -151,15 +160,19 @@ export default defineConfig([
       'e2e/artifacts-agent-owned/*.ts',
       'e2e/artifacts-review/*.ts',
       'e2e/chat/*.ts',
+      'e2e/chat-decisions/*.ts',
       'e2e/chat-file-preview/*.ts',
       'e2e/chat-mobile/*.ts',
       'e2e/chat-palette/*.ts',
+      'e2e/dialog-nested-popup/*.ts',
       'e2e/project-files-tabs/*.ts',
+      'e2e/secret-request/*.ts',
       'e2e/terminal-entrypoints/*.ts',
       'e2e/terminal-hidden/*.ts',
       'e2e/terminal-pane/*.ts',
       'e2e/terminal-workspace/*.ts',
       'e2e/test-hub-banner/*.ts',
+      'e2e/maintenance-preflight/*.ts',
       'e2e/broker-area/*.ts',
       'e2e/test-identity-session/*.ts',
       'e2e/page-policy/*.ts',
@@ -175,6 +188,7 @@ export default defineConfig([
       'e2e/groups/*.ts',
       'e2e/harness/*.ts',
       'e2e/roles/*.ts',
+      'e2e/system-one/*.ts',
       'e2e/terminal-coordinator/*.ts',
       'e2e/tokens/*.ts',
     ],

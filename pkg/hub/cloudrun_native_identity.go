@@ -56,7 +56,7 @@ const envNativeCloudRun = "SCION_METADATA_NATIVE_CLOUDRUN"
 
 // msgGCPMintNativeIdentity is the refusal of a GCP token request from a
 // natively assigned agent. It names no account.
-const msgGCPMintNativeIdentity = "the hub does not issue GCP tokens for agents on this Cloud Run Instances profile; use the instance's metadata server"
+const msgGCPMintNativeIdentity = "the hub does not issue GCP tokens for agents on Cloud Run Instances; use the instance's metadata server"
 
 // cloudRunProfileReportsNativeIdentity reports whether p is a Cloud Run
 // profile (Type cloudrun) whose broker reported, at report version
@@ -117,13 +117,14 @@ func brokerProfileNativelyAssigns(broker *store.RuntimeBroker, profileName strin
 }
 
 // cloudRunNativeLive is the hub's decision, from its stored broker row,
-// whether agent is natively assigned at this moment: gateOn (the
-// hub.cloudrun_native_identity experiment) and brokerProfileNativelyAssigns
-// for the agent's broker and profile. With gateOn false it reads nothing.
-// An agent with no broker, or whose broker row is gone, is not natively
-// assigned; any other lookup error is returned, and callers refuse on it.
+// whether agent is natively assigned at this moment: true for any flat Cloud
+// Run broker (flatCloudRunBroker) regardless of gateOn, and otherwise gateOn
+// (the hub.cloudrun_native_identity experiment) and
+// brokerProfileNativelyAssigns for the agent's broker and profile. An agent
+// with no broker, or whose broker row is gone, is not natively assigned; any
+// other lookup error is returned, and callers refuse on it.
 func cloudRunNativeLive(ctx context.Context, st store.Store, gateOn bool, agent *store.Agent) (bool, error) {
-	if !gateOn || agent == nil || agent.RuntimeBrokerID == "" || st == nil {
+	if agent == nil || agent.RuntimeBrokerID == "" || st == nil {
 		return false, nil
 	}
 	broker, err := st.GetRuntimeBroker(ctx, agent.RuntimeBrokerID)
@@ -132,6 +133,12 @@ func cloudRunNativeLive(ctx context.Context, st store.Store, gateOn bool, agent 
 	}
 	if err != nil {
 		return false, err
+	}
+	if flatCloudRunBroker(broker) {
+		return true, nil
+	}
+	if !gateOn {
+		return false, nil
 	}
 	profileName := ""
 	if agent.AppliedConfig != nil {

@@ -18,6 +18,9 @@ An isolated worker: one LLM-plus-harness loop in its own container with its own 
 ### Sub-agent
 An agent spawned by another agent; "sub" only from the orchestrating user's view, since it is a full agent in capability.
 
+### Execution container
+Any agent running the reserved built-in `shell` harness-config (no LLM harness). Users log into CLI tools inside it manually so credentials stay in the container's `$HOME` (never in `/workspace`) and are never exposed to LLM agents, and may register one in their user profile as their *default execution container* for approved commands.
+
 ### Reincarnation
 Migrating an existing agent to a new *generation*: the Hub re-resolves its template, image, and harness-config, then starts it again with the same agent ID and slug and a handoff as its first task. Done with [`scion reincarnate`](/scion/reference/cli/#scion-reincarnate). Distinct from *restart* (same config) and *resume* (same harness session).
 
@@ -75,7 +78,7 @@ How a project's workspace is provisioned across its agents. There are four canon
 A workspace sharing mode where one workspace directory is mounted into every agent with no per-agent isolation — the model used for plain (non-git) projects.
 
 ### Worktree-per-agent
-A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history (with the shared `.git` root mounted read-only into each container). Supported on repositories linked to the local workstation Hub (registered with this mode automatically; the worktrees are of your own checkout) and on Hub-managed git projects created with `worktree-per-agent` (see [Linked git projects](/scion/local/workspace/#linked-git-projects)); requires git 2.48 or later on the broker, and is not supported on Kubernetes.
+A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history (with the shared `.git` root mounted read-only into each container). Supported on repositories linked to the local workstation Hub (registered with this mode automatically; the worktrees are of your own checkout) and on Hub-managed git projects created with `worktree-per-agent` (see [Linked git projects](/scion/local/workspace/#linked-git-projects)); requires git 2.48 or later on the broker, and is not supported on Kubernetes or Cloud Run Instances (`cloudrun-sandbox` is unaffected).
 
 ### Clone-per-agent
 A workspace sharing mode where each agent gets its own full git clone of the repository. It is also what a Hub git project resolves to when it has no workspace mode set: only `shared` selects the shared checkout.
@@ -153,6 +156,10 @@ One of the roles a server process can run — the Hub API, the Runtime Broker AP
 
 ### Combo server
 A server process running both the Hub and Runtime Broker components together (the default in workstation mode).
+
+### Console (web UI mode)
+The management view in the web UI's three-way header mode switcher (**Console**, **Chat**, **Terminals**), holding the left-hand navigation and the overview, project, agent, Runtime Broker, and admin pages. Distinct from **Dashboard**, which is the overview landing page (`/`) inside Console's left-hand navigation.
+_Avoid_: Dashboard (when naming the mode-switcher option rather than the `/` overview page)
 
 ### Secret
 A credential made available to an agent at runtime (e.g. API keys, tokens). A harness-config's `secrets` field *declares* which secrets an agent needs; the **Secret Backend** — a pluggable store (local SQLite for development, GCP Secret Manager in production, selected via `SCION_SERVER_SECRETS_BACKEND`) — *stores and resolves* them, scoped by user, project, runtime broker, or hub, and injects them into the container.
@@ -237,7 +244,7 @@ A message mode that restricts messaging to users in the agent's ancestry chain �
 A message mode that behaves like Project mode within the agent's own project and additionally permits the agent to send direct messages across project boundaries (when cross-project messaging is enabled at the Hub and receiving-project level). A project-mode agent can receive a cross-project DM but cannot reply until granted Hub mode. Hub mode is subject to a non-escalation grant guard: an agent can only grant it to another agent if the granting agent is itself in Hub mode and has the `full` authorization role.
 
 ### Message Mode
-A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of five values: `none`, `lineage`, `branch`, `project` (the default), or `hub`. Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
+A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of five values: `none`, `lineage`, `branch`, `project` (the built-in default unless the operator sets `server.hub.default_message_mode`), or `hub`. Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
 
 ### Messageability
 A server-computed assessment of whether a specific viewer can message a specific agent, considering the agent's message mode, the viewer's identity, ancestry relationship, and permissions. Exposed in API responses as `_messageability` with `canMessage` and `canReachViewer` booleans. Used by the UI to gate message buttons and show reachability indicators.
@@ -252,7 +259,7 @@ A message mode that seals the agent from all messaging except system-plane notic
 The ability of a privileged user to bypass an agent's message mode restrictions. Super-admins pierce all modes including none. Project owners pierce lineage and branch modes. Piercing applies only to user identities — it is never inherited by an owner's agents.
 
 ### Project mode (message mode)
-The default message mode. Any user with the `agent:message` permission in the project scope can message the agent, and any same-project agent in project or branch mode can message it. The most permissive mode. Note that the default project-member role does not include `agent:message` — messaging requires an owner, admin, or ancestry relationship with the agent.
+The built-in default message mode (unless the operator sets `server.hub.default_message_mode`). Any user with the `agent:message` permission in the project scope can message the agent, and any same-project agent in project or branch mode can message it. The most permissive mode. Note that the default project-member role does not include `agent:message` — messaging requires an owner, admin, or ancestry relationship with the agent.
 
 ### Cross-project inbound policy
 A project-level setting (`crossProjectInbound`) that controls whether the project accepts agent messages originating from other projects. One of three values: `none` (default — reject all), `members` (accept only when the sender's originating human is a member of this project), or `any` (accept from any project on the Hub). One of three independent controls required for cross-project messaging.
@@ -278,7 +285,7 @@ The tracked `root → parent → child` relationship between agents that governs
 The infrastructure lifecycle stage of an agent container: `created`, `provisioning`, `cloning`, `starting`, `running`, `stopping`, `stopped`, `suspended`, or `error`. An agent provisioned with `scion create` and not yet started is shown as `created (not started)`.
 
 ### Activity
-What a running agent is currently doing within the `running` phase, such as `initializing` (shown as "starting": the harness is not yet reading input), `thinking`, `executing`, `waiting_for_input`, `blocked`, `completed`, `limits_exceeded`, `stalled`, or `offline`. Distinct from phase.
+What a running agent is currently doing within the `running` phase, such as `initializing` (shown as "starting": the harness is not yet reading input), `thinking`, `executing`, `waiting_for_input`, `blocked`, `completed`, `limits_exceeded`, `stalled`, `offline`, or `harness_error`. Distinct from phase.
 
 ### Blocked
 The activity an agent assigns to itself when intentionally waiting for an expected event (such as a child agent completing), so it is not mistaken for stalled.
@@ -289,11 +296,14 @@ The activity an agent assigns to itself when intentionally waiting for an expect
 ### Error (crash)
 The phase an agent enters when its process or container exits non-zero (a crash, OOM, or `SIGKILL`), carrying a message like `Agent crashed with exit code N`. The `error` phase is restartable: `scion start` clears it and runs a fresh session. A clean exit goes to `stopped` instead. The `error` phase also covers setup failures (e.g. a failed git clone) that happen before an agent reaches `running`.
 
+### Harness error
+The `harness_error` activity of a `running` agent whose harness process is alive at its prompt but reported that a model, API or auth error ended its turn. The reason is in the agent's message (for example `model API: APIError (status 400)`). Notifies the `HARNESS_ERROR` trigger; cleared by the harness's next prompt, model call or tool call, so a new message retries. Distinct from the `error` phase, where the harness process is dead.
+
 ### Stalled
-A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `waiting_for_input`, `completed`, `limits_exceeded` or `offline` are excluded. An agent can be marked stalled while `initializing`, but auto-suspend never suspends it for that stall. Distinct from `offline`, which means no heartbeat for over 2 minutes.
+A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `idle`, `waiting_for_input`, `completed`, `limits_exceeded`, `harness_error` or `offline` are excluded, and so is an agent whose container reported live work (a process doing CPU work, such as a build or test run) within the threshold, or a tool call still in flight (for at most 60 minutes, and for only 10 when its processes make no progress). A stalled agent whose container then reports live work gets its previous activity back. An agent can be marked stalled while `initializing`, but auto-suspend never suspends it for that stall. Distinct from `offline`, which means no heartbeat for over 2 minutes.
 
 ### Auto-Suspend
-A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
+A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped, and so are agents whose container reported live work in the last 90 seconds. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
 
 ### Run intent
 Whether the Hub has been asked to keep an agent running (`running`) or stopped (`stopped`). It is recorded when a lifecycle request (start, restart, wake, create-and-start, stop, suspend or delete) is accepted, before dispatch to the Runtime Broker, so it reflects the request even when the dispatch is queued or fails. Kept separately from phase and not shown in the agent's API record.
@@ -344,7 +354,30 @@ Connecting an interactive terminal to a running agent's tmux session for human-i
 The Hub handing an agent lifecycle command to the appropriate runtime broker for execution.
 
 ### Schedule
-A time-based trigger that fires an action — sending a message or dispatching (starting) an agent from a template — either once (a one-shot *scheduled event*, via `--at <time>` or `--in <duration>`) or repeatedly (a recurring *schedule* on a 5-field cron expression). Backs `scion schedule`.
+A time-based schedule that fires an **Action** — sending a message, dispatching (starting) an agent from a template, or running a command (`exec`) — either once (a one-shot *scheduled event*, via `--at <time>` or `--in <duration>`) or repeatedly (a recurring *schedule* on a 5-field cron expression). Backs `scion schedule`. Shares the Hub's fire core with **Trigger**.
+
+## Triggers
+
+Event-driven automation gated by the `hub.triggers` experiment (`scion trigger`). An external **Source** delivers an **Event** into the Hub's durable inbox; matching **Trigger** definitions evaluate rules and execute an **Action**, recording each attempt as a **Fire**.
+
+:::note[Disambiguation]
+"Trigger" is overloaded across three Scion concepts. Here, **Trigger** is the canonical project-scoped automation rule (`scion trigger`). In **Notifications**, qualify the activity that fires a subscription as a *trigger activity* (or *notification trigger*). In container/harness **Lifecycle Hooks** (such as **Pre-Start Hook**), say *hook point* or *lifecycle hook event*.
+:::
+
+### Source (triggers)
+An origin that emits **Events** into a project's trigger inbox, identified by `(source_kind, source_id)` — in Stage 1, a project-owned webhook endpoint (`source_kind: "webhook"`, `scion trigger webhook`, receiving signed `POST /api/v1/hooks/{id}` requests).
+
+### Event (triggers)
+An immutable durable inbox record (`trigger_events`) captured when a **Source** delivers a payload, carrying `type`, `subject`, `dedup_key`, `attributes`, allow-listed `headers`, and a bounded JSON `payload`, processed asynchronously through the Hub's durable queue (`trigger.event`). Distinct from the internal **Event Bus** and from a one-shot *scheduled event*.
+
+### Trigger
+A project-scoped automation rule (`scion trigger`) attached to a **Source** that matches incoming **Events** and executes an **Action** under the authoring principal's recorded authority. May be paused by the Hub with a structured `status_reason` (`creator_deleted`, `target_deleted`, or `source_deleted`).
+
+### Action (triggers / schedules)
+The Hub-executed operation a **Trigger** or **Schedule** performs when it fires (`message`, `dispatch_agent`, or `exec`), sharing one fire core and recorded-authority check. Stage 1 triggers authorize `message` actions.
+
+### Fire (triggers / schedules)
+One execution attempt of a **Trigger** for a specific **Event** (unique per `(event_id, trigger_id)`), or one execution of a **Schedule**. Moves from `firing` to a terminal status (`fired`, `skipped`, `failed`, or `refused`), visible via `scion trigger history`.
 
 ## Observability
 

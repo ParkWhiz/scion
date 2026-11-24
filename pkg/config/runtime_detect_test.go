@@ -15,6 +15,8 @@
 package config
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -215,6 +217,9 @@ func TestDetectLocalRuntime_NoRuntime(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected error when no runtime is available")
 			}
+			if !errors.Is(err, ErrNoLocalRuntime) {
+				t.Errorf("expected errors.Is(err, ErrNoLocalRuntime) to be true, got: %v", err)
+			}
 			if err.Error() != tt.want {
 				t.Errorf("unexpected error message for %s: %s", tt.goos, err.Error())
 			}
@@ -253,4 +258,160 @@ func TestDetectLocalRuntime_OnPathButNotFunctioning(t *testing.T) {
 	if result != "docker" {
 		t.Errorf("expected docker (podman not functioning), got %s", result)
 	}
+}
+
+func TestResetRuntimeDetectionCache(t *testing.T) {
+	mockRuntimeDetectionNone(t)
+
+	if _, err := detectLocalRuntimeOnce(); !errors.Is(err, ErrNoLocalRuntime) {
+		t.Fatalf("expected cached ErrNoLocalRuntime, got: %v", err)
+	}
+
+	lookPathFunc = func(file string) (string, error) {
+		if file == "docker" {
+			return "/usr/bin/docker", nil
+		}
+		return "", fmt.Errorf("not found: %s", file)
+	}
+	runCheckFunc = func(binary string, args []string) error { return nil }
+
+	// Without ResetRuntimeDetectionCache, detectLocalRuntimeOnce returns the cached error.
+	if _, err := detectLocalRuntimeOnce(); !errors.Is(err, ErrNoLocalRuntime) {
+		t.Fatalf("expected stale cached ErrNoLocalRuntime before reset, got: %v", err)
+	}
+
+	ResetRuntimeDetectionCache()
+	got, err := detectLocalRuntimeOnce()
+	if err != nil || got != "docker" {
+		t.Fatalf("expected fresh detection result docker after reset, got %q, %v", got, err)
+	}
+}
+
+func TestCheckRuntimeDaemon(t *testing.T) {
+	t.Run("docker daemon reachable", func(t *testing.T) {
+		var gotBinary string
+		var gotArgs []string
+		restore := OverrideRuntimeDetection(
+			func(file string) (string, error) { return "/usr/bin/" + file, nil },
+			func(binary string, args []string) error {
+				gotBinary = binary
+				gotArgs = args
+				return nil
+			},
+		)
+		t.Cleanup(restore)
+
+		if err := CheckRuntimeDaemon(t.Context(), "docker"); err != nil {
+			t.Fatalf("expected nil error when docker daemon is reachable, got: %v", err)
+		}
+		if gotBinary != "docker" || fmt.Sprint(gotArgs) != "[info]" {
+			t.Errorf("expected docker [info], got %s %v", gotBinary, gotArgs)
+		}
+	})
+
+	t.Run("docker daemon unreachable", func(t *testing.T) {
+		daemonErr := errors.New("Cannot connect to the Docker daemon")
+		restore := OverrideRuntimeDetection(
+			func(file string) (string, error) { return "/usr/bin/" + file, nil },
+			func(binary string, args []string) error {
+				if binary == "docker" && len(args) == 1 && args[0] == "info" {
+					return daemonErr
+				}
+				return nil
+			},
+		)
+		t.Cleanup(restore)
+
+		err := CheckRuntimeDaemon(t.Context(), "docker")
+		if !errors.Is(err, daemonErr) {
+			t.Fatalf("expected daemonErr, got: %v", err)
+		}
+	})
+
+	t.Run("podman daemon unreachable then reachable reflects live state", func(t *testing.T) {
+		running := false
+		restore := OverrideRuntimeDetection(
+			func(file string) (string, error) { return "/usr/bin/" + file, nil },
+			func(binary string, args []string) error {
+				if binary == "podman" && len(args) == 1 && args[0] == "info" && !running {
+					return errors.New("podman machine not running")
+				}
+				return nil
+			},
+		)
+		t.Cleanup(restore)
+
+		if err := CheckRuntimeDaemon(t.Context(), "podman"); err == nil {
+			t.Fatal("expected error while podman daemon is stopped")
+		}
+		running = true
+		if err := CheckRuntimeDaemon(t.Context(), "podman"); err != nil {
+			t.Fatalf("expected nil after podman daemon starts, got: %v", err)
+		}
+	})
+
+	t.Run("apple container skips daemon info probe", func(t *testing.T) {
+		called := false
+		restore := OverrideRuntimeDetection(
+			func(file string) (string, error) { return "/usr/bin/" + file, nil },
+			func(binary string, args []string) error {
+				called = true
+				return errors.New("should not be called")
+			},
+		)
+		t.Cleanup(restore)
+
+		if err := CheckRuntimeDaemon(t.Context(), "container"); err != nil {
+			t.Fatalf("expected nil for container CLI, got: %v", err)
+		}
+		if called {
+			t.Error("expected container CLI not to invoke runCheckFunc")
+		}
+	})
+
+	t.Run("unknown runtime returns error", func(t *testing.T) {
+		if err := CheckRuntimeDaemon(t.Context(), "unknown-rt"); err == nil {
+			t.Fatal("expected error for unknown runtime")
+		}
+	})
+
+	t.Run("cancelled context aborts probe", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		called := false
+		restore := OverrideRuntimeDetection(
+			func(file string) (string, error) { return "/usr/bin/" + file, nil },
+			func(binary string, args []string) error {
+				called = true
+				return nil
+			},
+		)
+		t.Cleanup(restore)
+
+		err := CheckRuntimeDaemon(ctx, "docker")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got: %v", err)
+		}
+		if called {
+			t.Error("expected cancelled context not to invoke probe")
+		}
+	})
+
+	t.Run("context cancellation during probe is propagated", func(t *testing.T) {
+		orig := runCheckCtxFunc
+		t.Cleanup(func() { runCheckCtxFunc = orig })
+
+		ctx, cancel := context.WithCancel(t.Context())
+		runCheckCtxFunc = func(probeCtx context.Context, binary string, args []string) error {
+			cancel()
+			<-probeCtx.Done()
+			return probeCtx.Err()
+		}
+
+		err := CheckRuntimeDaemon(ctx, "docker")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got: %v", err)
+		}
+	})
 }

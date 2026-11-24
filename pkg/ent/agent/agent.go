@@ -60,6 +60,8 @@ const (
 	FieldRuntimeState = "runtime_state"
 	// FieldStalledFromActivity holds the string denoting the stalled_from_activity field in the database.
 	FieldStalledFromActivity = "stalled_from_activity"
+	// FieldSuspendReason holds the string denoting the suspend_reason field in the database.
+	FieldSuspendReason = "suspend_reason"
 	// FieldCurrentTurns holds the string denoting the current_turns field in the database.
 	FieldCurrentTurns = "current_turns"
 	// FieldCurrentModelCalls holds the string denoting the current_model_calls field in the database.
@@ -106,6 +108,10 @@ const (
 	FieldLastSeen = "last_seen"
 	// FieldLastActivityEvent holds the string denoting the last_activity_event field in the database.
 	FieldLastActivityEvent = "last_activity_event"
+	// FieldLastLiveProcessAt holds the string denoting the last_live_process_at field in the database.
+	FieldLastLiveProcessAt = "last_live_process_at"
+	// FieldLastLiveWorkAt holds the string denoting the last_live_work_at field in the database.
+	FieldLastLiveWorkAt = "last_live_work_at"
 	// FieldStartedAt holds the string denoting the started_at field in the database.
 	FieldStartedAt = "started_at"
 	// FieldDeletedAt holds the string denoting the deleted_at field in the database.
@@ -206,6 +212,12 @@ const (
 	FieldStartClaimLaunchID = "start_claim_launch_id"
 	// FieldSoftDeleteOpID holds the string denoting the soft_delete_op_id field in the database.
 	FieldSoftDeleteOpID = "soft_delete_op_id"
+	// FieldActivitySince holds the string denoting the activity_since field in the database.
+	FieldActivitySince = "activity_since"
+	// FieldLastDeliveryAt holds the string denoting the last_delivery_at field in the database.
+	FieldLastDeliveryAt = "last_delivery_at"
+	// FieldIdleSuspendClaimUntil holds the string denoting the idle_suspend_claim_until field in the database.
+	FieldIdleSuspendClaimUntil = "idle_suspend_claim_until"
 	// EdgeProject holds the string denoting the project edge name in mutations.
 	EdgeProject = "project"
 	// EdgeMemberships holds the string denoting the memberships edge name in mutations.
@@ -216,6 +228,8 @@ const (
 	EdgeHolds = "holds"
 	// EdgeReportedRuns holds the string denoting the reported_runs edge name in mutations.
 	EdgeReportedRuns = "reported_runs"
+	// EdgeSuspendScreen holds the string denoting the suspend_screen edge name in mutations.
+	EdgeSuspendScreen = "suspend_screen"
 	// Table holds the table name of the agent in the database.
 	Table = "agents"
 	// ProjectTable is the table that holds the project relation/edge.
@@ -253,6 +267,13 @@ const (
 	ReportedRunsInverseTable = "broker_reported_runs"
 	// ReportedRunsColumn is the table column denoting the reported_runs relation/edge.
 	ReportedRunsColumn = "agent_id"
+	// SuspendScreenTable is the table that holds the suspend_screen relation/edge.
+	SuspendScreenTable = "agent_suspend_screens"
+	// SuspendScreenInverseTable is the table name for the AgentSuspendScreen entity.
+	// It exists in this package in order to avoid circular dependency with the "agentsuspendscreen" package.
+	SuspendScreenInverseTable = "agent_suspend_screens"
+	// SuspendScreenColumn is the table column denoting the suspend_screen relation/edge.
+	SuspendScreenColumn = "agent_id"
 )
 
 // Columns holds all SQL columns for agent fields.
@@ -280,6 +301,7 @@ var Columns = []string{
 	FieldExitReason,
 	FieldRuntimeState,
 	FieldStalledFromActivity,
+	FieldSuspendReason,
 	FieldCurrentTurns,
 	FieldCurrentModelCalls,
 	FieldImage,
@@ -303,6 +325,8 @@ var Columns = []string{
 	FieldUpdated,
 	FieldLastSeen,
 	FieldLastActivityEvent,
+	FieldLastLiveProcessAt,
+	FieldLastLiveWorkAt,
 	FieldStartedAt,
 	FieldDeletedAt,
 	FieldStateVersion,
@@ -353,6 +377,9 @@ var Columns = []string{
 	FieldStartClaimHoldUntil,
 	FieldStartClaimLaunchID,
 	FieldSoftDeleteOpID,
+	FieldActivitySince,
+	FieldLastDeliveryAt,
+	FieldIdleSuspendClaimUntil,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -622,6 +649,11 @@ func ByStalledFromActivity(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldStalledFromActivity, opts...).ToFunc()
 }
 
+// BySuspendReason orders the results by the suspend_reason field.
+func BySuspendReason(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldSuspendReason, opts...).ToFunc()
+}
+
 // ByCurrentTurns orders the results by the current_turns field.
 func ByCurrentTurns(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldCurrentTurns, opts...).ToFunc()
@@ -725,6 +757,16 @@ func ByLastSeen(opts ...sql.OrderTermOption) OrderOption {
 // ByLastActivityEvent orders the results by the last_activity_event field.
 func ByLastActivityEvent(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldLastActivityEvent, opts...).ToFunc()
+}
+
+// ByLastLiveProcessAt orders the results by the last_live_process_at field.
+func ByLastLiveProcessAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLastLiveProcessAt, opts...).ToFunc()
+}
+
+// ByLastLiveWorkAt orders the results by the last_live_work_at field.
+func ByLastLiveWorkAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLastLiveWorkAt, opts...).ToFunc()
 }
 
 // ByStartedAt orders the results by the started_at field.
@@ -972,6 +1014,21 @@ func BySoftDeleteOpID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldSoftDeleteOpID, opts...).ToFunc()
 }
 
+// ByActivitySince orders the results by the activity_since field.
+func ByActivitySince(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldActivitySince, opts...).ToFunc()
+}
+
+// ByLastDeliveryAt orders the results by the last_delivery_at field.
+func ByLastDeliveryAt(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldLastDeliveryAt, opts...).ToFunc()
+}
+
+// ByIdleSuspendClaimUntil orders the results by the idle_suspend_claim_until field.
+func ByIdleSuspendClaimUntil(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldIdleSuspendClaimUntil, opts...).ToFunc()
+}
+
 // ByProjectField orders the results by project field.
 func ByProjectField(field string, opts ...sql.OrderTermOption) OrderOption {
 	return func(s *sql.Selector) {
@@ -1034,6 +1091,13 @@ func ByReportedRuns(term sql.OrderTerm, terms ...sql.OrderTerm) OrderOption {
 		sqlgraph.OrderByNeighborTerms(s, newReportedRunsStep(), append([]sql.OrderTerm{term}, terms...)...)
 	}
 }
+
+// BySuspendScreenField orders the results by suspend_screen field.
+func BySuspendScreenField(field string, opts ...sql.OrderTermOption) OrderOption {
+	return func(s *sql.Selector) {
+		sqlgraph.OrderByNeighborTerms(s, newSuspendScreenStep(), sql.OrderByField(field, opts...))
+	}
+}
 func newProjectStep() *sqlgraph.Step {
 	return sqlgraph.NewStep(
 		sqlgraph.From(Table, FieldID),
@@ -1067,5 +1131,12 @@ func newReportedRunsStep() *sqlgraph.Step {
 		sqlgraph.From(Table, FieldID),
 		sqlgraph.To(ReportedRunsInverseTable, FieldID),
 		sqlgraph.Edge(sqlgraph.O2M, false, ReportedRunsTable, ReportedRunsColumn),
+	)
+}
+func newSuspendScreenStep() *sqlgraph.Step {
+	return sqlgraph.NewStep(
+		sqlgraph.From(Table, FieldID),
+		sqlgraph.To(SuspendScreenInverseTable, FieldID),
+		sqlgraph.Edge(sqlgraph.O2O, false, SuspendScreenTable, SuspendScreenColumn),
 	)
 }

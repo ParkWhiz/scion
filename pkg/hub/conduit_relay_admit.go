@@ -43,9 +43,8 @@ func init() {
 	hubInternalOps[relay.HubAdmitPath] = (*Server).hubAdmit
 }
 
-// conduitRelayAdmitRemoteAddr is the remote address of a forwarded
-// handshake: a documentation address that no trusted-proxy rule matches,
-// so proxy identity is never taken from a relay.
+// conduitRelayAdmitRemoteAddr is the sentinel remote address of a forwarded
+// handshake. relay.ForwardCredentialHeaders never forwards X-Forwarded-For.
 const conduitRelayAdmitRemoteAddr = "192.0.2.1:0"
 
 // maxRelaySessionIDLen bounds a relay-chosen session id.
@@ -230,6 +229,9 @@ func (s *Server) writeRelayAdmission(w http.ResponseWriter, r *http.Request, a c
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+	if p.Kind == registry.PrincipalAgent {
+		s.scheduleExternalRelayAgentAdmissionNudge(p.ID)
+	}
 }
 
 // relayUserAuthTypes are the user credential kinds a separate relay's

@@ -253,6 +253,44 @@ describe('previewDocument', () => {
     expect(PREVIEW_CSP).toBe("default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
     expect(PREVIEW_SANDBOX.split(' ')).not.toContain('allow-scripts');
   });
+  it('applies custom dark-mode review and error theme tokens to CriticMarkup and failed image placeholders', () => {
+    const doc = previewDocument('<mark class="critic-hl">hi</mark>', {
+      reviewHlBg: '#713f12',
+      reviewInsBg: '#14532d',
+      reviewInsText: '#bbf7d0',
+      reviewDelBg: '#7f1d1d',
+      reviewDelText: '#fecaca',
+      reviewNoteBlockText: '#e1d5ff',
+      reviewNoteBlockBg: '#3b1c66',
+      reviewNoteLine: '#a78bfa',
+      errorBg: 'rgba(239, 68, 68, 0.15)',
+      errorText: '#fca5a5',
+      errorBorder: 'rgba(248, 113, 113, 0.4)',
+    });
+    expect(doc).toContain('mark.critic-hl{background:#713f12;color:inherit}');
+    expect(doc).toContain(
+      'ins.critic-ins{color:#bbf7d0;background:#14532d;text-decoration:underline}'
+    );
+    expect(doc).toContain(
+      'del.critic-del{color:#fecaca;background:#7f1d1d;text-decoration:line-through}'
+    );
+    expect(doc).toContain('color:#e1d5ff;background:#3b1c66;border-left:3px solid #a78bfa');
+    expect(doc).toContain(
+      '.image-placeholder.failed{border-color:rgba(248, 113, 113, 0.4);color:#fca5a5;background:rgba(239, 68, 68, 0.15)}'
+    );
+  });
+  it('forwards radius tokens and rejects unsafe radius values', () => {
+    const square = previewDocument('<pre><code>x</code></pre>', { radiusSm: '0', radius: '0' });
+    expect(square).toContain('border-radius:0;border:1px solid');
+    expect(square).toContain('pre{background:#f8fafc;border:1px solid #e2e8f0;border-radius:0;');
+    const injected = previewDocument('<pre><code>x</code></pre>', {
+      radiusSm: '0;}</style><script>',
+      radius: '12px',
+    });
+    expect(injected).not.toContain('<script>');
+    expect(injected).toContain('border-radius:0.25rem;border:1px solid');
+    expect(injected).toContain('border-radius:12px;padding:1rem');
+  });
 });
 
 /**

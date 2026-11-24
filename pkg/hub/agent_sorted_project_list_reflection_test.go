@@ -202,6 +202,14 @@ var reflectFillStoreAgentSkipFields = map[string]bool{
 	// SetAgentSSHHostKey; CreateAgent and UpdateAgent never write them.
 	"SSHHostKey":      true,
 	"SSHHostKeyRunID": true,
+	// activity_since is store-managed (ptone/scion#7944): the store derives
+	// it from the row's own phase and activity and ignores the caller's
+	// value, so a reflection-filled value cannot round-trip.
+	"ActivitySince": true,
+	// suspend_reason is written only by UpdateAgentStatus with the suspended
+	// phase (ptone/scion#7826); UpdateAgent never writes it, and any other
+	// phase write clears it, so it cannot round-trip here.
+	"SuspendReason": true,
 	// workspace_placement is written only through SetAgentWorkspacePlacement
 	// (ptone/scion#2727): CreateAgent and UpdateAgent never write it, so it
 	// cannot round-trip here. It is not an authz input.
@@ -220,11 +228,14 @@ var reflectFillStoreAgentSkipFields = map[string]bool{
 	// Suspension is computed by the hub at response time from the agent's
 	// active holds (ptone/scion#3433); it is not stored.
 	"Suspension": true,
-	// Start claim columns are written only through the start-claim store
-	// methods (never by CreateAgent/UpdateAgent).
+	// Start claim and idle-suspend claim columns (and IdleSuspendClaimActive,
+	// derived at read time from IdleSuspendClaimUntil against the store clock)
+	// are written only through the claim store methods (never by
+	// CreateAgent/UpdateAgent). All are json:"-" and not authz inputs.
 	"StartClaimID": true, "StartClaimKind": true, "StartClaimState": true,
 	"StartClaimOwner": true, "StartClaimTarget": true, "StartClaimAt": true,
 	"StartClaimLeaseUntil": true, "StartClaimUnconfirmedAt": true,
+	"LastDeliveryAt": true, "IdleSuspendClaimUntil": true, "IdleSuspendClaimActive": true, "IdleSuspendClaimLeaseActive": true,
 	"StartClaimHoldUntil": true, "StartClaimLaunchID": true,
 	// soft_delete_op_id is written only through SetAgentSoftDeleteOpID
 	// (never by CreateAgent/UpdateAgent) and is set only alongside
@@ -237,6 +248,11 @@ var reflectFillStoreAgentSkipFields = map[string]bool{
 	// round-trip here. Both are json:"-" and not authz inputs.
 	"EffectiveConfig": true,
 	"LaunchRunID":     true,
+	// last_live_process_at and last_live_work_at are written only by
+	// UpdateAgentStatus from a heartbeat's live work (ptone/scion#7855);
+	// CreateAgent and UpdateAgent never write them. Not authz inputs.
+	"LastLiveProcessAt": true,
+	"LastLiveWorkAt":    true,
 }
 
 func reflectFillStoreAgent(t *testing.T, projectID string) *store.Agent {

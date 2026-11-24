@@ -18,10 +18,12 @@ package entadapter
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/enttest"
@@ -46,7 +48,11 @@ func newTestAgentStore(t *testing.T) (*AgentStore, string) {
 		Save(context.Background())
 	require.NoError(t, err)
 
-	return NewAgentStore(client), agentTestProjectUID.String()
+	as := NewAgentStore(client)
+	// The hub installs this gate (lifecycle.idle_suspend on); without one the
+	// store is lease-only.
+	as.SetIdleSuspendInProgressGate(func() bool { return true })
+	return as, agentTestProjectUID.String()
 }
 
 // makeAgent builds a minimal valid agent for the seeded project.
@@ -534,7 +540,7 @@ func TestAgentStore_MarkStalledAgents(t *testing.T) {
 	active.LastSeen = now
 	require.NoError(t, s.CreateAgent(ctx, active))
 
-	updated, err := s.MarkStalledAgents(ctx, activityThreshold, heartbeatRecency)
+	updated, err := s.MarkStalledAgents(ctx, store.StallCutoffs{Activity: activityThreshold, Thinking: activityThreshold}, heartbeatRecency)
 	require.NoError(t, err)
 	require.Len(t, updated, 1)
 	assert.Equal(t, stalled.ID, updated[0].ID)
@@ -543,6 +549,210 @@ func TestAgentStore_MarkStalledAgents(t *testing.T) {
 
 	gotActive, _ := s.GetAgent(ctx, active.ID)
 	assert.Equal(t, "executing", gotActive.Activity)
+}
+
+func TestAgentStore_MarkStalledAgents_NoHookSinceStartHint(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	now := time.Now()
+	staleStart := now.Add(-30 * time.Minute)
+	activityThreshold := now.Add(-15 * time.Minute)
+	heartbeatRecency := now.Add(-2 * time.Minute)
+
+	mkCandidate := func(slug, activity, msg string, startedAt, lastAct time.Time, turns int) *store.Agent {
+		a := makeAgent(projectID, slug)
+		a.Phase = string(state.PhaseRunning)
+		a.Activity = activity
+		a.Message = msg
+		a.StartedAt = startedAt
+		a.LastActivityEvent = lastAct
+		a.LastSeen = now
+		a.CurrentTurns = turns
+		require.NoError(t, s.CreateAgent(ctx, a))
+		return a
+	}
+
+	// Agents that never reported a hook event since start get the hint.
+	initOnly := mkCandidate("init-only", string(state.ActivityInitializing), "Agent started", staleStart, staleStart, 0)
+	settleReady := mkCandidate("settle-ready", string(state.ActivityWorking), "Harness started", staleStart, staleStart.Add(8*time.Second), 0)
+	deadlineReady := mkCandidate("deadline-ready", string(state.ActivityWorking), "Harness readiness not confirmed by deadline; assuming ready", staleStart, staleStart.Add(90*time.Second), 0)
+	startTimestampOnly := mkCandidate("start-ts-only", string(state.ActivityWorking), "", staleStart.Truncate(time.Second), staleStart, 0)
+
+	// Agents that reported hook activity before stalling do NOT get the hint.
+	sessionStarted := mkCandidate("session-started", string(state.ActivityWorking), "Session started", staleStart, staleStart.Add(2*time.Second), 0)
+	afterTurnReady := mkCandidate("after-turn-ready", string(state.ActivityWorking), "Ready", staleStart, staleStart.Add(5*time.Minute), 0)
+	thinking := mkCandidate("thinking", string(state.ActivityThinking), "Processing", staleStart, staleStart.Add(3*time.Minute), 0)
+	executing := mkCandidate("executing", string(state.ActivityExecuting), "Executing: Bash", staleStart, staleStart.Add(4*time.Minute), 0)
+	hadTurns := mkCandidate("had-turns", string(state.ActivityWorking), "Harness started", staleStart, staleStart.Add(8*time.Second), 1)
+
+	updated, err := s.MarkStalledAgents(ctx, store.StallCutoffs{Activity: activityThreshold, Thinking: activityThreshold}, heartbeatRecency)
+	require.NoError(t, err)
+	require.Len(t, updated, 9)
+
+	byID := make(map[string]store.Agent, len(updated))
+	for _, a := range updated {
+		byID[a.ID] = a
+	}
+
+	for _, wantHint := range []*store.Agent{initOnly, settleReady, deadlineReady, startTimestampOnly} {
+		got := byID[wantHint.ID]
+		assert.Equal(t, string(state.ActivityStalled), got.Activity, wantHint.Slug)
+		assert.Equal(t, state.StalledNoHookActivityHint, got.Message, "%s returned row should carry no-hook hint", wantHint.Slug)
+		persisted, err := s.GetAgent(ctx, wantHint.ID)
+		require.NoError(t, err)
+		assert.Equal(t, state.StalledNoHookActivityHint, persisted.Message, "%s persisted row should carry no-hook hint", wantHint.Slug)
+	}
+
+	for _, noHint := range []*store.Agent{sessionStarted, afterTurnReady, thinking, executing, hadTurns} {
+		got := byID[noHint.ID]
+		assert.Equal(t, string(state.ActivityStalled), got.Activity, noHint.Slug)
+		assert.Equal(t, noHint.Message, got.Message, "%s returned row must not get no-hook hint", noHint.Slug)
+		persisted, err := s.GetAgent(ctx, noHint.ID)
+		require.NoError(t, err)
+		assert.Equal(t, noHint.Message, persisted.Message, "%s persisted row must not get no-hook hint", noHint.Slug)
+	}
+
+	// Recovery without an explicit message (e.g. response-complete or live-work unstall)
+	// clears the stall hint so a recovered agent does not keep displaying it.
+	require.NoError(t, s.UpdateAgentStatus(ctx, initOnly.ID, store.AgentStatusUpdate{
+		Activity:    string(state.ActivityCompleted),
+		TaskSummary: "Done",
+	}))
+	gotCompleted, err := s.GetAgent(ctx, initOnly.ID)
+	require.NoError(t, err)
+	assert.Equal(t, string(state.ActivityCompleted), gotCompleted.Activity)
+	assert.Empty(t, gotCompleted.Message)
+
+	require.NoError(t, s.UpdateAgentStatus(ctx, settleReady.ID, store.AgentStatusUpdate{
+		Heartbeat:    true,
+		LiveWork:     &store.LiveWork{Kind: "tool", SuppressStall: true},
+		ReportSource: store.StatusReportSourceAgent,
+	}))
+	gotUnstalled, err := s.GetAgent(ctx, settleReady.ID)
+	require.NoError(t, err)
+	assert.Equal(t, string(state.ActivityWorking), gotUnstalled.Activity)
+	assert.Empty(t, gotUnstalled.Message)
+
+	// Recovery with an explicit hook message replaces the hint with the hook's message.
+	require.NoError(t, s.UpdateAgentStatus(ctx, deadlineReady.ID, store.AgentStatusUpdate{
+		Activity: string(state.ActivityThinking),
+		Message:  "Processing",
+	}))
+	gotThinking, err := s.GetAgent(ctx, deadlineReady.ID)
+	require.NoError(t, err)
+	assert.Equal(t, string(state.ActivityThinking), gotThinking.Activity)
+	assert.Equal(t, "Processing", gotThinking.Message)
+}
+
+// TestAgentStore_MarkStalledAgents_HarnessErrorExcluded pins that a
+// harness_error agent is never marked stalled (its reported reason must not
+// be replaced), but is still swept to offline when its heartbeats stop.
+func TestAgentStore_MarkStalledAgents_HarnessErrorExcluded(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	now := time.Now()
+	errored := makeAgent(projectID, "harness-error")
+	errored.Phase = "running"
+	errored.Activity = string(state.ActivityHarnessError)
+	errored.Message = "model API: APIError (status 400)"
+	errored.LastActivityEvent = now.Add(-30 * time.Minute)
+	errored.LastSeen = now
+	require.NoError(t, s.CreateAgent(ctx, errored))
+
+	cutoff := now.Add(-15 * time.Minute)
+	updated, err := s.MarkStalledAgents(ctx, store.StallCutoffs{Activity: cutoff, Thinking: cutoff}, now.Add(-2*time.Minute))
+	require.NoError(t, err)
+	assert.Empty(t, updated)
+	got, err := s.GetAgent(ctx, errored.ID)
+	require.NoError(t, err)
+	assert.Equal(t, string(state.ActivityHarnessError), got.Activity)
+	assert.Equal(t, "model API: APIError (status 400)", got.Message)
+
+	// Heartbeats stop: offline is the truth.
+	got.LastSeen = now.Add(-10 * time.Minute)
+	require.NoError(t, s.UpdateAgent(ctx, got))
+	offline, err := s.MarkStaleAgentsOffline(ctx, now.Add(-5*time.Minute))
+	require.NoError(t, err)
+	require.Len(t, offline, 1)
+	assert.Equal(t, "offline", offline[0].Activity)
+}
+
+func TestAgentStore_MarkStalledAgents_ThinkingCutoff(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	now := time.Now()
+	cutoffs := store.StallCutoffs{
+		Activity: now.Add(-5 * time.Minute),
+		Thinking: now.Add(-20 * time.Minute),
+	}
+	heartbeatRecency := now.Add(-2 * time.Minute)
+
+	mk := func(slug, activity string, age time.Duration) *store.Agent {
+		t.Helper()
+		a := makeAgent(projectID, slug)
+		a.Phase = string(state.PhaseRunning)
+		a.Activity = activity
+		a.LastActivityEvent = now.Add(-age)
+		a.LastSeen = now
+		require.NoError(t, s.CreateAgent(ctx, a))
+		return a
+	}
+	setLiveWork := func(a *store.Agent, age time.Duration) {
+		t.Helper()
+		require.NoError(t, s.client.Agent.UpdateOneID(uuid.MustParse(a.ID)).
+			SetLastLiveWorkAt(now.Add(-age)).
+			Exec(ctx))
+	}
+
+	thinkingUnderCap := mk("thinking-6m", string(state.ActivityThinking), 6*time.Minute)
+	thinkingOverCap := mk("thinking-21m", string(state.ActivityThinking), 21*time.Minute)
+	thinkingRecentLive := mk("thinking-live-10m", string(state.ActivityThinking), 25*time.Minute)
+	setLiveWork(thinkingRecentLive, 10*time.Minute)
+	thinkingOldLive := mk("thinking-live-21m", string(state.ActivityThinking), 25*time.Minute)
+	setLiveWork(thinkingOldLive, 21*time.Minute)
+
+	workingStale := mk("working-6m", string(state.ActivityWorking), 6*time.Minute)
+	executingStale := mk("executing-6m", string(state.ActivityExecuting), 6*time.Minute)
+	workingRecentLive := mk("working-live-2m", string(state.ActivityWorking), 10*time.Minute)
+	setLiveWork(workingRecentLive, 2*time.Minute)
+
+	blockedExcluded := mk("blocked-30m", string(state.ActivityBlocked), 30*time.Minute)
+	idleExcluded := mk("idle-30m", string(state.ActivityIdle), 30*time.Minute)
+
+	updated, err := s.MarkStalledAgents(ctx, cutoffs, heartbeatRecency)
+	require.NoError(t, err)
+
+	byID := make(map[string]store.Agent, len(updated))
+	for _, a := range updated {
+		byID[a.ID] = a
+	}
+
+	assert.Len(t, updated, 4)
+	for _, want := range []struct {
+		agent *store.Agent
+		from  state.Activity
+	}{
+		{thinkingOverCap, state.ActivityThinking},
+		{thinkingOldLive, state.ActivityThinking},
+		{workingStale, state.ActivityWorking},
+		{executingStale, state.ActivityExecuting},
+	} {
+		got, ok := byID[want.agent.ID]
+		require.True(t, ok, "%s should be marked stalled", want.agent.Slug)
+		assert.Equal(t, string(state.ActivityStalled), got.Activity, want.agent.Slug)
+		assert.Equal(t, string(want.from), got.StalledFromActivity, want.agent.Slug)
+	}
+
+	for _, stay := range []*store.Agent{thinkingUnderCap, thinkingRecentLive, workingRecentLive, blockedExcluded, idleExcluded} {
+		_, stalled := byID[stay.ID]
+		assert.False(t, stalled, "%s should not be marked stalled", stay.Slug)
+		got, err := s.GetAgent(ctx, stay.ID)
+		require.NoError(t, err)
+		assert.Equal(t, stay.Activity, got.Activity, stay.Slug)
+	}
 }
 
 // TestCompositeStore_PurgeDeletedAgents_Cutoff pins the purge's eligibility
@@ -1378,6 +1588,74 @@ func TestAgentStore_HarnessConfigFilter(t *testing.T) {
 	assert.Equal(t, 3, all.TotalCount)
 }
 
+func TestEntAgentToStore_PopulatesHarnessConfigOnUnparsableAppliedConfig(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	shell := makeAgent(projectID, "shell-corrupt-applied")
+	shell.AppliedConfig = &store.AgentAppliedConfig{HarnessConfig: "shell"}
+	require.NoError(t, s.CreateAgent(ctx, shell))
+
+	// Corrupt the JSON blob directly while keeping the indexed harness_config column intact.
+	uid := uuid.MustParse(shell.ID)
+	_, err := s.client.Agent.UpdateOneID(uid).SetAppliedConfig("{not json").Save(ctx)
+	require.NoError(t, err)
+
+	loaded, err := s.GetAgent(ctx, shell.ID)
+	require.NoError(t, err)
+	assert.Nil(t, loaded.AppliedConfig, "unparsable applied_config must decode to nil")
+	assert.Equal(t, "shell", loaded.HarnessConfig, "HarnessConfig must be populated from the indexed harness_config column")
+
+	// A subsequent whole-row UpdateAgent on the loaded struct (AppliedConfig=nil)
+	// must not erase the indexed harness_config shell marker.
+	loaded.Message = "routine status update"
+	require.NoError(t, s.UpdateAgent(ctx, loaded))
+
+	reloaded, err := s.GetAgent(ctx, shell.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "shell", reloaded.HarnessConfig, "UpdateAgent must preserve the shell marker when AppliedConfig is nil")
+
+	// UpdateAgentConfig with applied == nil (e.g. pending-config discard on a
+	// row whose applied_config failed to parse) must also leave harness_config
+	// untouched.
+	_, err = s.UpdateAgentConfig(ctx, shell.ID, reloaded.StateVersion, nil, nil)
+	require.NoError(t, err)
+
+	afterConfigUpdate, err := s.GetAgent(ctx, shell.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "shell", afterConfigUpdate.HarnessConfig, "UpdateAgentConfig(applied=nil) must preserve the shell marker")
+}
+
+func TestApplySucceededAgentInfo_PreservesShellHarnessConfig(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	shell := makeAgent(projectID, "shell-launch-report")
+	shell.AppliedConfig = &store.AgentAppliedConfig{HarnessConfig: "shell"}
+	require.NoError(t, s.CreateAgent(ctx, shell))
+
+	uid := uuid.MustParse(shell.ID)
+	current, err := s.client.Agent.Get(ctx, uid)
+	require.NoError(t, err)
+
+	upd := s.client.Agent.UpdateOneID(uid)
+	applySucceededAgentInfo(upd, current, store.LaunchReport{
+		AgentConfig: store.BrokerAgentConfig{
+			HarnessConfig: "claude",
+			Image:         "scion-base:latest",
+		},
+	})
+	_, err = upd.Save(ctx)
+	require.NoError(t, err)
+
+	loaded, err := s.GetAgent(ctx, shell.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "shell", loaded.HarnessConfig, "broker launch report must not overwrite indexed shell harness_config")
+	require.NotNil(t, loaded.AppliedConfig)
+	assert.Equal(t, "shell", loaded.AppliedConfig.HarnessConfig, "broker launch report must not overwrite AppliedConfig.HarnessConfig on a shell agent")
+	assert.Equal(t, "scion-base:latest", loaded.AppliedConfig.Image, "non-harness fields from broker launch report must still apply")
+}
+
 // TestAgentStore_HarnessConfigFilter_NoEnv is an explicit no-env-field case:
 // with no Env map at all, filtering by HarnessConfig must still match
 // exactly the top-level value and nothing else.
@@ -2033,7 +2311,7 @@ func TestUpdateAgentStatus_ExitFieldsKeptOutsidePreRunningToRunning(t *testing.T
 		wantReason string
 	}{
 		{"stopping to running", exited("stopping"), heartbeat("running", "", nil), "running", intp(137), "crashed"},
-		{"suspended to running", exited("suspended"), heartbeat("running", "", nil), "running", intp(137), "crashed"},
+		{"suspended to running", exited("suspended"), store.AgentStatusUpdate{Phase: "running"}, "running", intp(137), "crashed"},
 		{"explicit code and reason", exited("starting"), heartbeat("running", "limits_exceeded", intp(2)), "running", intp(2), "limits_exceeded"},
 		// The two partial rows also check the rule: the field not given is
 		// cleared.
@@ -2109,4 +2387,66 @@ func TestAgentStore_SetAgentAnnotation(t *testing.T) {
 	require.NoError(t, s.UpdateAgent(ctx, got))
 	assert.ErrorIs(t, s.SetAgentAnnotation(ctx, a.ID, "scion.dev/test", "x"), store.ErrNotFound)
 	assert.ErrorIs(t, s.SetAgentAnnotation(ctx, uuid.NewString(), "k", "v"), store.ErrNotFound)
+}
+
+func TestAgentStore_ListAgents_ActivityFilter(t *testing.T) {
+	ctx := context.Background()
+	s, projectID := newTestAgentStore(t)
+
+	ownerA := uuid.NewString()
+	ownerB := uuid.NewString()
+
+	seed := func(name, ownerID, phase, activity string, deleted bool) *store.Agent {
+		a := makeAgent(projectID, name)
+		a.OwnerID = ownerID
+		a.Phase = phase
+		a.Activity = activity
+		require.NoError(t, s.CreateAgent(ctx, a))
+		if deleted {
+			got, err := s.GetAgent(ctx, a.ID)
+			require.NoError(t, err)
+			got.DeletedAt = time.Now().UTC()
+			require.NoError(t, s.UpdateAgent(ctx, got))
+		}
+		return a
+	}
+
+	waitingA := seed("waiting-a", ownerA, "running", "waiting_for_input", false)
+	_ = seed("thinking-a", ownerA, "running", "thinking", false)
+	_ = seed("stopped-a", ownerA, "stopped", "", false)
+	_ = seed("deleted-waiting-a", ownerA, "running", "waiting_for_input", true)
+	waitingB := seed("waiting-b", ownerB, "running", "waiting_for_input", false)
+
+	// Activity alone matches all non-deleted waiting agents across owners.
+	res, err := s.ListAgents(ctx, store.AgentFilter{Activity: "waiting_for_input"}, store.ListOptions{})
+	require.NoError(t, err)
+	gotIDs := make([]string, len(res.Items))
+	for i, item := range res.Items {
+		gotIDs[i] = item.ID
+	}
+	assert.ElementsMatch(t, []string{waitingA.ID, waitingB.ID}, gotIDs)
+	assert.Equal(t, 2, res.TotalCount)
+
+	// Combined with OwnerID and Phase, narrows to ownerA's live running waiting agent.
+	filterA := store.AgentFilter{
+		OwnerID:  ownerA,
+		Phase:    "running",
+		Activity: "waiting_for_input",
+	}
+	resA, err := s.ListAgents(ctx, filterA, store.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, resA.Items, 1)
+	assert.Equal(t, waitingA.ID, resA.Items[0].ID)
+
+	countA, err := s.CountAgents(ctx, filterA)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countA)
+
+	// Unset Activity omits the JSON key so existing list cursor bindings stay stable.
+	emptyJSON, err := json.Marshal(store.AgentFilter{OwnerID: ownerA, Phase: "running"})
+	require.NoError(t, err)
+	assert.NotContains(t, string(emptyJSON), "Activity")
+	withActivityJSON, err := json.Marshal(filterA)
+	require.NoError(t, err)
+	assert.Contains(t, string(withActivityJSON), `"Activity":"waiting_for_input"`)
 }

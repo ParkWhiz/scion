@@ -159,8 +159,12 @@ var nonRouteCallSites = map[string][]permissionCallSite{
 	},
 	"project.clone":       {{"project_clone.go", "Server.handleProjectClone"}},
 	"agent.status_update": {{"handlers_agent_lifecycle.go", "Server.updateAgentStatus"}},
-	"project.secret_read": {{"material_runtime.go", "Server.materialRuntimePrecheck"}},
-	"agent.notify":        {{"handlers_notifications.go", "checkAgentNotifyScope"}},
+	"project.secret_read": {
+		{"material_runtime.go", "Server.materialRuntimePrecheckAllowViewer"},
+		{"handlers_env_secrets.go", "checkAgentProjectSecretReadScope"},
+		{"handlers_env_secrets.go", "agentLacksProjectSecretReadScope"},
+	},
+	"agent.notify": {{"handlers_notifications.go", "checkAgentNotifyScope"}},
 	"agent.token_refresh": {
 		{"handlers_agents_core.go", "Server.handleAgentTokenRefresh"},
 		{"handlers_agent_messaging.go", "Server.handleAgentGitHubTokenRefresh"},
@@ -177,6 +181,10 @@ var nonRouteCallSites = map[string][]permissionCallSite{
 	"gcp_service_account.use": {
 		{"handlers_gcp_identity_mint_authority.go", "Server.authorizeAgentGCPMint"},
 		{"authz_resource_parent_ceiling.go", "AuthzService.decideStoredAgentServiceAccountUse"},
+	},
+	"github_trigger.comment": {
+		{"trigger_authz.go", "Server.authorizeGitHubCommentAuthoringPermission"},
+		{"action_github_comment.go", "Server.authorizeGitHubCommentFire"},
 	},
 }
 

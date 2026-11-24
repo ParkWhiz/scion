@@ -89,13 +89,13 @@ func (d txOnlyDriver) Tx(context.Context) (dialect.Tx, error) {
 // newTxClient builds the *ent.Client every launch writer uses: ent builders
 // issued through it run on tx's connection and participate in tx, including
 // through UpdateOneID/DeleteOneID's internal nested-Tx call (see txOnlyDriver).
-// It registers entc.ClearLaunchResumePhaseHook, so the launch writers' phase
-// writes follow the same resume-memory rule as every other agent write
-// (ptone/scion#4669).
+// It registers entc.ClearLaunchResumePhaseHook and entc.ClearSuspendReasonHook,
+// so the launch writers' phase writes follow the same resume-memory and
+// suspend-reason rules as every other agent write (ptone/scion#4669).
 func newTxClient(dialectName string, tx *sql.Tx) *ent.Client {
 	drv := entsql.NewDriver(dialectName, entsql.Conn{ExecQuerier: tx})
 	client := ent.NewClient(ent.Driver(txOnlyDriver{drv}))
-	client.Use(entc.ClearLaunchResumePhaseHook)
+	client.Use(entc.ClearLaunchResumePhaseHook, entc.ClearSuspendReasonHook)
 	return client
 }
 
@@ -259,6 +259,19 @@ func (s *AgentStore) beginLaunch(ctx context.Context, agentID, kind string, time
 		SetLaunchPriorPhase(opts.PriorPhase).
 		SetLaunchRevokeOnFail(opts.RevokeOnFail).
 		SetLaunchRunID(boundLaunchRunID(current.RunID, opts.RunID))
+	if kind != store.LaunchKindCreate {
+		// A start or restart launch begins a new run: clear any retained or
+		// non-terminal prior-run activity so neither a pre-harness heartbeat
+		// nor failedAfterRunningObservedApplies reads it as live activity,
+		// while preserving terminal activities (crashed, limits_exceeded) if a
+		// start from stopped fails and rolls back to stopped.
+		if !isTerminalActivity(current.Activity) {
+			upd.SetActivity("")
+		}
+		upd.SetStalledFromActivity("").
+			SetToolName("").
+			ClearActivitySince()
+	}
 	if kind == store.LaunchKindRestart && current.Phase != string(state.PhaseStarting) {
 		// A restart's start leg moves the row to starting, as a phase
 		// change, so it bumps state_version (v11 §3.13).

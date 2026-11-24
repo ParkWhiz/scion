@@ -57,6 +57,14 @@ import {
   renderBrokerVersion,
   renderHubVersionNote,
 } from '../shared/broker-version.js';
+import {
+  brokerPolicyStyles,
+  canManageBrokerApproval,
+  renderAdminManagedBadge,
+  renderPolicyBlockedTag,
+  updateBrokerAdminManaged,
+} from '../shared/broker-policy-badges.js';
+import { showToast } from '../../utils/toast.js';
 
 /** One runtime broker row of the health summary, as far as this page reads it. */
 interface HealthSummaryBrokerRow {
@@ -83,6 +91,9 @@ export class ScionPageBrokersArea extends LitElement {
 
   @state()
   private loading = true;
+
+  @state()
+  private approvalBusyIds: Set<string> = new Set();
 
   @state()
   private brokers: RuntimeBroker[] = [];
@@ -118,6 +129,7 @@ export class ScionPageBrokersArea extends LitElement {
     brokerTypeBadgeStyles,
     brokerAreaStyles,
     brokerVersionStyles,
+    brokerPolicyStyles,
     css`
       .filter-row {
         display: flex;
@@ -246,7 +258,9 @@ export class ScionPageBrokersArea extends LitElement {
   }
 
   private get visibleBrokers(): RuntimeBroker[] {
-    return this.brokers.filter((b) => matchesBrokerFilter(b, this.filter, this.health?.get(b.id)));
+    return this.brokers.filter((b) =>
+      matchesBrokerFilter(b, this.filter, this.health?.get(b.id), this.hubVersion)
+    );
   }
 
   private getStatusVariant(status: string): 'success' | 'warning' | 'danger' | 'neutral' {
@@ -264,7 +278,46 @@ export class ScionPageBrokersArea extends LitElement {
     this.viewMode = e.detail.view;
   }
 
-  private renderName(broker: RuntimeBroker): TemplateResult {
+  private async handleToggleApproval(e: Event, broker: RuntimeBroker): Promise<void> {
+    e.preventDefault();
+    e.stopPropagation();
+    if (this.approvalBusyIds.has(broker.id)) return;
+    const next = !broker.adminManaged;
+    this.approvalBusyIds = new Set([...this.approvalBusyIds, broker.id]);
+    try {
+      const updated = await updateBrokerAdminManaged(broker.id, next);
+      const merged = { ...broker, ...updated };
+      this.brokers = this.brokers.map((b) => (b.id === broker.id ? merged : b));
+      stateManager.seedBrokers([merged]);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to update broker approval', 'danger');
+    } finally {
+      const nextSet = new Set(this.approvalBusyIds);
+      nextSet.delete(broker.id);
+      this.approvalBusyIds = nextSet;
+    }
+  }
+
+  private renderApprovalButton(broker: RuntimeBroker): TemplateResult | typeof nothing {
+    if (!canManageBrokerApproval(broker)) return nothing;
+    const busy = this.approvalBusyIds.has(broker.id);
+    return html`
+      <sl-button
+        size="small"
+        variant=${broker.adminManaged ? 'default' : 'primary'}
+        outline
+        data-testid="broker-approval-action"
+        ?loading=${busy}
+        ?disabled=${busy}
+        @click=${(e: Event) => this.handleToggleApproval(e, broker)}
+      >
+        <sl-icon slot="prefix" name=${broker.adminManaged ? 'shield-x' : 'shield-check'}></sl-icon>
+        ${broker.adminManaged ? 'Revoke' : 'Approve'}
+      </sl-button>
+    `;
+  }
+
+  private renderName(broker: RuntimeBroker, includeAction = true): TemplateResult {
     return html`
       <span class="name-cell">
         <sl-icon name="hdd-rack"></sl-icon>
@@ -277,7 +330,9 @@ export class ScionPageBrokersArea extends LitElement {
               title="Runs in this server's process"
             ></sl-icon>`
           : nothing}
-        ${this.renderBrokerTypeBadge(broker)}
+        ${this.renderBrokerTypeBadge(broker)} ${renderAdminManagedBadge(broker)}
+        ${renderPolicyBlockedTag(broker)}
+        ${includeAction ? this.renderApprovalButton(broker) : nothing}
       </span>
     `;
   }
@@ -303,7 +358,16 @@ export class ScionPageBrokersArea extends LitElement {
   private renderHealth(broker: RuntimeBroker): TemplateResult {
     const h = this.health?.get(broker.id);
     if (!h) return html`<span class="meta-text">–</span>`;
-    if (!healthProblem(h)) return html`<span class="health-ok">ok</span>`;
+    if (!healthProblem(h)) {
+      if (broker.status !== 'online') {
+        return html`<span
+          class="meta-text"
+          title="Broker is ${broker.status}; last reported: ${h.status || 'healthy'}"
+          >–</span
+        >`;
+      }
+      return html`<span class="health-ok">ok</span>`;
+    }
     const failing = failingChecks(h);
     const text = failing.length > 0 ? String(failing.length) : h.status || 'problem';
     return html`<span class="health-warn" title=${failing.join(', ') || (h.status ?? '')}
@@ -413,24 +477,30 @@ export class ScionPageBrokersArea extends LitElement {
   private renderGrid(rows: RuntimeBroker[]) {
     return html`
       <div class="resource-grid">
-        ${rows.map(
-          (broker) => html`
-            <a href="/brokers/${broker.id}" class="resource-card broker-row" data-id=${broker.id}>
-              <h3 class="resource-name">${this.renderName(broker)}</h3>
-              <div class="broker-meta">
-                ${this.renderKind(broker)}
-                <span class="target-cell">${this.targetText(broker)}</span>
-                <scion-status-badge
-                  status=${this.getStatusVariant(broker.status)}
-                  label=${broker.status}
-                  size="small"
-                ></scion-status-badge>
-                ${this.health ? this.renderHealth(broker) : nothing} ${this.renderVersion(broker)}
-                ${this.renderAgentCapacity(broker)}
-              </div>
-            </a>
-          `
-        )}
+        ${rows.map((broker) => {
+          const approvalBtn = this.renderApprovalButton(broker);
+          return html`
+            <div class="broker-card-wrap">
+              <a href="/brokers/${broker.id}" class="resource-card broker-row" data-id=${broker.id}>
+                <h3 class="resource-name">${this.renderName(broker, false)}</h3>
+                <div class="broker-meta">
+                  ${this.renderKind(broker)}
+                  <span class="target-cell">${this.targetText(broker)}</span>
+                  <scion-status-badge
+                    status=${this.getStatusVariant(broker.status)}
+                    label=${broker.status}
+                    size="small"
+                  ></scion-status-badge>
+                  ${this.health ? this.renderHealth(broker) : nothing} ${this.renderVersion(broker)}
+                  ${this.renderAgentCapacity(broker)}
+                </div>
+              </a>
+              ${approvalBtn !== nothing
+                ? html`<div class="broker-card-actions">${approvalBtn}</div>`
+                : nothing}
+            </div>
+          `;
+        })}
       </div>
     `;
   }

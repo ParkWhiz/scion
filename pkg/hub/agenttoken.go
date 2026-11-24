@@ -85,6 +85,15 @@ const (
 	// do; being able to publish the template it spawns them from is the same
 	// authority expressed once instead of per-agent.
 	ScopeProjectTemplateWrite AgentTokenScope = "project:template:write"
+	// ScopeProjectSkillWrite allows the agent to create and update (publish
+	// versions of) skills within its own project (skill.create, skill.update).
+	// On the Hub, skill.update also authorizes project-skill metadata edits and
+	// version deprecation, even though the CLI agent-mode allowlist only exposes
+	// `skills publish`. Deliberately excludes deletion and global/user scopes.
+	// Ceiling-optional (ceilingOptionalRoleScopes) so existing UAT ceilings
+	// and project-member creators still fit agent-role-full; tokens minted
+	// under ceilings that allow skill.create and skill.update carry it.
+	ScopeProjectSkillWrite AgentTokenScope = "project:skill:write"
 	// ScopeProjectArtifactRead allows the agent to use the artifact service
 	// to read artifacts (artifact.read). It is a ceiling-optional role scope
 	// (ceilingOptionalRoleScopes): readonly, baseline and full carry it, but
@@ -240,48 +249,62 @@ func hashJTI(jti string) string {
 // the looked-up credential has been revoked.
 var errAgentCredentialRevoked = errors.New("agent credential has been revoked")
 
+// errAgentCredentialNotFound is returned by evaluateAgentCredentialStatus when
+// no recorded credential exists for the token's JTI.
+var errAgentCredentialNotFound = errors.New("agent credential not found")
+
+// errAgentCredentialEmptyJTI is returned when an agent token carries no JTI.
+var errAgentCredentialEmptyJTI = errors.New("agent token has no jti")
+
 // errAgentCredentialMissing is returned by evaluateAgentCredentialStatus when
 // the credential store reports success but returns no credential record.
 // Callers treat it like any other store failure (retryable, not
 // authenticated), since the credential's status could not be determined.
 var errAgentCredentialMissing = errors.New("credential store returned no credential and no error")
 
+// errAgentCredentialStoreUnavailable is returned by evaluateAgentCredentialStatus
+// when no credential store is configured.
+var errAgentCredentialStoreUnavailable = errors.New("agent credential store not configured")
+
 // evaluateAgentCredentialStatus performs the credential-status lookup that
 // agent-token authentication requires: given the JTI carried by a validated
 // agent token, it looks up the corresponding credential record in credStore
-// and classifies the result. The result is one of four outcomes:
+// and classifies the result. The result is one of five outcomes:
 //
-//   - Found and active: the credential is returned with isLegacy=false and a
-//     nil error.
+//   - Empty JTI: nil credential and errAgentCredentialEmptyJTI.
+//   - Found and active: the credential is returned with a nil error.
 //   - Found and revoked: a nil credential and errAgentCredentialRevoked (test
 //     with errors.Is).
-//   - Not found (store.ErrNotFound): a nil credential, isLegacy=true, and a
-//     nil error. This is the legacy compatibility path for tokens issued
-//     before the credential table existed; it is retained pending a product
-//     decision and callers must not close or widen it here.
-//   - Any other store error: returned verbatim with isLegacy=false and a nil
-//     credential. Callers must treat that as a retryable failure — never as
-//     successful authentication — since a store error means the credential's
-//     status could not actually be determined.
+//   - Not found (store.ErrNotFound): a nil credential and
+//     errAgentCredentialNotFound (test with errors.Is).
+//   - Nil store or any other store error: returned with a nil credential.
+//     Callers must treat that as a retryable failure — never as successful
+//     authentication — since the credential's status could not be determined.
 //
 // A nil credential with a nil store error is classified as a store failure
 // and reported as errAgentCredentialMissing, so it follows the same
 // retryable path as any other store error.
-func evaluateAgentCredentialStatus(ctx context.Context, credStore store.AgentCredentialStore, jti string) (cred *store.AgentCredential, isLegacy bool, err error) {
-	cred, err = credStore.GetAgentCredentialByJTIHash(ctx, hashJTI(jti))
+func evaluateAgentCredentialStatus(ctx context.Context, credStore store.AgentCredentialStore, jti string) (*store.AgentCredential, error) {
+	if jti == "" {
+		return nil, errAgentCredentialEmptyJTI
+	}
+	if credStore == nil {
+		return nil, errAgentCredentialStoreUnavailable
+	}
+	cred, err := credStore.GetAgentCredentialByJTIHash(ctx, hashJTI(jti))
 	switch {
 	case err == nil:
 		if cred == nil {
-			return nil, false, errAgentCredentialMissing
+			return nil, errAgentCredentialMissing
 		}
 		if cred.RevokedAt != nil {
-			return nil, false, errAgentCredentialRevoked
+			return nil, errAgentCredentialRevoked
 		}
-		return cred, false, nil
+		return cred, nil
 	case errors.Is(err, store.ErrNotFound):
-		return nil, true, nil
+		return nil, errAgentCredentialNotFound
 	default:
-		return nil, false, err
+		return nil, err
 	}
 }
 
@@ -401,6 +424,9 @@ func (s *AgentTokenService) ValidateAgentToken(tokenString string) (*AgentTokenC
 	if err := claims.Validate(expected); err != nil {
 		return nil, fmt.Errorf("token validation failed: %w", err)
 	}
+	if claims.ID == "" {
+		return nil, fmt.Errorf("token validation failed: %w", errAgentCredentialEmptyJTI)
+	}
 
 	// A verified token whose wire form carried no scope_schema claim (reads
 	// as the Go zero value, 0) predates CurrentAgentScopeSchema entirely:
@@ -505,33 +531,6 @@ func (a *agentIdentityWrapper) OriginUserID() string {
 	return ""
 }
 
-// AgentAuthMiddleware creates middleware that validates agent tokens.
-// It looks for tokens in the Authorization header (Bearer) or X-Scion-Agent-Token header.
-// If valid, it adds the agent claims to the request context.
-func (s *AgentTokenService) AgentAuthMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Try to extract token from headers
-		token := extractAgentToken(r)
-		if token == "" {
-			// No agent token found, continue to next middleware (may have other auth)
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Validate the token
-		claims, err := s.ValidateAgentToken(token)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
-				"invalid agent token: "+err.Error(), nil)
-			return
-		}
-
-		// Add claims to context
-		ctx := context.WithValue(r.Context(), agentContextKey{}, claims)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
 // extractAgentToken extracts the agent token from the request.
 // It checks both the Authorization header and X-Scion-Agent-Token header.
 func extractAgentToken(r *http.Request) string {
@@ -552,61 +551,6 @@ func extractAgentToken(r *http.Request) string {
 	}
 
 	return parts[1]
-}
-
-// RequireAgentScope returns a middleware that requires the agent to have a specific scope.
-// It must be used after AgentAuthMiddleware.
-func RequireAgentScope(scope AgentTokenScope) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			claims := GetAgentFromContext(r.Context())
-			if claims == nil {
-				writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
-					"agent authentication required", nil)
-				return
-			}
-
-			if !claims.HasScope(scope) {
-				writeError(w, http.StatusForbidden, ErrCodeForbidden,
-					fmt.Sprintf("missing required scope: %s", scope), nil)
-				return
-			}
-
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-// RequireAgentSelfAccess returns a middleware that ensures the agent can only access its own resources.
-// It extracts the agent ID from the URL path and compares it with the token's subject.
-func RequireAgentSelfAccess(pathPrefix string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			claims := GetAgentFromContext(r.Context())
-			if claims == nil {
-				writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized,
-					"agent authentication required", nil)
-				return
-			}
-
-			// Extract agent ID from path
-			agentID, _ := extractAction(r, pathPrefix)
-			if agentID == "" {
-				writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
-					"agent ID required in path", nil)
-				return
-			}
-
-			// Verify the agent is accessing its own resource
-			if agentID != claims.Subject {
-				writeError(w, http.StatusForbidden, ErrCodeForbidden,
-					"agents can only access their own resources", nil)
-				return
-			}
-
-			next.ServeHTTP(w, r)
-		})
-	}
 }
 
 // checkAgentReadScope verifies that agent callers have ScopeProjectRead.

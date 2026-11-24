@@ -99,7 +99,7 @@ func TestAgentCompactView_ParityWithFullViewForEveryIdentityClassAndMode(t *test
 	require.Contains(t, rec.Body.String(), `"appliedConfig"`)
 	require.Contains(t, rec.Body.String(), `"creatorName"`)
 
-	wantProjectStatus := map[string]int{"hub-admin-non-member": http.StatusForbidden}
+	wantProjectStatus := map[string]int{"hub-admin-non-member": http.StatusNotFound}
 	require.Len(t, wantParityItems, 2*len(f.callers)-len(positiveParityItems), "one expected item total per identity class and endpoint")
 	for cell := range positiveParityItems {
 		_, dup := wantParityItems[cell]
@@ -155,7 +155,7 @@ var deletionParityModes = []string{
 // and the explicit null both views emit when no delete is active or failed.
 // Every other cell, a runtime broker identity on both endpoints among them,
 // is checked to read nothing: both views answer the cell's exact status, a
-// 403 or a 200 with an empty list.
+// 404 or a 200 with an empty list.
 func TestAgentCompactView_DeletionViewParityForEveryIdentityClass(t *testing.T) {
 	f := compactSetup(t)
 	deletingID, failedID := f.agentIDAt(1), f.agentIDAt(4)
@@ -186,14 +186,14 @@ func TestAgentCompactView_DeletionViewParityForEveryIdentityClass(t *testing.T) 
 	)
 
 	// Identity classes that read no agent of the project on an endpoint,
-	// each with the status both views answer: a 403, or a 200 with an
+	// each with the status both views answer: a 404, or a 200 with an
 	// empty list.
 	blind := map[string]int{
 		"hub-admin-non-member global":  http.StatusOK,
-		"hub-admin-non-member project": http.StatusForbidden,
+		"hub-admin-non-member project": http.StatusNotFound,
 		"agent-jwt global":             http.StatusOK,
 		"runtime-broker global":        http.StatusOK,
-		"runtime-broker project":       http.StatusForbidden,
+		"runtime-broker project":       http.StatusNotFound,
 	}
 	for _, c := range callers {
 		for _, ep := range []struct{ name, base string }{{"global", f.globalBase()}, {"project", f.projectBase()}} {
@@ -300,7 +300,7 @@ func TestAgentCompactView_KeySetIsAllowlist(t *testing.T) {
 	full := &store.Agent{
 		ID: tid("cv-allkeys"), Slug: "cv-allkeys", Name: "All Keys", Template: "claude",
 		ProjectID: f.project.ID, Labels: map[string]string{"k": "v"},
-		Phase: "running", Activity: "executing", ContainerStatus: "Up 5 minutes",
+		Phase: "suspended", Activity: "completed", SuspendReason: "idle", ContainerStatus: "Up 5 minutes",
 		Message: "Waiting for review", MessageMode: "project", Ancestry: []string{f.agentIDAt(0)},
 		CreatedBy: f.owner.ID, OwnerID: f.owner.ID,
 		AppliedConfig: &store.AgentAppliedConfig{CreatorName: "All Keys Creator", Env: map[string]string{"A": "b"}, Harness: "claude", ModelSize: "large"},
@@ -467,7 +467,7 @@ func TestAgentCompactView_CursorBindingPerIdentityAndEndpointMatchesFullView(t *
 							case replayer.name == "hub-admin-non-member" && replayEP.name == "project":
 								// Refused at the project agent.list gate before
 								// the cursor is read.
-								assert.Equal(t, http.StatusForbidden, full.Code, label)
+								assert.Equal(t, http.StatusNotFound, full.Code, label)
 							default:
 								assert.Equal(t, http.StatusBadRequest, full.Code, "%s: foreign replay must be refused", label)
 							}
@@ -689,9 +689,9 @@ func TestAgentCompactView_NilAgentsMarshalsLikeFullView(t *testing.T) {
 	for _, agents := range [][]AgentWithCapabilities{nil, {}} {
 		resp := ListAgentsResponse{Agents: agents, TotalCount: 0}
 		full := httptest.NewRecorder()
-		(&Server{}).writeAgentList(context.Background(), full, agentListViewFull, false, resp)
+		(&Server{}).writeAgentList(context.Background(), full, agentListViewFull, agentListIncludes{}, resp)
 		compact := httptest.NewRecorder()
-		(&Server{}).writeAgentList(context.Background(), compact, agentListViewCompact, false, resp)
+		(&Server{}).writeAgentList(context.Background(), compact, agentListViewCompact, agentListIncludes{}, resp)
 		require.Equal(t, http.StatusOK, full.Code)
 		require.Equal(t, http.StatusOK, compact.Code)
 		fullAgents := decodeObject(t, full.Body.Bytes())["agents"]

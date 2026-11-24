@@ -130,8 +130,12 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 
 	default:
-		// Ignore unhandled event types
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "event": eventType})
+		if !s.githubTriggersEnabled() {
+			// Ignore unhandled event types unchanged when triggers or github_triggers is off (§4.1 step 0).
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ignored", "event": eventType})
+			return
+		}
+		s.handleGitHubContentWebhook(w, r, eventType, deliveryID, body)
 		return
 	}
 }
@@ -156,13 +160,19 @@ type webhookInstallationEvent struct {
 }
 
 func (s *Server) handleInstallationWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
-	var event webhookInstallationEvent
-	if err := json.Unmarshal(body, &event); err != nil {
+	if err := s.processInstallationWebhook(r.Context(), body); err != nil {
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
 
-	ctx := r.Context()
+func (s *Server) processInstallationWebhook(ctx context.Context, body []byte) error {
+	var event webhookInstallationEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		return err
+	}
+
 	installationID := event.Installation.ID
 
 	switch event.Action {
@@ -195,8 +205,7 @@ func (s *Server) handleInstallationWebhook(w http.ResponseWriter, r *http.Reques
 		existing, err := s.store.GetGitHubInstallation(ctx, installationID)
 		if err != nil {
 			slog.Warn("Installation not found for deletion webhook", "installation_id", installationID)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-			return
+			return nil
 		}
 
 		existing.Status = store.GitHubInstallationStatusDeleted
@@ -212,8 +221,7 @@ func (s *Server) handleInstallationWebhook(w http.ResponseWriter, r *http.Reques
 		existing, err := s.store.GetGitHubInstallation(ctx, installationID)
 		if err != nil {
 			slog.Warn("Installation not found for suspend webhook", "installation_id", installationID)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-			return
+			return nil
 		}
 
 		existing.Status = store.GitHubInstallationStatusSuspended
@@ -228,8 +236,7 @@ func (s *Server) handleInstallationWebhook(w http.ResponseWriter, r *http.Reques
 		existing, err := s.store.GetGitHubInstallation(ctx, installationID)
 		if err != nil {
 			slog.Warn("Installation not found for unsuspend webhook", "installation_id", installationID)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-			return
+			return nil
 		}
 
 		existing.Status = store.GitHubInstallationStatusActive
@@ -239,9 +246,22 @@ func (s *Server) handleInstallationWebhook(w http.ResponseWriter, r *http.Reques
 
 		// Clear error state — will be validated on next token mint
 		s.updateProjectsForInstallation(ctx, installationID, store.GitHubAppStateUnchecked, "", "")
+
+	case "new_permissions_accepted":
+		if s.githubTriggersEnabled() {
+			// Refresh cached App identity (events + permissions) and reset
+			// degraded/permission_denied projects on this installation back to
+			// unchecked so the next mint validates the newly accepted permissions
+			// (§10.3, §11 G12).
+			if _, err := s.refreshGitHubAppIdentity(ctx); err != nil {
+				slog.Warn("Failed to refresh GitHub App identity after new_permissions_accepted",
+					"installation_id", installationID, "error", upstreamText(err.Error()))
+			}
+			s.resetPermissionDeniedProjectsForInstallation(ctx, installationID)
+		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	return nil
 }
 
 // webhookInstallationRepositoriesEvent represents the payload for installation_repositories events.
@@ -264,20 +284,25 @@ type webhookInstallationRepositoriesEvent struct {
 }
 
 func (s *Server) handleInstallationRepositoriesWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
-	var event webhookInstallationRepositoriesEvent
-	if err := json.Unmarshal(body, &event); err != nil {
+	if err := s.processInstallationRepositoriesWebhook(r.Context(), body); err != nil {
 		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid webhook payload", nil)
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
 
-	ctx := r.Context()
+func (s *Server) processInstallationRepositoriesWebhook(ctx context.Context, body []byte) error {
+	var event webhookInstallationRepositoriesEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		return err
+	}
+
 	installationID := event.Installation.ID
 
 	existing, err := s.store.GetGitHubInstallation(ctx, installationID)
 	if err != nil {
 		slog.Warn("Installation not found for repos webhook", "installation_id", installationID)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-		return
+		return nil
 	}
 
 	switch event.Action {
@@ -303,15 +328,17 @@ func (s *Server) handleInstallationRepositoriesWebhook(w http.ResponseWriter, r 
 		s.matchProjectsToInstallation(ctx, existing)
 
 	case "removed":
-		// Remove repos from the installation's repo list
+		// Remove repos from the installation's repo list. GitHub owner and
+		// repo names are case-insensitive, so the set is keyed by the
+		// lowercased owner/repo.
 		removedSet := make(map[string]bool)
 		for _, repo := range event.RepositoriesRemoved {
-			removedSet[repo.FullName] = true
+			removedSet[strings.ToLower(repo.FullName)] = true
 		}
 
 		filtered := existing.Repositories[:0]
 		for _, r := range existing.Repositories {
-			if !removedSet[r] {
+			if !removedSet[strings.ToLower(r)] {
 				filtered = append(filtered, r)
 			}
 		}
@@ -324,7 +351,7 @@ func (s *Server) handleInstallationRepositoriesWebhook(w http.ResponseWriter, r 
 		s.checkProjectsForRemovedRepos(ctx, installationID, removedSet)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	return nil
 }
 
 // handleGitHubAppSetup handles GET /github-app/setup.
@@ -374,9 +401,9 @@ func (s *Server) handleGitHubAppSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// List repos for this installation
-	repos, err := client.ListInstallationRepos(ctx, installationID)
-	if err != nil {
-		slog.Warn("Failed to list installation repos", "error", upstreamText(err.Error()), "installation_id", installationID)
+	repos, repoErr := client.ListInstallationRepos(ctx, installationID)
+	if repoErr != nil {
+		slog.Warn("Failed to list installation repos", "error", upstreamText(repoErr.Error()), "installation_id", installationID)
 		// Continue without repos — we can still record the installation
 	}
 
@@ -385,7 +412,9 @@ func (s *Server) handleGitHubAppSetup(w http.ResponseWriter, r *http.Request) {
 		repoNames[i] = repo.FullName
 	}
 
-	// Record the installation (idempotent)
+	// Record the installation (create if missing, update if already present).
+	// CreateGitHubInstallation uses ON CONFLICT DO NOTHING and returns nil on
+	// an existing row, so check explicitly rather than relying on a create error.
 	installation := &store.GitHubInstallation{
 		InstallationID: installationID,
 		AccountLogin:   ghInstallation.Account.Login,
@@ -399,17 +428,31 @@ func (s *Server) handleGitHubAppSetup(w http.ResponseWriter, r *http.Request) {
 		installation.Status = store.GitHubInstallationStatusSuspended
 	}
 
-	if err := s.store.CreateGitHubInstallation(ctx, installation); err != nil {
-		// Idempotent — update if already exists
-		if existing, getErr := s.store.GetGitHubInstallation(ctx, installationID); getErr == nil {
-			existing.AccountLogin = installation.AccountLogin
-			existing.AccountType = installation.AccountType
+	existing, getErr := s.store.GetGitHubInstallation(ctx, installationID)
+	switch {
+	case getErr == nil:
+		existing.AccountLogin = installation.AccountLogin
+		existing.AccountType = installation.AccountType
+		if repoErr == nil {
 			existing.Repositories = installation.Repositories
-			existing.Status = installation.Status
-			if updateErr := s.store.UpdateGitHubInstallation(ctx, existing); updateErr != nil {
-				slog.Error("Failed to update existing installation", "error", updateErr)
-			}
 		}
+		existing.Status = installation.Status
+		if updateErr := s.store.UpdateGitHubInstallation(ctx, existing); updateErr != nil {
+			slog.Error("Failed to update existing installation", "installation_id", installationID, "error", updateErr)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save GitHub App installation", nil)
+			return
+		}
+		installation = existing
+	case errors.Is(getErr, store.ErrNotFound):
+		if createErr := s.store.CreateGitHubInstallation(ctx, installation); createErr != nil {
+			slog.Error("Failed to create installation", "installation_id", installationID, "error", createErr)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save GitHub App installation", nil)
+			return
+		}
+	default:
+		slog.Error("Failed to load existing installation", "installation_id", installationID, "error", getErr)
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save GitHub App installation", nil)
+		return
 	}
 
 	// Auto-match projects
@@ -443,27 +486,69 @@ func (s *Server) handleGitHubAppDiscover(w http.ResponseWriter, r *http.Request)
 	// List all installations from GitHub
 	ghInstallations, err := client.ListInstallations(ctx)
 	if err != nil {
+		slog.Warn("Failed to list GitHub App installations", "error", upstreamText(err.Error()))
 		writeError(w, http.StatusBadGateway, ErrCodeInternalError,
-			fmt.Sprintf("failed to list installations from GitHub: %v", err), nil)
+			"failed to list installations from GitHub", nil)
 		return
 	}
 
 	var discovered []map[string]interface{}
+	var failedCount int
 	for _, ghInst := range ghInstallations {
-		// Try to list repos for each installation
-		repos, err := client.ListInstallationRepos(ctx, ghInst.ID)
-		if err != nil {
-			slog.Warn("Failed to list repos for installation", "installation_id", ghInst.ID, "error", upstreamText(err.Error()))
-		}
-
-		repoNames := make([]string, len(repos))
-		for i, r := range repos {
-			repoNames[i] = r.FullName
-		}
-
 		status := store.GitHubInstallationStatusActive
 		if ghInst.SuspendedAt != nil {
 			status = store.GitHubInstallationStatusSuspended
+		}
+
+		// Try to list repos for each installation
+		repos, listErr := client.ListInstallationRepos(ctx, ghInst.ID)
+		if listErr != nil {
+			failedCount++
+			slog.Warn("Failed to list repos for installation", "installation_id", ghInst.ID, "error", upstreamText(listErr.Error()))
+
+			// Preserve the last known repository list for existing installations.
+			var preservedRepos []string
+			existing, getErr := s.store.GetGitHubInstallation(ctx, ghInst.ID)
+			if getErr == nil {
+				preservedRepos = existing.Repositories
+				existing.AccountLogin = ghInst.Account.Login
+				existing.AccountType = ghInst.Account.Type
+				existing.Status = status
+				if updateErr := s.store.UpdateGitHubInstallation(ctx, existing); updateErr != nil {
+					slog.Error("Failed to update existing installation metadata", "installation_id", ghInst.ID, "error", updateErr)
+				}
+			} else if errors.Is(getErr, store.ErrNotFound) {
+				installation := &store.GitHubInstallation{
+					InstallationID: ghInst.ID,
+					AccountLogin:   ghInst.Account.Login,
+					AccountType:    ghInst.Account.Type,
+					AppID:          ghInst.AppID,
+					Repositories:   []string{},
+					Status:         status,
+				}
+				if createErr := s.store.CreateGitHubInstallation(ctx, installation); createErr != nil {
+					slog.Error("Failed to create installation", "installation_id", ghInst.ID, "error", createErr)
+				}
+			} else {
+				slog.Error("Failed to load existing installation", "installation_id", ghInst.ID, "error", getErr)
+			}
+
+			if preservedRepos == nil {
+				preservedRepos = []string{}
+			}
+			discovered = append(discovered, map[string]interface{}{
+				"installation_id":  ghInst.ID,
+				"account":          ghInst.Account.Login,
+				"repositories":     preservedRepos,
+				"matched_projects": []string(nil),
+				"error":            "failed to list repositories from GitHub",
+			})
+			continue
+		}
+
+		repoNames := make([]string, len(repos))
+		for i, repo := range repos {
+			repoNames[i] = repo.FullName
 		}
 
 		installation := &store.GitHubInstallation{
@@ -475,13 +560,21 @@ func (s *Server) handleGitHubAppDiscover(w http.ResponseWriter, r *http.Request)
 			Status:         status,
 		}
 
-		if err := s.store.CreateGitHubInstallation(ctx, installation); err != nil {
-			// Update existing
-			if existing, getErr := s.store.GetGitHubInstallation(ctx, ghInst.ID); getErr == nil {
-				existing.Repositories = repoNames
-				existing.Status = status
-				_ = s.store.UpdateGitHubInstallation(ctx, existing)
+		existing, getErr := s.store.GetGitHubInstallation(ctx, ghInst.ID)
+		if getErr == nil {
+			existing.AccountLogin = ghInst.Account.Login
+			existing.AccountType = ghInst.Account.Type
+			existing.Repositories = repoNames
+			existing.Status = status
+			if updateErr := s.store.UpdateGitHubInstallation(ctx, existing); updateErr != nil {
+				slog.Error("Failed to update existing installation", "installation_id", ghInst.ID, "error", updateErr)
 			}
+		} else if errors.Is(getErr, store.ErrNotFound) {
+			if createErr := s.store.CreateGitHubInstallation(ctx, installation); createErr != nil {
+				slog.Error("Failed to create installation", "installation_id", ghInst.ID, "error", createErr)
+			}
+		} else {
+			slog.Error("Failed to load existing installation", "installation_id", ghInst.ID, "error", getErr)
 		}
 
 		matchedProjects := s.matchProjectsToInstallation(ctx, installation)
@@ -494,10 +587,53 @@ func (s *Server) handleGitHubAppDiscover(w http.ResponseWriter, r *http.Request)
 		})
 	}
 
+	if failedCount > 0 {
+		writeError(w, http.StatusBadGateway, ErrCodeInternalError,
+			fmt.Sprintf("failed to list repositories for %d of %d GitHub App installation(s)", failedCount, len(ghInstallations)),
+			map[string]interface{}{
+				"installations": discovered,
+				"total":         len(discovered),
+				"failed":        failedCount,
+			})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"installations": discovered,
 		"total":         len(discovered),
 	})
+}
+
+// forEachGitHubAppProject pages through every project in the store via
+// ListProjects cursor pagination and calls visit on each project. The store
+// caps a single ListProjects page at 1000 rows, so callers must follow
+// NextCursor until exhausted rather than relying on a single large Limit.
+func (s *Server) forEachGitHubAppProject(ctx context.Context, visit func(project *store.Project)) error {
+	cursor := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		page, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{
+			Limit:          githubAssociationReportPageSize,
+			Cursor:         cursor,
+			SkipTotalCount: true,
+		})
+		if err != nil {
+			return err
+		}
+		if page == nil {
+			break
+		}
+		for i := range page.Items {
+			visit(&page.Items[i])
+		}
+		if page.NextCursor == "" || page.NextCursor == cursor || len(page.Items) == 0 {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	return nil
 }
 
 // matchProjectsToInstallation finds projects whose git remote matches repos in the
@@ -513,59 +649,55 @@ func (s *Server) matchProjectsToInstallation(ctx context.Context, installation *
 		repoSet[strings.ToLower(r)] = true
 	}
 
-	// List all projects and check their git remote against the installation repos
-	projects, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 10000})
-	if err != nil {
-		slog.Error("Failed to list projects for matching", "error", err)
-		return nil
-	}
-
+	// Page through all projects and check their git remote against the installation repos
 	var matched []string
-	for _, project := range projects.Items {
+	if err := s.forEachGitHubAppProject(ctx, func(project *store.Project) {
 		if project.GitRemote == "" {
-			continue
+			return
 		}
 
 		// Extract owner/repo from the git remote URL; a remote on any host
 		// other than the configured GitHub host yields "".
 		ownerRepo := s.githubOwnerRepo(project.GitRemote)
 		if ownerRepo == "" {
-			continue
+			return
 		}
 
 		if !repoSet[strings.ToLower(ownerRepo)] {
-			continue
+			return
 		}
 
 		// Only auto-associate if the project doesn't already have an installation
 		if project.GitHubInstallationID != nil {
-			continue
+			return
 		}
 
 		// A repo-name match only selects the candidate: associate only an
 		// authorized association (host, installation account, and the
 		// creator's own GitHub access; see authorizeGitHubAppAssociation).
-		if _, authzErr := s.authorizeGitHubAppAssociation(ctx, &project, installation.InstallationID); authzErr != nil {
+		if _, authzErr := s.authorizeGitHubAppAssociation(ctx, project, installation.InstallationID); authzErr != nil {
 			slog.Info("Not auto-associating project with GitHub App installation: association not authorized",
 				"project_id", project.ID, "installation_id", installation.InstallationID, "error", authzErr)
-			continue
+			return
 		}
 
 		// Associate the project with this installation
-		s.setGitHubInstallationAssociation(&project, installation.InstallationID)
+		s.setGitHubInstallationAssociation(project, installation.InstallationID)
 
-		if err := s.store.UpdateProject(ctx, &project); err != nil {
+		if err := s.store.UpdateProject(ctx, project); err != nil {
 			slog.Error("Failed to associate project with installation",
 				"project_id", project.ID, "installation_id", installation.InstallationID, "error", err)
-			continue
+			return
 		}
 		s.invalidateGitHubAssociation(project.ID)
-		s.events.PublishProjectUpdated(ctx, &project)
+		s.events.PublishProjectUpdated(ctx, project)
 
 		slog.Info("Auto-associated project with GitHub App installation",
 			"project_id", project.ID, "project_name", project.Name,
 			"installation_id", installation.InstallationID, "account", installation.AccountLogin)
 		matched = append(matched, project.ID)
+	}); err != nil {
+		slog.Error("Failed to list projects for matching", "error", err)
 	}
 
 	return matched
@@ -574,16 +706,10 @@ func (s *Server) matchProjectsToInstallation(ctx context.Context, installation *
 // updateProjectsForInstallation updates the GitHub App status for all projects
 // associated with the given installation.
 func (s *Server) updateProjectsForInstallation(ctx context.Context, installationID int64, state, errorCode, errorMessage string) {
-	projects, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 10000})
-	if err != nil {
-		slog.Error("Failed to list projects for status update", "error", err)
-		return
-	}
-
 	now := timeNow()
-	for _, project := range projects.Items {
+	if err := s.forEachGitHubAppProject(ctx, func(project *store.Project) {
 		if project.GitHubInstallationID == nil || *project.GitHubInstallationID != installationID {
-			continue
+			return
 		}
 
 		// Preserve the existing LastTokenMint before overwriting
@@ -603,37 +729,107 @@ func (s *Server) updateProjectsForInstallation(ctx context.Context, installation
 			project.GitHubAppStatus.LastError = &now
 		}
 
-		if err := s.store.UpdateProject(ctx, &project); err != nil {
-			slog.Error("Failed to update project GitHub App status",
+		if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
+			slog.ErrorContext(ctx, "Failed to update project GitHub App status",
 				"project_id", project.ID, "error", err)
-		} else {
-			s.events.PublishProjectUpdated(ctx, &project)
+		} else if s.events != nil {
+			s.events.PublishProjectUpdated(ctx, project)
 		}
+	}); err != nil {
+		slog.Error("Failed to list projects for status update", "error", err)
+	}
+}
+
+// resetPermissionDeniedProjectsPageSize is the ListProjects page size used by
+// resetPermissionDeniedProjectsForInstallation (a variable so tests can force
+// multi-page traversal without inserting thousands of rows).
+var resetPermissionDeniedProjectsPageSize = githubAssociationReportPageSize
+
+// resetPermissionDeniedProjectsForInstallation clears degraded or
+// permission_denied GitHubAppStatus back to unchecked for projects associated
+// with installationID (§10.3). Other error states (for example suspended or
+// repo_not_accessible) and active projects are left untouched.
+func (s *Server) resetPermissionDeniedProjectsForInstallation(ctx context.Context, installationID int64) {
+	pageSize := resetPermissionDeniedProjectsPageSize
+	if pageSize <= 0 {
+		pageSize = githubAssociationReportPageSize
+	}
+
+	now := timeNow()
+	cursor := ""
+	for {
+		page, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{
+			Limit:          pageSize,
+			Cursor:         cursor,
+			SkipTotalCount: true,
+		})
+		if err != nil {
+			slog.Error("Failed to list projects for permission acceptance reset", "error", err)
+			return
+		}
+
+		for i := range page.Items {
+			project := &page.Items[i]
+			if project.GitHubInstallationID == nil || *project.GitHubInstallationID != installationID {
+				continue
+			}
+			if project.GitHubAppStatus == nil {
+				continue
+			}
+			if project.GitHubAppStatus.State != store.GitHubAppStateDegraded &&
+				project.GitHubAppStatus.ErrorCode != githubapp.ErrCodePermissionDenied {
+				continue
+			}
+
+			lastTokenMint := project.GitHubAppStatus.LastTokenMint
+			project.GitHubAppStatus = &store.GitHubAppProjectStatus{
+				State:         store.GitHubAppStateUnchecked,
+				LastChecked:   now,
+				LastTokenMint: lastTokenMint,
+			}
+
+			if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
+				slog.ErrorContext(ctx, "Failed to reset project GitHub App status after new_permissions_accepted",
+					"project_id", project.ID, "error", err)
+				continue
+			}
+			s.invalidateGitHubAssociation(project.ID)
+			if s.events != nil {
+				s.events.PublishProjectUpdated(ctx, project)
+			}
+		}
+
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
 	}
 }
 
 // checkProjectsForRemovedRepos checks if any projects using the given installation
-// have lost access to their repository.
+// have lost access to their repository. removedRepos is keyed by lowercased
+// owner/repo. For each affected project, it marks GitHubAppStatus as
+// repo_not_accessible and pauses its GitHub-sourced triggers with
+// status_reason = source_deleted (§10.3). Installation trigger_routing entries
+// are intentionally left untouched so they surface as stale_primary (§8.4).
 func (s *Server) checkProjectsForRemovedRepos(ctx context.Context, installationID int64, removedRepos map[string]bool) {
-	projects, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 10000})
-	if err != nil {
-		slog.Error("Failed to list projects for repo removal check", "error", err)
+	if len(removedRepos) == 0 {
 		return
 	}
 
 	now := timeNow()
-	for _, project := range projects.Items {
+	if err := s.forEachGitHubAppProject(ctx, func(project *store.Project) {
 		if project.GitHubInstallationID == nil || *project.GitHubInstallationID != installationID {
-			continue
+			return
 		}
 
 		if project.GitRemote == "" {
-			continue
+			return
 		}
 
 		ownerRepo := s.githubOwnerRepo(project.GitRemote)
-		if ownerRepo == "" || !removedRepos[ownerRepo] {
-			continue
+		if ownerRepo == "" || !removedRepos[strings.ToLower(ownerRepo)] {
+			return
 		}
 
 		project.GitHubAppStatus = &store.GitHubAppProjectStatus{
@@ -644,13 +840,164 @@ func (s *Server) checkProjectsForRemovedRepos(ctx context.Context, installationI
 			LastError:    &now,
 		}
 
-		if err := s.store.UpdateProject(ctx, &project); err != nil {
-			slog.Error("Failed to update project after repo removal",
+		if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
+			slog.ErrorContext(ctx, "Failed to update project after repo removal",
 				"project_id", project.ID, "error", err)
 		} else {
-			s.events.PublishProjectUpdated(ctx, &project)
+			s.invalidateGitHubAssociation(project.ID)
+			if s.events != nil {
+				s.events.PublishProjectUpdated(ctx, project)
+			}
+		}
+
+		s.pauseGitHubTriggersForRemovedRepo(ctx, project, installationID, ownerRepo)
+	}); err != nil {
+		slog.Error("Failed to list projects for repo removal check", "error", err)
+	}
+}
+
+// pauseGitHubTriggersForRemovedRepo releases the project's active GitHub
+// trigger subject claims with release_reason = association_lost, pauses every
+// active (or reason-less paused) GitHub-sourced trigger in project with
+// status_reason = source_deleted, and writes a mutation audit record for each
+// paused trigger (§10.3). Triggers already paused with a system reason
+// (including source_deleted on redelivery) are skipped so the operation is
+// idempotent.
+func (s *Server) pauseGitHubTriggersForRemovedRepo(ctx context.Context, project *store.Project, installationID int64, ownerRepo string) {
+	if project == nil || project.ID == "" {
+		return
+	}
+
+	// Release this project's active GitHub trigger subject claims with
+	// release_reason = "association_lost" (§10.3).
+	if releasedClaims, err := s.store.ReleaseTriggerSubjectClaimsForProjectBySourceKind(
+		ctx,
+		project.ID,
+		store.TriggerSourceKindGitHub,
+		store.TriggerSubjectClaimReleaseReasonAssociationLost,
+		timeNow().UTC(),
+	); err != nil {
+		slog.WarnContext(ctx, "Failed to release GitHub trigger subject claims after repo removal",
+			"project_id", project.ID, "installation_id", installationID, "error", err)
+	} else if releasedClaims > 0 {
+		slog.InfoContext(ctx, "Released GitHub trigger subject claims after repository removal from installation",
+			"project_id", project.ID,
+			"installation_id", installationID,
+			"repo", strings.ToLower(strings.TrimSpace(ownerRepo)),
+			"released", releasedClaims,
+			"release_reason", store.TriggerSubjectClaimReleaseReasonAssociationLost,
+		)
+	}
+
+	var matches []store.Trigger
+	opts := store.ListOptions{Limit: scheduleCreatorPausePageSize, SkipTotalCount: true}
+	for {
+		page, err := s.store.ListTriggers(ctx, store.TriggerFilter{
+			ProjectID:  project.ID,
+			SourceKind: store.TriggerSourceKindGitHub,
+		}, opts)
+		if err != nil {
+			slog.Warn("Failed to list GitHub triggers after repo removal",
+				"project_id", project.ID, "installation_id", installationID, "error", err)
+			return
+		}
+		for _, tr := range page.Items {
+			if tr.Status == store.TriggerStatusActive ||
+				(tr.Status == store.TriggerStatusPaused && tr.StatusReason == store.TriggerStatusReasonNone) {
+				matches = append(matches, tr)
+			}
+		}
+		if page.NextCursor == "" || page.NextCursor == opts.Cursor {
+			break
+		}
+		opts.Cursor = page.NextCursor
+	}
+
+	lowerRepo := strings.ToLower(strings.TrimSpace(ownerRepo))
+	paused := 0
+	for i, tr := range matches {
+		if err := ctx.Err(); err != nil {
+			slog.Warn("Stopped pausing GitHub triggers after repo removal: context done",
+				"project_id", project.ID, "unpaused", len(matches)-i, "error", err)
+			break
+		}
+
+		audit := newTriggerAudit(ctx, mutationTypeTriggerPause, tr.ID)
+		afterBytes, _ := json.Marshal(map[string]any{
+			"project_id":      project.ID,
+			"trigger_id":      tr.ID,
+			"name":            tr.Name,
+			"status":          store.TriggerStatusPaused,
+			"status_reason":   store.TriggerStatusReasonSourceDeleted,
+			"installation_id": installationID,
+			"repo":            lowerRepo,
+			"cause":           "installation_repositories.removed",
+		})
+		audit.AfterSummary = string(afterBytes)
+
+		err := s.store.WithTx(ctx, func(tx store.Store) error {
+			if pErr := s.pauseTriggerWithReason(ctx, tx, tr, store.TriggerStatusReasonSourceDeleted); pErr != nil {
+				return pErr
+			}
+			return tx.CreateMutationAudit(ctx, audit)
+		})
+		switch {
+		case err == nil:
+			paused++
+		case errors.Is(err, store.ErrRevisionConflict), errors.Is(err, store.ErrNotFound):
+			// Edited, resumed, or deleted since it was listed.
+		default:
+			slog.Warn("Failed to pause GitHub trigger after repo removal",
+				"project_id", project.ID, "trigger_id", tr.ID, "error", err)
 		}
 	}
+	if paused > 0 {
+		slog.Info("Paused GitHub triggers after repository removal from installation",
+			"project_id", project.ID,
+			"installation_id", installationID,
+			"repo", lowerRepo,
+			"paused", paused,
+			"status_reason", store.TriggerStatusReasonSourceDeleted,
+		)
+	}
+}
+
+// requireGitHubInstallationHasRepo checks that project's repository is still
+// present (case-insensitively) in its GitHub App installation's repository
+// list, enforcing §10.3 ("un-paused after re-association") when resuming a
+// source_deleted GitHub trigger.
+func (s *Server) requireGitHubInstallationHasRepo(w http.ResponseWriter, r *http.Request, project *store.Project) bool {
+	if project == nil || project.GitHubInstallationID == nil || *project.GitHubInstallationID <= 0 {
+		writeError(w, http.StatusConflict, ErrCodeGitHubNotAssociated,
+			"project does not have a GitHub App installation", nil)
+		return false
+	}
+	ownerRepo := s.githubOwnerRepo(project.GitRemote)
+	if ownerRepo == "" {
+		writeError(w, http.StatusConflict, ErrCodeGitHubNotAssociated,
+			"project does not have a GitHub repository remote", nil)
+		return false
+	}
+	inst, err := s.store.GetGitHubInstallation(r.Context(), *project.GitHubInstallationID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusConflict, ErrCodeGitHubNotAssociated,
+				"project's GitHub App installation was not found", nil)
+			return false
+		}
+		slog.ErrorContext(r.Context(), "Failed to load GitHub installation for trigger resume",
+			"project_id", project.ID, "installation_id", *project.GitHubInstallationID, "error", err)
+		InternalError(w)
+		return false
+	}
+	for _, repo := range inst.Repositories {
+		if strings.EqualFold(repo, ownerRepo) {
+			return true
+		}
+	}
+	writeError(w, http.StatusConflict, githubapp.ErrCodeRepoNotAccessible,
+		"project repository is not in the GitHub App installation's repository list; re-add the repository to the installation (or discover/sync installations) before resuming this trigger", nil)
+	return false
 }
 
 // getGitHubAppClient creates a GitHub App client from the server's configuration.
@@ -672,12 +1019,14 @@ func (s *Server) getGitHubAppClient() (*githubapp.Client, error) {
 	if cfg.PrivateKey != "" {
 		keyData = []byte(cfg.PrivateKey)
 		keySource = "in-memory config"
+		s.warnGitHubAppKeyOverride(context.Background())
 	} else if cfg.PrivateKeyPath != "" {
 		keyData, err = os.ReadFile(cfg.PrivateKeyPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read private key file %q: %w", cfg.PrivateKeyPath, err)
 		}
 		keySource = "file:" + cfg.PrivateKeyPath
+		s.warnGitHubAppKeyOverride(context.Background())
 	} else {
 		// Try loading from secrets backend
 		keyStr, secretErr := s.loadGitHubAppSecret(context.Background(), GitHubAppSecretPrivateKey)
@@ -697,27 +1046,133 @@ func (s *Server) getGitHubAppClient() (*githubapp.Client, error) {
 	}, keyData)
 }
 
-// mintGitHubAppToken mints a GitHub App installation token for a project.
-// It handles error classification and updates the project's GitHub App status.
-// Returns the token string and expiry, or an error.
+// mintGitHubAppToken mints a fresh GitHub App installation token for a project
+// (agent delivery/refresh, status check, resource import, skills). It is
+// intentionally uncached so agent tokens retain their full lifetime and
+// status checks always contact GitHub.
 func (s *Server) mintGitHubAppToken(ctx context.Context, project *store.Project) (string, string, error) {
-	if project.GitHubInstallationID == nil {
-		return "", "", fmt.Errorf("project has no GitHub App installation")
+	tok, exp, _, err := s.mintGitHubAppTokenInternal(ctx, project, nil, false)
+	return tok, exp, err
+}
+
+// MintGitHubAppTokenWithPermissions mints (or returns a cached) repository-scoped
+// GitHub App installation token for hub-internal Stage 3 callers (trigger
+// enrichment and github.comment) with an explicit permission set (§7.3).
+// Association authorization runs on every call; if requested contains any
+// "write" permission level under a read-only grant (such as a pull-only creator
+// proof), it refuses with ErrGitHubWriteNotPermitted rather than downgrading.
+func (s *Server) MintGitHubAppTokenWithPermissions(
+	ctx context.Context,
+	project *store.Project,
+	requested githubapp.TokenPermissions,
+) (string, string, error) {
+	tok, exp, _, err := s.mintGitHubAppTokenInternal(ctx, project, &requested, true)
+	return tok, exp, err
+}
+
+func (s *Server) mintGitHubAppTokenInternal(
+	ctx context.Context,
+	project *store.Project,
+	requested *githubapp.TokenPermissions,
+	useCache bool,
+) (string, string, map[string]string, error) {
+	if project == nil || project.GitHubInstallationID == nil {
+		return "", "", nil, fmt.Errorf("project has no GitHub App installation")
 	}
 
 	// Single choke for every token delivery leg (hub-host clone and pull,
 	// agent env at create and refresh, the agent token-refresh endpoint,
-	// resource import, skills, the status check): the association must be
-	// authorized NOW, whatever was recorded before. See
-	// github_app_association_authz.go. A refusal, definitive or
-	// inconclusive, mints nothing and is surfaced on the project status.
+	// resource import, skills, the status check, trigger enrichment and
+	// github.comment): the association must be authorized NOW, whatever was
+	// recorded before. See github_app_association_authz.go. A refusal,
+	// definitive or inconclusive, mints nothing and is surfaced on the
+	// project status.
 	grant, authzErr := s.authorizeGitHubAppAssociation(ctx, project, *project.GitHubInstallationID)
 	if authzErr != nil {
-		slog.Warn("GitHub App token refused: installation association not authorized",
-			"project_id", project.ID, "installation_id", *project.GitHubInstallationID, "error", authzErr)
+		if s.githubAssociationRefusalLog.shouldLog(project.ID, *project.GitHubInstallationID, authzErr.Error()) {
+			slog.WarnContext(ctx, "GitHub App token refused: installation association not authorized",
+				"project_id", project.ID, "installation_id", *project.GitHubInstallationID, "error", authzErr)
+		}
+		errCode := githubAssociationErrorCode(authzErr)
 		s.updateProjectGitHubAppStatus(ctx, project, store.GitHubAppStateError,
-			githubAssociationErrorCode(authzErr), authzErr.Error())
-		return "", "", authzErr
+			errCode, githubAppStatusMessage(errCode))
+		return "", "", nil, authzErr
+	}
+	s.githubAssociationRefusalLog.clear(project.ID)
+
+	var perms githubapp.TokenPermissions
+	if requested != nil {
+		var reqAppPerms map[string]string
+		if !hasUsableStoredGitHubPermissions(project.GitHubPermissions) {
+			id, hasID := s.GitHubAppIdentity(ctx)
+			if !hasID || id == nil {
+				const msg = "Unable to verify GitHub App permissions. See the hub log for details."
+				slog.WarnContext(ctx, "GitHub App token refused: app permissions unavailable",
+					"project_id", project.ID, "installation_id", *project.GitHubInstallationID)
+				s.updateProjectGitHubAppStatus(ctx, project, store.GitHubAppStateError,
+					githubapp.ErrCodeTokenMintFailed, msg)
+				return "", "", nil, &githubapp.TokenMintError{
+					ErrorCode: githubapp.ErrCodeTokenMintFailed,
+					Message:   msg,
+				}
+			}
+			reqAppPerms = id.Permissions
+		}
+		var permErr error
+		perms, permErr = scopeRequestedGitHubTokenPermissions(*requested, project.GitHubPermissions, grant, reqAppPerms)
+		if permErr != nil {
+			return "", "", nil, permErr
+		}
+	} else if hasUsableStoredGitHubPermissions(project.GitHubPermissions) {
+		// Explicit stored project permissions are requested unchanged (still
+		// capped by the association's proof).
+		perms, _, _ = githubTokenPermissionsForGrant(project.GitHubPermissions, grant, nil)
+	} else {
+		// No usable stored permissions: intersect DefaultTokenPermissions with
+		// the permissions actually granted to the GitHub App so read-only and
+		// git-only Apps can mint scoped tokens without exceeding their grant.
+		// Fail closed and visibly if the App's permissions are unavailable or
+		// have no overlap with the defaults.
+		id, hasID := s.GitHubAppIdentity(ctx)
+		if !hasID || id == nil {
+			const msg = "Unable to verify GitHub App permissions. See the hub log for details."
+			slog.WarnContext(ctx, "GitHub App token refused: app permissions unavailable",
+				"project_id", project.ID, "installation_id", *project.GitHubInstallationID)
+			s.updateProjectGitHubAppStatus(ctx, project, store.GitHubAppStateError,
+				githubapp.ErrCodeTokenMintFailed, msg)
+			return "", "", nil, &githubapp.TokenMintError{
+				ErrorCode: githubapp.ErrCodeTokenMintFailed,
+				Message:   msg,
+			}
+		}
+		var ok bool
+		perms, _, ok = githubTokenPermissionsForGrant(project.GitHubPermissions, grant, id.Permissions)
+		if !ok {
+			const msg = "GitHub App does not have any of the default permissions required for this project. Update the GitHub App's permissions or configure project token permissions."
+			slog.WarnContext(ctx, "GitHub App token refused: default permissions intersection with app grant is empty",
+				"project_id", project.ID, "installation_id", *project.GitHubInstallationID)
+			s.updateProjectGitHubAppStatus(ctx, project, store.GitHubAppStateDegraded,
+				githubapp.ErrCodePermissionDenied, msg)
+			return "", "", nil, &githubapp.TokenMintError{
+				ErrorCode: githubapp.ErrCodePermissionDenied,
+				Message:   msg,
+			}
+		}
+	}
+
+	installationID := *project.GitHubInstallationID
+	ownerRepo := grant.Owner + "/" + grant.Repo
+	appID := s.githubAppConfiguredID()
+	apiBase := s.githubAppAPIBase()
+	permKey := canonicalGitHubTokenPermKey(perms)
+
+	if useCache {
+		if cachedToken, cachedExp, cachedPerms, ok := s.githubTokenCache.get(project.ID, permKey, appID, apiBase, installationID, ownerRepo); ok {
+			if len(cachedPerms) == 0 {
+				cachedPerms = githubapp.TokenPermissionsToMap(perms)
+			}
+			return cachedToken, cachedExp.UTC().Format("2006-01-02T15:04:05Z"), cachedPerms, nil
+		}
 	}
 
 	client, err := s.getGitHubAppClient()
@@ -736,16 +1191,16 @@ func (s *Server) mintGitHubAppToken(ctx context.Context, project *store.Project)
 			"error_code", errorCode, "error", upstreamText(err.Error()))
 		s.updateProjectGitHubAppStatus(ctx, project, store.GitHubAppStateError,
 			errorCode, githubAppStatusMessage(errorCode))
-		return "", "", err
+		return "", "", nil, err
 	}
 
-	installationID := *project.GitHubInstallationID
+	installationID = *project.GitHubInstallationID
 
 	// Never request more than the stored permissions and the association's
 	// proof allow (a pull-only proof gets read-only permissions), and never
 	// an empty set, which GitHub would treat as every installation
 	// permission.
-	perms := githubTokenPermissionsForGrant(project.GitHubPermissions, grant)
+	perms, _, _ = githubTokenPermissionsForGrant(project.GitHubPermissions, grant, nil)
 
 	// Pass nil for repos so GitHub grants the token access to all repositories
 	// permitted by this installation (allowing access to shared skill repos in the org).
@@ -774,7 +1229,19 @@ func (s *Server) mintGitHubAppToken(ctx context.Context, project *store.Project)
 		}
 
 		s.updateProjectGitHubAppStatus(ctx, project, state, errorCode, errorMessage)
-		return "", "", err
+		return "", "", nil, err
+	}
+
+	grantedPerms := make(map[string]string, len(token.Permissions))
+	for k, v := range token.Permissions {
+		grantedPerms[k] = v
+	}
+	if len(grantedPerms) == 0 {
+		grantedPerms = githubapp.TokenPermissionsToMap(perms)
+	}
+
+	if useCache {
+		s.githubTokenCache.put(project.ID, permKey, appID, apiBase, installationID, ownerRepo, token.Token, token.ExpiresAt, grantedPerms)
 	}
 
 	// Cache rate limit info
@@ -784,23 +1251,27 @@ func (s *Server) mintGitHubAppToken(ctx context.Context, project *store.Project)
 		s.mu.Unlock()
 	}
 
-	// Success — update project status
+	// Success — update project status. When no per-project permissions are
+	// stored, minting already intersected defaults with the App's grant (and
+	// failed closed above if the intersection was empty), so a successful
+	// mint is healthy.
 	now := timeNow()
 	project.GitHubAppStatus = &store.GitHubAppProjectStatus{
 		State:         store.GitHubAppStateOK,
 		LastTokenMint: &now,
 		LastChecked:   now,
 	}
-	if err := s.store.UpdateProject(ctx, project); err != nil {
-		slog.Warn("Failed to update project status after successful token mint", "error", err)
-	} else {
+	if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
+		slog.WarnContext(ctx, "Failed to update project status after successful token mint", "error", err)
+	} else if s.events != nil {
 		s.events.PublishProjectUpdated(ctx, project)
 	}
 
-	return token.Token, token.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z"), nil
+	return token.Token, token.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z"), grantedPerms, nil
 }
 
-// updateProjectGitHubAppStatus is a helper to update a project's GitHub App status.
+// updateProjectGitHubAppStatus is a helper to update a project's GitHub App status
+// via a narrow status-only store write so concurrent project updates are never reverted.
 func (s *Server) updateProjectGitHubAppStatus(ctx context.Context, project *store.Project, state, errorCode, errorMessage string) {
 	now := timeNow()
 	project.GitHubAppStatus = &store.GitHubAppProjectStatus{
@@ -810,9 +1281,9 @@ func (s *Server) updateProjectGitHubAppStatus(ctx context.Context, project *stor
 		LastChecked:  now,
 		LastError:    &now,
 	}
-	if err := s.store.UpdateProject(ctx, project); err != nil {
-		slog.Warn("Failed to update project GitHub App status", "project_id", project.ID, "error", err)
-	} else {
+	if err := s.store.UpdateProjectGitHubAppStatus(ctx, project.ID, project.GitHubAppStatus); err != nil {
+		slog.WarnContext(ctx, "Failed to update project GitHub App status", "project_id", project.ID, "error", err)
+	} else if s.events != nil {
 		s.events.PublishProjectUpdated(ctx, project)
 	}
 }
@@ -827,6 +1298,12 @@ func githubAppStatusMessage(errorCode string) string {
 		return "The GitHub App private key is missing or invalid. Re-upload it in Admin > Server Config."
 	case githubapp.ErrCodeAppNotFound:
 		return "GitHub App not found — verify the App ID in Admin > Server Config > GitHub App."
+	case githubAppErrAssociationUnauthorized:
+		return "The project's GitHub App installation association is not authorized. Re-bind or re-verify the installation."
+	case githubAppErrAssociationCheckFailed:
+		return "Could not verify the project's GitHub App installation association. See the hub log for details."
+	case githubapp.ErrCodePermissionDenied:
+		return "The GitHub App does not have the required permissions for this repository. Update the App's permissions on GitHub."
 	default:
 		return "The GitHub App could not provide a token. See the hub log for details."
 	}

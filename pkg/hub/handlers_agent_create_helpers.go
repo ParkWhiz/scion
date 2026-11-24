@@ -36,20 +36,51 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
+// userIDFromIdentity returns the user's ID when identity is a non-nil
+// UserIdentity, and "" for agents, brokers, or nil identities.
+func userIDFromIdentity(identity Identity) string {
+	if isNilIdentity(identity) {
+		return ""
+	}
+	if u, ok := identity.(UserIdentity); ok {
+		return u.ID()
+	}
+	return ""
+}
+
 // resolveTemplate looks up a template by ID or name/slug.
-// It tries: 1) by ID, 2) by slug in project scope, 3) by slug in global scope.
+// It tries: 1) by ID, 2) by slug in project scope (when projectID != ""),
+// 3) by slug in user scope (when userID != ""), 4) by slug in global scope.
 // Returns nil if not found, or an error for actual failures.
-func (s *Server) resolveTemplate(ctx context.Context, templateRef, projectID string) (*store.Template, error) {
-	return resolveTemplateRef(ctx, s.store, templateRef, projectID)
+func (s *Server) resolveTemplate(ctx context.Context, templateRef, projectID, userID string) (*store.Template, error) {
+	return resolveTemplateRef(ctx, s.store, templateRef, projectID, userID)
+}
+
+// resolveTemplateForIdentity resolves templateRef for an authenticated caller
+// in the documented scope order (ID -> project -> user -> global), skipping
+// slug-resolved candidates the caller is not authorized to read (mirroring the
+// CLI's scopeNotVisible fallback in cmd/template_resolution.go). A candidate
+// matched by explicit ID is returned unfiltered so the caller's
+// authorizeResolvedTemplate gate turns an unauthorized cross-scope ID into
+// not-found rather than falling through to another template.
+func (s *Server) resolveTemplateForIdentity(ctx context.Context, identity Identity, templateRef, projectID string) (*store.Template, error) {
+	return resolveTemplateRefWithFilter(ctx, s.store, templateRef, projectID, userIDFromIdentity(identity), func(tmpl *store.Template) bool {
+		return s.authorizeResolvedTemplate(ctx, identity, tmpl)
+	})
 }
 
 // resolveTemplateRef resolves templateRef by ID, then by slug in the
-// project's scope, then by slug in the global scope. It returns nil and no
-// error when nothing matches.
-func resolveTemplateRef(ctx context.Context, st store.Store, templateRef, projectID string) (*store.Template, error) {
+// project's scope (when projectID != ""), then by slug in the user's scope
+// (when userID != ""), then by slug in the global scope. It returns nil and
+// no error when nothing matches.
+func resolveTemplateRef(ctx context.Context, st store.Store, templateRef, projectID, userID string) (*store.Template, error) {
+	return resolveTemplateRefWithFilter(ctx, st, templateRef, projectID, userID, nil)
+}
+
+func resolveTemplateRefWithFilter(ctx context.Context, st store.Store, templateRef, projectID, userID string, allowSlug func(*store.Template) bool) (*store.Template, error) {
 	// Try looking up by ID first (the CLI typically resolves names to IDs)
 	template, err := st.GetTemplate(ctx, templateRef)
-	if err != nil && err != store.ErrNotFound {
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
 	if template != nil {
@@ -57,20 +88,36 @@ func resolveTemplateRef(ctx context.Context, st store.Store, templateRef, projec
 	}
 
 	// Try by slug/name within project scope
-	template, err = st.GetTemplateBySlug(ctx, templateRef, "project", projectID)
-	if err != nil && err != store.ErrNotFound {
-		return nil, err
+	if projectID != "" {
+		template, err = st.GetTemplateBySlug(ctx, templateRef, store.TemplateScopeProject, projectID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		if template != nil && (allowSlug == nil || allowSlug(template)) {
+			return template, nil
+		}
 	}
-	if template != nil {
-		return template, nil
+
+	// Try by slug/name within user scope
+	if userID != "" {
+		template, err = st.GetTemplateBySlug(ctx, templateRef, store.TemplateScopeUser, userID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		if template != nil && (allowSlug == nil || allowSlug(template)) {
+			return template, nil
+		}
 	}
 
 	// Try global scope
-	template, err = st.GetTemplateBySlug(ctx, templateRef, "global", "")
-	if err != nil && err != store.ErrNotFound {
+	template, err = st.GetTemplateBySlug(ctx, templateRef, store.TemplateScopeGlobal, "")
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
-	return template, nil
+	if template != nil && (allowSlug == nil || allowSlug(template)) {
+		return template, nil
+	}
+	return nil, nil
 }
 
 // authorizeResolvedTemplate reports whether identity may read the resolved
@@ -385,6 +432,21 @@ func (s *Server) populateAgentConfig(ctx context.Context, agent *store.Agent, pr
 // fallback (withNoAuthFallbackForbidden).
 var errNoAuthFallbackRefused = errors.New("the agent has no credentials for its harness, and the no-auth fallback is not allowed for this create")
 
+type managedAgentCreateKey struct{}
+
+// withManagedAgentCreate marks ctx as a hub-direct managed-agent create so
+// config derivation (deriveAgentConfig, profileDefaultSAUnlessPinned) never
+// stamps a Runtime Broker default profile onto the agent before agent.Runtime
+// is recorded by managedAgentCreate.
+func withManagedAgentCreate(ctx context.Context) context.Context {
+	return context.WithValue(ctx, managedAgentCreateKey{}, true)
+}
+
+func managedAgentCreateFrom(ctx context.Context) bool {
+	v, _ := ctx.Value(managedAgentCreateKey{}).(bool)
+	return v
+}
+
 type noAuthFallbackGuardKey struct{}
 
 // noAuthFallbackGuard records whether a create carrying it was refused.
@@ -521,10 +583,14 @@ func (s *Server) deriveAgentConfig(ctx context.Context, agent *store.Agent, proj
 	// is not a harness-config name, so a project default the rung above
 	// dropped stays dropped.
 	// A pinned (flat) agent takes no default Runtime Broker Profile: the
-	// project active profile is dropped with a dispatch warning.
+	// project active profile is dropped with a dispatch warning. A hub-direct
+	// managed agent has no Runtime Broker at all and silently ignores any
+	// project active profile without emitting a flat-broker warning.
 	priorProfile := agent.AppliedConfig.Profile
 	applyProjectDefaults(agent.AppliedConfig, project)
-	if agent.IsPinned() && agent.AppliedConfig.Profile != priorProfile {
+	if managedAgentCreateFrom(ctx) || isManagedAgentRuntime(agent.Runtime) {
+		agent.AppliedConfig.Profile = priorProfile
+	} else if agent.IsPinned() && agent.AppliedConfig.Profile != priorProfile {
 		dropped := agent.AppliedConfig.Profile
 		agent.AppliedConfig.Profile = priorProfile
 		addDispatchWarnings(ctx, flatDefaultProfileDroppedWarning(dropped, agent.PinnedRuntimeBrokerID))
@@ -676,6 +742,8 @@ func (s *Server) resolveDerivedConfig(ctx context.Context, agent *store.Agent, p
 	if resolvedTemplate != nil {
 		agent.AppliedConfig.TemplateID = resolvedTemplate.ID
 		agent.AppliedConfig.TemplateHash = resolvedTemplate.ContentHash
+		agent.AppliedConfig.TemplateSourceURL = resolvedTemplate.SourceURL
+		agent.AppliedConfig.TemplateSourceCommit = resolvedTemplate.SourceCommit
 
 		// The template's job keys are not copied here. Its model is filled
 		// by deriveAgentConfig's template rung, from the AgentConfig
@@ -838,7 +906,14 @@ func (s *Server) resolveDerivedConfig(ctx context.Context, agent *store.Agent, p
 	// is ambiguous: the project may well have an override we simply failed to
 	// read, and silently staging the hub script in that case would run the
 	// wrong code. On an ambiguous error we log and stage nothing.
-	if project != nil && agent.AppliedConfig.ProjectPreStartHookID == "" {
+	if isShellAgent(agent) {
+		// Shell execution containers never run project or hub pre-start hooks
+		// (security audit H3 / ptone/scion#8812 I1).
+		if agent.AppliedConfig != nil {
+			agent.AppliedConfig.ProjectPreStartHookID = ""
+			agent.AppliedConfig.ProjectPreStartHookScript = ""
+		}
+	} else if project != nil && agent.AppliedConfig != nil && agent.AppliedConfig.ProjectPreStartHookID == "" {
 		hook, hookErr := s.store.GetActiveProjectPreStartHook(ctx, project.ID)
 		switch {
 		case hookErr == nil:
@@ -1191,7 +1266,7 @@ func newNotifySubscription(projectID, notifySubscriberType, notifySubscriberID, 
 		SubscriberType:    notifySubscriberType,
 		SubscriberID:      notifySubscriberID,
 		ProjectID:         projectID,
-		TriggerActivities: []string{"COMPLETED", "WAITING_FOR_INPUT", "LIMITS_EXCEEDED", "STALLED", "ERROR", NotificationStatusHalted},
+		TriggerActivities: []string{"COMPLETED", "IDLE", "WAITING_FOR_INPUT", "LIMITS_EXCEEDED", "STALLED", "ERROR", NotificationStatusHarnessError, NotificationStatusHalted, "SUSPENDED"},
 		CreatedAt:         time.Now(),
 		CreatedBy:         createdBy,
 	}
@@ -1239,13 +1314,15 @@ const (
 // read-only. Both read the agent's effective resting phase
 // (store.EffectiveRestingPhase, ptone/scion#4669), never its stored phase:
 // an error row that remembers the phase a failed asynchronous start began
-// from takes the branch that phase would take. The CLI's mirror of this
-// tree (cmd/common.go) must follow the same rule.
+// from takes the branch that phase would take.
 func classifyExistingAgent(a *store.Agent, req CreateAgentRequest) existingAgentBranch {
 	rest := store.EffectiveRestingPhase(a)
 	switch {
-	case !req.ProvisionOnly && rest == string(state.PhaseSuspended):
-		return existingBranchStart
+	case !req.ProvisionOnly && (rest == string(state.PhaseSuspended) || a.IdleSuspendClaimActive):
+		if req.Resume {
+			return existingBranchStart
+		}
+		return existingBranchNone
 	case !req.ProvisionOnly && (rest == string(state.PhaseRunning) || rest == string(state.PhaseStopped) || rest == string(state.PhaseError) || rest == string(state.PhaseHalted)):
 		if inPlace, _ := resumeInPlaceDecision(rest, req.Resume, req.ForceResume); inPlace {
 			return existingBranchStart
@@ -1257,6 +1334,37 @@ func classifyExistingAgent(a *store.Agent, req CreateAgentRequest) existingAgent
 		return existingBranchStart
 	}
 	return existingBranchNone
+}
+
+// isResumableExistingAgent reports whether an existing agent is in a resting
+// phase that can be resumed or restarted in place only with an explicit Resume
+// request (suspended, stopped, halted, or an active idle-suspend claim).
+func isResumableExistingAgent(a *store.Agent, rest string) bool {
+	return rest == string(state.PhaseSuspended) ||
+		rest == string(state.PhaseStopped) ||
+		rest == string(state.PhaseHalted) ||
+		a.IdleSuspendClaimActive
+}
+
+// writeAgentExistsResumable writes a 409 agent_exists_resumable response naming
+// the agent's phase and hinting scion resume, delete, or using another name.
+func writeAgentExistsResumable(w http.ResponseWriter, slug, storedPhase, rest string, idleSuspendClaimActive bool) {
+	phaseDesc := rest
+	details := map[string]interface{}{
+		"agent": slug,
+		"phase": storedPhase,
+	}
+	switch {
+	case idleSuspendClaimActive && rest != string(state.PhaseSuspended):
+		phaseDesc = fmt.Sprintf("%s (suspending)", storedPhase)
+		details["restingPhase"] = string(state.PhaseSuspended)
+	case rest != storedPhase && storedPhase != "":
+		phaseDesc = fmt.Sprintf("%s, resumes as %s", storedPhase, rest)
+		details["resumePhase"] = rest
+	}
+	msg := fmt.Sprintf("agent %q already exists (phase: %s); run 'scion resume %s' to resume it, delete it, or use another name",
+		slug, phaseDesc, slug)
+	writeError(w, http.StatusConflict, ErrCodeAgentExistsResumable, msg, details)
 }
 
 // existingAgentFlatChecks applies the flat Runtime Broker checks for the
@@ -1345,15 +1453,19 @@ func (s *Server) existingAgentFlatChecks(ctx context.Context, w http.ResponseWri
 //     returned as it is (200, request not applied) → existingAgentStarted;
 //     any other start-gate refusal is written → existingAgentErrored.
 //
-// Branches (all but env-gather are skipped for req.ProvisionOnly):
-//  1. Suspended: restart in place, preserving harness state. Re-reserves
-//     quota, records run intent, dispatches start with the harness resume
-//     flag set, marks the agent running → existingAgentStarted.
-//  2. Running/stopped/error: resumeInPlaceDecision decides. A stopped agent
-//     with req.Resume restarts in place with a fresh harness session; an
-//     errored agent with req.Resume and req.ForceResume is force-resumed
-//     (crash recovery), continuing the interrupted session. Either path
-//     re-reserves quota and dispatches start → existingAgentStarted.
+// Branches (all but branch 0 and env-gather are skipped for req.ProvisionOnly):
+//  0. Resumable without req.Resume (suspended, stopped, halted, or an active
+//     idle-suspend claim): refuse immediately with 409 agent_exists_resumable
+//     naming the phase and hinting `scion resume <name>`, delete, or another
+//     name → existingAgentErrored (no dispatch, no idle-suspend wait).
+//  1. Suspended (with req.Resume): restart in place, preserving harness state.
+//     Re-reserves quota, records run intent, dispatches start with the harness
+//     resume flag set, marks the agent running → existingAgentStarted.
+//  2. Running/stopped/error/halted: resumeInPlaceDecision decides. A stopped or
+//     halted agent with req.Resume restarts in place with a fresh harness
+//     session; an errored agent with req.Resume and req.ForceResume is
+//     force-resumed (crash recovery), continuing the interrupted session.
+//     Either path re-reserves quota and dispatches start → existingAgentStarted.
 //     Anything else, including every running agent, is a duplicate →
 //     existingAgentConflict. Existing agents are never deleted here.
 //  3. Env-gather re-provisioning (provisioning + req.GatherEnv): record run
@@ -1399,6 +1511,8 @@ func (s *Server) handleExistingAgent(
 	runtimeBrokerID string,
 	req CreateAgentRequest,
 	notifySubscriberType, notifySubscriberID, createdBy string,
+	carriedSecrets *[]*secret.SecretWithValue,
+	createSecrets []validatedAgentSecret,
 ) existingAgentResult {
 	if existingAgent == nil {
 		return existingAgentNone
@@ -1430,10 +1544,29 @@ func (s *Server) handleExistingAgent(
 	// request.
 	if ref := s.startGate(ctx, existingAgent, startEntryCreateExisting); ref.refuses() {
 		if ref.InFlight {
+			if len(createSecrets) > 0 {
+				Conflict(w, "agent start is already in flight; cannot apply secrets until the agent stops")
+				return existingAgentErrored
+			}
 			s.writeExistingAgentLaunching(ctx, w, existingAgent, project, req)
 			return existingAgentStarted
 		}
 		ref.write(w)
+		return existingAgentErrored
+	}
+
+	// Managed and container execution modes never cross-adopt or cross-start a
+	// pre-existing agent row with the same slug: a managed create colliding
+	// with a container row, or a container create colliding with a managed row,
+	// returns 409 Conflict before any broker/pin mutation runs.
+	if req.ManagedAgent != isManagedAgentRuntime(existingAgent.Runtime) {
+		return existingAgentConflict
+	}
+
+	// Shell execution containers never accept an initial task (ptone/scion#8812 §3.2).
+	if isShellAgent(existingAgent) && strings.TrimSpace(req.Task) != "" {
+		writeError(w, http.StatusBadRequest, ErrCodeTaskNotSupported,
+			"execution containers do not support an initial task", nil)
 		return existingAgentErrored
 	}
 
@@ -1450,6 +1583,9 @@ func (s *Server) handleExistingAgent(
 	// which the whole-row post-start writes would persist. storedPhase is
 	// the stored phase, for the post-start "did the broker set a phase"
 	// checks.
+	if !req.ProvisionOnly && req.Resume && existingAgent.IdleSuspendClaimActive {
+		s.waitForIdleSuspendBeforeUserStart(ctx, existingAgent)
+	}
 	rest := store.EffectiveRestingPhase(existingAgent)
 	storedPhase := existingAgent.Phase
 
@@ -1466,8 +1602,17 @@ func (s *Server) handleExistingAgent(
 		cleanupMode = "strict"
 	}
 
-	// Branch 1: Suspended agents are restarted in-place (not deleted), preserving harness state.
-	if !req.ProvisionOnly && rest == string(state.PhaseSuspended) {
+	// Resumable resting phases (suspended, stopped, halted, or an active
+	// idle-suspend claim) are never reused implicitly: require req.Resume and
+	// refuse with 409 agent_exists_resumable plus a hint.
+	if !req.Resume && isResumableExistingAgent(existingAgent, rest) {
+		writeAgentExistsResumable(w, existingAgent.Slug, storedPhase, rest, existingAgent.IdleSuspendClaimActive)
+		return existingAgentErrored
+	}
+
+	// Branch 1: Suspended agents (or agents mid-idle-suspend claim that have not yet settled)
+	// with Resume=true are restarted in-place (not deleted), preserving harness state.
+	if !req.ProvisionOnly && req.Resume && (rest == string(state.PhaseSuspended) || existingAgent.IdleSuspendClaimActive) {
 		if existingAgent.RuntimeBrokerID == "" && runtimeBrokerID != "" {
 			existingAgent.RuntimeBrokerID = runtimeBrokerID
 		}
@@ -1482,6 +1627,12 @@ func (s *Server) handleExistingAgent(
 		// Fail fast on a GCP identity the token-mint gate would refuse,
 		// before any quota reservation or run-intent write.
 		if s.gcpIdentityStartRefusal(ctx, w, existingAgent, "resume") {
+			return existingAgentErrored
+		}
+
+		// Upsert create-time secrets onto the existing agent (requires agent.update)
+		// before starting/resuming so delivery picks them up (design §4.5).
+		if !s.upsertExistingAgentSecrets(ctx, w, existingAgent, createSecrets, createdBy) {
 			return existingAgentErrored
 		}
 
@@ -1503,7 +1654,7 @@ func (s *Server) handleExistingAgent(
 		extendWriteDeadlineForSyncDispatch(ctx, w, s.config.WriteTimeout)
 		// This branch only runs for suspended agents, so resume the harness
 		// session (Claude --continue) rather than starting fresh.
-		resume := rest == string(state.PhaseSuspended)
+		resume := rest == string(state.PhaseSuspended) || existingAgent.IdleSuspendClaimActive
 		// The post-start write runs inside the start claim, before it is
 		// released, so it never overwrites a newer start's status.
 		var afterErr error // a post-start write error, answered after the start
@@ -1527,6 +1678,8 @@ func (s *Server) handleExistingAgent(
 			// The row read starting during the dispatch (beginStartDispatch),
 			// so clear the rest of the prior generation's remnants here, as
 			// ClearTerminalRemnants does for a status write.
+			existingAgent.Activity = ""
+			existingAgent.ToolName = ""
 			existingAgent.Message = ""
 			existingAgent.StalledFromActivity = ""
 			if err := s.store.UpdateAgent(ctx, existingAgent); err != nil {
@@ -1545,6 +1698,9 @@ func (s *Server) handleExistingAgent(
 		if err := s.startAgentCore(ctx, existingAgent, StartOpts{Kind: store.StartClaimUser, Task: req.Task, Resume: resume, AfterStart: afterStart, SyncDispatchBound: true,
 			AcceptAsyncLaunch: req.AcceptAsyncLaunch, OnLaunchAccepted: func(context.Context, *store.Agent) { launchAccepted = true }}); answered || err != nil {
 			if answered {
+				return existingAgentErrored
+			}
+			if writeBrokerPolicyErrorCtx(ctx, w, nil, err) {
 				return existingAgentErrored
 			}
 			if writeAgentTokenRecordError(w, err) {
@@ -1566,7 +1722,7 @@ func (s *Server) handleExistingAgent(
 				// Response written.
 			case writeSecretResolutionError(w, err):
 				// 503: the agent's secrets or stored env settings could not be read; nothing was sent.
-			case writeEmptyPerAgentCapabilityError(w, err):
+			case writeWorkspaceModeCapabilityError(w, err):
 				// 412 already written (design #2703 D3).
 			case relayDispatchRefusal(w, err):
 				// Required-skill resolution failure relayed with the broker's status.
@@ -1638,6 +1794,12 @@ func (s *Server) handleExistingAgent(
 				return existingAgentErrored
 			}
 
+			// Upsert create-time secrets onto the existing agent (requires agent.update)
+			// before starting/resuming so delivery picks them up (design §4.5).
+			if !s.upsertExistingAgentSecrets(ctx, w, existingAgent, createSecrets, createdBy) {
+				return existingAgentErrored
+			}
+
 			if req.Task != "" {
 				if existingAgent.AppliedConfig == nil {
 					existingAgent.AppliedConfig = &store.AgentAppliedConfig{}
@@ -1687,6 +1849,8 @@ func (s *Server) handleExistingAgent(
 				// (beginStartDispatch), so clear the rest of the prior
 				// generation's remnants here, as ClearTerminalRemnants does
 				// for a status write.
+				existingAgent.Activity = ""
+				existingAgent.ToolName = ""
 				existingAgent.Message = ""
 				existingAgent.StalledFromActivity = ""
 				if err := s.updateAgentAfterDispatch(ctx, existingAgent); err != nil {
@@ -1705,6 +1869,9 @@ func (s *Server) handleExistingAgent(
 			if err := s.startAgentCore(ctx, existingAgent, StartOpts{Kind: store.StartClaimUser, Task: req.Task, Resume: forcedRecovery, AfterStart: afterStart, SyncDispatchBound: true,
 				AcceptAsyncLaunch: req.AcceptAsyncLaunch, OnLaunchAccepted: func(context.Context, *store.Agent) { launchAccepted = true }}); answered || err != nil {
 				if answered {
+					return existingAgentErrored
+				}
+				if writeBrokerPolicyErrorCtx(ctx, w, nil, err) {
 					return existingAgentErrored
 				}
 				if writeAgentTokenRecordError(w, err) {
@@ -1726,7 +1893,7 @@ func (s *Server) handleExistingAgent(
 					// Response written.
 				case writeSecretResolutionError(w, err):
 					// 503: the agent's secrets or stored env settings could not be read; nothing was sent.
-				case writeEmptyPerAgentCapabilityError(w, err):
+				case writeWorkspaceModeCapabilityError(w, err):
 					// 412 already written (design #2703 D3).
 				case relayDispatchRefusal(w, err):
 					// Required-skill resolution failure relayed with the broker's status.
@@ -1776,6 +1943,14 @@ func (s *Server) handleExistingAgent(
 
 	// Branch 3: Env-gather re-provisioning — provisioning + GatherEnv requested.
 	if req.GatherEnv && rest == string(state.PhaseProvisioning) {
+		// Snapshot any agent-scoped secrets before tearing down the existing
+		// provisioning agent so they survive recreate under the replacement
+		// agent's new ID. Fail closed on read error before deleting anything.
+		snap, err := s.snapshotAgentSecrets(ctx, existingAgent.ID)
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return existingAgentErrored
+		}
 		// Flat placement pre-check on the agent being replaced, before its
 		// stop intent: the recreate deletes it on its Runtime Broker.
 		if _, err := s.pinnedPlacementBroker(ctx, existingAgent); err != nil {
@@ -1826,29 +2001,35 @@ func (s *Server) handleExistingAgent(
 		}
 		// This removes existingAgent unless a delete holds it, the same way
 		// the main delete handler does, just reached via env-gather
-		// re-provisioning rather than an explicit DELETE — so it must revoke
-		// with the same reason too (ptone/scion#1956), before the row is gone
-		// and before the fall-through create below mints a credential for the
-		// new agent row's own (distinct) ID.
+		// re-provisioning rather than an explicit DELETE — so it revokes with
+		// the same reason first (ptone/scion#1956), including when a concurrent
+		// delete holds the row below after the broker teardown above ran.
 		revokeAgentCredentialsBestEffort(ctx, s.store, existingAgent.ID, agentCredentialRevokeReasonDeleted)
 		// The row is removed the way a create rollback removes its row
 		// (compensateAgentCreate): conditionally, in one transaction that
 		// reads the row (locked where supported), removes it, checks that no
-		// delete holds it (createRowHeldCheck) and then deactivates the
-		// agent's delegation edges, runs the hard-delete hooks and writes the
-		// agent_hard_delete audit record (hardDeleteAgentTx). A delete can
-		// claim the row after the start gate, while the broker delete above
-		// runs; when a delete holds the row, or the row is already gone or
-		// soft-deleted, the refused check rolls everything back and the row
-		// and its quotas are left to that delete: nothing is created and the
-		// answer is 409 delete_in_progress, as the start gate answers. A
-		// failed delete, or a deleting row whose lease lapsed, does not hold
-		// the row, so it is removed as before.
+		// delete holds it (createRowHeldCheck) and then revokes any remaining
+		// active credentials with reason agent_deleted, deactivates its
+		// delegation edges and service-account assignments, runs the
+		// hard-delete hooks and writes the agent_hard_delete audit record
+		// (hardDeleteAgentTx). Revoking inside the transaction ensures that a
+		// revoke failure rolls the row delete back before the fall-through
+		// create below can mint a credential for the new agent row's distinct
+		// ID. A delete can claim the row after the start gate, while the
+		// broker delete above runs; when a delete holds the row, or the row is
+		// already gone or soft-deleted, the refused check rolls everything
+		// back and the row and its quotas are left to that delete: nothing is
+		// created and the answer is 409 delete_in_progress, as the start gate
+		// answers. A failed delete, or a deleting row whose lease lapsed, does
+		// not hold the row, so it is removed as before.
 		actor := auditActorFromContext(ctx)
-		n, err := s.store.FinalizeAgentDeletion(lifecycleCreateRollback(ctx, "env_gather_recreate"), existingAgent.ID, createRowCompensable(), store.DeletionFinalizeHard, store.DeletionFields{},
-			createRowHeldCheck(func(tx store.Store) error {
-				return s.hardDeleteAgentTx(ctx, tx, existingAgent, actor)
-			}))
+		rbCtx := lifecycleCreateRollback(ctx, "env_gather_recreate")
+		n, err := s.withAgentSecretCleanup(rbCtx, existingAgent.ID, func(txCtx context.Context) (int, error) {
+			return s.store.FinalizeAgentDeletion(txCtx, existingAgent.ID, createRowCompensable(), store.DeletionFinalizeHard, store.DeletionFields{},
+				createRowHeldCheck(func(tx store.Store) error {
+					return s.hardDeleteAgentTx(txCtx, tx, existingAgent, actor)
+				}))
+		})
 		if errors.Is(err, errCreateRowDeleteHeld) || (err == nil && n == 0) {
 			deleteInProgressRefusal(existingAgent.ID).write(w)
 			return existingAgentErrored
@@ -1856,6 +2037,9 @@ func (s *Server) handleExistingAgent(
 		if err != nil {
 			writeErrorFromErr(w, err, "")
 			return existingAgentErrored
+		}
+		if carriedSecrets != nil && len(snap) > 0 {
+			*carriedSecrets = snap
 		}
 		// Reached only when this path removed the row; a row a delete holds
 		// keeps its quotas for that delete.
@@ -1892,6 +2076,12 @@ func (s *Server) handleExistingAgent(
 		// Fail fast on a GCP identity the token-mint gate would refuse,
 		// before any quota reservation or run-intent write.
 		if s.gcpIdentityStartRefusal(ctx, w, existingAgent, "start") {
+			return existingAgentErrored
+		}
+
+		// Upsert create-time secrets onto the existing agent (requires agent.update)
+		// before starting so delivery picks them up (design §4.5).
+		if !s.upsertExistingAgentSecrets(ctx, w, existingAgent, createSecrets, createdBy) {
 			return existingAgentErrored
 		}
 
@@ -1961,6 +2151,9 @@ func (s *Server) handleExistingAgent(
 			if answered {
 				return existingAgentErrored
 			}
+			if writeBrokerPolicyErrorCtx(ctx, w, nil, err) {
+				return existingAgentErrored
+			}
 			if writeAgentTokenRecordError(w, err) {
 				return existingAgentErrored
 			}
@@ -1980,7 +2173,7 @@ func (s *Server) handleExistingAgent(
 				// Response written.
 			case writeSecretResolutionError(w, err):
 				// 503: the agent's secrets or stored env settings could not be read; nothing was sent.
-			case writeEmptyPerAgentCapabilityError(w, err):
+			case writeWorkspaceModeCapabilityError(w, err):
 				// 412 already written (design #2703 D3).
 			case relayDispatchRefusal(w, err):
 				// Required-skill resolution failure relayed with the broker's status.
@@ -2151,6 +2344,23 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 		// to the project as a provider. This is common for hub-managed projects where
 		// providers aren't established via CLI registration.
 		broker, err := s.findBrokerByIDOrSlug(ctx, requestedBrokerID)
+		if errors.Is(err, store.ErrNotFound) {
+			// Exact ID, name, and slug all missed — check for a unique prefix
+			// match on Name or Slug among brokers the caller may use for this
+			// project (ptone/scion#8453). Hidden/unusable brokers and message-
+			// broker plugins are excluded so prefix resolution never acts as an
+			// existence oracle.
+			var candidates []store.RuntimeBroker
+			broker, candidates, err = s.findBrokerByPrefix(ctx, requestedBrokerID, project)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				writeErrorFromErr(w, err, "")
+				return "", err
+			}
+			if len(candidates) > 1 {
+				writeRuntimeBrokerPrefixAmbiguous(w, requestedBrokerID, candidates, project.DefaultRuntimeBrokerID)
+				return "", store.ErrNotFound
+			}
+		}
 		if err == nil && broker != nil {
 			// The lookup can find a broker that already is a provider even
 			// though the passes above missed it, e.g. by its current name
@@ -2179,6 +2389,10 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 			// canDispatchToBroker. The difference admits no additional
 			// caller.
 			if broker.IsFlat() {
+				if s.brokerPolicyRefuses(broker) {
+					writeBrokerPolicyDenialCtx(ctx, w, nil, brokerPolicyOpDispatch, broker, "", nil)
+					return "", store.ErrNotFound
+				}
 				if !s.canDispatchToBroker(ctx, broker) {
 					writeBrokerDispatchForbidden(w)
 					return "", store.ErrNotFound
@@ -2266,28 +2480,92 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 		return "", store.ErrNotFound
 	}
 
-	// Case 2: Use project's default runtime broker (must be online and dispatchable)
+	// Cases 2-4: no explicit broker. selectProjectRuntimeBroker is shared
+	// with scheduled dispatch (ptone/scion#7868), so both paths pick the same
+	// broker.
+	brokerID, refusal, policyErr := s.selectProjectRuntimeBrokerInternal(ctx, project, allProviders, availableBrokers)
+	if policyErr != nil {
+		writeBrokerPolicyErrorCtx(ctx, w, nil, policyErr)
+		return "", store.ErrNotFound
+	}
+	if refusal != "" {
+		NoRuntimeBroker(w, refusal, usableBrokers())
+		return "", store.ErrNotFound
+	}
+	return brokerID, nil
+}
+
+// selectProjectRuntimeBroker picks the runtime broker for an agent created in
+// project when no broker was requested. It writes no HTTP response and is
+// used by both interactive create (resolveRuntimeBroker) and scheduled
+// dispatch (dispatchAgentEventHandler). Every broker it returns has passed
+// canUseBrokerForProject for the identity in ctx. Priority order:
+//  1. Project's default runtime broker - must be online and usable; when it
+//     is not, there is no fallback
+//  2. Hub-level default broker - used only if it is a provider of the
+//     project and is online and usable; otherwise fall through
+//  3. Single provider (any status) - used if its broker is present and usable
+//  4. Multiple providers - the single online, usable one; none or several is
+//     a refusal
+//
+// allProviders is every provider of the project; availableBrokers is the
+// subset returned by getAvailableBrokersForProject. On refusal it returns ""
+// and a non-empty message for the caller to report.
+func (s *Server) selectProjectRuntimeBroker(ctx context.Context, project *store.Project, allProviders []store.ProjectProvider, availableBrokers []store.RuntimeBroker) (brokerID, refusal string) {
+	brokerID, refusal, _ = s.selectProjectRuntimeBrokerInternal(ctx, project, allProviders, availableBrokers)
+	return brokerID, refusal
+}
+
+func selectionBrokerPolicyError(b *store.RuntimeBroker) *brokerPolicyError {
+	remedy := "0 eligible brokers available. " + brokerPolicyRemedy(brokerPolicyOpDispatch, b)
+	return &brokerPolicyError{
+		Operation:    brokerPolicyOpDispatch,
+		Broker:       b,
+		Remedy:       remedy,
+		ExtraDetails: map[string]interface{}{"eligibleBrokers": 0},
+	}
+}
+
+func (s *Server) selectProjectRuntimeBrokerInternal(ctx context.Context, project *store.Project, allProviders []store.ProjectProvider, availableBrokers []store.RuntimeBroker) (brokerID, refusal string, policyErr *brokerPolicyError) {
+	// anyUsable reports whether an online provider passes
+	// canUseBrokerForProject. Computed only on refusal paths: it costs a
+	// dispatch check per online provider.
+	anyUsable := func() bool {
+		for i := range availableBrokers {
+			if s.canUseBrokerForProject(ctx, &availableBrokers[i], project) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Case 1: Use project's default runtime broker (must be online and dispatchable)
 	if project.DefaultRuntimeBrokerID != "" {
 		// Check if the default broker is still available
-		for _, h := range availableBrokers {
-			if h.ID == project.DefaultRuntimeBrokerID {
+		var defaultBroker *store.RuntimeBroker
+		for i := range availableBrokers {
+			if availableBrokers[i].ID == project.DefaultRuntimeBrokerID {
+				h := availableBrokers[i]
 				if s.canUseBrokerForProject(ctx, &h, project) {
-					return project.DefaultRuntimeBrokerID, nil
+					return project.DefaultRuntimeBrokerID, "", nil
 				}
+				defaultBroker = &h
 				// Default broker exists but user can't dispatch to it — fall through
 				break
 			}
 		}
 		// Default broker is not available or not dispatchable
-		if usable := usableBrokers(); len(usable) > 0 {
-			NoRuntimeBroker(w, "Default runtime broker is unavailable; specify an alternative", usable)
-		} else {
-			NoRuntimeBroker(w, "Default runtime broker is unavailable and no alternatives found", usable)
+		if anyUsable() {
+			return "", "Default runtime broker is unavailable; specify an alternative", nil
 		}
-		return "", store.ErrNotFound
+		if defaultBroker != nil && s.brokerRejectedOnlyByPolicy(ctx, defaultBroker, project) {
+			pe := selectionBrokerPolicyError(defaultBroker)
+			return "", pe.Error(), pe
+		}
+		return "", "Default runtime broker is unavailable and no alternatives found", nil
 	}
 
-	// Case 2.5: Hub-level default broker (from hub operational agent_defaults).
+	// Case 2: Hub-level default broker (from hub operational agent_defaults).
 	// Used when the project has no default broker set. The hub default must be a
 	// provider for this project and must be online and dispatchable.
 	if hubDefault := s.hubAgentDefaults().DefaultRuntimeBroker; hubDefault != "" {
@@ -2296,7 +2574,7 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 				if s.canUseBrokerForProject(ctx, &h, project) {
 					slog.Info("Using hub-level default runtime broker",
 						"broker", h.Name, "brokerID", h.ID, "project_id", project.ID)
-					return h.ID, nil
+					return h.ID, "", nil
 				}
 				break
 			}
@@ -2313,14 +2591,16 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 		broker, brokerErr := s.store.GetRuntimeBroker(ctx, allProviders[0].BrokerID)
 		present := brokerErr == nil && s.brokerPresence(ctx, broker).Connected
 		if present && s.canUseBrokerForProject(ctx, broker, project) {
-			return allProviders[0].BrokerID, nil
+			return allProviders[0].BrokerID, "", nil
 		}
 		if present {
-			NoRuntimeBroker(w, "No runtime brokers available for this project that you have permission to use", usableBrokers())
-		} else {
-			NoRuntimeBroker(w, "This project's only runtime broker is offline", usableBrokers())
+			if s.brokerRejectedOnlyByPolicy(ctx, broker, project) {
+				pe := selectionBrokerPolicyError(broker)
+				return "", pe.Error(), pe
+			}
+			return "", "No runtime brokers available for this project that you have permission to use", nil
 		}
-		return "", store.ErrNotFound
+		return "", "This project's only runtime broker is offline", nil
 	}
 
 	// Case 4: Multiple providers - filter to dispatchable brokers, then require selection
@@ -2334,20 +2614,34 @@ func (s *Server) resolveRuntimeBroker(ctx context.Context, w http.ResponseWriter
 	switch len(dispatchable) {
 	case 0:
 		if len(availableBrokers) > 0 {
-			// Online brokers exist, but none the caller may use.
-			NoRuntimeBroker(w, "No runtime brokers available for this project that you have permission to use", usableBrokers())
+			// Online brokers exist, but none the caller may use. When every
+			// online candidate was rejected only by broker_policy.admin_managed_only
+			// (design §4.3.C), surface the policy refusal with eligible count (0)
+			// and remedy. Mixed cases keep the generic permission message.
+			var policyRejected []store.RuntimeBroker
+			for i := range availableBrokers {
+				if s.brokerRejectedOnlyByPolicy(ctx, &availableBrokers[i], project) {
+					policyRejected = append(policyRejected, availableBrokers[i])
+				}
+			}
+			if len(policyRejected) == len(availableBrokers) {
+				var single *store.RuntimeBroker
+				if len(policyRejected) == 1 {
+					single = &policyRejected[0]
+				}
+				pe := selectionBrokerPolicyError(single)
+				return "", pe.Error(), pe
+			}
+			return "", "No runtime brokers available for this project that you have permission to use", nil
 		} else if len(allProviders) == 0 {
-			NoRuntimeBroker(w, "No runtime brokers available for this project; register a runtime broker first", usableBrokers())
-		} else {
-			NoRuntimeBroker(w, "None of this project's runtime brokers are online", usableBrokers())
+			return "", "No runtime brokers available for this project; register a runtime broker first", nil
 		}
-		return "", store.ErrNotFound
+		return "", "None of this project's runtime brokers are online", nil
 	case 1:
-		return dispatchable[0].ID, nil
+		return dispatchable[0].ID, "", nil
 	default:
 		// Multiple dispatchable brokers - require explicit selection
-		NoRuntimeBroker(w, "Multiple runtime brokers available for this project; specify runtimeBrokerId to select one", usableBrokers())
-		return "", store.ErrNotFound
+		return "", "Multiple runtime brokers available for this project; specify runtimeBrokerId to select one", nil
 	}
 }
 
@@ -2403,17 +2697,22 @@ func (s *Server) canDispatchToBroker(ctx context.Context, broker *store.RuntimeB
 // image on broker (the harness-config image operations with broker_id). It
 // writes no HTTP response.
 //
-// Dispatch authority is checked first: a user or dev caller holding
-// broker.dispatch on the broker passes. A user or dev caller whose
-// credential is not an interactive session or dev credential
-// (sessionCredentialAllowed) is then refused, so the broker's auto-provide
-// setting never admits a user access token or any other non-session
-// credential. Every other caller is decided by canDispatchToBroker, the
-// shared-broker rule agent creation uses. Agent creation itself keeps
-// canUseBrokerForProject.
+// When broker_policy.admin_managed_only is active, non-managed brokers are
+// refused first (before the broker.dispatch arm, with no super-admin
+// exemption; design ptone/scion#7829 §4.3.C). Dispatch authority is checked
+// next: a user or dev caller holding broker.dispatch on the broker passes. A
+// user or dev caller whose credential is not an interactive session or dev
+// credential (sessionCredentialAllowed) is then refused, so the broker's
+// auto-provide setting never admits a user access token or any other
+// non-session credential. Every other caller is decided by
+// canDispatchToBroker, the shared-broker rule agent creation uses. Agent
+// creation itself keeps canUseBrokerForProject.
 func (s *Server) canRunBrokerImageOps(ctx context.Context, broker *store.RuntimeBroker) bool {
 	identity := GetIdentityFromContext(ctx)
 	if isNilIdentity(identity) || broker == nil {
+		return false
+	}
+	if s.brokerPolicyRefuses(broker) {
 		return false
 	}
 	if user, ok := identity.(UserIdentity); ok && (identity.Type() == "user" || identity.Type() == "dev") {
@@ -2452,13 +2751,41 @@ func (s *Server) canUseBrokerForProject(ctx context.Context, broker *store.Runti
 	})
 }
 
+// brokerRejectedOnlyByPolicy reports whether broker is refused by
+// broker_policy.admin_managed_only and would otherwise be usable by the caller
+// in ctx for project.
+func (s *Server) brokerRejectedOnlyByPolicy(ctx context.Context, broker *store.RuntimeBroker, project *store.Project) bool {
+	if broker == nil || !s.brokerPolicyRefuses(broker) {
+		return false
+	}
+	if hasRuntimeTargetDescriptor(broker) {
+		return s.brokerDispatchAllowedWithoutPolicy(ctx, broker, func(user UserIdentity) bool {
+			return s.userHoldsBrokerDispatch(ctx, user, broker)
+		})
+	}
+	return s.brokerDispatchAllowedWithoutPolicy(ctx, broker, func(user UserIdentity) bool {
+		if project != nil && s.brokerProviderHasOwnerConsent(ctx, broker, project.ID) {
+			return true
+		}
+		return s.userHoldsBrokerDispatch(ctx, user, broker)
+	})
+}
+
 // brokerDispatchAllowed is the single identity switch behind
 // canDispatchToBroker and canUseBrokerForProject. An unauthenticated caller
-// is denied; an auto-provide broker is allowed for every authenticated
-// caller; a user or dev caller is decided by userAllowed; an agent caller
-// needs ScopeAgentCreate and a broker that serves its own project; every
-// other identity type is denied.
+// is denied; when broker_policy.admin_managed_only is active, non-managed
+// brokers are refused before the AutoProvide arm (no super-admin exemption);
+// an auto-provide broker is allowed for every authenticated caller; a user or
+// dev caller is decided by userAllowed; an agent caller needs ScopeAgentCreate
+// and a broker that serves its own project; every other identity type is denied.
 func (s *Server) brokerDispatchAllowed(ctx context.Context, broker *store.RuntimeBroker, userAllowed func(UserIdentity) bool) bool {
+	if broker != nil && s.brokerPolicyRefuses(broker) {
+		return false
+	}
+	return s.brokerDispatchAllowedWithoutPolicy(ctx, broker, userAllowed)
+}
+
+func (s *Server) brokerDispatchAllowedWithoutPolicy(ctx context.Context, broker *store.RuntimeBroker, userAllowed func(UserIdentity) bool) bool {
 	identity := GetIdentityFromContext(ctx)
 	if identity == nil || broker == nil {
 		// Unauthenticated. Note this branch is inverted from allow to deny, not
@@ -2613,6 +2940,109 @@ func (s *Server) findBrokerByIDOrSlug(ctx context.Context, identifier string) (*
 	return nil, store.ErrNotFound
 }
 
+const brokerPrefixListPageSize = 200
+
+// findBrokerByPrefix resolves a runtime broker name or slug prefix (case-
+// insensitive) among non-plugin runtime brokers usable by the caller in
+// project. Returns:
+//   - (broker, nil, nil) when exactly one broker matches;
+//   - (nil, candidates, nil) when more than one broker matches, sorted by
+//     case-folded Name, Name, and ID;
+//   - (nil, nil, store.ErrNotFound) when nothing matches or prefix is blank.
+func (s *Server) findBrokerByPrefix(ctx context.Context, prefix string, project *store.Project) (*store.RuntimeBroker, []store.RuntimeBroker, error) {
+	if strings.TrimSpace(prefix) == "" {
+		return nil, nil, store.ErrNotFound
+	}
+	prefixLower := strings.ToLower(prefix)
+	var matches []store.RuntimeBroker
+	seenIDs := make(map[string]struct{})
+	seenCursors := make(map[string]struct{})
+	cursor := ""
+	for {
+		page, err := s.store.ListRuntimeBrokers(ctx, store.RuntimeBrokerFilter{},
+			store.ListOptions{Limit: brokerPrefixListPageSize, Cursor: cursor, SkipTotalCount: true})
+		if err != nil {
+			return nil, nil, err
+		}
+		if page == nil {
+			break
+		}
+		for i := range page.Items {
+			b := &page.Items[i]
+			if isPluginBroker(b) {
+				continue
+			}
+			if _, dup := seenIDs[b.ID]; dup {
+				continue
+			}
+			nameMatch := b.Name != "" && strings.HasPrefix(strings.ToLower(b.Name), prefixLower)
+			slugMatch := b.Slug != "" && strings.HasPrefix(strings.ToLower(b.Slug), prefixLower)
+			if (!nameMatch && !slugMatch) || !s.canUseBrokerForProject(ctx, b, project) {
+				continue
+			}
+			seenIDs[b.ID] = struct{}{}
+			matches = append(matches, *b)
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		if _, dup := seenCursors[page.NextCursor]; dup {
+			return nil, nil, fmt.Errorf("listing runtime brokers for prefix match: pagination returned repeated cursor %q", page.NextCursor)
+		}
+		seenCursors[page.NextCursor] = struct{}{}
+		cursor = page.NextCursor
+	}
+	switch len(matches) {
+	case 0:
+		return nil, nil, store.ErrNotFound
+	case 1:
+		return &matches[0], nil, nil
+	default:
+		sort.Slice(matches, func(i, j int) bool {
+			li, lj := strings.ToLower(matches[i].Name), strings.ToLower(matches[j].Name)
+			if li != lj {
+				return li < lj
+			}
+			if matches[i].Name != matches[j].Name {
+				return matches[i].Name < matches[j].Name
+			}
+			return matches[i].ID < matches[j].ID
+		})
+		return nil, matches, nil
+	}
+}
+
+// writeRuntimeBrokerPrefixAmbiguous writes a 409 runtime_broker_ambiguous
+// response when a broker prefix matches multiple usable brokers, suggesting
+// their canonical names (and IDs when two candidates share a case-folded name).
+func writeRuntimeBrokerPrefixAmbiguous(w http.ResponseWriter, requested string, candidates []store.RuntimeBroker, defaultBrokerID string) {
+	nameCounts := make(map[string]int, len(candidates))
+	for _, b := range candidates {
+		nameCounts[strings.ToLower(b.Name)]++
+	}
+	labels := make([]string, 0, len(candidates))
+	summaries := make([]RuntimeBrokerSummary, 0, len(candidates))
+	for _, b := range candidates {
+		if nameCounts[strings.ToLower(b.Name)] > 1 {
+			labels = append(labels, fmt.Sprintf("%q (%s)", b.Name, b.ID))
+		} else {
+			labels = append(labels, fmt.Sprintf("%q", b.Name))
+		}
+		summaries = append(summaries, RuntimeBrokerSummary{
+			ID:        b.ID,
+			Name:      b.Name,
+			Status:    b.Status,
+			IsDefault: defaultBrokerID != "" && b.ID == defaultBrokerID,
+		})
+	}
+	message := fmt.Sprintf("Runtime broker prefix %q is ambiguous; matching brokers: %s",
+		requested, strings.Join(labels, ", "))
+	writeError(w, http.StatusConflict, ErrCodeRuntimeBrokerAmbiguous, message, map[string]interface{}{
+		"requestedBrokerId": requested,
+		"candidates":        summaries,
+	})
+}
+
 // agentHasGCPIdentityAssigned returns true when the agent's own GCPIdentity
 // config has MetadataMode set to assign or passthrough, mirroring the
 // broker's own preflight check (pkg/runtimebroker/handlers.go's
@@ -2646,19 +3076,65 @@ func agentHasGCPIdentityAssigned(agent *store.Agent) bool {
 // An agent whose GCPIdentity is explicitly block gets no metadata server, so
 // the project's verified service accounts do not count (ptone/scion#7733):
 // the broker auto-detects a non-GCP auth type for it, and the hub must agree
-// or it skips the no-auth fallback. Otherwise a verified project-scope service
-// account or the agent's own assign/passthrough identity counts. A nil
-// GCPIdentity still counts the project SA, since the hub cannot see whether
-// the broker will default it to block or passthrough (see
-// agentHasGCPIdentityAssigned).
+// or it skips the no-auth fallback. On a flat Cloud Run Runtime Broker, unset
+// and confined passthrough dispatches downgrade to block_service_account with
+// SCION_METADATA_MODE=block, so only assign or unconfined passthrough gives
+// the container metadata credentials. Otherwise a verified project-scope
+// service account or the agent's own assign/passthrough identity counts. A nil
+// GCPIdentity on a non-flat-Cloud-Run target still counts the project SA,
+// since the hub cannot see whether the broker will default it to block or
+// passthrough (see agentHasGCPIdentityAssigned).
 func (s *Server) agentGCPCredentialsAvailable(ctx context.Context, agent *store.Agent) (bool, error) {
 	if agentGCPIdentityBlocked(agent) {
+		return false, nil
+	}
+	flatCR, err := s.agentTargetsFlatCloudRun(ctx, agent)
+	if err != nil {
+		return false, err
+	}
+	if flatCR {
+		if agent == nil || agent.AppliedConfig == nil || agent.AppliedConfig.GCPIdentity == nil {
+			return false, nil
+		}
+		gcp := agent.AppliedConfig.GCPIdentity
+		if gcp.MetadataMode == store.GCPMetadataModeAssign {
+			return true, nil
+		}
+		if gcp.MetadataMode == store.GCPMetadataModePassthrough && !gcp.RequireLocalRuntime {
+			return true, nil
+		}
 		return false, nil
 	}
 	if agentHasGCPIdentityAssigned(agent) {
 		return true, nil
 	}
 	return s.projectHasVerifiedGCPSA(ctx, agent.ProjectID)
+}
+
+// agentTargetsFlatCloudRun reports whether agent is pinned or assigned to a
+// flat Cloud Run Runtime Broker.
+func (s *Server) agentTargetsFlatCloudRun(ctx context.Context, agent *store.Agent) (bool, error) {
+	if agent == nil {
+		return false, nil
+	}
+	if agent.PinnedRuntimeTargetType == flatCloudRunTargetType {
+		return true, nil
+	}
+	brokerID := agent.RuntimeBrokerID
+	if brokerID == "" {
+		brokerID = agent.PinnedRuntimeBrokerID
+	}
+	if brokerID == "" || s.store == nil {
+		return false, nil
+	}
+	broker, err := s.store.GetRuntimeBroker(ctx, brokerID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return flatCloudRunBroker(broker), nil
 }
 
 // agentGCPIdentityBlocked returns true when the agent's own GCPIdentity
@@ -2841,11 +3317,14 @@ func (s *Server) projectHasVerifiedGCPSA(ctx context.Context, projectID string) 
 // read; deliverySelector.probe). Before that (the create-time probe)
 // there is no target to authorize against and the record counts by
 // existence, as the start still authorizes every item before delivery.
-// An owner's user-scope row not shared with progeny counts only when the
-// owner material chain rule would deliver it (start_owner_material_chain.go).
-// An owner's secret shared with progeny, and an ancestor's progeny secret,
-// count only when start delivers them too (ownerChainCheck.allowsSecretRow
-// and sharedChainWithheld).
+// Once the agent's own record exists (newProbeOwnerChainCheck), an owner's
+// user-scope row not shared with progeny counts only when the owner material
+// chain rule would deliver it (start_owner_material_chain.go), and an
+// owner's secret shared with progeny or an ancestor's progeny secret counts
+// only when start delivers it too (ownerChainCheck.allowsSecretRow and
+// sharedChainWithheld). Before the agent is stored (the create-time probe)
+// the creating owner's rows count by existence, and start enforces the rule
+// once the agent and its delegation edge are stored.
 // A hub-scope secret counts only if secret.HubSecretDeliverable admits it,
 // at either time, since no other hub-scope secret is ever delivered.
 func (s *Server) hasAnyKey(ctx context.Context, agent *store.Agent, keys []string) (bool, error) {
@@ -2863,8 +3342,22 @@ func (s *Server) hasAnyKey(ctx context.Context, agent *store.Agent, keys []strin
 		return sel.probe(ctx, kind, record, id, key, scope, scopeID)
 	}
 	// An owner's user row the owner material chain rule withholds at start
-	// does not count as present (decided without a report).
-	ownerRows := newOwnerChainCheck(s.authzService, agent)
+	// does not count as present (decided without a report). Before the agent
+	// record is stored (the create-time probe), newProbeOwnerChainCheck
+	// returns nil, mirroring newProbeDeliverySelector.
+	var ownerRows *ownerChainCheck
+	ownerRowsReady := false
+	ownerCheck := func() (*ownerChainCheck, error) {
+		if !ownerRowsReady {
+			var err error
+			ownerRows, err = s.newProbeOwnerChainCheck(ctx, agent)
+			if err != nil {
+				return nil, err
+			}
+			ownerRowsReady = true
+		}
+		return ownerRows, nil
+	}
 	for _, key := range keys {
 		if agent.AppliedConfig != nil && agent.AppliedConfig.Env != nil {
 			if _, ok := agent.AppliedConfig.Env[key]; ok {
@@ -2876,15 +3369,27 @@ func (s *Server) hasAnyKey(ctx context.Context, agent *store.Agent, keys []strin
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				return false, err
 			}
-			if ev != nil && ownerRows.allowsRow(ctx, ev.AllowProgeny, ownerRowScope(ev.ScopeID, agent.OwnerID)) {
-				return true, nil
+			if ev != nil {
+				oc, err := ownerCheck()
+				if err != nil {
+					return false, err
+				}
+				if oc.allowsRow(ctx, ev.AllowProgeny, ownerRowScope(ev.ScopeID, agent.OwnerID)) {
+					return true, nil
+				}
 			}
 			sec, err := s.store.GetSecret(ctx, key, "user", agent.OwnerID)
 			if err != nil && !errors.Is(err, store.ErrNotFound) {
 				return false, err
 			}
-			if sec != nil && ownerRows.allowsSecretRow(ctx, sec.AllowProgeny, ownerRowScope(sec.ScopeID, agent.OwnerID)) {
-				return true, nil
+			if sec != nil {
+				oc, err := ownerCheck()
+				if err != nil {
+					return false, err
+				}
+				if oc.allowsSecretRow(ctx, sec.AllowProgeny, ownerRowScope(sec.ScopeID, agent.OwnerID)) {
+					return true, nil
+				}
 			}
 		}
 		for _, sc := range []struct{ scope, scopeID string }{
@@ -2943,7 +3448,11 @@ func (s *Server) hasAnyKey(ctx context.Context, agent *store.Agent, keys []strin
 		// Start refuses every progeny secret to an agent whose chain is
 		// not recorded or cannot be evaluated (the runtime chain verdict;
 		// sharedChainWithheld), so none of them counts as present then.
-		if !ownerRows.sharedChainWithheld(ctx) {
+		oc, err := ownerCheck()
+		if err != nil {
+			return false, err
+		}
+		if !oc.sharedChainWithheld(ctx) {
 			progenySecrets, err := s.store.ListProgenySecrets(ctx, agent.Ancestry)
 			if err != nil {
 				return false, err
@@ -3023,30 +3532,29 @@ func (s *Server) existingAgentGoneAfterLanding(ctx context.Context, w http.Respo
 	return true
 }
 
-// resolveHarnessConfigBySlug looks up the hub harness config named name:
-// in the project's scope first (when projectID is set), then globally. It
-// returns (nil, nil) when neither scope has one. A store failure other than
-// not-found is logged and returned with a nil config, after the global scope
-// was still tried.
+// resolveHarnessConfigBySlug looks up the hub harness config named name in
+// the scopes harnessConfigLookupScopes gives: project then global on a
+// workstation hub, global then project on a hosted hub. It returns (nil, nil)
+// when no scope has one. A store failure other than not-found is logged; on
+// a workstation hub the next scope is still tried and the failure returned
+// with a nil config if none matches, while on a hosted hub a failed global
+// lookup is returned at once, so the project scope is never consulted
+// without knowing whether a global config of that slug exists.
 func (s *Server) resolveHarnessConfigBySlug(ctx context.Context, projectID, name string) (*store.HarnessConfig, error) {
 	var lookupErr error
-	if projectID != "" {
-		hc, err := s.store.GetHarnessConfigBySlug(ctx, name, store.HarnessConfigScopeProject, projectID)
+	for _, sc := range s.harnessConfigLookupScopes(projectID) {
+		hc, err := s.store.GetHarnessConfigBySlug(ctx, name, sc.scope, sc.scopeID)
 		if err == nil && hc != nil {
 			return hc, nil
 		}
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			s.agentLifecycleLog.Warn("failed to get project harness config by slug", "slug", name, "project_id", projectID, "error", err)
+			s.agentLifecycleLog.Warn("failed to get "+sc.scope+" harness config by slug",
+				"slug", name, "scope_id", sc.scopeID, "error", err)
+			if !s.workstation && sc.scope == store.HarnessConfigScopeGlobal {
+				return nil, err
+			}
 			lookupErr = err
 		}
-	}
-	hc, err := s.store.GetHarnessConfigBySlug(ctx, name, store.HarnessConfigScopeGlobal, "")
-	if err == nil && hc != nil {
-		return hc, nil
-	}
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.agentLifecycleLog.Warn("failed to get global harness config by slug", "slug", name, "error", err)
-		lookupErr = err
 	}
 	return nil, lookupErr
 }

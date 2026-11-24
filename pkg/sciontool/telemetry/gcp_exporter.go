@@ -52,7 +52,7 @@ type GCPExporter struct {
 	// entries instead (tests).
 	analyticsOnce   sync.Once
 	analyticsLogger *logging.Logger
-	analyticsSink   func(logging.Entry) error
+	analyticsSink   func(context.Context, logging.Entry) error
 }
 
 // NewGCPExporter creates a new GCP-native exporter for traces, metrics, and logs.
@@ -135,6 +135,9 @@ func (e *GCPExporter) reportAsyncLogError(err error) {
 	e.asyncLogErrors.Add(1)
 	if e.onAsyncLogError != nil {
 		e.onAsyncLogError(err)
+		if isPermanentAuthError(err) {
+			return
+		}
 	}
 	log.Error("Cloud Logging asynchronous delivery failed: %v", err)
 }
@@ -254,7 +257,11 @@ func (e *GCPExporter) ExportProtoLogs(ctx context.Context, resourceLogs []*logsp
 	}
 	if e.logger != nil && e.logSink == nil {
 		if err := e.logger.Flush(); err != nil {
-			return &partialSuccessError{message: fmt.Sprintf("Cloud Logging flush failed with unknown per-record outcome: %v", err)}
+			return &partialSuccessError{
+				message:    fmt.Sprintf("Cloud Logging flush failed with unknown per-record outcome: %v", err),
+				causeClass: classifyError(err),
+				statusCode: status.Code(err).String(),
+			}
 		}
 	}
 	return nil
@@ -367,7 +374,7 @@ func (e *GCPExporter) SendAnalytics(ctx context.Context, line []byte) error {
 		return PermanentSendError(err)
 	}
 	if e.analyticsSink != nil {
-		return classifyAnalyticsSendError(e.analyticsSink(entry))
+		return classifyAnalyticsSendError(e.analyticsSink(ctx, entry))
 	}
 	if e.logClient == nil {
 		return errors.New("GCP analytics exporter unavailable")

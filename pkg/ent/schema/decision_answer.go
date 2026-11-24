@@ -66,6 +66,12 @@ func (DecisionAnswer) Fields() []ent.Field {
 			Immutable(),
 		field.String("choice_label").
 			Immutable(),
+		// other_text is the user's trimmed free-form text, set iff
+		// choice_id = "$other" (design-8146 §4.2). Kept on user deletion (D6).
+		field.Text("other_text").
+			Optional().
+			Nillable().
+			Immutable(),
 		// answered_by_user_id is cleared when the user is deleted; the name
 		// and email snapshots stay.
 		field.String("answered_by_user_id").
@@ -83,10 +89,16 @@ func (DecisionAnswer) Fields() []ent.Field {
 			Values("direct", "agent_interpreted").
 			Immutable(),
 		// outcome: confirm and override only on a direct row that follows
-		// an interpreted one.
+		// an interpreted one; dismiss on a user dismissal row.
 		field.Enum("outcome").
-			Values("answer", "confirm", "override").
+			Values("answer", "confirm", "override", "dismiss").
 			Default("answer").
+			Immutable(),
+		// dismiss_reason is optional plain text (<= 500 runes) set only when
+		// outcome == dismiss.
+		field.Text("dismiss_reason").
+			Optional().
+			Nillable().
 			Immutable(),
 		// interpreted_by_agent_id and source_message_id are set iff the
 		// provenance is agent_interpreted.
@@ -100,9 +112,9 @@ func (DecisionAnswer) Fields() []ent.Field {
 			Immutable(),
 		// surface is where the user acted.
 		field.Enum("surface").
-			Values("native", "slack", "google_chat", "discord", "telegram", "teams", "other").
+			Values("native", "decisions_page", "slack", "google_chat", "discord", "telegram", "teams", "other").
 			Immutable(),
-		// response_message_id is the choice-response message.
+		// response_message_id is the decision-response message.
 		field.UUID("response_message_id", uuid.UUID{}).
 			Immutable(),
 		// authorizing_user_id / delegation_grant_id: the same delegated-send
@@ -154,7 +166,10 @@ func (DecisionAnswer) Indexes() []ent.Index {
 			Unique(),
 		// The project's decision log, newest first.
 		index.Fields("project_id", "created_at"),
-		// History joins choice-response messages to their answer.
+		// The decision log filtered by asking agent (Decisions agent
+		// filter on Made), newest first.
+		index.Fields("project_id", "asker_agent_id", "created_at"),
+		// History joins decision-response messages to their answer.
 		index.Fields("response_message_id"),
 		// User deletion clears answered_by_user_id on the user's answers.
 		index.Fields("answered_by_user_id"),

@@ -388,6 +388,19 @@
       },
       "additionalProperties": false
     },
+    "broker_policy": {
+      "type": "object",
+      "description": "Hub-level policy for Runtime Brokers. Global-only.",
+      "x-scope": "global",
+      "x-since": "1",
+      "properties": {
+        "admin_managed_only": {
+          "type": "boolean",
+          "description": "When true (and experiment hub.admin_managed_brokers is enabled), restricts Runtime Broker registration, attachment, placement, and agent starts to admin-managed brokers. Default false."
+        }
+      },
+      "additionalProperties": false
+    },
     "auto_expose_ports": {
       "type": "object",
       "description": "Hub-level default for automatically exposing agent container ports. Global-only.",
@@ -690,13 +703,22 @@
             "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
             "maxLength": 253
           },
-          "description": "Maps a lowercase GCP service account email to the Kubernetes ServiceAccount (KSA) name it is bound to via Workload Identity, for GCP identity mode 'assign' on the Kubernetes runtime. Scion does not create, annotate, or bind the KSA; it must already be pre-provisioned by the operator. Only settings the broker itself resolves (this runtime entry, or a same-keyed entry in a profile defined in the same operator-controlled settings) are consulted; a project's own settings.yaml cannot add or override entries here. A same-keyed entry in the active profile overrides this one."
+          "description": "Maps a lowercase GCP service account email to the Kubernetes ServiceAccount (KSA) name it is bound to via Workload Identity, for GCP identity mode 'assign' on the Kubernetes runtime. Scion does not create, annotate, or bind KSAs listed here; each mapped KSA must already be pre-provisioned by the operator (for opt-in creation of the conventional KSA for Hub-minted GSAs, see create_service_accounts). Only settings the broker itself resolves (this runtime entry, or a same-keyed entry in a profile defined in the same operator-controlled settings) are consulted; a project's own settings.yaml cannot add or override entries here. A same-keyed entry in the active profile overrides this one."
         },
         "kubernetes_block_service_account": {
           "type": "string",
           "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
           "maxLength": 253,
           "description": "Kubernetes only. The Kubernetes ServiceAccount (KSA) a pod runs as when its GCP identity mode resolves to 'block'. It must be a dedicated KSA the operator provisions with no Workload Identity annotation and no IAM grants, so it is zero-privilege; Scion does not create or check it. Empty or unset means a block pod runs as the namespace's default ServiceAccount. Block pods also get automountServiceAccountToken false and a node selector for Workload Identity nodes. A profile value wins over this one. Read only from the broker's own operator-controlled settings."
+        },
+        "workload_identity_pool": {
+          "type": "string",
+          "pattern": "^$|^[a-z][a-z0-9-]{4,28}[a-z0-9]\\.svc\\.id\\.goog$",
+          "description": "Kubernetes only. The GKE Workload Identity pool of this entry's cluster, <cluster-project-id>.svc.id.goog. The broker reports it with the entry's namespace, and when the hub.k8s_workload_identity_setup experiment is on, a GCP service account the Hub mints is bound (roles/iam.workloadIdentityUser) to the Kubernetes ServiceAccount named after its account ID in that namespace. Read only from the broker's own operator-controlled settings, never from a project's settings.yaml."
+        },
+        "create_service_accounts": {
+          "type": "boolean",
+          "description": "Kubernetes only. When true (default false) and the hub.k8s_workload_identity_setup experiment is on, the broker creates the conventional Kubernetes ServiceAccount (<gsa-account-id>) in this entry's namespace on GCP identity mode 'assign' start of a Hub-minted GCP service account when no mapping or discovered annotation matches. Requires get, list, and create on serviceaccounts in the agent namespace. Read only from the broker's own operator-controlled settings, never from a project's settings.yaml."
         }
       },
       "additionalProperties": false
@@ -1436,6 +1458,12 @@
           "x-env-var": "SCION_SERVER_HUB_AGENTENDPOINT",
           "x-since": "1"
         },
+        "internal_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Optional Hub URL that hub-managed broker plugins call the Hub API on (the hub_url they receive), for deployments where public_url goes through an auth proxy or reverse proxy the plugins cannot pass (for example http://127.0.0.1:8080). It is not a public endpoint, and no other use reads this key. Plugins also receive public_url, but no plugin reads it yet: Slack, Teams, Telegram and Discord still build registration links from hub_url, so setting this key puts its address into those links (Discord's register_url overrides it; the others have no override yet). When unset, plugins receive public_url as hub_url too. Must be scheme://host[:port] only, by the rules of agent_endpoint; the Hub fails to start otherwise. Read once at startup. Settable only in the settings file or environment: the server-config API refuses this key in every mode. Security: with an http:// value off loopback, plugin API traffic travels unencrypted.",
+          "x-env-var": "SCION_SERVER_HUB_INTERNALURL"
+        },
         "class": {
           "type": "string",
           "description": "Deploy-time class of this hub. The only recognised value is \"test\"; unset means the hub is not a test hub. Read once at startup by the --test-mode gate: every level other than off requires \"test\". Settable only in the settings file or environment: the server-config API refuses this key in every mode.",
@@ -1482,6 +1510,11 @@
           "items": { "type": "string", "format": "email" },
           "description": "Email addresses to auto-promote to admin role.",
           "x-env-var": "SCION_SERVER_HUB_ADMINEMAILS"
+        },
+        "allowed_import_sources": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Sources, beyond https://github.com URLs, that a hosted Hub may fetch on its own host when it imports or discovers templates and harness-configs (import, discover, harness-config reimport). Each entry is an https:// URL prefix (no username, password, port other than 443, query or fragment) or a Google Cloud Storage prefix, gs://<bucket>/<prefix> or :gcs:<bucket>/<prefix>. Entries match on whole path segments. Plain http, the rclone local backend, other rclone backends and rclone connection strings with inline options can never be allowed. HTTP downloads reach public addresses only; redirects are blocked on allowlisted non-GitHub https:// sources. Unset, a hosted Hub fetches only https://github.com URLs. Workstation hubs are exempt. The Hub fails to start with an invalid entry. Read once at startup. Settable only in the settings file (no environment variable): the server-config API refuses this key in every mode."
         },
         "soft_delete_retention": {
           "type": "string",
@@ -1548,6 +1581,18 @@
           "x-env-var": "SCION_SERVER_HUB_STALLEDTHRESHOLD",
           "x-since": "1"
         },
+        "auto_suspend_idle": {
+          "type": "boolean",
+          "description": "Automatically suspend idle, completed, and harness-error agents after idle_suspend_after.",
+          "x-env-var": "SCION_SERVER_HUB_AUTOSUSPENDIDLE",
+          "x-since": "1"
+        },
+        "idle_suspend_after": {
+          "type": "string",
+          "description": "Duration an agent must remain in a suspend-eligible activity before idle auto-suspend applies (default '15m', minimum '5m').",
+          "x-env-var": "SCION_SERVER_HUB_IDLESUSPENDAFTER",
+          "x-since": "1"
+        },
         "start_claim_lease_ttl": {
           "type": "string",
           "description": "Lease of the claim every agent start holds; the holder renews it every third of this. Default '90s', allowed 30s to 5m.",
@@ -1603,6 +1648,14 @@
           "type": "integer",
           "description": "Broker keepalive interval, in seconds, sent to the broker with each asynchronous create. A launch with no broker report for 8x this value is ended. Restart required to change.",
           "x-env-var": "SCION_SERVER_HUB_LAUNCHKEEPALIVESECONDS",
+          "x-since": "1"
+        },
+        "audit_retention_days": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 90,
+          "description": "Number of days to retain mutation audit records in the Hub database (default 90). Set to 0 to disable automatic cleanup and retain records indefinitely. Negative values are rejected at startup. A periodic hourly maintenance job deletes records older than this window. Restart required to change.",
+          "x-env-var": "SCION_SERVER_HUB_AUDITRETENTIONDAYS",
           "x-since": "1"
         },
         "missing_agent_grace": {
@@ -1871,6 +1924,63 @@
               "x-since": "1"
             }
           }
+        },
+        "system_one": {
+          "type": "object",
+          "description": "System One message rule evaluation settings (hub.system_one experiment).",
+          "additionalProperties": false,
+          "properties": {
+            "max_eval_time": {
+              "type": "string",
+              "description": "Wall-clock budget for evaluating System One rules on a single message (e.g. '3s'; default '3s', must be > 0 and <= '30s').",
+              "x-env-var": "SCION_SERVER_HUB_SYSTEMONE_MAXEVALTIME",
+              "x-since": "1"
+            },
+            "secret_names": {
+              "type": "object",
+              "description": "Startup-only operator map of System One adapter ID to extra permitted named-secret keys (e.g. {\"gemini_decisions\": [\"MY_GEMINI_KEY\"]}). Layer-0; refused by the server-config API in every mode; changes require a Hub restart.",
+              "additionalProperties": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "x-since": "1"
+            }
+          }
+        },
+        "branding": {
+          "$ref": "#/$defs/serverHubBranding",
+          "description": "Hub-wide UI branding settings (product name, logos, icons, accent color, and WCAG AA validated light/dark color palettes).",
+          "x-since": "1"
+        },
+        "schedules": {
+          "type": "object",
+          "description": "Limits on recurring schedules, for every kind and author. Read at startup.",
+          "additionalProperties": false,
+          "properties": {
+            "min_interval": {
+              "type": "string",
+              "description": "Shortest interval a recurring schedule's cron expression may fire at, as a Go duration (default '5m'; '0s' turns the check off; at most '24h'). Checked on create, cron change, enable and resume.",
+              "x-env-var": "SCION_SERVER_HUB_SCHEDULES_MININTERVAL",
+              "x-since": "1"
+            },
+            "max_active_per_project": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000,
+              "description": "Most active recurring schedules one project may hold, of every kind (default 100; 0 = no cap). Checked on create, enable and resume.",
+              "x-env-var": "SCION_SERVER_HUB_SCHEDULES_MAXACTIVEPERPROJECT",
+              "x-since": "1"
+            }
+          }
+        },
+        "default_message_mode": {
+          "type": "string",
+          "enum": ["none", "lineage", "branch", "project"],
+          "description": "Message mode of a new agent when neither the create request, its template nor its parent agent sets one. Unset means 'project'. 'hub' is not accepted. Read at startup.",
+          "x-env-var": "SCION_SERVER_HUB_DEFAULTMESSAGEMODE",
+          "x-since": "1"
         }
       }
     },
@@ -1980,6 +2090,15 @@
               "maxLength": 253,
               "description": "Kubernetes only. The Kubernetes ServiceAccount this instance's pods run as when their GCP identity mode resolves to 'block'; a dedicated zero-privilege KSA the operator provisions. Empty or unset means the namespace's default ServiceAccount. Block pods also get automountServiceAccountToken false and a node selector for Workload Identity nodes. Local operator policy: not part of the runtime target identity and never sent to the Hub."
             },
+            "workload_identity_pool": {
+              "type": "string",
+              "pattern": "^$|^[a-z][a-z0-9-]{4,28}[a-z0-9]\\.svc\\.id\\.goog$",
+              "description": "Kubernetes only. The GKE Workload Identity pool of this instance's cluster, <cluster-project-id>.svc.id.goog. Local operator policy: not part of the runtime target identity or the presentation."
+            },
+            "create_service_accounts": {
+              "type": "boolean",
+              "description": "Kubernetes only. Default: false. When true and the Hub's hub.k8s_workload_identity_setup experiment is enabled, an unmapped Hub-minted GCP service account looks up the conventional Kubernetes ServiceAccount (<gsa-account-id>) by name in this instance's namespace (never listing serviceaccounts), creates it if missing, reuses it only if labeled app.kubernetes.io/managed-by=scion and annotated for the GSA, and otherwise fails with identity_ksa_conflict. Local operator policy: not part of the runtime target identity or the presentation."
+            },
             "kubernetes_service_account_mappings": {
               "type": "object",
               "propertyNames": {
@@ -2072,7 +2191,24 @@
               "type": "string",
               "pattern": "^(|[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com)$",
               "not": { "pattern": "^[0-9]+-compute@developer\\.gserviceaccount\\.com$|@appspot\\.gserviceaccount\\.com$|^service-[0-9]+@|@gcp-sa-" },
-              "description": "Cloud Run only, required. The user-managed service account (<name>@<project_id>.iam.gserviceaccount.com) agent instances run as. The project default service accounts (compute and App Engine) and Google-managed service agents are not allowed, and it must differ from the instance's credential principal. Agents can obtain its token, so it should hold no permissions in the project. Local operator policy: never sent to the Hub."
+              "description": "Cloud Run only, required. The user-managed service account (<name>@<project_id>.iam.gserviceaccount.com) agent instances run as when GCP identity mode is passthrough. The project default service accounts (compute and App Engine) and Google-managed service agents are not allowed, and it must differ from block_service_account and the instance's credential principal. Local operator policy: never sent to the Hub."
+            },
+            "block_service_account": {
+              "type": "string",
+              "pattern": "^(|[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com)$",
+              "not": { "pattern": "^[0-9]+-compute@developer\\.gserviceaccount\\.com$|@appspot\\.gserviceaccount\\.com$|^service-[0-9]+@|@gcp-sa-" },
+              "description": "Cloud Run only, required. The no-role user-managed service account (<name>@<project_id>.iam.gserviceaccount.com) agents with no GCP identity (unset or block) run as. Must differ from service_account, must not appear in assignable_service_accounts, and must differ from the instance's credential principal. Local operator policy: never sent to the Hub."
+            },
+            "assignable_service_accounts": {
+              "type": "array",
+              "maxItems": 64,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\\.iam\\.gserviceaccount\\.com$",
+                "not": { "pattern": "^[0-9]+-compute@developer\\.gserviceaccount\\.com$|@appspot\\.gserviceaccount\\.com$|^service-[0-9]+@|@gcp-sa-" }
+              },
+              "description": "Cloud Run only. Optional allow-list of user-managed service accounts (<name>@<project_id>.iam.gserviceaccount.com) agents may be assigned on this instance (at most 64 unique lower-case entries, excluding block_service_account and the instance's credential principal). Local operator policy: never sent to the Hub."
             },
             "network": {
               "type": "string",
@@ -2112,11 +2248,12 @@
             {
               "if": { "properties": { "type": { "const": "cloudrun" } } },
               "then": {
-                "required": ["project_id", "region", "service_account", "credentials_file"],
+                "required": ["project_id", "region", "service_account", "block_service_account", "credentials_file"],
                 "properties": {
                   "project_id": { "minLength": 1 },
                   "region": { "minLength": 1 },
                   "service_account": { "minLength": 1 },
+                  "block_service_account": { "minLength": 1 },
                   "credentials_file": { "minLength": 1 }
                 },
                 "anyOf": [
@@ -2137,6 +2274,8 @@
         { "required": ["namespace"], "properties": { "namespace": { "minLength": 1 } } },
         { "required": ["kubeconfig"], "properties": { "kubeconfig": { "minLength": 1 } } },
         { "required": ["kubernetes_block_service_account"], "properties": { "kubernetes_block_service_account": { "minLength": 1 } } },
+        { "required": ["workload_identity_pool"], "properties": { "workload_identity_pool": { "minLength": 1 } } },
+        { "required": ["create_service_accounts"], "properties": { "create_service_accounts": { "const": true } } },
         { "required": ["kubernetes_service_account_mappings"], "properties": { "kubernetes_service_account_mappings": { "minProperties": 1 } } },
         { "required": ["shared_dir_storage_class"], "properties": { "shared_dir_storage_class": { "minLength": 1 } } },
         { "required": ["shared_dir_size"], "properties": { "shared_dir_size": { "minLength": 1 } } },
@@ -2149,11 +2288,13 @@
       ]
     },
     "runtimeTargetCloudRunFieldsSet": {
-      "description": "Matches a runtime_target that sets any Cloud-Run-only field to a non-empty string.",
+      "description": "Matches a runtime_target that sets any Cloud-Run-only field to a non-empty string or list.",
       "anyOf": [
         { "required": ["project_id"], "properties": { "project_id": { "minLength": 1 } } },
         { "required": ["region"], "properties": { "region": { "minLength": 1 } } },
         { "required": ["service_account"], "properties": { "service_account": { "minLength": 1 } } },
+        { "required": ["block_service_account"], "properties": { "block_service_account": { "minLength": 1 } } },
+        { "required": ["assignable_service_accounts"], "properties": { "assignable_service_accounts": { "minItems": 1 } } },
         { "required": ["network"], "properties": { "network": { "minLength": 1 } } },
         { "required": ["subnetwork"], "properties": { "subnetwork": { "minLength": 1 } } },
         { "required": ["credentials_file"], "properties": { "credentials_file": { "minLength": 1 } } }
@@ -2247,6 +2388,11 @@
           "description": "PostgreSQL only. By default the hub refuses to start, and the maintenance commands that migrate the hub database refuse to run, when current_schema() has no hub tables but a later schema on the connection's search_path does, because the migration would create a new, empty table set that hides the existing data. Set true to log a warning and continue anyway, creating the new table set in the current schema.",
           "x-env-var": "SCION_SERVER_DATABASE_ALLOWSHADOWEDSCHEMA"
         },
+        "relay_role": {
+          "type": "string",
+          "description": "PostgreSQL only. Optional role name (for example '<hub>-relay') to which hub schema migration grants the minimum privileges required by separate conduit relays (scion server --role relay): CONNECT on the current database and USAGE on the current schema when missing, SELECT/INSERT/UPDATE/DELETE on relay_instances and conduit_sessions, SELECT/INSERT/UPDATE on conduit_principal_epochs, and SELECT on hub_settings. Ignored on SQLite and on --role relay. Startup fails if the named role does not exist.",
+          "x-env-var": "SCION_SERVER_DATABASE_RELAYROLE"
+        },
         "tx_diagnostics": {
           "type": "object",
           "description": "Transaction-hold and lock-wait diagnostics for the hub database. A transaction or connection checkout held past hold_warn_threshold, or a request that waited past lock_wait_warn_threshold for a connection, logs one WARN per call site and kind per warn_interval; hold and wait histograms are recorded when metrics export is on.",
@@ -2305,8 +2451,7 @@
         },
         "default_user_role": {
           "type": "string",
-          "description": "Role assigned to new users not in admin_emails. Values: 'member' (default), 'viewer'. 'admin' is blocked.",
-          "enum": ["member", "viewer"],
+          "description": "Role assigned to new users not in admin_emails. Values: 'member' (default), 'viewer', or an eligible custom system-scope role name when hub.custom_default_user_role is enabled. 'admin' is blocked.",
           "default": "member",
           "x-env-var": "SCION_SERVER_AUTH_DEFAULTUSERROLE",
           "x-since": "1"
@@ -2330,7 +2475,7 @@
           "type": "object",
           "description": "Proxy auth settings, consulted when mode is 'proxy'.",
           "properties": {
-            "provider": { "type": "string", "description": "Proxy auth provider: 'iap', 'jwt' or 'header'. Any other value is a startup error when mode is 'proxy'." },
+            "provider": { "type": "string", "description": "Proxy auth provider: 'iap' or 'jwt'. Any other value is a startup error when mode is 'proxy'." },
             "iap": {
               "type": "object",
               "description": "Google IAP settings.",
@@ -2345,6 +2490,11 @@
               "description": "Settings for the generic JWT proxy auth provider.",
               "properties": {
                 "header": { "type": "string", "description": "Request header that carries the JWT." },
+                "identity_headers": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Additional user identity headers set by the front proxy (for example email or ID headers) to strip before forwarding requests to an agent's exposed port."
+                },
                 "algorithm": { "type": "string", "description": "Expected JWT signing algorithm." },
                 "issuer": { "type": "string", "description": "Expected JWT issuer." },
                 "audience": { "type": "string", "description": "If set, validated against the JWT 'aud' claim." },
@@ -3000,7 +3150,9 @@
         "webhook_secret": { "type": "string", "x-sensitive": true },
         "api_base_url": { "type": "string" },
         "webhooks_enabled": { "type": "boolean" },
-        "installation_url": { "type": "string" }
+        "installation_url": { "type": "string" },
+        "app_slug": { "type": "string", "description": "Optional override for the GitHub App slug used in @mention command detection when GET /app is unavailable." },
+        "command_mention_aliases": { "type": "array", "items": { "type": "string" }, "description": "Additional @mention handles (without leading @) accepted alongside the GitHub App slug for slash-command detection." }
       },
       "additionalProperties": false
     },
@@ -3112,6 +3264,161 @@
         "allow_visitor_grants": {
           "type": "boolean",
           "description": "Let project owners grant visitor access to users of this issuer (issuer_type user or hub). Default false."
+        }
+      },
+      "additionalProperties": false
+    },
+    "hexColor": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "6-digit #RRGGBB hex color."
+    },
+    "brandAssetURI": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 180000,
+      "description": "Brand image URI: an https:// URL (<= 2048 chars), a same-origin /path (<= 512 chars), or a base64 data:image/{svg+xml,png,webp,x-icon};base64,... URI (<= 128 KiB decoded)."
+    },
+    "brandScale": {
+      "type": "object",
+      "description": "Optional 50..950 shade step hex overrides.",
+      "patternProperties": {
+        "^(50|100|200|300|400|500|600|700|800|900|950)$": {
+          "$ref": "#/$defs/hexColor"
+        }
+      },
+      "additionalProperties": false
+    },
+    "brandSemanticMode": {
+      "type": "object",
+      "description": "Semantic color token overrides (#RRGGBB) for one theme mode.",
+      "properties": {
+        "bg": { "$ref": "#/$defs/hexColor" },
+        "bg_subtle": { "$ref": "#/$defs/hexColor" },
+        "surface": { "$ref": "#/$defs/hexColor" },
+        "surface_raised": { "$ref": "#/$defs/hexColor" },
+        "text": { "$ref": "#/$defs/hexColor" },
+        "text_secondary": { "$ref": "#/$defs/hexColor" },
+        "text_muted": { "$ref": "#/$defs/hexColor" },
+        "border": { "$ref": "#/$defs/hexColor" },
+        "primary": { "$ref": "#/$defs/hexColor" },
+        "primary_hover": { "$ref": "#/$defs/hexColor" },
+        "primary_active": { "$ref": "#/$defs/hexColor" },
+        "primary_text": { "$ref": "#/$defs/hexColor" }
+      },
+      "additionalProperties": false
+    },
+    "serverHubBranding": {
+      "type": "object",
+      "description": "Hub-wide UI branding configuration. Reloads live without restart.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Product display name (1..64 characters, no control characters; default 'Scion').",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_NAME"
+        },
+        "short_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "description": "Optional compact product name for PWA manifests (1..24 characters; defaults to name truncated to 24 characters).",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_SHORTNAME"
+        },
+        "subtitle": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Optional tagline shown beneath the brand mark on login surfaces (0..80 characters).",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_SUBTITLE"
+        },
+        "attribution": {
+          "type": "string",
+          "enum": ["shown", "hidden"],
+          "description": "Whether 'Powered by Scion' attribution is shown ('shown', default) or hidden ('hidden') when custom branding is active.",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_ATTRIBUTION"
+        },
+        "corners": {
+          "type": "string",
+          "enum": ["default", "square", "rounded"],
+          "description": "Corner radius preset for UI controls and containers ('default', 'square', or 'rounded').",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_CORNERS"
+        },
+        "font_sans": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9]([A-Za-z0-9 -]{0,62}[A-Za-z0-9-])?$",
+          "description": "UI sans-serif typeface preset ('default', 'system', 'ibm-plex-sans', 'plus-jakarta-sans', 'dm-sans', 'source-sans-3') or any Google Fonts family name. Monospace (code and terminal) remains JetBrains Mono.",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_FONTSANS"
+        },
+        "logo": {
+          "type": "object",
+          "description": "Light and dark theme brand logo URIs.",
+          "properties": {
+            "light": {
+              "$ref": "#/$defs/brandAssetURI",
+              "description": "Logo URI for light theme (also used in dark theme when logo.dark is unset).",
+              "x-env-var": "SCION_SERVER_HUB_BRANDING_LOGO_LIGHT"
+            },
+            "dark": {
+              "$ref": "#/$defs/brandAssetURI",
+              "description": "Optional logo URI for dark theme (falls back to logo.light).",
+              "x-env-var": "SCION_SERVER_HUB_BRANDING_LOGO_DARK"
+            }
+          },
+          "additionalProperties": false
+        },
+        "icons": {
+          "type": "object",
+          "description": "Favicon and PWA icon URIs.",
+          "properties": {
+            "favicon": {
+              "$ref": "#/$defs/brandAssetURI",
+              "description": "Browser favicon URI (.svg, .png, or .ico).",
+              "x-env-var": "SCION_SERVER_HUB_BRANDING_ICONS_FAVICON"
+            },
+            "apple_touch_icon": {
+              "$ref": "#/$defs/brandAssetURI",
+              "description": "180x180 PNG Apple touch icon URI.",
+              "x-env-var": "SCION_SERVER_HUB_BRANDING_ICONS_APPLETOUCHICON"
+            },
+            "icon_192": {
+              "$ref": "#/$defs/brandAssetURI",
+              "description": "192x192 PNG web app manifest icon URI.",
+              "x-env-var": "SCION_SERVER_HUB_BRANDING_ICONS_ICON192"
+            },
+            "icon_512": {
+              "$ref": "#/$defs/brandAssetURI",
+              "description": "512x512 PNG web app manifest icon URI.",
+              "x-env-var": "SCION_SERVER_HUB_BRANDING_ICONS_ICON512"
+            },
+            "icon_maskable_512": {
+              "$ref": "#/$defs/brandAssetURI",
+              "description": "512x512 maskable PNG web app manifest icon URI.",
+              "x-env-var": "SCION_SERVER_HUB_BRANDING_ICONS_ICONMASKABLE512"
+            }
+          },
+          "additionalProperties": false
+        },
+        "accent_color": {
+          "$ref": "#/$defs/hexColor",
+          "description": "Optional #RRGGBB accent shorthand that generates a luminance-calibrated OKLCH primary 50..950 ramp.",
+          "x-env-var": "SCION_SERVER_HUB_BRANDING_ACCENTCOLOR"
+        },
+        "palette": {
+          "type": "object",
+          "description": "Optional 50..950 shade scale overrides and light/dark semantic token overrides.",
+          "properties": {
+            "primary": { "$ref": "#/$defs/brandScale" },
+            "neutral": { "$ref": "#/$defs/brandScale" },
+            "success": { "$ref": "#/$defs/brandScale" },
+            "warning": { "$ref": "#/$defs/brandScale" },
+            "danger": { "$ref": "#/$defs/brandScale" },
+            "light": { "$ref": "#/$defs/brandSemanticMode" },
+            "dark": { "$ref": "#/$defs/brandSemanticMode" }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

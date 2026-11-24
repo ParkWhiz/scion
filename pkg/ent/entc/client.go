@@ -175,6 +175,57 @@ func sqlitePragmaName(v string) string {
 // closed when a pragma did not take effect.
 var sqliteDSNPragmas = withSQLitePragmas
 
+// setSQLiteJournalModeWAL runs PRAGMA journal_mode = WAL and returns the
+// resulting mode SQLite reports. It is a variable only so a test can stub it
+// to check that OpenSQLite fails closed when SQLite stays in another mode
+// without returning an error.
+var setSQLiteJournalModeWAL = func(db *sql.DB) (string, error) {
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode = WAL").Scan(&mode); err != nil {
+		return "", err
+	}
+	return mode, nil
+}
+
+// enableSQLiteWAL switches db to WAL journal mode and verifies that a
+// file-backed database actually entered "wal" mode. PRAGMA journal_mode = WAL
+// returns the resulting mode as a row without raising an error when SQLite
+// stays in another mode (for example "memory" on an in-memory database, or
+// "delete" on an immutable file or a VFS without WAL support). Non-file-backed
+// databases (in-memory and temporary databases, whose main entry in
+// pragma_database_list has an empty file) legitimately stay out of WAL mode;
+// any file-backed database must report "wal".
+func enableSQLiteWAL(db *sql.DB) error {
+	mode, err := setSQLiteJournalModeWAL(db)
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(mode, "wal") {
+		return nil
+	}
+	fileBacked, err := sqliteMainIsFileBacked(db)
+	if err != nil {
+		return err
+	}
+	if fileBacked {
+		return fmt.Errorf("journal_mode is %q after PRAGMA journal_mode = WAL, want \"wal\"", mode)
+	}
+	return nil
+}
+
+// sqliteMainIsFileBacked reports whether SQLite's main database on db is
+// backed by a filesystem path. sqlite3_db_filename (exposed in SQL through
+// pragma_database_list) is empty for ":memory:", "file::memory:", URI
+// databases with mode=memory, memdb VFS databases, and anonymous temporary
+// databases, and non-empty for every file-backed database.
+func sqliteMainIsFileBacked(db *sql.DB) (bool, error) {
+	var file sql.NullString
+	if err := db.QueryRow("SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&file); err != nil {
+		return false, fmt.Errorf("reading main database filename: %w", err)
+	}
+	return file.Valid && file.String != "", nil
+}
+
 // requireSQLitePragmaOn returns an error unless PRAGMA name reads 1 on a
 // connection from db. The openers set their pragmas through the DSN
 // (withSQLitePragmas); this makes the open fail rather than return a
@@ -262,6 +313,12 @@ func UTCTimeHook(next ent.Mutator) ent.Mutator {
 // (entadapter.newTxClient), which every launch writer uses. A new
 // *ent.Client constructor that writes agents must register it too
 // (TestEntClientConstructorsRegisterResumeHook checks this).
+//
+// The same choke point also clears activity_since on an update that sets
+// a phase other than running and does not itself set or clear
+// activity_since: the column is NULL whenever the agent is not running,
+// whichever writer moves the phase (the store's activity writers maintain
+// it explicitly, see entadapter.stampActivitySince).
 func ClearLaunchResumePhaseHook(next ent.Mutator) ent.Mutator {
 	return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
 		am, ok := m.(*ent.AgentMutation)
@@ -271,6 +328,10 @@ func ClearLaunchResumePhaseHook(next ent.Mutator) ent.Mutator {
 		phase, set := am.Phase()
 		if !set {
 			return next.Mutate(ctx, m)
+		}
+		if _, explicit := am.ActivitySince(); !explicit && !am.ActivitySinceCleared() &&
+			state.Phase(phase) != state.PhaseRunning {
+			am.ClearActivitySince()
 		}
 		if _, explicit := am.LaunchResumePhase(); explicit {
 			return next.Mutate(ctx, m)
@@ -284,11 +345,46 @@ func ClearLaunchResumePhaseHook(next ent.Mutator) ent.Mutator {
 	})
 }
 
+// ClearSuspendReasonHook is an Ent mutation hook that ends an agent's
+// suspend_reason (state.SuspendReason) at one choke point: an Agent update
+// (UpdateOne or bulk Update) that sets phase to a value other than
+// suspended or starting, and does not itself set suspend_reason, clears
+// it. A resume, stop, delete or failed start therefore clears the reason
+// whichever writer makes it. starting (a resume dispatch) keeps it, so the
+// rollback of a failed resume, which restores suspended, keeps the reason
+// too. An explicit suspend_reason in the same mutation wins.
+//
+// Registered with ClearLaunchResumePhaseHook wherever that hook is (see
+// its comment), so the same constructors carry both.
+func ClearSuspendReasonHook(next ent.Mutator) ent.Mutator {
+	return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+		am, ok := m.(*ent.AgentMutation)
+		if !ok || (!am.Op().Is(ent.OpUpdate) && !am.Op().Is(ent.OpUpdateOne)) {
+			return next.Mutate(ctx, m)
+		}
+		phase, set := am.Phase()
+		if !set {
+			return next.Mutate(ctx, m)
+		}
+		if _, explicit := am.SuspendReason(); explicit || am.SuspendReasonCleared() {
+			return next.Mutate(ctx, m)
+		}
+		switch state.Phase(phase) {
+		case state.PhaseSuspended, state.PhaseStarting:
+		default:
+			am.ClearSuspendReason()
+		}
+		return next.Mutate(ctx, m)
+	})
+}
+
 // OpenSQLite creates an Ent client backed by SQLite.
 // The dsn should be a SQLite connection string (e.g. "file:ent?mode=memory&cache=shared").
-// Foreign keys and WAL journal mode are enabled automatically. Foreign keys
-// are a per-connection setting, so they are set through the DSN and apply to
-// every connection in the pool.
+// Foreign keys and WAL journal mode are enabled automatically (and verified:
+// foreign keys on every connection, and "wal" journal mode on file-backed
+// databases; in-memory databases stay in "memory" mode). Foreign keys are a
+// per-connection setting, so they are set through the DSN and apply to every
+// connection in the pool.
 // This uses the modernc.org/sqlite pure-Go driver which registers as "sqlite".
 func OpenSQLite(dsn string, pool PoolConfig, opts ...ent.Option) (*ent.Client, error) {
 	fullDSN := sqliteDSNPragmas(withUTCTimezone(dsn), "foreign_keys(1)")
@@ -311,14 +407,14 @@ func OpenSQLite(dsn string, pool PoolConfig, opts ...ent.Option) (*ent.Client, e
 	}
 	// journal_mode=WAL is stored in the database file, so setting it once
 	// covers every connection.
-	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+	if err := enableSQLiteWAL(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("enabling WAL mode: %w", err)
 	}
 	pool.apply(db)
 	drv := entsql.OpenDB(dialect.SQLite, db)
 	client := ent.NewClient(append(opts, ent.Driver(diagDriver(drv, mon)))...)
-	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook)
+	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook, ClearSuspendReasonHook)
 	return client, nil
 }
 
@@ -423,7 +519,7 @@ func OpenSQLiteReadOnly(dsn string, opts ...ent.Option) (*ent.Client, error) {
 	}
 	drv := entsql.OpenDB(dialect.SQLite, db)
 	client := ent.NewClient(append(opts, ent.Driver(drv))...)
-	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook)
+	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook, ClearSuspendReasonHook)
 	return client, nil
 }
 
@@ -603,7 +699,7 @@ func openPostgres(dsn string, pool PoolConfig, readOnly bool, opts ...ent.Option
 	pool.apply(db)
 	drv := entsql.OpenDB(dialect.Postgres, db)
 	client := ent.NewClient(append(opts, ent.Driver(diagDriver(drv, mon)))...)
-	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook)
+	client.Use(UTCTimeHook, ClearLaunchResumePhaseHook, ClearSuspendReasonHook)
 	return client, nil
 }
 
@@ -706,7 +802,10 @@ func AutoMigrate(ctx context.Context, client *ent.Client, opts ...AutoMigrateOpt
 	if err := dropDecisionAuditTable(ctx, client); err != nil {
 		return err
 	}
-	return dropTemplateLegacyColumns(ctx, client)
+	if err := dropTemplateLegacyColumns(ctx, client); err != nil {
+		return err
+	}
+	return MigrateSkillCoreScope(ctx, client)
 }
 
 // AutoMigrateOption configures AutoMigrate.

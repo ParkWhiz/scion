@@ -62,13 +62,23 @@ func TestCodexBuiltinDialect_StatusMatchesStagedDialect(t *testing.T) {
 				"tool_name":       "Bash",
 			},
 			before: state.ActivityExecuting,
-			want:   state.ActivityWorking,
+			want:   state.ActivityThinking,
 		},
 		{
 			name: "stop",
 			payload: map[string]interface{}{
 				"hook_event_name": "Stop",
 				"session_id":      "s-1",
+			},
+			before: state.ActivityThinking,
+			want:   state.ActivityWorking,
+		},
+		{
+			name: "agent-turn-complete",
+			payload: map[string]interface{}{
+				"type":                   "agent-turn-complete",
+				"title":                  "Done",
+				"last-assistant-message": "Inspecting brief and diff",
 			},
 			before: state.ActivityThinking,
 			want:   state.ActivityWorking,

@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -221,6 +222,20 @@ func TestResolveRoutingAgents(t *testing.T) {
 			wantSlugs: []string{"foo"},
 		},
 		{
+			name:         "leading possessive mention overrides default: @foo's proposal",
+			content:      "@foo's proposal",
+			defaultAgent: agentPtr(alpha),
+			agents:       allAgents,
+			wantSlugs:    []string{"foo"},
+		},
+		{
+			name:         "additive typographic possessive mention: check @foo’s, please",
+			content:      "check @foo\u2019s, please",
+			defaultAgent: agentPtr(alpha),
+			agents:       allAgents,
+			wantSlugs:    []string{"alpha", "foo"},
+		},
+		{
 			name:         "pagination: agents beyond first page",
 			content:      "hello @baz",
 			defaultAgent: agentPtr(alpha),
@@ -316,6 +331,62 @@ func TestDeduplicateAgentsByID(t *testing.T) {
 	assert.Len(t, result, 2)
 	assert.Equal(t, "alpha", result[0].Slug)
 	assert.Equal(t, "beta", result[1].Slug)
+}
+
+func TestResolveRoutingAgents_WrappedMentionsKeepAgentRoutingUnchanged(t *testing.T) {
+	alpha := makeAgent("id-alpha", "alpha")
+	foo := makeAgent("id-foo", "foo")
+	lister := &mockAgentLister{agents: []store.Agent{alpha, foo}}
+
+	t.Run("wrapped agent mentions do not route when no default", func(t *testing.T) {
+		plan, err := resolveRoutingAgents(context.Background(), lister, "proj-1",
+			`(@foo) **@foo** "@foo" FYI:@foo`, nil)
+		require.NoError(t, err)
+		assert.Empty(t, plan.Agents)
+		assert.Empty(t, plan.MentionNames)
+		assert.Empty(t, plan.HumanMentionNames, "agent slugs are still excluded from human mention candidates")
+	})
+
+	t.Run("wrapped agent mentions do not fan out alongside default, wrapped human names still collected", func(t *testing.T) {
+		plan, err := resolveRoutingAgents(context.Background(), lister, "proj-1",
+			"check (@alice-smith), **@bob-jones**, and (**@foo**); ignore `(@carol)`", agentPtr(alpha))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"alpha"}, slugs(plan.Agents))
+		assert.Empty(t, plan.MentionNames)
+		assert.Equal(t, []string{"alice-smith", "bob-jones"}, plan.HumanMentionNames)
+	})
+}
+
+func TestResolveRoutingAgentsWithOptions_CodeSpanMentions(t *testing.T) {
+	alpha := makeAgent("id-alpha", "alpha")
+	foo := makeAgent("id-foo", "foo")
+	lister := &mockAgentLister{agents: []store.Agent{alpha, foo}}
+
+	t.Run("flag off ignores standalone code-span mention", func(t *testing.T) {
+		plan, err := resolveRoutingAgentsWithOptions(context.Background(), lister, "proj-1",
+			"`@foo` please check with `@jane@example.com`", agentPtr(alpha), messages.MentionOptions{CodeSpanMentions: false})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"alpha"}, slugs(plan.Agents))
+		assert.Empty(t, plan.MentionNames)
+		assert.Empty(t, plan.HumanMentionNames)
+	})
+
+	t.Run("flag on promotes leading code-span mention override and human code-span mention", func(t *testing.T) {
+		plan, err := resolveRoutingAgentsWithOptions(context.Background(), lister, "proj-1",
+			"`@foo` please check with `@jane@example.com` and ignore `` `@alpha` ``", agentPtr(alpha), messages.MentionOptions{CodeSpanMentions: true})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"foo"}, slugs(plan.Agents), "leading `@foo` should override default alpha")
+		assert.Equal(t, []string{"foo", "jane@example.com"}, plan.MentionNames)
+		assert.Equal(t, []string{"jane@example.com"}, plan.HumanMentionNames)
+	})
+
+	t.Run("flag on does not promote multi-token or slash code spans", func(t *testing.T) {
+		plan, err := resolveRoutingAgentsWithOptions(context.Background(), lister, "proj-1",
+			"`@foo please run` and `@playwright/test`", agentPtr(alpha), messages.MentionOptions{CodeSpanMentions: true})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"alpha"}, slugs(plan.Agents))
+		assert.Empty(t, plan.MentionNames)
+	})
 }
 
 func joinStrings(ss []string) string {

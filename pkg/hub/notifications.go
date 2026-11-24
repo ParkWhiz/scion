@@ -55,6 +55,30 @@ type NotificationDispatcher struct {
 	// registry rebuilt from saved settings is used without restarting the
 	// dispatcher (ptone/scion#3904).
 	channelRegistryFn func() *ChannelRegistry
+
+	// autoWakeFn, when set, is offered each suspended subscriber whose
+	// notification is parked. It reports whether it queued a background
+	// wake (ptone/scion#7826); the notification stays parked either way
+	// and is delivered by the drain that follows a successful wake. The
+	// Server sets it (autoWakeNotificationSubscriber); nil = no auto-wake.
+	autoWakeFn func(subscriber *store.Agent) bool
+
+	// idleSuspendGateFn reports whether lifecycle.idle_suspend is enabled;
+	// nil means off (AC 8).
+	idleSuspendGateFn func() bool
+
+	// autoSuspendThresholdFn returns the configured threshold duration for
+	// an automatic suspension reason (idle or stalled); nil means unknown.
+	autoSuspendThresholdFn func(reason state.SuspendReason) time.Duration
+}
+
+func (nd *NotificationDispatcher) deliveryMarker() agentDeliveryMarker {
+	return gatedDeliveryMarker{store: nd.store, gate: nd.idleSuspendGateFn}
+}
+
+// offerAutoWake offers a suspended subscriber to autoWakeFn.
+func (nd *NotificationDispatcher) offerAutoWake(subscriber *store.Agent) bool {
+	return nd.autoWakeFn != nil && nd.autoWakeFn(subscriber)
 }
 
 // NewNotificationDispatcher creates a new NotificationDispatcher.
@@ -84,15 +108,18 @@ func (nd *NotificationDispatcher) SetBrokerProxy(p *MessageBrokerProxy) {
 // delete engine resolves them before the row changes and delivers them after
 // (ResolveDeletedNotifications, design ptone/scion#2483 §2.3).
 func (nd *NotificationDispatcher) Start() {
-	statusCh, unsubStatus := nd.events.Subscribe("project.>.agent.status")
+	// Use "*" (single-token wildcard) rather than ">" so "project.*.agent.status"
+	// does not cross-match non-status project subjects (such as ".agent.ports" or
+	// ".agent.deleted").
+	ch, unsubscribe := nd.events.Subscribe("project.*.agent.status")
 
 	nd.wg.Add(1)
 	go func() {
 		defer nd.wg.Done()
-		defer unsubStatus()
+		defer unsubscribe()
 		for {
 			select {
-			case evt, ok := <-statusCh:
+			case evt, ok := <-ch:
 				if !ok {
 					return
 				}
@@ -118,15 +145,18 @@ func (nd *NotificationDispatcher) Stop() {
 
 // handleEvent processes a single agent status event.
 func (nd *NotificationDispatcher) handleEvent(evt Event) {
+	if !strings.HasSuffix(evt.Subject, ".agent.status") {
+		return
+	}
 	var statusEvt AgentStatusEvent
 	if err := json.Unmarshal(evt.Data, &statusEvt); err != nil {
 		nd.log.Error("Failed to unmarshal agent status event", "error", err)
 		return
 	}
 
-	// Skip events with no agent ID — can happen for system events fired during
-	// project creation before any agents exist.
-	if statusEvt.AgentID == "" {
+	// Skip events with no agent ID or no status fields — can happen for system
+	// events fired during project creation before any agents exist.
+	if statusEvt.AgentID == "" || (statusEvt.Phase == "" && statusEvt.Activity == "") {
 		return
 	}
 	// A halt is notified once, in-process, by the hub instance whose write
@@ -166,12 +196,17 @@ func (nd *NotificationDispatcher) handleEvent(evt Event) {
 		return
 	}
 
-	// Use activity for matching (notifications trigger on activity changes).
-	// Fall back to phase when activity is empty (e.g. phase "error" has no activity).
-	matchStatus := statusEvt.Activity
-	if matchStatus == "" {
-		matchStatus = statusEvt.Phase
-	}
+	// Suspended agents match on phase ("suspended"), never on a retained
+	// activity such as completed, idle, or harness_error. Halted and stopped
+	// agents ignore retained non-terminal activities (such as completed) so
+	// notifications match on phase ("halted"/"stopped"), while terminal
+	// activities (crashed, limits_exceeded) and synthetic event statuses
+	// (ERROR, DELETED) still take precedence. Running agents match on activity
+	// and fall back to phase when activity is empty.
+	matchStatus := notificationEventStatus(statusEvt)
+
+	var watchedAgent *store.Agent
+	var watchedLoaded bool
 
 	// Deduplicate: one notification per (subscriber_type, subscriber_id).
 	// Agent-scoped subscriptions are checked first since they are more specific.
@@ -189,21 +224,64 @@ func (nd *NotificationDispatcher) handleEvent(evt Event) {
 			continue
 		}
 
-		// Dedup: check if the last notification for this subscription already has this status
-		lastStatus, err := nd.store.GetLastNotificationStatus(ctx, sub.ID)
+		// Deduplicate repeated notifications:
+		//   - For IDLE and COMPLETED, the stored agent row is authoritative:
+		//     a new period notifies only when the current row is running, its
+		//     activity matches matchStatus, and its activity_since is strictly
+		//     after the subscription's last notification. Heartbeats and stale
+		//     same-period re-reports (even if delivered after an intermediate
+		//     working event or a Hub restart) remain deduplicated.
+		//   - Every other trigger (WAITING_FOR_INPUT, STALLED, HARNESS_ERROR,
+		//     LIMITS_EXCEEDED, ERROR, SUSPENDED, STOPPED, ...) keeps status-based
+		//     deduplication against the subscription's previous notification.
+		lastNotif, err := nd.store.GetLastNotification(ctx, sub.ID)
 		if err != nil {
-			nd.log.Error("Failed to get last notification status",
+			nd.log.Error("Failed to get last notification",
 				"subscriptionID", sub.ID, "error", err)
 			continue
 		}
-		if strings.EqualFold(lastStatus, matchStatus) {
-			seen[dedupeKey] = true
-			continue
+		if lastNotif != nil && strings.EqualFold(lastNotif.Status, matchStatus) {
+			if !isPerPeriodNotificationStatus(matchStatus) ||
+				!nd.activityEnteredAfter(ctx, statusEvt.AgentID, matchStatus, lastNotif.CreatedAt, &watchedAgent, &watchedLoaded) {
+				seen[dedupeKey] = true
+				continue
+			}
 		}
 
 		seen[dedupeKey] = true
 		nd.storeAndDispatch(ctx, sub, statusEvt)
 	}
+}
+
+func isPerPeriodNotificationStatus(status string) bool {
+	return strings.EqualFold(status, string(state.ActivityIdle)) ||
+		strings.EqualFold(status, string(state.ActivityCompleted))
+}
+
+func (nd *NotificationDispatcher) activityEnteredAfter(
+	ctx context.Context,
+	agentID string,
+	matchStatus string,
+	notifCreatedAt time.Time,
+	cached **store.Agent,
+	loaded *bool,
+) bool {
+	if !*loaded {
+		*loaded = true
+		a, err := nd.store.GetAgent(ctx, agentID)
+		if err != nil {
+			nd.log.Warn("Failed to get agent for per-period notification check",
+				"agent_id", agentID, "error", err)
+		} else {
+			*cached = a
+		}
+	}
+	a := *cached
+	return a != nil &&
+		strings.EqualFold(a.Phase, string(state.PhaseRunning)) &&
+		strings.EqualFold(a.Activity, matchStatus) &&
+		a.ActivitySince != nil &&
+		a.ActivitySince.After(notifCreatedAt)
 }
 
 // pendingDeletedNotification is one DELETED notification resolved before an
@@ -346,12 +424,45 @@ func (nd *NotificationDispatcher) storeAndDispatch(ctx context.Context, sub *sto
 // to the subscriber, using agent as the watched agent (it is not re-read, so
 // it also works from a snapshot of an agent that has since been deleted).
 func (nd *NotificationDispatcher) storeAndDispatchForAgent(ctx context.Context, sub *store.NotificationSubscription, evt AgentStatusEvent, agent *store.Agent) {
-	nd.storeAndDispatchMessage(ctx, sub, evt, agent, formatNotificationMessage(agent, notificationEventStatus(evt)))
+	nd.storeAndDispatchMessage(ctx, sub, evt, agent, nd.formatEventMessage(evt, agent))
 }
 
-// notificationEventStatus is the status a notification for evt carries: its
-// activity, or its phase when the activity is empty.
+// formatEventMessage formats the notification message for evt and agent.
+// For SUSPENDED events caused by automatic suspension (idle or stalled), it
+// resolves the configured threshold from autoSuspendThresholdFn and the
+// auto-wake gate from idleSuspendGateFn so the notice names the reason,
+// threshold, and accurate wake/resume instruction; manual suspensions keep the
+// generic SUSPENDED notice.
+func (nd *NotificationDispatcher) formatEventMessage(evt AgentStatusEvent, agent *store.Agent) string {
+	status := notificationEventStatus(evt)
+	if strings.EqualFold(status, string(state.PhaseSuspended)) {
+		reason := state.SuspendReason(evt.SuspendReason)
+		if reason == "" {
+			reason = state.SuspendReason(agent.SuspendReason)
+		}
+		var threshold time.Duration
+		if reason.AutoWakes() && nd.autoSuspendThresholdFn != nil {
+			threshold = nd.autoSuspendThresholdFn(reason)
+		}
+		autoWakes := nd.idleSuspendGateFn != nil && nd.idleSuspendGateFn()
+		return formatSuspendedNotificationMessage(agent, reason, threshold, autoWakes)
+	}
+	return formatNotificationMessage(agent, status)
+}
+
+// notificationEventStatus is the status a notification for evt carries: for a
+// suspended agent it is always the phase ("suspended"), never a retained
+// activity; for a halted or stopped agent a retained non-terminal activity
+// (such as completed) is ignored so notifications match on phase
+// ("halted"/"stopped"), while terminal activities (crashed, limits_exceeded)
+// and synthetic event statuses (ERROR, DELETED) still take precedence;
+// otherwise its activity, or its phase when the activity is empty.
 func notificationEventStatus(evt AgentStatusEvent) string {
+	if evt.Phase == string(state.PhaseSuspended) ||
+		((evt.Phase == string(state.PhaseHalted) || evt.Phase == string(state.PhaseStopped)) &&
+			state.Activity(evt.Activity).IsRetainedOnStop()) {
+		return evt.Phase
+	}
 	if evt.Activity != "" {
 		return evt.Activity
 	}
@@ -361,6 +472,16 @@ func notificationEventStatus(evt AgentStatusEvent) string {
 // storeAndDispatchMessage is storeAndDispatchForAgent with the notification
 // text given by the caller.
 func (nd *NotificationDispatcher) storeAndDispatchMessage(ctx context.Context, sub *store.NotificationSubscription, evt AgentStatusEvent, agent *store.Agent, message string) {
+	notif := nd.storeNotification(ctx, sub, evt, message)
+	if notif == nil {
+		return
+	}
+	nd.dispatchStoredNotification(ctx, sub, notif, agent)
+}
+
+// storeNotification persists a notification row for evt with message and
+// returns it, or nil if the store write failed.
+func (nd *NotificationDispatcher) storeNotification(ctx context.Context, sub *store.NotificationSubscription, evt AgentStatusEvent, message string) *store.Notification {
 	effectiveStatus := notificationEventStatus(evt)
 
 	notif := &store.Notification{
@@ -378,17 +499,22 @@ func (nd *NotificationDispatcher) storeAndDispatchMessage(ctx context.Context, s
 	if err := nd.store.CreateNotification(ctx, notif); err != nil {
 		nd.log.Error("Failed to create notification",
 			"subscriptionID", sub.ID, "agent_id", evt.AgentID, "error", err)
-		return
+		return nil
 	}
 
 	nd.log.Info("Notification created",
 		"notificationID", notif.ID, "agent_id", evt.AgentID, "subscriber", sub.SubscriberType+":"+sub.SubscriberID, "status", notif.Status)
+	return notif
+}
 
+// dispatchStoredNotification delivers an already-persisted notification to its
+// subscriber.
+func (nd *NotificationDispatcher) dispatchStoredNotification(ctx context.Context, sub *store.NotificationSubscription, notif *store.Notification, agent *store.Agent) {
 	switch sub.SubscriberType {
 	case store.SubscriberTypeAgent:
 		nd.dispatchToAgent(ctx, sub, notif, agent.ID, agent.Slug)
 	case store.SubscriberTypeUser:
-		nd.events.PublishNotification(ctx, notif)
+		nd.events.PublishUserNotification(ctx, notif)
 		nd.log.Info("Notification dispatched to user via SSE",
 			"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
 
@@ -408,8 +534,9 @@ func (nd *NotificationDispatcher) storeAndDispatchMessage(ctx context.Context, s
 			nd.createInboxMessage(ctx, sub, notif, agent)
 			if nd.brokerProxy != nil {
 				// Federated corner (see persistsViaInbox): deliverToUser
-				// will refuse to persist, but plugins still get the card.
-				_ = nd.publishToBroker(ctx, sub, notif, agent)
+				// will refuse to persist, and createInboxMessage already
+				// wrote the message record; plugins still get the card.
+				_ = nd.publishToBroker(withUserRecordLogged(ctx), sub, notif, agent)
 			}
 		} else if !nd.dispatchToBroker(ctx, sub, notif, agent) {
 			// Nothing reached the broker's persisting subscriber; fall back
@@ -458,7 +585,14 @@ func (nd *NotificationDispatcher) dispatchToAgent(ctx context.Context, sub *stor
 		// No running agent to deliver to: leave the notification pending
 		// with no attempt counted. The dispatch sweep leaves it out while
 		// the subscriber is suspended, delivers it after a resume, and
-		// expires it at notificationRetryMaxAge.
+		// expires it at notificationRetryMaxAge. A subscriber the hub
+		// suspended is woken in the background, and the drain after the
+		// wake delivers the parked notification (auto_wake.go).
+		if nd.offerAutoWake(subscriber) {
+			nd.log.Info("Subscriber agent is suspended; notification parked while it is woken",
+				"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+			return
+		}
 		nd.log.Info("Subscriber agent is suspended; notification parked until it resumes",
 			"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
 		return
@@ -516,8 +650,29 @@ func (nd *NotificationDispatcher) dispatchToAgent(ctx context.Context, sub *stor
 	retryCtx, retryCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer retryCancel()
 
-	nd.recordAttempt(ctx, notif.ID)
-	if err := dispatchWithBrokerRetry(retryCtx, nd.messageLog, dispatcher, subscriber, notif.Message, false, structuredMsg); err != nil {
+	err = dispatchWithBrokerRetry(
+		retryCtx,
+		nd.deliveryMarker(),
+		nd.messageLog,
+		dispatcher,
+		subscriber,
+		notif.Message,
+		false,
+		structuredMsg,
+		withBeforeBrokerAttempt(func() { nd.recordAttempt(ctx, notif.ID) }),
+	)
+	if err != nil {
+		var idleErr *errAgentIdleSuspending
+		if errors.As(err, &idleErr) {
+			if nd.offerAutoWake(subscriber) {
+				nd.log.Info("Subscriber agent is suspending or suspended; notification parked while it is woken",
+					"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+				return
+			}
+			nd.log.Info("Subscriber agent is suspending or suspended; notification parked until it resumes",
+				"subscriberID", sub.SubscriberID, "notificationID", notif.ID)
+			return
+		}
 		nd.log.Error("Failed to dispatch notification to agent; notification NOT dispatched",
 			"subscriberID", sub.SubscriberID, "notificationID", notif.ID, "error", err)
 		// Do NOT mark as dispatched: the notification was not delivered.
@@ -681,6 +836,39 @@ func (nd *NotificationDispatcher) publishToBroker(ctx context.Context, sub *stor
 func (nd *NotificationDispatcher) createInboxMessage(ctx context.Context, sub *store.NotificationSubscription, notif *store.Notification, agent *store.Agent) {
 	msgType := notificationMessageType(notif.Status)
 	msgBody := notificationMessageBody(notif, agent)
+	projectID := notif.ProjectID
+	if projectID == "" {
+		projectID = agent.ProjectID
+	}
+
+	recordMsg := messages.StructuredMessage{
+		Sender:      "agent:" + agent.Slug,
+		SenderID:    agent.ID,
+		Recipient:   "user:" + sub.SubscriberID,
+		RecipientID: sub.SubscriberID,
+		Msg:         msgBody,
+		Type:        msgType,
+	}
+
+	// One message record per direct-to-inbox notification (ptone/scion#4650):
+	// the success path below writes it once persisted; an early return writes
+	// it here so the notification still appears once.
+	recorded := false
+	defer func() {
+		if recorded || nd.messageLog == nil {
+			return
+		}
+		attrs := []any{
+			"agent_id", agent.ID,
+			"agent_name", agent.Name,
+			"project_id", projectID,
+			"notification_id", notif.ID,
+			"source", "notification-inbox",
+			"persisted", false,
+		}
+		attrs = append(attrs, recordMsg.LogAttrs()...)
+		nd.messageLog.Info("user notification handed to inbox", attrs...)
+	}()
 
 	storeMsg := &store.Message{
 		ID:          api.NewUUID(),
@@ -723,6 +911,7 @@ func (nd *NotificationDispatcher) createInboxMessage(ctx context.Context, sub *s
 				"notification_id", notif.ID, "subscriber_id", sub.SubscriberID, "error", convErr)
 		} else {
 			storeMsg.ConversationID = convResult.ConversationID
+			recordMsg.ConversationID = convResult.ConversationID
 		}
 	}
 
@@ -733,6 +922,19 @@ func (nd *NotificationDispatcher) createInboxMessage(ctx context.Context, sub *s
 	}
 
 	nd.events.PublishUserMessage(ctx, storeMsg, nil, nil)
+	if nd.messageLog != nil {
+		attrs := []any{
+			"agent_id", agent.ID,
+			"agent_name", agent.Name,
+			"project_id", projectID,
+			"notification_id", notif.ID,
+			"message_id", storeMsg.ID,
+			"source", "notification-inbox",
+		}
+		attrs = append(attrs, recordMsg.LogAttrs()...)
+		nd.messageLog.Info("user notification delivered to inbox", attrs...)
+		recorded = true
+	}
 	nd.log.Debug("Inbox message created for notification",
 		"notificationID", notif.ID, "messageID", storeMsg.ID, "subscriberID", sub.SubscriberID)
 }
@@ -740,6 +942,12 @@ func (nd *NotificationDispatcher) createInboxMessage(ctx context.Context, sub *s
 // Chat messages (mentions, DMs) do not create notification rows: the
 // bell carries agent events only. Clients derive chat alerts from the
 // chat SSE stream (chat message and read-state events) instead.
+
+// NotificationStatusHarnessError is the notification trigger and status of a
+// running agent whose harness reported a turn-ending model, API or auth
+// error (activity harness_error, ptone/scion#7858). It is distinct from
+// ERROR, which matches only phase error (the harness process is dead).
+const NotificationStatusHarnessError = "HARNESS_ERROR"
 
 // formatNotificationMessage formats a notification message based on agent state and status.
 func formatNotificationMessage(agent *store.Agent, status string) string {
@@ -757,6 +965,12 @@ func formatNotificationMessage(agent *store.Agent, status string) string {
 			msg += ": " + agent.Message
 		}
 		return msg
+	case "IDLE":
+		msg := fmt.Sprintf("%s is IDLE", agent.Slug)
+		if agent.Message != "" {
+			msg += ": " + agent.Message
+		}
+		return msg
 	case "LIMITS_EXCEEDED":
 		msg := fmt.Sprintf("%s has reached a state of LIMITS_EXCEEDED", agent.Slug)
 		if agent.Message != "" {
@@ -764,10 +978,24 @@ func formatNotificationMessage(agent *store.Agent, status string) string {
 		}
 		return msg
 	case "STALLED":
+		// Pre-stall messages ("Ready", "Harness started") are stale and would
+		// mislead, so only the stall detector's no-hook-since-start hint is
+		// included (ptone/scion#4556).
 		msg := fmt.Sprintf("%s has STALLED", agent.Slug)
 		if agent.StalledFromActivity != "" {
 			msg += " (was " + agent.StalledFromActivity + ")"
 		}
+		if !agent.LastActivityEvent.IsZero() {
+			msg += ": no activity for " + formatStallAge(time.Since(agent.LastActivityEvent))
+			if agent.Message == state.StalledNoHookActivityHint {
+				msg += " (" + agent.Message + ")"
+			}
+		} else if agent.Message == state.StalledNoHookActivityHint {
+			msg += ": " + agent.Message
+		}
+		return msg
+	case NotificationStatusHarnessError:
+		msg := fmt.Sprintf("%s has a HARNESS_ERROR (harness alive; a new message retries)", agent.Slug)
 		if agent.Message != "" {
 			msg += ": " + agent.Message
 		}
@@ -791,4 +1019,59 @@ func formatNotificationMessage(agent *store.Agent, status string) string {
 	default:
 		return fmt.Sprintf("%s has reached status: %s", agent.Slug, upper)
 	}
+}
+
+// formatSuspendedNotificationMessage formats a SUSPENDED notification.
+// Automatic suspensions (idle or stalled) get a dedicated notice naming the
+// reason, the threshold that triggered it (when known), and how to resume the
+// agent ("any message wakes it" when lifecycle.idle_suspend auto-wake is
+// active, otherwise explicit `scion resume <slug>`). Manual and other
+// suspensions keep the existing generic notice.
+func formatSuspendedNotificationMessage(agent *store.Agent, reason state.SuspendReason, threshold time.Duration, autoWakes bool) string {
+	switch reason {
+	case state.SuspendReasonIdle, state.SuspendReasonStalled:
+		wakeHint := fmt.Sprintf("resume with 'scion resume %s'", agent.Slug)
+		if autoWakes {
+			wakeHint = "any message wakes it"
+		}
+		if dur := formatNotificationThreshold(threshold); dur != "" {
+			return fmt.Sprintf("%s was automatically SUSPENDED (%s for %s; %s)", agent.Slug, reason, dur, wakeHint)
+		}
+		return fmt.Sprintf("%s was automatically SUSPENDED (%s; %s)", agent.Slug, reason, wakeHint)
+	default:
+		return fmt.Sprintf("%s has reached status: SUSPENDED", agent.Slug)
+	}
+}
+
+// formatNotificationThreshold formats a configured threshold duration cleanly
+// for notification text (e.g. "15m", "5m", "1h30m", "2m30s", "30s").
+func formatNotificationThreshold(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	if d >= time.Minute && d%time.Minute != 0 {
+		return d.Truncate(time.Second).String()
+	}
+	return formatStallAge(d)
+}
+
+// formatStallAge renders how long a stalled agent has had no activity, in
+// whole minutes ("6m", "1h5m"), or seconds under a minute.
+func formatStallAge(d time.Duration) string {
+	if d < time.Minute {
+		if d < 0 {
+			d = 0
+		}
+		return fmt.Sprintf("%ds", int(d/time.Second))
+	}
+	d = d.Truncate(time.Minute)
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	}
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	if m == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh%dm", h, m)
 }

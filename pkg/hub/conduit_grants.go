@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/grant"
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/secret"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
@@ -96,6 +97,12 @@ import (
 // activate, then revoke the old kid.
 const (
 	conduitExperiment = "hub.conduit"
+	// conduitDeliverExperiment is experiments.ConduitDeliver: message
+	// delivery over the agent's conduit session (deliver-message).
+	conduitDeliverExperiment = experiments.ConduitDeliver
+	// execSchedulesExperiment is experiments.ExecSchedules: the agent
+	// registers the exec control routes (exec-start, exec-status).
+	execSchedulesExperiment = experiments.ExecSchedules
 
 	// conduitGrantKeySecretName is the ring's secret key (design
 	// "conduit.grant_key").

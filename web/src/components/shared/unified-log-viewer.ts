@@ -102,12 +102,36 @@ function formatLogRow(row: LogRow, zone: string): void {
 const SEVERITY_LEVELS = ['DEFAULT', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] as const;
 
 const SOURCE_CONFIG: Record<string, { badge: string; color: string; bg: string }> = {
-  hub: { badge: 'HUB', color: '#2563eb', bg: '#eff6ff' },
-  broker: { badge: 'BRK', color: '#059669', bg: '#ecfdf5' },
-  agent: { badge: 'AGT', color: '#d97706', bg: '#fffbeb' },
-  messages: { badge: 'MSG', color: '#7c3aed', bg: '#f5f3ff' },
-  artifacts: { badge: 'ART', color: '#db2777', bg: '#fdf2f8' },
-  server: { badge: 'SRV', color: '#4b5563', bg: '#f9fafb' },
+  hub: {
+    badge: 'HUB',
+    color: 'var(--sl-color-primary-600, #2563eb)',
+    bg: 'var(--sl-color-primary-50, #eff6ff)',
+  },
+  broker: {
+    badge: 'BRK',
+    color: 'var(--sl-color-emerald-600, #059669)',
+    bg: 'var(--sl-color-emerald-50, #ecfdf5)',
+  },
+  agent: {
+    badge: 'AGT',
+    color: 'var(--sl-color-warning-600, #d97706)',
+    bg: 'var(--sl-color-warning-50, #fffbeb)',
+  },
+  messages: {
+    badge: 'MSG',
+    color: 'var(--scion-log-messages-text, #7c3aed)',
+    bg: 'var(--scion-log-messages-bg, #f5f3ff)',
+  },
+  artifacts: {
+    badge: 'ART',
+    color: 'var(--sl-color-pink-600, #db2777)',
+    bg: 'var(--sl-color-pink-50, #fdf2f8)',
+  },
+  server: {
+    badge: 'SRV',
+    color: 'var(--scion-log-server-text, #4b5563)',
+    bg: 'var(--scion-log-server-bg, #f9fafb)',
+  },
 };
 
 const ALL_SOURCES = ['hub', 'broker', 'agent', 'messages', 'artifacts', 'server'];
@@ -213,7 +237,7 @@ export class ScionUnifiedLogViewer extends LitElement {
       align-items: center;
       gap: 0.25rem;
       padding: 0.25rem 0.5rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: 0.75rem;
       font-weight: 600;
       font-family: var(--scion-font-mono, monospace);
@@ -311,7 +335,7 @@ export class ScionUnifiedLogViewer extends LitElement {
     .source-badge {
       display: inline-block;
       padding: 0.0625rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: 0.6875rem;
       font-weight: 600;
       letter-spacing: 0.03em;
@@ -323,7 +347,7 @@ export class ScionUnifiedLogViewer extends LitElement {
     .sev {
       display: inline-block;
       padding: 0.0625rem 0.375rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       font-size: 0.6875rem;
       font-weight: 600;
       text-transform: uppercase;
@@ -341,7 +365,7 @@ export class ScionUnifiedLogViewer extends LitElement {
       opacity: 0.7;
     }
     .sev-INFO {
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       color: var(--scion-primary-700, #1d4ed8);
     }
     .sev-WARNING {
@@ -414,7 +438,7 @@ export class ScionUnifiedLogViewer extends LitElement {
       display: flex;
       justify-content: center;
       padding: 0.5rem;
-      background: var(--scion-primary-50, #eff6ff);
+      background: var(--scion-primary-tint, #eff6ff);
       border-top: 1px solid var(--scion-primary-200, #bfdbfe);
       cursor: pointer;
       font-size: 0.8125rem;
@@ -764,7 +788,7 @@ export class ScionUnifiedLogViewer extends LitElement {
                 style="background: ${enabled
                   ? config.bg
                   : 'transparent'}; color: ${config.color}; border-color: ${enabled
-                  ? config.color + '40'
+                  ? `color-mix(in srgb, ${config.color} 25%, transparent)`
                   : 'var(--scion-border, #e2e8f0)'};"
                 @click=${() => this.handleSourceToggle(src)}
                 >${config.badge}</span

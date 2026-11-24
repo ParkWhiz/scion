@@ -25,6 +25,7 @@ import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import { apiFetch } from '../../client/api.js';
+import { getBrandName, getNotificationIconUrl } from '../../client/branding.js';
 import { stateManager } from '../../client/state.js';
 import { dispatchTrayCount } from '../../client/tray-count-events.js';
 import {
@@ -37,6 +38,17 @@ import {
 } from '../../client/push-preference.js';
 import type { User, Notification } from '../../shared/types.js';
 import { formatRelative } from '../../utils/time.js';
+import {
+  FEATURE_FLAGS_CHANGED_EVENT,
+  decisionsEnabled,
+  isInboxDashboardEnabled,
+} from '../../utils/feature-flags.js';
+import {
+  INBOX_SUMMARY_CHANGED_EVENT,
+  ensureInboxSummaryStarted,
+  formatInboxSummaryBadge,
+  getInboxSummaryTotal,
+} from '../../client/inbox-summary-loader.js';
 import { navigateTo } from '../../client/navigation.js';
 import { coalescedRefresh, type CoalescedRefresh } from '../../client/coalesced-refresh.js';
 import { visibleInterval } from '../../client/visible-interval.js';
@@ -72,6 +84,37 @@ export function pendingSecretLink(n: Notification): string | null {
   return n.kind === SECRET_PENDING_KIND || n.status === SECRET_PENDING_STATUS
     ? PROFILE_SECRETS_PATH
     : null;
+}
+
+/**
+ * Coalesced cross-project Decisions notification (ptone/scion#7997). At most
+ * one unacknowledged row exists per user; it stays pinned at the top of the
+ * tray and links to Profile > Decisions (Waiting on you).
+ */
+export const DECISIONS_WAITING_KIND = 'decisions_waiting';
+export const DECISIONS_WAITING_STATUS = 'DECISIONS_WAITING';
+export const PROFILE_DECISIONS_PENDING_PATH = '/profile/decisions?tab=pending';
+
+/** Whether a notification row is the coalesced Decisions bell item. */
+export function isDecisionsWaiting(n: Pick<Notification, 'kind' | 'status'>): boolean {
+  return n.kind === DECISIONS_WAITING_KIND || n.status === DECISIONS_WAITING_STATUS;
+}
+
+/** The Profile > Decisions path for a decisions_waiting row, or null for any other row. */
+export function decisionsWaitingLink(n: Notification): string | null {
+  return isDecisionsWaiting(n) ? PROFILE_DECISIONS_PENDING_PATH : null;
+}
+
+function parseDecisionsCount(n: Pick<Notification, 'resourceId'>): number {
+  const parsed = Number.parseInt(n.resourceId ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function pinDecisionsWaitingFirst(list: Notification[]): Notification[] {
+  const pinned = list.filter((n) => isDecisionsWaiting(n));
+  if (pinned.length === 0) return list;
+  const rest = list.filter((n) => !isDecisionsWaiting(n));
+  return [...pinned, ...rest];
 }
 
 /**
@@ -140,8 +183,8 @@ export function reviewSummaryLink(n: Notification): string | null {
  *
  * The user-scoped `user.{id}.notification` subject delivers the row itself
  * (UserNotificationEvent): every field the tray renders (id, status,
- * message, createdAt, agentId). The bare `notification.created` path, and
- * anything malformed, yields null and is fetched instead.
+ * message, createdAt, agentId). Missing or malformed payloads yield null
+ * and fall back to fetching.
  *
  * The payload has no `acknowledged` field: a notification that was just
  * created is unacknowledged by definition, so a missing field passes and
@@ -178,7 +221,28 @@ export function notificationFromEvent(data: unknown, userId: string | null): Not
   };
 }
 
+/**
+ * Extracts a user-scoped SSE update whose `acknowledged` flag is `true`
+ * (e.g. `decisions_waiting` clearing when `waitingOnYou` reaches 0), or null.
+ * Kept separate from `notificationFromEvent` so callers expecting only
+ * unacknowledged rows from `notificationFromEvent` see unchanged behavior.
+ */
+export function acknowledgedNotificationFromEvent(
+  data: unknown,
+  userId: string | null
+): { id: string; isDecisions: boolean } | null {
+  if (!userId || !data || typeof data !== 'object') return null;
+  const d = data as Record<string, unknown>;
+  if (d.acknowledged !== true) return null;
+  if (typeof d.id !== 'string' || !d.id) return null;
+  if (d.subscriberId !== undefined && d.subscriberId !== userId) return null;
+  const isDecisions = d.kind === DECISIONS_WAITING_KIND || d.status === DECISIONS_WAITING_STATUS;
+  return { id: d.id, isDecisions };
+}
+
 const POLL_INTERVAL_MS = 5 * 60_000; // 5 minutes — fallback only; SSE delivers in real-time
+const UNHEALTHY_POLL_INTERVAL_MS = 30_000; // 30 seconds while SSE is disconnected
+const FOCUS_REFETCH_COOLDOWN_MS = 5_000; // avoid double-fetching when visibilitychange + focus fire together
 
 @customElement('scion-notification-tray')
 export class ScionNotificationTray extends LitElement {
@@ -192,16 +256,37 @@ export class ScionNotificationTray extends LitElement {
   @state() private pushEnabled = false;
   @state() private pushPermission: PushPermissionState = 'default';
 
+  /** Mirrors `web.inbox_dashboard` flag and `InboxSummaryStore` total/badge (design §6.1). */
+  @state() private inboxEnabled = false;
+  @state() private inboxTotal = 0;
+  @state() private inboxBadge: string | null = null;
+
   /** Stops the fallback poll; paused while the tab is hidden. */
   private stopPollTimer: (() => void) | null = null;
+  /** Whether the shared SSE stream has reported a drop without yet reconnecting. */
+  private sseUnhealthy = false;
+  /** Wall-clock timestamp of the most recent list fetch, for focus-refetch coalescing. */
+  private lastFetchAt = 0;
   /** The user id loading was started for; null when nothing is running. */
   private activeUserId: string | null = null;
   private boundOnClickOutside = this.onClickOutside.bind(this);
   private boundOnNotification = this.onNotificationEvent.bind(this);
+  private boundOnSseDisconnected = (): void => this.onSseDisconnected();
+  private boundOnSseConnected = (): void => this.onSseConnected();
+  private boundOnVisibilityChange = (): void => this.onVisibilityChange();
+  private boundOnWindowFocus = (): void => this.onWindowFocus();
   private boundOnPushPreference = (): void => this.syncPushState();
+  private boundOnFeatureFlagsChanged = (): void => this.onFeatureFlagsChanged();
+  private boundOnInboxSummaryChanged = (): void => this.syncInboxState();
 
   /** IDs already seen — used to detect genuinely new notifications. */
   private seenIds = new Set<string>();
+
+  /** Last observed count for decisions_waiting; governs browser push on increases. */
+  private lastDecisionsCount = 0;
+
+  /** Mirrors decisionsEnabled() so async flag loading at boot triggers reconcile + refresh. */
+  private decisionsFlagEnabled = false;
 
   /** Suppresses browser push for the initial fetch so existing notifications don't fire. */
   private initialFetchDone = false;
@@ -219,11 +304,20 @@ export class ScionNotificationTray extends LitElement {
   private appliedSeq = 0;
 
   /**
-   * Rows an event added, with the fetchSeq when it was added. A list request
-   * sent at or before that number may have been answered before the row
-   * existed, so its response must not drop the row.
+   * Rows an event added or updated in place, with the fetchSeq when the event
+   * arrived. A list request sent at or before that number may have been
+   * answered before the row existed (or with an older in-place version of a
+   * deterministic row such as decisions_waiting), so its response must neither
+   * drop nor overwrite the row.
    */
   private upsertedAtSeq = new Map<string, number>();
+
+  /**
+   * Rows acknowledged since the latest list request started, with the fetchSeq
+   * at the time of acknowledgement. Prevents an already-in-flight list request
+   * from resurrecting a row that SSE or user ack dismissed while it ran.
+   */
+  private ackedAtSeq = new Map<string, number>();
 
   /**
    * Fetches for events that carry no usable notification: the first of a
@@ -241,11 +335,16 @@ export class ScionNotificationTray extends LitElement {
 
   override connectedCallback(): void {
     super.connectedCallback();
+    this.decisionsFlagEnabled = decisionsEnabled();
+    this.inboxEnabled = isInboxDashboardEnabled();
     this.syncPushState();
     // Keep in step with the profile settings page, which writes the same
     // preference. Two toggles disagreeing about one setting is worse than one.
     window.addEventListener(PUSH_PREFERENCE_EVENT, this.boundOnPushPreference);
+    window.addEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    window.addEventListener(INBOX_SUMMARY_CHANGED_EVENT, this.boundOnInboxSummaryChanged);
     this.syncUser();
+    this.syncInboxState();
   }
 
   override disconnectedCallback(): void {
@@ -255,6 +354,8 @@ export class ScionNotificationTray extends LitElement {
     // A reconnect starts afresh, as a first mount does.
     this.activeUserId = null;
     window.removeEventListener(PUSH_PREFERENCE_EVENT, this.boundOnPushPreference);
+    window.removeEventListener(FEATURE_FLAGS_CHANGED_EVENT, this.boundOnFeatureFlagsChanged);
+    window.removeEventListener(INBOX_SUMMARY_CHANGED_EVENT, this.boundOnInboxSummaryChanged);
     document.removeEventListener('click', this.boundOnClickOutside, true);
   }
 
@@ -285,7 +386,14 @@ export class ScionNotificationTray extends LitElement {
       // Loading stops on disconnect and restarts in connectedCallback.
       if (!this.isConnected) return;
       this.activeUserId = id;
+      this.decisionsFlagEnabled = decisionsEnabled();
+      this.inboxEnabled = isInboxDashboardEnabled();
       void this.fetchNotifications();
+      this.reconcileDecisionsBell();
+      if (this.inboxEnabled) {
+        ensureInboxSummaryStarted(id);
+        this.syncInboxState();
+      }
       this.startPolling();
       this.listenForNotifications();
     } else {
@@ -293,7 +401,59 @@ export class ScionNotificationTray extends LitElement {
       this.stopPolling();
       this.stopListeningForNotifications();
       this.notifications = [];
+      this.inboxTotal = 0;
+      this.inboxBadge = null;
     }
+  }
+
+  private onFeatureFlagsChanged(): void {
+    const enabled = decisionsEnabled();
+    if (enabled !== this.decisionsFlagEnabled) {
+      this.decisionsFlagEnabled = enabled;
+      if (this.activeUserId) {
+        if (enabled) {
+          this.reconcileDecisionsBell();
+          void this.fetchNotifications();
+        } else {
+          this.lastDecisionsCount = 0;
+          this.notifications = this.notifications.filter((n) => !isDecisionsWaiting(n));
+        }
+      }
+    }
+
+    const nextInbox = isInboxDashboardEnabled();
+    if (nextInbox !== this.inboxEnabled) {
+      this.inboxEnabled = nextInbox;
+      if (nextInbox) {
+        if (this.activeUserId) {
+          ensureInboxSummaryStarted(this.activeUserId);
+        }
+        this.syncInboxState();
+      } else {
+        this.inboxTotal = 0;
+        this.inboxBadge = null;
+      }
+    }
+  }
+
+  private syncInboxState(): void {
+    if (!this.inboxEnabled) {
+      this.inboxTotal = 0;
+      this.inboxBadge = null;
+      return;
+    }
+    this.inboxTotal = getInboxSummaryTotal();
+    this.inboxBadge = formatInboxSummaryBadge();
+  }
+
+  /**
+   * Fires a zero-row pending decisions read (B6) so the hub reconciles the
+   * caller's coalesced `decisions_waiting` bell row asynchronously after
+   * responding; any healed row arrives via `user.{id}.notification`.
+   */
+  private reconcileDecisionsBell(): void {
+    if (!decisionsEnabled() || !this.user?.id) return;
+    void apiFetch('/api/v1/users/me/decisions?tab=pending&limit=0').catch(() => {});
   }
 
   // ---------------------------------------------------------------------------
@@ -312,7 +472,9 @@ export class ScionNotificationTray extends LitElement {
     this.stateUserId = id;
     this.notifications = [];
     this.seenIds = new Set();
+    this.lastDecisionsCount = 0;
     this.upsertedAtSeq.clear();
+    this.ackedAtSeq.clear();
     this.initialFetchDone = false;
     // The next user's first fetch answers any event the previous user's
     // coalescer held, and their first event fetches at once.
@@ -383,12 +545,31 @@ export class ScionNotificationTray extends LitElement {
 
   private startPolling(): void {
     this.stopPolling();
-    this.stopPollTimer = visibleInterval(() => void this.fetchNotifications(), POLL_INTERVAL_MS);
+    const intervalMs = this.sseUnhealthy ? UNHEALTHY_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+    this.stopPollTimer = visibleInterval(() => void this.fetchNotifications(), intervalMs, {
+      catchUpOnVisible: false,
+    });
+    document.addEventListener('visibilitychange', this.boundOnVisibilityChange);
+    window.addEventListener('focus', this.boundOnWindowFocus);
   }
 
   private stopPolling(): void {
     this.stopPollTimer?.();
     this.stopPollTimer = null;
+    document.removeEventListener('visibilitychange', this.boundOnVisibilityChange);
+    window.removeEventListener('focus', this.boundOnWindowFocus);
+  }
+
+  private onVisibilityChange(): void {
+    if (document.hidden || !this.activeUserId) return;
+    if (Date.now() - this.lastFetchAt < FOCUS_REFETCH_COOLDOWN_MS) return;
+    void this.fetchNotifications();
+  }
+
+  private onWindowFocus(): void {
+    if (document.hidden || !this.activeUserId) return;
+    if (Date.now() - this.lastFetchAt < FOCUS_REFETCH_COOLDOWN_MS) return;
+    void this.fetchNotifications();
   }
 
   // ---------------------------------------------------------------------------
@@ -397,11 +578,32 @@ export class ScionNotificationTray extends LitElement {
 
   private listenForNotifications(): void {
     stateManager.addEventListener('notification-created', this.boundOnNotification);
+    stateManager.addEventListener('disconnected', this.boundOnSseDisconnected);
+    stateManager.addEventListener('connected', this.boundOnSseConnected);
   }
 
   private stopListeningForNotifications(): void {
     stateManager.removeEventListener('notification-created', this.boundOnNotification);
+    stateManager.removeEventListener('disconnected', this.boundOnSseDisconnected);
+    stateManager.removeEventListener('connected', this.boundOnSseConnected);
+    this.sseUnhealthy = false;
     this.eventFetch.cancel();
+  }
+
+  private onSseDisconnected(): void {
+    if (!this.activeUserId) return;
+    if (!this.sseUnhealthy) {
+      this.sseUnhealthy = true;
+      this.startPolling();
+    }
+  }
+
+  private onSseConnected(): void {
+    if (!this.activeUserId || !this.sseUnhealthy) return;
+    this.sseUnhealthy = false;
+    this.startPolling();
+    void this.fetchNotifications();
+    this.reconcileDecisionsBell();
   }
 
   private onNotificationEvent(e: Event): void {
@@ -411,9 +613,23 @@ export class ScionNotificationTray extends LitElement {
     // first fetch has finished there is no list to add to (and no seen set
     // to tell a new row by), so that fetch is joined by fetching as well.
     const detail = (e as CustomEvent<{ data?: unknown } | undefined>).detail;
-    const n = this.initialFetchDone
-      ? notificationFromEvent(detail?.data, this.user?.id ?? null)
-      : null;
+    const userId = this.user?.id ?? null;
+    if (this.initialFetchDone) {
+      const ack = acknowledgedNotificationFromEvent(detail?.data, userId);
+      if (ack) {
+        if (ack.isDecisions) {
+          this.lastDecisionsCount = 0;
+        }
+        this.upsertedAtSeq.delete(ack.id);
+        this.ackedAtSeq.set(ack.id, this.fetchSeq);
+        this.seenIds.delete(ack.id);
+        if (this.notifications.some((x) => x.id === ack.id)) {
+          this.notifications = this.notifications.filter((x) => x.id !== ack.id);
+        }
+        return;
+      }
+    }
+    const n = this.initialFetchDone ? notificationFromEvent(detail?.data, userId) : null;
     if (n) {
       this.upsertNotification(n);
       return;
@@ -425,15 +641,26 @@ export class ScionNotificationTray extends LitElement {
   private upsertNotification(n: Notification): void {
     // Chat rows no longer belong in the bell (see fetchNotifications).
     if (RETIRED_CHAT_STATUSES.has(n.status)) return;
-    if (!this.seenIds.has(n.id)) {
+    if (isDecisionsWaiting(n)) {
+      if (!decisionsEnabled()) return;
+      const nextCount = parseDecisionsCount(n);
+      const currentlyShown = this.notifications.some((x) => x.id === n.id);
+      if (!currentlyShown || nextCount > this.lastDecisionsCount) {
+        this.dispatchBrowserNotification(n);
+      }
+      this.lastDecisionsCount = nextCount;
+      this.seenIds.add(n.id);
+    } else if (!this.seenIds.has(n.id)) {
       this.dispatchBrowserNotification(n);
       this.seenIds.add(n.id);
     }
+    this.ackedAtSeq.delete(n.id);
     this.upsertedAtSeq.set(n.id, this.fetchSeq);
-    // The list is newest first, as the endpoint returns it.
+    // The list is newest first, with decisions_waiting pinned at index 0.
     const at = this.notifications.findIndex((x) => x.id === n.id);
-    this.notifications =
+    const updated =
       at < 0 ? [n, ...this.notifications] : this.notifications.map((x, i) => (i === at ? n : x));
+    this.notifications = pinDecisionsWaitingFirst(updated);
   }
 
   // ---------------------------------------------------------------------------
@@ -443,6 +670,7 @@ export class ScionNotificationTray extends LitElement {
   private async fetchNotifications(): Promise<void> {
     const requestUserId = this.user?.id ?? null;
     const seq = ++this.fetchSeq;
+    this.lastFetchAt = Date.now();
     try {
       const res = await apiFetch('/api/v1/notifications?acknowledged=false');
       if (!res.ok) return;
@@ -451,31 +679,63 @@ export class ScionNotificationTray extends LitElement {
       // A newer request's answer is already shown: this one is older.
       if (seq < this.appliedSeq) return;
       this.appliedSeq = seq;
+      const decisionsOn = decisionsEnabled();
       // Older chat rows can still be unacknowledged; chat no longer belongs
       // in the bell, so they are neither listed, counted nor popped.
-      const incoming = (data ?? []).filter((n) => !RETIRED_CHAT_STATUSES.has(n.status));
+      const incoming = (data ?? []).filter(
+        (n) => !RETIRED_CHAT_STATUSES.has(n.status) && (decisionsOn || !isDecisionsWaiting(n))
+      );
 
-      // Detect new notifications (IDs not previously seen) and dispatch
-      // browser push for them — but only after the first fetch so we don't
-      // blast existing unacknowledged notifications on page load.
+      // Rows added, updated in place (such as decisions_waiting), or
+      // acknowledged after this request was sent are newer than its answer:
+      // keep the live event version and ignore any stale copy in incoming.
+      const newerInPlaceIds = new Set<string>();
+      for (const [id, at] of this.upsertedAtSeq) {
+        if (at >= seq) {
+          newerInPlaceIds.add(id);
+        } else {
+          this.upsertedAtSeq.delete(id);
+        }
+      }
+      const newerAckedIds = new Set<string>();
+      for (const [id, at] of this.ackedAtSeq) {
+        if (at >= seq) {
+          newerAckedIds.add(id);
+        } else {
+          this.ackedAtSeq.delete(id);
+        }
+      }
+      const freshIncoming = incoming.filter(
+        (n) => !newerInPlaceIds.has(n.id) && !newerAckedIds.has(n.id)
+      );
+
+      // Detect new notifications (IDs not previously seen, or decisions_waiting
+      // appearing / increasing) and dispatch browser push — but only after the
+      // first fetch so we don't blast existing unacknowledged rows on page load.
       if (this.initialFetchDone) {
-        for (const n of incoming) {
-          if (!this.seenIds.has(n.id)) {
+        for (const n of freshIncoming) {
+          if (isDecisionsWaiting(n)) {
+            const nextCount = parseDecisionsCount(n);
+            const currentlyShown = this.notifications.some((x) => x.id === n.id);
+            if (!currentlyShown || nextCount > this.lastDecisionsCount) {
+              this.dispatchBrowserNotification(n);
+            }
+          } else if (!this.seenIds.has(n.id)) {
             this.dispatchBrowserNotification(n);
           }
         }
       }
 
-      // Rows an event added after this request was sent are newer than its
-      // answer: keep them (they are already seen). Older ones are answered.
-      const incomingIds = new Set(incoming.map((n) => n.id));
+      const freshIncomingIds = new Set(freshIncoming.map((n) => n.id));
       const kept = this.notifications.filter(
-        (n) => !incomingIds.has(n.id) && (this.upsertedAtSeq.get(n.id) ?? -1) >= seq
+        (n) =>
+          !freshIncomingIds.has(n.id) &&
+          newerInPlaceIds.has(n.id) &&
+          (decisionsOn || !isDecisionsWaiting(n))
       );
-      for (const [id, at] of this.upsertedAtSeq) {
-        if (at < seq) this.upsertedAtSeq.delete(id);
-      }
-      const next = [...kept, ...incoming];
+      const next = pinDecisionsWaitingFirst([...kept, ...freshIncoming]);
+      const decisionsRow = next.find((n) => isDecisionsWaiting(n));
+      this.lastDecisionsCount = decisionsRow ? parseDecisionsCount(decisionsRow) : 0;
 
       // Update seen set to current snapshot
       this.seenIds = new Set(next.map((n) => n.id));
@@ -495,13 +755,14 @@ export class ScionNotificationTray extends LitElement {
       return;
     }
 
-    const title = this.browserNotificationTitle(n.status);
+    const decisions = isDecisionsWaiting(n);
+    const title = decisions ? 'Decisions waiting' : this.browserNotificationTitle(n.status);
     // The Notification API shows the body as plain text.
     const excerpt = reviewSummaryExcerpt(n);
     new window.Notification(title, {
       body: excerpt ? `${n.message}\n\u201c${excerpt}\u201d` : n.message,
-      tag: n.id, // deduplicate if the same notification is seen again
-      icon: '/scion-notification-icon.png',
+      tag: decisions ? DECISIONS_WAITING_KIND : n.id, // deduplicate in OS notification center
+      icon: getNotificationIconUrl(),
     });
   }
 
@@ -519,8 +780,10 @@ export class ScionNotificationTray extends LitElement {
         return 'Review Submitted';
       case SECRET_PENDING_STATUS:
         return 'Secret Awaiting Approval';
+      case DECISIONS_WAITING_STATUS:
+        return 'Decisions waiting';
       default:
-        return 'Scion Notification';
+        return `${getBrandName()} Notification`;
     }
   }
 
@@ -531,6 +794,7 @@ export class ScionNotificationTray extends LitElement {
       if (!this.isForCurrentUser(requestUserId)) return;
       this.notifications = this.notifications.filter((n) => n.id !== id);
       this.upsertedAtSeq.delete(id);
+      this.ackedAtSeq.set(id, this.fetchSeq);
     } catch {
       // Ignore
     }
@@ -541,6 +805,9 @@ export class ScionNotificationTray extends LitElement {
     try {
       await apiFetch('/api/v1/notifications/ack-all', { method: 'POST' });
       if (!this.isForCurrentUser(requestUserId)) return;
+      for (const n of this.notifications) {
+        this.ackedAtSeq.set(n.id, this.fetchSeq);
+      }
       this.notifications = [];
       this.upsertedAtSeq.clear();
     } catch {
@@ -559,8 +826,9 @@ export class ScionNotificationTray extends LitElement {
       requestAnimationFrame(() => {
         document.addEventListener('click', this.boundOnClickOutside, true);
       });
-      // Refresh on open
+      // Refresh on open and reconcile Decisions bell asynchronously (B6)
       void this.fetchNotifications();
+      this.reconcileDecisionsBell();
     } else {
       document.removeEventListener('click', this.boundOnClickOutside, true);
     }
@@ -590,6 +858,8 @@ export class ScionNotificationTray extends LitElement {
         return 'calendar-x';
       case SECRET_PENDING_STATUS:
         return 'shield-lock';
+      case DECISIONS_WAITING_STATUS:
+        return 'signpost-split';
       default:
         return 'info-circle-fill';
     }
@@ -605,6 +875,8 @@ export class ScionNotificationTray extends LitElement {
       case 'LIMITS_EXCEEDED':
       case SCHEDULE_BLOCKED_STATUS:
         return 'status-danger';
+      case DECISIONS_WAITING_STATUS:
+        return 'status-primary';
       default:
         return 'status-info';
     }
@@ -638,7 +910,7 @@ export class ScionNotificationTray extends LitElement {
       width: 2.25rem;
       height: 2.25rem;
       border: none;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       background: transparent;
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -664,9 +936,9 @@ export class ScionNotificationTray extends LitElement {
       min-width: 16px;
       height: 16px;
       padding: 0 4px;
-      border-radius: 8px;
-      background: var(--scion-danger, #ef4444);
-      color: #fff;
+      border-radius: var(--scion-radius-full);
+      background: var(--sl-color-danger-600, #dc2626);
+      color: var(--sl-color-neutral-0, #fff);
       font-size: 0.625rem;
       font-weight: 700;
       line-height: 16px;
@@ -701,7 +973,7 @@ export class ScionNotificationTray extends LitElement {
       flex-direction: column;
       background: var(--scion-surface, #ffffff);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.75rem;
+      border-radius: var(--scion-radius-lg);
       box-shadow:
         0 10px 15px -3px rgba(0, 0, 0, 0.1),
         0 4px 6px -4px rgba(0, 0, 0, 0.1);
@@ -724,6 +996,36 @@ export class ScionNotificationTray extends LitElement {
       margin: 0;
     }
 
+    .panel-header-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+    }
+
+    .inbox-link {
+      color: var(--scion-primary, #3b82f6);
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-decoration: none;
+      padding: 0.25rem 0.5rem;
+      border-radius: var(--scion-radius-sm);
+      transition: background 0.15s ease;
+    }
+
+    .inbox-link:hover {
+      background: var(--scion-bg-subtle, #f1f5f9);
+    }
+
+    .empty-inbox-link {
+      color: var(--scion-primary, #3b82f6);
+      font-weight: 500;
+      text-decoration: none;
+    }
+
+    .empty-inbox-link:hover {
+      text-decoration: underline;
+    }
+
     .mark-all-btn {
       border: none;
       background: transparent;
@@ -732,7 +1034,7 @@ export class ScionNotificationTray extends LitElement {
       font-weight: 500;
       cursor: pointer;
       padding: 0.25rem 0.5rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       transition: background 0.15s ease;
     }
 
@@ -763,6 +1065,22 @@ export class ScionNotificationTray extends LitElement {
       background: var(--scion-bg-subtle, #f1f5f9);
     }
 
+    .notif-item.pinned {
+      background: color-mix(
+        in srgb,
+        var(--scion-primary, #3b82f6) 5%,
+        var(--scion-surface, #ffffff)
+      );
+    }
+
+    .notif-item.pinned:hover {
+      background: color-mix(
+        in srgb,
+        var(--scion-primary, #3b82f6) 9%,
+        var(--scion-surface, #ffffff)
+      );
+    }
+
     .notif-icon {
       flex-shrink: 0;
       display: flex;
@@ -775,15 +1093,19 @@ export class ScionNotificationTray extends LitElement {
     }
 
     .status-success sl-icon {
-      color: var(--scion-success, #22c55e);
+      color: var(--scion-status-success, #22c55e);
     }
 
     .status-warning sl-icon {
-      color: var(--scion-warning, #f59e0b);
+      color: var(--scion-status-warning, #f59e0b);
     }
 
     .status-danger sl-icon {
-      color: var(--scion-danger, #ef4444);
+      color: var(--scion-status-danger, #ef4444);
+    }
+
+    .status-primary sl-icon {
+      color: var(--scion-primary, #3b82f6);
     }
 
     .status-info sl-icon {
@@ -793,6 +1115,14 @@ export class ScionNotificationTray extends LitElement {
     .notif-body {
       flex: 1;
       min-width: 0;
+    }
+
+    .notif-title {
+      font-size: 0.75rem;
+      font-weight: 600;
+      line-height: 1.3;
+      color: var(--scion-text, #1e293b);
+      margin-bottom: 0.125rem;
     }
 
     .notif-message {
@@ -827,7 +1157,7 @@ export class ScionNotificationTray extends LitElement {
       font-size: 0.6875rem;
       font-weight: 700;
       line-height: 1.25rem;
-      border-radius: 0.5rem;
+      border-radius: var(--scion-radius);
       background: var(--scion-bg-subtle, #f1f5f9);
       color: var(--scion-text-muted, #64748b);
       cursor: pointer;
@@ -850,6 +1180,10 @@ export class ScionNotificationTray extends LitElement {
     .notif-meta a {
       color: var(--scion-primary, #3b82f6);
       text-decoration: none;
+    }
+
+    .notif-meta a.decisions-open-link {
+      font-weight: 600;
     }
 
     .notif-meta a:hover {
@@ -907,7 +1241,7 @@ export class ScionNotificationTray extends LitElement {
       font-weight: 500;
       cursor: pointer;
       padding: 0.25rem 0.5rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       transition: background 0.15s ease;
     }
 
@@ -932,7 +1266,7 @@ export class ScionNotificationTray extends LitElement {
       font-weight: 500;
       cursor: pointer;
       padding: 0.25rem 0.5rem;
-      border-radius: 0.25rem;
+      border-radius: var(--scion-radius-sm);
       text-decoration: none;
       transition: background 0.15s ease;
     }
@@ -971,7 +1305,7 @@ export class ScionNotificationTray extends LitElement {
         right: 0;
         width: 100%;
         max-height: 70vh;
-        border-radius: 0.75rem 0.75rem 0 0;
+        border-radius: var(--scion-radius-lg) var(--scion-radius-lg) 0 0;
       }
     }
   `;
@@ -1002,14 +1336,29 @@ export class ScionNotificationTray extends LitElement {
 
   private renderPanel() {
     const count = this.notifications.length;
+    const inboxOn = this.isConnected ? this.inboxEnabled : isInboxDashboardEnabled();
+    const inboxBadge = this.isConnected ? this.inboxBadge : formatInboxSummaryBadge();
     return html`
       <div class="panel" role="dialog" aria-label="Notifications">
         <div class="panel-header">
           <h3 class="panel-title">Notifications</h3>
-          ${count > 0
-            ? html`<button class="mark-all-btn" @click=${(): void => void this.ackAll()}>
-                Mark all read
-              </button>`
+          ${inboxOn || count > 0
+            ? html`<div class="panel-header-actions">
+                ${inboxOn
+                  ? html`<a
+                      href="/profile/inbox"
+                      class="inbox-link"
+                      data-tray-inbox-link
+                      @click=${(e: Event): void => this.navigateToPath(e, '/profile/inbox')}
+                      >${inboxBadge ? `Inbox \u00b7 ${inboxBadge} \u2192` : 'Inbox \u2192'}</a
+                    >`
+                  : nothing}
+                ${count > 0
+                  ? html`<button class="mark-all-btn" @click=${(): void => void this.ackAll()}>
+                      Mark all read
+                    </button>`
+                  : nothing}
+              </div>`
             : nothing}
         </div>
         <div class="panel-list">
@@ -1076,12 +1425,16 @@ export class ScionNotificationTray extends LitElement {
     const excerpt = reviewSummaryExcerpt(n);
     const artifactLink = reviewSummaryLink(n);
     const secretsLink = pendingSecretLink(n);
+    const decisionsLink = decisionsWaitingLink(n);
+    const isDecisions = decisionsLink !== null;
+    const iconStatus = isDecisions ? DECISIONS_WAITING_STATUS : n.status;
     return html`
-      <div class="notif-item">
-        <div class="notif-icon ${this.statusClass(n.status)}">
-          <sl-icon name=${this.statusIcon(n.status)}></sl-icon>
+      <div class="notif-item ${isDecisions ? 'pinned' : ''}">
+        <div class="notif-icon ${this.statusClass(iconStatus)}">
+          <sl-icon name=${this.statusIcon(iconStatus)}></sl-icon>
         </div>
         <div class="notif-body">
+          ${isDecisions ? html`<div class="notif-title">Decisions waiting</div>` : nothing}
           <div class="notif-message">${n.message}</div>
           <sl-tooltip content=${n.message} hoist>
             <span class="truncation-badge" style="display:none">...</span>
@@ -1089,6 +1442,15 @@ export class ScionNotificationTray extends LitElement {
           ${excerpt ? html`<div class="notif-excerpt">“${excerpt}”</div>` : nothing}
           <div class="notif-meta">
             <span>${this.relativeTime(n.createdAt)}</span>
+            ${decisionsLink
+              ? html`<a
+                  href=${decisionsLink}
+                  class="decisions-open-link"
+                  @click=${(e: Event): void => this.navigateToPath(e, decisionsLink)}
+                >
+                  Open Decisions
+                </a>`
+              : nothing}
             ${artifactLink
               ? html`<a
                   href=${artifactLink}
@@ -1125,10 +1487,23 @@ export class ScionNotificationTray extends LitElement {
   }
 
   private renderEmpty() {
+    const inboxOn = this.isConnected ? this.inboxEnabled : isInboxDashboardEnabled();
+    const inboxTotal = this.isConnected ? this.inboxTotal : getInboxSummaryTotal();
     return html`
       <div class="empty-state">
         <sl-icon name="bell-slash"></sl-icon>
-        <span>No notifications</span>
+        ${inboxOn && inboxTotal > 0
+          ? html`<span>
+              No new notifications.
+              <a
+                href="/profile/inbox"
+                class="empty-inbox-link"
+                data-tray-empty-inbox-link
+                @click=${(e: Event): void => this.navigateToPath(e, '/profile/inbox')}
+                >Open Inbox</a
+              >
+            </span>`
+          : html`<span>No notifications</span>`}
       </div>
     `;
   }

@@ -107,15 +107,17 @@ var testAdminPermissionPolicy = map[string]testAdminPolicy{
 	"agent.identity_token": testAdminPolicyAllow,
 
 	// Projects.
-	"project.create":               testAdminPolicyAllow,
-	"project.read":                 testAdminPolicyAllow,
-	"project.update":               testAdminPolicyAllow,
-	"project.delete":               testAdminPolicyAllow,
-	"project.manage":               testAdminPolicyAllow,
-	"project.register":             testAdminPolicyAllow,
-	"project.set_messaging_policy": testAdminPolicyAllow,
-	"project.clone":                testAdminPolicyAllow,
-	"project.list":                 testAdminPolicyAllow,
+	"project.create":                  testAdminPolicyAllow,
+	"project.read":                    testAdminPolicyAllow,
+	"project.update":                  testAdminPolicyAllow,
+	"project.delete":                  testAdminPolicyAllow,
+	"project.manage":                  testAdminPolicyAllow,
+	"project.register":                testAdminPolicyAllow,
+	"project.set_messaging_policy":    testAdminPolicyAllow,
+	"project.manage_message_policies": testAdminPolicyAllow,
+	"project.read_message_policies":   testAdminPolicyAllow,
+	"project.clone":                   testAdminPolicyAllow,
+	"project.list":                    testAdminPolicyAllow,
 	// Posting into a project's chat threads, held by the built-in
 	// project roles.
 	"project.chat_post": testAdminPolicyAllow,
@@ -142,29 +144,34 @@ var testAdminPermissionPolicy = map[string]testAdminPolicy{
 	"project.secret_read": testAdminPolicyAllow,
 
 	// Artifacts, skills, templates, harness configs.
-	"artifact.read":         testAdminPolicyAllow,
-	"artifact.create":       testAdminPolicyAllow,
-	"artifact.update":       testAdminPolicyAllow,
-	"artifact.delete":       testAdminPolicyAllow,
-	"artifact.manage":       testAdminPolicyAllow,
-	"artifact.steward":      testAdminPolicyAllow,
-	"skill.create":          testAdminPolicyAllow,
-	"skill.create_global":   testAdminPolicyAllow,
-	"skill.read":            testAdminPolicyAllow,
-	"skill.update":          testAdminPolicyAllow,
-	"skill.delete":          testAdminPolicyAllow,
-	"skill.list":            testAdminPolicyAllow,
-	"skill.register":        testAdminPolicyAllow,
-	"template.create":       testAdminPolicyAllow,
-	"template.read":         testAdminPolicyAllow,
-	"template.update":       testAdminPolicyAllow,
-	"template.delete":       testAdminPolicyAllow,
-	"template.list":         testAdminPolicyAllow,
-	"harness_config.create": testAdminPolicyAllow,
-	"harness_config.read":   testAdminPolicyAllow,
-	"harness_config.update": testAdminPolicyAllow,
-	"harness_config.delete": testAdminPolicyAllow,
-	"harness_config.list":   testAdminPolicyAllow,
+	"artifact.read":          testAdminPolicyAllow,
+	"artifact.create":        testAdminPolicyAllow,
+	"artifact.update":        testAdminPolicyAllow,
+	"artifact.delete":        testAdminPolicyAllow,
+	"artifact.manage":        testAdminPolicyAllow,
+	"artifact.steward":       testAdminPolicyAllow,
+	"skill.create":           testAdminPolicyAllow,
+	"skill.create_global":    testAdminPolicyAllow,
+	"skill.read":             testAdminPolicyAllow,
+	"skill.update":           testAdminPolicyAllow,
+	"skill.update_global":    testAdminPolicyAllow,
+	"skill.delete":           testAdminPolicyAllow,
+	"skill.delete_global":    testAdminPolicyAllow,
+	"skill.list":             testAdminPolicyAllow,
+	"skill.register":         testAdminPolicyAllow,
+	"template.create":        testAdminPolicyAllow,
+	"template.create_global": testAdminPolicyAllow,
+	"template.read":          testAdminPolicyAllow,
+	"template.update":        testAdminPolicyAllow,
+	"template.update_global": testAdminPolicyAllow,
+	"template.delete":        testAdminPolicyAllow,
+	"template.delete_global": testAdminPolicyAllow,
+	"template.list":          testAdminPolicyAllow,
+	"harness_config.create":  testAdminPolicyAllow,
+	"harness_config.read":    testAdminPolicyAllow,
+	"harness_config.update":  testAdminPolicyAllow,
+	"harness_config.delete":  testAdminPolicyAllow,
+	"harness_config.list":    testAdminPolicyAllow,
 
 	// Groups, users, policies.
 	"group.create":       testAdminPolicyAllow,
@@ -195,6 +202,7 @@ var testAdminPermissionPolicy = map[string]testAdminPolicy{
 	"broker.delete":       testAdminPolicyAllow,
 	"broker.list":         testAdminPolicyAllow,
 	"broker.auto_provide": testAdminPolicyAllow,
+	"broker.manage":       testAdminPolicyDeny,
 	"broker.dispatch":     testAdminPolicyAllow,
 
 	// GCP service accounts registered on this hub.
@@ -252,6 +260,14 @@ var testAdminPermissionPolicy = map[string]testAdminPolicy{
 	"test_identity.issue_admin":       testAdminPolicyDeny,
 	"test_identity.issue_super_admin": testAdminPolicyDeny,
 
+	// System One provider instances (ptone/scion#8044): runtime-writable
+	// credential and outbound provider configuration surface — deny for
+	// admin test identities.
+	"system_one_instance.read":    testAdminPolicyDeny,
+	"system_one_instance.create":  testAdminPolicyDeny,
+	"system_one_instance.delete":  testAdminPolicyDeny,
+	"system_one_instance.execute": testAdminPolicyDeny,
+
 	// Quotas, roles, bindings, access constraints, schedules.
 	"quota.read":              testAdminPolicyAllow,
 	"quota.create":            testAdminPolicyAllow,
@@ -271,6 +287,26 @@ var testAdminPermissionPolicy = map[string]testAdminPolicy{
 	"scheduled_event.create":  testAdminPolicyAllow,
 	"scheduled_event.delete":  testAdminPolicyAllow,
 	"scheduled_event.update":  testAdminPolicyAllow,
+	"trigger.read":            testAdminPolicyAllow,
+	"trigger.list":            testAdminPolicyAllow,
+	"trigger.create":          testAdminPolicyAllow,
+	"trigger.delete":          testAdminPolicyAllow,
+	"trigger.update":          testAdminPolicyAllow,
+	"webhook_endpoint.read":   testAdminPolicyAllow,
+	"webhook_endpoint.list":   testAdminPolicyAllow,
+	"webhook_endpoint.create": testAdminPolicyAllow,
+	"webhook_endpoint.delete": testAdminPolicyAllow,
+
+	// GitHub App triggers (ptone/scion#8090): github_trigger.comment is held
+	// by the built-in project-member, project-admin, and project-owner roles;
+	// like project.chat_post, keeping it allow preserves test-admin group
+	// delegation of project-member while exercising it still requires the
+	// hub.github_triggers experiment (deny for test admins) plus an authorized
+	// GitHub App association on a test-class hub. Configuring project GitHub
+	// trigger source settings (github_trigger.configure) stays deny for direct
+	// exercise and grantable at project scope (testAdminGrantableAtProjectScope).
+	"github_trigger.comment":   testAdminPolicyAllow,
+	"github_trigger.configure": testAdminPolicyDeny,
 
 	// Material delivery and runtime retrieval of secret values.
 	"secret.deliver":          testAdminPolicyDeny,
@@ -304,6 +340,7 @@ var testAdminGrantableAtProjectScope = map[string]bool{
 	"agent.delegation.list":              true,
 	"agent.delegation.read":              true,
 	"project.manage_visitors":            true,
+	"github_trigger.configure":           true,
 }
 
 // testAdminGrantRefuses reports whether an admin-kind test identity is
@@ -357,6 +394,41 @@ var testAdminLegacyRoutePolicy = map[string]testAdminPolicy{
 	"users.sessions.revoke": testAdminPolicyAllow,
 }
 
+// viewAsMemberGateKind classifies how an admin gate, DB-row role read, or
+// identity-rebuild site behaves when the caller's web session is in
+// "View as member" mode (ptone/scion#8648, design §4.2.4).
+// The zero value is intentionally invalid so omitting ViewAsMember fails the
+// census test. Additional census-only kinds (denied_first, not_a_request_gate)
+// and the census validator live in test_admin_policy_census_test.go.
+type viewAsMemberGateKind string
+
+const (
+	// viewAsMemberEffective means the site honours view-as-member by
+	// construction (effective Role(), clamped AuthzService store, or
+	// applyViewAsMemberFromContext / viewAsMemberUserFromContext).
+	viewAsMemberEffective viewAsMemberGateKind = "effective"
+	// viewAsMemberRealByDesign means the site intentionally evaluates real
+	// (unclamped) admin status (e.g., maintenance admission per D4,
+	// AuthorizeViewAsMemberChange, or non-caller principal checks). Requires
+	// Reason.
+	viewAsMemberRealByDesign viewAsMemberGateKind = "real_by_design"
+)
+
+// viewAsMemberGate records the view-as-member classification of a single site.
+type viewAsMemberGate struct {
+	Kind   viewAsMemberGateKind
+	Reason string
+	By     string
+}
+
+func vamEffective() viewAsMemberGate {
+	return viewAsMemberGate{Kind: viewAsMemberEffective}
+}
+
+func vamRealByDesign(reason string) viewAsMemberGate {
+	return viewAsMemberGate{Kind: viewAsMemberRealByDesign, Reason: reason}
+}
+
 // testAdminRoleGate is the classification of one role-claim admin gate: a
 // function that admits an unscoped local platform admin (or a stored or
 // claimed admin role) outside the legacy admin routes.
@@ -364,8 +436,9 @@ type testAdminRoleGate struct {
 	Policy testAdminPolicy
 	// EnforcedIn names the function that calls testAdminPolicyRefuses for
 	// this gate (deny entries only; empty means the gate's own function).
-	EnforcedIn string
-	Reason     string
+	EnforcedIn   string
+	Reason       string
+	ViewAsMember viewAsMemberGate
 }
 
 // testAdminRoleGatePolicy classifies every role-claim admin gate, keyed
@@ -373,49 +446,52 @@ type testAdminRoleGate struct {
 // them: the callers of IsUnscopedLocalPlatformAdmin, IsSystemAdmin and
 // IsHubAdmin, and the role gates of testAdminRoleAdminCensus).
 var testAdminRoleGatePolicy = map[string]testAdminRoleGate{
-	"authorize.go:requireAdminAt":                                 {Policy: testAdminPolicyAllow, Reason: "legacy admin routes: classified per route in testAdminLegacyRoutePolicy and enforced in requireAdminAt"},
-	"admin_delegation_adoption.go:isDelegationAdoptionAdmin":      {Policy: testAdminPolicyDeny, Reason: "agent authority migration"},
-	"admin_delegation_adoption.go:recheckDelegationAdoptionAdmin": {Policy: testAdminPolicyDeny, Reason: "agent authority migration"},
-	"admin_mode.go:adminModeMiddleware":                           {Policy: testAdminPolicyAllow, Reason: "admins pass while admin mode is on (the mode itself is hub.admin_mode.update, deny)"},
-	"admin_mode.go:adminModeWebMiddleware":                        {Policy: testAdminPolicyAllow, Reason: "admins pass while admin mode is on (web)"},
-	"agent_pending_config_authz.go:deferDuringMaintenance":        {Policy: testAdminPolicyAllow, Reason: "a held edit's fold mirrors adminModeMiddleware: an admin saver's keys are not deferred while admin mode is on"},
-	"gcp_iam_settings.go:gcpIAMHubAdmin":                          {Policy: testAdminPolicyDeny, EnforcedIn: "requireGCPIAMHubAdmin", Reason: "GCP permission check settings are runtime configuration"},
-	"handlers_env_secrets.go:authorizeHubEnvVarList":              {Policy: testAdminPolicyDeny, Reason: "hub environment variables (hub.env_vars.read)"},
-	"handlers_env_secrets.go:resolveEnvSecretAccess":              {Policy: testAdminPolicyDeny, Reason: "hub-scope environment variables and secrets"},
-	"handlers_env_secrets.go:authorizeBrokerMaterial":             {Policy: testAdminPolicyDeny, Reason: "runtime broker environment variables and secrets, matching the material root scopes"},
-	"handlers_runtime_brokers.go:updateRuntimeBroker":             {Policy: testAdminPolicyDeny, Reason: "runtime broker update, except a broker the test identity registered (the co-located broker)"},
-	"handlers_runtime_brokers.go:deleteRuntimeBroker":             {Policy: testAdminPolicyDeny, Reason: "runtime broker deregistration, except a broker the test identity registered (the co-located broker)"},
-	"web.go:authorizeSSESubjects":                                 {Policy: testAdminPolicyAllow, Reason: "event subscriptions (read)"},
-	"passthrough_gate.go:evaluatePassthroughIdentity":             {Policy: testAdminPolicyDeny, Reason: "exposes the co-located broker's host GCP identity to agents"},
-	"handlers_auth.go:handleAuthAdminStatus":                      {Policy: testAdminPolicyAllow, Reason: "display of the caller's own admin status"},
-	"perftrace_middleware.go:perfHeadersAllowed":                  {Policy: testAdminPolicyAllow, Reason: "request timing headers"},
-	"project_messaging_policy.go:messagingPolicyOwnerRule":        {Policy: testAdminPolicyAllow, Reason: "project messaging policy (project.set_messaging_policy is allow)"},
-	"authorize_message.go:authorizeAgentMessage":                  {Policy: testAdminPolicyAllow, Reason: "messaging agents"},
-	"handlers_agent_message_mode.go:handleSetMessageMode":         {Policy: testAdminPolicyAllow, Reason: "agent message mode"},
-	"deletion_redact.go:callerSeesDeletionDetail":                 {Policy: testAdminPolicyAllow, Reason: "deletion detail display"},
-	"authz_candelegate.go:CanDelegate":                            {Policy: testAdminPolicyAllow, Reason: "the role-claim shortcut runs after refuseTestAdminDeniedGrant, which refuses any grant by an admin kind holding a deny-classified permission (census-pinned), and refuseTestAdminUnshapedGrant; what remains is forced to expire with the identity by the store's grant shaping (A3)"},
+	"authorize.go:requireAdminAt":                                 {Policy: testAdminPolicyAllow, Reason: "legacy admin routes: classified per route in testAdminLegacyRoutePolicy and enforced in requireAdminAt", ViewAsMember: vamEffective()},
+	"admin_delegation_adoption.go:isDelegationAdoptionAdmin":      {Policy: testAdminPolicyDeny, Reason: "agent authority migration", ViewAsMember: vamEffective()},
+	"admin_delegation_adoption.go:recheckDelegationAdoptionAdmin": {Policy: testAdminPolicyDeny, Reason: "agent authority migration", ViewAsMember: vamEffective()},
+	"admin_mode.go:adminModeMiddleware":                           {Policy: testAdminPolicyAllow, Reason: "admins pass while admin mode is on (the mode itself is hub.admin_mode.update, deny)", ViewAsMember: vamRealByDesign("maintenance admission uses real stored admin status (D4) so an admin in view-as-member stays admitted and can exit")},
+	"admin_mode.go:adminModeWebMiddleware":                        {Policy: testAdminPolicyAllow, Reason: "admins pass while admin mode is on (web)", ViewAsMember: vamRealByDesign("maintenance admission uses real stored admin status (D4) so an admin in view-as-member stays admitted and can exit")},
+	"agent_pending_config_authz.go:deferDuringMaintenance":        {Policy: testAdminPolicyAllow, Reason: "a held edit's fold mirrors adminModeMiddleware: an admin saver's keys are not deferred while admin mode is on", ViewAsMember: vamRealByDesign("maintenance deferral mirrors adminModeMiddleware using real stored admin status (D4)")},
+	"gcp_iam_settings.go:gcpIAMHubAdmin":                          {Policy: testAdminPolicyDeny, EnforcedIn: "requireGCPIAMHubAdmin", Reason: "GCP permission check settings are runtime configuration", ViewAsMember: vamEffective()},
+	"handlers_env_secrets.go:authorizeHubEnvVarList":              {Policy: testAdminPolicyDeny, Reason: "hub environment variables (hub.env_vars.read)", ViewAsMember: vamEffective()},
+	"handlers_env_secrets.go:resolveEnvSecretAccess":              {Policy: testAdminPolicyDeny, Reason: "hub-scope environment variables and secrets", ViewAsMember: vamEffective()},
+	"handlers_env_secrets.go:authorizeBrokerMaterial":             {Policy: testAdminPolicyDeny, Reason: "runtime broker environment variables and secrets, matching the material root scopes", ViewAsMember: vamEffective()},
+	"handlers_runtime_brokers.go:updateRuntimeBroker":             {Policy: testAdminPolicyDeny, Reason: "runtime broker update, except a broker the test identity registered (the co-located broker)", ViewAsMember: vamEffective()},
+	"handlers_runtime_brokers.go:deleteRuntimeBroker":             {Policy: testAdminPolicyDeny, Reason: "runtime broker deregistration, except a broker the test identity registered (the co-located broker)", ViewAsMember: vamEffective()},
+	"web.go:authorizeSSESubjects":                                 {Policy: testAdminPolicyAllow, Reason: "event subscriptions (read)", ViewAsMember: vamEffective()},
+	"passthrough_gate.go:evaluatePassthroughIdentity":             {Policy: testAdminPolicyDeny, Reason: "exposes the co-located broker's host GCP identity to agents", ViewAsMember: vamEffective()},
+	"handlers_auth.go:handleAuthAdminStatus":                      {Policy: testAdminPolicyAllow, Reason: "display of the caller's own admin status", ViewAsMember: vamEffective()},
+	"perftrace_middleware.go:perfHeadersAllowed":                  {Policy: testAdminPolicyAllow, Reason: "request timing headers", ViewAsMember: vamEffective()},
+	"project_messaging_policy.go:messagingPolicyOwnerRule":        {Policy: testAdminPolicyAllow, Reason: "project messaging policy (project.set_messaging_policy is allow)", ViewAsMember: vamEffective()},
+	"handlers_message_policies.go:messagePolicyOwnerOrAdminRule":  {Policy: testAdminPolicyAllow, Reason: "project message policies (project.manage_message_policies is allow)", ViewAsMember: vamEffective()},
+	"authorize_message.go:authorizeAgentMessage":                  {Policy: testAdminPolicyAllow, Reason: "messaging agents", ViewAsMember: vamEffective()},
+	"handlers_agent_message_mode.go:handleSetMessageMode":         {Policy: testAdminPolicyAllow, Reason: "agent message mode", ViewAsMember: vamEffective()},
+	"deletion_redact.go:callerSeesDeletionDetail":                 {Policy: testAdminPolicyAllow, Reason: "deletion detail display", ViewAsMember: vamEffective()},
+	"authz_candelegate.go:CanDelegate":                            {Policy: testAdminPolicyAllow, Reason: "the role-claim shortcut runs after refuseTestAdminDeniedGrant, which refuses any grant by an admin kind holding a deny-classified permission (census-pinned), and refuseTestAdminUnshapedGrant; what remains is forced to expire with the identity by the store's grant shaping (A3)", ViewAsMember: vamEffective()},
 	// System-admin binding checks outside decide (IsSystemAdmin, IsHubAdmin).
-	"handlers_agent_create_helpers.go:brokerProviderHasOwnerConsent": {Policy: testAdminPolicyAllow, Reason: "reads whether the broker provider's linker (not the caller) is a system admin"},
-	"handlers_brokers.go:brokerRemintTargetAuthorized":               {Policy: testAdminPolicyDeny, Reason: "runtime broker credential remint (key material)"},
-	"handlers_brokers.go:authorizedForBrokerRotate":                  {Policy: testAdminPolicyDeny, Reason: "runtime broker secret rotation (key material)"},
-	"authz_delegation_ceiling.go:evaluateUserDelegatorAuthority":     {Policy: testAdminPolicyAllow, Reason: "delegation ceiling of a system-admin delegator; an agent rooted at a test admin is issued no scope covering a deny-classified permission (clampTestAdminRootedScopes, A3)"},
-	"project_deletion_service.go:Delete":                             {Policy: testAdminPolicyAllow, Reason: "super-admin project deletion governance"},
-	"project_deletion_service.go:checkDeletionGovernance":            {Policy: testAdminPolicyAllow, Reason: "super-admin project deletion governance"},
+	"handlers_agent_create_helpers.go:brokerProviderHasOwnerConsent": {Policy: testAdminPolicyAllow, Reason: "reads whether the broker provider's linker (not the caller) is a system admin", ViewAsMember: vamRealByDesign("checks the broker provider linker's admin status, not the caller's; clamp is keyed on caller user ID")},
+	"handlers_brokers.go:brokerRemintTargetAuthorized":               {Policy: testAdminPolicyDeny, Reason: "runtime broker credential remint (key material)", ViewAsMember: vamEffective()},
+	"handlers_brokers.go:authorizedForBrokerRotate":                  {Policy: testAdminPolicyDeny, Reason: "runtime broker secret rotation (key material)", ViewAsMember: vamEffective()},
+	"broker_policy.go:authorizeBrokerManage":                         {Policy: testAdminPolicyDeny, Reason: "approving or revoking admin-managed runtime broker status (ptone/scion#7829)", ViewAsMember: vamEffective()},
+	"authz_delegation_ceiling.go:evaluateUserDelegatorAuthority":     {Policy: testAdminPolicyAllow, Reason: "delegation ceiling of a system-admin delegator; an agent rooted at a test admin is issued no scope covering a deny-classified permission (clampTestAdminRootedScopes, A3)", ViewAsMember: vamEffective()},
+	"project_deletion_service.go:Delete":                             {Policy: testAdminPolicyAllow, Reason: "super-admin project deletion governance", ViewAsMember: vamEffective()},
+	"project_deletion_service.go:checkDeletionGovernance":            {Policy: testAdminPolicyAllow, Reason: "super-admin project deletion governance", ViewAsMember: vamEffective()},
 	// Test identity issuance and management: deny states the intent; each
 	// also refuses every test identity kind by kind or by the route
 	// permission.
-	"handlers_test_admin_identities.go:canIssueTestAdmin":                  {Policy: testAdminPolicyDeny, Reason: "test identities never issue (design 3.6.1: test_identity.issue* are deny); also refused by kind in testAdminIssuer"},
-	"handlers_test_admin_identities.go:handleRevokeAllTestAdminIdentities": {Policy: testAdminPolicyDeny, Reason: "revoke-all is for human super-admins only (design 3.3); also refused by kind first"},
-	"handlers_test_identities.go:testIdentityCallerSeesAll":                {Policy: testAdminPolicyDeny, Reason: "issuance and list visibility of every test identity (test_identity.issue routes are deny)"},
-	"handlers_test_admin_identities.go:recheckTestAdminDelegationGrantor":  {Policy: testAdminPolicyAllow, Reason: "reads the super-admin binding of a workload delegation's grantor (not of the caller, a workload) inside the issuance transaction, after requiring the grantor's stored kind to be human; test kinds never hold a delegation (delegation create refuses them)"},
-	"test_admin_purge.go:canPurgeTestAdminIdentity":                        {Policy: testAdminPolicyDeny, Reason: "purging an admin-kind identity is for its issuer or a human super-admin (A3); test identities are also refused as purge callers by testIdentityCaller"},
-	"test_admin_residue.go:handleTestAdminResidue":                         {Policy: testAdminPolicyDeny, Reason: "the residue report is for human super-admins only (A3); also refused by kind first"},
+	"handlers_test_admin_identities.go:canIssueTestAdmin":                  {Policy: testAdminPolicyDeny, Reason: "test identities never issue (design 3.6.1: test_identity.issue* are deny); also refused by kind in testAdminIssuer", ViewAsMember: vamEffective()},
+	"handlers_test_admin_identities.go:handleRevokeAllTestAdminIdentities": {Policy: testAdminPolicyDeny, Reason: "revoke-all is for human super-admins only (design 3.3); also refused by kind first", ViewAsMember: vamEffective()},
+	"handlers_test_identities.go:testIdentityCallerSeesAll":                {Policy: testAdminPolicyDeny, Reason: "issuance and list visibility of every test identity (test_identity.issue routes are deny)", ViewAsMember: vamEffective()},
+	"handlers_test_admin_identities.go:recheckTestAdminDelegationGrantor":  {Policy: testAdminPolicyAllow, Reason: "reads the super-admin binding of a workload delegation's grantor (not of the caller, a workload) inside the issuance transaction, after requiring the grantor's stored kind to be human; test kinds never hold a delegation (delegation create refuses them)", ViewAsMember: vamRealByDesign("checks a workload delegation grantor's super-admin binding, not a web session caller")},
+	"test_admin_purge.go:canPurgeTestAdminIdentity":                        {Policy: testAdminPolicyDeny, Reason: "purging an admin-kind identity is for its issuer or a human super-admin (A3); test identities are also refused as purge callers by testIdentityCaller", ViewAsMember: vamEffective()},
+	"test_admin_residue.go:handleTestAdminResidue":                         {Policy: testAdminPolicyDeny, Reason: "the residue report is for human super-admins only (A3); also refused by kind first", ViewAsMember: vamEffective()},
+	"view_as_member.go:AuthorizeViewAsMemberChange":                        {Policy: testAdminPolicyDeny, Reason: "view-as-member toggle is for human hub admins only; test identities are refused by kind first", ViewAsMember: vamRealByDesign("evaluates real (unclamped) admin eligibility to enter view-as-member")},
 	// The role-claim fast path itself, moved to pkg/hub/internal/principal
 	// (GoogleCloudPlatform/scion#3316) and scanned there since
 	// GoogleCloudPlatform/scion#3472. testAdminRoleAdminCensus labels it a
 	// role gate, so the census requires an entry here. It is not a gate of
 	// its own: every caller above is classified separately.
-	"internal/principal/identity.go:IsUnscopedLocalPlatformAdmin": {Policy: testAdminPolicyAllow, Reason: "definition of the role-claim admin fast path, not a gate; a test_super_admin does pass it, so each caller is its own classified gate in this table (an unclassified caller fails the census)"},
+	"internal/principal/identity.go:IsUnscopedLocalPlatformAdmin": {Policy: testAdminPolicyAllow, Reason: "definition of the role-claim admin fast path, not a gate; a test_super_admin does pass it, so each caller is its own classified gate in this table (an unclassified caller fails the census)", ViewAsMember: vamEffective()},
 }
 
 // testAdminSettingsSectionPolicy classifies every operational settings
@@ -428,9 +504,11 @@ var testAdminSettingsSectionPolicy = map[string]testAdminPolicy{
 	"telemetry":         testAdminPolicyDeny,
 	"auto_expose_ports": testAdminPolicyDeny,
 	"hub_observability": testAdminPolicyDeny,
+	"branding":          testAdminPolicyDeny,
 	"quotas":            testAdminPolicyDeny,
 	"gcp_iam":           testAdminPolicyDeny,
 	"agent_secrets":     testAdminPolicyDeny,
+	"broker_policy":     testAdminPolicyDeny,
 	"agent_defaults":    testAdminPolicyDeny,
 	"endpoints":         testAdminPolicyDeny,
 	"github_app":        testAdminPolicyDeny,
@@ -451,98 +529,152 @@ var testAdminSettingsSectionPolicy = map[string]testAdminPolicy{
 // testAdminSettingsKeyPolicy classifies every operational settings key
 // (each section's KoanfPaths). All are deny.
 var testAdminSettingsKeyPolicy = map[string]testAdminPolicy{
-	"server.hub.admin_emails":                  testAdminPolicyDeny,
-	"server.auth.user_access_mode":             testAdminPolicyDeny,
-	"server.auth.default_user_role":            testAdminPolicyDeny,
-	"server.auth.authorized_domains":           testAdminPolicyDeny,
-	"server.hub.auto_suspend_stalled":          testAdminPolicyDeny,
-	"server.hub.stalled_threshold":             testAdminPolicyDeny,
-	"server.hub.soft_delete_retention":         testAdminPolicyDeny,
-	"server.hub.soft_delete_retain_files":      testAdminPolicyDeny,
-	"server.hub.start_claim_lease_ttl":         testAdminPolicyDeny,
-	"server.hub.start_max_duration":            testAdminPolicyDeny,
-	"server.hub.start_unconfirmed_hold":        testAdminPolicyDeny,
-	"server.hub.start_create_unconfirmed_hold": testAdminPolicyDeny,
-	"telemetry.enabled":                        testAdminPolicyDeny,
-	"telemetry.cloud":                          testAdminPolicyDeny,
-	"telemetry.cloud.enabled":                  testAdminPolicyDeny,
-	"telemetry.cloud.endpoint":                 testAdminPolicyDeny,
-	"telemetry.cloud.protocol":                 testAdminPolicyDeny,
-	"telemetry.cloud.headers":                  testAdminPolicyDeny,
-	"telemetry.cloud.provider":                 testAdminPolicyDeny,
-	"telemetry.cloud.gcp_project_id":           testAdminPolicyDeny,
-	"telemetry.cloud.tls":                      testAdminPolicyDeny,
-	"telemetry.cloud.tls.enabled":              testAdminPolicyDeny,
-	"telemetry.cloud.tls.insecure_skip_verify": testAdminPolicyDeny,
-	"telemetry.cloud.tls.ca_file":              testAdminPolicyDeny,
-	"telemetry.cloud.tls.cert_file":            testAdminPolicyDeny,
-	"telemetry.cloud.tls.key_file":             testAdminPolicyDeny,
-	"server.hub.observability.metrics_enabled": testAdminPolicyDeny,
-	"server.hub.observability.tracing_enabled": testAdminPolicyDeny,
-	"telemetry.cloud.batch":                    testAdminPolicyDeny,
-	"telemetry.cloud.batch.max_size":           testAdminPolicyDeny,
-	"telemetry.cloud.batch.timeout":            testAdminPolicyDeny,
-	"telemetry.hub":                            testAdminPolicyDeny,
-	"telemetry.hub.enabled":                    testAdminPolicyDeny,
-	"telemetry.hub.report_interval":            testAdminPolicyDeny,
-	"telemetry.local":                          testAdminPolicyDeny,
-	"telemetry.local.enabled":                  testAdminPolicyDeny,
-	"telemetry.local.file":                     testAdminPolicyDeny,
-	"telemetry.local.console":                  testAdminPolicyDeny,
-	"telemetry.filter":                         testAdminPolicyDeny,
-	"telemetry.filter.enabled":                 testAdminPolicyDeny,
-	"telemetry.filter.respect_debug_mode":      testAdminPolicyDeny,
-	"telemetry.filter.events":                  testAdminPolicyDeny,
-	"telemetry.filter.events.include":          testAdminPolicyDeny,
-	"telemetry.filter.events.exclude":          testAdminPolicyDeny,
-	"telemetry.filter.attributes":              testAdminPolicyDeny,
-	"telemetry.filter.attributes.redact":       testAdminPolicyDeny,
-	"telemetry.filter.attributes.hash":         testAdminPolicyDeny,
-	"telemetry.filter.sampling":                testAdminPolicyDeny,
-	"telemetry.filter.sampling.default":        testAdminPolicyDeny,
-	"telemetry.filter.sampling.rates":          testAdminPolicyDeny,
-	"telemetry.resource":                       testAdminPolicyDeny,
-	"auto_expose_ports.enabled":                testAdminPolicyDeny,
-	"quotas.enforce_broker_quotas":             testAdminPolicyDeny,
-	"server.hub.gcp_iam_check_mode":            testAdminPolicyDeny,
-	"server.hub.gcp_iam_deny_unknown_policy":   testAdminPolicyDeny,
-	"agent_secrets.user_scope_only":            testAdminPolicyDeny,
-	"default_template":                         testAdminPolicyDeny,
-	"default_harness_config":                   testAdminPolicyDeny,
-	"default_max_turns":                        testAdminPolicyDeny,
-	"default_max_model_calls":                  testAdminPolicyDeny,
-	"default_max_duration":                     testAdminPolicyDeny,
-	"default_resources":                        testAdminPolicyDeny,
-	"default_model":                            testAdminPolicyDeny,
-	"default_thinking_level":                   testAdminPolicyDeny,
-	"default_max_agent_role":                   testAdminPolicyDeny,
-	"default_agent_role":                       testAdminPolicyDeny,
-	"default_runtime_broker":                   testAdminPolicyDeny,
-	"default_timezone":                         testAdminPolicyDeny,
-	"default_gcp_identity_mode":                testAdminPolicyDeny,
-	"default_gcp_identity_service_account_id":  testAdminPolicyDeny,
-	"server.hub.public_url":                    testAdminPolicyDeny,
-	"server.hub.hub_name":                      testAdminPolicyDeny,
-	"server.hub.content_url":                   testAdminPolicyDeny,
-	"server.hub.content_url_allow_same_site":   testAdminPolicyDeny,
-	"image_registry":                           testAdminPolicyDeny,
-	"server.hub.monitoring_dashboard_url":      testAdminPolicyDeny,
-	"server.github_app":                        testAdminPolicyDeny,
-	"server.github_app.app_id":                 testAdminPolicyDeny,
-	"server.github_app.api_base_url":           testAdminPolicyDeny,
-	"server.github_app.webhooks_enabled":       testAdminPolicyDeny,
-	"server.github_app.installation_url":       testAdminPolicyDeny,
-	"server.github_app.private_key_path":       testAdminPolicyDeny,
-	"server.notification_channels":             testAdminPolicyDeny,
-	"project_defaults.default_scratchpad":      testAdminPolicyDeny,
-	"server.federation.enabled":                testAdminPolicyDeny,
-	"server.federation.trusted_issuers":        testAdminPolicyDeny,
-	"server.federation.algorithms":             testAdminPolicyDeny,
-	"server.federation.refresh_interval":       testAdminPolicyDeny,
-	"server.federation.debounce_interval":      testAdminPolicyDeny,
-	"runtimes":                                 testAdminPolicyDeny,
-	"profiles":                                 testAdminPolicyDeny,
-	"harness_configs":                          testAdminPolicyDeny,
+	"server.hub.admin_emails":                          testAdminPolicyDeny,
+	"server.auth.user_access_mode":                     testAdminPolicyDeny,
+	"server.auth.default_user_role":                    testAdminPolicyDeny,
+	"server.auth.authorized_domains":                   testAdminPolicyDeny,
+	"server.hub.auto_suspend_stalled":                  testAdminPolicyDeny,
+	"server.hub.stalled_threshold":                     testAdminPolicyDeny,
+	"server.hub.auto_suspend_idle":                     testAdminPolicyDeny,
+	"server.hub.idle_suspend_after":                    testAdminPolicyDeny,
+	"server.hub.soft_delete_retention":                 testAdminPolicyDeny,
+	"server.hub.soft_delete_retain_files":              testAdminPolicyDeny,
+	"server.hub.start_claim_lease_ttl":                 testAdminPolicyDeny,
+	"server.hub.start_max_duration":                    testAdminPolicyDeny,
+	"server.hub.start_unconfirmed_hold":                testAdminPolicyDeny,
+	"server.hub.start_create_unconfirmed_hold":         testAdminPolicyDeny,
+	"telemetry.enabled":                                testAdminPolicyDeny,
+	"telemetry.cloud":                                  testAdminPolicyDeny,
+	"telemetry.cloud.enabled":                          testAdminPolicyDeny,
+	"telemetry.cloud.endpoint":                         testAdminPolicyDeny,
+	"telemetry.cloud.protocol":                         testAdminPolicyDeny,
+	"telemetry.cloud.headers":                          testAdminPolicyDeny,
+	"telemetry.cloud.provider":                         testAdminPolicyDeny,
+	"telemetry.cloud.gcp_project_id":                   testAdminPolicyDeny,
+	"telemetry.cloud.tls":                              testAdminPolicyDeny,
+	"telemetry.cloud.tls.enabled":                      testAdminPolicyDeny,
+	"telemetry.cloud.tls.insecure_skip_verify":         testAdminPolicyDeny,
+	"telemetry.cloud.tls.ca_file":                      testAdminPolicyDeny,
+	"telemetry.cloud.tls.cert_file":                    testAdminPolicyDeny,
+	"telemetry.cloud.tls.key_file":                     testAdminPolicyDeny,
+	"server.hub.observability.metrics_enabled":         testAdminPolicyDeny,
+	"server.hub.observability.tracing_enabled":         testAdminPolicyDeny,
+	"server.hub.branding":                              testAdminPolicyDeny,
+	"server.hub.branding.name":                         testAdminPolicyDeny,
+	"server.hub.branding.short_name":                   testAdminPolicyDeny,
+	"server.hub.branding.subtitle":                     testAdminPolicyDeny,
+	"server.hub.branding.attribution":                  testAdminPolicyDeny,
+	"server.hub.branding.corners":                      testAdminPolicyDeny,
+	"server.hub.branding.font_sans":                    testAdminPolicyDeny,
+	"server.hub.branding.logo":                         testAdminPolicyDeny,
+	"server.hub.branding.logo.light":                   testAdminPolicyDeny,
+	"server.hub.branding.logo.dark":                    testAdminPolicyDeny,
+	"server.hub.branding.icons":                        testAdminPolicyDeny,
+	"server.hub.branding.icons.favicon":                testAdminPolicyDeny,
+	"server.hub.branding.icons.apple_touch_icon":       testAdminPolicyDeny,
+	"server.hub.branding.icons.icon_192":               testAdminPolicyDeny,
+	"server.hub.branding.icons.icon_512":               testAdminPolicyDeny,
+	"server.hub.branding.icons.icon_maskable_512":      testAdminPolicyDeny,
+	"server.hub.branding.accent_color":                 testAdminPolicyDeny,
+	"server.hub.branding.palette":                      testAdminPolicyDeny,
+	"server.hub.branding.palette.primary":              testAdminPolicyDeny,
+	"server.hub.branding.palette.neutral":              testAdminPolicyDeny,
+	"server.hub.branding.palette.success":              testAdminPolicyDeny,
+	"server.hub.branding.palette.warning":              testAdminPolicyDeny,
+	"server.hub.branding.palette.danger":               testAdminPolicyDeny,
+	"server.hub.branding.palette.light":                testAdminPolicyDeny,
+	"server.hub.branding.palette.light.bg":             testAdminPolicyDeny,
+	"server.hub.branding.palette.light.bg_subtle":      testAdminPolicyDeny,
+	"server.hub.branding.palette.light.surface":        testAdminPolicyDeny,
+	"server.hub.branding.palette.light.surface_raised": testAdminPolicyDeny,
+	"server.hub.branding.palette.light.text":           testAdminPolicyDeny,
+	"server.hub.branding.palette.light.text_secondary": testAdminPolicyDeny,
+	"server.hub.branding.palette.light.text_muted":     testAdminPolicyDeny,
+	"server.hub.branding.palette.light.border":         testAdminPolicyDeny,
+	"server.hub.branding.palette.light.primary":        testAdminPolicyDeny,
+	"server.hub.branding.palette.light.primary_hover":  testAdminPolicyDeny,
+	"server.hub.branding.palette.light.primary_active": testAdminPolicyDeny,
+	"server.hub.branding.palette.light.primary_text":   testAdminPolicyDeny,
+	"server.hub.branding.palette.dark":                 testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.bg":              testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.bg_subtle":       testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.surface":         testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.surface_raised":  testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.text":            testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.text_secondary":  testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.text_muted":      testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.border":          testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.primary":         testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.primary_hover":   testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.primary_active":  testAdminPolicyDeny,
+	"server.hub.branding.palette.dark.primary_text":    testAdminPolicyDeny,
+	"telemetry.cloud.batch":                            testAdminPolicyDeny,
+	"telemetry.cloud.batch.max_size":                   testAdminPolicyDeny,
+	"telemetry.cloud.batch.timeout":                    testAdminPolicyDeny,
+	"telemetry.hub":                                    testAdminPolicyDeny,
+	"telemetry.hub.enabled":                            testAdminPolicyDeny,
+	"telemetry.hub.report_interval":                    testAdminPolicyDeny,
+	"telemetry.local":                                  testAdminPolicyDeny,
+	"telemetry.local.enabled":                          testAdminPolicyDeny,
+	"telemetry.local.file":                             testAdminPolicyDeny,
+	"telemetry.local.console":                          testAdminPolicyDeny,
+	"telemetry.filter":                                 testAdminPolicyDeny,
+	"telemetry.filter.enabled":                         testAdminPolicyDeny,
+	"telemetry.filter.respect_debug_mode":              testAdminPolicyDeny,
+	"telemetry.filter.events":                          testAdminPolicyDeny,
+	"telemetry.filter.events.include":                  testAdminPolicyDeny,
+	"telemetry.filter.events.exclude":                  testAdminPolicyDeny,
+	"telemetry.filter.attributes":                      testAdminPolicyDeny,
+	"telemetry.filter.attributes.redact":               testAdminPolicyDeny,
+	"telemetry.filter.attributes.hash":                 testAdminPolicyDeny,
+	"telemetry.filter.sampling":                        testAdminPolicyDeny,
+	"telemetry.filter.sampling.default":                testAdminPolicyDeny,
+	"telemetry.filter.sampling.rates":                  testAdminPolicyDeny,
+	"telemetry.resource":                               testAdminPolicyDeny,
+	"auto_expose_ports.enabled":                        testAdminPolicyDeny,
+	"quotas.enforce_broker_quotas":                     testAdminPolicyDeny,
+	"server.hub.gcp_iam_check_mode":                    testAdminPolicyDeny,
+	"server.hub.gcp_iam_deny_unknown_policy":           testAdminPolicyDeny,
+	"agent_secrets.user_scope_only":                    testAdminPolicyDeny,
+	"broker_policy.admin_managed_only":                 testAdminPolicyDeny,
+	"default_template":                                 testAdminPolicyDeny,
+	"default_harness_config":                           testAdminPolicyDeny,
+	"default_max_turns":                                testAdminPolicyDeny,
+	"default_max_model_calls":                          testAdminPolicyDeny,
+	"default_max_duration":                             testAdminPolicyDeny,
+	"default_resources":                                testAdminPolicyDeny,
+	"default_model":                                    testAdminPolicyDeny,
+	"default_thinking_level":                           testAdminPolicyDeny,
+	"default_max_agent_role":                           testAdminPolicyDeny,
+	"default_agent_role":                               testAdminPolicyDeny,
+	"default_runtime_broker":                           testAdminPolicyDeny,
+	"default_timezone":                                 testAdminPolicyDeny,
+	"default_gcp_identity_mode":                        testAdminPolicyDeny,
+	"default_gcp_identity_service_account_id":          testAdminPolicyDeny,
+	"server.hub.public_url":                            testAdminPolicyDeny,
+	"server.hub.hub_name":                              testAdminPolicyDeny,
+	"server.hub.content_url":                           testAdminPolicyDeny,
+	"server.hub.content_url_allow_same_site":           testAdminPolicyDeny,
+	"image_registry":                                   testAdminPolicyDeny,
+	"server.hub.monitoring_dashboard_url":              testAdminPolicyDeny,
+	"server.github_app":                                testAdminPolicyDeny,
+	"server.github_app.app_id":                         testAdminPolicyDeny,
+	"server.github_app.api_base_url":                   testAdminPolicyDeny,
+	"server.github_app.webhooks_enabled":               testAdminPolicyDeny,
+	"server.github_app.installation_url":               testAdminPolicyDeny,
+	"server.github_app.private_key_path":               testAdminPolicyDeny,
+	"server.github_app.app_slug":                       testAdminPolicyDeny,
+	"server.github_app.command_mention_aliases":        testAdminPolicyDeny,
+	"server.notification_channels":                     testAdminPolicyDeny,
+	"project_defaults.default_scratchpad":              testAdminPolicyDeny,
+	"server.federation.enabled":                        testAdminPolicyDeny,
+	"server.federation.trusted_issuers":                testAdminPolicyDeny,
+	"server.federation.algorithms":                     testAdminPolicyDeny,
+	"server.federation.refresh_interval":               testAdminPolicyDeny,
+	"server.federation.debounce_interval":              testAdminPolicyDeny,
+	"runtimes":                                         testAdminPolicyDeny,
+	"profiles":                                         testAdminPolicyDeny,
+	"harness_configs":                                  testAdminPolicyDeny,
 }
 
 // testAdminFileLiveKeyPolicy classifies every file-live key (fileLiveKeys:
@@ -565,15 +697,20 @@ var testAdminExperimentPolicy = map[string]testAdminPolicy{
 	"web.gcs_links":                          testAdminPolicyDeny,
 	experiments.K8sNFSHome:                   testAdminPolicyDeny,
 	experiments.CloudRunNativeIdentity:       testAdminPolicyDeny,
+	experiments.CloudRunEphemeralAgents:      testAdminPolicyDeny,
+	experiments.K8sWorkloadIdentitySetup:     testAdminPolicyDeny,
 	experiments.FlatRuntimeBrokers:           testAdminPolicyDeny,
 	experiments.FlatCloudRunTarget:           testAdminPolicyDeny,
 	experiments.Artifacts:                    testAdminPolicyDeny,
 	"hub.conduit":                            testAdminPolicyDeny,
 	experiments.ConduitDeliver:               testAdminPolicyDeny,
+	experiments.ExecSchedules:                testAdminPolicyDeny,
 	experiments.ChatScheduledSend:            testAdminPolicyDeny,
 	experiments.ChatStarredMessages:          testAdminPolicyDeny,
-	experiments.ChatChoices:                  testAdminPolicyDeny,
+	experiments.Decisions:                    testAdminPolicyDeny,
+	experiments.InboxDashboard:               testAdminPolicyDeny,
 	experiments.ChatRetention:                testAdminPolicyDeny,
+	experiments.ConversationWatch:            testAdminPolicyDeny,
 	experiments.AgentEdit:                    testAdminPolicyDeny,
 	experiments.AgentEditHeld:                testAdminPolicyDeny,
 	experiments.AttachmentArtifacts:          testAdminPolicyDeny,
@@ -592,10 +729,27 @@ var testAdminExperimentPolicy = map[string]testAdminPolicy{
 	experiments.ArtifactArchive:              testAdminPolicyDeny,
 	experiments.ImageTagSetting:              testAdminPolicyDeny,
 	experiments.ImageTagVersionDefault:       testAdminPolicyDeny,
+	experiments.IdleSuspend:                  testAdminPolicyDeny,
 	experiments.ReincarnateHarnessSwitch:     testAdminPolicyDeny,
+	experiments.RuntimeOrphanReconcile:       testAdminPolicyDeny,
 	experiments.ArtifactsOpenReviewCheck:     testAdminPolicyDeny,
+	experiments.ArtifactsReviewDrafts:        testAdminPolicyDeny,
 	experiments.ProjectSelfLeave:             testAdminPolicyDeny,
 	experiments.WelcomeProject:               testAdminPolicyDeny,
+	experiments.SystemOne:                    testAdminPolicyDeny,
+	experiments.GitHubTriggers:               testAdminPolicyDeny,
+	experiments.Triggers:                     testAdminPolicyDeny,
+	experiments.MessagePolicies:              testAdminPolicyDeny,
+	experiments.EffectivePermissions:         testAdminPolicyDeny,
+	experiments.AdminManagedBrokers:          testAdminPolicyDeny,
+	experiments.CustomDefaultUserRole:        testAdminPolicyDeny,
+	experiments.TemplateConfigValidation:     testAdminPolicyDeny,
+	experiments.AgentSecrets:                 testAdminPolicyDeny,
+	experiments.CodeSpanMentions:             testAdminPolicyDeny,
+	experiments.ViewAsMember:                 testAdminPolicyDeny,
+	experiments.ExecContainers:               testAdminPolicyDeny,
+	experiments.SuspendScreen:                testAdminPolicyDeny,
+	experiments.FiltersQueryDialect:          testAdminPolicyDeny,
 }
 
 // testAdminPolicyInputs are the vocabularies the classification must cover.
@@ -938,11 +1092,13 @@ func (d *HTTPAgentDispatcher) testAdminRootScopes(ctx context.Context, agent *st
 	}
 	if agent.OwnerID == root {
 		allowed[store.ScopeUser] = true
+		allowed[store.ScopeAgent] = true
 	}
 	// Project-scope secrets are material: the project-viewer role
 	// alone does not admit them (ptone/scion#5519, AdmitsBeyondViewer).
 	if m := checkEffectiveMembership(ctx, d.store, d.authzService, root, agent.ProjectID); m.Err == nil && m.AdmitsBeyondViewer() {
 		allowed[store.ScopeProject] = true
+		allowed[store.ScopeAgent] = true
 	}
 	return true, allowed, root
 }
@@ -984,7 +1140,17 @@ func (d *HTTPAgentDispatcher) applyTestAdminSecretScopes(ctx context.Context, ag
 // as_needed pass); the TZ chain (resolveStorageTZ)
 // reads only TZ and keeps every scope.
 func (d *HTTPAgentDispatcher) envScopesForDispatch(ctx context.Context, agent *store.Agent) []store.EnvVarFilter {
-	filters := d.envScopesInPrecedenceOrder(agent)
+	var filters []store.EnvVarFilter
+	if isShellAgent(agent) {
+		// Shell execution containers receive only the owning user's user-scope
+		// env vars (plus reserved SCION_* control variables), never project,
+		// broker, hub, or progeny env (ptone/scion#8817 H2).
+		if agent.OwnerID != "" {
+			filters = []store.EnvVarFilter{{Scope: store.ScopeUser, ScopeID: agent.OwnerID}}
+		}
+	} else {
+		filters = d.envScopesInPrecedenceOrder(agent)
+	}
 	restricted, allowed, root := d.testAdminRootScopes(ctx, agent)
 	if !restricted {
 		return filters

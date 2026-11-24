@@ -1245,7 +1245,7 @@ func TestSuspendedResponse_Never200HTML(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSuspendedPage_EmailEscaped(t *testing.T) {
-	html := suspendedPageHTML("<script>alert('xss')</script>@example.com")
+	html := suspendedPageHTMLWithBranding(nil, "<script>alert('xss')</script>@example.com")
 	assert.NotContains(t, html, "<script>alert")
 	assert.Contains(t, html, "&lt;script&gt;")
 }
@@ -1271,12 +1271,24 @@ func (s *transientErrorStore) GetUserByEmail(_ context.Context, _ string) (*stor
 	return nil, fmt.Errorf("connection refused (simulated transient error)")
 }
 
+func (s *transientErrorStore) WithTx(_ context.Context, fn func(tx store.Store) error) error {
+	return fn(s)
+}
+
+func (s *transientErrorStore) LockUserRow(context.Context, string, bool) error {
+	return nil
+}
+
 func (s *transientErrorStore) GetGroupBySlug(_ context.Context, _ string) (*store.Group, error) {
 	return nil, store.ErrNotFound
 }
 
 func (s *transientErrorStore) AddGroupMember(_ context.Context, _ *store.GroupMember) error {
 	return nil
+}
+
+func (s *transientErrorStore) ListRoleBindingsForPrincipal(_ context.Context, _ string, _ string) ([]*store.RoleBinding, error) {
+	return nil, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@
 package messages
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"time"
@@ -96,18 +97,26 @@ const (
 	// (same as TypeInstruction — a reply to an agent is still a request).
 	TypeReply = "reply"
 
-	// TypeChoicePrompt is an agent message that carries one or more
-	// decisions (choices.go). TypeChoiceResponse records an answer to one
+	// TypeDecisionPrompt is an agent message that carries one or more
+	// decisions (choices.go). TypeDecisionResponse records an answer to one
 	// of them. Both are hub-minted: see IsHubMintedType.
-	TypeChoicePrompt   = "choice-prompt"
-	TypeChoiceResponse = "choice-response"
+	TypeDecisionPrompt   = "decision-prompt"
+	TypeDecisionResponse = "decision-response"
+
+	// TypeSecretRequest is an agent message asking a user to supply one or
+	// more agent-scoped secrets. TypeSecretResponse notifies the agent when
+	// a request is fulfilled or dismissed. Both are hub-minted: see
+	// IsHubMintedType.
+	TypeSecretRequest  = "secret-request"
+	TypeSecretResponse = "secret-response"
 )
 
 // IsHubMintedType reports whether t is a message type only the hub may set.
 // Every client send path must reject a caller-supplied type for which it
 // returns true.
 func IsHubMintedType(t string) bool {
-	return t == TypeChoicePrompt || t == TypeChoiceResponse
+	return t == TypeDecisionPrompt || t == TypeDecisionResponse ||
+		t == TypeSecretRequest || t == TypeSecretResponse
 }
 
 // System message category constants identify the origin of a system message.
@@ -120,24 +129,33 @@ const (
 	// deferred their message instead of dispatching it — distinct from
 	// SystemCategoryDeliveryFailed: the message was saved, not dropped.
 	SystemCategoryDeliveryDeferred = "delivery-deferred"
+	// SystemCategoryDeliveryUnconfirmed marks the notice sent to an agent
+	// sender when a message row expired in dispatch_state="pending" without
+	// dispatch confirmation (ptone/scion#7405): delivery may already have
+	// occurred, so the sender should check before resending.
+	SystemCategoryDeliveryUnconfirmed = "delivery-unconfirmed"
 	// SystemCategoryArtifactReview marks the notice sent to an artifact's
 	// owner when a review version of the artifact was published.
 	SystemCategoryArtifactReview = "artifact-review"
+	// SystemCategoryTrigger marks a system event delivered by an event trigger.
+	SystemCategoryTrigger = "trigger"
 )
 
 // validTypes is the set of valid message types.
 var validTypes = map[string]bool{
-	TypeInstruction:    true,
-	TypeInputNeeded:    true,
-	TypeStateChange:    true,
-	TypeAssistantReply: true,
-	TypeGroupSet:       true,
-	TypeMention:        true,
-	TypeSystem:         true,
-	TypeChat:           true,
-	TypeReply:          true,
-	TypeChoicePrompt:   true,
-	TypeChoiceResponse: true,
+	TypeInstruction:      true,
+	TypeInputNeeded:      true,
+	TypeStateChange:      true,
+	TypeAssistantReply:   true,
+	TypeGroupSet:         true,
+	TypeMention:          true,
+	TypeSystem:           true,
+	TypeChat:             true,
+	TypeReply:            true,
+	TypeDecisionPrompt:   true,
+	TypeDecisionResponse: true,
+	TypeSecretRequest:    true,
+	TypeSecretResponse:   true,
 }
 
 // StructuredMessage represents a formatted Scion message.
@@ -195,6 +213,13 @@ type StructuredMessage struct {
 	PersistMessageID string    `json:"-"`
 	PersistCreatedAt time.Time `json:"-"`
 
+	// MentionedUserIDs, when set, are the resolved human project member IDs
+	// @mentioned in a thread message that the sending handler already computed
+	// so the persisting subscriber can record mention rows before publishing
+	// SSE without re-querying project members. Hub-internal like
+	// PersistMessageID: never rendered, never accepted from request JSON.
+	MentionedUserIDs []string `json:"-"`
+
 	// AttachmentDeliveries are the attachments stored as artifacts, bound to
 	// a stored message, that the hub delivers into the recipient agent's
 	// home with this dispatch (ptone/scion#4596). Set by the hub's send path
@@ -216,6 +241,10 @@ type StructuredMessage struct {
 	// home. Set by the hub's send path only; never read from a request,
 	// never serialized.
 	AttachmentMounts map[string]string `json:"-"`
+
+	// Event carries the structured EventBody JSON for TypeSystem deliveries
+	// (such as trigger fires) through the legacy StructuredMessage path.
+	Event json.RawMessage `json:"event,omitempty"`
 
 	// DeliveryText is the fully rendered agent-facing envelope, produced by
 	// the hub. When set, the broker delivers it verbatim and performs no

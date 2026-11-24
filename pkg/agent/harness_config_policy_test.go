@@ -25,6 +25,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	goruntime "runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1619,9 +1622,10 @@ func TestHarnessConfigPolicy_StartRestoresSecretsRecord(t *testing.T) {
 }
 
 // restoreSecretsRecord restores only regular files, into a 0700 directory
-// with 0600 files, and returns their names, and only when the recorded
-// harness-config identity matches the current one; any ambiguity restores
-// nothing.
+// with 0600 files, and returns their names. Exact identity matches restore all
+// regular files; same-lineage revision changes restore only names accepted by
+// allow (never writing filtered files to the home); allow == nil on a revision
+// change or any lineage mismatch restores nothing.
 func TestRestoreSecretsRecord(t *testing.T) {
 	agentDir := t.TempDir()
 	home := filepath.Join(t.TempDir(), "home")
@@ -1629,7 +1633,10 @@ func TestRestoreSecretsRecord(t *testing.T) {
 	if err := os.MkdirAll(record, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(record, "TOKEN_A"), []byte("a"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(record, "TOKEN_A"), []byte("secret-val-a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(record, "TOKEN_B"), []byte("secret-val-b"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(filepath.Join(record, "TOKEN_A"), filepath.Join(record, "LINKED")); err != nil {
@@ -1643,17 +1650,23 @@ func TestRestoreSecretsRecord(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(record, secretsIdentityFile), idData, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	allowAll := func(string) bool { return true }
 
-	// Ambiguity or mismatch restores nothing.
-	for name, current := range map[string]*harnessConfigIdentity{
-		"unknown current identity": nil,
-		"different name":           {Name: "other", Source: "broker-local", Revision: "sha256:abc"},
-		"different revision":       {Name: "hc", Source: "broker-local", Revision: "sha256:def"},
-		"different hub record":     {Name: "hc", Source: "broker-local", HubRecordID: "rec-2", Revision: "sha256:abc"},
+	// Ambiguity, lineage mismatch, or cross-revision with nil allow restores nothing.
+	for _, tc := range []struct {
+		name    string
+		current *harnessConfigIdentity
+		allow   func(string) bool
+	}{
+		{"unknown current identity", nil, allowAll},
+		{"different name", &harnessConfigIdentity{Name: "other", Source: "broker-local", Revision: "sha256:abc"}, allowAll},
+		{"different source", &harnessConfigIdentity{Name: "hc", Source: "template-bundled", Revision: "sha256:abc"}, allowAll},
+		{"different hub record", &harnessConfigIdentity{Name: "hc", Source: "broker-local", HubRecordID: "rec-2", Revision: "sha256:abc"}, allowAll},
+		{"same lineage with nil allow", &harnessConfigIdentity{Name: "hc", Source: "broker-local", Revision: "sha256:def"}, nil},
 	} {
-		got, err := restoreSecretsRecord(agentDir, home, "agent-x", current)
+		got, err := restoreSecretsRecord(agentDir, home, "agent-x", tc.current, tc.allow)
 		if err != nil || len(got) != 0 {
-			t.Errorf("%s: expected nothing restored, got %v (err=%v)", name, got, err)
+			t.Errorf("%s: expected nothing restored, got %v (err=%v)", tc.name, got, err)
 		}
 	}
 	for name, content := range map[string]string{"missing identity": "", "unparseable identity": "{not json"} {
@@ -1662,7 +1675,7 @@ func TestRestoreSecretsRecord(t *testing.T) {
 		} else if err := os.WriteFile(filepath.Join(record, secretsIdentityFile), []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		got, err := restoreSecretsRecord(agentDir, home, "agent-x", id)
+		got, err := restoreSecretsRecord(agentDir, home, "agent-x", id, allowAll)
 		if err != nil || len(got) != 0 {
 			t.Errorf("%s: expected nothing restored, got %v (err=%v)", name, got, err)
 		}
@@ -1674,12 +1687,34 @@ func TestRestoreSecretsRecord(t *testing.T) {
 		t.Fatalf("nothing should have been restored yet (stat err=%v)", err)
 	}
 
-	names, err := restoreSecretsRecord(agentDir, home, "agent-x", id)
+	// Same lineage with revision change and allow predicate: restores only allowed
+	// names, never writes filtered files to home, and logs names only (no values).
+	logBuf := capturePolicyLogs(t)
+	crossHome := filepath.Join(t.TempDir(), "cross-home")
+	revB := &harnessConfigIdentity{Name: "hc", Source: "broker-local", Revision: "sha256:def"}
+	crossNames, err := restoreSecretsRecord(agentDir, crossHome, "agent-x", revB, func(n string) bool { return n == "TOKEN_A" })
+	if err != nil || !reflect.DeepEqual(crossNames, []string{"TOKEN_A"}) {
+		t.Fatalf("cross-revision restore = (%v, %v), want ([TOKEN_A], nil)", crossNames, err)
+	}
+	if _, err := os.Stat(filepath.Join(crossHome, ".scion", "harness", "secrets", "TOKEN_B")); !os.IsNotExist(err) {
+		t.Errorf("filtered-out TOKEN_B must never be written to home (stat err=%v)", err)
+	}
+	logOut := logBuf.String()
+	if !strings.Contains(logOut, "restoring recorded secrets across a harness-config revision change") ||
+		!strings.Contains(logOut, "TOKEN_A") || !strings.Contains(logOut, "TOKEN_B") {
+		t.Errorf("expected cross-revision restore log with restored and dropped names, got: %s", logOut)
+	}
+	if strings.Contains(logOut, "secret-val-a") || strings.Contains(logOut, "secret-val-b") {
+		t.Errorf("secret values leaked into log: %s", logOut)
+	}
+
+	// Exact match restores all regular files even with allow == nil.
+	names, err := restoreSecretsRecord(agentDir, home, "agent-x", id, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(names, ",") != "TOKEN_A" {
-		t.Errorf("restored names = %v, want [TOKEN_A]", names)
+	if strings.Join(names, ",") != "TOKEN_A,TOKEN_B" {
+		t.Errorf("restored names = %v, want [TOKEN_A TOKEN_B]", names)
 	}
 	dir := filepath.Join(home, ".scion", "harness", "secrets")
 	if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != 0o700 {
@@ -1805,15 +1840,49 @@ func TestHarnessConfigPolicy_SecretsRestoredOnlyForStagingConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("content change of the resolved dir restores nothing", func(t *testing.T) {
+	t.Run("content change of the same config restores its declared secrets", func(t *testing.T) {
 		e := newPolicyTestEnv(t)
 		e.projectHC(t, "hc-a", policyTestScriptedADC)
 		mgr := policyTestManager(nil)
 		adcStart(t, mgr, e, "rev", "hc-a", newADCFile(t), nil)
 		e.projectHC(t, "hc-a", policyTestScriptedADC+"# revised\n")
 		adcStart(t, mgr, e, "rev", "hc-a", "", nil)
-		if staged, ref := restoredADC(t, e, "rev"); staged || ref {
-			t.Errorf("a revised harness-config restored the earlier revision's secret (staged=%v referenced=%v)", staged, ref)
+		if staged, ref := restoredADC(t, e, "rev"); !staged || !ref {
+			t.Errorf("a revised harness-config did not restore its declared secret (staged=%v referenced=%v)", staged, ref)
+		}
+	})
+
+	t.Run("content change drops secrets the new revision no longer declares", func(t *testing.T) {
+		e, mgr := newPolicyTestEnv(t), policyTestManager(nil)
+		revB := policyTestScripted + "auth:\n  default_type: api-key\n  types:\n    api-key:\n      required_env:\n        - any_of: [\"KEEP_TOKEN\"]\n"
+		revA := revB + "        - any_of: [\"FOO_TOKEN\"]\n"
+		e.projectHC(t, "hc-drop", revA)
+		if _, err := mgr.Start(context.Background(), api.StartOptions{
+			Name: "drop", ProjectPath: e.scion, HarnessConfig: "hc-drop", HarnessAuth: "api-key",
+			Env: map[string]string{"KEEP_TOKEN": "keep-secret-val", "FOO_TOKEN": "foo-secret-val"},
+		}); err != nil {
+			t.Fatalf("Start revA: %v", err)
+		}
+		e.projectHC(t, "hc-drop", revB)
+		if _, err := mgr.Start(context.Background(), api.StartOptions{
+			Name: "drop", ProjectPath: e.scion, HarnessConfig: "hc-drop", HarnessAuth: "api-key",
+		}); err != nil {
+			t.Fatalf("Start revB: %v", err)
+		}
+
+		home := config.GetAgentHomePath(e.scion, "drop")
+		record := filepath.Join(config.ResolveAgentDir(e.scion, "drop"), config.HarnessSecretsRecordDirName)
+		for _, dir := range []string{filepath.Join(home, ".scion", "harness", "secrets"), record} {
+			if _, err := os.Stat(filepath.Join(dir, "FOO_TOKEN")); !os.IsNotExist(err) {
+				t.Errorf("removed key FOO_TOKEN present in %s (stat err=%v)", dir, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "KEEP_TOKEN")); err != nil {
+				t.Errorf("declared key KEEP_TOKEN missing from %s: %v", dir, err)
+			}
+		}
+		cands, err := os.ReadFile(filepath.Join(home, ".scion", "harness", "inputs", "auth-candidates.json"))
+		if err != nil || strings.Contains(string(cands), "FOO_TOKEN") || !strings.Contains(string(cands), "KEEP_TOKEN") {
+			t.Errorf("unexpected auth-candidates.json (err=%v): %s", err, cands)
 		}
 	})
 
@@ -2097,5 +2166,788 @@ func TestAgentStateDirStrictness(t *testing.T) {
 	dir, _, err := agentStateDir(projectScion, "a", true, "", false)
 	if err != nil || dir != filepath.Join(projectScion, "agents", "a") {
 		t.Errorf("local without a project ID: got %q (err=%v), want the in-project dir", dir, err)
+	}
+}
+
+const policyTestDeclCaptureAuth = policyTestDecl + `auth:
+  default_type: auth-file
+  types:
+    auth-file:
+      required_files:
+        - name: DECL_CRED
+          type: file
+          target_suffix: .decl/creds.json
+`
+
+func writeDeclCaptureAuthHC(t *testing.T, e *policyTestEnv, name string) string {
+	t.Helper()
+	e.projectHC(t, name, policyTestDeclCaptureAuth)
+	dir := filepath.Join(e.scion, "harness-configs", name)
+	if err := os.WriteFile(filepath.Join(dir, "capture_auth.py"), []byte("#!/usr/bin/env python3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func assertCaptureAuthNotStaged(t *testing.T, e *policyTestEnv, agentName string) {
+	t.Helper()
+	home := config.GetAgentHomePath(e.scion, agentName)
+	for _, rel := range []string{
+		filepath.Join(".scion", "harness", "capture_auth.py"),
+		filepath.Join(".scion", "harness", "inputs", "capture-auth-config.json"),
+	} {
+		if _, err := os.Lstat(filepath.Join(home, rel)); !os.IsNotExist(err) {
+			t.Errorf("%s was staged in agent home despite policy refusal (stat err=%v)", rel, err)
+		}
+	}
+}
+
+func assertCaptureAuthStaged(t *testing.T, e *policyTestEnv, agentName string) {
+	t.Helper()
+	home := config.GetAgentHomePath(e.scion, agentName)
+	script := filepath.Join(home, ".scion", "harness", "capture_auth.py")
+	info, err := os.Stat(script)
+	if err != nil {
+		t.Fatalf("capture_auth.py not staged: %v", err)
+	}
+	if info.Mode()&0o111 == 0 {
+		t.Errorf("capture_auth.py mode = %v, want executable", info.Mode())
+	}
+	cfgPath := filepath.Join(home, ".scion", "harness", "inputs", "capture-auth-config.json")
+	if _, err := os.Stat(cfgPath); err != nil {
+		t.Errorf("capture-auth-config.json not staged: %v", err)
+	}
+}
+
+// TestHarnessConfigPolicy_StageCaptureAuthCallSitesAreGated guards that
+// pkg/harness's StageCaptureAuthAssets is called outside pkg/harness only from
+// stageFallbackCaptureAuthAssets, where the context's harness-config policy
+// gates staging capture_auth.py (ptone/scion#622).
+func TestHarnessConfigPolicy_StageCaptureAuthCallSitesAreGated(t *testing.T) {
+	const gatedSite = "pkg/agent/harness_config_policy.go:stageFallbackCaptureAuthAssets"
+	root := mustAbs(t, filepath.Join("..", ".."))
+	sawGatedCall := false
+
+	for _, top := range []string{"pkg", "cmd"} {
+		err := filepath.WalkDir(filepath.Join(root, top), func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				if path == filepath.Join(root, "pkg", "harness") || d.Name() == "testdata" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			rel, _ := filepath.Rel(root, path)
+			relSlash := filepath.ToSlash(rel)
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+			if err != nil {
+				return err
+			}
+			local, dot := harnessImportName(file)
+			if local == "" && !dot {
+				return nil
+			}
+			isStageRef := func(n ast.Node) bool {
+				switch x := n.(type) {
+				case *ast.SelectorExpr:
+					if id, ok := x.X.(*ast.Ident); ok && local != "" && id.Name == local && x.Sel.Name == "StageCaptureAuthAssets" {
+						return true
+					}
+				case *ast.Ident:
+					if dot && x.Name == "StageCaptureAuthAssets" {
+						return true
+					}
+				}
+				return false
+			}
+			for _, decl := range file.Decls {
+				fn, isFn := decl.(*ast.FuncDecl)
+				if isFn && fn.Body == nil {
+					continue
+				}
+				callees := map[ast.Node]bool{}
+				ast.Inspect(decl, func(n ast.Node) bool {
+					if call, ok := n.(*ast.CallExpr); ok {
+						callees[call.Fun] = true
+					}
+					return true
+				})
+				ast.Inspect(decl, func(n ast.Node) bool {
+					if !isStageRef(n) {
+						return true
+					}
+					if !isFn {
+						t.Errorf("%s: package-level reference to harness.StageCaptureAuthAssets; call it only from %s", relSlash, gatedSite)
+						return true
+					}
+					site := relSlash + ":" + fn.Name.Name
+					if !callees[n] {
+						t.Errorf("%s: harness.StageCaptureAuthAssets used as a function value; call it directly from %s", site, gatedSite)
+						return true
+					}
+					if site != gatedSite {
+						t.Errorf("ungated harness.StageCaptureAuthAssets call at %s; route through %s", site, gatedSite)
+						return true
+					}
+					sawGatedCall = true
+					return true
+				})
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !sawGatedCall {
+		t.Errorf("expected %s to call harness.StageCaptureAuthAssets", gatedSite)
+	}
+}
+
+// ptone/scion#622: when the context's harness-config policy refuses
+// container-script harnesses, a declarative harness-config still launches,
+// neither capture_auth.py nor capture-auth-config.json is staged on
+// ProvisionAgent, Start, or relaunch after an allowed start, and suppression is
+// logged clearly for operators.
+func TestHarnessConfigPolicy_DisallowedSuppressesCaptureAuthStaging(t *testing.T) {
+	assertSuppressedLog := func(t *testing.T, logs, agentName, hcName string) {
+		t.Helper()
+		for _, want := range []string{
+			"capture-auth asset staging suppressed",
+			"agent=" + agentName,
+			"harness=generic",
+			"harness_config=" + hcName,
+			`reason="container-script harnesses disallowed"`,
+		} {
+			if !strings.Contains(logs, want) {
+				t.Errorf("expected suppression log containing %q, got:\n%s", want, logs)
+			}
+		}
+	}
+
+	t.Run("ProvisionAgent disallowed", func(t *testing.T) {
+		e := newPolicyTestEnv(t)
+		writeDeclCaptureAuthHC(t, e, "hc-decl-ca")
+		var logBuf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+
+		ctx := (&recordingPolicy{refuse: true}).ctx()
+		if _, _, _, err := ProvisionAgent(ctx, "prov-disallowed", "", "", "hc-decl-ca", e.scion, "", "", "", ""); err != nil {
+			t.Fatalf("ProvisionAgent with declarative harness under restrictive policy failed: %v", err)
+		}
+		assertCaptureAuthNotStaged(t, e, "prov-disallowed")
+		assertSuppressedLog(t, logBuf.String(), "prov-disallowed", "hc-decl-ca")
+	})
+
+	t.Run("Start disallowed", func(t *testing.T) {
+		e := newPolicyTestEnv(t)
+		writeDeclCaptureAuthHC(t, e, "hc-decl-ca")
+		var logBuf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+
+		runs := 0
+		ctx := (&recordingPolicy{refuse: true}).ctx()
+		if _, err := policyTestManager(&runs).Start(ctx, api.StartOptions{
+			Name: "start-disallowed", ProjectPath: e.scion, HarnessConfig: "hc-decl-ca", NoAuth: true,
+		}); err != nil {
+			t.Fatalf("Start with declarative harness under restrictive policy failed: %v", err)
+		}
+		if runs != 1 {
+			t.Errorf("expected container to run once, got %d", runs)
+		}
+		assertCaptureAuthNotStaged(t, e, "start-disallowed")
+		assertSuppressedLog(t, logBuf.String(), "start-disallowed", "hc-decl-ca")
+	})
+
+	t.Run("Relaunch disallowed clears previously staged capture-auth", func(t *testing.T) {
+		e := newPolicyTestEnv(t)
+		writeDeclCaptureAuthHC(t, e, "hc-decl-ca")
+		runs := 0
+		mgr := policyTestManager(&runs)
+		opts := api.StartOptions{Name: "relaunch-disallowed", ProjectPath: e.scion, HarnessConfig: "hc-decl-ca", NoAuth: true}
+		if _, err := mgr.Start(context.Background(), opts); err != nil {
+			t.Fatalf("first Start (allowed): %v", err)
+		}
+		assertCaptureAuthStaged(t, e, "relaunch-disallowed")
+
+		var logBuf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+
+		if _, err := mgr.Start((&recordingPolicy{refuse: true}).ctx(), opts); err != nil {
+			t.Fatalf("relaunch under restrictive policy: %v", err)
+		}
+		if runs != 2 {
+			t.Errorf("expected container to run twice, got %d", runs)
+		}
+		assertCaptureAuthNotStaged(t, e, "relaunch-disallowed")
+		assertSuppressedLog(t, logBuf.String(), "relaunch-disallowed", "hc-decl-ca")
+	})
+
+	t.Run("Stat error on capture_auth.py under restrictive policy fails closed on staging", func(t *testing.T) {
+		e := newPolicyTestEnv(t)
+		// Use policyTestDecl (no auth/required_files block) so hasCaptureAuthCredentials
+		// is false and ONLY the !errors.Is(statErr, os.ErrNotExist) clause triggers
+		// the policy probe.
+		e.projectHC(t, "hc-stat-err", policyTestDecl)
+		hcDir, err := config.LoadHarnessConfigDir(filepath.Join(e.scion, "harness-configs", "hc-stat-err"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hasCaptureAuthCredentials(hcDir.Config.Auth) {
+			t.Fatal("fixture: expected no capture-auth credentials so only the stat-error clause applies")
+		}
+		notADir := filepath.Join(t.TempDir(), "regular-file")
+		if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		hcDir.Path = filepath.Join(notADir, "hc") // Lstat("<regular-file>/hc/capture_auth.py") -> ENOTDIR
+		home := t.TempDir()
+		p := &recordingPolicy{refuse: true}
+		stageCalled := false
+
+		var logBuf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+
+		stageFallbackCaptureAuthAssets(
+			p.ctx(),
+			"stat-err-agent",
+			harness.New("generic"),
+			"hc-stat-err",
+			hcDir,
+			home,
+			func(fn func() error) error {
+				stageCalled = true
+				return fn()
+			},
+		)
+		if got := strings.Join(p.recorded(), ","); got != "hc-stat-err:scripted" {
+			t.Errorf("policy evaluations = %q, want %q", got, "hc-stat-err:scripted")
+		}
+		if stageCalled {
+			t.Error("StageCaptureAuthAssets must not be called when statting capture_auth.py fails under a restrictive policy")
+		}
+		if _, err := os.Lstat(filepath.Join(home, ".scion", "harness")); !os.IsNotExist(err) {
+			t.Errorf(".scion/harness was created despite uncertain capture_auth.py stat under restrictive policy (stat err=%v)", err)
+		}
+		assertSuppressedLog(t, logBuf.String(), "stat-err-agent", "hc-stat-err")
+	})
+
+	t.Run("Config-only without capture_auth.py disallowed", func(t *testing.T) {
+		e := newPolicyTestEnv(t)
+		e.projectHC(t, "hc-decl-cfgonly", policyTestDeclCaptureAuth)
+		runs := 0
+		if _, err := policyTestManager(&runs).Start((&recordingPolicy{refuse: true}).ctx(), api.StartOptions{
+			Name: "cfgonly-disallowed", ProjectPath: e.scion, HarnessConfig: "hc-decl-cfgonly", NoAuth: true,
+		}); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if runs != 1 {
+			t.Errorf("expected container to run once, got %d", runs)
+		}
+		assertCaptureAuthNotStaged(t, e, "cfgonly-disallowed")
+	})
+}
+
+// ptone/scion#622: when no policy is attached (solo CLI or
+// AllowContainerScriptHarnesses=true) or the attached policy permits container
+// scripts, capture_auth.py and capture-auth-config.json are staged as before,
+// and staging I/O errors warn without failing the launch.
+func TestHarnessConfigPolicy_AllowedStagesCaptureAuthAsBefore(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func() context.Context
+	}{
+		{"no policy", context.Background},
+		{"permissive policy", func() context.Context { return (&recordingPolicy{refuse: false}).ctx() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newPolicyTestEnv(t)
+			writeDeclCaptureAuthHC(t, e, "hc-decl-ca")
+			if _, _, _, err := ProvisionAgent(tc.ctx(), "prov-ok", "", "", "hc-decl-ca", e.scion, "", "", "", ""); err != nil {
+				t.Fatalf("ProvisionAgent: %v", err)
+			}
+			assertCaptureAuthStaged(t, e, "prov-ok")
+
+			runs := 0
+			if _, err := policyTestManager(&runs).Start(tc.ctx(), api.StartOptions{
+				Name: "start-ok", ProjectPath: e.scion, HarnessConfig: "hc-decl-ca", NoAuth: true,
+			}); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if runs != 1 {
+				t.Errorf("expected container to run once, got %d", runs)
+			}
+			assertCaptureAuthStaged(t, e, "start-ok")
+		})
+	}
+
+	t.Run("staging I/O error when allowed warns without failing launch", func(t *testing.T) {
+		e := newPolicyTestEnv(t)
+		hcDir := writeDeclCaptureAuthHC(t, e, "hc-decl-ioerr")
+		script := filepath.Join(hcDir, "capture_auth.py")
+		if err := os.Remove(script); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(script, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := ProvisionAgent(context.Background(), "prov-ioerr", "", "", "hc-decl-ioerr", e.scion, "", "", "", ""); err != nil {
+			t.Fatalf("ProvisionAgent must warn rather than fail on capture-auth I/O error: %v", err)
+		}
+		runs := 0
+		if _, err := policyTestManager(&runs).Start((&recordingPolicy{refuse: false}).ctx(), api.StartOptions{
+			Name: "start-ioerr", ProjectPath: e.scion, HarnessConfig: "hc-decl-ioerr", NoAuth: true,
+		}); err != nil {
+			t.Fatalf("Start must warn rather than fail on capture-auth I/O error: %v", err)
+		}
+		if runs != 1 {
+			t.Errorf("expected container to run once, got %d", runs)
+		}
+	})
+}
+
+func snapshotDirBytes(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", dir, err)
+	}
+	snap := make(map[string][]byte, len(entries))
+	for _, e := range entries {
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", e.Name(), err)
+		}
+		snap[e.Name()] = data
+	}
+	return snap
+}
+
+func capturePolicyLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+func writeSecretMap(t *testing.T, dir string, files map[string]string) []string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for k, v := range files {
+		if err := os.WriteFile(filepath.Join(dir, k), []byte(v), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func TestRecordSecretsGuard(t *testing.T) {
+	oldSame := &harnessConfigIdentity{Name: "claude", Source: "hub-hydrated", HubRecordID: "rec-1", Revision: "sha256:rev1"}
+	curSameRev := &harnessConfigIdentity{Name: "claude", Source: "hub-hydrated", HubRecordID: "rec-1", Revision: "sha256:rev1"}
+	curNewRev := &harnessConfigIdentity{Name: "claude", Source: "hub-hydrated", HubRecordID: "rec-1", Revision: "sha256:rev2"}
+	curOther := &harnessConfigIdentity{Name: "gemini", Source: "hub-hydrated", HubRecordID: "rec-2", Revision: "sha256:rev2"}
+	allowKeepOnly := func(n string) bool { return n == "KEEP_KEY" }
+	allowAll := func(string) bool { return true }
+	allowNone := func(string) bool { return false }
+
+	for _, tc := range []struct {
+		name           string
+		oldID          *harnessConfigIdentity
+		oldFiles       map[string]string
+		cur            *harnessConfigIdentity
+		newFiles       map[string]string
+		freshSatisfied bool
+		allow          func(string) bool
+		wantReplaced   bool
+		wantMissing    []string
+	}{
+		{"oldID nil replaces", nil, map[string]string{"KEEP_KEY": "old-secret"}, curSameRev, nil, false, allowAll, true, nil},
+		{"other lineage replaces despite lost keys", oldSame, map[string]string{"KEEP_KEY": "old-secret"}, curOther, nil, false, allowAll, true, nil},
+		{"same lineage freshSatisfied replaces (credential rotation)", oldSame, map[string]string{"KEEP_KEY": "old-secret"}, curSameRev, map[string]string{"NEW_KEY": "new-secret"}, true, allowAll, true, nil},
+		{"same lineage no lost keys replaces", oldSame, map[string]string{"KEEP_KEY": "old-secret"}, curNewRev, map[string]string{"KEEP_KEY": "old-secret", "EXTRA": "v"}, false, allowAll, true, nil},
+		{"same revision lost key keeps old record", oldSame, map[string]string{"KEEP_KEY": "old-secret", "LOST_KEY": "top-secret-val"}, curSameRev, map[string]string{"KEEP_KEY": "old-secret"}, false, allowKeepOnly, false, []string{"LOST_KEY"}},
+		{"cross-revision declared key lost keeps old record", oldSame, map[string]string{"KEEP_KEY": "old-secret", "DECLARED_KEY": "top-secret-val"}, curNewRev, map[string]string{"KEEP_KEY": "old-secret"}, false, allowAll, false, []string{"DECLARED_KEY"}},
+		{"cross-revision undeclared key dropped still replaces", oldSame, map[string]string{"KEEP_KEY": "old-secret", "REMOVED_KEY": "old-removed"}, curNewRev, map[string]string{"KEEP_KEY": "old-secret"}, false, allowKeepOnly, true, nil},
+		{"cross-revision freshSatisfied replaces", oldSame, map[string]string{"KEEP_KEY": "old-secret"}, curNewRev, map[string]string{"NEW_KEY": "new-secret"}, true, allowAll, true, nil},
+		{"cur nil with lost key keeps old record", oldSame, map[string]string{"KEEP_KEY": "old-secret"}, nil, nil, false, allowNone, false, []string{"KEEP_KEY"}},
+		{"cur nil with no lost keys replaces", oldSame, map[string]string{"KEEP_KEY": "old-secret"}, nil, map[string]string{"KEEP_KEY": "old-secret"}, false, allowAll, true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agentDir, home := t.TempDir(), filepath.Join(t.TempDir(), "home")
+			record := filepath.Join(agentDir, config.HarnessSecretsRecordDirName)
+			writeSecretMap(t, record, tc.oldFiles)
+			if tc.oldID != nil {
+				idBytes, _ := json.Marshal(tc.oldID)
+				if err := os.WriteFile(filepath.Join(record, secretsIdentityFile), idBytes, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			beforeSnap := snapshotDirBytes(t, record)
+			newNames := writeSecretMap(t, stagedSecretsDir(home), tc.newFiles)
+			logBuf := capturePolicyLogs(t)
+
+			replaced, err := recordSecrets(agentDir, home, "agent-guard", recordUpdate{
+				Names: newNames, Current: tc.cur, FreshSatisfied: tc.freshSatisfied, Allow: tc.allow,
+			})
+			if err != nil || replaced != tc.wantReplaced {
+				t.Fatalf("recordSecrets = (%v, %v), want (%v, nil)", replaced, err, tc.wantReplaced)
+			}
+			if !tc.wantReplaced {
+				if afterSnap := snapshotDirBytes(t, record); !reflect.DeepEqual(afterSnap, beforeSnap) {
+					t.Errorf("old record modified when !replaced:\ngot:  %q\nwant: %q", afterSnap, beforeSnap)
+				}
+				logOut := logBuf.String()
+				for _, m := range tc.wantMissing {
+					if !strings.Contains(logOut, m) {
+						t.Errorf("warning log missing key name %q: %s", m, logOut)
+					}
+				}
+				if strings.Contains(logOut, "top-secret-val") || strings.Contains(logOut, "old-secret") {
+					t.Errorf("secret value leaked in warning log: %s", logOut)
+				}
+			}
+		})
+	}
+}
+
+func TestRecordSecretsAtomic(t *testing.T) {
+	agentDir, home := t.TempDir(), filepath.Join(t.TempDir(), "home")
+	stagedDir := stagedSecretsDir(home)
+	writeSecretMap(t, stagedDir, map[string]string{"TOKEN_OLD": "val-old", "TOKEN_NEW": "val-new"})
+	id1 := &harnessConfigIdentity{Name: "hc", Source: "broker-local", Revision: "sha256:r1"}
+	id2 := &harnessConfigIdentity{Name: "hc", Source: "broker-local", Revision: "sha256:r2"}
+	if replaced, err := recordSecrets(agentDir, home, "agent-atomic", recordUpdate{
+		Names: []string{"TOKEN_OLD"}, Current: id1, FreshSatisfied: true,
+	}); err != nil || !replaced {
+		t.Fatalf("initial recordSecrets: replaced=%v err=%v", replaced, err)
+	}
+
+	boom := errors.New("simulated failure between renames")
+	recordSecretsBetweenRenamesHook = func() error { return boom }
+	t.Cleanup(func() { recordSecretsBetweenRenamesHook = nil })
+	if _, err := recordSecrets(agentDir, home, "agent-atomic", recordUpdate{
+		Names: []string{"TOKEN_NEW"}, Current: id2, FreshSatisfied: true,
+	}); !errors.Is(err, boom) {
+		t.Fatalf("recordSecrets with hook err = %v, want %v", err, boom)
+	}
+	recordSecretsBetweenRenamesHook = nil
+
+	recordPath := filepath.Join(agentDir, config.HarnessSecretsRecordDirName)
+	oldPath := filepath.Join(agentDir, secretsRecordOldDirName)
+	if _, err := os.Lstat(recordPath); !os.IsNotExist(err) {
+		t.Fatalf("expected harness-secrets absent mid-rename, got err=%v", err)
+	}
+	if _, err := os.Lstat(oldPath); err != nil {
+		t.Fatalf("expected harness-secrets.old present mid-rename: %v", err)
+	}
+	strayTmp := filepath.Join(agentDir, secretsRecordTmpPrefix+"deadbeef")
+	writeSecretMap(t, strayTmp, map[string]string{"TOKEN_STRAY": "val-stray"})
+
+	restored, err := restoreSecretsRecord(agentDir, filepath.Join(t.TempDir(), "restore-home"), "agent-atomic", id1, nil)
+	if err != nil || !reflect.DeepEqual(restored, []string{"TOKEN_OLD"}) {
+		t.Fatalf("restoreSecretsRecord after interrupted swap = (%v, %v), want ([TOKEN_OLD], nil)", restored, err)
+	}
+	if _, err := os.Lstat(oldPath); !os.IsNotExist(err) {
+		t.Errorf("expected .old renamed back, stat err=%v", err)
+	}
+
+	if replaced, err := recordSecrets(agentDir, home, "agent-atomic", recordUpdate{
+		Names: []string{"TOKEN_NEW"}, Current: id2, FreshSatisfied: true,
+	}); err != nil || !replaced {
+		t.Fatalf("second recordSecrets: replaced=%v err=%v", replaced, err)
+	}
+	if fi, err := os.Stat(recordPath); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("record dir mode = %v (err=%v), want 0700", fi, err)
+	}
+	if fi, err := os.Stat(filepath.Join(recordPath, "TOKEN_NEW")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("recorded file mode = %v (err=%v), want 0600", fi, err)
+	}
+	if entries, err := os.ReadDir(agentDir); err != nil || len(entries) != 1 || entries[0].Name() != config.HarnessSecretsRecordDirName {
+		t.Errorf("unexpected agentDir entries (err=%v): %v", err, entries)
+	}
+}
+
+func TestEnsureSecretsRecord_RecoversInterruptedSwap(t *testing.T) {
+	agentDir, home := t.TempDir(), filepath.Join(t.TempDir(), "home")
+	id := &harnessConfigIdentity{Name: "hc", Source: "broker-local", Revision: "sha256:r1"}
+	writeSecretMap(t, stagedSecretsDir(home), map[string]string{"GOOGLE_CLOUD_PROJECT": "p"})
+	if _, err := recordSecrets(agentDir, home, "a", recordUpdate{
+		Names: []string{"GOOGLE_CLOUD_PROJECT"}, Current: id, FreshSatisfied: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a broker crash between Rename(harness-secrets -> .old) and Rename(tmp -> harness-secrets),
+	// followed by ProvisionAgent's ensureSecretsRecord before the next Start.
+	if err := os.Rename(filepath.Join(agentDir, config.HarnessSecretsRecordDirName), filepath.Join(agentDir, secretsRecordOldDirName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSecretsRecord(agentDir); err != nil {
+		t.Fatal(err)
+	}
+	got, err := restoreSecretsRecord(agentDir, filepath.Join(t.TempDir(), "h2"), "a", id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"GOOGLE_CLOUD_PROJECT"}) {
+		t.Fatalf("restored = %v, want [GOOGLE_CLOUD_PROJECT] (.old was orphaned)", got)
+	}
+}
+
+func TestRecordSecrets_CleansLeftoverTmpDirs(t *testing.T) {
+	agentDir, home := t.TempDir(), filepath.Join(t.TempDir(), "home")
+	id := &harnessConfigIdentity{Name: "hc", Source: "broker-local", Revision: "sha256:r1"}
+	writeSecretMap(t, stagedSecretsDir(home), map[string]string{"TOKEN_KEEP": "val"})
+	if _, err := recordSecrets(agentDir, home, "a", recordUpdate{
+		Names: []string{"TOKEN_KEEP"}, Current: id, FreshSatisfied: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Leftover .tmp-* dirs from a crashed write are swept even when the guard preserves the record.
+	for _, sfx := range []string{"crash1", "crash2"} {
+		writeSecretMap(t, filepath.Join(agentDir, secretsRecordTmpPrefix+sfx), map[string]string{"LEAK": "v"})
+	}
+	emptyHome := filepath.Join(t.TempDir(), "empty-home")
+	if replaced, err := recordSecrets(agentDir, emptyHome, "a", recordUpdate{Current: id}); err != nil || replaced {
+		t.Fatalf("guarded recordSecrets = (%v, %v), want (false, nil)", replaced, err)
+	}
+	if matches, err := filepath.Glob(filepath.Join(agentDir, secretsRecordTmpPrefix+"*")); err != nil || len(matches) != 0 {
+		t.Fatalf("leftover tmp dirs after guarded recordSecrets = %v (err=%v), want none", matches, err)
+	}
+
+	// Also swept on a replacing write without interfering with the new tmp dir.
+	writeSecretMap(t, filepath.Join(agentDir, secretsRecordTmpPrefix+"crash3"), map[string]string{"LEAK": "v"})
+	if replaced, err := recordSecrets(agentDir, home, "a", recordUpdate{
+		Names: []string{"TOKEN_KEEP"}, Current: id, FreshSatisfied: true,
+	}); err != nil || !replaced {
+		t.Fatalf("replacing recordSecrets = (%v, %v), want (true, nil)", replaced, err)
+	}
+	if entries, err := os.ReadDir(agentDir); err != nil || len(entries) != 1 || entries[0].Name() != config.HarnessSecretsRecordDirName {
+		t.Fatalf("unexpected agentDir entries after replace (err=%v): %v", err, entries)
+	}
+}
+
+func TestRecordSecrets_CleansLeftoverTmpDirs_GlobMetacharacters(t *testing.T) {
+	cases := []struct {
+		name        string
+		dirName     string
+		skipWindows bool
+	}{
+		{name: "unclosed bracket", dirName: "a[b"},
+		{name: "character class", dirName: "x[1]"},
+		{name: "class and wildcard", dirName: "x[1]*", skipWindows: true},
+	}
+	id := &harnessConfigIdentity{Name: "hc", Source: "broker-local", Revision: "sha256:r1"}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skipWindows && goruntime.GOOS == "windows" {
+				t.Skip("glob wildcard '*' is not a valid filename character on Windows")
+			}
+			agentDir := filepath.Join(t.TempDir(), tc.dirName)
+			if err := os.MkdirAll(agentDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			recordPath := filepath.Join(agentDir, config.HarnessSecretsRecordDirName)
+			oldPath := filepath.Join(agentDir, secretsRecordOldDirName)
+			writeSecretMap(t, recordPath, map[string]string{"TOKEN_KEEP": "val-keep"})
+			writeSecretMap(t, oldPath, map[string]string{"TOKEN_OLD": "val-old"})
+			recordBefore := snapshotDirBytes(t, recordPath)
+			oldBefore := snapshotDirBytes(t, oldPath)
+
+			tmp1 := filepath.Join(agentDir, secretsRecordTmpPrefix+"crash1")
+			tmp2 := filepath.Join(agentDir, secretsRecordTmpPrefix+"crash2")
+			writeSecretMap(t, tmp1, map[string]string{"LEAK": "v1"})
+			writeSecretMap(t, tmp2, map[string]string{"LEAK": "v2"})
+
+			if err := cleanupSecretsRecordTmp(agentDir); err != nil {
+				t.Fatalf("cleanupSecretsRecordTmp(%q) = %v, want nil", agentDir, err)
+			}
+			for _, p := range []string{tmp1, tmp2} {
+				if _, err := os.Lstat(p); !os.IsNotExist(err) {
+					t.Errorf("leftover tmp dir %q still exists (err=%v)", p, err)
+				}
+			}
+			if got := snapshotDirBytes(t, recordPath); !reflect.DeepEqual(got, recordBefore) {
+				t.Errorf("real record modified by cleanupSecretsRecordTmp: got %v, want %v", got, recordBefore)
+			}
+			if got := snapshotDirBytes(t, oldPath); !reflect.DeepEqual(got, oldBefore) {
+				t.Errorf(".old record modified by cleanupSecretsRecordTmp: got %v, want %v", got, oldBefore)
+			}
+
+			// Verify recordSecrets also succeeds and sweeps leftover tmp dirs in this agentDir.
+			home := filepath.Join(t.TempDir(), "home")
+			writeSecretMap(t, stagedSecretsDir(home), map[string]string{"TOKEN_NEW": "val-new"})
+			tmp3 := filepath.Join(agentDir, secretsRecordTmpPrefix+"crash3")
+			writeSecretMap(t, tmp3, map[string]string{"LEAK": "v3"})
+			if replaced, err := recordSecrets(agentDir, home, "a", recordUpdate{
+				Names: []string{"TOKEN_NEW"}, Current: id, FreshSatisfied: true,
+			}); err != nil || !replaced {
+				t.Fatalf("recordSecrets(%q) = (%v, %v), want (true, nil)", agentDir, replaced, err)
+			}
+			if _, err := os.Lstat(tmp3); !os.IsNotExist(err) {
+				t.Errorf("leftover tmp dir %q still exists after recordSecrets (err=%v)", tmp3, err)
+			}
+			if entries, err := os.ReadDir(agentDir); err != nil || len(entries) != 1 || entries[0].Name() != config.HarnessSecretsRecordDirName {
+				t.Fatalf("unexpected agentDir entries after recordSecrets (err=%v): %v", err, entries)
+			}
+		})
+	}
+}
+
+const policyTestClaudeVertex = "harness: claude\nimage: scion-claude:test\nuser: scion\nprovisioner:\n" +
+	"  type: container-script\n  interface_version: 1\n  command: [\"python3\", \"/home/scion/.scion/harness/provision.py\"]\n" +
+	"auth:\n  default_type: api-key\n  types:\n    api-key:\n      required_env:\n        - any_of: [\"ANTHROPIC_API_KEY\"]\n" +
+	"    vertex-ai:\n      required_env:\n        - any_of: [\"GOOGLE_CLOUD_PROJECT\"]\n" +
+	"        - any_of: [\"GOOGLE_CLOUD_REGION\", \"CLOUD_ML_REGION\", \"GOOGLE_CLOUD_LOCATION\"]\n" +
+	"      required_files:\n        - name: gcloud-adc\n          type: file\n          field: GoogleAppCredentials\n" +
+	"          alternative_env_keys: [\"GOOGLE_APPLICATION_CREDENTIALS\"]\n          skipped_when_gcp_service_account_assigned: true\n          required: true\n"
+
+var wantClaudeVertex7Files = []string{
+	"ANTHROPIC_VERTEX_PROJECT_ID", "CLAUDE_CODE_USE_VERTEX", "CLOUD_ML_REGION",
+	"GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_REGION", "SCION_HARNESS_SELECTED_AUTH",
+}
+
+func recordSecretNames(t *testing.T, record string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(record)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", record, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && e.Name() != secretsIdentityFile {
+			names = append(names, e.Name())
+		}
+	}
+	return names
+}
+
+func startClaudeVertex(t *testing.T, mgr Manager, scionDir, name, hydrated, authType string, env map[string]string) {
+	t.Helper()
+	if _, err := mgr.Start(context.Background(), api.StartOptions{
+		Name: name, ProjectPath: scionDir, BrokerMode: true,
+		HarnessConfig: "claude", HarnessConfigPath: hydrated, HarnessConfigID: "hc-uuid-1",
+		HarnessAuth: authType, Env: env,
+	}); err != nil {
+		t.Fatalf("Start(%s): %v", name, err)
+	}
+}
+
+func TestStart_AsNeededSurvivesHarnessConfigRevisionChange(t *testing.T) {
+	e, hydrated, mgr := newPolicyTestEnv(t), filepath.Join(t.TempDir(), "hydrated", "claude"), policyTestManager(nil)
+	writePolicyHC(t, hydrated, policyTestClaudeVertex)
+
+	startClaudeVertex(t, mgr, e.scion, "claude-vtx", hydrated, "vertex-ai", map[string]string{
+		"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-east5", "GOOGLE_CLOUD_PROJECT": "secret-gcp-proj-42",
+	})
+	record := filepath.Join(config.ResolveAgentDir(e.scion, "claude-vtx"), config.HarnessSecretsRecordDirName)
+	id1 := readSecretsIdentity(record)
+	if id1 == nil || !reflect.DeepEqual(recordSecretNames(t, record), wantClaudeVertex7Files) {
+		t.Fatalf("initial record = (%+v, %v), want 7 files", id1, recordSecretNames(t, record))
+	}
+
+	writePolicyHC(t, hydrated, policyTestClaudeVertex+"# synced edit\n")
+	logBuf := capturePolicyLogs(t)
+	startClaudeVertex(t, mgr, e.scion, "claude-vtx", hydrated, "", map[string]string{
+		"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-east5",
+	})
+
+	home := config.GetAgentHomePath(e.scion, "claude-vtx")
+	candsData, err := os.ReadFile(filepath.Join(home, ".scion", "harness", "inputs", "auth-candidates.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cands struct {
+		EnvSecretFiles map[string]string `json:"env_secret_files"`
+	}
+	if err := json.Unmarshal(candsData, &cands); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"GOOGLE_CLOUD_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID"} {
+		if cands.EnvSecretFiles[k] != "$HOME/.scion/harness/secrets/"+k {
+			t.Errorf("auth-candidates.json missing %s: %v", k, cands.EnvSecretFiles)
+		}
+	}
+	if id2 := readSecretsIdentity(record); id2 == nil || id2.Revision == id1.Revision {
+		t.Fatalf("expected updated revision in record identity, got %+v (was %+v)", id2, id1)
+	}
+	if got := recordSecretNames(t, record); !reflect.DeepEqual(got, wantClaudeVertex7Files) {
+		t.Errorf("record files after revision bump = %v, want %v", got, wantClaudeVertex7Files)
+	}
+	if strings.Contains(logBuf.String(), "secret-gcp-proj-42") {
+		t.Errorf("secret project value leaked in log: %s", logBuf.String())
+	}
+}
+
+func TestStart_RevisionChangeWithStrictRestoreKeepsRecord(t *testing.T) {
+	e, hydrated, mgr := newPolicyTestEnv(t), filepath.Join(t.TempDir(), "hydrated", "claude"), policyTestManager(nil)
+	writePolicyHC(t, hydrated, policyTestClaudeVertex)
+
+	startClaudeVertex(t, mgr, e.scion, "claude-guard", hydrated, "vertex-ai", map[string]string{
+		"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-east5", "GOOGLE_CLOUD_PROJECT": "secret-gcp-proj-42",
+	})
+	record := filepath.Join(config.ResolveAgentDir(e.scion, "claude-guard"), config.HarnessSecretsRecordDirName)
+	beforeSnap := snapshotDirBytes(t, record)
+
+	writePolicyHC(t, hydrated, policyTestClaudeVertex+"# synced edit\n")
+	restoreSecretsAllowTestHook = func(string) bool { return false }
+	t.Cleanup(func() { restoreSecretsAllowTestHook = nil })
+	logBuf := capturePolicyLogs(t)
+
+	startClaudeVertex(t, mgr, e.scion, "claude-guard", hydrated, "", map[string]string{
+		"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-east5",
+	})
+	if afterSnap := snapshotDirBytes(t, record); !reflect.DeepEqual(afterSnap, beforeSnap) {
+		t.Errorf("guard failed to preserve 7-file old-revision record byte-for-byte: got %v", recordSecretNames(t, record))
+	}
+	logOut := logBuf.String()
+	if !strings.Contains(logOut, "ANTHROPIC_VERTEX_PROJECT_ID") || !strings.Contains(logOut, "GOOGLE_CLOUD_PROJECT") {
+		t.Errorf("expected warning naming missing project keys, got: %s", logOut)
+	}
+	if strings.Contains(logOut, "secret-gcp-proj-42") {
+		t.Errorf("secret project value leaked in warning log: %s", logOut)
+	}
+}
+
+func TestStart_OverwrittenRecordHealsWithGatheredEnv(t *testing.T) {
+	e, hydrated, mgr := newPolicyTestEnv(t), filepath.Join(t.TempDir(), "hydrated", "claude"), policyTestManager(nil)
+	writePolicyHC(t, hydrated, policyTestClaudeVertex)
+
+	startClaudeVertex(t, mgr, e.scion, "claude-heal", hydrated, "vertex-ai", map[string]string{
+		"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-east5",
+	})
+	record := filepath.Join(config.ResolveAgentDir(e.scion, "claude-heal"), config.HarnessSecretsRecordDirName)
+	if got := len(recordSecretNames(t, record)); got != 5 {
+		t.Fatalf("fixture: expected 5-file partial record, got %d (%v)", got, recordSecretNames(t, record))
+	}
+
+	startClaudeVertex(t, mgr, e.scion, "claude-heal", hydrated, "", map[string]string{
+		"GOOGLE_CLOUD_LOCATION": "us-east5", "GOOGLE_CLOUD_REGION": "us-east5", "GOOGLE_CLOUD_PROJECT": "healed-proj",
+	})
+	if got := recordSecretNames(t, record); !reflect.DeepEqual(got, wantClaudeVertex7Files) {
+		t.Errorf("healed record files = %v, want %v", got, wantClaudeVertex7Files)
 	}
 }

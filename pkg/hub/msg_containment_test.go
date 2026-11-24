@@ -88,7 +88,9 @@ func TestC1_ScheduledMessageCrossProjectAgentID(t *testing.T) {
 	evt = withSessionRevision(evt, creatorID)
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	err := handler(context.Background(), evt)
 	// Handler returns the denial error — the enclosing scheduler wrapper
 	// (fireEvent / executeSchedule) owns status recording.
@@ -130,7 +132,9 @@ func TestC1_ScheduledMessageCrossProjectRawPayload(t *testing.T) {
 	evt = withSessionRevision(evt, "creator")
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	_ = handler(context.Background(), evt)
 
 	if len(spy.getCalls()) != 0 {
@@ -169,7 +173,9 @@ func TestC1_ScheduledMessageModeNoneDenied(t *testing.T) {
 	evt = withSessionRevision(evt, creatorID)
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	err := handler(context.Background(), evt)
 	if err == nil {
 		t.Fatal("handler must return error on authorization denial")
@@ -215,7 +221,9 @@ func TestC1_ScheduledMessageBranchDenied(t *testing.T) {
 	evt = withMockAgentRevision(evt, creatorAgentID)
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	_ = handler(context.Background(), evt)
 
 	if len(spy.getCalls()) != 0 {
@@ -255,7 +263,9 @@ func TestC1_ScheduledMessageCreatorSuspended(t *testing.T) {
 	evt = withSessionRevision(evt, creatorID)
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	err := handler(context.Background(), evt)
 	if err == nil {
 		t.Fatal("handler must return error on authorization denial")
@@ -293,7 +303,9 @@ func TestC1_ScheduledMessageCreatorAgentDeleted(t *testing.T) {
 	evt = withMockAgentRevision(evt, "deleted-creator-agent-id")
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	err := handler(context.Background(), evt)
 	if err == nil {
 		t.Fatal("handler must return error on authorization denial")
@@ -330,7 +342,9 @@ func TestC1_ScheduledMessageEmptyCreatedBy(t *testing.T) {
 	}
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	err := handler(context.Background(), evt)
 	if err == nil {
 		t.Fatal("handler must return error on authorization denial")
@@ -378,7 +392,9 @@ func TestC1_ScheduledMessageTargetModeChanged(t *testing.T) {
 	evt = withSessionRevision(evt, creatorID)
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	_ = handler(context.Background(), evt)
 
 	if len(spy.getCalls()) != 0 {
@@ -400,7 +416,7 @@ func TestC1_ScheduledMessageHappyPath(t *testing.T) {
 	}
 	ms.agents["target"] = &store.Agent{
 		ID: "target", Name: "target", Slug: "target",
-		ProjectID: projectID, MessageMode: store.MessageModeProject,
+		ProjectID: projectID, Phase: "running", MessageMode: store.MessageModeProject,
 	}
 
 	// Set up role binding so the creator has agent.message permission.
@@ -434,7 +450,9 @@ func TestC1_ScheduledMessageHappyPath(t *testing.T) {
 	evt = withSessionRevision(evt, creatorID)
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	err := handler(context.Background(), evt)
 	if err != nil {
 		t.Fatalf("happy path should not return error: %v", err)
@@ -477,7 +495,9 @@ func TestC1_ScheduledMessageStoreErrorFailsClosed(t *testing.T) {
 	evt = withSessionRevision(evt, "nonexistent-id")
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	_ = handler(context.Background(), evt)
 
 	if len(spy.getCalls()) != 0 {
@@ -517,7 +537,9 @@ func TestC1_ScheduledMessageCreatorAgentSoftDeleted(t *testing.T) {
 	evt = withMockAgentRevision(evt, "deleted-creator")
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	_ = handler(context.Background(), evt)
 
 	if len(spy.getCalls()) != 0 {
@@ -560,7 +582,9 @@ func TestC1_ScheduledMessageDenialReturnsError(t *testing.T) {
 	evt = withSessionRevision(evt, creatorID)
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	err := handler(context.Background(), evt)
 
 	// Handler must return the denial error.
@@ -609,7 +633,9 @@ func TestC1_ScheduledMessageTargetDeletedReturnsError(t *testing.T) {
 	evt = withSessionRevision(evt, creatorID)
 	ms.events[evt.ID] = &evt
 
-	handler := srv.messageEventHandler()
+	handler := func(ctx context.Context, evt store.ScheduledEvent) error {
+		return fireScheduledActionForTest(ctx, srv, "message", evt)
+	}
 	err := handler(context.Background(), evt)
 
 	if err == nil {
@@ -657,7 +683,8 @@ func TestC1_FireEvent_DenialRecordsErrorOnEvent(t *testing.T) {
 
 	// Create a Scheduler and register the message handler.
 	sched := NewScheduler(ms, slog.Default())
-	sched.RegisterEventHandler("message", srv.messageEventHandler())
+	sched.srv = srv
+	sched.RegisterAction(&messageAction{srv: srv})
 
 	payload, _ := json.Marshal(MessageEventPayload{
 		AgentID: "agent-in-b", Message: "cross-project message",
@@ -701,7 +728,7 @@ func TestC1_FireEvent_SuccessRecordsFiredNoError(t *testing.T) {
 	}
 	ms.agents["target"] = &store.Agent{
 		ID: "target", Name: "target", Slug: "target",
-		ProjectID: projectID, MessageMode: store.MessageModeProject,
+		ProjectID: projectID, Phase: "running", MessageMode: store.MessageModeProject,
 	}
 	ms.roleDefinitions["member-role"] = &store.RoleDefinition{
 		ID:          "member-role",
@@ -722,7 +749,8 @@ func TestC1_FireEvent_SuccessRecordsFiredNoError(t *testing.T) {
 	srv.SetDispatcher(spy)
 
 	sched := NewScheduler(ms, slog.Default())
-	sched.RegisterEventHandler("message", srv.messageEventHandler())
+	sched.srv = srv
+	sched.RegisterAction(&messageAction{srv: srv})
 
 	payload, _ := json.Marshal(MessageEventPayload{
 		AgentID: "target", Message: "hello",
@@ -765,7 +793,8 @@ func TestC1_FireEvent_TargetDeletedRecordsError(t *testing.T) {
 	srv.SetDispatcher(spy)
 
 	sched := NewScheduler(ms, slog.Default())
-	sched.RegisterEventHandler("message", srv.messageEventHandler())
+	sched.srv = srv
+	sched.RegisterAction(&messageAction{srv: srv})
 
 	payload, _ := json.Marshal(MessageEventPayload{
 		AgentID: "deleted-agent", Message: "hello?",
@@ -800,7 +829,8 @@ func TestC1_FireEvent_DispatchAgentHandlerFailure(t *testing.T) {
 	srv := containmentTestServer(ms)
 
 	sched := NewScheduler(ms, slog.Default())
-	sched.RegisterEventHandler("dispatch_agent", srv.dispatchAgentEventHandler())
+	sched.srv = srv
+	sched.RegisterAction(&dispatchAgentAction{srv: srv})
 
 	// Create a dispatch_agent event with no project in the store.
 	// The handler will fail when resolving the project.
@@ -841,7 +871,7 @@ func TestC1_FireEvent_StatusWriteFailureIsNotRetried(t *testing.T) {
 	}
 	ms.agents["target"] = &store.Agent{
 		ID: "target", Name: "target", Slug: "target",
-		ProjectID: projectID, MessageMode: store.MessageModeProject,
+		ProjectID: projectID, Phase: "running", MessageMode: store.MessageModeProject,
 	}
 	ms.roleDefinitions["member-role"] = &store.RoleDefinition{
 		ID:          "member-role",
@@ -862,7 +892,8 @@ func TestC1_FireEvent_StatusWriteFailureIsNotRetried(t *testing.T) {
 	srv.SetDispatcher(spy)
 
 	sched := NewScheduler(ms, slog.Default())
-	sched.RegisterEventHandler("message", srv.messageEventHandler())
+	sched.srv = srv
+	sched.RegisterAction(&messageAction{srv: srv})
 
 	payload, _ := json.Marshal(MessageEventPayload{
 		AgentID: "target", Message: "hello",
@@ -898,7 +929,8 @@ func TestC1_ExecuteSchedule_DenialRecordsErrorOnEvent(t *testing.T) {
 	srv.SetDispatcher(spy)
 
 	srv.scheduler = NewScheduler(s, slog.Default())
-	srv.scheduler.RegisterEventHandler("message", srv.messageEventHandler())
+	srv.scheduler.srv = srv
+	srv.RegisterAction(&messageAction{srv: srv})
 
 	projectA := &store.Project{
 		ID: tid("exec-sched-a"), Name: "Project A", Slug: "exec-sched-a",
@@ -1097,10 +1129,15 @@ func TestC1_ScheduledMessageCreate_HubScopedUATAdmittedAtRoute(t *testing.T) {
 	baseUser := NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "token")
 	scopedIdent := scheduleTestUAT(t, baseUser, hubBoundary(), "scheduled_event:create", "agent:message")
 
+	require.NoError(t, s.CreateAgent(ctx, &store.Agent{
+		ID: tid("uat-hub-target"), Name: "uat-hub-target", Slug: "uat-hub-target",
+		ProjectID: project.ID, Phase: "running", MessageMode: store.MessageModeProject,
+	}))
+
 	reqBody := CreateScheduledEventRequest{
 		EventType: "message",
 		FireIn:    "30m",
-		AgentName: "uat-hub-ghost-target",
+		AgentName: "uat-hub-target",
 		Message:   "hello",
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
@@ -1172,7 +1209,8 @@ func TestC1_RecurringScheduleCreate_CrossProjectDenied(t *testing.T) {
 	ctx := context.Background()
 
 	srv.scheduler = NewScheduler(s, slog.Default())
-	srv.scheduler.RegisterEventHandler("message", srv.messageEventHandler())
+	srv.scheduler.srv = srv
+	srv.RegisterAction(&messageAction{srv: srv})
 
 	projectA := &store.Project{
 		ID: tid("sched-create-a"), Name: "Project A", Slug: "sched-create-a",
@@ -1212,7 +1250,8 @@ func TestC1_RecurringScheduleUpdate_CrossProjectDenied(t *testing.T) {
 	ctx := context.Background()
 
 	srv.scheduler = NewScheduler(s, slog.Default())
-	srv.scheduler.RegisterEventHandler("message", srv.messageEventHandler())
+	srv.scheduler.srv = srv
+	srv.RegisterAction(&messageAction{srv: srv})
 
 	projectA := &store.Project{
 		ID: tid("sched-update-a"), Name: "Project A", Slug: "sched-update-a",
@@ -1230,8 +1269,13 @@ func TestC1_RecurringScheduleUpdate_CrossProjectDenied(t *testing.T) {
 	}
 	require.NoError(t, s.CreateAgent(ctx, crossAgent))
 
-	// First create a valid schedule in project A (target unresolvable at authoring
-	// time, which is allowed — fire-time will catch it).
+	localAgent := &store.Agent{
+		ID: tid("local-update-agent"), Name: "some-agent", Slug: "some-agent",
+		ProjectID: projectA.ID, Phase: "running", MessageMode: store.MessageModeProject,
+	}
+	require.NoError(t, s.CreateAgent(ctx, localAgent))
+
+	// First create a valid schedule in project A targeting a live local agent.
 	createRec := doRequest(t, srv, "POST", "/api/v1/projects/"+projectA.ID+"/schedules",
 		CreateScheduleRequest{
 			Name:      "update-me",
@@ -1265,7 +1309,8 @@ func TestC1_RecurringScheduleUpdate_ExistingPayloadDenied(t *testing.T) {
 	ctx := context.Background()
 
 	srv.scheduler = NewScheduler(s, slog.Default())
-	srv.scheduler.RegisterEventHandler("message", srv.messageEventHandler())
+	srv.scheduler.srv = srv
+	srv.RegisterAction(&messageAction{srv: srv})
 
 	projectA := &store.Project{
 		ID: tid("sched-existing-a"), Name: "Project A", Slug: "sched-existing-a",
@@ -1302,11 +1347,18 @@ func TestC1_RecurringScheduleUpdate_ExistingPayloadDenied(t *testing.T) {
 	}
 	require.NoError(t, s.CreateSchedule(ctx, schedule))
 
-	// Update only the name — the existing payload should be re-validated.
-	updateRec := doRequest(t, srv, "PATCH", "/api/v1/projects/"+projectA.ID+"/schedules/"+schedule.ID,
+	// Name-only PATCH does not bump the revision and stays accepted (ptone/scion#8588).
+	nameRec := doRequest(t, srv, "PATCH", "/api/v1/projects/"+projectA.ID+"/schedules/"+schedule.ID,
 		UpdateScheduleRequest{Name: "updated-name"})
+	assert.Equal(t, http.StatusOK, nameRec.Code,
+		"name-only update stays accepted: %s", nameRec.Body.String())
+
+	// Dispatch-changing PATCH (cron change) re-validates the existing
+	// cross-project payload and denies with 403.
+	updateRec := doRequest(t, srv, "PATCH", "/api/v1/projects/"+projectA.ID+"/schedules/"+schedule.ID,
+		UpdateScheduleRequest{CronExpr: "30 * * * *"})
 	assert.Equal(t, http.StatusForbidden, updateRec.Code,
-		"update must re-validate existing cross-project payload: %s", updateRec.Body.String())
+		"dispatch-changing update must re-validate existing cross-project payload: %s", updateRec.Body.String())
 }
 
 func TestC1_AuthorizeScheduledMessageFire_DirectUnit(t *testing.T) {

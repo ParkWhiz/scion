@@ -24,6 +24,8 @@ type Decision struct {
 	ProjectID uuid.UUID `json:"project_id,omitempty"`
 	// ConversationID holds the value of the "conversation_id" field.
 	ConversationID *uuid.UUID `json:"conversation_id,omitempty"`
+	// ChatKey holds the value of the "chat_key" field.
+	ChatKey *string `json:"chat_key,omitempty"`
 	// MessageID holds the value of the "message_id" field.
 	MessageID uuid.UUID `json:"message_id,omitempty"`
 	// Position holds the value of the "position" field.
@@ -46,10 +48,20 @@ type Decision struct {
 	Choices []messages.Choice `json:"choices,omitempty"`
 	// DefaultChoiceID holds the value of the "default_choice_id" field.
 	DefaultChoiceID *string `json:"default_choice_id,omitempty"`
+	// AllowOther holds the value of the "allow_other" field.
+	AllowOther bool `json:"allow_other,omitempty"`
+	// OtherLabel holds the value of the "other_label" field.
+	OtherLabel *string `json:"other_label,omitempty"`
+	// OtherDescription holds the value of the "other_description" field.
+	OtherDescription *string `json:"other_description,omitempty"`
+	// OtherPlaceholder holds the value of the "other_placeholder" field.
+	OtherPlaceholder *string `json:"other_placeholder,omitempty"`
 	// IntroLength holds the value of the "intro_length" field.
 	IntroLength int `json:"intro_length,omitempty"`
 	// Status holds the value of the "status" field.
 	Status decision.Status `json:"status,omitempty"`
+	// Settled holds the value of the "settled" field.
+	Settled bool `json:"settled,omitempty"`
 	// ReplacedByID holds the value of the "replaced_by_id" field.
 	ReplacedByID *uuid.UUID `json:"replaced_by_id,omitempty"`
 	// CreatedAt holds the value of the "created_at" field.
@@ -57,7 +69,13 @@ type Decision struct {
 	// DecidedAt holds the value of the "decided_at" field.
 	DecidedAt *time.Time `json:"decided_at,omitempty"`
 	// ReplacedAt holds the value of the "replaced_at" field.
-	ReplacedAt   *time.Time `json:"replaced_at,omitempty"`
+	ReplacedAt *time.Time `json:"replaced_at,omitempty"`
+	// WithdrawnAt holds the value of the "withdrawn_at" field.
+	WithdrawnAt *time.Time `json:"withdrawn_at,omitempty"`
+	// WithdrawnReason holds the value of the "withdrawn_reason" field.
+	WithdrawnReason *string `json:"withdrawn_reason,omitempty"`
+	// DismissedAt holds the value of the "dismissed_at" field.
+	DismissedAt  *time.Time `json:"dismissed_at,omitempty"`
 	selectValues sql.SelectValues
 }
 
@@ -70,11 +88,13 @@ func (*Decision) scanValues(columns []string) ([]any, error) {
 			values[i] = &sql.NullScanner{S: new(uuid.UUID)}
 		case decision.FieldChoices:
 			values[i] = new([]byte)
+		case decision.FieldAllowOther, decision.FieldSettled:
+			values[i] = new(sql.NullBool)
 		case decision.FieldPosition, decision.FieldVersion, decision.FieldIntroLength:
 			values[i] = new(sql.NullInt64)
-		case decision.FieldAskerAgentName, decision.FieldKey, decision.FieldKeyNorm, decision.FieldKeySource, decision.FieldQuestion, decision.FieldDefaultChoiceID, decision.FieldStatus:
+		case decision.FieldChatKey, decision.FieldAskerAgentName, decision.FieldKey, decision.FieldKeyNorm, decision.FieldKeySource, decision.FieldQuestion, decision.FieldDefaultChoiceID, decision.FieldOtherLabel, decision.FieldOtherDescription, decision.FieldOtherPlaceholder, decision.FieldStatus, decision.FieldWithdrawnReason:
 			values[i] = new(sql.NullString)
-		case decision.FieldCreatedAt, decision.FieldDecidedAt, decision.FieldReplacedAt:
+		case decision.FieldCreatedAt, decision.FieldDecidedAt, decision.FieldReplacedAt, decision.FieldWithdrawnAt, decision.FieldDismissedAt:
 			values[i] = new(sql.NullTime)
 		case decision.FieldID, decision.FieldProjectID, decision.FieldMessageID, decision.FieldAskerAgentID:
 			values[i] = new(uuid.UUID)
@@ -111,6 +131,13 @@ func (_m *Decision) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.ConversationID = new(uuid.UUID)
 				*_m.ConversationID = *value.S.(*uuid.UUID)
+			}
+		case decision.FieldChatKey:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field chat_key", values[i])
+			} else if value.Valid {
+				_m.ChatKey = new(string)
+				*_m.ChatKey = value.String
 			}
 		case decision.FieldMessageID:
 			if value, ok := values[i].(*uuid.UUID); !ok {
@@ -181,6 +208,33 @@ func (_m *Decision) assignValues(columns []string, values []any) error {
 				_m.DefaultChoiceID = new(string)
 				*_m.DefaultChoiceID = value.String
 			}
+		case decision.FieldAllowOther:
+			if value, ok := values[i].(*sql.NullBool); !ok {
+				return fmt.Errorf("unexpected type %T for field allow_other", values[i])
+			} else if value.Valid {
+				_m.AllowOther = value.Bool
+			}
+		case decision.FieldOtherLabel:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field other_label", values[i])
+			} else if value.Valid {
+				_m.OtherLabel = new(string)
+				*_m.OtherLabel = value.String
+			}
+		case decision.FieldOtherDescription:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field other_description", values[i])
+			} else if value.Valid {
+				_m.OtherDescription = new(string)
+				*_m.OtherDescription = value.String
+			}
+		case decision.FieldOtherPlaceholder:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field other_placeholder", values[i])
+			} else if value.Valid {
+				_m.OtherPlaceholder = new(string)
+				*_m.OtherPlaceholder = value.String
+			}
 		case decision.FieldIntroLength:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
 				return fmt.Errorf("unexpected type %T for field intro_length", values[i])
@@ -192,6 +246,12 @@ func (_m *Decision) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field status", values[i])
 			} else if value.Valid {
 				_m.Status = decision.Status(value.String)
+			}
+		case decision.FieldSettled:
+			if value, ok := values[i].(*sql.NullBool); !ok {
+				return fmt.Errorf("unexpected type %T for field settled", values[i])
+			} else if value.Valid {
+				_m.Settled = value.Bool
 			}
 		case decision.FieldReplacedByID:
 			if value, ok := values[i].(*sql.NullScanner); !ok {
@@ -219,6 +279,27 @@ func (_m *Decision) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.ReplacedAt = new(time.Time)
 				*_m.ReplacedAt = value.Time
+			}
+		case decision.FieldWithdrawnAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field withdrawn_at", values[i])
+			} else if value.Valid {
+				_m.WithdrawnAt = new(time.Time)
+				*_m.WithdrawnAt = value.Time
+			}
+		case decision.FieldWithdrawnReason:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field withdrawn_reason", values[i])
+			} else if value.Valid {
+				_m.WithdrawnReason = new(string)
+				*_m.WithdrawnReason = value.String
+			}
+		case decision.FieldDismissedAt:
+			if value, ok := values[i].(*sql.NullTime); !ok {
+				return fmt.Errorf("unexpected type %T for field dismissed_at", values[i])
+			} else if value.Valid {
+				_m.DismissedAt = new(time.Time)
+				*_m.DismissedAt = value.Time
 			}
 		default:
 			_m.selectValues.Set(columns[i], values[i])
@@ -264,6 +345,11 @@ func (_m *Decision) String() string {
 		builder.WriteString(fmt.Sprintf("%v", *v))
 	}
 	builder.WriteString(", ")
+	if v := _m.ChatKey; v != nil {
+		builder.WriteString("chat_key=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
 	builder.WriteString("message_id=")
 	builder.WriteString(fmt.Sprintf("%v", _m.MessageID))
 	builder.WriteString(", ")
@@ -299,11 +385,32 @@ func (_m *Decision) String() string {
 		builder.WriteString(*v)
 	}
 	builder.WriteString(", ")
+	builder.WriteString("allow_other=")
+	builder.WriteString(fmt.Sprintf("%v", _m.AllowOther))
+	builder.WriteString(", ")
+	if v := _m.OtherLabel; v != nil {
+		builder.WriteString("other_label=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	if v := _m.OtherDescription; v != nil {
+		builder.WriteString("other_description=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	if v := _m.OtherPlaceholder; v != nil {
+		builder.WriteString("other_placeholder=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
 	builder.WriteString("intro_length=")
 	builder.WriteString(fmt.Sprintf("%v", _m.IntroLength))
 	builder.WriteString(", ")
 	builder.WriteString("status=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Status))
+	builder.WriteString(", ")
+	builder.WriteString("settled=")
+	builder.WriteString(fmt.Sprintf("%v", _m.Settled))
 	builder.WriteString(", ")
 	if v := _m.ReplacedByID; v != nil {
 		builder.WriteString("replaced_by_id=")
@@ -320,6 +427,21 @@ func (_m *Decision) String() string {
 	builder.WriteString(", ")
 	if v := _m.ReplacedAt; v != nil {
 		builder.WriteString("replaced_at=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.WithdrawnAt; v != nil {
+		builder.WriteString("withdrawn_at=")
+		builder.WriteString(v.Format(time.ANSIC))
+	}
+	builder.WriteString(", ")
+	if v := _m.WithdrawnReason; v != nil {
+		builder.WriteString("withdrawn_reason=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	if v := _m.DismissedAt; v != nil {
+		builder.WriteString("dismissed_at=")
 		builder.WriteString(v.Format(time.ANSIC))
 	}
 	builder.WriteByte(')')

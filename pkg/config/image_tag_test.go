@@ -151,16 +151,16 @@ func TestEffectiveImageTag(t *testing.T) {
 		// 1. a release build defaults to its own version
 		{"", "v1.0.0", "v1.0.0", false},
 		{"", "v0.3.0-preview.5", "v0.3.0-preview.5", false},
+		{"", "v0.4.0-preview.4", "v0.4.0-preview.4", false},
 		{"", "v0.3.0-rc.1", "v0.3.0-rc.1", false},
+		{"", "nightly-20261117", "nightly-20261117", false},
 		{"  ", "v1.0.0", "v1.0.0", false},
 		// 2. a dev or unversioned build keeps :latest (no change)
 		{"", "", "", false},
 		{"", "dev", "", false},
 		{"", "v0.3.0-dirty", "", false},
-		{"", "nightly-20261105", "", false},
 		{"", "v0.0.0-20261108002803-39f9e3d31e76", "", false},
 		{"", "v0.3.0+meta", "", false},
-		{"version", "nightly-20261105", "latest", false},
 		{"version", "dev", "latest", false},
 		{"version", "", "latest", false},
 		{"version", "v1+meta", "latest", false},
@@ -171,6 +171,7 @@ func TestEffectiveImageTag(t *testing.T) {
 		{" stable ", "", "stable", false},
 		{"version", "v0.3.0-preview.5", "v0.3.0-preview.5", false},
 		{"version", "v0.3.0-rc.2", "v0.3.0-rc.2", false},
+		{"version", "nightly-20261117", "nightly-20261117", false},
 		// invalid settings give no tag
 		{"bad tag", "v1.0.0", "", true},
 		{".hidden", "v1.0.0", "", true},
@@ -185,13 +186,20 @@ func TestEffectiveImageTag(t *testing.T) {
 
 // TestReleaseImageTag: only the release tag forms are release versions.
 func TestReleaseImageTag(t *testing.T) {
-	for _, v := range []string{"v0.3.0", "v1.2.3", "v0.3.0-preview.5", "v0.3.0-rc.1", "v10.0.0-preview.12"} {
+	for _, v := range []string{
+		"v0.3.0", "v1.0.0", "v1.2.3", "v0.3.0-preview.5", "v0.4.0-preview.4",
+		"v0.3.0-rc.1", "v10.0.0-preview.12", "nightly-20261105", "nightly-20261117",
+	} {
 		if got, ok := ReleaseImageTag(v); !ok || got != v {
 			t.Errorf("ReleaseImageTag(%q) = %q, %v; want %q, true", v, got, ok, v)
 		}
 	}
-	for _, v := range []string{"", "dev", "latest", "nightly-20261105", "0.3.0", "v0.3", "v0.3.0-dirty",
-		"v0.3.0+meta", "v0.3.0-rc1", "v0.3.0-preview", "v01.2.3", "v0.0.0-20261108002803-39f9e3d31e76", " v0.3.0"} {
+	for _, v := range []string{
+		"", "dev", "latest", "nightly", "nightly-", "nightly-2026111", "nightly-202611170",
+		"nightly-latest", "nightly-20261117.1", "0.3.0", "v0.3", "v0.3.0-dirty",
+		"v0.3.0+meta", "v0.3.0-rc1", "v0.3.0-preview", "v01.2.3",
+		"v0.0.0-20261108002803-39f9e3d31e76", " v0.3.0", " nightly-20261117",
+	} {
 		if got, ok := ReleaseImageTag(v); ok || got != "" {
 			t.Errorf("ReleaseImageTag(%q) = %q, %v; want \"\", false", v, got, ok)
 		}
@@ -409,6 +417,45 @@ func TestImageTagSettingPattern_MatchesSchemaAndValidator(t *testing.T) {
 	for _, v := range []string{"", "version", "latest", "v0.3.0-preview.5", "_x", strings.Repeat("a", 128), ".v1", "-v1", "v1:2", "v 1", strings.Repeat("a", 129), " v1 ", " ", "v1 "} {
 		if got, want := re.MatchString(v), ValidateImageTag(v) == nil; got != want {
 			t.Errorf("%q: pattern match %v, ValidateImageTag ok %v", v, got, want)
+		}
+	}
+}
+
+func TestImageBasename(t *testing.T) {
+	tests := []struct {
+		ref  string
+		want string
+	}{
+		{"", ""},
+		{"scion-claude:latest", "scion-claude:latest"},
+		{"org/scion-claude:latest", "scion-claude:latest"},
+		{"us-docker.pkg.dev/proj/repo/scion-claude:latest", "scion-claude:latest"},
+		{"localhost:5000/scion-claude:v1", "scion-claude:v1"},
+		{"ghcr.io/org/scion-claude@" + testDigest, "scion-claude@" + testDigest},
+	}
+	for _, tc := range tests {
+		if got := ImageBasename(tc.ref); got != tc.want {
+			t.Errorf("ImageBasename(%q) = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+}
+
+func TestIsShortFormImage(t *testing.T) {
+	tests := []struct {
+		ref  string
+		want bool
+	}{
+		{"", false},
+		{"scion-claude:latest", true},
+		{"scion-claude", true},
+		{"org/scion-claude:latest", true},
+		{"us-docker.pkg.dev/proj/repo/scion-claude:latest", false},
+		{"ghcr.io/org/scion-claude:v1", false},
+		{"localhost:5000/scion-claude:latest", false},
+	}
+	for _, tc := range tests {
+		if got := IsShortFormImage(tc.ref); got != tc.want {
+			t.Errorf("IsShortFormImage(%q) = %v, want %v", tc.ref, got, tc.want)
 		}
 	}
 }

@@ -1304,6 +1304,8 @@ func (b *DiscordBroker) handleInteractionCreate(s *discordgo.Session, i *discord
 	commands := b.commands
 	callbacks := b.callbacks
 	registration := b.registration
+	store := b.store
+	hubClient := b.hubClient
 	b.mu.RUnlock()
 
 	switch i.Type {
@@ -1385,9 +1387,8 @@ func (b *DiscordBroker) handleInteractionCreate(s *discordgo.Session, i *discord
 				},
 			})
 
-			store := b.store
 			go func() {
-				HandleModalSubmit(s, i, store, b.deliverInbound, b.log)
+				HandleModalSubmit(s, i, store, hubClient, b.deliverInbound, b.log)
 			}()
 		} else if strings.HasPrefix(data.CustomID, "secret:") {
 			if commands == nil {
@@ -2380,12 +2381,12 @@ func (b *DiscordBroker) ownsWebhook(channelID, webhookID string) bool {
 }
 
 // defaultAgentApplies reports whether an unaddressed message would go to
-// the channel's default agent. It does not use the agent list. On the
-// routed path any text that is not a command, or an attachment, counts
-// when a default is set: the hub decides the routing. On the legacy path
-// the message needs text that is not a command and must not mention
-// another Discord user; a leading @name counts because the default agent
-// receives it either as the implicit primary or as the fallback.
+// the channel's default agent. It does not use the agent list. Any text
+// that is not a command, or an attachment, counts when a default is set.
+// On the routed path the hub decides the routing; on the legacy path the
+// message also must not mention another Discord user, and a leading @name
+// counts because the default agent receives it either as the implicit
+// primary or as the fallback.
 func defaultAgentApplies(m *discordgo.MessageCreate, botUserID, effectiveDefault string, routed bool) bool {
 	if effectiveDefault == "" {
 		return false
@@ -2394,10 +2395,10 @@ func defaultAgentApplies(m *discordgo.MessageCreate, botUserID, effectiveDefault
 	if strings.HasPrefix(text, "/") {
 		return false
 	}
-	if routed {
-		return text != "" || len(m.Attachments) > 0
+	if text == "" && len(m.Attachments) == 0 {
+		return false
 	}
-	return text != "" && !hasNonBotMentions(m.Message, botUserID)
+	return routed || !hasNonBotMentions(m.Message, botUserID)
 }
 
 // --- Routing helpers ---

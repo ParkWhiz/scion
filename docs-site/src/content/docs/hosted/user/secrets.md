@@ -100,6 +100,28 @@ This applies to Hub-scoped secrets only. Hub-scoped environment variables (`scio
 
 An agent reading Hub-scoped secrets (`GET /api/v1/secrets?scope=hub`, `GET /api/v1/env?scope=hub` and their single-key routes) sees only the `environment` secrets with the `always` mode. Every other Hub-scoped secret, including the telemetry credential file, is left out of those lists, and a request for it by name answers as for a key that does not exist. Hub administrators see every Hub-scoped secret.
 
+### Agent-Scoped Secrets
+
+:::note[Experimental]
+Agent-scoped secrets require the `hub.agent_secrets` [experiment](/scion/reference/experiments/), which is off by default. While it is off, the Hub rejects the `agent` scope with `400 invalid scope: agent` and delivers no agent-scoped secrets.
+:::
+
+An agent-scoped secret belongs to a single agent. Only that agent receives it at start and restart, and only that agent can read its value at runtime. When the experiment is on, it takes precedence over a secret of the same name at Runtime Broker, Hub, Project or User scope (`runtime_broker < hub < project < user < agent`), and it is deleted when the agent is hard-deleted or purged. The scope exists for secrets only; environment variables cannot be agent-scoped.
+
+- **You** set, list, update and clear an agent's secrets with `scion hub secret --agent <name|id>` (or on the agent's **Secrets** tab in the Web UI). Listing and reading metadata need read access to the agent, and writing or clearing needs update access. As at every scope, values are never returned to you.
+- **The agent** stores and removes its own agent-scoped secrets with `sciontool secret set --scope agent` and `sciontool secret delete --scope agent` (see [Writing secrets with `sciontool`](#writing-secrets-with-sciontool)), and reads them with `scion secret get --value`. An agent cannot read or write another agent's agent-scoped secrets.
+
+```bash
+# Store a secret for one agent (a name is resolved in the current project)
+printf %s "$TOKEN" | scion hub secret set --agent my-agent API_TOKEN -
+
+# List that agent's secrets (metadata only)
+scion hub secret list --agent my-agent
+
+# Remove it
+scion hub secret clear --agent my-agent API_TOKEN
+```
+
 ---
 ## Injection Modes
 
@@ -298,7 +320,7 @@ From inside an agent container, read secrets with `scion secret`. The calls are 
     # Set a user-scoped (personal) secret
     sciontool secret set MY_PERSONAL_TOKEN "token-xyz" --scope user
     ```
-    *Note: `--scope` accepts `project` (default) or `user`.*
+    *Note: `--scope` accepts `project` (default), `user`, or `agent`. `--scope agent` stores a secret private to the calling agent and needs the `hub.agent_secrets` experiment; the agent removes it with `sciontool secret delete KEY --scope agent`. See [Agent-Scoped Secrets](#agent-scoped-secrets).*
 
     *Hub admins can restrict agents to writing user (profile) scope only. If the "Restrict
     agent-written secrets to profile scope" setting is on (Admin > Server Config), a project-scope
@@ -435,6 +457,7 @@ Under the hood, `scion secret` and `sciontool` interact with the Hub's agent-spe
 #### Security & Audit Logging
 *   **Authentication**: API access is restricted to the running agent container. The agent must include its unique Hub-issued JWT (loaded from `SCION_HUB_TOKEN`) in the `Authorization: Bearer <token>` header of every request.
 *   **Authorization**: Agents are strictly bounded to their own project's secrets. They can also access user-scoped (personal) secrets belonging to their originating user (the user who kicked off the agent chain), which are resolved on the Hub via the agent JWT's `OriginUserID` (the user who originally started the agent chain). Agents cannot access secrets in other projects, other users' secrets, or global Hub secrets unless explicitly shared via progeny policies (descendant access).
+*   **Project Secret Metadata Needs `project:secret:read`**: An agent reads project secret metadata only when its token carries `project:secret:read` (the `full` [agent role](/scion/hosted/ha/permissions/#tiered-agent-authorization-roles)). Otherwise `GET /api/v1/secrets` and `GET /api/v1/secrets/{key}` with `scope=project`, and `GET /api/v1/projects/{id}/secrets` and `GET /api/v1/projects/{id}/secrets/{key}`, answer `403`, as `GET /api/v1/agents/{agentID}/secrets` already does. Project environment variable reads leave out environment-type secrets and any plain variable that a secret with the same key overrides (a single-key read of one answers `404`). Hub-scope reads and user callers are not affected.
 *   **Fail-Closed Reads & Start-Time Resolution**: Both start-time secret delivery (create, start, restart, resume, and `as_needed` resolution) and every runtime secret read go through one check sequence: project permission, then an originating user who is still active and either an active member of the project (any active project role binding counts, built-in or custom, direct or through a group, except `project-visitor`) or holds system-level authority for the exact `secret.use` permission, then progeny sharing. For an agent whose delegation chain carries recorded delegation provenance, a user-scoped secret shared with progeny is also bounded by that chain at both start time and runtime: every recorded delegation on the chain must allow secret use (`secret.use`), every agent on the chain must be live and hold `project:secret:read`, and the user at the root of the chain must be the secret's owner and recorded author, active, admitted to the project and not restricted from `secret.use` by an access constraint (if a user-scoped secret is withheld at start by this check, a lower-precedence project, broker, or hub secret with the same key still applies). An agent whose chain has no recorded provenance is withheld these secrets at start and refused them at runtime (see the next item). The agent secret list applies the same rule, so it lists a user-scoped key exactly when a read of that key would return it. Membership alone does not grant reads: the project permission check (`project.secret_read`) still applies. A value is fetched only for the version recorded in the secret's metadata. If a value cannot be retrieved, that key is reported as unavailable in the response rather than returned as an empty value; other keys in the same request are unaffected. When the Hub itself cannot resolve an agent's secrets, or cannot read its stored environment settings, create, start, restart, resume and waking an agent for a direct message answer `503` (`agent secrets could not be resolved; the agent was not started`, `... not created` for a create, or the environment settings equivalent) instead of starting the agent without them: a start leaves the agent as it was, a restart (which stops the agent first) leaves it stopped, and a failed create is rolled back. A provision-only create still succeeds, and the agent's later start fails closed. A reincarnation answers `202` and then fails at its start leg; it is recorded as failed with the same message and the previous config is restored. The message names no secret or value. Having no secrets or settings is not an error.
 *   **Chains Without Recorded Provenance**: An agent whose delegation chain is not recorded (no recorded delegation of its own, the backfill's migration edge, an edge without recorded provenance, more than one active edge, or such a hop anywhere above it) cannot have that chain evaluated. Its owner's user-scoped secrets shared with progeny are withheld at create, start, resume, restart and `as_needed` resolution, and runtime reads and lists of them are refused (`chain_unrecorded`). A refused read answers exactly as a read of a key that does not exist (`404`, `secret not found`), and a refused list returns no user-scoped keys. The Hub logs one rate-limited `Warn` per agent and counts each start-time withhold as `scion.hub.user_material.owner_chain` with `outcome=withheld` and `reason=chain_unrecorded`. An agent with no stored ancestry is no exception: it keeps its owner's shared secrets at start only when its chain is recorded and ends at the owner; otherwise they are withheld and counted with the chain's reason (for example `chain_unrecorded`, `terminal_user_not_owner` or `chain_lookup_error`). The Hub's check for a template's required keys before a start, and the environment gather, treat a secret withheld this way as missing, so the gather prompts for it instead of reporting it as stored. A reincarnate that leaves the chain unrecorded above the agent warns about it in its plan. To restore the agent, its owner reincarnates it from a CLI session (`scion reincarnate <agent>`, keeping its role) or re-creates it. The `runtime read` section of `hack/delivery-census` lists the affected agents with where their chain stops and the names (never values) of the refused secrets; like the rest of its output, it is operator-only.
 *   **Audit Trail**: To ensure accountability, every runtime read and write operation is fully audited on the Hub. Each retrieval request logs one audit event (`agent_secret_read`) identifying the calling agent, the requested keys, and the outcome.
@@ -548,6 +571,7 @@ Other scopes use the same names, read from their own credentials only:
 | :--- | :--- |
 | Global scope (Hub-level) | Hub-scope `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN`. There is no GitHub App step: App installations belong to projects. |
 | User scope | Your own user-scope `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN`. An import uses them only when you are the user it imports for, never for another user. |
+| `scion templates import-url` | Runs on the Hub (`POST /api/v1/resources/import`) and uses the target scope's Hub secrets in the same order above (project, global, or user). No GitHub token is sent from the CLI. |
 | `scion harness-config install` and `scion templates import` | The `GH_{OWNER}__{REPO}`, `GH_{OWNER}`, then `GITHUB_TOKEN` environment variables of the shell running the CLI. The CLI fetches the source itself. |
 
 In every scope the first match wins, and with no match the fetch is unauthenticated, which works for public repos only. A global or user-scope import never reads project credentials.
@@ -555,6 +579,8 @@ In every scope the first match wins, and with no match the fetch is unauthentica
 Reimporting an existing template (`POST /api/v1/templates/{id}/reimport`) uses the same lookup order for the template's own scope: a project template's project credentials and App token, a global template's Hub credentials, and a user template's credentials only when you are that user. With a credential, the Hub requests the archive from `api.github.com`. When an import runs `git` instead (`git ls-remote` to resolve a branch name that contains `/`, or a sparse checkout when the archive download fails), the credential reaches `git` only through a credential helper scoped to `https://github.com`, with terminal prompts off (and `GIT_LFS_SKIP_SMUDGE=1` for the checkout); it is never put in the repository URL. `git` offers no credential of the Hub host's own (its git config, `~/.netrc`, ssh or Kerberos credentials), so without a credential it runs anonymously. The CLI's own imports work the same way.
 
 Only GitHub folder URLs use a credential. Archive URLs (`.tar.gz`, `.tgz`, `.zip`, including `github.com/.../archive/...` links), rclone sources and other hosts are always fetched without one.
+
+On a hosted Hub, archive URLs that redirect (for example `github.com/.../archive/...` links and release assets) are refused; give the final URL.
 
 ### Injection Mode Behavior
 

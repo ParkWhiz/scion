@@ -38,6 +38,8 @@ type AccessSettings struct {
 type LifecycleSettings struct {
 	AutoSuspendStalled         *bool  `json:"auto_suspend_stalled,omitempty"`
 	StalledThreshold           string `json:"stalled_threshold,omitempty"`
+	AutoSuspendIdle            *bool  `json:"auto_suspend_idle,omitempty"`
+	IdleSuspendAfter           string `json:"idle_suspend_after,omitempty"`
 	SoftDeleteRetention        string `json:"soft_delete_retention,omitempty"`
 	SoftDeleteRetainFiles      *bool  `json:"soft_delete_retain_files,omitempty"`
 	StartClaimLeaseTTL         string `json:"start_claim_lease_ttl,omitempty"`
@@ -112,11 +114,13 @@ type EndpointsSettings struct {
 // GitHubAppSettings holds the Layer-1 GitHub App configuration.
 // Secret material (private_key, webhook_secret) is excluded — stays in secret backend.
 type GitHubAppSettings struct {
-	AppID           int64  `json:"app_id,omitempty"`
-	APIBaseURL      string `json:"api_base_url,omitempty"`
-	WebhooksEnabled *bool  `json:"webhooks_enabled,omitempty"`
-	InstallationURL string `json:"installation_url,omitempty"`
-	PrivateKeyPath  string `json:"private_key_path,omitempty"`
+	AppID                 int64    `json:"app_id,omitempty"`
+	APIBaseURL            string   `json:"api_base_url,omitempty"`
+	WebhooksEnabled       *bool    `json:"webhooks_enabled,omitempty"`
+	InstallationURL       string   `json:"installation_url,omitempty"`
+	PrivateKeyPath        string   `json:"private_key_path,omitempty"`
+	AppSlug               string   `json:"app_slug,omitempty"`
+	CommandMentionAliases []string `json:"command_mention_aliases,omitempty"`
 }
 
 // NotificationsSettings holds the Layer-1 notification channel configuration.
@@ -461,6 +465,15 @@ type AgentSecretsSettings struct {
 	UserScopeOnly *bool `json:"user_scope_only,omitempty" koanf:"user_scope_only"`
 }
 
+// BrokerPolicySettings holds Layer-1 hub policy for Runtime Brokers
+// (ptone/scion#7829). AdminManagedOnly is nil when unset (default false).
+type BrokerPolicySettings struct {
+	// AdminManagedOnly, when true (and experiment hub.admin_managed_brokers is
+	// enabled), restricts Runtime Broker registration, attachment, placement,
+	// and agent starts to admin-managed brokers.
+	AdminManagedOnly *bool `json:"admin_managed_only,omitempty" koanf:"admin_managed_only"`
+}
+
 // MessagingSettings holds Layer-1 messaging configuration.
 // DB-only (runtime state), no settings.yaml representation.
 //
@@ -552,4 +565,67 @@ func ParseExperimentsDoc(raw json.RawMessage) (doc ExperimentsSettings, malforme
 		return ExperimentsSettings{}, true
 	}
 	return doc, false
+}
+
+// BrandingSectionName is the Layer-1 opsettings section name for server.hub.branding.
+const BrandingSectionName = "branding"
+
+// BrandingSettings holds Layer-1 Hub-wide UI branding configuration
+// (server.hub.branding). It embeds config.BrandingConfig to preserve full
+// fidelity across settings.yaml, koanf, and the hub_settings DB store.
+type BrandingSettings struct {
+	config.BrandingConfig
+}
+
+// BrandingKoanfPaths lists every koanf path owned by the "branding" section.
+var BrandingKoanfPaths = []string{
+	"server.hub.branding",
+	"server.hub.branding.name",
+	"server.hub.branding.short_name",
+	"server.hub.branding.subtitle",
+	"server.hub.branding.attribution",
+	"server.hub.branding.corners",
+	"server.hub.branding.font_sans",
+	"server.hub.branding.logo",
+	"server.hub.branding.logo.light",
+	"server.hub.branding.logo.dark",
+	"server.hub.branding.icons",
+	"server.hub.branding.icons.favicon",
+	"server.hub.branding.icons.apple_touch_icon",
+	"server.hub.branding.icons.icon_192",
+	"server.hub.branding.icons.icon_512",
+	"server.hub.branding.icons.icon_maskable_512",
+	"server.hub.branding.accent_color",
+	"server.hub.branding.palette",
+	"server.hub.branding.palette.primary",
+	"server.hub.branding.palette.neutral",
+	"server.hub.branding.palette.success",
+	"server.hub.branding.palette.warning",
+	"server.hub.branding.palette.danger",
+	"server.hub.branding.palette.light",
+	"server.hub.branding.palette.light.bg",
+	"server.hub.branding.palette.light.bg_subtle",
+	"server.hub.branding.palette.light.surface",
+	"server.hub.branding.palette.light.surface_raised",
+	"server.hub.branding.palette.light.text",
+	"server.hub.branding.palette.light.text_secondary",
+	"server.hub.branding.palette.light.text_muted",
+	"server.hub.branding.palette.light.border",
+	"server.hub.branding.palette.light.primary",
+	"server.hub.branding.palette.light.primary_hover",
+	"server.hub.branding.palette.light.primary_active",
+	"server.hub.branding.palette.light.primary_text",
+	"server.hub.branding.palette.dark",
+	"server.hub.branding.palette.dark.bg",
+	"server.hub.branding.palette.dark.bg_subtle",
+	"server.hub.branding.palette.dark.surface",
+	"server.hub.branding.palette.dark.surface_raised",
+	"server.hub.branding.palette.dark.text",
+	"server.hub.branding.palette.dark.text_secondary",
+	"server.hub.branding.palette.dark.text_muted",
+	"server.hub.branding.palette.dark.border",
+	"server.hub.branding.palette.dark.primary",
+	"server.hub.branding.palette.dark.primary_hover",
+	"server.hub.branding.palette.dark.primary_active",
+	"server.hub.branding.palette.dark.primary_text",
 }

@@ -299,6 +299,26 @@ func (_u *RuntimeBrokerUpdate) ClearHealth() *RuntimeBrokerUpdate {
 	return _u
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (_u *RuntimeBrokerUpdate) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpdate {
+	_u.mutation.SetWorkloadIdentityTargets(v)
+	return _u
+}
+
+// SetNillableWorkloadIdentityTargets sets the "workload_identity_targets" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdate) SetNillableWorkloadIdentityTargets(v *string) *RuntimeBrokerUpdate {
+	if v != nil {
+		_u.SetWorkloadIdentityTargets(*v)
+	}
+	return _u
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (_u *RuntimeBrokerUpdate) ClearWorkloadIdentityTargets() *RuntimeBrokerUpdate {
+	_u.mutation.ClearWorkloadIdentityTargets()
+	return _u
+}
+
 // SetLabels sets the "labels" field.
 func (_u *RuntimeBrokerUpdate) SetLabels(v map[string]string) *RuntimeBrokerUpdate {
 	_u.mutation.SetLabels(v)
@@ -373,6 +393,20 @@ func (_u *RuntimeBrokerUpdate) SetAutoProvide(v bool) *RuntimeBrokerUpdate {
 func (_u *RuntimeBrokerUpdate) SetNillableAutoProvide(v *bool) *RuntimeBrokerUpdate {
 	if v != nil {
 		_u.SetAutoProvide(*v)
+	}
+	return _u
+}
+
+// SetAdminManaged sets the "admin_managed" field.
+func (_u *RuntimeBrokerUpdate) SetAdminManaged(v bool) *RuntimeBrokerUpdate {
+	_u.mutation.SetAdminManaged(v)
+	return _u
+}
+
+// SetNillableAdminManaged sets the "admin_managed" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdate) SetNillableAdminManaged(v *bool) *RuntimeBrokerUpdate {
+	if v != nil {
+		_u.SetAdminManaged(*v)
 	}
 	return _u
 }
@@ -960,6 +994,12 @@ func (_u *RuntimeBrokerUpdate) sqlSave(ctx context.Context) (_node int, err erro
 	if _u.mutation.HealthCleared() {
 		_spec.ClearField(runtimebroker.FieldHealth, field.TypeString)
 	}
+	if value, ok := _u.mutation.WorkloadIdentityTargets(); ok {
+		_spec.SetField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString, value)
+	}
+	if _u.mutation.WorkloadIdentityTargetsCleared() {
+		_spec.ClearField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString)
+	}
 	if value, ok := _u.mutation.Labels(); ok {
 		_spec.SetField(runtimebroker.FieldLabels, field.TypeJSON, value)
 	}
@@ -986,6 +1026,9 @@ func (_u *RuntimeBrokerUpdate) sqlSave(ctx context.Context) (_node int, err erro
 	}
 	if value, ok := _u.mutation.AutoProvide(); ok {
 		_spec.SetField(runtimebroker.FieldAutoProvide, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.AdminManaged(); ok {
+		_spec.SetField(runtimebroker.FieldAdminManaged, field.TypeBool, value)
 	}
 	if value, ok := _u.mutation.GcpHostServiceAccountEmail(); ok {
 		_spec.SetField(runtimebroker.FieldGcpHostServiceAccountEmail, field.TypeString, value)
@@ -1413,6 +1456,26 @@ func (_u *RuntimeBrokerUpdateOne) ClearHealth() *RuntimeBrokerUpdateOne {
 	return _u
 }
 
+// SetWorkloadIdentityTargets sets the "workload_identity_targets" field.
+func (_u *RuntimeBrokerUpdateOne) SetWorkloadIdentityTargets(v string) *RuntimeBrokerUpdateOne {
+	_u.mutation.SetWorkloadIdentityTargets(v)
+	return _u
+}
+
+// SetNillableWorkloadIdentityTargets sets the "workload_identity_targets" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdateOne) SetNillableWorkloadIdentityTargets(v *string) *RuntimeBrokerUpdateOne {
+	if v != nil {
+		_u.SetWorkloadIdentityTargets(*v)
+	}
+	return _u
+}
+
+// ClearWorkloadIdentityTargets clears the value of the "workload_identity_targets" field.
+func (_u *RuntimeBrokerUpdateOne) ClearWorkloadIdentityTargets() *RuntimeBrokerUpdateOne {
+	_u.mutation.ClearWorkloadIdentityTargets()
+	return _u
+}
+
 // SetLabels sets the "labels" field.
 func (_u *RuntimeBrokerUpdateOne) SetLabels(v map[string]string) *RuntimeBrokerUpdateOne {
 	_u.mutation.SetLabels(v)
@@ -1487,6 +1550,20 @@ func (_u *RuntimeBrokerUpdateOne) SetAutoProvide(v bool) *RuntimeBrokerUpdateOne
 func (_u *RuntimeBrokerUpdateOne) SetNillableAutoProvide(v *bool) *RuntimeBrokerUpdateOne {
 	if v != nil {
 		_u.SetAutoProvide(*v)
+	}
+	return _u
+}
+
+// SetAdminManaged sets the "admin_managed" field.
+func (_u *RuntimeBrokerUpdateOne) SetAdminManaged(v bool) *RuntimeBrokerUpdateOne {
+	_u.mutation.SetAdminManaged(v)
+	return _u
+}
+
+// SetNillableAdminManaged sets the "admin_managed" field if the given value is not nil.
+func (_u *RuntimeBrokerUpdateOne) SetNillableAdminManaged(v *bool) *RuntimeBrokerUpdateOne {
+	if v != nil {
+		_u.SetAdminManaged(*v)
 	}
 	return _u
 }
@@ -2104,6 +2181,12 @@ func (_u *RuntimeBrokerUpdateOne) sqlSave(ctx context.Context) (_node *RuntimeBr
 	if _u.mutation.HealthCleared() {
 		_spec.ClearField(runtimebroker.FieldHealth, field.TypeString)
 	}
+	if value, ok := _u.mutation.WorkloadIdentityTargets(); ok {
+		_spec.SetField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString, value)
+	}
+	if _u.mutation.WorkloadIdentityTargetsCleared() {
+		_spec.ClearField(runtimebroker.FieldWorkloadIdentityTargets, field.TypeString)
+	}
 	if value, ok := _u.mutation.Labels(); ok {
 		_spec.SetField(runtimebroker.FieldLabels, field.TypeJSON, value)
 	}
@@ -2130,6 +2213,9 @@ func (_u *RuntimeBrokerUpdateOne) sqlSave(ctx context.Context) (_node *RuntimeBr
 	}
 	if value, ok := _u.mutation.AutoProvide(); ok {
 		_spec.SetField(runtimebroker.FieldAutoProvide, field.TypeBool, value)
+	}
+	if value, ok := _u.mutation.AdminManaged(); ok {
+		_spec.SetField(runtimebroker.FieldAdminManaged, field.TypeBool, value)
 	}
 	if value, ok := _u.mutation.GcpHostServiceAccountEmail(); ok {
 		_spec.SetField(runtimebroker.FieldGcpHostServiceAccountEmail, field.TypeString, value)

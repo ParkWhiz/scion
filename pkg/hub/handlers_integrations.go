@@ -55,7 +55,7 @@ var pluginBrokerNS = uuid.MustParse("5c104390-a1d0-5e9a-9b1e-5c104390a1d0")
 // the cached-config carry-over (the live hub values override them), and
 // filterSensitiveConfig omits them from integration settings responses.
 var hubKeys = map[string]bool{
-	"hub_url": true, "broker_id": true, "hmac_key": true,
+	"hub_url": true, "public_url": true, "broker_id": true, "hmac_key": true,
 	"plugin_name": true, "project_slug_map": true,
 	"transport_mode": true, "transport_audience": true,
 	"database_driver": true, "database_url": true,
@@ -64,6 +64,7 @@ var hubKeys = map[string]bool{
 var reconfigureRuntimeKeys = map[string]bool{
 	"config_file":      true,
 	"hub_url":          true,
+	"public_url":       true,
 	"hmac_key":         true,
 	"broker_id":        true,
 	"plugin_name":      true,
@@ -96,7 +97,7 @@ type IntegrationManager interface {
 	Reconnect(pluginType, name string) error
 	BrokerHealthCheck(name string) (status, message string, details map[string]string, err error)
 	BrokerInfo(name string) (version, channelID string, capabilities []string, err error)
-	UpdatePlugin(name string, repoPath string) error
+	UpdatePlugin(name string, repoPath string) (plugin.UpdateResult, error)
 	InstallPlugin(name, repoPath, pluginsDir, configFile string) error
 	LoadOne(pluginType, name string, entry plugin.PluginEntry, pluginsDir string) error
 	GetBroker(name string) (eventbus.EventBus, error)
@@ -848,7 +849,17 @@ func (s *Server) handleUpdateIntegration(w http.ResponseWriter, r *http.Request,
 		// Non-fatal — continue with the update.
 	}
 
-	if err := mgr.UpdatePlugin(name, repoPath); err != nil {
+	updateRes, err := mgr.UpdatePlugin(name, repoPath)
+	if err != nil {
+		var permErr *plugin.PermissionError
+		if errors.As(err, &permErr) {
+			slog.Warn("Failed to update integration due to permissions", "plugin", name, "binary", permErr.BinaryPath, "error", err)
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeUnprocessable,
+				permErr.UserMessage(), map[string]interface{}{
+					"guidance": permErr.Guidance(repoPath),
+				})
+			return
+		}
 		slog.Error("Failed to update integration", "plugin", name, "error", err)
 		InternalError(w)
 		return
@@ -859,8 +870,22 @@ func (s *Server) handleUpdateIntegration(w http.ResponseWriter, r *http.Request,
 	}
 
 	resp := map[string]interface{}{"status": "ok"}
+	var warnings []string
+	if updateRes.Relocated {
+		slog.Warn("Integration binary relocated during update",
+			"plugin", name, "previous_binary", updateRes.PreviousPath, "binary", updateRes.BinaryPath)
+		resp["relocated_from"] = updateRes.PreviousPath
+		resp["binary_path"] = updateRes.BinaryPath
+		warnings = append(warnings, fmt.Sprintf(
+			"plugin %q binary in %s could not be overwritten; installed updated binary to %s (stale copy at %s was left untouched)",
+			name, filepath.Dir(updateRes.PreviousPath), updateRes.BinaryPath, updateRes.PreviousPath,
+		))
+	}
 	if err := s.refreshBrokerSpoke(mgr, name); err != nil { // also logged inside
-		resp["warnings"] = []string{fmt.Sprintf("plugin %q updated, but its message routing was not fully restored: %v", name, err)}
+		warnings = append(warnings, fmt.Sprintf("plugin %q updated, but its message routing was not fully restored: %v", name, err))
+	}
+	if len(warnings) > 0 {
+		resp["warnings"] = warnings
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -985,8 +1010,7 @@ func (s *Server) handleInstallIntegration(w http.ResponseWriter, r *http.Request
 		// Config file and settings.yaml were written above — no build needed.
 		slog.Info("Plugin binary found on PATH, skipping build", "plugin", name, "binary", binaryName)
 
-		binaryPath, _ := exec.LookPath(binaryName)
-		if err := mgr.LoadOne(plugin.PluginTypeBroker, name, plugin.PluginEntry{Path: binaryPath, ConfigFile: configFilePath}, pluginsDir); err != nil {
+		if err := mgr.LoadOne(plugin.PluginTypeBroker, name, plugin.PluginEntry{ConfigFile: configFilePath}, pluginsDir); err != nil {
 			// LoadOne failing due to missing required config (e.g. bot_token) is
 			// expected on first install — the plugin is installed but not yet
 			// configured. Log a warning and continue; the operator must configure
@@ -1630,17 +1654,25 @@ var errPluginBrokerRow = errors.New("plugin broker row")
 
 // ensurePluginBroker creates the runtime broker row for the named broker
 // plugin when it does not exist, with the same fields server startup
-// (cmd/server_foreground.go) uses. A plugin activated or reconfigured
-// without a restart, or whose row was deleted, then has the live row its
-// HMAC secret authenticates against. It reports a failed look-up (other
-// than not found) or create (other than already exists), wrapping
-// errPluginBrokerRow.
+// (cmd/server_foreground.go) uses, and verifies that an existing row at the
+// deterministic UUIDv5 actually belongs to this plugin
+// (Labels[pluginBrokerLabel] == name) so a pre-registered non-plugin row can
+// never be adopted (ptone/scion#7625).
+// A plugin activated or reconfigured without a restart, or whose row was
+// deleted, then has the live row its HMAC secret authenticates against. It
+// reports a failed look-up (other than not found), label mismatch, or create
+// (other than already exists with matching label), wrapping errPluginBrokerRow.
 func (s *Server) ensurePluginBroker(ctx context.Context, name, brokerID string) error {
 	if s.store == nil {
 		return nil
 	}
-	_, err := s.store.GetRuntimeBroker(ctx, brokerID)
+	existing, err := s.store.GetRuntimeBroker(ctx, brokerID)
 	if err == nil {
+		if existing.Labels[pluginBrokerLabel] != name {
+			slog.WarnContext(ctx, "Refusing non-plugin broker row at deterministic plugin broker ID",
+				"plugin", name, "brokerId", brokerID)
+			return fmt.Errorf("%w label mismatch", errPluginBrokerRow)
+		}
 		return nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
@@ -1659,9 +1691,17 @@ func (s *Server) ensurePluginBroker(ctx context.Context, name, brokerID string) 
 		Created:         now,
 		Updated:         now,
 	}
-	if err := s.store.CreateRuntimeBrokerClearingCredentials(ctx, b); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-		slog.WarnContext(ctx, "Failed to create plugin broker row", "plugin", name, "brokerId", brokerID)
-		return fmt.Errorf("%w create failed", errPluginBrokerRow)
+	if err := s.store.CreateRuntimeBrokerClearingCredentials(ctx, b); err != nil {
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			slog.WarnContext(ctx, "Failed to create plugin broker row", "plugin", name, "brokerId", brokerID)
+			return fmt.Errorf("%w create failed", errPluginBrokerRow)
+		}
+		reread, rerr := s.store.GetRuntimeBroker(ctx, brokerID)
+		if rerr != nil || reread.Labels[pluginBrokerLabel] != name {
+			slog.WarnContext(ctx, "Refusing concurrent non-plugin broker row at deterministic plugin broker ID",
+				"plugin", name, "brokerId", brokerID)
+			return fmt.Errorf("%w label mismatch", errPluginBrokerRow)
+		}
 	}
 	return nil
 }
@@ -1683,9 +1723,14 @@ func (s *Server) getPluginHubCredsChecked(ctx context.Context, name string) (map
 	var credsErr error
 	creds := make(map[string]string)
 
-	// hub_url: from the server config (same value that startup resolves).
-	if hubURL := s.HubEndpointFor(HubEndpointForPluginBrokers); hubURL != "" {
+	// hub_url and public_url: from the server config (the same values that
+	// startup resolves; see PluginHubURLs).
+	hubURL, publicURL := s.PluginHubURLs()
+	if hubURL != "" {
 		creds["hub_url"] = hubURL
+	}
+	if publicURL != "" {
+		creds["public_url"] = publicURL
 	}
 
 	// broker_id: deterministic UUIDv5 — same namespace and seed as startup.
@@ -1693,10 +1738,20 @@ func (s *Server) getPluginHubCredsChecked(ctx context.Context, name string) (map
 	brokerID := uuid.NewSHA1(pluginBrokerNS, []byte(legacyID)).String()
 	creds["broker_id"] = brokerID
 
-	// hmac_key: from BrokerAuthService (idempotent — returns existing key).
-	// A broker secret authenticates only a live broker row, so the plugin's
-	// row is ensured first, as startup does; without a confirmed row no
-	// secret is generated or rotated.
+	// hmac_key: from BrokerAuthService (idempotent — returns existing key;
+	// audited in ptone/scion#7625). Intentionally retains GenerateAndStoreSecret:
+	//   1. getPluginHubCredsChecked is called mid-session during live
+	//      reconfiguration, restart, activation, and supervisor reconnects
+	//      (including self-managed standalone bridges dialed across Hub
+	//      replicas that share one hmac_key), before ReplaceBrokerConfig or
+	//      RestartBrokerPlugin pushes the merged config; rotating here would
+	//      desynchronize replicas or brick a running plugin if the RPC push
+	//      subsequently failed.
+	//   2. Pre-registered non-plugin rows and orphaned secrets are prevented
+	//      because both server startup (provisionInProcessPluginBrokerSecret)
+	//      and ensurePluginBroker verify Labels[pluginBrokerLabel] == name, and
+	//      row creation clears orphaned credentials via
+	//      CreateRuntimeBrokerClearingCredentials.
 	if authSvc := s.GetBrokerAuthService(); authSvc != nil {
 		if err := s.ensurePluginBroker(ctx, name, brokerID); err != nil {
 			credsErr = fmt.Errorf("hmac key: %w", err)
@@ -1782,10 +1837,16 @@ func (s *Server) resolveIntegrationMergedConfigChecked(ctx context.Context, mgr 
 	// manager's boot-resolved map as "inline" config, because it contains
 	// the file's own keys and would trigger spurious deprecation warnings (B2).
 	// When no config file exists, pass the manager map as inline config so
-	// that inline-only deployments retain their configuration keys.
+	// that inline-only deployments retain their configuration keys, but drop
+	// hub-supplied keys so they come only from live hub state below.
 	var inlineToPass map[string]string
-	if configFile == "" {
-		inlineToPass = pluginCfg
+	if configFile == "" && len(pluginCfg) > 0 {
+		inlineToPass = make(map[string]string, len(pluginCfg))
+		for k, v := range pluginCfg {
+			if !hubKeys[k] {
+				inlineToPass[k] = v
+			}
+		}
 	}
 	merged, err := config.ResolvePluginConfig(configFile, inlineToPass)
 	if err != nil {

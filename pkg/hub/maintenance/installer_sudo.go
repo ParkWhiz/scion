@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
 )
 
 // SudoStagingName is the file, in the maintenance repo, where sudo-install
@@ -32,9 +34,20 @@ import (
 // rebuild-server.
 const SudoStagingName = "scion.rebuild"
 
-// sudoInstaller installs through the existing starter-hub sudoers rules:
+// SudoInstallWrapperPath is the root-owned helper installed by
+// scripts/starter-hub/gce-start-hub.sh that validates the staged file is a
+// regular, non-symlink file owned by scion before installing it.
+const SudoInstallWrapperPath = "/usr/local/libexec/scion/scion-install-rebuild.sh"
+
+const (
+	defaultStarterStagingPath = "/home/scion/scion/" + SudoStagingName
+	defaultStarterBinaryDest  = "/usr/local/bin/scion"
+)
+
+// sudoInstaller installs through the starter-hub sudoers rules:
 //
-//	install -m 755 <RepoPath>/scion.rebuild <BinaryDest>
+//	/usr/local/libexec/scion/scion-install-rebuild.sh  (current starter-hub hosts)
+//	install -m 755 <RepoPath>/scion.rebuild <BinaryDest> (legacy starter-hub hosts)
 //	systemctl restart --no-block <service>   (newer hosts)
 //	systemctl restart <service>              (all hosts)
 //
@@ -48,9 +61,15 @@ type sudoInstaller struct {
 	// restartGrace is how long the plain restart is watched for an early
 	// failure; default plainRestartGrace.
 	restartGrace time.Duration
+	// wrapperPath, wrapperSrc and wrapperDest identify the root-owned rebuild
+	// helper and the fixed source/destination paths it installs between.
+	wrapperPath string
+	wrapperSrc  string
+	wrapperDest string
 
-	mu      sync.Mutex
-	noBlock bool // the --no-block restart rule exists (set by Preflight)
+	mu         sync.Mutex
+	useWrapper bool // the root-owned wrapper rule exists (set by Preflight)
+	noBlock    bool // the --no-block restart rule exists (set by Preflight)
 }
 
 func newSudoInstaller(opts DetectOptions) *sudoInstaller {
@@ -60,6 +79,9 @@ func newSudoInstaller(opts DetectOptions) *sudoInstaller {
 		serviceName:  opts.ServiceName,
 		runner:       opts.Runner,
 		restartGrace: plainRestartGrace,
+		wrapperPath:  SudoInstallWrapperPath,
+		wrapperSrc:   defaultStarterStagingPath,
+		wrapperDest:  defaultStarterBinaryDest,
 	}
 }
 
@@ -69,8 +91,25 @@ const plainRestartGrace = 10 * time.Second
 
 func (s *sudoInstaller) stagingPath() string { return filepath.Join(s.repoPath, SudoStagingName) }
 
+func (s *sudoInstaller) wrapperApplies() bool {
+	return s.wrapperPath != "" &&
+		filepath.Clean(s.stagingPath()) == filepath.Clean(s.wrapperSrc) &&
+		filepath.Clean(s.binaryDest) == filepath.Clean(s.wrapperDest)
+}
+
+func (s *sudoInstaller) wrapperArgv() []string {
+	return []string{s.wrapperPath}
+}
+
 func (s *sudoInstaller) installArgv() []string {
 	return []string{"install", "-m", "755", s.stagingPath(), s.binaryDest}
+}
+
+func (s *sudoInstaller) activeInstallArgv() []string {
+	if s.usingWrapper() {
+		return s.wrapperArgv()
+	}
+	return s.installArgv()
 }
 
 func (s *sudoInstaller) restartArgv(noBlock bool) []string {
@@ -109,7 +148,17 @@ func (s *sudoInstaller) Preflight(ctx context.Context) error {
 	if !isWritableDir(s.repoPath) {
 		return fmt.Errorf("maintenance repo path %s is not writable by the hub user", s.repoPath)
 	}
-	if !s.sudoAllowed(ctx, s.installArgv()) {
+	switch {
+	case s.wrapperApplies() && s.sudoAllowed(ctx, s.wrapperArgv()):
+		s.setUseWrapper(true)
+	case s.sudoAllowed(ctx, s.installArgv()):
+		s.setUseWrapper(false)
+	default:
+		if s.wrapperApplies() {
+			return fmt.Errorf("no sudoers rule allows `%s` or `%s`",
+				strings.Join(s.wrapperArgv(), " "),
+				strings.Join(s.installArgv(), " "))
+		}
 		return fmt.Errorf("no sudoers rule allows `%s`", strings.Join(s.installArgv(), " "))
 	}
 	switch {
@@ -121,6 +170,18 @@ func (s *sudoInstaller) Preflight(ctx context.Context) error {
 		return fmt.Errorf("no sudoers rule allows `%s`", strings.Join(s.restartArgv(false), " "))
 	}
 	return nil
+}
+
+func (s *sudoInstaller) setUseWrapper(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.useWrapper = v
+}
+
+func (s *sudoInstaller) usingWrapper() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.useWrapper
 }
 
 func (s *sudoInstaller) setNoBlock(v bool) {
@@ -152,36 +213,52 @@ func (s *sudoInstaller) Stage(_ context.Context, _ string, bin string) (string, 
 	return dst, nil
 }
 
-// Activate implements Installer: sudo -n install -m 755 <staged> <dest>.
-// install(1) writes a new file and renames it over the destination, so a
-// failure leaves the old binary in place.
+// Activate implements Installer: runs either the root-owned rebuild wrapper or
+// the legacy `sudo -n install -m 755 <staged> <dest>`. Both write a new file
+// and rename it over the destination, so a failure leaves the old binary in
+// place.
 func (s *sudoInstaller) Activate(ctx context.Context, staged string) error {
 	if filepath.Clean(staged) != s.stagingPath() {
 		return fmt.Errorf("staged binary %s is not %s", staged, s.stagingPath())
 	}
-	args := append([]string{"-n"}, s.installArgv()...)
+	argv := s.activeInstallArgv()
+	args := append([]string{"-n"}, argv...)
 	if out, err := s.runner.Run(ctx, "sudo", args...); err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("sudo %s: %w", strings.Join(s.installArgv(), " "), ctx.Err())
+			return fmt.Errorf("sudo %s: %w", strings.Join(argv, " "), ctx.Err())
 		}
 		if detail := strings.TrimSpace(string(out)); detail != "" {
-			return fmt.Errorf("sudo %s: %s", strings.Join(s.installArgv(), " "), detail)
+			return fmt.Errorf("sudo %s: %s", strings.Join(argv, " "), detail)
 		}
-		return fmt.Errorf("sudo %s: %w", strings.Join(s.installArgv(), " "), err)
+		return fmt.Errorf("sudo %s: %w", strings.Join(argv, " "), err)
 	}
 	return nil
 }
 
 // Restart implements Installer. With the --no-block rule systemctl returns
-// once the restart job is queued. With only the plain rule the command
-// blocks while systemd stops this process, so it is started and watched for
+// once the restart job is queued, or is killed by SIGTERM when systemd begins
+// stopping the unit's control group before the child exits (see
+// IsStopSignalExit). With only the plain rule the command blocks while
+// systemd stops this process, so it is started and watched for
 // plainRestartGrace: only a normal non-zero exit in that window (nothing was
 // restarted) fails Restart.
 func (s *sudoInstaller) Restart(ctx context.Context) error {
 	if s.useNoBlock() {
 		args := append([]string{"-n"}, s.restartArgv(true)...)
 		if out, err := s.runner.Run(ctx, "sudo", args...); err != nil {
-			return fmt.Errorf("sudo %s: %v %s", strings.Join(s.restartArgv(true), " "), err, strings.TrimSpace(string(out)))
+			if ctx.Err() != nil {
+				return fmt.Errorf("sudo %s: %w", strings.Join(s.restartArgv(true), " "), ctx.Err())
+			}
+			if IsStopSignalExit(err) {
+				logging.Subsystem("hub.maintenance.installer").Info(
+					"Restart command terminated by stop signal; restart is under way",
+					"service", s.serviceName, "mode", "no-block")
+				return nil
+			}
+			if detail := strings.TrimSpace(string(out)); detail != "" {
+				return fmt.Errorf("sudo %s: %w (%s)", strings.Join(s.restartArgv(true), " "), err, detail)
+			}
+			return fmt.Errorf("sudo %s: %w", strings.Join(s.restartArgv(true), " "), err)
 		}
 		return nil
 	}

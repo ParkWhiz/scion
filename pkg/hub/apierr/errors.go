@@ -72,15 +72,26 @@ type ErrorResponse struct {
 
 // Error codes matching the Hub API specification.
 const (
-	ErrCodeInvalidRequest        = "invalid_request"
-	ErrCodeValidationError       = "validation_error"
-	ErrCodeUnauthorized          = "unauthorized"
-	ErrCodeForbidden             = "forbidden"
-	ErrCodeNotFound              = "not_found"
-	ErrCodeConflict              = "conflict"
+	ErrCodeInvalidRequest     = "invalid_request"
+	ErrCodeInvalidFilterQuery = "invalid_filter_query"
+	ErrCodeValidationError    = "validation_error"
+	ErrCodeUnauthorized       = "unauthorized"
+	ErrCodeForbidden          = "forbidden"
+	ErrCodeNotFound           = "not_found"
+	ErrCodeConflict           = "conflict"
+	// ErrCodeAgentExistsResumable is returned (409) when a create/start
+	// request without Resume targets an existing agent in a resumable
+	// resting phase (suspended, stopped, halted, or an active idle-suspend
+	// claim).
+	ErrCodeAgentExistsResumable = "agent_exists_resumable"
+	// ErrCodeBrokerOnline is returned (409) when a broker re-registration
+	// matches an existing broker that is currently online and force was not
+	// set. Details carry brokerId, brokerName, and status.
+	ErrCodeBrokerOnline          = "broker_online"
 	ErrCodeVersionConflict       = "version_conflict"
 	ErrCodeTemplateConflict      = "template_conflict"       // 409: a template commit lost its compare-and-swap (ptone/scion#4221)
 	ErrCodeHarnessConfigConflict = "harness_config_conflict" // 409: a harness-config commit lost its compare-and-swap (ptone/scion#4219)
+	ErrCodeProtectedAnnotation   = "protected_annotation"    // 409: PATCH attempted to add, change or remove a protected annotation prefix (ptone/scion#8090)
 	ErrCodeUnprocessable         = "unprocessable"
 	ErrCodeRateLimited           = "rate_limited"
 	ErrCodeInternalError         = "internal_error"
@@ -115,10 +126,13 @@ const (
 	ErrCodeMessageDenied = "message_denied"
 
 	// Delivery error codes
-	ErrCodeAgentNotFound   = "agent_not_found"
-	ErrCodeDeliveryFailed  = "delivery_failed"
-	ErrCodeAgentNotRunning = "agent_not_running"
-	ErrCodeBrokerTimeout   = "broker_timeout"
+	ErrCodeAgentNotFound       = "agent_not_found"
+	ErrCodeAgentNotMessageable = "agent_not_messageable"
+	ErrCodeDeliveryFailed      = "delivery_failed"
+	ErrCodeAgentNotRunning     = "agent_not_running"
+	ErrCodeBrokerTimeout       = "broker_timeout"
+	ErrCodeReservedName        = "reserved_name"
+	ErrCodeTaskNotSupported    = "task_not_supported"
 	// ErrCodeAgentSessionUnavailable is returned (503) when the agent is
 	// running but the conduit session a stream needs is not connected.
 	ErrCodeAgentSessionUnavailable = "agent_session_unavailable"
@@ -131,12 +145,13 @@ const (
 	ErrCodeSendInProgress = "send_in_progress"
 
 	// Broker authentication error codes
-	ErrCodeInvalidJoinToken = "invalid_join_token"
-	ErrCodeExpiredJoinToken = "expired_join_token"
-	ErrCodeBrokerAuthFailed = "broker_auth_failed"
-	ErrCodeInvalidSignature = "invalid_signature"
-	ErrCodeClockSkew        = "clock_skew"
-	ErrCodeReplayDetected   = "replay_detected"
+	ErrCodeInvalidJoinToken   = "invalid_join_token"
+	ErrCodeExpiredJoinToken   = "expired_join_token"
+	ErrCodeBrokerAuthFailed   = "broker_auth_failed"
+	ErrCodeBrokerDeregistered = "broker_deregistered"
+	ErrCodeInvalidSignature   = "invalid_signature"
+	ErrCodeClockSkew          = "clock_skew"
+	ErrCodeReplayDetected     = "replay_detected"
 
 	// ErrCodeUserNotFound is returned (401) when a hub-issued user token
 	// names a subject that has no user record, for example after the
@@ -161,7 +176,8 @@ const (
 	ErrCodeRuntimeBrokerNotLinked           = "runtime_broker_not_linked"            // 422
 	ErrCodeRuntimeBrokerLinkPathUnsupported = "runtime_broker_link_path_unsupported" // 409
 	ErrCodeRuntimeTargetTypeUnsupported     = "runtime_target_type_unsupported"      // 422
-	ErrCodeExperimentDisabled               = "experiment_disabled"                  // 412
+	ErrCodeExperimentDisabled               = "experiment_disabled"                  // 412 / 400
+	ErrCodeGitHubNotAssociated              = "github_not_associated"                // 409
 
 	// ErrCodeHarnessConfigNotFound is returned (404) by a reincarnate
 	// --harness request naming a harness config the hub does not know, and
@@ -210,6 +226,12 @@ const (
 	// capability that the server does not yet support (e.g. cross-project
 	// attachment transfer). Status 422.
 	ErrCodeUnsupportedCapability = "unsupported_capability"
+
+	// ErrCodeImplicitHarnessSwitch is returned (412) when a plain
+	// reincarnation (without --harness) would change the agent's harness
+	// config, refusing an unrequested switch that would bypass home-reset
+	// and credential safeguards.
+	ErrCodeImplicitHarnessSwitch = "implicit_harness_switch"
 
 	// ErrCodeInvalidDMKey is returned when a DM key does not have exactly 5
 	// colon-separated parts. Distinguishable from ErrCodeConversationNotResolved
@@ -359,6 +381,11 @@ const (
 	// reliably and show a specific message (design ptone/scion#2291 §6).
 	ErrCodeSecretScopeRestricted = "secret_scope_restricted"
 
+	// ErrCodeBrokerPolicyAdminManagedOnly is returned (403) when a Runtime
+	// Broker registration, attachment, placement, or agent start is refused
+	// because broker_policy.admin_managed_only is on (ptone/scion#7829).
+	ErrCodeBrokerPolicyAdminManagedOnly = "broker_policy_admin_managed_only"
+
 	// ErrCodeSecretPendingHeldByOtherAgent is returned when an agent writes
 	// a user-scope secret whose name already has a pending secret, written
 	// by another agent, awaiting the owner's decision. Nothing overrides it,
@@ -377,6 +404,21 @@ const (
 	// secret write would exceed the pending secret caps: per writing agent
 	// or per owner. Nothing is stored.
 	ErrCodeSecretPendingCap = "secret_pending_cap"
+
+	// ErrCodeInternalSecret is returned (409) when a caller attempts to
+	// overwrite, patch, or delete a SecretTypeInternal row through the
+	// user-facing secrets API.
+	ErrCodeInternalSecret = "internal_secret"
+
+	// ErrCodeLimitExceeded is returned (409) when creating, enabling, or
+	// resuming a resource would exceed a configured per-project or per-source
+	// cap.
+	ErrCodeLimitExceeded = "limit_exceeded"
+
+	// ErrCodeInvalidRule is returned (400) when a trigger or consumer rule
+	// fails dialect admission or authoring-time compilation (Stage 1 §7.2).
+	// Details carry structured CompileError or UnsupportedDialectError fields.
+	ErrCodeInvalidRule = "invalid_rule"
 
 	// ErrCodeInvalidRoleSet is returned by PUT …/members/principals/{type}/{id}
 	// when the desired role set contains an unknown role definition ID, a

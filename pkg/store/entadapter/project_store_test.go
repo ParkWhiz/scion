@@ -265,6 +265,66 @@ func TestProjectOwnerID_UpdateProjectNilReturnsInvalidInput(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrInvalidInput)
 }
 
+// TestProject_UpdateProjectGitHubAppStatus pins G3 S7 / G1 S1 / G1 S4:
+// UpdateProjectGitHubAppStatus writes only github_app_status and leaves every
+// other field untouched so a concurrent admin unbind or remote change is never
+// reverted by a status writer holding a stale project snapshot.
+func TestProject_UpdateProjectGitHubAppStatus(t *testing.T) {
+	ps := newTestProjectStore(t)
+	ctx := context.Background()
+
+	instID := int64(4242)
+	p := &store.Project{
+		ID:                   uuid.NewString(),
+		Name:                 "Status Narrow Update",
+		Slug:                 "status-narrow-update",
+		GitRemote:            "https://github.com/acme/widgets",
+		GitHubInstallationID: &instID,
+		Annotations:          map[string]string{"k": "v1"},
+	}
+	require.NoError(t, ps.CreateProject(ctx, p))
+
+	// Simulate a concurrent admin unbind and remote update after another caller
+	// already took a snapshot of p.
+	concurrent, err := ps.GetProject(ctx, p.ID)
+	require.NoError(t, err)
+	concurrent.GitHubInstallationID = nil
+	concurrent.GitRemote = "https://github.com/acme/renamed"
+	concurrent.Annotations = map[string]string{"k": "v2"}
+	require.NoError(t, ps.UpdateProject(ctx, concurrent))
+
+	// Now write only GitHubAppStatus using the narrow store method.
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	status := &store.GitHubAppProjectStatus{
+		State:        store.GitHubAppStateError,
+		ErrorCode:    "association_unauthorized",
+		ErrorMessage: "fixed content-free message",
+		LastChecked:  now,
+		LastError:    &now,
+	}
+	require.NoError(t, ps.UpdateProjectGitHubAppStatus(ctx, p.ID, status))
+
+	got, err := ps.GetProject(ctx, p.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.GitHubAppStatus)
+	assert.Equal(t, store.GitHubAppStateError, got.GitHubAppStatus.State)
+	assert.Equal(t, "association_unauthorized", got.GitHubAppStatus.ErrorCode)
+	assert.Equal(t, "fixed content-free message", got.GitHubAppStatus.ErrorMessage)
+	assert.Nil(t, got.GitHubInstallationID, "narrow status write must not revert concurrent admin unbind")
+	assert.Equal(t, "https://github.com/acme/renamed", got.GitRemote, "narrow status write must not revert concurrent remote update")
+	assert.Equal(t, map[string]string{"k": "v2"}, got.Annotations, "narrow status write must not revert concurrent annotations")
+
+	// Passing nil clears github_app_status without touching other columns.
+	require.NoError(t, ps.UpdateProjectGitHubAppStatus(ctx, p.ID, nil))
+	got, err = ps.GetProject(ctx, p.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.GitHubAppStatus)
+	assert.Equal(t, "https://github.com/acme/renamed", got.GitRemote)
+
+	// Missing project returns store.ErrNotFound.
+	assert.ErrorIs(t, ps.UpdateProjectGitHubAppStatus(ctx, uuid.NewString(), status), store.ErrNotFound)
+}
+
 func TestProject_SharedDirsRoundTrip(t *testing.T) {
 	ps := newTestProjectStore(t)
 	ctx := context.Background()
@@ -300,8 +360,11 @@ func TestProject_ListFilters(t *testing.T) {
 	ctx := context.Background()
 
 	owner := uuid.NewString()
+	instA := int64(77001)
+	instB := int64(77002)
 	pub := newProject(1)
 	pub.OwnerID = owner
+	pub.GitHubInstallationID = &instA
 	require.NoError(t, ps.CreateProject(ctx, pub))
 
 	priv := newProject(2)
@@ -318,6 +381,17 @@ func TestProject_ListFilters(t *testing.T) {
 	byName, err := ps.ListProjects(ctx, store.ProjectFilter{Name: pub.Name}, store.ListOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, 1, byName.TotalCount)
+
+	byInstA, err := ps.ListProjects(ctx, store.ProjectFilter{GitHubInstallationID: &instA}, store.ListOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, byInstA.TotalCount)
+	require.Len(t, byInstA.Items, 1)
+	assert.Equal(t, pub.ID, byInstA.Items[0].ID)
+
+	byInstB, err := ps.ListProjects(ctx, store.ProjectFilter{GitHubInstallationID: &instB}, store.ListOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 0, byInstB.TotalCount)
+	assert.Empty(t, byInstB.Items)
 
 	limited, err := ps.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 1})
 	require.NoError(t, err)
@@ -1024,6 +1098,95 @@ func TestProjectStore_AuthorizedProjectIDs(t *testing.T) {
 	})
 }
 
+// TestProjectStore_AuthorizedProjectIDs_WithTemplateExclusion verifies that
+// combining IsTemplate=false (the default project-list template exclusion) with
+// AuthorizedProjectIDs returns only authorized non-template projects, even when
+// unauthorized projects have non-null or null labels. Runs on SQLite locally
+// and against live Postgres in CI (enttest.NewClient) to guard against SQL OR
+// precedence regressions in projectLabelNotContains (ptone/scion#8531,
+// GoogleCloudPlatform/scion#5105).
+func TestProjectStore_AuthorizedProjectIDs_WithTemplateExclusion(t *testing.T) {
+	ctx := context.Background()
+	ps := newTestProjectStore(t)
+
+	authWithLabels := &store.Project{
+		ID:     uuid.NewString(),
+		Name:   "auth-with-labels",
+		Slug:   "auth-with-labels-" + uuid.NewString()[:8],
+		Labels: map[string]string{"env": "prod"},
+	}
+	authNilLabels := &store.Project{
+		ID:   uuid.NewString(),
+		Name: "auth-nil-labels",
+		Slug: "auth-nil-labels-" + uuid.NewString()[:8],
+	}
+	foreignWithLabels := &store.Project{
+		ID:     uuid.NewString(),
+		Name:   "foreign-with-labels",
+		Slug:   "foreign-with-labels-" + uuid.NewString()[:8],
+		Labels: map[string]string{"env": "prod"},
+	}
+	foreignNilLabels := &store.Project{
+		ID:   uuid.NewString(),
+		Name: "foreign-nil-labels",
+		Slug: "foreign-nil-labels-" + uuid.NewString()[:8],
+	}
+	authTemplate := &store.Project{
+		ID:     uuid.NewString(),
+		Name:   "auth-template",
+		Slug:   "auth-template-" + uuid.NewString()[:8],
+		Labels: map[string]string{store.LabelTemplate: "true"},
+	}
+	foreignTemplate := &store.Project{
+		ID:     uuid.NewString(),
+		Name:   "foreign-template",
+		Slug:   "foreign-template-" + uuid.NewString()[:8],
+		Labels: map[string]string{store.LabelTemplate: "true"},
+	}
+	for _, p := range []*store.Project{
+		authWithLabels, authNilLabels,
+		foreignWithLabels, foreignNilLabels,
+		authTemplate, foreignTemplate,
+	} {
+		require.NoError(t, ps.CreateProject(ctx, p))
+	}
+
+	isTemplateFalse := false
+
+	t.Run("member of one project sees only that project", func(t *testing.T) {
+		result, err := ps.ListProjects(ctx, store.ProjectFilter{
+			IsTemplate:           &isTemplateFalse,
+			AuthorizedProjectIDs: []string{authWithLabels.ID},
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 1, result.TotalCount)
+		require.Len(t, result.Items, 1)
+		assert.Equal(t, authWithLabels.ID, result.Items[0].ID)
+	})
+
+	t.Run("authorized non-template projects with and without labels returned; template and foreign excluded", func(t *testing.T) {
+		result, err := ps.ListProjects(ctx, store.ProjectFilter{
+			IsTemplate:           &isTemplateFalse,
+			AuthorizedProjectIDs: []string{authWithLabels.ID, authNilLabels.ID, authTemplate.ID},
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 2, result.TotalCount)
+		require.Len(t, result.Items, 2)
+		gotIDs := []string{result.Items[0].ID, result.Items[1].ID}
+		assert.ElementsMatch(t, []string{authWithLabels.ID, authNilLabels.ID}, gotIDs)
+	})
+
+	t.Run("empty authorized set with template exclusion returns zero projects", func(t *testing.T) {
+		result, err := ps.ListProjects(ctx, store.ProjectFilter{
+			IsTemplate:           &isTemplateFalse,
+			AuthorizedProjectIDs: []string{},
+		}, store.ListOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 0, result.TotalCount)
+		assert.Empty(t, result.Items)
+	})
+}
+
 // TestListProjects_MaxLimit verifies that ListProjects with a Limit exceeding
 // 1000 is capped at maxProjectListLimit=1000.
 func TestListProjects_MaxLimit(t *testing.T) {
@@ -1132,4 +1295,46 @@ func TestFindEmbeddedBroker_IgnoresOwnedRows(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, hubManaged.ID, got.ID)
+}
+
+func TestProject_LegacyEmptyGitHubPermissionsReadAsNil(t *testing.T) {
+	ps := newTestProjectStore(t)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "empty object", raw: "{}"},
+		{name: "empty fields", raw: `{"contents":"","metadata":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newProject(1)
+			require.NoError(t, ps.CreateProject(ctx, p))
+
+			uid, err := uuid.Parse(p.ID)
+			require.NoError(t, err)
+			require.NoError(t, ps.client.Project.UpdateOneID(uid).SetGithubPermissions(tc.raw).Exec(ctx))
+
+			got, err := ps.GetProject(ctx, p.ID)
+			require.NoError(t, err)
+			assert.Nil(t, got.GitHubPermissions, "legacy empty github_permissions row must read back as nil")
+
+			listed, err := ps.ListProjects(ctx, store.ProjectFilter{Slug: p.Slug}, store.ListOptions{})
+			require.NoError(t, err)
+			require.Len(t, listed.Items, 1)
+			assert.Nil(t, listed.Items[0].GitHubPermissions, "listed legacy empty github_permissions row must read back as nil")
+		})
+	}
+
+	t.Run("non-empty preserved", func(t *testing.T) {
+		p := newProject(2)
+		p.GitHubPermissions = &store.GitHubTokenPermissions{Contents: "read"}
+		require.NoError(t, ps.CreateProject(ctx, p))
+
+		got, err := ps.GetProject(ctx, p.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.GitHubPermissions)
+		assert.Equal(t, store.GitHubTokenPermissions{Contents: "read"}, *got.GitHubPermissions)
+	})
 }

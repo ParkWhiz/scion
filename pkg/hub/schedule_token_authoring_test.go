@@ -22,7 +22,9 @@ import (
 	"log/slog"
 	"net/http"
 	"testing"
+	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -300,8 +302,9 @@ func schedFireMint(t *testing.T, f *schedFire, boundary TokenBoundary, scopes ..
 // can fire them.
 func withFireScheduler(srv *Server, s store.Store) {
 	srv.scheduler = NewScheduler(s, slog.Default())
-	srv.scheduler.RegisterEventHandler("message", srv.messageEventHandler())
-	srv.scheduler.RegisterEventHandler("dispatch_agent", srv.dispatchAgentEventHandler())
+	srv.scheduler.srv = srv
+	srv.RegisterAction(&messageAction{srv: srv})
+	srv.RegisterAction(&dispatchAgentAction{srv: srv})
 }
 
 // createTokenEvent creates a one-shot event with key over the route and
@@ -387,16 +390,45 @@ func TestScheduledFire_UsesRecordedTokenCeiling(t *testing.T) {
 		f.assertDelivered(t, 1)
 
 		// A token without agent:read or agent:message cannot see the
-		// target, so authoring treats it like an unknown agent; the
-		// recorded ceiling has no agent.message and the fire is refused.
+		// target, so strict authoring refuses it with masked 404
+		// (ptone/scion#8588); a pre-existing stored event carrying that
+		// token's bounded ceiling (without agent.message) is still
+		// refused at fire time.
 		without, tok := schedFireMint(t, f.schedFire, projectBoundary(f.proj.ID), "scheduled_event:create")
-		evt = createTokenEvent(t, f.srv, f.store, without, f.proj.ID, body)
-		assertTokenRevision(t, "message event without agent:message", tok, evt.InitiatorAttribution, evt.AuthorityCeiling)
-		require.NotContains(t, evt.AuthorityCeiling.PermissionIDs, scheduledMessagePermission)
-		err := authorizeScheduledMessageFireFor(f.srv, evt, f.target)
+		rec := doRequestWithToken(t, f.srv, without, http.MethodPost, "/api/v1/projects/"+f.proj.ID+"/scheduled-events", body)
+		require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+
+		storedEvt := store.ScheduledEvent{
+			ID:        api.NewUUID(),
+			ProjectID: f.proj.ID,
+			EventType: "message",
+			FireAt:    time.Now().Add(time.Hour),
+			Payload:   `{"agentId":"` + f.target.ID + `","message":"scheduled hello"}`,
+			Status:    store.ScheduledEventPending,
+			CreatedBy: tok.UserID,
+			InitiatorAttribution: store.InitiatorAttribution{
+				InitiatorPrincipalKind:  store.DelegationPrincipalUser,
+				InitiatorPrincipalID:    tok.UserID,
+				InitiatorCredentialKind: store.InitiatorCredentialKindUAT,
+				InitiatorCredentialID:   tok.ID,
+				AuthorizationRevision:   1,
+				AttributionVersion:      1,
+			},
+			AuthorityCeiling: store.EffectCeiling{
+				Kind:              store.EffectCeilingBounded,
+				Version:           tok.CeilingVersion,
+				PermissionIDs:     tok.CeilingPermissionIDs,
+				BoundaryKind:      tok.BoundaryKind,
+				BoundaryProjectID: tok.ProjectID,
+			},
+		}
+		require.NoError(t, f.store.CreateScheduledEvent(context.Background(), &storedEvt))
+		assertTokenRevision(t, "message event without agent:message", tok, storedEvt.InitiatorAttribution, storedEvt.AuthorityCeiling)
+		require.NotContains(t, storedEvt.AuthorityCeiling.PermissionIDs, scheduledMessagePermission)
+		err := authorizeScheduledMessageFireFor(f.srv, storedEvt, f.target)
 		require.ErrorIs(t, err, errScheduledAuthorityDenied)
 		assert.Contains(t, err.Error(), "revision ceiling does not allow "+scheduledMessagePermission)
-		got = fireStoredEvent(t, f.srv, f.store, evt)
+		got = fireStoredEvent(t, f.srv, f.store, storedEvt)
 		assert.Equal(t, store.ScheduledEventFailed, got.Status)
 		assert.Equal(t, errScheduledMessageRefused.Error(), got.Error)
 		f.assertDelivered(t, 1)
@@ -426,7 +458,7 @@ func TestScheduledFire_UsesRecordedTokenBoundary(t *testing.T) {
 			assert.Equal(t, string(boundary.Kind), evt.AuthorityCeiling.BoundaryKind, slug)
 			assert.Equal(t, boundary.ProjectID, evt.AuthorityCeiling.BoundaryProjectID, slug)
 
-			_, identity, err := f.srv.resolveScheduledAuthority(context.Background(), evt)
+			_, identity, err := resolveScheduledAuthorityForTest(context.Background(), f.srv, evt)
 			require.NoError(t, err, slug)
 			scoped, ok := identity.(*ScopedUserIdentity)
 			require.True(t, ok, "%s: the fire runs as a token identity, got %T", slug, identity)
@@ -451,7 +483,7 @@ func TestScheduledFire_UsesRecordedTokenBoundary(t *testing.T) {
 			evt := createTokenEvent(t, f.srv, f.store, key, f.proj.ID, body)
 			assertTokenRevision(t, label, tok, evt.InitiatorAttribution, evt.AuthorityCeiling)
 
-			_, identity, err := f.srv.resolveScheduledAuthority(context.Background(), evt)
+			_, identity, err := resolveScheduledAuthorityForTest(context.Background(), f.srv, evt)
 			require.NoError(t, err, label)
 			scoped, ok := identity.(*ScopedUserIdentity)
 			require.True(t, ok, "%s: the fire runs as a token identity, got %T", label, identity)
@@ -483,7 +515,7 @@ func TestScheduledFire_UsesRecordedTokenBoundary(t *testing.T) {
 		assertOutsideBoundary := func(label string, evt store.ScheduledEvent, wantErr string) {
 			t.Helper()
 			require.Equal(t, other, evt.AuthorityCeiling.BoundaryProjectID, label)
-			_, identity, err := f.srv.resolveScheduledAuthority(ctx, evt)
+			_, identity, err := resolveScheduledAuthorityForTest(ctx, f.srv, evt)
 			require.NoError(t, err, label)
 			scoped, ok := identity.(*ScopedUserIdentity)
 			require.True(t, ok, "%s: the fire runs as a token identity, got %T", label, identity)

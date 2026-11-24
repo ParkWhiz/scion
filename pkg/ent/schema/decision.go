@@ -52,7 +52,15 @@ func (Decision) Fields() []ent.Field {
 			Optional().
 			Nillable().
 			Immutable(),
-		// message_id is the choice-prompt message that carried this version.
+		// chat_key is the prompt message's thread_id (topic key or canonical
+		// dm:... key), captured when the prompt is created so authorization and
+		// project listing keep working after chat retention purges the prompt.
+		field.String("chat_key").
+			Optional().
+			Nillable().
+			MaxLen(256).
+			Immutable(),
+		// message_id is the decision-prompt message that carried this version.
 		field.UUID("message_id", uuid.UUID{}).
 			Immutable(),
 		// position is the order of the decision within its message.
@@ -92,16 +100,43 @@ func (Decision) Fields() []ent.Field {
 			Optional().
 			Nillable().
 			Immutable(),
+		// allow_other and other_* configure an optional free-form Other choice
+		// (design-8146 §4.2). other_label is set iff allow_other is true.
+		field.Bool("allow_other").
+			Default(false).
+			Immutable(),
+		field.String("other_label").
+			Optional().
+			Nillable().
+			MaxRuneLen(messages.MaxChoiceLabelLen).
+			Immutable(),
+		field.String("other_description").
+			Optional().
+			Nillable().
+			MaxRuneLen(messages.MaxChoiceDescriptionLen).
+			Immutable(),
+		field.String("other_placeholder").
+			Optional().
+			Nillable().
+			MaxRuneLen(messages.MaxOtherPlaceholderLen).
+			Immutable(),
 		// intro_length is the byte offset in the prompt message's msg where
-		// the markdown fallback starts (messages.RenderChoiceFallback). It is
+		// the markdown fallback starts (messages.RenderDecisionFallback). It is
 		// set on the message's position 0 row only; 0 means no intro.
 		field.Int("intro_length").
 			Default(0).
 			NonNegative().
 			Immutable(),
 		field.Enum("status").
-			Values("pending", "decided", "replaced").
+			Values("pending", "decided", "replaced", "withdrawn", "dismissed").
 			Default("pending"),
+		// settled is a hint: true only when this row is known settled (replaced,
+		// withdrawn, dismissed, or decided with a direct answer). false means
+		// "possibly open": rows written by an older binary stay false until the
+		// background indexer settles them. Readers MUST keep the exact open
+		// predicate.
+		field.Bool("settled").
+			Default(false),
 		// replaced_by_id is the row of the version that replaced this one.
 		field.UUID("replaced_by_id", uuid.UUID{}).
 			Optional().
@@ -113,6 +148,15 @@ func (Decision) Fields() []ent.Field {
 			Optional().
 			Nillable(),
 		field.Time("replaced_at").
+			Optional().
+			Nillable(),
+		field.Time("withdrawn_at").
+			Optional().
+			Nillable(),
+		field.Text("withdrawn_reason").
+			Optional().
+			Nillable(),
+		field.Time("dismissed_at").
 			Optional().
 			Nillable(),
 	}
@@ -130,6 +174,12 @@ func (Decision) Indexes() []ent.Index {
 		index.Fields("asker_agent_id", "status"),
 		// The project's pending decisions.
 		index.Fields("project_id", "status"),
+		// Project-wide decisions scoped to readable conversation keys.
+		index.Fields("project_id", "chat_key", "status"),
+		// Partial index for open-prompt lookups and bell fast-path project checks:
+		// covers queries filtering on (project_id, chat_key) WHERE settled = false.
+		index.Fields("project_id", "chat_key").
+			Annotations(entsql.IndexWhere("settled = false")),
 		// History pages load a page's decisions by message.
 		index.Fields("message_id", "position"),
 		index.Fields("conversation_id"),

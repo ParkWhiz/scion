@@ -71,4 +71,57 @@ func TestBrokerRegisterInstance_LabelsTheRowAsARemoteBroker(t *testing.T) {
 	require.NoError(t, runBrokerRegister(brokerRegisterCmd, nil))
 	require.NotNil(t, got, "registration was not called")
 	assert.Equal(t, map[string]string{"scion.io/broker-role": "remote"}, got.Labels)
+	assert.Empty(t, got.GCPHostServiceAccountEmail, "non-cloudrun targets do not populate GCPHostServiceAccountEmail")
+	assert.Empty(t, got.GCPHostProjectID, "non-cloudrun targets do not populate GCPHostProjectID")
+	assert.False(t, got.AdminManaged)
+}
+
+func TestBrokerRegisterInstance_AdminManagedFlagForwarded(t *testing.T) {
+	setupRegisterInstanceTest(t, "https://hub.example:8080")
+	brokerRegisterInstance = "remote-docker"
+	origAdminManaged := brokerAdminManaged
+	brokerAdminManaged = true
+	t.Cleanup(func() { brokerAdminManaged = origAdminManaged })
+
+	orig := registerFlatInstance
+	t.Cleanup(func() { registerFlatInstance = orig })
+	var got *brokerregistration.Options
+	registerFlatInstance = func(_ context.Context, _ hubclient.Client, _ config.V1RuntimeBrokerInstanceConfig, id *brokeridentity.Identity,
+		_, _ string, o brokerregistration.Options) (*brokercredentials.BrokerCredentials, error) {
+		got = &o
+		return &brokercredentials.BrokerCredentials{BrokerID: id.RuntimeBrokerID, HubEndpoint: o.HubEndpoint}, nil
+	}
+
+	require.NoError(t, runBrokerRegister(brokerRegisterCmd, nil))
+	require.NotNil(t, got, "registration was not called")
+	assert.True(t, got.AdminManaged, "--admin-managed must be forwarded to flat instance registration options")
+}
+
+// TestFlatInstanceRegistrationOptions_CloudRunPopulatesGCPHostPair verifies
+// that flatInstanceRegistrationOptions populates GCPHostServiceAccountEmail
+// and GCPHostProjectID from runtime_target.service_account for cloudrun
+// targets and leaves non-cloudrun targets untouched.
+func TestFlatInstanceRegistrationOptions_CloudRunPopulatesGCPHostPair(t *testing.T) {
+	crInst := config.V1RuntimeBrokerInstanceConfig{
+		Key:  "cr-west",
+		Name: "cr-west",
+		RuntimeTarget: &config.V1RuntimeTargetConfig{
+			Type:           config.RuntimeTargetTypeCloudRun,
+			ServiceAccount: "Agents-Runner@cr-host-proj.iam.gserviceaccount.com",
+		},
+	}
+	opts := flatInstanceRegistrationOptions(crInst, "host-a", []string{"sync"}, false, nil, "", "", "https://hub.example:8080", nil)
+	assert.Equal(t, "agents-runner@cr-host-proj.iam.gserviceaccount.com", opts.GCPHostServiceAccountEmail)
+	assert.Equal(t, "cr-host-proj", opts.GCPHostProjectID)
+
+	dockerInst := config.V1RuntimeBrokerInstanceConfig{
+		Key:  "remote-docker",
+		Name: "remote-docker",
+		RuntimeTarget: &config.V1RuntimeTargetConfig{
+			Type: config.RuntimeTargetTypeDocker,
+		},
+	}
+	dockerOpts := flatInstanceRegistrationOptions(dockerInst, "host-a", []string{"sync"}, false, nil, "", "", "https://hub.example:8080", nil)
+	assert.Empty(t, dockerOpts.GCPHostServiceAccountEmail)
+	assert.Empty(t, dockerOpts.GCPHostProjectID)
 }

@@ -26,6 +26,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -40,8 +41,10 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/eventbus"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/google/uuid"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/githubapp"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util"
 )
 
 func TestGitHubOwnerRepo(t *testing.T) {
@@ -525,6 +528,89 @@ func TestHandleGitHubWebhook_InstallationReposRemoved(t *testing.T) {
 	}
 	if updatedProject.GitHubAppStatus.ErrorCode != "repo_not_accessible" {
 		t.Errorf("expected repo_not_accessible error code, got %s", updatedProject.GitHubAppStatus.ErrorCode)
+	}
+}
+
+// TestHandleGitHubWebhook_InstallationReposRemoved_CaseInsensitive covers
+// ptone/scion#7548: GitHub owner and repo names are case-insensitive, so a
+// removed repository must match the installation's repo list and the
+// project's git remote regardless of letter case.
+func TestHandleGitHubWebhook_InstallationReposRemoved_CaseInsensitive(t *testing.T) {
+	cases := []struct {
+		name        string
+		storedRepos []string
+		gitRemote   string
+		removed     string
+	}{
+		{"mixed-case remote, lowercase payload", []string{"acme/widgets", "acme/api"}, "https://github.com/Acme/Widgets.git", "acme/widgets"},
+		{"lowercase remote, mixed-case payload", []string{"Acme/Widgets", "acme/api"}, "https://github.com/acme/widgets.git", "Acme/Widgets"},
+		{"stored list differs from payload", []string{"ACME/WIDGETS", "acme/api"}, "git@github.com:aCmE/wIdGeTs.git", "Acme/Widgets"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, s := webhookTestServer(t)
+			ctx := context.Background()
+
+			installationID := int64(12345)
+			if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+				InstallationID: installationID,
+				AccountLogin:   "acme",
+				AccountType:    "Organization",
+				AppID:          42,
+				Repositories:   tc.storedRepos,
+				Status:         store.GitHubInstallationStatusActive,
+			}); err != nil {
+				t.Fatalf("failed to create installation: %v", err)
+			}
+			if err := s.CreateProject(ctx, &store.Project{
+				ID:                   tid("project-1"),
+				Name:                 "Test Project",
+				Slug:                 "test-project",
+				GitRemote:            tc.gitRemote,
+				GitHubInstallationID: &installationID,
+				GitHubAppStatus:      &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: time.Now()},
+				Created:              time.Now(),
+				Updated:              time.Now(),
+			}); err != nil {
+				t.Fatalf("failed to create project: %v", err)
+			}
+
+			payload := mustJSON(t, map[string]interface{}{
+				"action":       "removed",
+				"installation": map[string]interface{}{"id": installationID},
+				"repositories_removed": []map[string]interface{}{
+					{"id": 1, "full_name": tc.removed, "name": "widgets"},
+				},
+				"repositories_added": []map[string]interface{}{},
+			})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Event", "installation_repositories")
+			req.Header.Set("X-Hub-Signature-256", signWebhookPayload(payload, "test-webhook-secret"))
+			rec := httptest.NewRecorder()
+			srv.handleGitHubWebhook(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rec.Code)
+			}
+
+			updated, err := s.GetGitHubInstallation(ctx, installationID)
+			if err != nil {
+				t.Fatalf("failed to get installation: %v", err)
+			}
+			if len(updated.Repositories) != 1 || updated.Repositories[0] != "acme/api" {
+				t.Errorf("expected [acme/api], got %v", updated.Repositories)
+			}
+
+			updatedProject, err := s.GetProject(ctx, tid("project-1"))
+			if err != nil {
+				t.Fatalf("failed to get project: %v", err)
+			}
+			if updatedProject.GitHubAppStatus == nil || updatedProject.GitHubAppStatus.State != store.GitHubAppStateError {
+				t.Fatalf("expected error state, got %v", updatedProject.GitHubAppStatus)
+			}
+			if updatedProject.GitHubAppStatus.ErrorCode != githubapp.ErrCodeRepoNotAccessible {
+				t.Errorf("expected %s error code, got %s", githubapp.ErrCodeRepoNotAccessible, updatedProject.GitHubAppStatus.ErrorCode)
+			}
+		})
 	}
 }
 
@@ -2993,6 +3079,547 @@ func TestHandleGitHubWebhook_NoAppropriateProjectCommentBack(t *testing.T) {
 	}
 
 	installation := &store.GitHubInstallation{
+=======
+// pagedListProjectsStore wraps store.Store and caps every ListProjects call to
+// pageSize items while its fault switch is armed, simulating the store's page
+// cap across multiple cursor pages without inserting thousands of rows.
+type pagedListProjectsStore struct {
+	store.Store
+	fault    *storeFaultSwitch
+	pageSize int
+
+	mu    sync.Mutex
+	calls []store.ListOptions
+}
+
+func (p *pagedListProjectsStore) ListProjects(ctx context.Context, filter store.ProjectFilter, opts store.ListOptions) (*store.ListResult[store.Project], error) {
+	if !p.fault.Active() {
+		return p.Store.ListProjects(ctx, filter, opts)
+	}
+	p.mu.Lock()
+	p.calls = append(p.calls, opts)
+	p.mu.Unlock()
+
+	capped := opts
+	if p.pageSize > 0 && (capped.Limit <= 0 || capped.Limit > p.pageSize) {
+		capped.Limit = p.pageSize
+	}
+	return p.Store.ListProjects(ctx, filter, capped)
+}
+
+func (p *pagedListProjectsStore) recordedCalls() []store.ListOptions {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]store.ListOptions, len(p.calls))
+	copy(out, p.calls)
+	return out
+}
+
+func assertCursorPaginationCalls(t *testing.T, calls []store.ListOptions, minPages int) {
+	t.Helper()
+	if len(calls) < minPages {
+		t.Fatalf("expected at least %d ListProjects page calls, got %d: %+v", minPages, len(calls), calls)
+	}
+	if calls[0].Cursor != "" {
+		t.Errorf("expected first ListProjects call to have empty cursor, got %q", calls[0].Cursor)
+	}
+	for i, c := range calls {
+		if c.Limit <= 0 || c.Limit > 1000 {
+			t.Errorf("call %d requested Limit=%d, want 1..1000", i, c.Limit)
+		}
+		if !c.SkipTotalCount {
+			t.Errorf("call %d did not set SkipTotalCount=true", i)
+		}
+		if i > 0 && c.Cursor == "" {
+			t.Errorf("call %d had empty Cursor, expected pagination cursor", i)
+		}
+	}
+}
+
+// scriptedListProjectsStore is a pure fake store returning scripted ListProjects
+// pages (and/or errors) without touching a database.
+type scriptedListProjectsStore struct {
+	store.Store
+	pages []func(opts store.ListOptions) (*store.ListResult[store.Project], error)
+	calls []store.ListOptions
+}
+
+func (f *scriptedListProjectsStore) ListProjects(_ context.Context, _ store.ProjectFilter, opts store.ListOptions) (*store.ListResult[store.Project], error) {
+	idx := len(f.calls)
+	f.calls = append(f.calls, opts)
+	if idx >= len(f.pages) {
+		return &store.ListResult[store.Project]{}, nil
+	}
+	return f.pages[idx](opts)
+}
+
+func TestForEachGitHubAppProject_FakeStore(t *testing.T) {
+	t.Run("follows cursors across pages until exhausted", func(t *testing.T) {
+		fake := &scriptedListProjectsStore{
+			pages: []func(store.ListOptions) (*store.ListResult[store.Project], error){
+				func(opts store.ListOptions) (*store.ListResult[store.Project], error) {
+					if opts.Cursor != "" {
+						t.Errorf("page 1 cursor = %q, want empty", opts.Cursor)
+					}
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p1"}, {ID: "p2"}},
+						NextCursor: "cursor-1",
+					}, nil
+				},
+				func(opts store.ListOptions) (*store.ListResult[store.Project], error) {
+					if opts.Cursor != "cursor-1" {
+						t.Errorf("page 2 cursor = %q, want cursor-1", opts.Cursor)
+					}
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p3"}, {ID: "p4"}},
+						NextCursor: "cursor-2",
+					}, nil
+				},
+				func(opts store.ListOptions) (*store.ListResult[store.Project], error) {
+					if opts.Cursor != "cursor-2" {
+						t.Errorf("page 3 cursor = %q, want cursor-2", opts.Cursor)
+					}
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p5"}},
+						NextCursor: "",
+					}, nil
+				},
+			},
+		}
+		testSrv := &Server{store: fake}
+		var visited []string
+		if err := testSrv.forEachGitHubAppProject(context.Background(), func(p *store.Project) {
+			visited = append(visited, p.ID)
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{"p1", "p2", "p3", "p4", "p5"}
+		if strings.Join(visited, ",") != strings.Join(want, ",") {
+			t.Fatalf("visited = %v, want %v", visited, want)
+		}
+		assertCursorPaginationCalls(t, fake.calls, 3)
+	})
+
+	t.Run("propagates error on subsequent page", func(t *testing.T) {
+		boom := errors.New("page 2 query failed")
+		fake := &scriptedListProjectsStore{
+			pages: []func(store.ListOptions) (*store.ListResult[store.Project], error){
+				func(store.ListOptions) (*store.ListResult[store.Project], error) {
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p1"}},
+						NextCursor: "cursor-1",
+					}, nil
+				},
+				func(store.ListOptions) (*store.ListResult[store.Project], error) {
+					return nil, boom
+				},
+			},
+		}
+		testSrv := &Server{store: fake}
+		var visited []string
+		err := testSrv.forEachGitHubAppProject(context.Background(), func(p *store.Project) {
+			visited = append(visited, p.ID)
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want %v", err, boom)
+		}
+		if len(visited) != 1 || visited[0] != "p1" {
+			t.Fatalf("visited = %v, want [p1]", visited)
+		}
+	})
+
+	t.Run("terminates on stagnant cursor or empty page", func(t *testing.T) {
+		fake := &scriptedListProjectsStore{
+			pages: []func(store.ListOptions) (*store.ListResult[store.Project], error){
+				func(store.ListOptions) (*store.ListResult[store.Project], error) {
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p1"}},
+						NextCursor: "stuck",
+					}, nil
+				},
+				func(store.ListOptions) (*store.ListResult[store.Project], error) {
+					return &store.ListResult[store.Project]{
+						Items:      []store.Project{{ID: "p2"}},
+						NextCursor: "stuck",
+					}, nil
+				},
+			},
+		}
+		testSrv := &Server{store: fake}
+		var visited []string
+		if err := testSrv.forEachGitHubAppProject(context.Background(), func(p *store.Project) {
+			visited = append(visited, p.ID)
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(fake.calls) != 2 {
+			t.Fatalf("expected loop to stop on repeated cursor after 2 calls, got %d", len(fake.calls))
+		}
+		if strings.Join(visited, ",") != "p1,p2" {
+			t.Fatalf("visited = %v, want [p1 p2]", visited)
+		}
+	})
+}
+
+func TestGitHubAppHandlers_PaginateProjects(t *testing.T) {
+	oldBase := time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC)
+
+	t.Run("matchProjectsToInstallation", func(t *testing.T) {
+		srv, s := webhookTestServer(t)
+		paged, fault := installStoreFault(t, srv, func(inner store.Store, f *storeFaultSwitch) *pagedListProjectsStore {
+			return &pagedListProjectsStore{Store: inner, fault: f, pageSize: 2}
+		})
+		ctx := context.Background()
+
+		giveUserGitHubToken(t, srv, s, "creator-paged", "ghp_creator_paged")
+		fakeCreatorAccess(srv, map[string]githubapp.RepoAccess{
+			"ghp_creator_paged|acme/widgets": {Push: true, Pull: true},
+		})
+
+		newestTime := time.Now().UTC().Add(10 * time.Minute)
+		fixtures := []*store.Project{
+			{
+				ID: tid("match-oldest"), Name: "Match Oldest", Slug: tid("match-oldest"),
+				GitRemote: "https://github.com/acme/widgets.git", CreatedBy: "creator-paged",
+				Created: oldBase, Updated: oldBase,
+			},
+			{
+				ID: tid("match-filler-1"), Name: "Filler 1", Slug: tid("match-filler-1"),
+				GitRemote: "https://github.com/other/repo.git", CreatedBy: "creator-paged",
+				Created: oldBase.Add(1 * time.Minute), Updated: oldBase.Add(1 * time.Minute),
+			},
+			{
+				ID: tid("match-filler-2"), Name: "Filler 2", Slug: tid("match-filler-2"),
+				GitRemote: "https://github.com/other/repo.git", CreatedBy: "creator-paged",
+				Created: oldBase.Add(2 * time.Minute), Updated: oldBase.Add(2 * time.Minute),
+			},
+			{
+				ID: tid("match-filler-3"), Name: "Filler 3", Slug: tid("match-filler-3"),
+				Created: oldBase.Add(3 * time.Minute), Updated: oldBase.Add(3 * time.Minute),
+			},
+			{
+				ID: tid("match-newest"), Name: "Match Newest", Slug: tid("match-newest"),
+				GitRemote: "https://github.com/acme/widgets.git", CreatedBy: "creator-paged",
+				Created: newestTime, Updated: newestTime,
+			},
+		}
+		for _, p := range fixtures {
+			if err := s.CreateProject(ctx, p); err != nil {
+				t.Fatalf("CreateProject(%s): %v", p.ID, err)
+			}
+		}
+
+		inst := &store.GitHubInstallation{
+			InstallationID: 31001,
+			AccountLogin:   "acme",
+			AccountType:    "Organization",
+			AppID:          42,
+			Repositories:   []string{"acme/widgets"},
+			Status:         store.GitHubInstallationStatusActive,
+		}
+		if err := s.CreateGitHubInstallation(ctx, inst); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+
+		fault.Arm()
+		matched := srv.matchProjectsToInstallation(ctx, inst)
+
+		if len(matched) != 2 {
+			t.Fatalf("expected 2 matched projects across pages, got %d: %v", len(matched), matched)
+		}
+		assertCursorPaginationCalls(t, paged.recordedCalls(), 3)
+
+		for _, id := range []string{tid("match-newest"), tid("match-oldest")} {
+			got, err := s.GetProject(ctx, id)
+			if err != nil {
+				t.Fatalf("GetProject(%s): %v", id, err)
+			}
+			if got.GitHubInstallationID == nil || *got.GitHubInstallationID != inst.InstallationID {
+				t.Errorf("project %s installation = %v, want %d", id, got.GitHubInstallationID, inst.InstallationID)
+			}
+		}
+	})
+
+	t.Run("updateProjectsForInstallation", func(t *testing.T) {
+		srv, s := webhookTestServer(t)
+		paged, fault := installStoreFault(t, srv, func(inner store.Store, f *storeFaultSwitch) *pagedListProjectsStore {
+			return &pagedListProjectsStore{Store: inner, fault: f, pageSize: 2}
+		})
+		ctx := context.Background()
+
+		instID := int64(31002)
+		if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+			InstallationID: instID,
+			AccountLogin:   "acme",
+			AccountType:    "Organization",
+			AppID:          42,
+			Status:         store.GitHubInstallationStatusActive,
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+
+		newestTime := time.Now().UTC().Add(10 * time.Minute)
+		fixtures := []*store.Project{
+			{
+				ID: tid("upd-oldest"), Name: "Update Oldest", Slug: tid("upd-oldest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         oldBase, Updated: oldBase,
+			},
+			{
+				ID: tid("upd-filler-1"), Name: "Filler 1", Slug: tid("upd-filler-1"),
+				Created: oldBase.Add(1 * time.Minute), Updated: oldBase.Add(1 * time.Minute),
+			},
+			{
+				ID: tid("upd-filler-2"), Name: "Filler 2", Slug: tid("upd-filler-2"),
+				Created: oldBase.Add(2 * time.Minute), Updated: oldBase.Add(2 * time.Minute),
+			},
+			{
+				ID: tid("upd-filler-3"), Name: "Filler 3", Slug: tid("upd-filler-3"),
+				Created: oldBase.Add(3 * time.Minute), Updated: oldBase.Add(3 * time.Minute),
+			},
+			{
+				ID: tid("upd-newest"), Name: "Update Newest", Slug: tid("upd-newest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         newestTime, Updated: newestTime,
+			},
+		}
+		for _, p := range fixtures {
+			if err := s.CreateProject(ctx, p); err != nil {
+				t.Fatalf("CreateProject(%s): %v", p.ID, err)
+			}
+		}
+
+		fault.Arm()
+		payload := mustJSON(t, map[string]any{
+			"action": "deleted",
+			"installation": map[string]any{
+				"id":     instID,
+				"app_id": 42,
+				"account": map[string]any{
+					"login": "acme",
+					"type":  "Organization",
+				},
+			},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Event", "installation")
+		req.Header.Set("X-Hub-Signature-256", signWebhookPayload(payload, "test-webhook-secret"))
+		rec := httptest.NewRecorder()
+		srv.handleGitHubWebhook(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook returned %d: %s", rec.Code, rec.Body.String())
+		}
+
+		assertCursorPaginationCalls(t, paged.recordedCalls(), 3)
+
+		for _, id := range []string{tid("upd-newest"), tid("upd-oldest")} {
+			got, err := s.GetProject(ctx, id)
+			if err != nil {
+				t.Fatalf("GetProject(%s): %v", id, err)
+			}
+			if got.GitHubAppStatus == nil || got.GitHubAppStatus.State != store.GitHubAppStateError {
+				t.Errorf("project %s status = %+v, want error state", id, got.GitHubAppStatus)
+			}
+		}
+	})
+
+	t.Run("checkProjectsForRemovedRepos", func(t *testing.T) {
+		srv, s := webhookTestServer(t)
+		paged, fault := installStoreFault(t, srv, func(inner store.Store, f *storeFaultSwitch) *pagedListProjectsStore {
+			return &pagedListProjectsStore{Store: inner, fault: f, pageSize: 2}
+		})
+		ctx := context.Background()
+
+		instID := int64(31003)
+		if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+			InstallationID: instID,
+			AccountLogin:   "acme",
+			AccountType:    "Organization",
+			AppID:          42,
+			Repositories:   []string{"acme/widgets", "acme/api"},
+			Status:         store.GitHubInstallationStatusActive,
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+
+		newestTime := time.Now().UTC().Add(10 * time.Minute)
+		fixtures := []*store.Project{
+			{
+				ID: tid("rem-oldest"), Name: "Removed Oldest", Slug: tid("rem-oldest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         oldBase, Updated: oldBase,
+			},
+			{
+				ID: tid("rem-filler-1"), Name: "Filler 1", Slug: tid("rem-filler-1"),
+				Created: oldBase.Add(1 * time.Minute), Updated: oldBase.Add(1 * time.Minute),
+			},
+			{
+				ID: tid("rem-filler-2"), Name: "Filler 2", Slug: tid("rem-filler-2"),
+				Created: oldBase.Add(2 * time.Minute), Updated: oldBase.Add(2 * time.Minute),
+			},
+			{
+				ID: tid("rem-filler-3"), Name: "Filler 3", Slug: tid("rem-filler-3"),
+				GitRemote: "https://github.com/acme/api.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         oldBase.Add(3 * time.Minute), Updated: oldBase.Add(3 * time.Minute),
+			},
+			{
+				ID: tid("rem-newest"), Name: "Removed Newest", Slug: tid("rem-newest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubAppStatus: &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:         newestTime, Updated: newestTime,
+			},
+		}
+		for _, p := range fixtures {
+			if err := s.CreateProject(ctx, p); err != nil {
+				t.Fatalf("CreateProject(%s): %v", p.ID, err)
+			}
+		}
+
+		fault.Arm()
+		payload := mustJSON(t, map[string]any{
+			"action":       "removed",
+			"installation": map[string]any{"id": instID},
+			"repositories_removed": []map[string]any{
+				{"id": 1, "full_name": "acme/widgets", "name": "widgets"},
+			},
+			"repositories_added": []map[string]any{},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Event", "installation_repositories")
+		req.Header.Set("X-Hub-Signature-256", signWebhookPayload(payload, "test-webhook-secret"))
+		rec := httptest.NewRecorder()
+		srv.handleGitHubWebhook(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook returned %d: %s", rec.Code, rec.Body.String())
+		}
+
+		assertCursorPaginationCalls(t, paged.recordedCalls(), 3)
+
+		for _, id := range []string{tid("rem-newest"), tid("rem-oldest")} {
+			got, err := s.GetProject(ctx, id)
+			if err != nil {
+				t.Fatalf("GetProject(%s): %v", id, err)
+			}
+			if got.GitHubAppStatus == nil ||
+				got.GitHubAppStatus.State != store.GitHubAppStateError ||
+				got.GitHubAppStatus.ErrorCode != githubapp.ErrCodeRepoNotAccessible {
+				t.Errorf("project %s status = %+v, want error/%s", id, got.GitHubAppStatus, githubapp.ErrCodeRepoNotAccessible)
+			}
+		}
+	})
+
+	t.Run("handleSyncAppPermissions", func(t *testing.T) {
+		mockGH := newMockAppEndpoint(t, http.StatusOK, map[string]any{
+			"id":     42,
+			"slug":   "scion-app",
+			"events": []string{},
+			"permissions": map[string]string{
+				"contents": "read",
+				"metadata": "read",
+			},
+		})
+
+		srv, s := webhookTestServer(t)
+		paged, fault := installStoreFault(t, srv, func(inner store.Store, f *storeFaultSwitch) *pagedListProjectsStore {
+			return &pagedListProjectsStore{Store: inner, fault: f, pageSize: 2}
+		})
+		srv.mu.Lock()
+		srv.config.GitHubAppConfig.PrivateKey = testGitHubAppPrivateKeyPEM(t)
+		srv.config.GitHubAppConfig.APIBaseURL = mockGH.server.URL
+		srv.mu.Unlock()
+
+		ctx := context.Background()
+		instID := int64(31004)
+		if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+			InstallationID: instID,
+			AccountLogin:   "acme",
+			AccountType:    "Organization",
+			AppID:          42,
+			Status:         store.GitHubInstallationStatusActive,
+		}); err != nil {
+			t.Fatalf("CreateGitHubInstallation: %v", err)
+		}
+
+		newestTime := time.Now().UTC().Add(10 * time.Minute)
+		fixtures := []*store.Project{
+			{
+				ID: tid("sync-oldest"), Name: "Sync Oldest", Slug: tid("sync-oldest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubPermissions: &store.GitHubTokenPermissions{Contents: "write", Metadata: "read"},
+				GitHubAppStatus:   &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:           oldBase, Updated: oldBase,
+			},
+			{
+				ID: tid("sync-filler-1"), Name: "Filler 1", Slug: tid("sync-filler-1"),
+				Created: oldBase.Add(1 * time.Minute), Updated: oldBase.Add(1 * time.Minute),
+			},
+			{
+				ID: tid("sync-filler-2"), Name: "Filler 2", Slug: tid("sync-filler-2"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubPermissions: &store.GitHubTokenPermissions{Contents: "read", Metadata: "read"},
+				Created:           oldBase.Add(2 * time.Minute), Updated: oldBase.Add(2 * time.Minute),
+			},
+			{
+				ID: tid("sync-filler-3"), Name: "Filler 3", Slug: tid("sync-filler-3"),
+				Created: oldBase.Add(3 * time.Minute), Updated: oldBase.Add(3 * time.Minute),
+			},
+			{
+				ID: tid("sync-newest"), Name: "Sync Newest", Slug: tid("sync-newest"),
+				GitRemote: "https://github.com/acme/widgets.git", GitHubInstallationID: &instID,
+				GitHubPermissions: &store.GitHubTokenPermissions{Contents: "write", Metadata: "read"},
+				GitHubAppStatus:   &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: oldBase},
+				Created:           newestTime, Updated: newestTime,
+			},
+		}
+		for _, p := range fixtures {
+			if err := s.CreateProject(ctx, p); err != nil {
+				t.Fatalf("CreateProject(%s): %v", p.ID, err)
+			}
+		}
+
+		fault.Arm()
+		rec := doRequest(t, srv, http.MethodPost, "/api/v1/github-app/sync-permissions", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("sync-permissions returned %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			AffectedCount    int              `json:"affected_count"`
+			AffectedProjects []map[string]any `json:"affected_projects"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.AffectedCount != 2 {
+			t.Fatalf("affected_count = %d, want 2 (body: %+v)", resp.AffectedCount, resp)
+		}
+
+		assertCursorPaginationCalls(t, paged.recordedCalls(), 3)
+
+		for _, id := range []string{tid("sync-newest"), tid("sync-oldest")} {
+			got, err := s.GetProject(ctx, id)
+			if err != nil {
+				t.Fatalf("GetProject(%s): %v", id, err)
+			}
+			if got.GitHubAppStatus == nil || got.GitHubAppStatus.State != store.GitHubAppStateDegraded {
+				t.Errorf("project %s status = %+v, want degraded", id, got.GitHubAppStatus)
+			}
+		}
+	})
+}
+
+func TestHandleGitHubWebhook_InstallationReposRemoved_PausesGitHubTriggers(t *testing.T) {
+	srv, s := webhookTestServer(t)
+	ctx := context.Background()
+
+	instID := int64(12345)
+	otherInstID := int64(99999)
+
+	if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
 		InstallationID: instID,
 		AccountLogin:   "acme",
 		AccountType:    "Organization",
@@ -3664,5 +4291,578 @@ func TestHandleGitHubWebhook_SpawnedAgentStandingAndTokenGrant(t *testing.T) {
 	resolved, err = srv.resolveWebhookAgentCreator(ctx, *project)
 	if err != nil || resolved.ID != DevUserID {
 		t.Fatalf("expected fallback to DevUserID (%s), got %v, err=%v", DevUserID, resolved, err)
+		Repositories:   []string{"Acme/Widgets", "acme/api"},
+		Status:         store.GitHubInstallationStatusActive,
+	}); err != nil {
+		t.Fatalf("failed to create installation: %v", err)
+	}
+	if err := s.CreateGitHubInstallation(ctx, &store.GitHubInstallation{
+		InstallationID: otherInstID,
+		AccountLogin:   "acme",
+		AccountType:    "Organization",
+		AppID:          42,
+		Repositories:   []string{"acme/widgets"},
+		Status:         store.GitHubInstallationStatusActive,
+	}); err != nil {
+		t.Fatalf("failed to create other installation: %v", err)
+	}
+
+	projAffectedA := tid("repo-rem-aff-a")
+	projAffectedB := tid("repo-rem-aff-b")
+	projOtherRepo := tid("repo-rem-other-repo")
+	projOtherInst := tid("repo-rem-other-inst")
+
+	now := time.Now().UTC()
+	for _, p := range []*store.Project{
+		{
+			ID:                   projAffectedA,
+			Name:                 "Affected A",
+			Slug:                 "affected-a",
+			GitRemote:            "https://github.com/acme/widgets.git",
+			GitHubInstallationID: &instID,
+			GitHubAppStatus:      &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: now},
+			Created:              now,
+			Updated:              now,
+		},
+		{
+			ID:                   projAffectedB,
+			Name:                 "Affected B",
+			Slug:                 "affected-b",
+			GitRemote:            "git@github.com:ACME/WIDGETS.git", // case-insensitive match
+			GitHubInstallationID: &instID,
+			GitHubAppStatus:      &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: now},
+			Created:              now,
+			Updated:              now,
+		},
+		{
+			ID:                   projOtherRepo,
+			Name:                 "Other Repo",
+			Slug:                 "other-repo",
+			GitRemote:            "https://github.com/acme/api.git",
+			GitHubInstallationID: &instID,
+			GitHubAppStatus:      &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: now},
+			Created:              now,
+			Updated:              now,
+		},
+		{
+			ID:                   projOtherInst,
+			Name:                 "Other Installation",
+			Slug:                 "other-inst",
+			GitRemote:            "https://github.com/acme/widgets.git",
+			GitHubInstallationID: &otherInstID,
+			GitHubAppStatus:      &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: now},
+			Created:              now,
+			Updated:              now,
+		},
+	} {
+		if err := s.CreateProject(ctx, p); err != nil {
+			t.Fatalf("CreateProject(%s): %v", p.ID, err)
+		}
+	}
+
+	// Set a primary routing entry on instID for acme/widgets; §8.4 requires
+	// installation_repositories.removed NOT to edit trigger_routing.
+	if err := s.SetGitHubInstallationTriggerRoute(ctx, instID, "acme/widgets", store.GitHubTriggerRoute{
+		PrimaryProjectID: projAffectedA,
+		SetBy:            "admin-1",
+		SetAt:            now,
+	}); err != nil {
+		t.Fatalf("SetGitHubInstallationTriggerRoute: %v", err)
+	}
+
+	mkTrigger := func(id, projectID, name, sourceKind, sourceID, status, statusReason string) *store.Trigger {
+		tr := &store.Trigger{
+			ID:            tid(id),
+			ProjectID:     projectID,
+			Name:          name,
+			SourceKind:    sourceKind,
+			SourceID:      sourceID,
+			MatchTypes:    []string{"github.issue_comment.created"},
+			ActionType:    store.TriggerActionMessage,
+			ActionPayload: `{"agentId":"agent-1","message":"hi"}`,
+			Status:        status,
+			StatusReason:  statusReason,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		if err := s.CreateTrigger(ctx, tr); err != nil {
+			t.Fatalf("CreateTrigger(%s): %v", id, err)
+		}
+		return tr
+	}
+
+	trAffActiveA := mkTrigger("tr-aff-a-active", projAffectedA, "gh-active-a", store.TriggerSourceKindGitHub, "", store.TriggerStatusActive, store.TriggerStatusReasonNone)
+	trAffUserPausedA := mkTrigger("tr-aff-a-user-paused", projAffectedA, "gh-user-paused-a", store.TriggerSourceKindGitHub, "", store.TriggerStatusPaused, store.TriggerStatusReasonNone)
+	trAffCreatorDelA := mkTrigger("tr-aff-a-creator-del", projAffectedA, "gh-creator-del-a", store.TriggerSourceKindGitHub, "", store.TriggerStatusPaused, store.TriggerStatusReasonCreatorDeleted)
+	trAffWebhookA := mkTrigger("tr-aff-a-webhook", projAffectedA, "wh-active-a", store.TriggerSourceKindWebhook, tid("ep-1"), store.TriggerStatusActive, store.TriggerStatusReasonNone)
+	trAffActiveB := mkTrigger("tr-aff-b-active", projAffectedB, "gh-active-b", store.TriggerSourceKindGitHub, "", store.TriggerStatusActive, store.TriggerStatusReasonNone)
+	trOtherRepo := mkTrigger("tr-other-repo", projOtherRepo, "gh-other-repo", store.TriggerSourceKindGitHub, "", store.TriggerStatusActive, store.TriggerStatusReasonNone)
+	trOtherInst := mkTrigger("tr-other-inst", projOtherInst, "gh-other-inst", store.TriggerSourceKindGitHub, "", store.TriggerStatusActive, store.TriggerStatusReasonNone)
+
+	sendRemovedWebhook := func() {
+		t.Helper()
+		payload := mustJSON(t, map[string]interface{}{
+			"action":       "removed",
+			"installation": map[string]interface{}{"id": instID},
+			"repositories_removed": []map[string]interface{}{
+				{"id": 1, "full_name": "aCmE/wIdGeTs", "name": "widgets"},
+			},
+			"repositories_added": []map[string]interface{}{},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Event", "installation_repositories")
+		req.Header.Set("X-Hub-Signature-256", signWebhookPayload(payload, "test-webhook-secret"))
+		rec := httptest.NewRecorder()
+		srv.handleGitHubWebhook(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	sendRemovedWebhook()
+
+	assertTriggerState := func(id, wantStatus, wantReason string) {
+		t.Helper()
+		got, err := s.GetTrigger(ctx, id)
+		if err != nil {
+			t.Fatalf("GetTrigger(%s): %v", id, err)
+		}
+		if got.Status != wantStatus || got.StatusReason != wantReason {
+			t.Errorf("trigger %s: got (%q, %q), want (%q, %q)", id, got.Status, got.StatusReason, wantStatus, wantReason)
+		}
+	}
+
+	// Affected projects' github triggers paused with source_deleted.
+	assertTriggerState(trAffActiveA.ID, store.TriggerStatusPaused, store.TriggerStatusReasonSourceDeleted)
+	assertTriggerState(trAffUserPausedA.ID, store.TriggerStatusPaused, store.TriggerStatusReasonSourceDeleted)
+	assertTriggerState(trAffActiveB.ID, store.TriggerStatusPaused, store.TriggerStatusReasonSourceDeleted)
+
+	// Already system-paused trigger preserves its existing system reason.
+	assertTriggerState(trAffCreatorDelA.ID, store.TriggerStatusPaused, store.TriggerStatusReasonCreatorDeleted)
+
+	// Webhook trigger on affected project and github triggers on unaffected projects stay active.
+	assertTriggerState(trAffWebhookA.ID, store.TriggerStatusActive, store.TriggerStatusReasonNone)
+	assertTriggerState(trOtherRepo.ID, store.TriggerStatusActive, store.TriggerStatusReasonNone)
+	assertTriggerState(trOtherInst.ID, store.TriggerStatusActive, store.TriggerStatusReasonNone)
+
+	// Primary routing entry on the installation is NOT edited (§8.4).
+	updatedInst, err := s.GetGitHubInstallation(ctx, instID)
+	if err != nil {
+		t.Fatalf("GetGitHubInstallation: %v", err)
+	}
+	route, ok := updatedInst.TriggerRouting["acme/widgets"]
+	if !ok || route.PrimaryProjectID != projAffectedA {
+		t.Errorf("expected trigger_routing[acme/widgets] to stay %q, got %+v", projAffectedA, updatedInst.TriggerRouting)
+	}
+
+	// Exactly 3 mutation audit records written (one per newly paused trigger).
+	audits, _, err := s.ListMutationAudits(ctx, store.MutationAuditFilter{
+		MutationType: mutationTypeTriggerPause,
+		Limit:        100,
+	})
+	if err != nil {
+		t.Fatalf("ListMutationAudits: %v", err)
+	}
+	if len(audits) != 3 {
+		t.Fatalf("expected 3 trigger_pause audit records, got %d", len(audits))
+	}
+	auditedTargets := make(map[string]*store.MutationAuditRecord, len(audits))
+	for _, rec := range audits {
+		auditedTargets[rec.TargetID] = rec
+	}
+	for _, wantID := range []string{trAffActiveA.ID, trAffUserPausedA.ID, trAffActiveB.ID} {
+		rec, exists := auditedTargets[wantID]
+		if !exists {
+			t.Errorf("missing trigger_pause audit for trigger %s", wantID)
+			continue
+		}
+		if !strings.Contains(rec.AfterSummary, store.TriggerStatusReasonSourceDeleted) ||
+			!strings.Contains(rec.AfterSummary, "installation_repositories.removed") {
+			t.Errorf("audit for %s has unexpected AfterSummary: %s", wantID, rec.AfterSummary)
+		}
+	}
+
+	// Redelivery must be idempotent: triggers stay paused, no duplicate audit records.
+	sendRemovedWebhook()
+
+	assertTriggerState(trAffActiveA.ID, store.TriggerStatusPaused, store.TriggerStatusReasonSourceDeleted)
+	assertTriggerState(trAffUserPausedA.ID, store.TriggerStatusPaused, store.TriggerStatusReasonSourceDeleted)
+	assertTriggerState(trAffActiveB.ID, store.TriggerStatusPaused, store.TriggerStatusReasonSourceDeleted)
+
+	auditsAfterRedelivery, _, err := s.ListMutationAudits(ctx, store.MutationAuditFilter{
+		MutationType: mutationTypeTriggerPause,
+		Limit:        100,
+	})
+	if err != nil {
+		t.Fatalf("ListMutationAudits after redelivery: %v", err)
+	}
+	if len(auditsAfterRedelivery) != 3 {
+		t.Errorf("expected 3 trigger_pause audit records after idempotent redelivery, got %d", len(auditsAfterRedelivery))
+	}
+}
+
+func TestResumeGitHubTrigger_RefusedUntilRepoReassociated(t *testing.T) {
+	f := setupTriggersTestFixture(t)
+	ctx := context.Background()
+
+	gh := newFakeGitHubForAssoc(t)
+	f.srv.mu.Lock()
+	f.srv.config.GitHubAppConfig.APIBaseURL = gh.srv.URL
+	f.srv.config.GitHubAppConfig.AppID = 778899
+	f.srv.config.GitHubAppConfig.AppSlug = "scion-bot"
+	f.srv.config.GitHubAppConfig.WebhookSecret = "test-webhook-secret"
+	f.srv.config.GitHubAppConfig.WebhooksEnabled = true
+	f.srv.mu.Unlock()
+
+	setTriggerExperimentsForG1bTest(t, f.srv, true, true)
+
+	sysAdmin := createAssocAdmin(t, f.store, "resume-sys-admin")
+	const instID int64 = 6202
+	createAssocInstallation(t, f.store, instID, "acme", "acme/widgets")
+
+	// Associate the fixture project with instID + Acme/Widgets via admin binding.
+	remote := gh.remote("Acme", "Widgets")
+	proj, err := f.store.GetProject(ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	proj.GitRemote = remote
+	idCopy := instID
+	proj.GitHubInstallationID = &idCopy
+	proj.GitHubAppStatus = &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: time.Now().UTC()}
+	if err := f.store.UpdateProject(ctx, proj); err != nil {
+		t.Fatalf("UpdateProject: %v", err)
+	}
+	setAdminBinding(t, f.store, proj, instID, util.NormalizeGitRemote(remote), sysAdmin.ID)
+	f.srv.invalidateGitHubAssociation(proj.ID)
+
+	// Create an active github trigger.
+	createRec := f.doTrigger(t, f.ownerAuth, "", http.MethodPost, CreateTriggerRequest{
+		Name:   "gh-resume-check",
+		Source: TriggerSourceSpec{Kind: store.TriggerSourceKindGitHub, ID: ""},
+		Match:  &TriggerMatchSpec{Types: []string{"github.issue_comment.created"}},
+		Action: TriggerActionSpec{Type: store.TriggerActionMessage, AgentID: f.agentA.ID, Message: "ping"},
+	})
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create trigger: expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created TriggerResponse
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created trigger: %v", err)
+	}
+
+	// Remove acme/widgets via installation_repositories.removed -> pauses trigger with source_deleted.
+	removePayload := mustJSON(t, map[string]any{
+		"action":       "removed",
+		"installation": map[string]any{"id": instID},
+		"repositories_removed": []map[string]any{
+			{"id": 1, "full_name": "acme/widgets", "name": "widgets"},
+		},
+		"repositories_added": []map[string]any{},
+	})
+	removeReq := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(removePayload))
+	removeReq.Header.Set("X-GitHub-Event", "installation_repositories")
+	removeReq.Header.Set("X-Hub-Signature-256", signWebhookPayload(removePayload, "test-webhook-secret"))
+	removeRec := httptest.NewRecorder()
+	f.srv.handleGitHubWebhook(removeRec, removeReq)
+	if removeRec.Code != http.StatusOK {
+		t.Fatalf("removed webhook: expected 200, got %d: %s", removeRec.Code, removeRec.Body.String())
+	}
+
+	// Attempting to resume while repo is absent from installation.Repositories must return 409 repo_not_accessible.
+	refusedRec := f.doTrigger(t, f.ownerAuth, created.ID+"/resume", http.MethodPost, nil)
+	if refusedRec.Code != http.StatusConflict {
+		t.Fatalf("resume before re-association: expected 409, got %d: %s", refusedRec.Code, refusedRec.Body.String())
+	}
+	if code := decodeAPIErrorCode(t, refusedRec); code != githubapp.ErrCodeRepoNotAccessible {
+		t.Errorf("expected error code %q, got %q (body: %s)", githubapp.ErrCodeRepoNotAccessible, code, refusedRec.Body.String())
+	}
+	if !strings.Contains(refusedRec.Body.String(), "repository list") {
+		t.Errorf("expected clear reason in 409 body, got: %s", refusedRec.Body.String())
+	}
+
+	// Trigger must still be paused with source_deleted.
+	stillPaused, err := f.store.GetTrigger(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetTrigger: %v", err)
+	}
+	if stillPaused.Status != store.TriggerStatusPaused || stillPaused.StatusReason != store.TriggerStatusReasonSourceDeleted {
+		t.Fatalf("expected trigger still paused (source_deleted), got (%q, %q)", stillPaused.Status, stillPaused.StatusReason)
+	}
+
+	// Re-add the repository via installation_repositories.added (mixed case) -> resume now succeeds.
+	addPayload := mustJSON(t, map[string]any{
+		"action":       "added",
+		"installation": map[string]any{"id": instID},
+		"repositories_added": []map[string]any{
+			{"id": 1, "full_name": "Acme/Widgets", "name": "widgets"},
+		},
+		"repositories_removed": []map[string]any{},
+	})
+	addReq := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(addPayload))
+	addReq.Header.Set("X-GitHub-Event", "installation_repositories")
+	addReq.Header.Set("X-Hub-Signature-256", signWebhookPayload(addPayload, "test-webhook-secret"))
+	addRec := httptest.NewRecorder()
+	f.srv.handleGitHubWebhook(addRec, addReq)
+	if addRec.Code != http.StatusOK {
+		t.Fatalf("added webhook: expected 200, got %d: %s", addRec.Code, addRec.Body.String())
+	}
+
+	resumedRec := f.doTrigger(t, f.ownerAuth, created.ID+"/resume", http.MethodPost, nil)
+	if resumedRec.Code != http.StatusOK {
+		t.Fatalf("resume after re-association: expected 200, got %d: %s", resumedRec.Code, resumedRec.Body.String())
+	}
+	resumed, err := f.store.GetTrigger(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetTrigger after resume: %v", err)
+	}
+	if resumed.Status != store.TriggerStatusActive || resumed.StatusReason != store.TriggerStatusReasonNone {
+		t.Fatalf("expected trigger active with empty reason, got (%q, %q)", resumed.Status, resumed.StatusReason)
+	}
+}
+
+func TestResumeGitHubTrigger_UserPausedResumesWithEmptyRepoCache(t *testing.T) {
+	f := setupTriggersTestFixture(t)
+	ctx := context.Background()
+
+	gh := newFakeGitHubForAssoc(t)
+	f.srv.mu.Lock()
+	f.srv.config.GitHubAppConfig.APIBaseURL = gh.srv.URL
+	f.srv.config.GitHubAppConfig.AppID = 778899
+	f.srv.config.GitHubAppConfig.AppSlug = "scion-bot"
+	f.srv.config.GitHubAppConfig.WebhookSecret = "test-webhook-secret"
+	f.srv.config.GitHubAppConfig.WebhooksEnabled = true
+	f.srv.mu.Unlock()
+
+	setTriggerExperimentsForG1bTest(t, f.srv, true, true)
+
+	sysAdmin := createAssocAdmin(t, f.store, "resume-empty-cache-admin")
+	const instID int64 = 6203
+	// Create installation with an empty cached Repositories list (non-authoritative cache).
+	createAssocInstallation(t, f.store, instID, "acme")
+
+	remote := gh.remote("acme", "widgets")
+	proj, err := f.store.GetProject(ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	proj.GitRemote = remote
+	idCopy := instID
+	proj.GitHubInstallationID = &idCopy
+	proj.GitHubAppStatus = &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: time.Now().UTC()}
+	if err := f.store.UpdateProject(ctx, proj); err != nil {
+		t.Fatalf("UpdateProject: %v", err)
+	}
+	setAdminBinding(t, f.store, proj, instID, util.NormalizeGitRemote(remote), sysAdmin.ID)
+	f.srv.invalidateGitHubAssociation(proj.ID)
+
+	createRec := f.doTrigger(t, f.ownerAuth, "", http.MethodPost, CreateTriggerRequest{
+		Name:   "gh-user-paused-empty-cache",
+		Source: TriggerSourceSpec{Kind: store.TriggerSourceKindGitHub, ID: ""},
+		Match:  &TriggerMatchSpec{Types: []string{"github.issue_comment.created"}},
+		Action: TriggerActionSpec{Type: store.TriggerActionMessage, AgentID: f.agentA.ID, Message: "ping"},
+	})
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create trigger: expected 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var created TriggerResponse
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created trigger: %v", err)
+	}
+
+	// User-pause the trigger (StatusReason == "").
+	pauseRec := f.doTrigger(t, f.ownerAuth, created.ID+"/pause", http.MethodPost, nil)
+	if pauseRec.Code != http.StatusOK {
+		t.Fatalf("pause trigger: expected 200, got %d: %s", pauseRec.Code, pauseRec.Body.String())
+	}
+
+	// User-paused trigger must resume even while installation.Repositories is empty.
+	resumeRec := f.doTrigger(t, f.ownerAuth, created.ID+"/resume", http.MethodPost, nil)
+	if resumeRec.Code != http.StatusOK {
+		t.Fatalf("resume user-paused trigger with empty repo cache: expected 200, got %d: %s", resumeRec.Code, resumeRec.Body.String())
+	}
+	resumed, err := f.store.GetTrigger(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetTrigger: %v", err)
+	}
+	if resumed.Status != store.TriggerStatusActive || resumed.StatusReason != store.TriggerStatusReasonNone {
+		t.Fatalf("expected trigger active with empty reason, got (%q, %q)", resumed.Status, resumed.StatusReason)
+	}
+}
+
+func TestInstallationRepositoriesRemoved_ReleasesSubjectClaimsWithAssociationLost(t *testing.T) {
+	f := setupTriggersTestFixture(t)
+	ctx := context.Background()
+
+	gh := newFakeGitHubForAssoc(t)
+	f.srv.mu.Lock()
+	f.srv.config.GitHubAppConfig.APIBaseURL = gh.srv.URL
+	f.srv.config.GitHubAppConfig.AppID = 778899
+	f.srv.config.GitHubAppConfig.AppSlug = "scion-bot"
+	f.srv.config.GitHubAppConfig.WebhookSecret = "test-webhook-secret"
+	f.srv.config.GitHubAppConfig.WebhooksEnabled = true
+	f.srv.mu.Unlock()
+
+	setTriggerExperimentsForG1bTest(t, f.srv, true, true)
+
+	sysAdmin := createAssocAdmin(t, f.store, "claim-release-sys-admin")
+	const instID int64 = 6204
+	createAssocInstallation(t, f.store, instID, "acme", "acme/widgets", "acme/other")
+
+	// Associate fixture project with instID + acme/widgets.
+	remoteA := gh.remote("Acme", "Widgets")
+	projA, err := f.store.GetProject(ctx, f.projectID)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	projA.GitRemote = remoteA
+	idCopy := instID
+	projA.GitHubInstallationID = &idCopy
+	projA.GitHubAppStatus = &store.GitHubAppProjectStatus{State: store.GitHubAppStateOK, LastChecked: time.Now().UTC()}
+	if err := f.store.UpdateProject(ctx, projA); err != nil {
+		t.Fatalf("UpdateProject: %v", err)
+	}
+	setAdminBinding(t, f.store, projA, instID, util.NormalizeGitRemote(remoteA), sysAdmin.ID)
+	f.srv.invalidateGitHubAssociation(projA.ID)
+
+	// Create a second project on acme/other under the same installation; its claims must not be released.
+	remoteB := gh.remote("acme", "other")
+	projB := createAssocProject(t, f.store, "claim-release-other", remoteB, sysAdmin.ID, ptrInt64(instID))
+	setAdminBinding(t, f.store, projB, instID, util.NormalizeGitRemote(remoteB), sysAdmin.ID)
+	f.srv.invalidateGitHubAssociation(projB.ID)
+
+	// Seed a GitHub trigger and a non-GitHub (webhook) trigger in projA, plus a GitHub trigger in projB.
+	ghTrigA := uuid.NewString()
+	if err := f.store.CreateTrigger(ctx, &store.Trigger{
+		ID:            ghTrigA,
+		ProjectID:     projA.ID,
+		Name:          "gh-claim-a",
+		SourceKind:    store.TriggerSourceKindGitHub,
+		MatchTypes:    []string{"github.pull_request.opened"},
+		MatchDialect:  "cel",
+		ActionType:    store.TriggerActionDispatchAgent,
+		ActionPayload: `{"template":"default"}`,
+		SubjectMode:   store.TriggerSubjectModeSkip,
+		Status:        store.TriggerStatusActive,
+	}); err != nil {
+		t.Fatalf("CreateTrigger ghTrigA: %v", err)
+	}
+
+	whTrigA := uuid.NewString()
+	if err := f.store.CreateTrigger(ctx, &store.Trigger{
+		ID:            whTrigA,
+		ProjectID:     projA.ID,
+		Name:          "wh-claim-a",
+		SourceKind:    store.TriggerSourceKindWebhook,
+		SourceID:      uuid.NewString(),
+		MatchTypes:    []string{"*"},
+		MatchDialect:  "cel",
+		ActionType:    store.TriggerActionDispatchAgent,
+		ActionPayload: `{"template":"default"}`,
+		SubjectMode:   store.TriggerSubjectModeSkip,
+		Status:        store.TriggerStatusActive,
+	}); err != nil {
+		t.Fatalf("CreateTrigger whTrigA: %v", err)
+	}
+
+	ghTrigB := uuid.NewString()
+	if err := f.store.CreateTrigger(ctx, &store.Trigger{
+		ID:            ghTrigB,
+		ProjectID:     projB.ID,
+		Name:          "gh-claim-b",
+		SourceKind:    store.TriggerSourceKindGitHub,
+		MatchTypes:    []string{"github.pull_request.opened"},
+		MatchDialect:  "cel",
+		ActionType:    store.TriggerActionDispatchAgent,
+		ActionPayload: `{"template":"default"}`,
+		SubjectMode:   store.TriggerSubjectModeSkip,
+		Status:        store.TriggerStatusActive,
+	}); err != nil {
+		t.Fatalf("CreateTrigger ghTrigB: %v", err)
+	}
+
+	now := time.Now().UTC()
+	seedClaim := func(trigID, subject string) *store.TriggerSubjectClaim {
+		t.Helper()
+		c, existing, err := f.store.ClaimTriggerSubject(ctx, trigID, subject, uuid.NewString(), uuid.NewString(), now, now.Add(-5*time.Minute))
+		if err != nil || existing != nil || c == nil {
+			t.Fatalf("ClaimTriggerSubject(%s, %s): c=%v existing=%v err=%v", trigID, subject, c, existing, err)
+		}
+		if ok, err := f.store.BindTriggerSubjectClaim(ctx, c.ID, c.FireID, f.agentA.ID, now); err != nil || !ok {
+			t.Fatalf("BindTriggerSubjectClaim: ok=%v err=%v", ok, err)
+		}
+		return c
+	}
+
+	seedClaim(ghTrigA, "github:acme/widgets#42")
+	seedClaim(whTrigA, "wh-subject-42")
+	seedClaim(ghTrigB, "github:acme/other#7")
+
+	// Deliver installation_repositories.removed for acme/widgets.
+	removePayload := mustJSON(t, map[string]any{
+		"action":       "removed",
+		"installation": map[string]any{"id": instID},
+		"repositories_removed": []map[string]any{
+			{"id": 1, "full_name": "acme/widgets", "name": "widgets"},
+		},
+		"repositories_added": []map[string]any{},
+	})
+	removeReq := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(removePayload))
+	removeReq.Header.Set("X-GitHub-Event", "installation_repositories")
+	removeReq.Header.Set("X-Hub-Signature-256", signWebhookPayload(removePayload, "test-webhook-secret"))
+	removeRec := httptest.NewRecorder()
+	f.srv.handleGitHubWebhook(removeRec, removeReq)
+	if removeRec.Code != http.StatusOK {
+		t.Fatalf("removed webhook: expected 200, got %d: %s", removeRec.Code, removeRec.Body.String())
+	}
+
+	// projA's GitHub trigger claim must be released; webhook trigger claim and projB's claim stay active.
+	if _, err := f.store.GetActiveTriggerSubjectClaim(ctx, ghTrigA, "github:acme/widgets#42"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected projA GitHub subject claim to be released, got err=%v", err)
+	}
+	if _, err := f.store.GetActiveTriggerSubjectClaim(ctx, whTrigA, "wh-subject-42"); err != nil {
+		t.Fatalf("expected projA webhook subject claim to remain active, got err=%v", err)
+	}
+	if _, err := f.store.GetActiveTriggerSubjectClaim(ctx, ghTrigB, "github:acme/other#7"); err != nil {
+		t.Fatalf("expected projB GitHub subject claim to remain active, got err=%v", err)
+	}
+
+	// projA's GitHub trigger must be paused with source_deleted.
+	pausedTrig, err := f.store.GetTrigger(ctx, ghTrigA)
+	if err != nil {
+		t.Fatalf("GetTrigger ghTrigA: %v", err)
+	}
+	if pausedTrig.Status != store.TriggerStatusPaused || pausedTrig.StatusReason != store.TriggerStatusReasonSourceDeleted {
+		t.Fatalf("expected ghTrigA paused (source_deleted), got (%q, %q)", pausedTrig.Status, pausedTrig.StatusReason)
+	}
+
+	// Re-associate via installation_repositories.added and admin-resume the trigger.
+	addPayload := mustJSON(t, map[string]any{
+		"action":       "added",
+		"installation": map[string]any{"id": instID},
+		"repositories_added": []map[string]any{
+			{"id": 1, "full_name": "acme/widgets", "name": "widgets"},
+		},
+		"repositories_removed": []map[string]any{},
+	})
+	addReq := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/github", bytes.NewReader(addPayload))
+	addReq.Header.Set("X-GitHub-Event", "installation_repositories")
+	addReq.Header.Set("X-Hub-Signature-256", signWebhookPayload(addPayload, "test-webhook-secret"))
+	addRec := httptest.NewRecorder()
+	f.srv.handleGitHubWebhook(addRec, addReq)
+	if addRec.Code != http.StatusOK {
+		t.Fatalf("added webhook: expected 200, got %d: %s", addRec.Code, addRec.Body.String())
+	}
+
+	resumedRec := f.doTrigger(t, f.ownerAuth, ghTrigA+"/resume", http.MethodPost, nil)
+	if resumedRec.Code != http.StatusOK {
+		t.Fatalf("resume after re-association: expected 200, got %d: %s", resumedRec.Code, resumedRec.Body.String())
+	}
+
+	// Because the old claim was released, a new claim on the same subject succeeds cleanly.
+	reclaimed, existing, err := f.store.ClaimTriggerSubject(ctx, ghTrigA, "github:acme/widgets#42", uuid.NewString(), uuid.NewString(), now.Add(time.Minute), now)
+	if err != nil || existing != nil || reclaimed == nil {
+		t.Fatalf("expected fresh claim after re-association, got reclaimed=%v existing=%v err=%v", reclaimed, existing, err)
+>>>>>>> upstream
 	}
 }

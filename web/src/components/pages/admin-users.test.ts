@@ -23,6 +23,9 @@
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 
 import type { AdminUser } from '../../shared/types.js';
+import { clearAdminStatus } from '../../client/admin-status.js';
+import { stateManager } from '../../client/state.js';
+import type { AdminStatus } from '../../lib/admin-permissions.js';
 import { requestBodyText, requestUrl } from '../../client/__fixtures__/request-url.js';
 
 vi.mock('../../utils/toast.js', () => ({ showToast: vi.fn() }));
@@ -58,6 +61,15 @@ function createFetchHandler(users: AdminUser[]) {
     if (path.includes('/auth/me')) {
       return Promise.resolve(jsonResponse({ id: SELF_ID, role: 'admin' }));
     }
+    if (path.includes('/api/v1/auth/admin-status')) {
+      return Promise.resolve(
+        jsonResponse({
+          isAdmin: true,
+          isSuperAdmin: true,
+          permissions: ['user.read', 'user.invite'],
+        } satisfies AdminStatus)
+      );
+    }
     if (method === 'PATCH' && path.includes('/api/v1/users/')) {
       const body = JSON.parse(requestBodyText(init?.body ?? '{}')) as { role?: string };
       const id = path.split('/api/v1/users/')[1];
@@ -77,6 +89,7 @@ function createFetchHandler(users: AdminUser[]) {
 let mod: any;
 
 async function createComponent(users: AdminUser[]) {
+  clearAdminStatus();
   vi.stubGlobal('fetch', vi.fn(createFetchHandler(users)));
   const el = document.createElement('scion-page-admin-users') as HTMLElement & {
     updateComplete: Promise<boolean>;
@@ -1914,5 +1927,585 @@ describe('scion-page-admin-users — copy invite link (ptone/scion#7555)', () =>
     expect(el.inviteCopied).toBe(false);
     expect(showToast).toHaveBeenCalledTimes(1);
     expect(showToast).toHaveBeenCalledWith('Could not copy', 'danger');
+  });
+});
+
+describe('admin-users Roles menu item (D4a–D4c)', () => {
+  let el: (HTMLElement & { updateComplete: Promise<boolean> }) | null = null;
+
+  beforeAll(async () => {
+    mod = await import('./admin-users.js');
+  });
+
+  afterEach(() => {
+    el?.remove();
+    el = null;
+    clearAdminStatus();
+    vi.unstubAllGlobals();
+  });
+
+  async function mountWithPermissions(users: AdminUser[], permissions: string[] | null) {
+    clearAdminStatus();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string | URL | Request) => {
+        const path = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
+        if (path.includes('/auth/me')) {
+          return Promise.resolve(jsonResponse({ id: SELF_ID, role: 'admin' }));
+        }
+        if (path.includes('/api/v1/auth/admin-status')) {
+          if (permissions === null) {
+            return Promise.resolve(jsonResponse({ error: { message: 'fail' } }, 500));
+          }
+          return Promise.resolve(
+            jsonResponse({
+              isAdmin: permissions.length > 0,
+              isSuperAdmin: false,
+              permissions,
+            })
+          );
+        }
+        if (path.includes('/api/v1/users')) {
+          return Promise.resolve(
+            jsonResponse({ users, totalCount: users.length, _capabilities: { actions: ['list'] } })
+          );
+        }
+        return Promise.resolve(jsonResponse([]));
+      })
+    );
+
+    const page = document.createElement('scion-page-admin-users') as HTMLElement & {
+      updateComplete: Promise<boolean>;
+    };
+    document.body.appendChild(page);
+    await page.updateComplete;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await page.updateComplete;
+    el = page;
+    return page;
+  }
+
+  function rowForEmail(page: HTMLElement, email: string): HTMLTableRowElement {
+    const rows = Array.from(page.shadowRoot?.querySelectorAll('tbody tr') ?? []);
+    const row = rows.find((r) => r.textContent?.includes(email)) as HTMLTableRowElement | undefined;
+    expect(row, `expected row for ${email}`).toBeDefined();
+    return row!;
+  }
+
+  function topLevelMenuLabels(row: HTMLTableRowElement): string[] {
+    const menu = row.querySelector('.actions-cell > sl-dropdown > sl-menu');
+    if (!menu) return [];
+    return Array.from(menu.children)
+      .filter((child) => child.tagName.toLowerCase() === 'sl-menu-item')
+      .map((item) => item.textContent?.replace(/\s+/g, ' ').trim() ?? '');
+  }
+
+  it('D4a: shows "Roles" for role_binding.read holders even without user.* mutation capabilities', async () => {
+    const target = makeUser({
+      id: 'u-readonly',
+      email: 'readonly@example.com',
+      status: 'active',
+      _capabilities: { actions: ['read'] },
+    });
+    const page = await mountWithPermissions([target], ['role_binding.read']);
+    const row = rowForEmail(page, 'readonly@example.com');
+
+    expect(topLevelMenuLabels(row)).toEqual(['Roles']);
+    expect(row.querySelector('.actions-cell sl-divider')).toBeNull();
+  });
+
+  it('D4a: omits "Roles" across all row types when caller lacks role_binding.read', async () => {
+    const users = [
+      makeUser({ id: SELF_ID, email: 'self@example.com', status: 'active' }),
+      makeUser({
+        id: 'u-active-full',
+        email: 'active-full@example.com',
+        status: 'active',
+        _capabilities: { actions: ['read', 'update', 'promote', 'suspend', 'delete'] },
+      }),
+      makeUser({
+        id: 'u-active-update-only',
+        email: 'active-update@example.com',
+        status: 'active',
+        _capabilities: { actions: ['read', 'update'] },
+      }),
+      makeUser({
+        id: 'u-susp',
+        email: 'susp@example.com',
+        status: 'suspended',
+        _capabilities: { actions: ['read', 'suspend', 'delete'] },
+      }),
+      makeUser({
+        id: 'u-inv',
+        email: 'inv@example.com',
+        status: 'invited',
+        _capabilities: { actions: ['read', 'delete'] },
+      }),
+      makeUser({
+        id: 'u-del',
+        email: 'del@example.com',
+        status: 'deleting',
+        _capabilities: { actions: ['read', 'delete'] },
+      }),
+    ];
+    const page = await mountWithPermissions(users, ['user.read']);
+
+    expect(
+      rowForEmail(page, 'self@example.com').querySelector('.actions-cell sl-dropdown')
+    ).toBeNull();
+    expect(
+      rowForEmail(page, 'active-update@example.com').querySelector('.actions-cell sl-dropdown')
+    ).toBeNull();
+
+    const activeFullRow = rowForEmail(page, 'active-full@example.com');
+    const activeLabels = topLevelMenuLabels(activeFullRow);
+    expect(activeLabels).not.toContain('Roles');
+    expect(activeLabels).not.toContain('View Roles');
+    // First child of sl-menu should not be an orphan divider.
+    const firstChildTag = activeFullRow
+      .querySelector('.actions-cell > sl-dropdown > sl-menu')
+      ?.firstElementChild?.tagName.toLowerCase();
+    expect(firstChildTag).toBe('sl-menu-item');
+
+    expect(topLevelMenuLabels(rowForEmail(page, 'susp@example.com'))).toEqual([
+      'Reactivate',
+      'Delete',
+    ]);
+    expect(topLevelMenuLabels(rowForEmail(page, 'inv@example.com'))).toEqual(['Remove']);
+    expect(topLevelMenuLabels(rowForEmail(page, 'del@example.com'))).toEqual(['Deletion status']);
+  });
+
+  it('D4b: renders a minimal Roles-only menu on the caller self row and opens the Roles dialog', async () => {
+    const selfUser = makeUser({
+      id: SELF_ID,
+      email: 'self@example.com',
+      displayName: 'Self Admin',
+      status: 'active',
+      _capabilities: { actions: ['read', 'update', 'promote', 'suspend', 'delete'] },
+    });
+    const page = await mountWithPermissions([selfUser], ['role_binding.read']);
+    const row = rowForEmail(page, 'self@example.com');
+
+    expect(topLevelMenuLabels(row)).toEqual(['Roles']);
+    expect(row.querySelector('.actions-cell sl-divider')).toBeNull();
+
+    const rolesItem = row.querySelector<HTMLElement>('.actions-cell sl-menu-item');
+    expect(rolesItem).not.toBeNull();
+    rolesItem!.click();
+    await page.updateComplete;
+
+    const dialog = page.shadowRoot?.querySelector('sl-dialog.roles-dialog');
+    expect(dialog).not.toBeNull();
+    expect(dialog?.getAttribute('label')).toBe('Roles — Self Admin');
+  });
+
+  it('D4c: shows "Roles" on suspended, invited, and deleting rows with or without user.* actions', async () => {
+    const users = [
+      makeUser({
+        id: 'u-susp-actions',
+        email: 'susp-actions@example.com',
+        status: 'suspended',
+        _capabilities: { actions: ['read', 'suspend', 'delete'] },
+      }),
+      makeUser({
+        id: 'u-susp-ro',
+        email: 'susp-ro@example.com',
+        status: 'suspended',
+        _capabilities: { actions: ['read'] },
+      }),
+      makeUser({
+        id: 'u-inv-actions',
+        email: 'inv-actions@example.com',
+        status: 'invited',
+        _capabilities: { actions: ['read', 'delete'] },
+      }),
+      makeUser({
+        id: 'u-inv-ro',
+        email: 'inv-ro@example.com',
+        status: 'invited',
+        _capabilities: { actions: ['read'] },
+      }),
+      makeUser({
+        id: 'u-del-actions',
+        email: 'del-actions@example.com',
+        status: 'deleting',
+        _capabilities: { actions: ['read', 'delete'] },
+      }),
+      makeUser({
+        id: 'u-del-ro',
+        email: 'del-ro@example.com',
+        status: 'deleting',
+        _capabilities: { actions: ['read'] },
+      }),
+    ];
+    const page = await mountWithPermissions(users, ['role_binding.read']);
+
+    const suspActions = rowForEmail(page, 'susp-actions@example.com');
+    expect(topLevelMenuLabels(suspActions)).toEqual(['Roles', 'Reactivate', 'Delete']);
+    expect(suspActions.querySelectorAll('.actions-cell sl-divider').length).toBe(2);
+
+    const suspRo = rowForEmail(page, 'susp-ro@example.com');
+    expect(topLevelMenuLabels(suspRo)).toEqual(['Roles']);
+    expect(suspRo.querySelector('.actions-cell sl-divider')).toBeNull();
+
+    const invActions = rowForEmail(page, 'inv-actions@example.com');
+    expect(topLevelMenuLabels(invActions)).toEqual(['Roles', 'Remove']);
+    expect(invActions.querySelectorAll('.actions-cell sl-divider').length).toBe(1);
+
+    const invRo = rowForEmail(page, 'inv-ro@example.com');
+    expect(topLevelMenuLabels(invRo)).toEqual(['Roles']);
+    expect(invRo.querySelector('.actions-cell sl-divider')).toBeNull();
+
+    const delActions = rowForEmail(page, 'del-actions@example.com');
+    expect(topLevelMenuLabels(delActions)).toEqual(['Roles', 'Deletion status']);
+    expect(delActions.querySelectorAll('.actions-cell sl-divider').length).toBe(1);
+
+    const delRo = rowForEmail(page, 'del-ro@example.com');
+    expect(topLevelMenuLabels(delRo)).toEqual(['Roles']);
+    expect(delRo.querySelector('.actions-cell sl-divider')).toBeNull();
+  });
+});
+
+describe('scion-page-admin-users — Invite User / Import CSV permission gating (ptone/scion#8179)', () => {
+  let element: HTMLElement | null = null;
+
+  beforeAll(async () => {
+    vi.stubGlobal('fetch', vi.fn(createFetchHandler([])));
+    mod = await import('./admin-users.js');
+  });
+
+  afterEach(() => {
+    element?.remove();
+    element = null;
+    clearAdminStatus();
+    vi.restoreAllMocks();
+  });
+
+  function buttonLabels(el: HTMLElement): string[] {
+    return Array.from(el.shadowRoot?.querySelectorAll('sl-button') ?? []).map(
+      (b) => b.textContent?.trim() ?? ''
+    );
+  }
+
+  async function mountWithStatus(
+    users: AdminUser[],
+    adminStatusResponse: () => Response,
+    authMeRole = 'member'
+  ): Promise<HTMLElement> {
+    clearAdminStatus();
+    const base = createFetchHandler(users);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string | URL | Request, init?: RequestInit) => {
+        const path = requestUrl(url);
+        if (path.includes('/auth/me')) {
+          return Promise.resolve(jsonResponse({ id: SELF_ID, role: authMeRole }));
+        }
+        if (path.includes('/api/v1/auth/admin-status')) {
+          return Promise.resolve(adminStatusResponse());
+        }
+        return base(url, init);
+      })
+    );
+    const el = document.createElement('scion-page-admin-users') as HTMLElement & {
+      updateComplete: Promise<boolean>;
+    };
+    document.body.appendChild(el);
+    await el.updateComplete;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await el.updateComplete;
+    return el;
+  }
+
+  it('hides Invite User and Import CSV in the toolbar for a hub member without user.invite', async () => {
+    element = await mountWithStatus([makeUser({ _capabilities: { actions: ['read'] } })], () =>
+      jsonResponse({
+        isAdmin: false,
+        isSuperAdmin: false,
+        permissions: ['user.read'],
+      } satisfies AdminStatus)
+    );
+
+    const labels = buttonLabels(element);
+    expect(labels).not.toContain('Invite User');
+    expect(labels).not.toContain('Import CSV');
+  });
+
+  it('hides Invite User in the empty state for a hub member without user.invite', async () => {
+    element = await mountWithStatus([], () =>
+      jsonResponse({
+        isAdmin: false,
+        isSuperAdmin: false,
+        permissions: ['user.read'],
+      } satisfies AdminStatus)
+    );
+
+    const labels = buttonLabels(element);
+    expect(labels).not.toContain('Invite User');
+    expect(element.shadowRoot?.querySelector('.empty-state p')?.textContent?.trim()).toBe(
+      'There are no users registered in the system.'
+    );
+  });
+
+  it('shows Invite User and Import CSV when the viewer holds user.invite (even with isAdmin=false)', async () => {
+    element = await mountWithStatus([makeUser({ _capabilities: { actions: ['read'] } })], () =>
+      jsonResponse({
+        isAdmin: false,
+        isSuperAdmin: false,
+        permissions: ['user.read', 'user.invite'],
+      } satisfies AdminStatus)
+    );
+
+    const labels = buttonLabels(element);
+    expect(labels).toContain('Invite User');
+    expect(labels).toContain('Import CSV');
+  });
+
+  it('shows Invite User in the empty state when the viewer holds user.invite', async () => {
+    element = await mountWithStatus([], () =>
+      jsonResponse({
+        isAdmin: true,
+        isSuperAdmin: false,
+        permissions: ['user.read', 'user.invite'],
+      } satisfies AdminStatus)
+    );
+
+    expect(buttonLabels(element)).toContain('Invite User');
+  });
+
+  it('fails closed when admin-status fails', async () => {
+    element = await mountWithStatus(
+      [makeUser()],
+      () => jsonResponse({ error: 'unavailable' }, 500),
+      'admin'
+    );
+
+    const labels = buttonLabels(element);
+    expect(labels).not.toContain('Invite User');
+    expect(labels).not.toContain('Import CSV');
+  });
+});
+
+describe('scion-page-admin-users — Invite Codes tab permission gating (ptone/scion#8345)', () => {
+  type TabPage = HTMLElement & {
+    updateComplete: Promise<boolean>;
+    activeTab: 'users' | 'invites';
+    loadInvites(): Promise<void>;
+  };
+  let element: TabPage | null = null;
+
+  beforeAll(async () => {
+    vi.stubGlobal('fetch', vi.fn(createFetchHandler([])));
+    mod = await import('./admin-users.js');
+  });
+
+  afterEach(() => {
+    element?.remove();
+    element = null;
+    clearAdminStatus();
+    vi.restoreAllMocks();
+  });
+
+  async function mountWithStatus(
+    adminStatusResponse: () => Response,
+    authMeRole = 'member',
+    invitesResponse: () => Response = () => jsonResponse({ items: [], totalCount: 0 })
+  ): Promise<TabPage> {
+    clearAdminStatus();
+    const base = createFetchHandler([makeUser({ _capabilities: { actions: ['read'] } })]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string | URL | Request, init?: RequestInit) => {
+        const path = requestUrl(url);
+        if (path.includes('/auth/me')) {
+          return Promise.resolve(jsonResponse({ id: SELF_ID, role: authMeRole }));
+        }
+        if (path.includes('/api/v1/auth/admin-status')) {
+          return Promise.resolve(adminStatusResponse());
+        }
+        if (path.includes('/api/v1/admin/invites')) {
+          return Promise.resolve(invitesResponse());
+        }
+        return base(url, init);
+      })
+    );
+    const el = document.createElement('scion-page-admin-users') as TabPage;
+    document.body.appendChild(el);
+    await el.updateComplete;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await el.updateComplete;
+    return el;
+  }
+
+  function inviteRequests(): string[] {
+    return vi
+      .mocked(fetch)
+      .mock.calls.map(([url]) => requestUrl(url))
+      .filter((u) => u.includes('/api/v1/admin/invites'));
+  }
+
+  function inviteCodesTab(el: HTMLElement): HTMLElement | null {
+    return (
+      el.shadowRoot?.querySelector<HTMLElement>('.tab-btn[aria-controls="panel-invites"]') ?? null
+    );
+  }
+
+  it('hides the Invite Codes tab and makes no invite request for a read-only user (user.read only)', async () => {
+    element = await mountWithStatus(
+      () =>
+        jsonResponse({
+          isAdmin: false,
+          isSuperAdmin: false,
+          permissions: ['user.read'],
+        } satisfies AdminStatus),
+      'member',
+      () => jsonResponse({ error: { code: 'forbidden', message: 'forbidden' } }, 403)
+    );
+
+    expect(inviteCodesTab(element)).toBeNull();
+    expect(inviteRequests()).toEqual([]);
+  });
+
+  it('shows the Invite Codes tab and loads invites when the viewer holds user.invite (even with isAdmin=false)', async () => {
+    element = await mountWithStatus(
+      () =>
+        jsonResponse({
+          isAdmin: false,
+          isSuperAdmin: false,
+          permissions: ['user.read', 'user.invite'],
+        } satisfies AdminStatus),
+      'member',
+      () =>
+        jsonResponse({
+          items: [
+            {
+              id: 'inv-1',
+              codePrefix: 'scn_abc',
+              createdBy: SELF_ID,
+              createdAt: '2026-01-01T00:00:00Z',
+              expiresAt: '2099-01-01T00:00:00Z',
+              maxUses: 5,
+              useCount: 1,
+              revoked: false,
+              note: 'team invite',
+            },
+          ],
+          totalCount: 1,
+        })
+    );
+
+    const tab = inviteCodesTab(element);
+    expect(tab).not.toBeNull();
+    expect(inviteRequests()).toEqual([]);
+
+    tab!.click();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await element.updateComplete;
+
+    expect(inviteRequests()).toHaveLength(1);
+    expect(element.shadowRoot?.textContent).toContain('scn_abc...');
+    expect(element.shadowRoot?.textContent).toContain('1 invite code');
+  });
+
+  it('shows the Invite Codes tab for a super-admin even with an empty permissions array', async () => {
+    element = await mountWithStatus(
+      () =>
+        jsonResponse({
+          isAdmin: true,
+          isSuperAdmin: true,
+          permissions: [],
+        } satisfies AdminStatus),
+      'admin'
+    );
+
+    const tab = inviteCodesTab(element);
+    expect(tab).not.toBeNull();
+    tab!.click();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await element.updateComplete;
+
+    expect(inviteRequests()).toHaveLength(1);
+    expect(element.shadowRoot?.textContent).toContain('No Invite Codes');
+  });
+
+  it('fails closed when admin-status fails', async () => {
+    element = await mountWithStatus(() => jsonResponse({ error: 'unavailable' }, 500), 'admin');
+
+    expect(inviteCodesTab(element)).toBeNull();
+    expect(inviteRequests()).toEqual([]);
+  });
+
+  it('does not render the invites panel or fetch invites if invoked without user.invite', async () => {
+    element = await mountWithStatus(() =>
+      jsonResponse({
+        isAdmin: false,
+        isSuperAdmin: false,
+        permissions: ['user.read'],
+      } satisfies AdminStatus)
+    );
+
+    element.activeTab = 'invites';
+    await element.loadInvites();
+    await element.updateComplete;
+
+    expect(inviteRequests()).toEqual([]);
+    expect(element.shadowRoot?.textContent).not.toContain('Create Invite Code');
+  });
+
+  it('ignores a stale admin-status response from a previous user after /auth/me resolves a different user', async () => {
+    clearAdminStatus();
+    vi.spyOn(stateManager, 'getCurrentUserId').mockReturnValue('u-previous');
+
+    let resolvePreviousStatus!: (res: Response) => void;
+    let adminStatusCallCount = 0;
+    const base = createFetchHandler([makeUser({ _capabilities: { actions: ['read'] } })]);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string | URL | Request, init?: RequestInit) => {
+        const path = requestUrl(url);
+        if (path.includes('/auth/me')) {
+          return Promise.resolve(jsonResponse({ id: SELF_ID, role: 'member' }));
+        }
+        if (path.includes('/api/v1/auth/admin-status')) {
+          adminStatusCallCount++;
+          if (adminStatusCallCount === 1) {
+            return new Promise<Response>((resolve) => {
+              resolvePreviousStatus = resolve;
+            });
+          }
+          return Promise.resolve(
+            jsonResponse({
+              isAdmin: false,
+              isSuperAdmin: false,
+              permissions: ['user.read', 'user.invite'],
+            } satisfies AdminStatus)
+          );
+        }
+        return base(url, init);
+      })
+    );
+
+    element = document.createElement('scion-page-admin-users') as TabPage;
+    document.body.appendChild(element);
+    await element.updateComplete;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await element.updateComplete;
+
+    expect(adminStatusCallCount).toBe(2);
+    expect(inviteCodesTab(element)).not.toBeNull();
+
+    // Now resolve the earlier user's superseded request; it must not clobber SELF_ID's permission.
+    resolvePreviousStatus(
+      jsonResponse({
+        isAdmin: false,
+        isSuperAdmin: false,
+        permissions: ['user.read'],
+      } satisfies AdminStatus)
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await element.updateComplete;
+
+    expect(inviteCodesTab(element)).not.toBeNull();
   });
 });

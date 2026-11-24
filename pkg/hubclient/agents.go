@@ -101,6 +101,9 @@ type AgentService interface {
 	// Exec executes a command in an agent container.
 	Exec(ctx context.Context, agentID string, command []string, timeout int) (*ExecResponse, error)
 
+	// GetScreen retrieves the terminal screen saved before an agent's most recent suspend.
+	GetScreen(ctx context.Context, agentID string) (*AgentScreen, error)
+
 	// GetLogs retrieves agent logs.
 	GetLogs(ctx context.Context, agentID string, opts *GetLogsOptions) (string, error)
 
@@ -202,6 +205,10 @@ type ListAgentsOptions struct {
 	// per listed agent.
 	IncludeAuthority bool
 
+	// IncludeCapabilities asks the Hub to include each agent's
+	// resolvedHarness and harnessCapabilities (include=capabilities).
+	IncludeCapabilities bool
+
 	Page apiclient.PageOptions
 }
 
@@ -234,23 +241,27 @@ type StopAllResponse struct {
 
 // CreateAgentRequest is the request body for creating an agent.
 type CreateAgentRequest struct {
-	Name            string            `json:"name"`
-	ProjectID       string            `json:"projectId"`
-	Template        string            `json:"template,omitempty"`
-	HarnessConfig   string            `json:"harnessConfig,omitempty"` // Explicit harness config name (used during sync when template may not be on Hub)
-	HarnessAuth     string            `json:"harnessAuth,omitempty"`   // Late-binding override for auth_selected_type
-	RuntimeBrokerID string            `json:"runtimeBrokerId,omitempty"`
-	Profile         string            `json:"profile,omitempty"`
-	Task            string            `json:"task,omitempty"`
-	Branch          string            `json:"branch,omitempty"`
-	Workspace       string            `json:"workspace,omitempty"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	Annotations     map[string]string `json:"annotations,omitempty"`
-	Config          *api.ScionConfig  `json:"config,omitempty"`
-	Resume          bool              `json:"resume,omitempty"`
-	ForceResume     bool              `json:"forceResume,omitempty"`
-	Attach          bool              `json:"attach,omitempty"`        // If true, signals interactive attach mode to the broker/harness
-	ProvisionOnly   bool              `json:"provisionOnly,omitempty"` // If true, provision only (write task to prompt.md) without starting
+	Name            string `json:"name"`
+	ProjectID       string `json:"projectId"`
+	Template        string `json:"template,omitempty"`
+	HarnessConfig   string `json:"harnessConfig,omitempty"` // Explicit harness config name (used during sync when template may not be on Hub)
+	HarnessAuth     string `json:"harnessAuth,omitempty"`   // Late-binding override for auth_selected_type
+	RuntimeBrokerID string `json:"runtimeBrokerId,omitempty"`
+	Profile         string `json:"profile,omitempty"`
+	// ManagedAgent selects hub-direct managed-agent execution (e.g. managed:google),
+	// bypassing Runtime Brokers entirely. Mutually exclusive with RuntimeBrokerID,
+	// ExpectedRuntimeTargetID, and Runtime Broker Profile selection.
+	ManagedAgent  bool              `json:"managedAgent,omitempty"`
+	Task          string            `json:"task,omitempty"`
+	Branch        string            `json:"branch,omitempty"`
+	Workspace     string            `json:"workspace,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Annotations   map[string]string `json:"annotations,omitempty"`
+	Config        *api.ScionConfig  `json:"config,omitempty"`
+	Resume        bool              `json:"resume,omitempty"`
+	ForceResume   bool              `json:"forceResume,omitempty"`
+	Attach        bool              `json:"attach,omitempty"`        // If true, signals interactive attach mode to the broker/harness
+	ProvisionOnly bool              `json:"provisionOnly,omitempty"` // If true, provision only (write task to prompt.md) without starting
 	// WorkspaceFiles is populated for non-git workspace bootstrap.
 	WorkspaceFiles []transfer.FileInfo `json:"workspaceFiles,omitempty"`
 
@@ -293,6 +304,22 @@ type CreateAgentRequest struct {
 	// on a different runtime target than the caller showed
 	// (.design/flat-runtime-brokers-contract.md section 9).
 	ExpectedRuntimeTargetID string `json:"expectedRuntimeTargetId,omitempty"`
+
+	// Secrets supplies agent-scoped secrets to store at creation time (behind
+	// hub.agent_secrets). Never persisted on the agent record.
+	Secrets []AgentSecretInput `json:"secrets,omitempty"`
+}
+
+// AgentSecretInput describes an agent-scoped secret supplied at agent creation
+// (or existing-agent start) time.
+type AgentSecretInput struct {
+	Key           string `json:"key"`
+	Value         string `json:"value"` // base64-encoded when Encoding == "base64"; raw UTF-8 otherwise
+	Encoding      string `json:"encoding,omitempty"`
+	Type          string `json:"type,omitempty"` // environment (default) | file | variable
+	Target        string `json:"target,omitempty"`
+	InjectionMode string `json:"injectionMode,omitempty"`
+	Description   string `json:"description,omitempty"`
 }
 
 // GCPIdentityConfig specifies GCP identity configuration for agent creation.
@@ -486,8 +513,15 @@ func (s *agentService) List(ctx context.Context, opts *ListAgentsOptions) (*List
 		if opts.LineageRootID != "" {
 			query.Set("lineageRootId", opts.LineageRootID)
 		}
+		var includes []string
 		if opts.IncludeAuthority {
-			query.Set("include", "authority")
+			includes = append(includes, "authority")
+		}
+		if opts.IncludeCapabilities {
+			includes = append(includes, "capabilities")
+		}
+		if len(includes) > 0 {
+			query.Set("include", strings.Join(includes, ","))
 		}
 		opts.Page.ToQuery(query)
 	}
@@ -1058,27 +1092,34 @@ type OutboundMessageRequest struct {
 	// AttachmentIDs names attachments the sending agent uploaded, by id
 	// (ptone/scion#4596). Attachments keeps meaning staged paths.
 	AttachmentIDs []string `json:"attachment_ids,omitempty"`
-	// Choices makes the message a choice prompt: the decisions as the JSON
-	// array scion message --choices takes. The hub validates them (the
-	// web.chat_choices experiment); Msg is then the optional intro.
-	Choices json.RawMessage `json:"choices,omitempty"`
-	// ChoicesUpdate lets Choices replace decisions whose keys exist.
-	ChoicesUpdate bool `json:"choices_update,omitempty"`
+	// Decisions makes the message a decision prompt: the decisions as the JSON
+	// array scion message takes. The hub validates them (the web.decisions
+	// experiment); Msg is then the optional intro.
+	Decisions json.RawMessage `json:"decisions,omitempty"`
+	// DecisionsUpdate lets Decisions replace decisions whose keys exist.
+	DecisionsUpdate bool `json:"decisions_update,omitempty"`
+	// SecretRequests makes the message a secret request prompt: the requested
+	// keys as a JSON array of SecretRequestInput. The hub validates them (the
+	// hub.agent_secrets experiment); Msg is then the optional intro.
+	SecretRequests json.RawMessage `json:"secret_requests,omitempty"`
+	// SecretRequestsUpdate lets SecretRequests replace pending secret requests
+	// whose keys already exist.
+	SecretRequestsUpdate bool `json:"secret_requests_update,omitempty"`
 }
 
-// ChoiceDecisionResult is one decision of a sent choice prompt.
-type ChoiceDecisionResult struct {
-	Key      string                  `json:"key"`
-	Version  int                     `json:"version"`
-	Ref      string                  `json:"ref"`
-	RowID    string                  `json:"row_id,omitempty"`
-	Replaced *ChoiceReplacedDecision `json:"replaced"`
+// DecisionSendResult is one decision of a sent decision prompt.
+type DecisionSendResult struct {
+	Key      string            `json:"key"`
+	Version  int               `json:"version"`
+	Ref      string            `json:"ref"`
+	RowID    string            `json:"row_id,omitempty"`
+	Replaced *DecisionReplaced `json:"replaced"`
 }
 
-// ChoiceReplacedDecision is the version a choice prompt replaced.
+// DecisionReplaced is the version a decision prompt replaced.
 // For a decided version, Answer is the effective answer's label and
 // AnsweredBy who gave it (the name, else the email).
-type ChoiceReplacedDecision struct {
+type DecisionReplaced struct {
 	Version    int    `json:"version"`
 	Status     string `json:"status"`
 	Answer     string `json:"answer,omitempty"`
@@ -1130,9 +1171,13 @@ type OutboundMessageResult struct {
 	// attachment was recorded, or on hubs that predate this field.
 	AttachmentWarnings []AttachmentWarning `json:"attachment_warnings,omitempty"`
 
-	// Decisions lists the decisions of a choice prompt, one per decision
+	// Decisions lists the decisions of a decision prompt, one per decision
 	// sent; empty for any other message.
-	Decisions []ChoiceDecisionResult `json:"decisions,omitempty"`
+	Decisions []DecisionSendResult `json:"decisions,omitempty"`
+
+	// SecretRequests lists the secret requests of a secret-request prompt, one
+	// per key sent; empty for any other message.
+	SecretRequests []messages.SecretRequestSendResult `json:"secret_requests,omitempty"`
 }
 
 // SendOutboundMessage sends a message from an agent via the outbound endpoint.
@@ -1194,6 +1239,24 @@ func (s *agentService) Exec(ctx context.Context, agentID string, command []strin
 		return nil, err
 	}
 	return apiclient.DecodeRequired[ExecResponse](resp)
+}
+
+// AgentScreen is the saved terminal screen returned by GET .../agents/{id}/screen.
+type AgentScreen struct {
+	AgentID    string    `json:"agentId"`
+	Content    string    `json:"content"`
+	CapturedAt time.Time `json:"capturedAt"`
+	Truncated  bool      `json:"truncated"`
+	Phase      string    `json:"phase"`
+}
+
+// GetScreen retrieves the terminal screen saved before an agent's most recent suspend.
+func (s *agentService) GetScreen(ctx context.Context, agentID string) (*AgentScreen, error) {
+	resp, err := s.c.get(ctx, s.agentPath(agentID)+"/screen", nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[AgentScreen](resp)
 }
 
 // GetLogs retrieves agent logs.
@@ -1477,10 +1540,12 @@ type MoveCheck struct {
 }
 
 // FieldChange describes an old→new change to a single scalar field on the
-// reincarnation plan.
+// reincarnation plan, with an optional hub-written reason explaining why the
+// field changed (or noting broker-side resolution).
 type FieldChange struct {
-	Old string `json:"old,omitempty"`
-	New string `json:"new,omitempty"`
+	Old    string `json:"old,omitempty"`
+	New    string `json:"new,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // KeyDiff describes an old→new change to a set of map keys (e.g. env var
@@ -1513,7 +1578,9 @@ type ReincarnationPlan struct {
 
 	// HomeReset is set when the reincarnation deletes and rebuilds the
 	// agent's home (a harness switch); Warnings[0] is then the home-reset
-	// warning. Harness is the harness-config name old→new.
-	HomeReset bool         `json:"homeReset,omitempty"`
-	Harness   *FieldChange `json:"harness,omitempty"`
+	// warning. Harness is the harness-config name old→new. HarnessName is
+	// the resolved harness-config name for the new generation.
+	HomeReset   bool         `json:"homeReset,omitempty"`
+	Harness     *FieldChange `json:"harness,omitempty"`
+	HarnessName string       `json:"harnessName,omitempty"`
 }

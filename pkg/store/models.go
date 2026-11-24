@@ -69,6 +69,20 @@ type Agent struct {
 	// Stalled detection
 	StalledFromActivity string `json:"stalledFromActivity,omitempty"` // Activity before stalled; empty when not stalled
 
+	// ActivitySince is when Activity last changed value; nil when phase is
+	// not running. The store manages it: UpdateAgent and CreateAgent ignore
+	// the caller's value. It is internal (the idle-suspend grace reads it)
+	// and not part of the API response.
+	ActivitySince *time.Time `json:"-"`
+
+	// SuspendReason is why the agent is suspended (state.SuspendReason:
+	// user, idle, stalled); empty when it is not suspended, or was
+	// suspended without a recorded reason. Written only by
+	// UpdateAgentStatus (AgentStatusUpdate.SuspendReason) with the
+	// suspended phase; UpdateAgent never writes it, and any write of a phase
+	// other than suspended or starting clears it.
+	SuspendReason string `json:"suspendReason,omitempty"`
+
 	// Runtime configuration
 	Image           string        `json:"image,omitempty"`
 	Detached        bool          `json:"detached"`
@@ -128,6 +142,14 @@ type Agent struct {
 	LastSeen          time.Time `json:"lastSeen,omitempty"`
 	LastActivityEvent time.Time `json:"lastActivityEvent,omitempty"`
 	DeletedAt         time.Time `json:"deletedAt,omitempty"`
+
+	// Live work (ptone/scion#7855): written only by UpdateAgentStatus from
+	// the container's heartbeat (AgentStatusUpdate.LiveWork); nil until the
+	// first report. LastLiveProcessAt is any live work and guards
+	// auto-suspend (HasRecentLiveWork); LastLiveWorkAt is live work that
+	// suppresses STALLED and is read by the stall sweep.
+	LastLiveProcessAt *time.Time `json:"lastLiveProcessAt,omitempty"`
+	LastLiveWorkAt    *time.Time `json:"lastLiveWorkAt,omitempty"`
 
 	// Ownership
 	CreatedBy   string `json:"createdBy,omitempty"`
@@ -260,6 +282,24 @@ type Agent struct {
 	// StartClaimLaunchID is the launch a create claim is linked to ("" when
 	// none): only that launch's end settles the claim.
 	StartClaimLaunchID string `json:"-"`
+
+	// Idle auto-suspend delivery handshake (see idle_suspend.go).
+	// LastDeliveryAt is the store-clock time an inbound item was last handed
+	// to a running/starting agent; IdleSuspendClaimUntil is the lease expiry
+	// of an in-flight idle auto-suspend. Internal bookkeeping, untagged like
+	// the start_claim_* columns; UpdateAgent and CreateAgent never write them.
+	LastDeliveryAt        *time.Time `json:"-"`
+	IdleSuspendClaimUntil *time.Time `json:"-"`
+	// IdleSuspendClaimActive is true when MarkAgentDelivery observed an
+	// unexpired IdleSuspendClaimUntil against the store clock (storeNow) on
+	// this snapshot. Populated by MarkAgentDelivery so hub callers do not
+	// compare store-clock leases against replica wall clocks.
+	IdleSuspendClaimActive bool `json:"-"`
+	// IdleSuspendClaimLeaseActive is the strict form: the lease itself is
+	// unexpired on the store clock. Delivery paths use IdleSuspendClaimActive;
+	// paths that may act on an agent whose idle stop never landed (the
+	// intent-stop backstop) use this one.
+	IdleSuspendClaimLeaseActive bool `json:"-"`
 
 	// Launch is the computed, client-facing view of the launch_* columns
 	// above (design §3.2; see launch_view.go). It is nil unless a
@@ -436,9 +476,11 @@ type AgentAppliedConfig struct {
 	Workspace     string              `json:"workspace,omitempty"` // Host path to mount as /workspace (overrides default project root)
 	GitClone      *api.GitCloneConfig `json:"gitClone,omitempty"`
 
-	// Template info for Runtime Broker hydration
-	TemplateID   string `json:"templateId,omitempty"`   // Hub template ID for fetching
-	TemplateHash string `json:"templateHash,omitempty"` // Content hash for cache validation
+	// Template info for Runtime Broker hydration and provenance
+	TemplateID           string `json:"templateId,omitempty"`           // Hub template ID for fetching
+	TemplateHash         string `json:"templateHash,omitempty"`         // Content hash for cache validation
+	TemplateSourceURL    string `json:"templateSourceUrl,omitempty"`    // Template source URL at agent create time
+	TemplateSourceCommit string `json:"templateSourceCommit,omitempty"` // Template source commit SHA at agent create time
 
 	// RuntimeTargetCandidate is a target reported by one heartbeat that
 	// differs from RuntimeTarget. It becomes RuntimeTarget only when the next
@@ -505,6 +547,16 @@ type AgentAppliedConfig struct {
 	// AgentRole is the effective authorization role resolved at creation time.
 	// Determines which JWT scopes the agent receives. Immutable after creation.
 	AgentRole string `json:"agentRole,omitempty"`
+
+	// GitHubTokenPreference controls GitHub token delivery precedence for
+	// trigger-dispatched agents (Stage 2 design §5.1a): "" or "user_preferred"
+	// keeps the default user-PAT-over-App precedence; "installation" drops all
+	// blocked GitHub token keys (GITHUB_TOKEN, GH_* aliases,
+	// SCION_USER_GITHUB_TOKEN) from every scope (user, project, hub, broker) so
+	// only the project's GitHub App installation token (or no GitHub token at
+	// all when none is installed) is delivered. Immutable after creation and
+	// preserved across reincarnation.
+	GitHubTokenPreference string `json:"githubTokenPreference,omitempty"`
 
 	// AgentRoleGrandfathered records that AgentRole was assigned by the
 	// pre-role backfill, not by an explicit grant. It is provenance only.
@@ -880,6 +932,19 @@ type AgentCreateInputs struct {
 	// (hub-managed workspace path, shared-workspace default branch) ran.
 	Branch    string `json:"branch,omitempty"`
 	Workspace string `json:"workspace,omitempty"`
+
+	// HomeFilesPending is true from agent row commit until the create dispatch
+	// delivers the agent's required create-time HomeFiles (e.g. a trigger's
+	// .scion/trigger-event.json). While true, generic start paths refuse to
+	// launch the agent so a concurrent start can never start it without its
+	// event file. Cleared once the create dispatch succeeds (or an accepted
+	// async create launch reports succeeded).
+	HomeFilesPending bool `json:"homeFilesPending,omitempty"`
+
+	// GitHubTokenPreference records the headless create's GitHub token
+	// delivery preference ("installation" | "user_preferred", or "" for
+	// interactive creates) so reincarnation preserves it (Stage 2 §5.1a).
+	GitHubTokenPreference string `json:"githubTokenPreference,omitempty"`
 }
 
 // Project type constants.
@@ -1234,6 +1299,15 @@ type RuntimeBroker struct {
 	// has never reported it (an older broker).
 	Health *api.BrokerHealthReport `json:"health,omitempty"`
 
+	// WorkloadIdentityTargets are the Kubernetes runtime targets of the
+	// broker that have a GKE Workload Identity pool configured, as the
+	// broker last reported them in its heartbeat (ptone/scion#3329 phase
+	// 5): one per profile for a legacy broker, at most one (with no
+	// profile) for a flat instance. Written only when it changes (stored as
+	// JSON). Nil means never reported (an older broker, or one that has not
+	// sent the field); an empty list means the broker reports none.
+	WorkloadIdentityTargets []WorkloadIdentityTarget `json:"workloadIdentityTargets,omitempty"`
+
 	// RuntimeTargetPresentation is the publishable configuration a flat
 	// Runtime Broker instance last reported
 	// (.design/flat-runtime-brokers/contract-appendix-p3.md FC4-a;
@@ -1289,6 +1363,14 @@ type RuntimeBroker struct {
 	// Auto-provide configuration
 	// When true, this broker is automatically added as a provider for new projects
 	AutoProvide bool `json:"autoProvide,omitempty"`
+
+	// AdminManaged records whether a hub administrator explicitly registered or
+	// approved this broker as admin-managed (ptone/scion#7829).
+	//
+	// Written only by CreateRuntimeBroker and the dedicated
+	// SetRuntimeBrokerAdminManaged store method. UpdateRuntimeBroker leaves the
+	// stored value unchanged whatever this copy carries.
+	AdminManaged bool `json:"adminManaged,omitempty"`
 
 	// Timestamps
 	Created time.Time `json:"created"`
@@ -1435,6 +1517,10 @@ type BrokerCapabilities struct {
 	// agent on non-git projects). The hub refuses to dispatch such agents to
 	// brokers without it, returning 412 (fail closed; design #2703 D3).
 	EmptyPerAgentWorkspace bool `json:"emptyPerAgentWorkspace"`
+	// EphemeralPersistence indicates the broker's runtime can run an agent
+	// with persistence: ephemeral (ptone/scion#7780; Cloud Run only). The
+	// hub refuses an ephemeral create on a broker without it.
+	EphemeralPersistence bool `json:"ephemeralPersistence,omitempty"`
 	// AgentMove indicates the broker can take part in moving an agent
 	// between brokers that share a workspace export (`scion reincarnate
 	// --broker`). The hub refuses a move unless both the source and the
@@ -1451,6 +1537,11 @@ type BrokerCapabilities struct {
 	// delivering the text (ptone/scion#4596). The hub issues capabilities
 	// only to brokers that report it.
 	AttachmentDelivery bool `json:"attachmentDelivery"`
+	// HomeFiles indicates the broker writes create-time HomeFiles entries into
+	// the newly provisioned agent's home directory under .scion/ before
+	// starting the harness (ptone/scion#8058). The hub refuses to dispatch a
+	// create carrying non-empty HomeFiles to a broker without it.
+	HomeFiles bool `json:"homeFiles,omitempty"`
 	// ReprovisionEmptyPerAgent indicates the broker's reprovision reuses an
 	// empty-per-agent agent's private workspace in place (same-broker
 	// `scion reincarnate`, miller79/scion#167). The hub refuses same-broker
@@ -1464,6 +1555,11 @@ type BrokerCapabilities struct {
 	// other runtime, before anything is stopped (ptone/scion#7757). An old
 	// broker reports none, so it is refused everywhere.
 	ReprovisionResetHomeRuntimes []string `json:"reprovisionResetHomeRuntimes,omitempty"`
+	// RestartingRuntimes lists the runtimes on which the platform may
+	// restart an agent container that exited. On those the hub stops a run
+	// that reported limits_exceeded (ptone/scion#7928). An old broker
+	// reports none, so it gets no such stop.
+	RestartingRuntimes []string `json:"restartingRuntimes,omitempty"`
 	// ChangedFields indicates the broker re-renders, at start, the files
 	// provisioning wrote for the provision-rendered keys the hub lists in
 	// the inline config's changed_fields (ptone/scion#3982). Only for such
@@ -1503,12 +1599,34 @@ type BrokerCapabilities struct {
 	// does the hub stop writing those values into InlineConfig
 	// (ptone/scion#4222). Refreshed by every heartbeat.
 	TemplateTiers bool `json:"templateTiers,omitempty"`
+	// WITargetsV1 indicates the broker reports its Workload Identity
+	// targets in every heartbeat (the wi_targets_v1 capability,
+	// ptone/scion#3329 phase 5), so a broker that reports none has no
+	// workload_identity_pool configured rather than being too old to report
+	// one. Refreshed by every heartbeat.
+	WITargetsV1 bool `json:"wiTargetsV1,omitempty"`
 	// NodeImageRegistry is the broker's SCION_IMAGE_REGISTRY: the node env
 	// layer the hub resolves this broker's dispatches with
 	// (ptone/scion#3916). It is a node configuration value, not a feature
 	// flag. Sent at registration and in every heartbeat with capabilities;
 	// empty (an old broker, or none set) means no node env.
 	NodeImageRegistry string `json:"nodeImageRegistry,omitempty"`
+}
+
+// WorkloadIdentityTarget is one Kubernetes runtime target of a broker with a
+// GKE Workload Identity pool (hubclient.WorkloadIdentityTarget): where an
+// agent of that target runs, so the hub can bind a GCP service account it
+// mints to the conventional Kubernetes ServiceAccount there.
+type WorkloadIdentityTarget struct {
+	// Profile is the legacy broker profile; empty for a flat instance.
+	Profile string `json:"profile,omitempty"`
+	// Pool is the Workload Identity pool, "<project>.svc.id.goog".
+	Pool string `json:"pool"`
+	// Namespace is the namespace the broker runs the target's agents in.
+	Namespace string `json:"namespace"`
+	// KSACreation reports that the broker may create the conventional
+	// Kubernetes ServiceAccount (create_service_accounts; ptone/scion#7966).
+	KSACreation bool `json:"ksaCreation,omitempty"`
 }
 
 // BrokerProfile describes a runtime profile available on a broker.
@@ -1655,10 +1773,11 @@ type Template struct {
 	Status string `json:"status"` // pending, active, archived
 
 	// Ownership
-	OwnerID   string `json:"ownerId,omitempty"`
-	CreatedBy string `json:"createdBy,omitempty"`
-	UpdatedBy string `json:"updatedBy,omitempty"`
-	SourceURL string `json:"sourceUrl,omitempty"`
+	OwnerID      string `json:"ownerId,omitempty"`
+	CreatedBy    string `json:"createdBy,omitempty"`
+	UpdatedBy    string `json:"updatedBy,omitempty"`
+	SourceURL    string `json:"sourceUrl,omitempty"`
+	SourceCommit string `json:"sourceCommit,omitempty"`
 
 	// Timestamps
 	Created time.Time `json:"created"`
@@ -1763,17 +1882,18 @@ const HarnessConfigLayoutBlobs = TemplateLayoutBlobs
 
 // HarnessConfigData holds the harness-specific configuration details.
 type HarnessConfigData struct {
-	Harness          string                   `json:"harness,omitempty"`
-	Image            string                   `json:"image,omitempty"`
-	User             string                   `json:"user,omitempty"`
-	Model            string                   `json:"model,omitempty"`
-	Args             []string                 `json:"args,omitempty"`
-	Env              map[string]string        `json:"env,omitempty"`
-	AuthSelectedType string                   `json:"authSelectedType,omitempty"`
-	Secrets          []api.RequiredSecret     `json:"secrets,omitempty"`
-	ModelAliases     map[string]string        `json:"modelAliases,omitempty"`
-	NoAuthBehavior   string                   `json:"noAuthBehavior,omitempty"`
-	AuthMeta         *api.HarnessAuthMetadata `json:"authMeta,omitempty"`
+	Harness          string                           `json:"harness,omitempty"`
+	Image            string                           `json:"image,omitempty"`
+	User             string                           `json:"user,omitempty"`
+	Model            string                           `json:"model,omitempty"`
+	Args             []string                         `json:"args,omitempty"`
+	Env              map[string]string                `json:"env,omitempty"`
+	AuthSelectedType string                           `json:"authSelectedType,omitempty"`
+	Secrets          []api.RequiredSecret             `json:"secrets,omitempty"`
+	ModelAliases     map[string]string                `json:"modelAliases,omitempty"`
+	NoAuthBehavior   string                           `json:"noAuthBehavior,omitempty"`
+	AuthMeta         *api.HarnessAuthMetadata         `json:"authMeta,omitempty"`
+	Capabilities     *api.HarnessAdvancedCapabilities `json:"capabilities,omitempty"`
 }
 
 // HarnessConfigStatus constants
@@ -1924,16 +2044,18 @@ type ExpiredTestFixtureQuery struct {
 // one fixture root: every resource whose stamp names it.
 type FixtureRootedResources struct {
 	// Agents includes soft-deleted agents.
-	Agents    []Agent
-	Schedules []Schedule
-	Groups    []Group
-	Projects  []Project
+	Agents           []Agent
+	Schedules        []Schedule
+	Triggers         []Trigger
+	WebhookEndpoints []WebhookEndpoint
+	Groups           []Group
+	Projects         []Project
 	// Truncated is true when a kind had more rows than the limit.
 	Truncated bool
 }
 
 // FixtureProvenance is the creation-time test-identity provenance stamp of
-// an agent, project, schedule or group: the hub test identity at the root
+// an agent, project, schedule, trigger, webhook endpoint or group: the hub test identity at the root
 // of the principal chain that created the row (RootID) and that identity's
 // issued_by user (IssuerID). The zero value means the row was not created
 // under a test identity, or predates the stamp.
@@ -1964,6 +2086,10 @@ type UserPreferences struct {
 	DefaultProfile  string `json:"defaultProfile,omitempty"`
 	Theme           string `json:"theme,omitempty"`    // light, dark
 	Timezone        string `json:"timezone,omitempty"` // IANA zone name; empty means Auto (browser zone)
+	// PreselectRecommendedChoices makes a multi-decision choices card start
+	// with each recommended choice selected. Off by default: recommended
+	// choices are only outlined (ptone/scion#7842).
+	PreselectRecommendedChoices bool `json:"preselectRecommendedChoices,omitempty"`
 }
 
 // UserRole constants
@@ -2525,7 +2651,87 @@ const (
 	// @mention). It is saved to the thread but no agent was given it, so it
 	// must not read as "dispatched". Terminal: nothing retries it.
 	MessageDispatchNoRecipient = "no_recipient"
+	// MessageDispatchDelivering marks a row bound to one deliver-message
+	// flush over the recipient's conduit session (delivery_id), between
+	// the hub's bind and the agent's answer (design
+	// .design/conduit/v2.22-deliver-message.md §2.6).
+	MessageDispatchDelivering = "delivering"
+	// MessageDispatchDelivered: the bound flush was pasted and submitted.
+	MessageDispatchDelivered = "delivered"
+	// MessageDispatchPartial: the bound flush may have been pasted (a
+	// partial answer, an ambiguous call, or a stale delivering row). It is
+	// never re-driven.
+	MessageDispatchPartial = "partial"
+	// MessageDispatchAwaitingSession marks a row proved not to reach a
+	// conduit-delivered agent because no conduit session was connected
+	// (ptone/scion#7881), or queued behind earlier held rows on the same
+	// agent. Re-driven in creation order once a session advertising
+	// deliver-message connects, or failed on expiry/stop.
+	MessageDispatchAwaitingSession = "awaiting_session"
 )
+
+// Message.NotReached proof values stamped by the hub's /deliver handler.
+const (
+	MessageNotReachedNoSession = "no_session"
+)
+
+// PrepareOrHoldResult reports what PrepareOrHoldMessage recorded on a row
+// before broker dispatch.
+type PrepareOrHoldResult struct {
+	Held         bool
+	HoldUntil    *time.Time
+	HoldLaunchID string
+}
+
+// HoldMessageParams carries the inputs for HoldMessageAwaitingSession's
+// atomic compare-and-set transition into awaiting_session.
+type HoldMessageParams struct {
+	MessageID   string
+	AgentID     string
+	MaxProofAge time.Duration
+	HoldTTL     time.Duration
+	MaxHeld     int
+}
+
+// DeliveryOutcomeUnknownPartial is the delivery_outcome stored when a row
+// bound to a conduit delivery ends without a known answer: the stale sweep,
+// or a failure recorded while it was delivering. A same-id /deliver replays
+// it.
+const DeliveryOutcomeUnknownPartial = `{"outcome":"partial","stage":"unknown"}`
+
+// ErrDeliveryContended: BindMessageDelivery kept losing its conditional
+// update to concurrent writers although the rows read bindable. Nothing
+// was bound; the hub answers "not reached", so the broker may retry.
+var ErrDeliveryContended = errors.New("store: message delivery bind contended")
+
+// DeliveryBindResult is how BindMessageDelivery treated a /deliver call.
+type DeliveryBindResult int
+
+const (
+	// DeliveryBound: every row moved to delivering under the id.
+	DeliveryBound DeliveryBindResult = iota
+	// DeliveryInFlight: every row carries the same id and at least one is
+	// still delivering (another may already have failed under it):
+	// another call owns the delivery. The caller must not call the agent,
+	// unbind or finish the rows.
+	DeliveryInFlight
+	// DeliveryReplay: every row is final (delivered, partial or failed)
+	// under the same id; Outcome holds the stored answer and the agent is
+	// not called.
+	DeliveryReplay
+	// DeliveryConflict: some row is bound to another delivery, past
+	// delivering, or not in a bindable state; nothing changed.
+	DeliveryConflict
+)
+
+// DeliveryBind is BindMessageDelivery's result.
+type DeliveryBind struct {
+	Result DeliveryBindResult
+	// Outcome is the replayed outcome JSON, for DeliveryReplay: the rows'
+	// common stored delivery_outcome, or partial/unknown when they differ
+	// or one has none (never one row's outcome for the others).
+	Outcome string
+}
 
 // MessageEnteredPendingLogMsg is the text of the one structured log line
 // written whenever a message row is persisted in dispatch_state "pending"
@@ -2643,6 +2849,12 @@ const (
 	// most once per owner, agent and key per hour. It never carries a
 	// value.
 	NotificationKindSecretPending = "secret_pending"
+	// NotificationKindDecisionsWaiting: one coalesced per-user bell item
+	// summarizing open decisions waiting on the subscriber across member
+	// projects. AgentID and ProjectID are nil UUIDs; ResourceType is
+	// NotificationResourceDecisions and ResourceID stores the previous
+	// waiting count P as a decimal string ("0" when cleared).
+	NotificationKindDecisionsWaiting = "decisions_waiting"
 )
 
 // Notification.ResourceType values.
@@ -2651,6 +2863,9 @@ const (
 	NotificationResourceArtifact = "artifact"
 	// NotificationResourcePendingSecret: ResourceID is a pending secret id.
 	NotificationResourcePendingSecret = "pending_secret"
+	// NotificationResourceDecisions: ResourceID is the coalesced waiting
+	// decision count string for NotificationKindDecisionsWaiting.
+	NotificationResourceDecisions = "decisions"
 )
 
 // Notification.Status values of NotificationKindArtifactGrant rows.
@@ -2671,6 +2886,10 @@ const NotificationStatusArtifactReviewSubmitted = "ARTIFACT_REVIEW_SUBMITTED"
 // NotificationStatusSecretPending is the Status of a
 // NotificationKindSecretPending row.
 const NotificationStatusSecretPending = "SECRET_PENDING"
+
+// NotificationStatusDecisionsWaiting is the Status of a
+// NotificationKindDecisionsWaiting row.
+const NotificationStatusDecisionsWaiting = "DECISIONS_WAITING"
 
 // MatchesActivity returns true if the given activity matches any of the subscription's
 // trigger activities. Comparison is case-insensitive.
@@ -2933,6 +3152,7 @@ const (
 	ScopeUser          = "user"
 	ScopeProject       = "project"
 	ScopeRuntimeBroker = "runtime_broker"
+	ScopeAgent         = "agent"
 )
 
 // ScopeIDHub was previously a fixed sentinel "hub". It is now the hub's
@@ -3554,6 +3774,19 @@ type Message struct {
 	DispatchedAt          *time.Time `json:"dispatchedAt,omitempty"`
 	DispatchFailureReason *string    `json:"dispatchFailureReason,omitempty"`
 
+	// Hold-until-session re-drive fields (ptone/scion#7881). Internal store
+	// fields only — never serialized to API, history, or SSE responses.
+	HoldUntil        *time.Time `json:"-"`
+	HoldLaunchID     string     `json:"-"`
+	NotReached       string     `json:"-"`
+	NotReachedAt     *time.Time `json:"-"`
+	ScheduledEventID string     `json:"-"`
+
+	// ConversationSeq is the commit-ordered per-conversation sequence number
+	// allocated in CreateMessage (ptone/scion#8136). Internal store field only;
+	// API responses expose opaque cursors instead.
+	ConversationSeq int64 `json:"-"`
+
 	// DeferredAttachments is never stored. For a deferred message, the
 	// conversation messages route lists its attachments stored as
 	// artifacts here, to a reader only, so catch-up can say they were not
@@ -3605,6 +3838,38 @@ type MessageFilter struct {
 type LatestMessageOptions struct {
 	Channel     string // Only messages on this channel
 	ExcludeType string // Ignore messages of this type
+}
+
+// ConversationFeedFilter selects which messages in a conversation a feed query returns.
+type ConversationFeedFilter string
+
+const (
+	// ConversationFeedFilterOthers returns messages not sent by the caller.
+	ConversationFeedFilterOthers ConversationFeedFilter = "others"
+	// ConversationFeedFilterAll returns all messages, including the caller's own sends.
+	ConversationFeedFilterAll ConversationFeedFilter = "all"
+	// ConversationFeedFilterAddressed returns messages not sent by the caller
+	// where the caller is a recipient or addressee.
+	ConversationFeedFilterAddressed ConversationFeedFilter = "addressed"
+)
+
+// ConversationFeedQuery describes a feed read over a single conversation
+// ordered by ascending conversation_seq (ptone/scion#8136).
+type ConversationFeedQuery struct {
+	ConversationID string
+	AfterSeq       int64
+	Limit          int
+	Filter         ConversationFeedFilter
+	PrincipalKind  string // "user" or "agent"
+	PrincipalID    string // principal UUID
+}
+
+// ConversationFeedPage is the result of ListConversationFeed.
+type ConversationFeedPage struct {
+	Messages  []Message
+	ScannedTo int64 // highest seq scanned (last returned seq when HasMore, else head)
+	HasMore   bool  // more matching rows exist at or below head
+	Truncated bool  // rows between AfterSeq and first surviving seq > AfterSeq were deleted
 }
 
 // =============================================================================
@@ -3750,7 +4015,7 @@ type ScheduledEvent struct {
 	EventType  string     `json:"eventType"` // "message", "status_update"
 	FireAt     time.Time  `json:"fireAt"`    // When to fire (UTC)
 	Payload    string     `json:"payload"`   // JSON blob (handler-specific)
-	Status     string     `json:"status"`    // pending, fired, cancelled, expired
+	Status     string     `json:"status"`    // pending, firing, fired, cancelled, expired, failed
 	CreatedAt  time.Time  `json:"createdAt"`
 	CreatedBy  string     `json:"createdBy"`
 	FiredAt    *time.Time `json:"firedAt,omitempty"`
@@ -3776,10 +4041,146 @@ type ScheduledEvent struct {
 // ScheduledEventStatus constants
 const (
 	ScheduledEventPending   = "pending"
+	ScheduledEventFiring    = "firing" // Claimed/created for a wake fire whose outcome is not yet recorded
 	ScheduledEventFired     = "fired"
 	ScheduledEventCancelled = "cancelled"
 	ScheduledEventExpired   = "expired" // Loaded on startup past its fire time
 	ScheduledEventFailed    = "failed"
+	// ScheduledEventSkipped: the fire ran nothing because a precondition
+	// did not hold (target not running, no executor, experiment off,
+	// capacity, missed window). It is not an error (ptone/scion#7883, D4).
+	ScheduledEventSkipped = "skipped"
+)
+
+// ScheduledExecRun is the durable record of one admitted run of a scheduled
+// exec event (ptone/scion#7883): one row per event, written before
+// exec-start is sent. It never holds argv or command output. Every field but
+// the outcome group (FinishedAt, Outcome, ExitCode, DurationMS, OutputBytes)
+// is fixed at insert.
+type ScheduledExecRun struct {
+	EventID       string // non-empty for schedule-owned runs; empty for trigger-owned runs
+	FireID        string // non-empty for trigger-owned runs; empty for schedule-owned runs
+	ScheduleID    string // empty for a one-shot event or a trigger-owned run
+	OverlapKey    string // overlap scope ("schedule:<id>" or "trigger:<id>")
+	ProjectID     string
+	TargetAgentID string
+
+	InitiatorPrincipalKind  string
+	InitiatorPrincipalID    string
+	InitiatorCredentialKind string
+	InitiatorCredentialID   string
+	AuthorizationRevision   int
+
+	ExecutorKind string
+	ExecutorID   string
+
+	CommandSHA256  string
+	Argc           int
+	TimeoutSeconds int
+
+	StartedAt time.Time
+	// NotAfter is the start-admission deadline sent with exec-start,
+	// frozen at admission (zero: StartedAt).
+	NotAfter   time.Time
+	LeaseUntil time.Time
+	FinishedAt *time.Time
+
+	Outcome      string // ScheduledExecOutcome*
+	ExitCode     *int
+	DurationMS   *int64
+	OutputBytes  *int64
+	CaptureMode  string // "", "json", "tail" (immutable after insert)
+	OutputStatus string // "", "captured", "truncated", "too_large", "invalid_json", "empty", "expired", "lost"
+
+	Runtime  string
+	LaunchID string
+
+	// LastPolledAt is when the sweeper last claimed the run for a status
+	// poll (StartedAt at insert).
+	LastPolledAt time.Time
+}
+
+// RunID returns the stable exec run identifier sent as exec-start run_id:
+// EventID for schedule-owned runs, FireID for trigger-owned runs.
+func (r ScheduledExecRun) RunID() string {
+	if r.EventID != "" {
+		return r.EventID
+	}
+	return r.FireID
+}
+
+// IsTriggerOwned reports whether the run is owned by a trigger fire rather than
+// a scheduled event.
+func (r ScheduledExecRun) IsTriggerOwned() bool {
+	return r.FireID != ""
+}
+
+// EffectiveOverlapKey returns the overlap scope key for the run: OverlapKey
+// when set, or "schedule:"+ScheduleID for legacy schedule runs.
+func (r ScheduledExecRun) EffectiveOverlapKey() string {
+	if r.OverlapKey != "" {
+		return r.OverlapKey
+	}
+	if r.ScheduleID != "" {
+		return "schedule:" + r.ScheduleID
+	}
+	return ""
+}
+
+// Outcomes of a ScheduledExecRun. Starting and running are unfinished
+// (FinishedAt nil); the others are final.
+const (
+	ScheduledExecOutcomeStarting  = "starting"
+	ScheduledExecOutcomeRunning   = "running"
+	ScheduledExecOutcomeOK        = "ok"
+	ScheduledExecOutcomeNonzero   = "nonzero"
+	ScheduledExecOutcomeTimeout   = "timeout"
+	ScheduledExecOutcomeSkipped   = "skipped"
+	ScheduledExecOutcomeError     = "error"
+	ScheduledExecOutcomeAbandoned = "abandoned"
+)
+
+// MaxExecRunOutputBytes bounds the captured output persisted in exec_run_outputs.
+const MaxExecRunOutputBytes = 64 * 1024
+
+// ExecRunOutputOwnerScheduledExec is the owner_kind of scheduled exec runs in
+// exec_run_outputs.
+const ExecRunOutputOwnerScheduledExec = "scheduled_exec"
+
+// ScheduledExecRunFinish is the final outcome FinishScheduledExecRun records
+// on a run, and the status it records on the run's owner (scheduled_events or
+// trigger_fires).
+type ScheduledExecRunFinish struct {
+	EventID      string
+	FireID       string
+	FinishedAt   time.Time
+	Outcome      string // a final ScheduledExecOutcome*
+	ExitCode     *int
+	DurationMS   *int64
+	OutputBytes  *int64
+	OutputStatus string
+	// Output, when non-empty, is inserted into exec_run_outputs inside the
+	// same transaction only if the FinishScheduledExecRun CAS wins. Must not
+	// exceed MaxExecRunOutputBytes.
+	Output []byte
+	// EventStatus, when not empty, is written to the run's scheduled event
+	// (with EventError) in the same transaction, only while the event is still
+	// fired or expired: a run's outcome never overwrites a recorded event
+	// outcome.
+	EventStatus string
+	EventError  string
+	// FireStatus, when not empty, is written to the run's trigger_fires row
+	// (with FireError) in the same transaction, only while the fire is still
+	// firing or fired, along with trigger counters and subject-claim release.
+	FireStatus string
+	FireError  string
+}
+
+// ScheduledEventSort constants for ordering ListScheduledEvents results.
+const (
+	ScheduledEventSortCreatedDesc   = "created_desc"   // default: created DESC, id DESC
+	ScheduledEventSortFireAtAsc     = "fire_at_asc"    // pending: fire_at ASC, id ASC
+	ScheduledEventSortCompletedDesc = "completed_desc" // past: COALESCE(fired_at, created) DESC, id DESC
 )
 
 // ScheduledEventFilter for listing events.
@@ -3787,7 +4188,9 @@ type ScheduledEventFilter struct {
 	ProjectID  string
 	EventType  string
 	Status     string
-	ScheduleID string // Filter events generated by a specific recurring schedule
+	Statuses   []string // When non-empty, matches status IN Statuses
+	Sort       string   // "", "created_desc", "fire_at_asc", "completed_desc"
+	ScheduleID string   // Filter events generated by a specific recurring schedule
 	// InitiatorAgentID, when set, keeps only rows whose current initiator
 	// principal is this agent with a recorded attribution (version 1 or
 	// later, credential kind neither empty nor legacy_unknown). It matches
@@ -3807,13 +4210,13 @@ type Schedule struct {
 	Name          string     `json:"name"`
 	CronExpr      string     `json:"cronExpr"`               // Standard 5-field cron expression, evaluated in TimeZone
 	TimeZone      string     `json:"timeZone,omitempty"`     // IANA time zone for CronExpr; empty means UTC
-	EventType     string     `json:"eventType"`              // "message" (future: "dispatch_agent")
+	EventType     string     `json:"eventType"`              // "message", "dispatch_agent", "exec"
 	Payload       string     `json:"payload"`                // JSON: handler-specific configuration
 	Status        string     `json:"status"`                 // active, paused, deleted
 	StatusReason  string     `json:"statusReason,omitempty"` // system pause reason (ScheduleStatusReason*); empty otherwise
 	NextRunAt     *time.Time `json:"nextRunAt,omitempty"`
 	LastRunAt     *time.Time `json:"lastRunAt,omitempty"`
-	LastRunStatus string     `json:"lastRunStatus,omitempty"` // success, error
+	LastRunStatus string     `json:"lastRunStatus,omitempty"` // success, error, skipped
 	LastRunError  string     `json:"lastRunError,omitempty"`
 	RunCount      int        `json:"runCount"`
 	ErrorCount    int        `json:"errorCount"`
@@ -3863,21 +4266,27 @@ const (
 	// expression carries a zone prefix (CRON_TZ= or TZ=), which is not
 	// supported. The expression must be edited to UTC before resuming.
 	ScheduleStatusReasonCronZoneUnsupported = "cron_zone_unsupported"
+	// ScheduleStatusReasonTargetDeleted: paused because the target agent of an
+	// exec or message schedule was deleted. Editing the schedule to name a live
+	// target and resuming re-records the authority and clears the reason.
+	ScheduleStatusReasonTargetDeleted = "target_deleted"
 )
 
 // ScheduleRunStatus constants
 const (
 	ScheduleRunSuccess = "success"
 	ScheduleRunError   = "error"
+	ScheduleRunSkipped = "skipped"
 )
 
 // ScheduleFilter for listing schedules.
 type ScheduleFilter struct {
 	ProjectID string
 	Status    string
+	EventType string
 	Name      string
 	// LastRunStatus, when set, keeps only schedules whose most recent run
-	// ended with this status (ScheduleRunSuccess or ScheduleRunError).
+	// ended with this status (ScheduleRunSuccess, ScheduleRunError, or ScheduleRunSkipped).
 	LastRunStatus string
 	// InitiatorAgentID, when set, keeps only rows whose current initiator
 	// principal is this agent with a recorded attribution (version 1 or
@@ -4010,16 +4419,25 @@ func (g *Project) ToAPI() *api.ProjectInfo {
 // GitHub App Integration
 // =============================================================================
 
+// GitHubTriggerRoute designates a primary project for GitHub App trigger
+// webhook fan-out on one repository within an installation (§8.4).
+type GitHubTriggerRoute struct {
+	PrimaryProjectID string    `json:"primary_project_id"`
+	SetBy            string    `json:"set_by,omitempty"`
+	SetAt            time.Time `json:"set_at"`
+}
+
 // GitHubInstallation represents a GitHub App installation registered on the Hub.
 type GitHubInstallation struct {
-	InstallationID int64     `json:"installation_id"`
-	AccountLogin   string    `json:"account_login"`
-	AccountType    string    `json:"account_type"` // "Organization" or "User"
-	AppID          int64     `json:"app_id"`
-	Repositories   []string  `json:"repositories,omitempty"`
-	Status         string    `json:"status"` // "active", "suspended", "deleted"
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	InstallationID int64                         `json:"installation_id"`
+	AccountLogin   string                        `json:"account_login"`
+	AccountType    string                        `json:"account_type"` // "Organization" or "User"
+	AppID          int64                         `json:"app_id"`
+	Repositories   []string                      `json:"repositories,omitempty"`
+	TriggerRouting map[string]GitHubTriggerRoute `json:"-"`
+	Status         string                        `json:"status"` // "active", "suspended", "deleted"
+	CreatedAt      time.Time                     `json:"created_at"`
+	UpdatedAt      time.Time                     `json:"updated_at"`
 }
 
 // GitHub installation status constants.
@@ -4259,7 +4677,6 @@ const (
 
 // SkillScope constants
 const (
-	SkillScopeCore    = "core"
 	SkillScopeGlobal  = "global"
 	SkillScopeProject = "project"
 	SkillScopeUser    = "user"
@@ -4672,24 +5089,29 @@ func ValidEdgeDeactivationCause(c EdgeDeactivationCause) bool {
 		EdgeDeactivationDelegatorDeleted,
 		EdgeDeactivationCreateCompensation,
 		EdgeDeactivationReincarnateReplaced,
+		EdgeDeactivationReincarnateFailed,
+		EdgeDeactivationReincarnatePendingSwept,
+		EdgeDeactivationReincarnateStaleSwept,
 		EdgeDeactivationUserDeleteCascade:
 		return true
 	}
 	return false
 }
 
-// Deactivation causes recorded only on service-account assignments. The edge
-// store rejects them.
+// Deactivation causes recorded on reincarnation failure rollback (both
+// delegation edges and service-account assignments), plus assignment-only
+// causes (sa_replaced, sa_cleared) which the edge store rejects.
 const (
 	// EdgeDeactivationSAReplaced marks an assignment replaced by a later
-	// write that set a service account on the same agent.
+	// write that set a service account on the same agent. Assignment-only.
 	EdgeDeactivationSAReplaced EdgeDeactivationCause = "sa_replaced"
 	// EdgeDeactivationSACleared marks an assignment ended by a write that
-	// removed the agent's assign-mode GCP identity.
+	// removed the agent's assign-mode GCP identity. Assignment-only.
 	EdgeDeactivationSACleared EdgeDeactivationCause = "sa_cleared"
-	// EdgeDeactivationReincarnateFailed marks the assignment a reincarnation
-	// claim recorded for a new account, ended when the reincarnation failed
-	// and the previous configuration was restored by the worker.
+	// EdgeDeactivationReincarnateFailed marks the delegation edge or
+	// service-account assignment a reincarnation claim recorded for a
+	// patched role or account, ended when the reincarnation failed and
+	// the previous configuration was restored by the worker.
 	EdgeDeactivationReincarnateFailed EdgeDeactivationCause = "reincarnate_failed"
 	// EdgeDeactivationReincarnatePendingSwept is EdgeDeactivationReincarnateFailed
 	// for a reincarnation the sweep failed because its worker never started.
@@ -4735,11 +5157,13 @@ type SAAssignmentOrigin string
 
 const (
 	SAAssignmentOriginCreateExplicit                 SAAssignmentOrigin = "create_explicit"
+	SAAssignmentOriginCreateProjectBrokerDefault     SAAssignmentOrigin = "create_project_broker_default"
 	SAAssignmentOriginCreateProjectProfileDefault    SAAssignmentOrigin = "create_project_profile_default"
 	SAAssignmentOriginCreateProjectDefault           SAAssignmentOrigin = "create_project_default"
 	SAAssignmentOriginCreateHubDefault               SAAssignmentOrigin = "create_hub_default"
 	SAAssignmentOriginUpdate                         SAAssignmentOrigin = "update"
 	SAAssignmentOriginReincarnate                    SAAssignmentOrigin = "reincarnate"
+	SAAssignmentOriginScheduledProjectBrokerDefault  SAAssignmentOrigin = "scheduled_project_broker_default"
 	SAAssignmentOriginScheduledProjectProfileDefault SAAssignmentOrigin = "scheduled_project_profile_default"
 	SAAssignmentOriginScheduledProjectDefault        SAAssignmentOrigin = "scheduled_project_default"
 	SAAssignmentOriginScheduledHubDefault            SAAssignmentOrigin = "scheduled_hub_default"
@@ -5206,6 +5630,10 @@ type DecisionAuditRecord struct {
 	// ListFilter is the summary of a list request's item filter. Set only
 	// when RecordKind is DecisionAuditRecordKindListFilter.
 	ListFilter *DecisionAuditListFilter
+	// SessionMode marks a decision made while the caller's web session was
+	// operating in a restricted session mode (e.g. "view_as_member",
+	// ptone/scion#8648). Empty for ordinary sessions.
+	SessionMode string
 }
 
 // DecisionAuditRecordKindListFilter is the RecordKind of the one aggregated
@@ -5299,6 +5727,11 @@ type MutationAuditRecord struct {
 	// issuer cleanup (3c, ptone/scion#4240): the creation-time stamp the
 	// delete relied on and its run. Empty for every other record.
 	ProvenanceBasis string
+
+	// SessionMode marks a mutation performed while the caller's web session
+	// was operating in a restricted session mode (e.g. "view_as_member",
+	// ptone/scion#8648). Empty for ordinary sessions.
+	SessionMode string
 }
 
 // MutationAuditFilter defines query parameters for listing mutation audit records.
@@ -5313,10 +5746,12 @@ type MutationAuditFilter struct {
 	// ExecutorID, when set, keeps only records whose executor_id equals
 	// it (for example a test identity purge's test_identity:<id>).
 	ExecutorID string
-	Since      time.Time
-	Until      time.Time
-	Limit      int
-	Offset     int
+	// SessionMode, when set, keeps only records whose session_mode equals it.
+	SessionMode string
+	Since       time.Time
+	Until       time.Time
+	Limit       int
+	Offset      int
 }
 
 // =============================================================================
@@ -5374,6 +5809,7 @@ const (
 const (
 	QuotaScopeSystem  = "system"
 	QuotaScopeProject = "project"
+	QuotaScopeGroup   = "group"
 	// QuotaScopeBroker scopes a limit to a single runtime broker rather than a
 	// user, project, or the whole Hub. See LimitMaxAgentsPerBroker: a broker is
 	// where the resource-exhaustion risk actually lives (it is the process

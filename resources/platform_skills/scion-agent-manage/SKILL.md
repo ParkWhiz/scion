@@ -33,13 +33,13 @@ The best and most current reference for the CLI commands is available from `scio
 
 3. **Choose appropriate templates**: Use `--type researcher` for a researcher.
 
-4. **Monitor with logs**: Use `scion logs <agent>` to check progress without interrupting.
+4. **Monitor without interrupting**: Use `scion look <agent>` to inspect recent output and terminal state without interrupting (`scion logs` is user- and operator-scoped and returns `403` to agents).
 
 5. **Interrupt carefully**: The `--interrupt` flag on messages stops current work - use only when necessary.
 
 6. **Preserve branches**: Use `--preserve-branch` to keep the branch after deletion for later review. The flag does not push — confirm the branch is on the remote first.
 
-7. **Agent state**: Do not attempt to resume an agent unless you were the one who stopped it. An 'idle' agent may still be working.
+7. **Agent state**: Do not attempt to resume an agent unless you were the one who stopped it. An 'idle' agent may still be working. `scion start <name>` never implicitly resumes a `suspended`, `stopped`, or `halted` agent — it fails with `409 agent_exists_resumable` and hints to use `scion resume <name>`, delete the agent, or pick another name. Use `scion resume <name>` explicitly when you intend to continue a suspended session or restart a stopped/halted agent in place.
 
 ## Creating Agents
 
@@ -79,6 +79,8 @@ A brief states:
 | Boundaries | what is explicitly out of scope |
 | Deliverable | what artifact is owed, and in what shape |
 | Reporting | who to report to, and when — including who to ask when blocked ([see below](#direct-questions-to-the-person-who-can-answer-them)) |
+
+Reference installed skills by **skill name**, never by your own container's harness-specific home path (different harnesses mount skills at different paths under `$HOME`); when a brief cites a skill or document not installed on the target template, point to a shared-volume or repository source.
 
 ### Direct questions to the person who can answer them
 

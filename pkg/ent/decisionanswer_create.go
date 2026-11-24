@@ -72,6 +72,20 @@ func (_c *DecisionAnswerCreate) SetChoiceLabel(v string) *DecisionAnswerCreate {
 	return _c
 }
 
+// SetOtherText sets the "other_text" field.
+func (_c *DecisionAnswerCreate) SetOtherText(v string) *DecisionAnswerCreate {
+	_c.mutation.SetOtherText(v)
+	return _c
+}
+
+// SetNillableOtherText sets the "other_text" field if the given value is not nil.
+func (_c *DecisionAnswerCreate) SetNillableOtherText(v *string) *DecisionAnswerCreate {
+	if v != nil {
+		_c.SetOtherText(*v)
+	}
+	return _c
+}
+
 // SetAnsweredByUserID sets the "answered_by_user_id" field.
 func (_c *DecisionAnswerCreate) SetAnsweredByUserID(v string) *DecisionAnswerCreate {
 	_c.mutation.SetAnsweredByUserID(v)
@@ -130,6 +144,20 @@ func (_c *DecisionAnswerCreate) SetOutcome(v decisionanswer.Outcome) *DecisionAn
 func (_c *DecisionAnswerCreate) SetNillableOutcome(v *decisionanswer.Outcome) *DecisionAnswerCreate {
 	if v != nil {
 		_c.SetOutcome(*v)
+	}
+	return _c
+}
+
+// SetDismissReason sets the "dismiss_reason" field.
+func (_c *DecisionAnswerCreate) SetDismissReason(v string) *DecisionAnswerCreate {
+	_c.mutation.SetDismissReason(v)
+	return _c
+}
+
+// SetNillableDismissReason sets the "dismiss_reason" field if the given value is not nil.
+func (_c *DecisionAnswerCreate) SetNillableDismissReason(v *string) *DecisionAnswerCreate {
+	if v != nil {
+		_c.SetDismissReason(*v)
 	}
 	return _c
 }
@@ -486,6 +514,10 @@ func (_c *DecisionAnswerCreate) createSpec() (*DecisionAnswer, *sqlgraph.CreateS
 		_spec.SetField(decisionanswer.FieldChoiceLabel, field.TypeString, value)
 		_node.ChoiceLabel = value
 	}
+	if value, ok := _c.mutation.OtherText(); ok {
+		_spec.SetField(decisionanswer.FieldOtherText, field.TypeString, value)
+		_node.OtherText = &value
+	}
 	if value, ok := _c.mutation.AnsweredByUserID(); ok {
 		_spec.SetField(decisionanswer.FieldAnsweredByUserID, field.TypeString, value)
 		_node.AnsweredByUserID = &value
@@ -505,6 +537,10 @@ func (_c *DecisionAnswerCreate) createSpec() (*DecisionAnswer, *sqlgraph.CreateS
 	if value, ok := _c.mutation.Outcome(); ok {
 		_spec.SetField(decisionanswer.FieldOutcome, field.TypeEnum, value)
 		_node.Outcome = value
+	}
+	if value, ok := _c.mutation.DismissReason(); ok {
+		_spec.SetField(decisionanswer.FieldDismissReason, field.TypeString, value)
+		_node.DismissReason = &value
 	}
 	if value, ok := _c.mutation.InterpretedByAgentID(); ok {
 		_spec.SetField(decisionanswer.FieldInterpretedByAgentID, field.TypeUUID, value)
@@ -657,6 +693,9 @@ func (u *DecisionAnswerUpsertOne) UpdateNewValues() *DecisionAnswerUpsertOne {
 		if _, exists := u.create.mutation.ChoiceLabel(); exists {
 			s.SetIgnore(decisionanswer.FieldChoiceLabel)
 		}
+		if _, exists := u.create.mutation.OtherText(); exists {
+			s.SetIgnore(decisionanswer.FieldOtherText)
+		}
 		if _, exists := u.create.mutation.AnsweredByName(); exists {
 			s.SetIgnore(decisionanswer.FieldAnsweredByName)
 		}
@@ -668,6 +707,9 @@ func (u *DecisionAnswerUpsertOne) UpdateNewValues() *DecisionAnswerUpsertOne {
 		}
 		if _, exists := u.create.mutation.Outcome(); exists {
 			s.SetIgnore(decisionanswer.FieldOutcome)
+		}
+		if _, exists := u.create.mutation.DismissReason(); exists {
+			s.SetIgnore(decisionanswer.FieldDismissReason)
 		}
 		if _, exists := u.create.mutation.InterpretedByAgentID(); exists {
 			s.SetIgnore(decisionanswer.FieldInterpretedByAgentID)
@@ -958,6 +1000,9 @@ func (u *DecisionAnswerUpsertBulk) UpdateNewValues() *DecisionAnswerUpsertBulk {
 			if _, exists := b.mutation.ChoiceLabel(); exists {
 				s.SetIgnore(decisionanswer.FieldChoiceLabel)
 			}
+			if _, exists := b.mutation.OtherText(); exists {
+				s.SetIgnore(decisionanswer.FieldOtherText)
+			}
 			if _, exists := b.mutation.AnsweredByName(); exists {
 				s.SetIgnore(decisionanswer.FieldAnsweredByName)
 			}
@@ -969,6 +1014,9 @@ func (u *DecisionAnswerUpsertBulk) UpdateNewValues() *DecisionAnswerUpsertBulk {
 			}
 			if _, exists := b.mutation.Outcome(); exists {
 				s.SetIgnore(decisionanswer.FieldOutcome)
+			}
+			if _, exists := b.mutation.DismissReason(); exists {
+				s.SetIgnore(decisionanswer.FieldDismissReason)
 			}
 			if _, exists := b.mutation.InterpretedByAgentID(); exists {
 				s.SetIgnore(decisionanswer.FieldInterpretedByAgentID)

@@ -28,10 +28,21 @@ import (
 // accessor, never the s.experiments field directly, because many pkg/hub
 // tests build &Server{...} by struct literal without New() (ptone/scion#2217).
 func (s *Server) experimentRegistry() *experiments.Registry {
-	if s.experiments == nil {
+	s.experimentsMu.RLock()
+	reg := s.experiments
+	s.experimentsMu.RUnlock()
+	if reg == nil {
 		return experiments.Default()
 	}
-	return s.experiments
+	return reg
+}
+
+// setExperimentRegistry swaps the server's compiled experiment registry
+// safely with respect to concurrent experimentRegistry() readers.
+func (s *Server) setExperimentRegistry(reg *experiments.Registry) {
+	s.experimentsMu.Lock()
+	s.experiments = reg
+	s.experimentsMu.Unlock()
 }
 
 // experimentsSnapshot returns the cached experiments settings view, or an
@@ -139,8 +150,24 @@ func (s *Server) requireExperiment(name string, next http.HandlerFunc) http.Hand
 
 // dispatchExperimentNames are the server-layer experiments whose state the
 // hub sends with each agent dispatch, because they change what the broker
-// does. hub.conduit is added separately (see dispatchExperiments).
-var dispatchExperimentNames = []string{experiments.K8sNFSHome, experiments.AgentPlugins, experiments.CloudRunNativeIdentity}
+// does. hub.conduit, hub.conduit_deliver and hub.exec_schedules are added
+// separately (see dispatchExperiments).
+//
+// It also lists every experiment a platform skill gates on (experiment:
+// frontmatter or a scion:experiment block, ptone/scion#7830): the broker
+// evaluates those gates from the dispatched state. A test fails when a
+// skill names an experiment that is missing here.
+var dispatchExperimentNames = []string{
+	experiments.K8sNFSHome,
+	experiments.K8sWorkloadIdentitySetup,
+	experiments.AgentPlugins,
+	experiments.CloudRunNativeIdentity,
+	experiments.CloudRunEphemeralAgents,
+	experiments.Decisions,
+	experiments.Artifacts,
+	experiments.MessagePolicies,
+	experiments.CodeSpanMentions,
+}
 
 // dispatchExperiments returns the dispatch experiments that are enabled
 // now, resolved from one snapshot, or nil when none is. hub.conduit is a
@@ -158,6 +185,19 @@ func (s *Server) dispatchExperiments() []string {
 	}
 	if s.conduitServingIn(snap) || s.conduitIngressServingIn(snap) {
 		out = append(out, conduitExperiment)
+		// hub.conduit_deliver needs hub.conduit (gap G6 of the v2.22
+		// freeze): it reaches the broker and the agent only while conduit
+		// is served. The agent registers deliver-message from it at
+		// launch; the broker routes the agent's deliveries over conduit
+		// only for agents launched with it.
+		if s.experimentEnabledIn(snap, experiments.ConduitDeliver) {
+			out = append(out, experiments.ConduitDeliver)
+		}
+		// hub.exec_schedules needs hub.conduit too (design D8): the agent
+		// registers exec-start and exec-status from it at launch.
+		if s.experimentEnabledIn(snap, experiments.ExecSchedules) {
+			out = append(out, experiments.ExecSchedules)
+		}
 	}
 	return out
 }

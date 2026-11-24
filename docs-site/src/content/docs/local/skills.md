@@ -49,6 +49,7 @@ Frontmatter fields:
 | :--- | :--- | :--- |
 | `name` | Yes | Skill name in **kebab-case** (lowercase alphanumeric with hyphens, 1–64 chars, no leading/trailing hyphen). |
 | `description` | Yes | A short, human-readable summary shown in listings. |
+| `experiment` | No | Built-in platform skills only: gates the whole skill (`SKILL.md`) or a supporting `.md` file on a registered [experiment](/scion/reference/experiments/) (sections inside Markdown files can also be wrapped in `<!-- scion:experiment <id> -->` … `<!-- scion:end-experiment -->`; see [Platform skills](#platform-skills) and [Platform and Workspace Skills](/scion/reference/agent-config/#platform-and-workspace-skills)). |
 
 ### Scaffolding a new skill
 
@@ -130,6 +131,7 @@ Most segments are optional. Common forms:
 | `skill://scion/project/<projectId>/deploy-checklist` | Project-scoped skill (scope + scope ID). |
 | `skill://scion/user/<userId>/scratch@1.4.0` | User-scoped skill, exact version. |
 | `skill://project/deploy-checklist` | Scope-alias form (registry defaults to `scion`). |
+| `skill://global/deploy-checklist` | Scope-alias form for a global skill; the same as `skill://scion/global/deploy-checklist`. Prefer the full form: older Hubs read `skill://global/...` as a federated registry named `global`. |
 | `skill://registry.example.com/global/tool@^2.0` | External registry (federation). |
 | `gh://<owner>/<repo>/<path>[@<ref>][?token=<SECRET>]` | Skill sourced from a GitHub repository. Supports private repos and per-URI credentials. |
 | `gcp-skill://<alias>/<skillId>@<version>` | Skill sourced from GCP Vertex AI. |
@@ -175,13 +177,16 @@ To make adding skills as seamless as possible, Scion automatically validates and
 The old `scion://` scheme is no longer supported and is rejected during validation with a clear error pointing to `skill://`.
 :::
 
+:::note[The `core` scope is retired]
+Skills used to have a fourth scope, `core`. It is retired: a reference with a `core` scope segment, such as `skill://core/<name>`, `skill://scion/core/<name>` or `skill://<registry>/core/<name>`, is rejected with an error that names the `global` replacement (for example `skill://scion/global/<name>`). The `skill://global/` and `skill://core/` prefixes always mean the local Hub's scope, even if a federated registry named `global` or `core` is configured. Existing `core` skills became `global` skills when the Hub was upgraded; see the [release notes](/scion/release-notes/#global-catalog-writes-need-the-global-permissions-and-the-core-skill-scope-is-retired).
+:::
+
 ### Scopes and resolution order
 
-Skills live in one of four **scopes**:
+Skills live in one of three **scopes**:
 
 | Scope | Description |
 | :--- | :--- |
-| `core` | Built-in platform skills. |
 | `global` | Shared across all users of the Hub. |
 | `project` | Scoped to a specific project (requires a scope ID). |
 | `user` | Personal to a specific user (requires a scope ID). |
@@ -189,7 +194,7 @@ Skills live in one of four **scopes**:
 When a reference does not name a scope, the Hub searches in this order and returns the first match:
 
 ```text
-user → project → global → core
+user → project → global
 ```
 
 More specific scopes therefore override broader ones — a user's own skill shadows a global skill of the same name.
@@ -240,11 +245,11 @@ scion skills publish ./deploy-checklist --version 1.1.0 --skill-id <skill-id>
 | Flag | Default | Description |
 | :--- | :--- | :--- |
 | `--version` | *(required)* | SemVer version to publish (e.g. `1.0.0`). |
-| `--scope` | `global` | Scope for a **newly created** skill: `core`, `global`, `project`, or `user`. With `project`, the skill is attached to the current Hub-linked project. The command fails if no project can be determined (run `scion hub link` first). |
-| `--skill-id` | *(auto)* | Publish a new version for an existing skill ID. If omitted, Scion matches by directory name and creates the skill when no match exists. |
+| `--scope` | `global` (for a new skill) | Scope to publish into: `global`, `project`, or `user`. When `--scope` is set and `--skill-id` is not, Scion adds the version only to a skill of that name **in that scope**: the current project's skill for `project`, your own skill for `user`. It creates the skill there if there is none, so a same-named skill in another scope, project or user's scope is never published to. If that lookup fails (for example because the Hub refuses the list), the command stops with an error rather than creating a possibly duplicate skill. Without `--scope`, any skill of that name you can see gets the version, and a new skill is created in `global`. With `project`, the skill is attached to the current Hub-linked project; the command fails if no project can be determined (run `scion hub link` first). With `global`, no project is linked or looked up; outside a Scion project, add the root `--global` flag. |
+| `--skill-id` | *(auto)* | Publish a new version for an existing skill ID. If omitted, Scion matches by directory name as described for `--scope` and creates the skill when no match exists. |
 
 :::note[Global scope permissions]
-Publishing a skill to the `global` scope requires either the `hub-admin` role or the `global-catalog-author` role. The `global-catalog-author` role grants only the `skill.create_global` permission, allowing non-admin users to author global catalog skills without full Hub administrator authority. See [Permissions & Policy](/scion/hosted/ha/permissions/#roles) for role details.
+Creating a skill in the `global` scope needs the `skill.create_global` permission; publishing a new version of a global skill, changing it or deprecating a version needs `skill.update_global`, and deleting it needs `skill.delete_global`. The `global-catalog-author` role grants all three (and the matching template permissions) without Hub administrator authority, and `hub-admin` holds them as well. Owning a global skill grants nothing: the user who created it needs the role to keep changing it. For a CI token that publishes global skills, see [Hub-boundary tokens for global catalog authoring](/scion/hosted/user/personal-access-tokens/#hub-boundary-tokens-for-global-catalog-authoring); for the role and permission details, see [Global catalog authoring](/scion/hosted/ha/permissions/#global-catalog-authoring).
 :::
 
 **Per-version limits:** at most **50 files**, **10 MB** per file, and **50 MB** total. `.git/`, `.DS_Store`, `__pycache__`, and files matching `.gitignore` patterns are excluded automatically.
@@ -333,6 +338,10 @@ Hub (System + User-Defined) → User → Project → Template
 ```
 
 1. **Hub Scope** (broadest): Configured by the Hub administrator for the entire platform. This includes pre-seeded **System** (built-in) skills under the `scion-platform://` URI scheme (such as status signaling and messaging operations) as well as admin-defined global skills.
+
+   :::caution
+   A **global** skill on the Hub's injected list reaches every agent, and every holder of `skill.update_global` (every `global-catalog-author` and hub admin) can change its content, for example by publishing a new version. Add a global skill here only if you trust every holder of that permission with that reach, or pin it to an exact version (`@1.2.0`) or content hash (`@sha256:<hash>`), whose content cannot change. See [Global catalog authoring](/scion/hosted/ha/permissions/#global-catalog-authoring).
+   :::
 2. **User Scope**: Configured by you. These skills are automatically injected into every agent you provision, regardless of the project.
 3. **Project Scope**: Configured for a specific project. These skills are automatically injected into all agents running within that project.
 4. **Template Scope** (highest): Defined directly inside the agent's template. A template-level skill reference always overrides any injected skill of the same name.
@@ -401,7 +410,22 @@ Before performing discovery or logging requests (`POST /api/v1/skills/discover-d
 
 ## Platform skills
 
-Beyond skills you publish, **platform skills** are injected automatically at provisioning — a set of skills embedded in the Scion binary and injected into every agent (including `scion-web-serving` and its `references/web-apps.md`, which the agent instructions preamble points to for serving web apps and files over port forwarding). They provide baseline capabilities without any Hub or template setup.
+Beyond skills you publish, **platform skills** are embedded in the Scion binary (`resources/platform_skills/`, displayed in Hub settings under `scion-platform://`) and injected automatically into the harness's skills directory inside the Agent home at provisioning time. They provide baseline capabilities without any Hub or template setup:
+
+| Skill | Gate | Purpose |
+| :--- | :--- | :--- |
+| `git-operations` | Always | Git safety rules, shallow-clone diagnostics and deepening, working-tree resets, and non-interactive git operations. |
+| `git-sandbox` | `inject_when: git_workspace` | Git workflow protocol for sandbox and worktree workspaces. |
+| `scion-agent-manage` | Always | Managing concurrent agents (`scion start`, `look`, `reincarnate`), lifecycle rules (`references/agent-lifecycle.md`), and recovery (`references/troubleshooting.md`). |
+| `scion-artifacts` | `experiment: hub.artifacts` | Publishing, versioning, fetching, listing, and reviewing [artifacts](/scion/hosted/user/artifacts/) with CriticMarkup (`scion artifact`), sending references with `scion message --artifact`, and agent-mode limits. |
+| `scion-cli-operations` | Always | Container sandbox operational constraints and Hub-only CLI/API access rules. |
+| `scion-conversation` | Always | Managing conversations, participants, and message retrieval (`scion conversation`). |
+| `scion-messaging` | Always *(with gated sections)* | Sending messages to users and agents (`scion message`), addressing, mentions, and history catch-up (see [Messaging & Notifications](/scion/hosted/user/messaging/)). Gates `references/decisions.md` and inline decision-prompt guidance on `web.decisions`, and its `--artifact` pointer on `hub.artifacts`. |
+| `scion-scheduler` | Always | One-shot and recurring [schedules](/scion/hosted/user/scheduling/) (`scion schedule`), time zones, scheduled container exec (`--type exec`), and the blocked-wait pairing rule. |
+| `scion-web-serving` | Always | Exposing HTTP services and web apps through the Hub's [port proxy](/scion/hosted/user/port-forwarding/) (`scion expose`, `unexpose`, `tunnel`, and `references/web-apps.md`, referenced by the mandatory agent instructions preamble). |
+| `team-creation` | Always | Scaffolding and extending multi-agent team templates under `.scion/templates/` (see [Templates & Roles](/scion/local/templates/#the-team-creation-skill)). |
+
+### Environment gating (`inject_when`)
 
 Platform skills honor an optional `inject_when` frontmatter condition in `SKILL.md`, which gates injection on the agent's environment:
 
@@ -409,9 +433,19 @@ Platform skills honor an optional `inject_when` frontmatter condition in `SKILL.
 | :--- | :--- |
 | *(unset)* | Always. |
 | `git_workspace` | The workspace is a git repository. |
-| `hub_enabled` | The agent is connected to a Hub. |
+| `hub_enabled` | The agent is provisioned by a Runtime Broker or has a Hub endpoint configured. |
 
-A skill supplied by a template always takes precedence over a platform skill of the same name.
+### Experiment gating (`experiment` and `scion:experiment`)
+
+Platform skills and their supporting `.md` files can gate guidance on a registered [experiment](/scion/reference/experiments/) so agents are only shown features that are enabled:
+
+- **Whole skill (`SKILL.md` frontmatter):** Setting `experiment: <id>` in `SKILL.md` omits the entire skill directory while `<id>` is off (for example, `scion-artifacts` is installed only when `hub.artifacts` is enabled).
+- **Supporting file (`*.md` frontmatter):** Setting `experiment: <id>` in another Markdown file inside the skill omits that file while `<id>` is off (for example, `scion-messaging/references/decisions.md` requires `web.decisions`).
+- **Inline Markdown block:** Wrapping lines between `<!-- scion:experiment <id> -->` and `<!-- scion:end-experiment -->` (each marker on its own line) keeps those lines only while `<id>` is on and strips the marker lines either way.
+
+When a Runtime Broker provisions an agent for a Hub, Scion evaluates these gates against the experiments the Hub dispatches (`HubAgentDefaults.Experiments`, never the broker host's own settings); outside Hub dispatch, it checks `local_experiments` in the effective settings. Every gate fails closed: an off, unknown, or retired experiment ID — or an unclosed or nested block — omits the gated skill or content.
+
+Ordinary restarts and resumes leave already-installed platform skill directories untouched; [`scion reincarnate`](/scion/local/agent-lifecycle/) reprovisions platform skills from the current binary and experiment state, including removing a platform-owned skill whose `SKILL.md` experiment is now off. A skill supplied by a template always takes precedence over a platform skill of the same name.
 
 ## See also
 

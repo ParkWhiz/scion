@@ -16,15 +16,21 @@ package entadapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/execrunoutput"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/predicate"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/schedule"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledevent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecpollcursor"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/scheduledexecrun"
 	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/google/uuid"
@@ -35,6 +41,7 @@ import (
 // SQLite backend where schedules and scheduled events share one store.
 type ScheduleStore struct {
 	client *ent.Client
+	inTx   bool
 }
 
 // NewScheduleStore creates a new Ent-backed ScheduleStore.
@@ -342,6 +349,9 @@ func (s *ScheduleStore) ListSchedules(ctx context.Context, filter store.Schedule
 	} else {
 		// By default, exclude deleted schedules.
 		query.Where(schedule.StatusNEQ(store.ScheduleStatusDeleted))
+	}
+	if filter.EventType != "" {
+		query.Where(schedule.EventTypeEQ(filter.EventType))
 	}
 	if filter.Name != "" {
 		query.Where(schedule.NameEQ(filter.Name))
@@ -723,20 +733,33 @@ func (s *ScheduleStore) RecordScheduleRun(ctx context.Context, id string, ranAt 
 	if err != nil {
 		return err
 	}
-	counters := s.client.Schedule.UpdateOneID(uid).AddRunCount(1)
+	return recordScheduleRunOnClient(ctx, s.client, uid, ranAt, errMsg)
+}
+
+func recordScheduleRunOnClient(ctx context.Context, client *ent.Client, uid uuid.UUID, ranAt time.Time, errMsg string) error {
+	status := store.ScheduleRunSuccess
 	if errMsg != "" {
+		status = store.ScheduleRunError
+	}
+	return recordScheduleRunStatusOnClient(ctx, client, uid, ranAt, status, errMsg)
+}
+
+func recordScheduleRunStatusOnClient(ctx context.Context, client *ent.Client, uid uuid.UUID, ranAt time.Time, status string, errMsg string) error {
+	counters := client.Schedule.UpdateOneID(uid).AddRunCount(1)
+	if status == store.ScheduleRunError {
 		counters.AddErrorCount(1)
 	}
 	if err := counters.Exec(ctx); err != nil {
 		return mapError(err)
 	}
-	last := s.client.Schedule.Update().
+	last := client.Schedule.Update().
 		Where(schedule.ID(uid), schedule.Or(schedule.LastRunAtIsNil(), schedule.LastRunAtLT(ranAt))).
-		SetLastRunAt(ranAt)
-	if errMsg != "" {
-		last.SetLastRunStatus(store.ScheduleRunError).SetLastRunError(errMsg)
+		SetLastRunAt(ranAt).
+		SetLastRunStatus(status)
+	if errMsg != "" && status != store.ScheduleRunSuccess {
+		last.SetLastRunError(errMsg)
 	} else {
-		last.SetLastRunStatus(store.ScheduleRunSuccess).ClearLastRunError()
+		last.ClearLastRunError()
 	}
 	if _, err := last.Save(ctx); err != nil {
 		return mapError(err)
@@ -762,16 +785,35 @@ func (s *ScheduleStore) DeleteSchedulesByProject(ctx context.Context, projectID 
 	if err != nil {
 		return 0, err
 	}
-	// First delete all scheduled events for this project's schedules.
-	if _, err := s.client.ScheduledEvent.Delete().
-		Where(scheduledevent.ProjectIDEQ(uid)).
-		Exec(ctx); err != nil {
-		return 0, err
-	}
-	// Then delete the schedules themselves.
-	n, err := s.client.Schedule.Delete().
-		Where(schedule.ProjectIDEQ(uid)).
-		Exec(ctx)
+	// One transaction: the project's scheduled exec runs
+	// (ptone/scion#7883), then its scheduled events (whose foreign key
+	// would cascade to any run inserted meanwhile), then the schedules.
+	var n int
+	err = runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
+		if _, err := c.ExecRunOutput.Delete().
+			Where(
+				execrunoutput.OwnerKindEQ(execrunoutput.OwnerKindScheduledExec),
+				execrunoutput.ProjectIDEQ(uid),
+			).
+			Exec(ctx); err != nil {
+			return err
+		}
+		if _, err := c.ScheduledExecRun.Delete().
+			Where(scheduledexecrun.ProjectIDEQ(uid)).
+			Exec(ctx); err != nil {
+			return err
+		}
+		if _, err := c.ScheduledEvent.Delete().
+			Where(scheduledevent.ProjectIDEQ(uid)).
+			Exec(ctx); err != nil {
+			return err
+		}
+		deleted, err := c.Schedule.Delete().
+			Where(schedule.ProjectIDEQ(uid)).
+			Exec(ctx)
+		n = deleted
+		return err
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -1006,6 +1048,102 @@ func (s *ScheduleStore) UpdateScheduledEventStatus(ctx context.Context, id strin
 	return err
 }
 
+// CompleteFiringScheduledEvent atomically transitions an event in status
+// "firing" to status, setting fired_at and errMsg, and when scheduleID is
+// non-empty also records the run on that schedule inside the same transaction.
+// A deleted schedule is ignored so an orphaned firing event can still be
+// finalized.
+func (s *ScheduleStore) CompleteFiringScheduledEvent(
+	ctx context.Context,
+	id string,
+	status string,
+	firedAt time.Time,
+	errMsg string,
+	scheduleID string,
+	ranAt time.Time,
+) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	var schedUID uuid.UUID
+	if scheduleID != "" {
+		schedUID, err = parseUUID(scheduleID)
+		if err != nil {
+			return false, err
+		}
+	}
+	var updated bool
+	err = runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
+		upd := c.ScheduledEvent.Update().
+			Where(
+				scheduledevent.IDEQ(uid),
+				scheduledevent.StatusEQ(store.ScheduledEventFiring),
+			).
+			SetStatus(status).
+			SetFiredAt(firedAt)
+		if errMsg != "" {
+			upd.SetError(errMsg)
+		} else {
+			upd.ClearError()
+		}
+		n, err := upd.Save(ctx)
+		if err != nil {
+			return mapError(err)
+		}
+		if n == 0 {
+			return nil
+		}
+		updated = true
+		if scheduleID != "" {
+			runStatus := store.ScheduleRunSuccess
+			switch {
+			case status == store.ScheduledEventSkipped:
+				runStatus = store.ScheduleRunSkipped
+			case status == store.ScheduledEventFailed || errMsg != "":
+				runStatus = store.ScheduleRunError
+			}
+			if err := recordScheduleRunStatusOnClient(ctx, c, schedUID, ranAt, runStatus, errMsg); err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return updated, nil
+}
+
+// ListFiringScheduledEvents returns up to limit events in status "firing"
+// whose fired_at (or fire_at when fired_at is nil) is at or before cutoff,
+// ordered oldest-first.
+func (s *ScheduleStore) ListFiringScheduledEvents(ctx context.Context, cutoff time.Time, limit int) ([]store.ScheduledEvent, error) {
+	limit = clampLimit(limit)
+	entities, err := s.client.ScheduledEvent.Query().
+		Where(
+			scheduledevent.StatusEQ(store.ScheduledEventFiring),
+			scheduledevent.Or(
+				scheduledevent.FiredAtLTE(cutoff),
+				scheduledevent.And(
+					scheduledevent.FiredAtIsNil(),
+					scheduledevent.FireAtLTE(cutoff),
+				),
+			),
+		).
+		Order(scheduledevent.ByFiredAt(), scheduledevent.ByCreated()).
+		Limit(limit).
+		All(ctx)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	out := make([]store.ScheduledEvent, 0, len(entities))
+	for _, e := range entities {
+		out = append(out, *entScheduledEventToStore(e))
+	}
+	return out, nil
+}
+
 // ClaimScheduledEvent atomically transitions a scheduled event from "pending" to
 // claimedStatus, returning whether this caller won the claim. It is the
 // multi-replica dedup primitive (store.ScheduledEventClaimer): several hub
@@ -1076,6 +1214,18 @@ func (s *ScheduleStore) CancelScheduledEventWithReason(ctx context.Context, id s
 
 // ListScheduledEvents returns events matching the filter criteria.
 func (s *ScheduleStore) ListScheduledEvents(ctx context.Context, filter store.ScheduledEventFilter, opts store.ListOptions) (*store.ListResult[store.ScheduledEvent], error) {
+	sortMode := filter.Sort
+	if sortMode == "" {
+		sortMode = store.ScheduledEventSortCreatedDesc
+	}
+	switch sortMode {
+	case store.ScheduledEventSortCreatedDesc,
+		store.ScheduledEventSortFireAtAsc,
+		store.ScheduledEventSortCompletedDesc:
+	default:
+		return nil, fmt.Errorf("%w: unsupported scheduled event sort %q", store.ErrInvalidInput, filter.Sort)
+	}
+
 	query := s.client.ScheduledEvent.Query()
 
 	if filter.ProjectID != "" {
@@ -1090,6 +1240,9 @@ func (s *ScheduleStore) ListScheduledEvents(ctx context.Context, filter store.Sc
 	}
 	if filter.Status != "" {
 		query.Where(scheduledevent.StatusEQ(filter.Status))
+	}
+	if len(filter.Statuses) > 0 {
+		query.Where(scheduledevent.StatusIn(filter.Statuses...))
 	}
 	if filter.ScheduleID != "" {
 		query.Where(scheduledevent.ScheduleIDEQ(filter.ScheduleID))
@@ -1108,17 +1261,74 @@ func (s *ScheduleStore) ListScheduledEvents(ctx context.Context, filter store.Sc
 		return nil, err
 	}
 
+	// Keyset pagination bound to the sort/filter mode so cursors from
+	// Pending (fire_at ASC), Past (COALESCE(fired_at, created) DESC), and
+	// default (created DESC) cannot be mixed (ptone/scion#9082). Default
+	// created_desc with no multi-status filter preserves the unbound
+	// two-part cursor format for backwards compatibility.
+	cursorBinding := scheduledEventCursorBinding(sortMode, filter, opts.CursorBinding)
+	var (
+		cursorTS time.Time
+		cursorID uuid.UUID
+	)
 	if opts.Cursor != "" {
-		cursorUID, err := parseCursorUUID(opts.Cursor)
+		var err error
+		cursorTS, cursorID, err = decodeListCursor(opts.Cursor, cursorBinding)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid cursor: %w", err)
 		}
-		query.Where(scheduledevent.IDLT(cursorUID))
+		cursorTS = cursorTS.UTC()
+		switch sortMode {
+		case store.ScheduledEventSortCreatedDesc:
+			query.Where(scheduledevent.Or(
+				scheduledevent.CreatedLT(cursorTS),
+				scheduledevent.And(
+					scheduledevent.CreatedEQ(cursorTS),
+					scheduledevent.IDLT(cursorID),
+				),
+			))
+		case store.ScheduledEventSortFireAtAsc:
+			query.Where(scheduledevent.Or(
+				scheduledevent.FireAtGT(cursorTS),
+				scheduledevent.And(
+					scheduledevent.FireAtEQ(cursorTS),
+					scheduledevent.IDGT(cursorID),
+				),
+			))
+		case store.ScheduledEventSortCompletedDesc:
+			query.Where(func(s *entsql.Selector) {
+				key := scheduledEventCompletedAtExpr(s)
+				idCol := s.C(scheduledevent.FieldID)
+				tsArg := timeArg(s.Dialect(), cursorTS)
+				s.Where(entsql.P(func(b *entsql.Builder) {
+					b.WriteString("((").WriteString(key).WriteString(" < ").Arg(tsArg).
+						WriteString(") OR (").WriteString(key).WriteString(" = ").Arg(tsArg).
+						WriteString(" AND ").WriteString(idCol).WriteString(" < ").Arg(cursorID).WriteString("))")
+				}))
+			})
+		}
+	}
+
+	switch sortMode {
+	case store.ScheduledEventSortCreatedDesc:
+		query.
+			Order(scheduledevent.ByCreated(entsql.OrderDesc())).
+			Order(scheduledevent.ByID(entsql.OrderDesc()))
+	case store.ScheduledEventSortFireAtAsc:
+		query.
+			Order(scheduledevent.ByFireAt(entsql.OrderAsc())).
+			Order(scheduledevent.ByID(entsql.OrderAsc()))
+	case store.ScheduledEventSortCompletedDesc:
+		query.Order(func(s *entsql.Selector) {
+			s.OrderExpr(entsql.Raw(fmt.Sprintf("%s DESC, %s DESC",
+				scheduledEventCompletedAtExpr(s),
+				s.C(scheduledevent.FieldID),
+			)))
+		})
 	}
 
 	limit := clampLimit(opts.Limit)
 	entities, err := query.
-		Order(scheduledevent.ByCreated(entsql.OrderDesc())).
 		Limit(limit + 1).
 		All(ctx)
 	if err != nil {
@@ -1133,31 +1343,125 @@ func (s *ScheduleStore) ListScheduledEvents(ctx context.Context, filter store.Sc
 	result := &store.ListResult[store.ScheduledEvent]{TotalCount: totalCount}
 	if len(events) > limit {
 		result.Items = events[:limit]
-		result.NextCursor = events[limit-1].ID
+		last := events[limit-1]
+		// No-progress guard, as ListSchedules.
+		if opts.Cursor == "" || eventCursorAdvances(sortMode, last, cursorTS, cursorID) {
+			result.NextCursor = encodeListCursor(scheduledEventSortTime(sortMode, last), last.ID, cursorBinding)
+		}
 	} else {
 		result.Items = events
 	}
 	return result, nil
 }
 
-// PurgeOldScheduledEvents removes non-pending events that completed before
-// cutoff. Completion is fired_at (set for fired, expired and failed events);
-// an event with no fired_at (a cancelled one) falls back to created. So an
-// event scheduled far ahead keeps its outcome for the full period after it
-// fires (ptone/scion#4517).
+// scheduledEventCompletedAtExpr returns the SQL expression for completion time:
+// COALESCE(fired_at, created), normalized via timeColumnExpr so SQLite and
+// Postgres both compare instants cleanly and propagate NULL fired_at.
+func scheduledEventCompletedAtExpr(s *entsql.Selector) string {
+	return fmt.Sprintf("COALESCE(%s, %s)",
+		timeColumnExpr(s, scheduledevent.FieldFiredAt),
+		timeColumnExpr(s, scheduledevent.FieldCreated),
+	)
+}
+
+func scheduledEventSortTime(sortMode string, evt store.ScheduledEvent) time.Time {
+	switch sortMode {
+	case store.ScheduledEventSortFireAtAsc:
+		return evt.FireAt.UTC()
+	case store.ScheduledEventSortCompletedDesc:
+		if evt.FiredAt != nil {
+			return evt.FiredAt.UTC()
+		}
+		return evt.CreatedAt.UTC()
+	default:
+		return evt.CreatedAt.UTC()
+	}
+}
+
+func scheduledEventCursorBinding(sortMode string, filter store.ScheduledEventFilter, explicit string) string {
+	if sortMode == store.ScheduledEventSortCreatedDesc && len(filter.Statuses) == 0 {
+		return explicit
+	}
+	statuses := append([]string(nil), filter.Statuses...)
+	sort.Strings(statuses)
+	binding := sortMode + ":" + strings.Join(statuses, "|")
+	if explicit != "" {
+		binding += ":" + explicit
+	}
+	return binding
+}
+
+// eventCursorAdvances reports whether row is strictly after the cursor
+// (ts, id) in the active sortMode order.
+func eventCursorAdvances(sortMode string, row store.ScheduledEvent, ts time.Time, id uuid.UUID) bool {
+	rt := scheduledEventSortTime(sortMode, row)
+	if sortMode == store.ScheduledEventSortFireAtAsc {
+		if !rt.Equal(ts) {
+			return rt.After(ts)
+		}
+		return row.ID > id.String()
+	}
+	if !rt.Equal(ts) {
+		return rt.Before(ts)
+	}
+	return row.ID < id.String()
+}
+
+// PurgeOldScheduledEvents removes completed events (excluding pending and
+// firing) that finished before cutoff. Completion is fired_at (set for fired,
+// expired and failed events); an event with no fired_at (a cancelled one)
+// falls back to created. So an event scheduled far ahead keeps its outcome for
+// the full period after it fires (ptone/scion#4517).
+//
+// The scheduled exec run of each purged event (ptone/scion#7883) is deleted
+// in the same transaction, before the events, by the same predicate; no
+// cascade is relied on.
 func (s *ScheduleStore) PurgeOldScheduledEvents(ctx context.Context, cutoff time.Time) (int, error) {
-	n, err := s.client.ScheduledEvent.Delete().
-		Where(
-			scheduledevent.StatusNEQ(store.ScheduledEventPending),
-			scheduledevent.Or(
-				scheduledevent.FiredAtLT(cutoff),
-				scheduledevent.And(
-					scheduledevent.FiredAtIsNil(),
-					scheduledevent.CreatedLT(cutoff),
-				),
+	purgeable := []predicate.ScheduledEvent{
+		scheduledevent.StatusNotIn(store.ScheduledEventPending, store.ScheduledEventFiring),
+		scheduledevent.Or(
+			scheduledevent.FiredAtLT(cutoff),
+			scheduledevent.And(
+				scheduledevent.FiredAtIsNil(),
+				scheduledevent.CreatedLT(cutoff),
 			),
-		).
-		Exec(ctx)
+		),
+	}
+	var n int
+	err := runInEntTx(ctx, s.client, s.inTx, func(c *ent.Client) error {
+		ids, err := c.ScheduledEvent.Query().Where(purgeable...).IDs(ctx)
+		if err != nil {
+			return err
+		}
+		for start := 0; start < len(ids); start += scheduledExecRunsByEventChunk {
+			end := min(start+scheduledExecRunsByEventChunk, len(ids))
+			chunk := ids[start:end]
+			if _, err := c.ExecRunOutput.Delete().
+				Where(
+					execrunoutput.OwnerKindEQ(execrunoutput.OwnerKindScheduledExec),
+					execrunoutput.IDIn(chunk...),
+				).
+				Exec(ctx); err != nil {
+				return err
+			}
+			if _, err := c.ScheduledExecRun.Delete().Where(scheduledexecrun.EventIDIn(chunk...)).Exec(ctx); err != nil {
+				return err
+			}
+			deleted, err := c.ScheduledEvent.Delete().
+				Where(append([]predicate.ScheduledEvent{scheduledevent.IDIn(chunk...)}, purgeable...)...).
+				Exec(ctx)
+			if err != nil {
+				return err
+			}
+			n += deleted
+		}
+		if _, err := c.ScheduledExecPollCursor.Delete().
+			Where(scheduledexecpollcursor.LastPolledAtLT(cutoff.UTC())).
+			Exec(ctx); err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}

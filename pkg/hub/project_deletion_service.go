@@ -47,10 +47,11 @@ import (
 
 // ProjectDeletionService is the bounded domain service for project deletion.
 type ProjectDeletionService struct {
-	store   store.Store
-	authz   *AuthzService
-	logger  *slog.Logger
-	nowFunc func() time.Time
+	store            store.Store
+	authz            *AuthzService
+	logger           *slog.Logger
+	nowFunc          func() time.Time
+	onProjectDeleted func(projectID string)
 }
 
 // NewProjectDeletionService creates a new ProjectDeletionService.
@@ -103,6 +104,10 @@ type ProjectDeleteResult struct {
 	// secrets, for the caller to release with the secret backend after
 	// the commit.
 	PendingSecretValueRefs []string
+	// AgentSecretKeys maps each deleted project agent's ID to the key names of
+	// its agent-scoped secrets that were removed in the transaction, for
+	// best-effort post-commit external backend cleanup (removeAgentScopedSecrets).
+	AgentSecretKeys map[string][]string
 }
 
 // CascadeSummary records what was cascade-deleted in the transaction.
@@ -117,6 +122,7 @@ type CascadeSummary struct {
 	HarnessConfigs    int `json:"harness_configs_deleted"`
 	UserAccessTokens  int `json:"user_access_tokens_deleted"`
 	Schedules         int `json:"schedules_deleted"`
+	Triggers          int `json:"triggers_deleted"`
 	AgentCredentials  int `json:"agent_credentials_deleted"`
 	LifecycleHooks    int `json:"lifecycle_hooks_deleted"`
 	PreStartHooks     int `json:"pre_start_hooks_deleted"`
@@ -140,6 +146,9 @@ type CascadeSummary struct {
 	// pendingSecretValueRefs are the value refs of the deleted pending
 	// secrets (never serialized).
 	pendingSecretValueRefs []string
+	// agentSecretKeys maps agent ID -> deleted agent-scope secret keys
+	// (never serialized).
+	agentSecretKeys map[string][]string
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +365,7 @@ func (svc *ProjectDeletionService) Delete(ctx context.Context, req ProjectDelete
 			Project:                project,
 			CascadeSummary:         cascadeSummary,
 			PendingSecretValueRefs: cascadeSummary.pendingSecretValueRefs,
+			AgentSecretKeys:        cascadeSummary.agentSecretKeys,
 		}
 		return nil
 	})
@@ -383,6 +393,10 @@ func (svc *ProjectDeletionService) Delete(ctx context.Context, req ProjectDelete
 			Reason:     "project deletion failed",
 			HTTPStatus: 500,
 		}
+	}
+
+	if svc.onProjectDeleted != nil {
+		svc.onProjectDeleted(req.ProjectID)
 	}
 
 	// The project's storage (its tree on the shared project storage, the
@@ -588,6 +602,18 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 		cs.pendingSecretValueRefs = refs
 	}
 
+	// 3c. Agent-scoped secrets of every agent in the project (soft-deleted
+	// included). CompositeStore.DeleteProject removes the agent rows directly
+	// without invoking hardDeleteAgentTx, so we delete their agent-scope
+	// secret rows in the transaction here and return their keys for
+	// best-effort post-commit external backend cleanup (ptone/scion#8743).
+	if n, agentKeys, err := deleteProjectAgentSecretsTx(ctx, tx, projectID); err != nil {
+		return cs, fmt.Errorf("cascade agent secrets: %w", err)
+	} else {
+		cs.Secrets += n
+		cs.agentSecretKeys = agentKeys
+	}
+
 	// 4. Env vars — project-scoped environment variables.
 	if n, err := tx.DeleteEnvVarsByScope(ctx, store.ScopeProject, projectID); err != nil {
 		return cs, fmt.Errorf("cascade env vars: %w", err)
@@ -648,6 +674,14 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 		return cs, fmt.Errorf("cascade schedules: %w", err)
 	} else {
 		cs.Schedules = n
+	}
+
+	// 10b. Triggers, webhook endpoints, trigger events/fires, and hub-scoped
+	// webhook endpoint internal secrets for the project (ptone/scion#8028).
+	if n, err := tx.DeleteTriggersByProject(ctx, projectID); err != nil {
+		return cs, fmt.Errorf("cascade triggers: %w", err)
+	} else {
+		cs.Triggers = n
 	}
 
 	// 11. Agent credentials — project-scoped agent auth tokens.
@@ -736,6 +770,8 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 	// | harness_configs        | Transactional: DeleteHarnessConfigsByScope (step 8)      | Config   |
 	// | user_access_tokens     | Transactional: DeleteUserAccessTokensByProject (step 9)  | Cred     |
 	// | schedules (+events)    | Transactional: DeleteSchedulesByProject (step 10)        | Job      |
+	// | triggers (+endpoints,  | Transactional: DeleteTriggersByProject (step 10b)        | Job/Cred |
+	// |   events, fires, internal webhook secrets)                                        |          |
 	// | agent_credentials      | Transactional: DeleteAgentCredentialsByProject (step 11) | Cred     |
 	// | lifecycle_hooks        | Transactional: DeleteLifecycleHooksByScope (step 12)     | Job      |
 	// | pre_start_hooks        | Transactional: DeletePreStartHooksByProject (step 13)    | Job      |
@@ -755,6 +791,52 @@ func (svc *ProjectDeletionService) cascadeSecurityState(ctx context.Context, tx 
 	// ---------------------------------------------------------------------------
 
 	return cs, nil
+}
+
+// deleteProjectAgentSecretsTx deletes agent-scoped secret rows for every
+// agent (soft-deleted or live) belonging to projectID inside tx, returning
+// the total rows deleted and a map of agentID -> secret key names for
+// best-effort post-commit external backend cleanup.
+func deleteProjectAgentSecretsTx(ctx context.Context, tx store.Store, projectID string) (int, map[string][]string, error) {
+	total := 0
+	var agentKeys map[string][]string
+	cursor := ""
+	for {
+		page, err := tx.ListAgents(ctx, store.AgentFilter{ProjectID: projectID, IncludeDeleted: true},
+			store.ListOptions{Limit: 100, Cursor: cursor, SkipTotalCount: true})
+		if err != nil {
+			return total, agentKeys, fmt.Errorf("list project agents for secret cleanup: %w", err)
+		}
+		if page == nil {
+			return total, agentKeys, fmt.Errorf("%w: nil agent page in deleteProjectAgentSecretsTx", store.ErrInvalidInput)
+		}
+		for _, a := range page.Items {
+			rows, err := tx.ListSecrets(ctx, store.SecretFilter{Scope: store.ScopeAgent, ScopeID: a.ID})
+			if err != nil {
+				return total, agentKeys, fmt.Errorf("list agent secrets for agent %s: %w", a.ID, err)
+			}
+			if len(rows) == 0 {
+				continue
+			}
+			keys := make([]string, 0, len(rows))
+			for _, r := range rows {
+				keys = append(keys, r.Key)
+			}
+			if agentKeys == nil {
+				agentKeys = make(map[string][]string)
+			}
+			agentKeys[a.ID] = keys
+			n, err := tx.DeleteSecretsByScope(ctx, store.ScopeAgent, a.ID)
+			if err != nil {
+				return total, agentKeys, fmt.Errorf("delete agent secrets for agent %s: %w", a.ID, err)
+			}
+			total += n
+		}
+		if page.NextCursor == "" {
+			return total, agentKeys, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 // deactivateProjectAgentEdges deactivates every active delegation edge where

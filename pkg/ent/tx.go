@@ -26,6 +26,8 @@ type Tx struct {
 	AgentDelegatedCredential *AgentDelegatedCredentialClient
 	// AgentDelegationGrant is the client for interacting with the AgentDelegationGrant builders.
 	AgentDelegationGrant *AgentDelegationGrantClient
+	// AgentDeliveryHold is the client for interacting with the AgentDeliveryHold builders.
+	AgentDeliveryHold *AgentDeliveryHoldClient
 	// AgentHold is the client for interacting with the AgentHold builders.
 	AgentHold *AgentHoldClient
 	// AgentIdentityKey is the client for interacting with the AgentIdentityKey builders.
@@ -42,6 +44,8 @@ type Tx struct {
 	AgentServiceAccountAssignment *AgentServiceAccountAssignmentClient
 	// AgentSessionMetrics is the client for interacting with the AgentSessionMetrics builders.
 	AgentSessionMetrics *AgentSessionMetricsClient
+	// AgentSuspendScreen is the client for interacting with the AgentSuspendScreen builders.
+	AgentSuspendScreen *AgentSuspendScreenClient
 	// AllowListEntry is the client for interacting with the AllowListEntry builders.
 	AllowListEntry *AllowListEntryClient
 	// ApiKey is the client for interacting with the ApiKey builders.
@@ -82,10 +86,14 @@ type Tx struct {
 	DelegationAdoption *DelegationAdoptionClient
 	// DelegationEdge is the client for interacting with the DelegationEdge builders.
 	DelegationEdge *DelegationEdgeClient
+	// DurableQueueItem is the client for interacting with the DurableQueueItem builders.
+	DurableQueueItem *DurableQueueItemClient
 	// EntitlementBinding is the client for interacting with the EntitlementBinding builders.
 	EntitlementBinding *EntitlementBindingClient
 	// EnvVar is the client for interacting with the EnvVar builders.
 	EnvVar *EnvVarClient
+	// ExecRunOutput is the client for interacting with the ExecRunOutput builders.
+	ExecRunOutput *ExecRunOutputClient
 	// ExternalIdentity is the client for interacting with the ExternalIdentity builders.
 	ExternalIdentity *ExternalIdentityClient
 	// GCPServiceAccount is the client for interacting with the GCPServiceAccount builders.
@@ -132,6 +140,10 @@ type Tx struct {
 	Message *MessageClient
 	// MessageAddressee is the client for interacting with the MessageAddressee builders.
 	MessageAddressee *MessageAddresseeClient
+	// MessagePolicy is the client for interacting with the MessagePolicy builders.
+	MessagePolicy *MessagePolicyClient
+	// MessagePolicyDecision is the client for interacting with the MessagePolicyDecision builders.
+	MessagePolicyDecision *MessagePolicyDecisionClient
 	// MutationAudit is the client for interacting with the MutationAudit builders.
 	MutationAudit *MutationAuditClient
 	// NonceCache is the client for interacting with the NonceCache builders.
@@ -164,12 +176,20 @@ type Tx struct {
 	RoleDefinition *RoleDefinitionClient
 	// RuntimeBroker is the client for interacting with the RuntimeBroker builders.
 	RuntimeBroker *RuntimeBrokerClient
+	// RuntimeOrphan is the client for interacting with the RuntimeOrphan builders.
+	RuntimeOrphan *RuntimeOrphanClient
 	// Schedule is the client for interacting with the Schedule builders.
 	Schedule *ScheduleClient
 	// ScheduledEvent is the client for interacting with the ScheduledEvent builders.
 	ScheduledEvent *ScheduledEventClient
+	// ScheduledExecPollCursor is the client for interacting with the ScheduledExecPollCursor builders.
+	ScheduledExecPollCursor *ScheduledExecPollCursorClient
+	// ScheduledExecRun is the client for interacting with the ScheduledExecRun builders.
+	ScheduledExecRun *ScheduledExecRunClient
 	// Secret is the client for interacting with the Secret builders.
 	Secret *SecretClient
+	// SecretRequest is the client for interacting with the SecretRequest builders.
+	SecretRequest *SecretRequestClient
 	// Skill is the client for interacting with the Skill builders.
 	Skill *SkillClient
 	// SkillInjection is the client for interacting with the SkillInjection builders.
@@ -180,6 +200,8 @@ type Tx struct {
 	SkillVersion *SkillVersionClient
 	// SubscriptionTemplate is the client for interacting with the SubscriptionTemplate builders.
 	SubscriptionTemplate *SubscriptionTemplateClient
+	// SystemOneInstance is the client for interacting with the SystemOneInstance builders.
+	SystemOneInstance *SystemOneInstanceClient
 	// Template is the client for interacting with the Template builders.
 	Template *TemplateClient
 	// TestIdentityDelegation is the client for interacting with the TestIdentityDelegation builders.
@@ -192,6 +214,14 @@ type Tx struct {
 	ThreadGroup *ThreadGroupClient
 	// ThreadGroupMember is the client for interacting with the ThreadGroupMember builders.
 	ThreadGroupMember *ThreadGroupMemberClient
+	// Trigger is the client for interacting with the Trigger builders.
+	Trigger *TriggerClient
+	// TriggerEvent is the client for interacting with the TriggerEvent builders.
+	TriggerEvent *TriggerEventClient
+	// TriggerFire is the client for interacting with the TriggerFire builders.
+	TriggerFire *TriggerFireClient
+	// TriggerSubjectClaim is the client for interacting with the TriggerSubjectClaim builders.
+	TriggerSubjectClaim *TriggerSubjectClaimClient
 	// UsageReservation is the client for interacting with the UsageReservation builders.
 	UsageReservation *UsageReservationClient
 	// User is the client for interacting with the User builders.
@@ -202,8 +232,12 @@ type Tx struct {
 	UserDeletion *UserDeletionClient
 	// UserDeletionAgent is the client for interacting with the UserDeletionAgent builders.
 	UserDeletionAgent *UserDeletionAgentClient
+	// UserExecContainer is the client for interacting with the UserExecContainer builders.
+	UserExecContainer *UserExecContainerClient
 	// UserTerminalWorkspace is the client for interacting with the UserTerminalWorkspace builders.
 	UserTerminalWorkspace *UserTerminalWorkspaceClient
+	// WebhookEndpoint is the client for interacting with the WebhookEndpoint builders.
+	WebhookEndpoint *WebhookEndpointClient
 
 	// lazily loaded.
 	client     *Client
@@ -342,6 +376,7 @@ func (tx *Tx) init() {
 	tx.AgentCredential = NewAgentCredentialClient(tx.config)
 	tx.AgentDelegatedCredential = NewAgentDelegatedCredentialClient(tx.config)
 	tx.AgentDelegationGrant = NewAgentDelegationGrantClient(tx.config)
+	tx.AgentDeliveryHold = NewAgentDeliveryHoldClient(tx.config)
 	tx.AgentHold = NewAgentHoldClient(tx.config)
 	tx.AgentIdentityKey = NewAgentIdentityKeyClient(tx.config)
 	tx.AgentLifecycleCursor = NewAgentLifecycleCursorClient(tx.config)
@@ -350,6 +385,7 @@ func (tx *Tx) init() {
 	tx.AgentReincarnation = NewAgentReincarnationClient(tx.config)
 	tx.AgentServiceAccountAssignment = NewAgentServiceAccountAssignmentClient(tx.config)
 	tx.AgentSessionMetrics = NewAgentSessionMetricsClient(tx.config)
+	tx.AgentSuspendScreen = NewAgentSuspendScreenClient(tx.config)
 	tx.AllowListEntry = NewAllowListEntryClient(tx.config)
 	tx.ApiKey = NewApiKeyClient(tx.config)
 	tx.BrokerDispatch = NewBrokerDispatchClient(tx.config)
@@ -370,8 +406,10 @@ func (tx *Tx) init() {
 	tx.DecisionKeyCounter = NewDecisionKeyCounterClient(tx.config)
 	tx.DelegationAdoption = NewDelegationAdoptionClient(tx.config)
 	tx.DelegationEdge = NewDelegationEdgeClient(tx.config)
+	tx.DurableQueueItem = NewDurableQueueItemClient(tx.config)
 	tx.EntitlementBinding = NewEntitlementBindingClient(tx.config)
 	tx.EnvVar = NewEnvVarClient(tx.config)
+	tx.ExecRunOutput = NewExecRunOutputClient(tx.config)
 	tx.ExternalIdentity = NewExternalIdentityClient(tx.config)
 	tx.GCPServiceAccount = NewGCPServiceAccountClient(tx.config)
 	tx.GitHubResolutionCache = NewGitHubResolutionCacheClient(tx.config)
@@ -395,6 +433,8 @@ func (tx *Tx) init() {
 	tx.MembershipLossCheck = NewMembershipLossCheckClient(tx.config)
 	tx.Message = NewMessageClient(tx.config)
 	tx.MessageAddressee = NewMessageAddresseeClient(tx.config)
+	tx.MessagePolicy = NewMessagePolicyClient(tx.config)
+	tx.MessagePolicyDecision = NewMessagePolicyDecisionClient(tx.config)
 	tx.MutationAudit = NewMutationAuditClient(tx.config)
 	tx.NonceCache = NewNonceCacheClient(tx.config)
 	tx.Notification = NewNotificationClient(tx.config)
@@ -411,26 +451,37 @@ func (tx *Tx) init() {
 	tx.RoleBinding = NewRoleBindingClient(tx.config)
 	tx.RoleDefinition = NewRoleDefinitionClient(tx.config)
 	tx.RuntimeBroker = NewRuntimeBrokerClient(tx.config)
+	tx.RuntimeOrphan = NewRuntimeOrphanClient(tx.config)
 	tx.Schedule = NewScheduleClient(tx.config)
 	tx.ScheduledEvent = NewScheduledEventClient(tx.config)
+	tx.ScheduledExecPollCursor = NewScheduledExecPollCursorClient(tx.config)
+	tx.ScheduledExecRun = NewScheduledExecRunClient(tx.config)
 	tx.Secret = NewSecretClient(tx.config)
+	tx.SecretRequest = NewSecretRequestClient(tx.config)
 	tx.Skill = NewSkillClient(tx.config)
 	tx.SkillInjection = NewSkillInjectionClient(tx.config)
 	tx.SkillRegistry = NewSkillRegistryClient(tx.config)
 	tx.SkillVersion = NewSkillVersionClient(tx.config)
 	tx.SubscriptionTemplate = NewSubscriptionTemplateClient(tx.config)
+	tx.SystemOneInstance = NewSystemOneInstanceClient(tx.config)
 	tx.Template = NewTemplateClient(tx.config)
 	tx.TestIdentityDelegation = NewTestIdentityDelegationClient(tx.config)
 	tx.TestIdentityLoginCode = NewTestIdentityLoginCodeClient(tx.config)
 	tx.TestInfraMarker = NewTestInfraMarkerClient(tx.config)
 	tx.ThreadGroup = NewThreadGroupClient(tx.config)
 	tx.ThreadGroupMember = NewThreadGroupMemberClient(tx.config)
+	tx.Trigger = NewTriggerClient(tx.config)
+	tx.TriggerEvent = NewTriggerEventClient(tx.config)
+	tx.TriggerFire = NewTriggerFireClient(tx.config)
+	tx.TriggerSubjectClaim = NewTriggerSubjectClaimClient(tx.config)
 	tx.UsageReservation = NewUsageReservationClient(tx.config)
 	tx.User = NewUserClient(tx.config)
 	tx.UserAccessToken = NewUserAccessTokenClient(tx.config)
 	tx.UserDeletion = NewUserDeletionClient(tx.config)
 	tx.UserDeletionAgent = NewUserDeletionAgentClient(tx.config)
+	tx.UserExecContainer = NewUserExecContainerClient(tx.config)
 	tx.UserTerminalWorkspace = NewUserTerminalWorkspaceClient(tx.config)
+	tx.WebhookEndpoint = NewWebhookEndpointClient(tx.config)
 }
 
 // txDriver wraps the given dialect.Tx with a nop dialect.Driver implementation.

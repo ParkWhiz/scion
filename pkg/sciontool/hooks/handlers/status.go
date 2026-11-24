@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"time"
 
 	state "github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/agentinfolock"
@@ -66,11 +67,66 @@ func (h *StatusHandler) update(mutate func(info map[string]interface{}) bool) er
 	}
 	return agentinfolock.Update(h.StatusPath, opts, func() error {
 		info := h.readAgentInfoMap()
+		prevActivity, _ := info["activity"].(string)
+		prevMessage := detailMessage(info)
 		if !mutate(info) {
 			return nil
 		}
+		dropStaleHarnessErrorReason(info, prevActivity, prevMessage)
+		stampActivitySince(info, prevActivity, time.Now())
 		return h.writeAgentInfoLocked(info)
 	})
+}
+
+// detailMessage returns info's detail.message, or "".
+func detailMessage(info map[string]interface{}) string {
+	detail, _ := info["detail"].(map[string]interface{})
+	message, _ := detail["message"].(string)
+	return message
+}
+
+// dropStaleHarnessErrorReason removes the harness_error reason from
+// detail.message when a write replaced the harness_error activity and left
+// the reason in place, so no later reader (the broker heartbeat relays
+// detail.message) shows the cleared error. A write that set its own
+// message keeps it.
+func dropStaleHarnessErrorReason(info map[string]interface{}, prevActivity, prevMessage string) {
+	if prevActivity != string(state.ActivityHarnessError) || prevMessage == "" {
+		return
+	}
+	if current, _ := info["activity"].(string); current == string(state.ActivityHarnessError) {
+		return
+	}
+	if detailMessage(info) == prevMessage {
+		applyMessage(info, "")
+	}
+}
+
+// activitySinceKey is the agent-info.json field that records when the
+// current activity began (RFC 3339, UTC). The liveness sampler reads it
+// (ptone/scion#7855): a process the harness started after a tool call
+// began is that tool call's process, and the tool-call stall suppression
+// is capped by the time since then.
+const activitySinceKey = "activitySince"
+
+// stampActivitySince sets activitySinceKey to now when the write changed the
+// activity from before, or set an activity on a record that has no stamp
+// yet; it removes the stamp when the write removed the activity. A write
+// that keeps the activity (a second tool-start while executing, a message
+// or phase-only write) keeps the stamp. Every write goes through update, so
+// this is the one place the stamp is kept.
+func stampActivitySince(info map[string]interface{}, before string, now time.Time) {
+	after, _ := info["activity"].(string)
+	switch {
+	case after == "":
+		delete(info, activitySinceKey)
+	case after != before:
+		info[activitySinceKey] = now.UTC().Format(time.RFC3339Nano)
+	default:
+		if _, ok := info[activitySinceKey].(string); !ok {
+			info[activitySinceKey] = now.UTC().Format(time.RFC3339Nano)
+		}
+	}
 }
 
 // NewStatusHandler creates a new status handler.
@@ -100,6 +156,20 @@ const activitySourceKey = "activitySource"
 
 // activitySourceNotification marks an activity set by a Notification event.
 const activitySourceNotification = "notification"
+
+// ActivitySourceAskUser marks a waiting_for_input activity set explicitly by
+// the agent via `sciontool status ask_user` (including the legacy
+// `sciontool hook ask_user` and `scion message --decisions-file` paths).
+// Unlike unmarked waiting_for_input (Claude ExitPlanMode/AskUserQuestion), an
+// ask-user wait survives tool-start within the same turn and clears on a
+// subsequent turn (after a parent EventAgentEnd sets askUserTurnEndedKey).
+const ActivitySourceAskUser = "ask-user"
+
+// askUserTurnEndedKey is the agent-info.json boolean field set on a parent
+// EventAgentEnd while an ask-user waiting_for_input is active. Once set, the
+// next turn's parent tool-start, model-start, or agent-end clears the wait.
+// Every write that removes activitySourceKey also removes this field.
+const askUserTurnEndedKey = "askUserTurnEnded"
 
 // activitySourceSubagentEnd marks the working activity written when the last
 // owner's SubagentStop released a sub-agent-held wait. Only the HubHandler
@@ -178,7 +248,14 @@ const parentWaitKey = "parentWait"
 const (
 	parentWaitNotification = "notification"
 	parentWaitAgent        = "agent"
+	parentWaitAskUser      = "ask-user"
 )
+
+// isParentAgentWait reports whether kind is a parent wait set by the agent or
+// its Claude ask tools (as opposed to a harness Notification).
+func isParentAgentWait(kind string) bool {
+	return kind == parentWaitAgent || kind == parentWaitAskUser
+}
 
 // maxNotificationWaitAgents caps notificationWaitAgentsKey. Past the cap, a
 // sub-agent's question still sets the wait but its agent_id is not recorded.
@@ -186,6 +263,10 @@ const maxNotificationWaitAgents = 64
 
 // isStickyActivity returns true if the given activity is a "sticky" value that
 // should resist being overwritten by normal event-driven updates.
+// idle (agent-reported, `sciontool status idle`) is handled exactly like
+// blocked: wherever the comments in this file and hub.go list blocked as
+// kept or held, idle is too, and the same new-work events (isNewWorkEvent)
+// clear it.
 func isStickyActivity(activity string) bool {
 	return state.Activity(activity).IsSticky()
 }
@@ -207,6 +288,12 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 	// with no parent tool-end left to clear the wait.
 	if event.Name == hooks.EventSubagentEnd && isSubagentEvent(event) {
 		return h.releaseNotificationWaitOwner(subagentID(event))
+	}
+
+	// The parent's turn ended on an error the harness reported: the harness
+	// is alive at its prompt but the turn failed (see setHarnessError).
+	if isTurnEndError(event) {
+		return h.setHarnessError(harnessErrorReason(event))
 	}
 
 	result := eventToPhaseActivity(event)
@@ -237,8 +324,14 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 
 	// New work events (prompt-submit, agent-start, and a session-start of a
 	// new session): always update activity unconditionally — clears any
-	// sticky state.
+	// sticky state. For a promptless start (SCION_INITIAL_TASK != "1"), a
+	// session-start while still initializing leaves initializing in place so
+	// sciontool init's readiness watcher transitions it to idle once
+	// readiness settles.
 	if isNewWorkEvent(event.Name) {
+		if event.Name == hooks.EventSessionStart && !hasInitialTask() {
+			return h.updateSessionStartWithoutInitialTask(result.activity)
+		}
 		return h.UpdateActivity(result.activity, "")
 	}
 
@@ -290,13 +383,76 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 	if reportsNoBackgroundWork(event) {
 		return h.endTurnWithNoBackgroundWork(result.activity)
 	}
+	if event.Name == hooks.EventAgentEnd && !isSubagentEvent(event) {
+		return h.updateActivityIfNotSticky(result.activity, "", clearAgentEnd, "")
+	}
 	if event.Name == hooks.EventToolEnd || event.Name == hooks.EventAgentEnd {
 		return h.updateActivityIfNotSticky(result.activity, "", clearNotificationWaiting, subagentID(event))
 	}
 
-	// All other events (model-end, etc.): update activity only if current
-	// activity is not sticky.
+	// model-start and an error-free model-end are turn progress: the
+	// harness reached the model, so a harness_error is cleared (see
+	// clearHarnessError). Parent model-start also clears a turn-ended
+	// ask-user wait (e.g. Antigravity PreInvocation on turn 2); model-end
+	// is intentionally excluded because its ordering against session.idle
+	// in OpenCode is not pinned down.
+	if isHarnessProgressEvent(event) {
+		clearRule := clearHarnessError
+		if event.Name == hooks.EventModelStart {
+			clearRule = clearModelStart
+		}
+		return h.updateActivityIfNotSticky(result.activity, "", clearRule, "")
+	}
+
+	// All other events: update activity only if current activity is not
+	// sticky.
 	return h.updateActivityIfNotSticky(result.activity, "", clearNone, "")
+}
+
+// isHarnessProgressEvent reports whether event is the parent's model-start,
+// or its model-end with no error that is not uncounted
+// (isProgressModelEnd). OpenCode emits no prompt-submit,
+// agent-start or model-start on a later turn, so its model-end (one per
+// completed model step) is what shows a follow-up turn reached the model.
+func isHarnessProgressEvent(event *hooks.Event) bool {
+	if isSubagentEvent(event) {
+		return false
+	}
+	switch event.Name {
+	case hooks.EventModelStart:
+		return true
+	case hooks.EventModelEnd:
+		return isProgressModelEnd(event)
+	}
+	return false
+}
+
+// setHarnessError records that the harness reported a turn-ending error:
+// activity harness_error with reason in detail.message. It replaces every
+// activity except completed (the agent finished its task before the turn
+// failed) and the terminal limits_exceeded and crashed. Like
+// SetHarnessErrorIf, it writes only while the phase is running (or not
+// recorded): a turn error reported while the agent stops or after it
+// stopped is not a live harness at its prompt. It is one locked update.
+func (h *StatusHandler) setHarnessError(reason string) error {
+	return h.update(func(info map[string]interface{}) bool {
+		if phase := stringField(info, "phase"); phase != "" && phase != string(state.PhaseRunning) {
+			return false
+		}
+		current := state.Activity(stringField(info, "activity"))
+		if current == state.ActivityCompleted || current.IsTerminal() {
+			return false
+		}
+		applyActivity(info, state.ActivityHarnessError, "")
+		applyMessage(info, reason)
+		return true
+	})
+}
+
+// stringField returns info[key] when it is a string, or "".
+func stringField(info map[string]interface{}, key string) string {
+	v, _ := info[key].(string)
+	return v
 }
 
 // setWaitingFromNotificationFor sets waiting_for_input, marks it as set by a
@@ -323,6 +479,7 @@ func (h *StatusHandler) Handle(event *hooks.Event) error {
 // owner list change.
 func (h *StatusHandler) setWaitingFromNotificationFor(owner string) error {
 	return h.update(func(info map[string]interface{}) bool {
+		askUser := isAskUserWaiting(info)
 		agentSet := isAgentSetWaiting(info)
 		if agentSet && owner == "" {
 			return false
@@ -344,10 +501,12 @@ func (h *StatusHandler) setWaitingFromNotificationFor(owner string) error {
 		if owner != "" && !slices.Contains(owners, owner) && len(owners) < maxNotificationWaitAgents {
 			owners = append(owners, owner)
 		}
-		if owner == "" && len(owners) > 0 && parent != parentWaitAgent {
+		if owner == "" && len(owners) > 0 && !isParentAgentWait(parent) {
 			parent = parentWaitNotification
 		}
-		if agentSet {
+		if askUser {
+			parent = parentWaitAskUser
+		} else if agentSet {
 			parent = parentWaitAgent
 		}
 
@@ -355,6 +514,9 @@ func (h *StatusHandler) setWaitingFromNotificationFor(owner string) error {
 		info[activitySourceKey] = activitySourceNotification
 		setNotificationWaitOwners(info, owners)
 		setParentWait(info, parent, owners)
+		if parent != parentWaitAskUser {
+			delete(info, askUserTurnEndedKey)
+		}
 		delete(info, "toolName")
 		delete(info, "status")
 		delete(info, "sessionStatus")
@@ -381,6 +543,7 @@ func (h *StatusHandler) setParentQuestionWait() error {
 		}
 		if isNotificationWaiting(info) && len(notificationWaitOwners(info)) > 0 {
 			info[parentWaitKey] = parentWaitAgent
+			delete(info, askUserTurnEndedKey)
 			delete(info, "toolName")
 			delete(info, "status")
 			delete(info, "sessionStatus")
@@ -404,7 +567,7 @@ func (h *StatusHandler) endTurnWithNoBackgroundWork(activity state.Activity) err
 			restoreParentWait(info)
 			dropped = true
 		}
-		if blocks, released := stickyBlocksUpdate(info, clearNotificationWaiting, ""); blocks {
+		if blocks, released := stickyBlocksUpdate(info, clearAgentEnd, ""); blocks {
 			return dropped || released
 		}
 		applyActivity(info, activity, "")
@@ -477,7 +640,7 @@ func (h *StatusHandler) releaseNotificationWaitOnRestart() error {
 		if !isNotificationWaiting(info) {
 			return false
 		}
-		if parentWaitOf(info) == parentWaitAgent {
+		if isParentAgentWait(parentWaitOf(info)) {
 			restoreParentWait(info)
 			return true
 		}
@@ -517,6 +680,22 @@ func isAgentSetWaiting(info map[string]interface{}) bool {
 	activity, _ := info["activity"].(string)
 	source, _ := info[activitySourceKey].(string)
 	return activity == string(state.ActivityWaitingForInput) && source != activitySourceNotification
+}
+
+// isAskUserWaiting reports whether info holds a waiting_for_input that the
+// agent set explicitly via `sciontool status ask_user` (or legacy
+// `sciontool hook ask_user` / `scion message --decisions-file`).
+func isAskUserWaiting(info map[string]interface{}) bool {
+	activity, _ := info["activity"].(string)
+	source, _ := info[activitySourceKey].(string)
+	return activity == string(state.ActivityWaitingForInput) && source == ActivitySourceAskUser
+}
+
+// isAskUserTurnEnded reports whether a parent EventAgentEnd has already fired
+// while the current ask-user wait was active.
+func isAskUserTurnEnded(info map[string]interface{}) bool {
+	ended, _ := info[askUserTurnEndedKey].(bool)
+	return ended
 }
 
 // notificationWaitOwners returns the string entries of the owner list.
@@ -574,11 +753,17 @@ func restoreParentWait(info map[string]interface{}) bool {
 	switch kind {
 	case parentWaitNotification:
 		info[activitySourceKey] = activitySourceNotification
+		delete(info, askUserTurnEndedKey)
 		return true
 	case parentWaitAgent:
 		delete(info, activitySourceKey)
+		delete(info, askUserTurnEndedKey)
+		return true
+	case parentWaitAskUser:
+		info[activitySourceKey] = ActivitySourceAskUser
 		return true
 	}
+	delete(info, askUserTurnEndedKey)
 	return false
 }
 
@@ -599,14 +784,24 @@ func removeString(list []string, s string) ([]string, bool) {
 // UpdateActivity writes the activity to the agent-info.json file atomically.
 // Used for runtime activity changes (most events). Preserves the current phase.
 func (h *StatusHandler) UpdateActivity(activity state.Activity, toolName string) error {
+	return h.UpdateActivityWithSource(activity, toolName, "")
+}
+
+// UpdateActivityWithSource writes the activity and an optional activitySource
+// marker to agent-info.json in one locked update. Passing an empty source
+// removes any existing activitySource marker (identical to UpdateActivity).
+func (h *StatusHandler) UpdateActivityWithSource(activity state.Activity, toolName, source string) error {
 	return h.update(func(info map[string]interface{}) bool {
 		applyActivity(info, activity, toolName)
+		if source != "" {
+			info[activitySourceKey] = source
+		}
 		return true
 	})
 }
 
 // applyActivity sets or clears activity and toolName, and removes the
-// notification marker and legacy fields.
+// activitySource, turn-end, notification-owner and legacy fields.
 func applyActivity(info map[string]interface{}, activity state.Activity, toolName string) {
 	if activity == "" {
 		delete(info, "activity")
@@ -621,8 +816,9 @@ func applyActivity(info map[string]interface{}, activity state.Activity, toolNam
 		delete(info, "toolName")
 	}
 
-	// This write did not come from a Notification.
+	// This write did not come from a Notification or carry over an earlier wait.
 	delete(info, activitySourceKey)
+	delete(info, askUserTurnEndedKey)
 	delete(info, notificationWaitAgentsKey)
 	delete(info, parentWaitKey)
 
@@ -707,6 +903,24 @@ func (h *StatusHandler) CurrentActivity() state.Activity {
 	return state.Activity(current)
 }
 
+// CurrentActivitySince returns the activity recorded in agent-info.json and
+// when it began (activitySinceKey). The time is zero when the file is
+// missing or unreadable, or when the record has no valid stamp (a record
+// written by an older sciontool).
+func (h *StatusHandler) CurrentActivitySince() (state.Activity, time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	info := h.readAgentInfoMap()
+	current, _ := info["activity"].(string)
+	var since time.Time
+	if raw, ok := info[activitySinceKey].(string); ok {
+		if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			since = t
+		}
+	}
+	return state.Activity(current), since
+}
+
 // SetMessage writes a message to the agent-info.json detail section.
 // This is used to persist error messages so the broker heartbeat can
 // relay them to the hub even after the container exits.
@@ -731,38 +945,127 @@ const (
 	clearNotificationWaiting
 	// clearAnyWaiting clears any waiting_for_input (the parent's tool-start:
 	// the user has responded and the agent is running a tool), except a
-	// wait that sub-agents hold.
+	// wait that sub-agents hold. It also clears harness_error, like
+	// clearHarnessError.
 	clearAnyWaiting
+	// clearHarnessError clears harness_error and keeps every other sticky
+	// activity, as clearNone does (the parent's error-free model-end).
+	// harness_error is a harness observation, not an agent intent, so any
+	// turn-progress event clears it: prompt-submit, agent-start and a new
+	// session-start (which clear every sticky activity, see isNewWorkEvent),
+	// the parent's tool-start (clearAnyWaiting) and these. It is
+	// deliberately separate from isNewWorkEvent, which decides what clears
+	// blocked.
+	clearHarnessError
+	// clearModelStart clears harness_error and a turn-ended ask-user wait
+	// (the parent's model-start, e.g. Antigravity PreInvocation on turn 2).
+	// A same-turn ask-user wait and all other sticky activities are kept.
+	clearModelStart
+	// clearAgentEnd handles the parent's EventAgentEnd (Stop / session.idle):
+	// it clears a notification-set wait as clearNotificationWaiting does,
+	// arms askUserTurnEnded on a same-turn ask-user wait, and clears a
+	// turn-ended ask-user wait (backstop for harnesses like OpenCode that
+	// emit no new-work or model-start event on a text-only follow-up turn).
+	clearAgentEnd
 )
+
+// clearsHarnessError reports whether an event with clear rule c replaces a
+// harness_error activity.
+func (c waitingClear) clearsHarnessError() bool {
+	return c == clearAnyWaiting || c == clearHarnessError || c == clearModelStart
+}
 
 // stickyBlocksUpdate reports whether the activity recorded in info is sticky
 // and must not be overwritten by an event with the given clear rule. Only
-// waiting_for_input can be cleared; completed, blocked, limits_exceeded and
-// crashed always block. subagent is the event's sub-agent agent_id, or ""
+// waiting_for_input and harness_error (see clearsHarnessError) can be
+// cleared; completed, blocked, limits_exceeded and crashed always block. subagent is the event's sub-agent agent_id, or ""
 // for the parent's own event. When the event is blocked but changed info,
 // released is true, so the caller writes info. That happens when a
 // sub-agent's event removes its own entry while other owners remain, when
 // the last owner's event leaves the parent's recorded wait (see
-// restoreParentWait), and when a parent event clears the parent's recorded
-// wait (parentWaitKey) while owners remain.
+// restoreParentWait), when a parent event clears the parent's recorded
+// wait (parentWaitKey) while owners remain, and when a parent agent-end
+// sets askUserTurnEndedKey on an ask-user wait.
 func stickyBlocksUpdate(info map[string]interface{}, clear waitingClear, subagent string) (blocks, released bool) {
 	currentActivity, _ := info["activity"].(string)
 	if !isStickyActivity(currentActivity) {
 		return false, false
+	}
+	if currentActivity == string(state.ActivityHarnessError) {
+		return !clear.clearsHarnessError(), false
 	}
 	if currentActivity != string(state.ActivityWaitingForInput) {
 		return true, false
 	}
 	switch clear {
 	case clearAnyWaiting:
-		// Only the parent's tool-start uses this rule. It keeps a wait
-		// that sub-agents hold, and clears the parent's own wait of
-		// either kind inside it.
+		// Only the parent's tool-start uses this rule. A same-turn
+		// ask-user wait is kept so follow-up tool calls (such as
+		// `scion message`) do not wipe waiting_for_input; a turn-ended
+		// ask-user wait (from a previous turn) is cleared. Unmarked
+		// (Claude ExitPlanMode/AskUserQuestion) and unowned
+		// notification waits are always cleared. A wait that sub-agents
+		// hold is kept, clearing the parent's own wait inside it under
+		// the same rule.
+		if isAskUserWaiting(info) {
+			if !isAskUserTurnEnded(info) {
+				return true, false
+			}
+			return false, false
+		}
 		if !isNotificationWaiting(info) || len(notificationWaitOwners(info)) == 0 {
 			return false, false
 		}
+		if parentWaitOf(info) == parentWaitAskUser {
+			if !isAskUserTurnEnded(info) {
+				return true, false
+			}
+			delete(info, parentWaitKey)
+			delete(info, askUserTurnEndedKey)
+			return true, true
+		}
 		if parentWaitOf(info) != "" {
 			delete(info, parentWaitKey)
+			return true, true
+		}
+		return true, false
+	case clearModelStart:
+		if isAskUserWaiting(info) && isAskUserTurnEnded(info) {
+			return false, false
+		}
+		if isNotificationWaiting(info) && len(notificationWaitOwners(info)) > 0 &&
+			parentWaitOf(info) == parentWaitAskUser && isAskUserTurnEnded(info) {
+			delete(info, parentWaitKey)
+			delete(info, askUserTurnEndedKey)
+			return true, true
+		}
+		return true, false
+	case clearAgentEnd:
+		if isAskUserWaiting(info) {
+			if isAskUserTurnEnded(info) {
+				return false, false
+			}
+			info[askUserTurnEndedKey] = true
+			return true, true
+		}
+		if !isNotificationWaiting(info) {
+			return true, false
+		}
+		owners := notificationWaitOwners(info)
+		if len(owners) == 0 {
+			return false, false
+		}
+		switch parentWaitOf(info) {
+		case parentWaitNotification:
+			delete(info, parentWaitKey)
+			return true, true
+		case parentWaitAskUser:
+			if isAskUserTurnEnded(info) {
+				delete(info, parentWaitKey)
+				delete(info, askUserTurnEndedKey)
+				return true, true
+			}
+			info[askUserTurnEndedKey] = true
 			return true, true
 		}
 		return true, false
@@ -878,6 +1181,33 @@ func (h *StatusHandler) writeAgentInfoLocked(info map[string]interface{}) error 
 	return nil
 }
 
+// envInitialTask is set to "1" in the container environment when the agent was
+// started with an initial task (pkg/agent/run.go).
+const envInitialTask = "SCION_INITIAL_TASK"
+
+// hasInitialTask reports whether this container was started with an initial
+// task.
+func hasInitialTask() bool {
+	return os.Getenv(envInitialTask) == "1"
+}
+
+// updateSessionStartWithoutInitialTask handles a new-session EventSessionStart
+// when the container was started without an initial task. While the agent is
+// still initializing, it leaves initializing in place so sciontool init's
+// readiness watcher transitions initializing -> idle once harness readiness
+// settles. Once past initializing (e.g. a later new session), it writes
+// activity unconditionally like any other new-work event. It is one locked
+// update.
+func (h *StatusHandler) updateSessionStartWithoutInitialTask(activity state.Activity) error {
+	return h.update(func(info map[string]interface{}) bool {
+		if current, _ := info["activity"].(string); current == string(state.ActivityInitializing) {
+			return false
+		}
+		applyActivity(info, activity, "")
+		return true
+	})
+}
+
 // isNewWorkEvent returns true for events that indicate new work is starting.
 // These events unconditionally update activity, clearing any sticky state.
 func isNewWorkEvent(name string) bool {
@@ -962,7 +1292,13 @@ func eventToPhaseActivity(event *hooks.Event) *eventResult {
 	case hooks.EventToolStart:
 		return &eventResult{activity: state.ActivityExecuting}
 
-	case hooks.EventToolEnd, hooks.EventAgentEnd:
+	case hooks.EventToolEnd:
+		if isSubagentEvent(event) {
+			return &eventResult{activity: state.ActivityWorking}
+		}
+		return &eventResult{activity: state.ActivityThinking}
+
+	case hooks.EventAgentEnd:
 		return &eventResult{activity: state.ActivityWorking}
 
 	case hooks.EventResponseComplete:

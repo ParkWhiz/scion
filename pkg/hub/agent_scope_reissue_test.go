@@ -410,12 +410,13 @@ func TestScopeReissue_T4_PerScopeWithhold(t *testing.T) {
 	t.Cleanup(func() { reissueLiveCheckFault = prev })
 
 	resp := f.run(t, f.child, false)
-	assert.Equal(t, []string{string(ScopeProjectArtifactRead)}, resp.Added)
+	assert.Equal(t, []string{string(ScopeProjectArtifactRead), string(ScopeProjectSkillWrite)}, resp.Added)
 	assert.Contains(t, resp.Withheld, reissueWithheldScope{Scope: string(ScopeProjectArtifactWrite), Cause: reissueWithheldLookup})
 	assert.NotContains(t, f.activeEdge(t, f.child).PermissionIDs, "artifact.create")
 
 	after := f.grant(t, f.child)
 	assert.Contains(t, scopeStrings(after), string(ScopeProjectArtifactRead))
+	assert.Contains(t, scopeStrings(after), string(ScopeProjectSkillWrite))
 	assert.NotContains(t, scopeStrings(after), string(ScopeProjectArtifactWrite), "refresh issues the re-issued set")
 }
 
@@ -698,8 +699,7 @@ func TestScopeReissue_EqualsCreateToday(t *testing.T) {
 	parent := f.reload(t, f.parent)
 	parentGrant, err := f.srv.AuthorizeAgentToken(context.Background(), parent)
 	require.NoError(t, err)
-	token, err := f.srv.agentTokenService.GenerateAgentToken(parent.ID, f.projectID, parentGrant.Scopes, append(append([]string{}, parent.Ancestry...), parent.ID))
-	require.NoError(t, err)
+	token := f.srv.generateRecordedAgentToken(t, parent.ID, f.projectID, parentGrant.Scopes, append(append([]string{}, parent.Ancestry...), parent.ID))
 	rec := doRequestWithAgentToken(t, f.srv, http.MethodPost, "/api/v1/projects/"+f.projectID+"/agents",
 		CreateAgentRequest{Name: "rs-eq-sibling", AgentRole: string(AgentRoleFull)}, token)
 	require.Less(t, rec.Code, 300, rec.Body.String())

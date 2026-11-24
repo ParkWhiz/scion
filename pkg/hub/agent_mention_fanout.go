@@ -20,10 +20,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
+
+// mentionOptions returns the current hub-wide mention parsing options,
+// reflecting whether the hub.code_span_mentions experiment is enabled.
+func (s *Server) mentionOptions() messages.MentionOptions {
+	return messages.MentionOptions{
+		CodeSpanMentions: s.experimentEnabled(experiments.CodeSpanMentions),
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Server-side @mention fan-out for agent-authored sends.
@@ -169,7 +178,7 @@ func (s *Server) fanOutAgentMentions(ctx context.Context, in agentMentionFanoutI
 		return nil
 	}
 
-	names := messages.DedupMentionNames(in.Explicit, messages.ExtractProseMentions(in.Msg))
+	names := messages.DedupMentionNames(in.Explicit, messages.ExtractProseMentionsWithOptions(in.Msg, s.mentionOptions()))
 	if len(names) == 0 {
 		return nil
 	}
@@ -314,8 +323,10 @@ type mentionCopyOutcome struct {
 	Status string
 	// Error is the human-readable reason when Status is not delivered.
 	Error string
-	// AgentPhase is the target's lifecycle phase, set when delivered.
+	// AgentPhase is the target's lifecycle phase.
 	AgentPhase string
+	// SuspendReason is why target was suspended when AgentPhase is suspended.
+	SuspendReason string
 	// BudgetExhausted reports that the sender's rate budget refused the
 	// delivery, so later deliveries in the same call should not be tried.
 	BudgetExhausted bool
@@ -339,7 +350,9 @@ func (s *Server) deliverAgentMentionCopy(ctx, aggregateCtx context.Context, in a
 	// when only one slot remains.
 	if !s.mentionPairLimiter.Reserve(in.Sender.ID, target.ID) {
 		return mentionCopyOutcome{Status: "suppressed",
-			Error: "mention loop protection: too many mentions between these agents; retry later"}
+			Error:         "mention loop protection: too many mentions between these agents; retry later",
+			AgentPhase:    target.Phase,
+			SuspendReason: target.SuspendReason}
 	}
 
 	// Authorize before any conversation is created: a mention must
@@ -356,15 +369,18 @@ func (s *Server) deliverAgentMentionCopy(ctx, aggregateCtx context.Context, in a
 		// Distinguish the two so a deadline is reported as a timeout,
 		// not a false "the recipient denied this".
 		if aggregateCtx.Err() != nil {
-			return mentionCopyOutcome{Status: "timeout", Error: "aggregate mention dispatch timeout exceeded"}
+			return mentionCopyOutcome{Status: "timeout", Error: "aggregate mention dispatch timeout exceeded",
+				AgentPhase: target.Phase, SuspendReason: target.SuspendReason}
 		}
-		return mentionCopyOutcome{Status: "unauthorized", Error: "message delivery denied"}
+		return mentionCopyOutcome{Status: "unauthorized", Error: "message delivery denied",
+			AgentPhase: target.Phase, SuspendReason: target.SuspendReason}
 	}
 
 	convResult, convID, threadID, registerAfter, convOK := s.resolveMentionConversation(aggregateCtx, in, target)
 	if !convOK {
 		s.mentionPairLimiter.Release(in.Sender.ID, target.ID)
-		return mentionCopyOutcome{Status: "error", Error: "conversation resolution failed"}
+		return mentionCopyOutcome{Status: "error", Error: "conversation resolution failed",
+			AgentPhase: target.Phase, SuspendReason: target.SuspendReason}
 	}
 
 	// mention_source names where the mention came from, for the
@@ -418,43 +434,56 @@ func (s *Server) deliverAgentMentionCopy(ctx, aggregateCtx context.Context, in a
 		Channel:        in.Channel,
 		ThreadID:       threadID,
 		ProjectID:      in.Sender.ProjectID,
-		// A mention must not wake a stopped or suspended agent — that
-		// would be a surprising side effect of merely being mentioned —
-		// but it must also not be silently dropped just because the
-		// recipient isn't running right now: it still gets a persisted
-		// row and a dispatch attempt, the same as any other message to
-		// an agent that isn't currently reachable.
-		SkipPhaseGate: true,
+		// A mention must not wake a stopped or user-suspended agent —
+		// that would be a surprising side effect of merely being
+		// mentioned — but it must also not be silently dropped just
+		// because the recipient isn't running right now: it still gets a
+		// persisted row and a dispatch attempt, the same as any other
+		// message to an agent that isn't currently reachable. An agent
+		// the hub suspended (shouldAutoWake) is woken in the background
+		// and gets the mention once ready (AgentDMWakeQueued).
+		SkipPhaseGate:       true,
+		AttachmentAddressee: addresseeRow,
 	})
 	dispatchCancel()
-	if dmErr != nil {
+	switch {
+	case dmErr != nil:
 		s.finishAttachmentAddressee(context.WithoutCancel(ctx), addresseeRow, errors.New(dmErr.Message))
-	} else {
+	case dmResult.Outcome == AgentDMWakeQueued:
+		// The background wake settles it when it delivers or fails.
+	default:
 		s.finishAttachmentAddressee(context.WithoutCancel(ctx), addresseeRow, nil)
 	}
 	if dmErr != nil {
 		s.mentionPairLimiter.Release(in.Sender.ID, target.ID)
 		switch dmErr.Code {
 		case ErrCodeRateLimited:
-			return mentionCopyOutcome{Status: "rate_limited", Error: dmErr.Message, BudgetExhausted: true}
+			return mentionCopyOutcome{Status: "rate_limited", Error: dmErr.Message,
+				AgentPhase: target.Phase, SuspendReason: target.SuspendReason, BudgetExhausted: true}
 		case ErrCodeMessageDenied:
-			return mentionCopyOutcome{Status: "unauthorized", Error: dmErr.Message}
+			return mentionCopyOutcome{Status: "unauthorized", Error: dmErr.Message,
+				AgentPhase: target.Phase, SuspendReason: target.SuspendReason}
 		default:
-			return mentionCopyOutcome{Status: "error", Error: dmErr.Message}
+			return mentionCopyOutcome{Status: "error", Error: dmErr.Message,
+				AgentPhase: target.Phase, SuspendReason: target.SuspendReason}
 		}
 	}
 
-	var out mentionCopyOutcome
+	out := mentionCopyOutcome{
+		AgentPhase:    target.Phase,
+		SuspendReason: target.SuspendReason,
+	}
 	switch dmResult.Outcome {
 	case AgentDMAmbiguous:
 		out.Status = "ambiguous"
 	default:
 		out.Status = "delivered"
-		out.AgentPhase = target.Phase
 	}
 
 	// The sender must be allowed to add the target under its message
-	// mode (group_message_mode.go).
+	// mode (group_message_mode.go). A wake-queued mention counts as
+	// delivered and is registered before its wake on purpose: a participant
+	// is a listing index, not an ACL.
 	if out.Status == "delivered" && registerAfter {
 		if joinOK, joinReason := s.groupAgentJoinAllowed(aggregateCtx, in.SenderIdent, target); !joinOK {
 			s.messageLog.Info("mention target not registered as group participant: message mode",

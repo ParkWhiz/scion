@@ -144,6 +144,10 @@ func hubDeleteFailure(agentName string, o hubDeleteOutcome, what string) error {
 		if msg != "" {
 			msg = ": " + msg
 		}
+		if code == "placement_conflict" {
+			return fmt.Errorf("delete failed on the Hub (%s)%s; %s. Force delete cannot override an inconsistent saved placement",
+				code, msg, what)
+		}
 		blocked := ""
 		switch code {
 		case "in_doubt", "revoke_failed", "finalize_failed":
@@ -179,7 +183,7 @@ func hubDeletePendingReason(o hubDeleteOutcome) string {
 		switch {
 		case errors.Is(err, errDeleteResultUnknown):
 			return err.Error()
-		case err == nil, apiclient.IsForbiddenError(err), apiclient.IsUnauthorizedError(err):
+		case err == nil, apiclient.IsForbiddenError(err), apiclient.IsUnauthorizedError(err), apiclient.IsNotFoundError(err):
 			return "the Hub did not allow reading the agent"
 		default:
 			return fmt.Sprintf("the Hub rejected reading the agent: %v", err)

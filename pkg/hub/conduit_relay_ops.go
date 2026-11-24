@@ -92,9 +92,10 @@ type conduitRelayVerdict struct {
 }
 
 // recheckRelayAdmission re-checks an admission's credential and principal
-// against current state: the user row and access token, the agent row and
-// its run, or the broker registration and secret. The close codes are the
-// in-process ones: 4404 for a deleted agent, 4401 otherwise.
+// against current state: the user row and access token, the agent row,
+// its run and delegation standing, or the broker registration and secret.
+// The close codes are the in-process ones: 4404 for a deleted agent, 4401
+// otherwise.
 func (s *Server) recheckRelayAdmission(ctx context.Context, c conduitAdmissionClaims) conduitRelayVerdict {
 	deny := func(code uint32, reason string) conduitRelayVerdict {
 		return conduitRelayVerdict{verdict: conduitAuthzDenied, reason: reason, closeCode: code}
@@ -130,10 +131,22 @@ func (s *Server) recheckRelayAdmission(ctx context.Context, c conduitAdmissionCl
 		// The admitting agent token's current status and the agent's
 		// hold, as agent-token authentication checks them on every
 		// request.
-		if cs := s.authConfig.CredentialStore; cs != nil && c.CredentialID != "" {
-			if _, _, err := evaluateAgentCredentialStatus(ctx, cs, c.CredentialID); errors.Is(err, errAgentCredentialRevoked) {
+		if c.CredentialID == "" {
+			return deny(conduit.CloseUnauthenticated, "agent credential missing jti")
+		}
+		cs := s.authConfig.CredentialStore
+		if cs == nil {
+			return unavailable("agent credential store not configured")
+		}
+		if _, err := evaluateAgentCredentialStatus(ctx, cs, c.CredentialID); err != nil {
+			switch {
+			case errors.Is(err, errAgentCredentialRevoked):
 				return deny(conduit.CloseUnauthenticated, "agent credential revoked")
-			} else if err != nil {
+			case errors.Is(err, errAgentCredentialNotFound):
+				return deny(conduit.CloseUnauthenticated, "agent credential not recorded")
+			case errors.Is(err, errAgentCredentialEmptyJTI):
+				return deny(conduit.CloseUnauthenticated, "agent credential missing jti")
+			default:
 				return unavailable("agent credential lookup failed")
 			}
 		}
@@ -145,6 +158,12 @@ func (s *Server) recheckRelayAdmission(ctx context.Context, c conduitAdmissionCl
 			case held:
 				return deny(conduit.CloseUnauthenticated, "agent held")
 			}
+		}
+		if err := s.agentStanding(ctx, c.ID); err != nil {
+			if errors.Is(err, errAgentNotInStanding) {
+				return deny(conduit.CloseUnauthenticated, "agent not in good standing")
+			}
+			return unavailable("agent standing lookup failed")
 		}
 		return conduitRelayVerdict{verdict: conduitAuthzAllowed}
 	case registry.PrincipalBroker:
@@ -398,6 +417,9 @@ func (s *Server) hubRelaySessionRecheck(w http.ResponseWriter, r *http.Request, 
 				break
 			}
 			res.OK = true
+			if c.Kind == registry.PrincipalAgent {
+				s.maybeScheduleHeldMessageRedriveIfConnected(c.ID)
+			}
 			// Re-issued only while the credential itself is valid.
 			if admissionHalfLifeLeft(c, now) && (c.CredentialExpiry == 0 || now.Unix() < c.CredentialExpiry) {
 				if tok, err := s.reissueAdmissionToken(c, time.Time{}, now); err == nil {

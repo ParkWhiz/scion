@@ -2150,7 +2150,7 @@ func TestMergeScionConfig_Skills(t *testing.T) {
 	t.Run("base has skills, override has none", func(t *testing.T) {
 		base := &api.ScionConfig{
 			Skills: []api.SkillReference{
-				{URI: "skill://scion/core/scion@^1.0"},
+				{URI: "skill://scion/global/scion@^1.0"},
 			},
 		}
 		override := &api.ScionConfig{}
@@ -2158,7 +2158,7 @@ func TestMergeScionConfig_Skills(t *testing.T) {
 		if len(got.Skills) != 1 {
 			t.Fatalf("expected 1 skill, got %d", len(got.Skills))
 		}
-		if got.Skills[0].URI != "skill://scion/core/scion@^1.0" {
+		if got.Skills[0].URI != "skill://scion/global/scion@^1.0" {
 			t.Errorf("expected base skill preserved, got %q", got.Skills[0].URI)
 		}
 	})
@@ -2166,22 +2166,22 @@ func TestMergeScionConfig_Skills(t *testing.T) {
 	t.Run("both have skills - concatenated", func(t *testing.T) {
 		base := &api.ScionConfig{
 			Skills: []api.SkillReference{
-				{URI: "skill://scion/core/scion@^1.0"},
+				{URI: "skill://scion/global/scion@^1.0"},
 			},
 		}
 		override := &api.ScionConfig{
 			Skills: []api.SkillReference{
-				{URI: "skill://scion/core/security-audit@latest", Optional: true},
+				{URI: "skill://scion/global/security-audit@latest", Optional: true},
 			},
 		}
 		got := MergeScionConfig(base, override)
 		if len(got.Skills) != 2 {
 			t.Fatalf("expected 2 skills, got %d", len(got.Skills))
 		}
-		if got.Skills[0].URI != "skill://scion/core/scion@^1.0" {
+		if got.Skills[0].URI != "skill://scion/global/scion@^1.0" {
 			t.Errorf("first skill = %q, want base skill", got.Skills[0].URI)
 		}
-		if got.Skills[1].URI != "skill://scion/core/security-audit@latest" {
+		if got.Skills[1].URI != "skill://scion/global/security-audit@latest" {
 			t.Errorf("second skill = %q, want override skill", got.Skills[1].URI)
 		}
 		if !got.Skills[1].Optional {
@@ -2398,4 +2398,66 @@ func TestTemplateFromDir(t *testing.T) {
 	if viaFind.Name != "planner" || viaFind.Path != dir {
 		t.Errorf("FindTemplate(%s) = {%q, %q}, want {planner, %s}", dir, viaFind.Name, viaFind.Path, dir)
 	}
+}
+
+func TestListTemplatesGroupedForProject(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	// Create global template
+	globalTplDir := filepath.Join(homeDir, GlobalDir, "templates", "global-base")
+	if err := os.MkdirAll(globalTplDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create CWD project with its own template
+	cwdProj := t.TempDir()
+	cwdScionDir := filepath.Join(cwdProj, DotScion)
+	if err := os.MkdirAll(filepath.Join(cwdScionDir, "templates", "cwd-only"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create another project with its own templates
+	otherProj := t.TempDir()
+	otherScionDir := filepath.Join(otherProj, DotScion)
+	for _, name := range []string{"zeta", "alpha"} {
+		if err := os.MkdirAll(filepath.Join(otherScionDir, "templates", name), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	origWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origWd) }()
+	if err := os.Chdir(cwdProj); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("explicit project dir reads that project instead of CWD", func(t *testing.T) {
+		global, project, err := ListTemplatesGroupedForProject(otherScionDir)
+		if err != nil {
+			t.Fatalf("ListTemplatesGroupedForProject: %v", err)
+		}
+		if len(global) != 1 || global[0].Name != "global-base" {
+			t.Errorf("global = %+v, want [global-base]", global)
+		}
+		if len(project) != 2 || project[0].Name != "alpha" || project[1].Name != "zeta" {
+			t.Errorf("project = %+v, want sorted [alpha, zeta]", project)
+		}
+	})
+
+	t.Run("empty project dir skips CWD project templates", func(t *testing.T) {
+		global, project, err := ListTemplatesGroupedForProject("")
+		if err != nil {
+			t.Fatalf("ListTemplatesGroupedForProject(\"\"): %v", err)
+		}
+		if len(global) != 1 || global[0].Name != "global-base" {
+			t.Errorf("global = %+v, want [global-base]", global)
+		}
+		if len(project) != 0 {
+			t.Errorf("project = %+v, want empty when projectDir is empty", project)
+		}
+	})
 }

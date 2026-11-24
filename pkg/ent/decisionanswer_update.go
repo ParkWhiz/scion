@@ -88,11 +88,17 @@ func (_u *DecisionAnswerUpdate) sqlSave(ctx context.Context) (_node int, err err
 			}
 		}
 	}
+	if _u.mutation.OtherTextCleared() {
+		_spec.ClearField(decisionanswer.FieldOtherText, field.TypeString)
+	}
 	if value, ok := _u.mutation.AnsweredByUserID(); ok {
 		_spec.SetField(decisionanswer.FieldAnsweredByUserID, field.TypeString, value)
 	}
 	if _u.mutation.AnsweredByUserIDCleared() {
 		_spec.ClearField(decisionanswer.FieldAnsweredByUserID, field.TypeString)
+	}
+	if _u.mutation.DismissReasonCleared() {
+		_spec.ClearField(decisionanswer.FieldDismissReason, field.TypeString)
 	}
 	if _u.mutation.InterpretedByAgentIDCleared() {
 		_spec.ClearField(decisionanswer.FieldInterpretedByAgentID, field.TypeUUID)
@@ -223,11 +229,17 @@ func (_u *DecisionAnswerUpdateOne) sqlSave(ctx context.Context) (_node *Decision
 			}
 		}
 	}
+	if _u.mutation.OtherTextCleared() {
+		_spec.ClearField(decisionanswer.FieldOtherText, field.TypeString)
+	}
 	if value, ok := _u.mutation.AnsweredByUserID(); ok {
 		_spec.SetField(decisionanswer.FieldAnsweredByUserID, field.TypeString, value)
 	}
 	if _u.mutation.AnsweredByUserIDCleared() {
 		_spec.ClearField(decisionanswer.FieldAnsweredByUserID, field.TypeString)
+	}
+	if _u.mutation.DismissReasonCleared() {
+		_spec.ClearField(decisionanswer.FieldDismissReason, field.TypeString)
 	}
 	if _u.mutation.InterpretedByAgentIDCleared() {
 		_spec.ClearField(decisionanswer.FieldInterpretedByAgentID, field.TypeUUID)

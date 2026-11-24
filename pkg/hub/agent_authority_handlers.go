@@ -16,11 +16,9 @@ package hub
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
@@ -50,14 +48,7 @@ const agentListIncludeAuthority = "authority"
 // include values are ignored, as legacy list callers never got a 400 for
 // an unknown parameter.
 func agentListIncludesAuthority(query url.Values) bool {
-	for _, v := range query["include"] {
-		for _, part := range strings.Split(v, ",") {
-			if strings.TrimSpace(part) == agentListIncludeAuthority {
-				return true
-			}
-		}
-	}
-	return false
+	return agentListQueryIncludes(query, agentListIncludeAuthority)
 }
 
 // agentAuthorityReader answers authority states for one reader within one
@@ -86,7 +77,8 @@ func (s *Server) newAgentAuthorityReader(identity Identity) *agentAuthorityReade
 func (r *agentAuthorityReader) authority(ctx context.Context, agent *store.Agent) *api.AgentAuthority {
 	out, err := r.res.resolve(ctx, agent)
 	if err != nil {
-		slog.WarnContext(ctx, "agent authority state could not be computed", "agent_id", agent.ID, "error", err)
+		logAuthzCheckFault(ctx, nil, "agent_authority_state",
+			"agent authority state could not be computed", err, "agent_id", agent.ID)
 		return nil
 	}
 	if out.Principal != nil && out.Principal.ID != "" && !r.principalVisible(ctx, agent, *out.Principal) {

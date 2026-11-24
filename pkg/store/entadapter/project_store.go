@@ -131,8 +131,11 @@ func entProjectToStore(p *ent.Project) *store.Project {
 		sp.SharedDirs = dirs
 	}
 	if p.GithubPermissions != "" {
-		sp.GitHubPermissions = &store.GitHubTokenPermissions{}
-		unmarshalRawJSON(p.GithubPermissions, sp.GitHubPermissions)
+		var perms store.GitHubTokenPermissions
+		unmarshalRawJSON(p.GithubPermissions, &perms)
+		if perms != (store.GitHubTokenPermissions{}) {
+			sp.GitHubPermissions = &perms
+		}
 	}
 	if p.GithubAppStatus != "" {
 		sp.GitHubAppStatus = &store.GitHubAppProjectStatus{}
@@ -444,6 +447,26 @@ func (s *ProjectStore) SetProjectOwnerID(ctx context.Context, projectID, ownerID
 	return nil
 }
 
+// UpdateProjectGitHubAppStatus updates only the github_app_status column of a
+// project, leaving every other column untouched so concurrent admin unbinds or
+// remote/permission changes are never reverted by a stale snapshot writer.
+func (s *ProjectStore) UpdateProjectGitHubAppStatus(ctx context.Context, projectID string, status *store.GitHubAppProjectStatus) error {
+	uid, err := parseUUID(projectID)
+	if err != nil {
+		return err
+	}
+	update := s.client.Project.UpdateOneID(uid)
+	if status != nil {
+		update.SetGithubAppStatus(marshalRawJSON(status))
+	} else {
+		update.ClearGithubAppStatus()
+	}
+	if err := update.Exec(ctx); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
 // UpdateProjectMessagingPolicy atomically updates the cross-project inbound
 // policy using optimistic concurrency on the revision counter. Returns the
 // updated project or ErrRevisionConflict if expectedRevision does not match.
@@ -555,6 +578,9 @@ func (s *ProjectStore) listProjects(ctx context.Context, filter store.ProjectFil
 		query.Where(project.GitRemoteEQ(filter.GitRemote))
 	} else if filter.GitRemotePrefix != "" {
 		query.Where(project.GitRemoteHasPrefix(filter.GitRemotePrefix))
+	}
+	if filter.GitHubInstallationID != nil {
+		query.Where(project.GithubInstallationIDEQ(*filter.GitHubInstallationID))
 	}
 	if filter.BrokerID != "" {
 		brokerUID, err := parseUUID(filter.BrokerID)
@@ -785,6 +811,7 @@ func entBrokerToStore(b *ent.RuntimeBroker) *store.RuntimeBroker {
 		ConnectionState: b.ConnectionState,
 		Endpoint:        b.Endpoint,
 		AutoProvide:     b.AutoProvide,
+		AdminManaged:    b.AdminManaged,
 		Created:         b.Created,
 		Updated:         b.Updated,
 		CreatedBy:       b.CreatedBy,
@@ -818,6 +845,7 @@ func entBrokerToStore(b *ent.RuntimeBroker) *store.RuntimeBroker {
 	sb.DefaultProfile = b.DefaultProfile
 	unmarshalRawJSON(b.WorkspaceStorage, &sb.WorkspaceStorage)
 	unmarshalRawJSON(b.Health, &sb.Health)
+	unmarshalRawJSON(b.WorkloadIdentityTargets, &sb.WorkloadIdentityTargets)
 	sb.Labels = b.Labels
 	if sb.Labels == nil {
 		sb.Labels = make(map[string]string)
@@ -909,11 +937,13 @@ func createRuntimeBroker(ctx context.Context, client *ent.Client, uid uuid.UUID,
 		SetSlug(b.Slug).
 		SetEndpoint(b.Endpoint).
 		SetAutoProvide(b.AutoProvide).
+		SetAdminManaged(b.AdminManaged).
 		SetCapabilities(marshalRawJSON(b.Capabilities)).
 		SetRuntimes(marshalRawJSON(profiles)).
 		SetDefaultProfile(defaultProfile).
 		SetWorkspaceStorage(marshalRawJSON(b.WorkspaceStorage)).
 		SetHealth(marshalRawJSON(b.Health)).
+		SetWorkloadIdentityTargets(marshalRawJSON(b.WorkloadIdentityTargets)).
 		SetLabels(b.Labels).
 		SetAnnotations(b.Annotations)
 	// The six presentation columns are never written at creation; only
@@ -1047,6 +1077,7 @@ func (s *ProjectStore) UpdateRuntimeBroker(ctx context.Context, b *store.Runtime
 			SetDefaultProfile(defaultProfile).
 			SetWorkspaceStorage(marshalRawJSON(b.WorkspaceStorage)).
 			SetHealth(marshalRawJSON(b.Health)).
+			SetWorkloadIdentityTargets(marshalRawJSON(b.WorkloadIdentityTargets)).
 			SetLabels(b.Labels).
 			SetAnnotations(b.Annotations).
 			SetEndpoint(b.Endpoint).
@@ -1068,6 +1099,7 @@ func (s *ProjectStore) UpdateRuntimeBroker(ctx context.Context, b *store.Runtime
 		} else {
 			update.ClearConnectedAt()
 		}
+		// admin_managed is never written here; see SetRuntimeBrokerAdminManaged.
 		// The GCP host pair and its source are never written here; see
 		// SetRuntimeBrokerGCPHost*.
 		affected, err := update.Save(ctx)
@@ -1115,6 +1147,7 @@ func (s *ProjectStore) RefreshRuntimeBrokerState(ctx context.Context, id string,
 			SetWorkspaceStorage(marshalRawJSON(b.WorkspaceStorage)).
 			SetDefaultProfile(defaultProfile).
 			SetHealth(marshalRawJSON(b.Health)).
+			SetWorkloadIdentityTargets(marshalRawJSON(b.WorkloadIdentityTargets)).
 			SetRuntimes(marshalRawJSON(profiles)).
 			SetVersion(b.Version).
 			SetUpdated(time.Now()).
@@ -1159,6 +1192,34 @@ func (s *ProjectStore) SetRuntimeBrokerCreatedByIfEmpty(ctx context.Context, id,
 		return false, mapError(err)
 	}
 	return affected == 1, nil
+}
+
+// SetRuntimeBrokerAdminManaged sets admin_managed on a runtime broker as a
+// compare-and-set on lock_version and returns the value it replaced.
+func (s *ProjectStore) SetRuntimeBrokerAdminManaged(ctx context.Context, id string, adminManaged bool) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	for attempt := 0; attempt < maxCASRetries; attempt++ {
+		cur, err := s.client.RuntimeBroker.Get(ctx, uid)
+		if err != nil {
+			return false, mapError(err)
+		}
+		affected, err := s.client.RuntimeBroker.Update().
+			Where(runtimebroker.IDEQ(uid), runtimebroker.LockVersionEQ(cur.LockVersion)).
+			SetAdminManaged(adminManaged).
+			SetUpdated(time.Now()).
+			AddLockVersion(1).
+			Save(ctx)
+		if err != nil {
+			return false, mapError(err)
+		}
+		if affected == 1 {
+			return cur.AdminManaged, nil
+		}
+	}
+	return false, store.ErrVersionConflict
 }
 
 // gcpHostEmailUnset and the other predicates below match both an empty
@@ -1573,13 +1634,19 @@ func (s *ProjectStore) UpdateRuntimeBrokerHeartbeat(ctx context.Context, id stri
 		if err != nil {
 			return mapError(err)
 		}
-		affected, err := s.client.RuntimeBroker.Update().
+		upd := s.client.RuntimeBroker.Update().
 			Where(runtimebroker.IDEQ(uid), runtimebroker.LockVersionEQ(cur.LockVersion)).
 			SetStatus(status).
 			SetLastHeartbeat(now).
 			SetUpdated(now).
-			AddLockVersion(1).
-			Save(ctx)
+			AddLockVersion(1)
+		switch status {
+		case store.BrokerStatusOnline:
+			upd.SetConnectionState("connected")
+		case store.BrokerStatusOffline:
+			upd.SetConnectionState("disconnected")
+		}
+		affected, err := upd.Save(ctx)
 		if err != nil {
 			return mapError(err)
 		}
@@ -1614,6 +1681,7 @@ func (s *ProjectStore) ClaimRuntimeBrokerConnection(ctx context.Context, brokerI
 			SetConnectedSessionID(sessionID).
 			SetConnectedAt(now).
 			SetStatus(store.BrokerStatusOnline).
+			SetConnectionState("connected").
 			SetLastHeartbeat(now).
 			SetUpdated(now).
 			AddLockVersion(1).
@@ -1700,6 +1768,7 @@ func (s *ProjectStore) ReleaseAndMarkBrokerOffline(ctx context.Context, brokerID
 			ClearConnectedSessionID().
 			ClearConnectedAt().
 			SetStatus(store.BrokerStatusOffline).
+			SetConnectionState("disconnected").
 			SetLastHeartbeat(now).
 			SetUpdated(now).
 			AddLockVersion(1).
@@ -1714,9 +1783,10 @@ func (s *ProjectStore) ReleaseAndMarkBrokerOffline(ctx context.Context, brokerID
 	return false, store.ErrVersionConflict
 }
 
-// MarkBrokerOffline sets a broker's status to offline. Used during startup
-// repair to ensure stale broker records that were never properly shut down are
-// explicitly marked offline. Uses the version-CAS loop for safe concurrency.
+// MarkBrokerOffline sets a broker's status to offline and marks its project
+// contributor records offline atomically. Used during startup repair to ensure
+// stale broker records that were never properly shut down are explicitly marked
+// offline. Uses the version-CAS loop for safe concurrency.
 // Returns ErrNotFound if the broker doesn't exist.
 func (s *ProjectStore) MarkBrokerOffline(ctx context.Context, brokerID string) error {
 	uid, err := parseUUID(brokerID)
@@ -1726,28 +1796,73 @@ func (s *ProjectStore) MarkBrokerOffline(ctx context.Context, brokerID string) e
 
 	now := time.Now()
 	for attempt := 0; attempt < maxCASRetries; attempt++ {
-		cur, err := s.client.RuntimeBroker.Get(ctx, uid)
+		done, err := s.markBrokerOfflineAttempt(ctx, uid, now)
 		if err != nil {
-			return mapError(err)
+			return err
 		}
-		// Already offline — nothing to do.
-		if cur.Status == store.BrokerStatusOffline {
-			return nil
-		}
-		affected, err := s.client.RuntimeBroker.Update().
-			Where(runtimebroker.IDEQ(uid), runtimebroker.LockVersionEQ(cur.LockVersion)).
-			SetStatus(store.BrokerStatusOffline).
-			SetUpdated(now).
-			AddLockVersion(1).
-			Save(ctx)
-		if err != nil {
-			return mapError(err)
-		}
-		if affected == 1 {
+		if done {
 			return nil
 		}
 	}
 	return store.ErrVersionConflict
+}
+
+func (s *ProjectStore) markBrokerOfflineAttempt(ctx context.Context, uid uuid.UUID, now time.Time) (bool, error) {
+	tx, err := s.client.Tx(ctx)
+	if err != nil {
+		if !errors.Is(err, ent.ErrTxStarted) {
+			return false, mapError(err)
+		}
+		// Already inside store.WithTx: run on the caller's transaction.
+		return markBrokerOfflineOnClient(ctx, s.client, uid, now)
+	}
+	defer func() { _ = tx.Rollback() }()
+	done, err := markBrokerOfflineOnClient(ctx, tx.Client(), uid, now)
+	if err != nil || !done {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, mapError(err)
+	}
+	return true, nil
+}
+
+func markBrokerOfflineOnClient(ctx context.Context, client *ent.Client, uid uuid.UUID, now time.Time) (bool, error) {
+	cur, err := client.RuntimeBroker.Get(ctx, uid)
+	if err != nil {
+		return false, mapError(err)
+	}
+	alreadyOffline := cur.Status == store.BrokerStatusOffline && cur.ConnectionState == "disconnected" &&
+		cur.ConnectedHubID == nil && cur.ConnectedSessionID == nil && cur.ConnectedAt == nil
+	if !alreadyOffline {
+		affected, err := client.RuntimeBroker.Update().
+			Where(runtimebroker.IDEQ(uid), runtimebroker.LockVersionEQ(cur.LockVersion)).
+			SetStatus(store.BrokerStatusOffline).
+			SetConnectionState("disconnected").
+			ClearConnectedHubID().
+			ClearConnectedSessionID().
+			ClearConnectedAt().
+			SetUpdated(now).
+			AddLockVersion(1).
+			Save(ctx)
+		if err != nil {
+			return false, mapError(err)
+		}
+		if affected != 1 {
+			return false, nil
+		}
+	}
+	if _, err := client.ProjectContributor.Update().
+		Where(
+			projectcontributor.BrokerIDEQ(uid),
+			projectcontributor.StatusNEQ(store.BrokerStatusOffline),
+		).
+		SetStatus(store.BrokerStatusOffline).
+		SetLastSeen(now).
+		Save(ctx); err != nil {
+		return false, mapError(err)
+	}
+	return true, nil
 }
 
 // ReapStaleBrokerAffinity clears affinity (connected_hub_id/connected_session_id/
@@ -1791,6 +1906,7 @@ func (s *ProjectStore) MarkStaleBrokersOffline(ctx context.Context, threshold ti
 		affected, err := s.client.RuntimeBroker.Update().
 			Where(runtimebroker.IDEQ(b.ID), runtimebroker.LockVersionEQ(b.LockVersion)).
 			SetStatus(store.BrokerStatusOffline).
+			SetConnectionState("disconnected").
 			ClearConnectedHubID().
 			ClearConnectedSessionID().
 			ClearConnectedAt().

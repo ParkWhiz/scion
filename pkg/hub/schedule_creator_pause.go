@@ -16,6 +16,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 
@@ -111,6 +112,176 @@ func (s *Server) pauseSchedulesAuthoredByAgent(ctx context.Context, agent *store
 		s.agentLifecycleLog.With("agent_id", agent.ID, "project_id", agent.ProjectID))
 }
 
+// messagePayloadTarget extracts agentId and agentName from a message
+// schedule's JSON payload. Invalid JSON returns empty strings.
+func messagePayloadTarget(raw string) (agentID, agentName string) {
+	var p MessageEventPayload
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		return "", ""
+	}
+	return p.AgentID, p.AgentName
+}
+
+// scheduleTargetsAgent reports whether a schedule's payload targets agent.
+// Exec schedules match strictly by resolved agentId (never by agentName/slug).
+// Message schedules match by agentId across any project, or by same-project
+// agentName (slug) when agentId is absent.
+func scheduleTargetsAgent(sched store.Schedule, agent *store.Agent) bool {
+	if agent == nil || agent.ID == "" {
+		return false
+	}
+	switch sched.EventType {
+	case scheduledEventTypeExec:
+		targetID := execPayloadTarget(sched.Payload)
+		return targetID != "" && targetID == agent.ID
+	case "message":
+		targetID, targetName := messagePayloadTarget(sched.Payload)
+		if targetID != "" {
+			return targetID == agent.ID
+		}
+		return sched.ProjectID == agent.ProjectID &&
+			agent.Slug != "" &&
+			targetName != "" &&
+			targetName == agent.Slug
+	default:
+		return false
+	}
+}
+
+// scheduleTargetGone reports whether an exec or message schedule's target
+// agent row is missing or soft-deleted.
+func (s *Server) scheduleTargetGone(ctx context.Context, sched store.Schedule) (bool, error) {
+	var (
+		target *store.Agent
+		err    error
+	)
+	switch sched.EventType {
+	case scheduledEventTypeExec:
+		targetID := execPayloadTarget(sched.Payload)
+		if targetID == "" {
+			return false, nil
+		}
+		target, err = s.store.GetAgent(ctx, targetID)
+	case "message":
+		targetID, targetName := messagePayloadTarget(sched.Payload)
+		switch {
+		case targetID != "":
+			target, err = s.store.GetAgent(ctx, targetID)
+		case targetName != "" && sched.ProjectID != "":
+			target, err = s.store.GetAgentBySlug(ctx, sched.ProjectID, targetName)
+		default:
+			return false, nil
+		}
+	default:
+		return false, nil
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return true, nil
+		}
+		return false, err
+	}
+	return target == nil || !target.DeletedAt.IsZero(), nil
+}
+
+// pauseSchedulesTargetingAgent pauses, with status reason target_deleted,
+// every active exec schedule in the agent's project and every active message
+// schedule (in any project, covering cross-project message schedules) whose
+// payload targets agent (ptone/scion#7884, ptone/scion#8927). It runs before
+// pauseSchedulesAuthoredByAgent so self-targeted schedules record
+// target_deleted.
+func (s *Server) pauseSchedulesTargetingAgent(ctx context.Context, agent *store.Agent) {
+	if agent == nil || agent.ID == "" {
+		return
+	}
+	log := s.agentLifecycleLog.With("agent_id", agent.ID, "project_id", agent.ProjectID)
+
+	filters := make([]store.ScheduleFilter, 0, 2)
+	if agent.ProjectID != "" {
+		filters = append(filters, store.ScheduleFilter{
+			ProjectID: agent.ProjectID,
+			Status:    store.ScheduleStatusActive,
+			EventType: scheduledEventTypeExec,
+		})
+	}
+	filters = append(filters, store.ScheduleFilter{
+		Status:    store.ScheduleStatusActive,
+		EventType: "message",
+	})
+
+	// Collect first, then pause: pausing removes rows from the active set
+	// being paged.
+	var matches []store.Schedule
+	for _, filter := range filters {
+		opts := store.ListOptions{Limit: scheduleCreatorPausePageSize, SkipTotalCount: true}
+		for {
+			page, err := s.store.ListSchedules(ctx, filter, opts)
+			if err != nil {
+				log.Warn("Failed to list schedules targeting deleted agent",
+					"event_type", filter.EventType, "error", err)
+				break
+			}
+			for _, sched := range page.Items {
+				if scheduleTargetsAgent(sched, agent) {
+					matches = append(matches, sched)
+				}
+			}
+			if page.NextCursor == "" || page.NextCursor == opts.Cursor {
+				break
+			}
+			opts.Cursor = page.NextCursor
+		}
+	}
+
+	paused := 0
+	for i, sched := range matches {
+		if err := ctx.Err(); err != nil {
+			log.Warn("Stopped pausing schedules targeting deleted agent: context done",
+				"unpaused", len(matches)-i, "error", err)
+			break
+		}
+		err := s.pauseScheduleWithReason(ctx, sched, store.ScheduleStatusReasonTargetDeleted)
+		switch {
+		case err == nil:
+			paused++
+		case errors.Is(err, store.ErrRevisionConflict), errors.Is(err, store.ErrNotFound):
+			// Edited/resumed or deleted since it was listed.
+		default:
+			log.Warn("Failed to pause schedule targeting deleted agent",
+				"schedule_id", sched.ID, "event_type", sched.EventType, "error", err)
+		}
+	}
+	if paused > 0 {
+		log.Info("Paused schedules targeting deleted agent",
+			"paused", paused, "status_reason", store.ScheduleStatusReasonTargetDeleted)
+	}
+}
+
+// pauseScheduleIfTargetGone is the evaluator backstop for exec and message
+// schedules whose target agent was deleted by a path that did not pause them.
+func (s *Server) pauseScheduleIfTargetGone(ctx context.Context, sched store.Schedule, log *slog.Logger) bool {
+	gone, err := s.scheduleTargetGone(ctx, sched)
+	if err != nil {
+		log.Warn("schedule-evaluator: target agent lookup failed; firing as usual", "error", err)
+		return false
+	}
+	if !gone {
+		return false
+	}
+	err = s.pauseScheduleWithReason(ctx, sched, store.ScheduleStatusReasonTargetDeleted)
+	switch {
+	case err == nil:
+		log.Warn("schedule paused: its target agent was deleted; edit its target and resume",
+			"status_reason", store.ScheduleStatusReasonTargetDeleted)
+	case errors.Is(err, store.ErrRevisionConflict), errors.Is(err, store.ErrNotFound):
+		log.Info("schedule-evaluator: schedule changed since listed; skipping this tick", "error", err)
+	default:
+		log.Error("schedule-evaluator: failed to pause schedule whose target agent was deleted", "error", err)
+		return false
+	}
+	return true
+}
+
 // pauseSchedulesAuthoredByUser pauses, with status reason creator_deleted,
 // every active schedule in any project whose recorded authority is the
 // user (ptone/scion#2143): the schedules do not block the user's
@@ -185,6 +356,203 @@ func (s *Server) pauseSchedulesWithAuthority(ctx context.Context, projectID stri
 	if paused > 0 {
 		log.Info("Paused schedules whose authority is a deleted principal",
 			"paused", paused, "status_reason", store.ScheduleStatusReasonCreatorDeleted)
+	}
+}
+
+// pauseTriggersAuthoredByAgent pauses, with status reason creator_deleted,
+// every active trigger in the agent's project whose recorded authority is the
+// agent (§5.6). Runs in its own step/budget separate from schedule pausing;
+// the fire-time standing check remains the backstop.
+func (s *Server) pauseTriggersAuthoredByAgent(ctx context.Context, agent *store.Agent) {
+	if agent == nil || agent.ID == "" || agent.ProjectID == "" {
+		return
+	}
+	s.pauseTriggersWithAuthority(ctx, agent.ProjectID,
+		store.ScheduleAuthorityPrincipal{Kind: store.DelegationPrincipalAgent, ID: agent.ID},
+		s.agentLifecycleLog.With("agent_id", agent.ID, "project_id", agent.ProjectID))
+}
+
+// pauseTriggersAuthoredByUser pauses, with status reason creator_deleted,
+// every active trigger in any project whose recorded authority is the user
+// (§5.6). Runs separately from schedule pausing; the fire-time standing check
+// remains the backstop.
+func (s *Server) pauseTriggersAuthoredByUser(ctx context.Context, userID string) {
+	if userID == "" {
+		return
+	}
+	s.pauseTriggersWithAuthority(ctx, "",
+		store.ScheduleAuthorityPrincipal{Kind: store.DelegationPrincipalUser, ID: userID},
+		slog.Default().With("subsystem", "triggers", "user_id", userID))
+}
+
+// triggerAuthorityPrincipal returns the principal the trigger's recorded
+// authority resolves to, or the zero value for legacy attribution with no
+// recorded principal.
+func (s *Server) triggerAuthorityPrincipal(tr store.Trigger) store.ScheduleAuthorityPrincipal {
+	initiator := s.scheduledInitiator(tr.InitiatorAttribution)
+	if initiator.LegacyUnknown || initiator.PrincipalID == "" {
+		return store.ScheduleAuthorityPrincipal{}
+	}
+	return store.ScheduleAuthorityPrincipal{Kind: initiator.PrincipalKind, ID: initiator.PrincipalID}
+}
+
+// pauseTriggerWithReason pauses tr with a system status reason, conditioned on
+// the authorization revision tr was read with so a concurrent resume or edit
+// is never clobbered.
+func (s *Server) pauseTriggerWithReason(ctx context.Context, ts store.TriggerStore, tr store.Trigger, reason string) error {
+	prevRevision := tr.AuthorizationRevision
+	prevRevisionKnown := tr.AuthorizationRevision != 0
+	tr.Status = store.TriggerStatusPaused
+	tr.StatusReason = reason
+	fields := store.TriggerFieldMask{Status: true}
+	return ts.UpdateTrigger(ctx, &tr, fields, prevRevision, prevRevisionKnown, nil)
+}
+
+// pauseTriggersWithAuthority pauses, with status reason creator_deleted, every
+// active trigger whose recorded authority is principal, in projectID or, when
+// projectID is empty, in every project (§5.6). Uses the same page size and
+// revision-CAS pattern as pauseSchedulesWithAuthority.
+func (s *Server) pauseTriggersWithAuthority(ctx context.Context, projectID string, principal store.ScheduleAuthorityPrincipal, log *slog.Logger) {
+	ts, ok := s.store.(store.TriggerStore)
+	if !ok || ts == nil {
+		return
+	}
+
+	var matches []store.Trigger
+	opts := store.ListOptions{Limit: scheduleCreatorPausePageSize, SkipTotalCount: true}
+	for {
+		page, err := ts.ListTriggers(ctx, store.TriggerFilter{
+			ProjectID:          projectID,
+			Status:             store.TriggerStatusActive,
+			AuthorityPrincipal: principal,
+		}, opts)
+		if err != nil {
+			log.Warn("Failed to list triggers whose authority is a deleted principal", "error", err)
+			break
+		}
+		for _, tr := range page.Items {
+			if s.triggerAuthorityPrincipal(tr) == principal {
+				matches = append(matches, tr)
+			}
+		}
+		if page.NextCursor == "" || page.NextCursor == opts.Cursor {
+			break
+		}
+		opts.Cursor = page.NextCursor
+	}
+
+	paused := 0
+	for i, tr := range matches {
+		if err := ctx.Err(); err != nil {
+			log.Warn("Stopped pausing triggers whose authority is a deleted principal: context done",
+				"unpaused", len(matches)-i, "error", err)
+			break
+		}
+		err := s.pauseTriggerWithReason(ctx, ts, tr, store.TriggerStatusReasonCreatorDeleted)
+		switch {
+		case err == nil:
+			paused++
+		case errors.Is(err, store.ErrRevisionConflict), errors.Is(err, store.ErrNotFound):
+			// Resumed (re-attributed) or deleted since it was read.
+		default:
+			log.Warn("Failed to pause trigger whose authority is a deleted principal",
+				"trigger_id", tr.ID, "error", err)
+		}
+	}
+	if paused > 0 {
+		log.Info("Paused triggers whose authority is a deleted principal",
+			"paused", paused, "status_reason", store.TriggerStatusReasonCreatorDeleted)
+	}
+}
+
+// triggerTargetsAgent reports whether a trigger's action payload targets
+// agentID strictly by resolved agentId (never by agentName/slug).
+func triggerTargetsAgent(tr store.Trigger, agentID string) bool {
+	if agentID == "" {
+		return false
+	}
+	switch tr.ActionType {
+	case store.TriggerActionMessage:
+		var p MessageEventPayload
+		if err := json.Unmarshal([]byte(tr.ActionPayload), &p); err != nil {
+			return false
+		}
+		return p.AgentID != "" && p.AgentID == agentID
+	case store.TriggerActionExec:
+		targetID := execPayloadTarget(tr.ActionPayload)
+		return targetID != "" && targetID == agentID
+	default:
+		return false
+	}
+}
+
+// pauseTriggersTargetingAgent pauses, with status reason target_deleted, every
+// active trigger (in any project, covering cross-project message triggers)
+// whose action payload targets agent.ID (§5.6). It runs before
+// pauseTriggersAuthoredByAgent so self-targeted triggers record target_deleted.
+//
+// Queries are filtered in SQL by active status, target-bearing action types,
+// and target agent ID with SkipTotalCount, and matching rows are paused page by
+// page so keyset pagination stays stable and progress is never lost on timeout.
+func (s *Server) pauseTriggersTargetingAgent(ctx context.Context, agent *store.Agent) {
+	if agent == nil || agent.ID == "" {
+		return
+	}
+	ts, ok := s.store.(store.TriggerStore)
+	if !ok || ts == nil {
+		return
+	}
+	log := s.agentLifecycleLog.With("agent_id", agent.ID, "project_id", agent.ProjectID)
+
+	paused := 0
+	opts := store.ListOptions{Limit: scheduleCreatorPausePageSize, SkipTotalCount: true}
+	filter := store.TriggerFilter{
+		Status:        store.TriggerStatusActive,
+		ActionTypes:   []string{store.TriggerActionMessage, store.TriggerActionExec},
+		TargetAgentID: agent.ID,
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			log.Warn("Stopped pausing triggers targeting deleted agent: context done",
+				"paused", paused, "error", err)
+			break
+		}
+		page, err := ts.ListTriggers(ctx, filter, opts)
+		if err != nil {
+			log.Warn("Failed to list triggers targeting deleted agent", "error", err)
+			break
+		}
+		stopped := false
+		for _, tr := range page.Items {
+			if !triggerTargetsAgent(tr, agent.ID) {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				log.Warn("Stopped pausing triggers targeting deleted agent: context done",
+					"paused", paused, "error", err)
+				stopped = true
+				break
+			}
+			pErr := s.pauseTriggerWithReason(ctx, ts, tr, store.TriggerStatusReasonTargetDeleted)
+			switch {
+			case pErr == nil:
+				paused++
+			case errors.Is(pErr, store.ErrRevisionConflict), errors.Is(pErr, store.ErrNotFound):
+				// Edited/resumed or deleted since it was listed.
+			default:
+				log.Warn("Failed to pause trigger targeting deleted agent",
+					"trigger_id", tr.ID, "error", pErr)
+			}
+		}
+		if stopped || page.NextCursor == "" || page.NextCursor == opts.Cursor {
+			break
+		}
+		opts.Cursor = page.NextCursor
+	}
+
+	if paused > 0 {
+		log.Info("Paused triggers targeting deleted agent",
+			"paused", paused, "status_reason", store.TriggerStatusReasonTargetDeleted)
 	}
 }
 

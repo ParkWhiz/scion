@@ -65,6 +65,11 @@ func ConversationID(v uuid.UUID) predicate.Decision {
 	return predicate.Decision(sql.FieldEQ(FieldConversationID, v))
 }
 
+// ChatKey applies equality check predicate on the "chat_key" field. It's identical to ChatKeyEQ.
+func ChatKey(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldChatKey, v))
+}
+
 // MessageID applies equality check predicate on the "message_id" field. It's identical to MessageIDEQ.
 func MessageID(v uuid.UUID) predicate.Decision {
 	return predicate.Decision(sql.FieldEQ(FieldMessageID, v))
@@ -110,9 +115,34 @@ func DefaultChoiceID(v string) predicate.Decision {
 	return predicate.Decision(sql.FieldEQ(FieldDefaultChoiceID, v))
 }
 
+// AllowOther applies equality check predicate on the "allow_other" field. It's identical to AllowOtherEQ.
+func AllowOther(v bool) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldAllowOther, v))
+}
+
+// OtherLabel applies equality check predicate on the "other_label" field. It's identical to OtherLabelEQ.
+func OtherLabel(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldOtherLabel, v))
+}
+
+// OtherDescription applies equality check predicate on the "other_description" field. It's identical to OtherDescriptionEQ.
+func OtherDescription(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldOtherDescription, v))
+}
+
+// OtherPlaceholder applies equality check predicate on the "other_placeholder" field. It's identical to OtherPlaceholderEQ.
+func OtherPlaceholder(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldOtherPlaceholder, v))
+}
+
 // IntroLength applies equality check predicate on the "intro_length" field. It's identical to IntroLengthEQ.
 func IntroLength(v int) predicate.Decision {
 	return predicate.Decision(sql.FieldEQ(FieldIntroLength, v))
+}
+
+// Settled applies equality check predicate on the "settled" field. It's identical to SettledEQ.
+func Settled(v bool) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldSettled, v))
 }
 
 // ReplacedByID applies equality check predicate on the "replaced_by_id" field. It's identical to ReplacedByIDEQ.
@@ -133,6 +163,21 @@ func DecidedAt(v time.Time) predicate.Decision {
 // ReplacedAt applies equality check predicate on the "replaced_at" field. It's identical to ReplacedAtEQ.
 func ReplacedAt(v time.Time) predicate.Decision {
 	return predicate.Decision(sql.FieldEQ(FieldReplacedAt, v))
+}
+
+// WithdrawnAt applies equality check predicate on the "withdrawn_at" field. It's identical to WithdrawnAtEQ.
+func WithdrawnAt(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldWithdrawnAt, v))
+}
+
+// WithdrawnReason applies equality check predicate on the "withdrawn_reason" field. It's identical to WithdrawnReasonEQ.
+func WithdrawnReason(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldWithdrawnReason, v))
+}
+
+// DismissedAt applies equality check predicate on the "dismissed_at" field. It's identical to DismissedAtEQ.
+func DismissedAt(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldDismissedAt, v))
 }
 
 // ProjectIDEQ applies the EQ predicate on the "project_id" field.
@@ -223,6 +268,81 @@ func ConversationIDIsNil() predicate.Decision {
 // ConversationIDNotNil applies the NotNil predicate on the "conversation_id" field.
 func ConversationIDNotNil() predicate.Decision {
 	return predicate.Decision(sql.FieldNotNull(FieldConversationID))
+}
+
+// ChatKeyEQ applies the EQ predicate on the "chat_key" field.
+func ChatKeyEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldChatKey, v))
+}
+
+// ChatKeyNEQ applies the NEQ predicate on the "chat_key" field.
+func ChatKeyNEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldChatKey, v))
+}
+
+// ChatKeyIn applies the In predicate on the "chat_key" field.
+func ChatKeyIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldIn(FieldChatKey, vs...))
+}
+
+// ChatKeyNotIn applies the NotIn predicate on the "chat_key" field.
+func ChatKeyNotIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldNotIn(FieldChatKey, vs...))
+}
+
+// ChatKeyGT applies the GT predicate on the "chat_key" field.
+func ChatKeyGT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGT(FieldChatKey, v))
+}
+
+// ChatKeyGTE applies the GTE predicate on the "chat_key" field.
+func ChatKeyGTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGTE(FieldChatKey, v))
+}
+
+// ChatKeyLT applies the LT predicate on the "chat_key" field.
+func ChatKeyLT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLT(FieldChatKey, v))
+}
+
+// ChatKeyLTE applies the LTE predicate on the "chat_key" field.
+func ChatKeyLTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLTE(FieldChatKey, v))
+}
+
+// ChatKeyContains applies the Contains predicate on the "chat_key" field.
+func ChatKeyContains(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContains(FieldChatKey, v))
+}
+
+// ChatKeyHasPrefix applies the HasPrefix predicate on the "chat_key" field.
+func ChatKeyHasPrefix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasPrefix(FieldChatKey, v))
+}
+
+// ChatKeyHasSuffix applies the HasSuffix predicate on the "chat_key" field.
+func ChatKeyHasSuffix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasSuffix(FieldChatKey, v))
+}
+
+// ChatKeyIsNil applies the IsNil predicate on the "chat_key" field.
+func ChatKeyIsNil() predicate.Decision {
+	return predicate.Decision(sql.FieldIsNull(FieldChatKey))
+}
+
+// ChatKeyNotNil applies the NotNil predicate on the "chat_key" field.
+func ChatKeyNotNil() predicate.Decision {
+	return predicate.Decision(sql.FieldNotNull(FieldChatKey))
+}
+
+// ChatKeyEqualFold applies the EqualFold predicate on the "chat_key" field.
+func ChatKeyEqualFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEqualFold(FieldChatKey, v))
+}
+
+// ChatKeyContainsFold applies the ContainsFold predicate on the "chat_key" field.
+func ChatKeyContainsFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContainsFold(FieldChatKey, v))
 }
 
 // MessageIDEQ applies the EQ predicate on the "message_id" field.
@@ -740,6 +860,241 @@ func DefaultChoiceIDContainsFold(v string) predicate.Decision {
 	return predicate.Decision(sql.FieldContainsFold(FieldDefaultChoiceID, v))
 }
 
+// AllowOtherEQ applies the EQ predicate on the "allow_other" field.
+func AllowOtherEQ(v bool) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldAllowOther, v))
+}
+
+// AllowOtherNEQ applies the NEQ predicate on the "allow_other" field.
+func AllowOtherNEQ(v bool) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldAllowOther, v))
+}
+
+// OtherLabelEQ applies the EQ predicate on the "other_label" field.
+func OtherLabelEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldOtherLabel, v))
+}
+
+// OtherLabelNEQ applies the NEQ predicate on the "other_label" field.
+func OtherLabelNEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldOtherLabel, v))
+}
+
+// OtherLabelIn applies the In predicate on the "other_label" field.
+func OtherLabelIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldIn(FieldOtherLabel, vs...))
+}
+
+// OtherLabelNotIn applies the NotIn predicate on the "other_label" field.
+func OtherLabelNotIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldNotIn(FieldOtherLabel, vs...))
+}
+
+// OtherLabelGT applies the GT predicate on the "other_label" field.
+func OtherLabelGT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGT(FieldOtherLabel, v))
+}
+
+// OtherLabelGTE applies the GTE predicate on the "other_label" field.
+func OtherLabelGTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGTE(FieldOtherLabel, v))
+}
+
+// OtherLabelLT applies the LT predicate on the "other_label" field.
+func OtherLabelLT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLT(FieldOtherLabel, v))
+}
+
+// OtherLabelLTE applies the LTE predicate on the "other_label" field.
+func OtherLabelLTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLTE(FieldOtherLabel, v))
+}
+
+// OtherLabelContains applies the Contains predicate on the "other_label" field.
+func OtherLabelContains(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContains(FieldOtherLabel, v))
+}
+
+// OtherLabelHasPrefix applies the HasPrefix predicate on the "other_label" field.
+func OtherLabelHasPrefix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasPrefix(FieldOtherLabel, v))
+}
+
+// OtherLabelHasSuffix applies the HasSuffix predicate on the "other_label" field.
+func OtherLabelHasSuffix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasSuffix(FieldOtherLabel, v))
+}
+
+// OtherLabelIsNil applies the IsNil predicate on the "other_label" field.
+func OtherLabelIsNil() predicate.Decision {
+	return predicate.Decision(sql.FieldIsNull(FieldOtherLabel))
+}
+
+// OtherLabelNotNil applies the NotNil predicate on the "other_label" field.
+func OtherLabelNotNil() predicate.Decision {
+	return predicate.Decision(sql.FieldNotNull(FieldOtherLabel))
+}
+
+// OtherLabelEqualFold applies the EqualFold predicate on the "other_label" field.
+func OtherLabelEqualFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEqualFold(FieldOtherLabel, v))
+}
+
+// OtherLabelContainsFold applies the ContainsFold predicate on the "other_label" field.
+func OtherLabelContainsFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContainsFold(FieldOtherLabel, v))
+}
+
+// OtherDescriptionEQ applies the EQ predicate on the "other_description" field.
+func OtherDescriptionEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldOtherDescription, v))
+}
+
+// OtherDescriptionNEQ applies the NEQ predicate on the "other_description" field.
+func OtherDescriptionNEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldOtherDescription, v))
+}
+
+// OtherDescriptionIn applies the In predicate on the "other_description" field.
+func OtherDescriptionIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldIn(FieldOtherDescription, vs...))
+}
+
+// OtherDescriptionNotIn applies the NotIn predicate on the "other_description" field.
+func OtherDescriptionNotIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldNotIn(FieldOtherDescription, vs...))
+}
+
+// OtherDescriptionGT applies the GT predicate on the "other_description" field.
+func OtherDescriptionGT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGT(FieldOtherDescription, v))
+}
+
+// OtherDescriptionGTE applies the GTE predicate on the "other_description" field.
+func OtherDescriptionGTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGTE(FieldOtherDescription, v))
+}
+
+// OtherDescriptionLT applies the LT predicate on the "other_description" field.
+func OtherDescriptionLT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLT(FieldOtherDescription, v))
+}
+
+// OtherDescriptionLTE applies the LTE predicate on the "other_description" field.
+func OtherDescriptionLTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLTE(FieldOtherDescription, v))
+}
+
+// OtherDescriptionContains applies the Contains predicate on the "other_description" field.
+func OtherDescriptionContains(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContains(FieldOtherDescription, v))
+}
+
+// OtherDescriptionHasPrefix applies the HasPrefix predicate on the "other_description" field.
+func OtherDescriptionHasPrefix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasPrefix(FieldOtherDescription, v))
+}
+
+// OtherDescriptionHasSuffix applies the HasSuffix predicate on the "other_description" field.
+func OtherDescriptionHasSuffix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasSuffix(FieldOtherDescription, v))
+}
+
+// OtherDescriptionIsNil applies the IsNil predicate on the "other_description" field.
+func OtherDescriptionIsNil() predicate.Decision {
+	return predicate.Decision(sql.FieldIsNull(FieldOtherDescription))
+}
+
+// OtherDescriptionNotNil applies the NotNil predicate on the "other_description" field.
+func OtherDescriptionNotNil() predicate.Decision {
+	return predicate.Decision(sql.FieldNotNull(FieldOtherDescription))
+}
+
+// OtherDescriptionEqualFold applies the EqualFold predicate on the "other_description" field.
+func OtherDescriptionEqualFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEqualFold(FieldOtherDescription, v))
+}
+
+// OtherDescriptionContainsFold applies the ContainsFold predicate on the "other_description" field.
+func OtherDescriptionContainsFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContainsFold(FieldOtherDescription, v))
+}
+
+// OtherPlaceholderEQ applies the EQ predicate on the "other_placeholder" field.
+func OtherPlaceholderEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderNEQ applies the NEQ predicate on the "other_placeholder" field.
+func OtherPlaceholderNEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderIn applies the In predicate on the "other_placeholder" field.
+func OtherPlaceholderIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldIn(FieldOtherPlaceholder, vs...))
+}
+
+// OtherPlaceholderNotIn applies the NotIn predicate on the "other_placeholder" field.
+func OtherPlaceholderNotIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldNotIn(FieldOtherPlaceholder, vs...))
+}
+
+// OtherPlaceholderGT applies the GT predicate on the "other_placeholder" field.
+func OtherPlaceholderGT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGT(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderGTE applies the GTE predicate on the "other_placeholder" field.
+func OtherPlaceholderGTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGTE(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderLT applies the LT predicate on the "other_placeholder" field.
+func OtherPlaceholderLT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLT(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderLTE applies the LTE predicate on the "other_placeholder" field.
+func OtherPlaceholderLTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLTE(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderContains applies the Contains predicate on the "other_placeholder" field.
+func OtherPlaceholderContains(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContains(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderHasPrefix applies the HasPrefix predicate on the "other_placeholder" field.
+func OtherPlaceholderHasPrefix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasPrefix(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderHasSuffix applies the HasSuffix predicate on the "other_placeholder" field.
+func OtherPlaceholderHasSuffix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasSuffix(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderIsNil applies the IsNil predicate on the "other_placeholder" field.
+func OtherPlaceholderIsNil() predicate.Decision {
+	return predicate.Decision(sql.FieldIsNull(FieldOtherPlaceholder))
+}
+
+// OtherPlaceholderNotNil applies the NotNil predicate on the "other_placeholder" field.
+func OtherPlaceholderNotNil() predicate.Decision {
+	return predicate.Decision(sql.FieldNotNull(FieldOtherPlaceholder))
+}
+
+// OtherPlaceholderEqualFold applies the EqualFold predicate on the "other_placeholder" field.
+func OtherPlaceholderEqualFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEqualFold(FieldOtherPlaceholder, v))
+}
+
+// OtherPlaceholderContainsFold applies the ContainsFold predicate on the "other_placeholder" field.
+func OtherPlaceholderContainsFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContainsFold(FieldOtherPlaceholder, v))
+}
+
 // IntroLengthEQ applies the EQ predicate on the "intro_length" field.
 func IntroLengthEQ(v int) predicate.Decision {
 	return predicate.Decision(sql.FieldEQ(FieldIntroLength, v))
@@ -798,6 +1153,16 @@ func StatusIn(vs ...Status) predicate.Decision {
 // StatusNotIn applies the NotIn predicate on the "status" field.
 func StatusNotIn(vs ...Status) predicate.Decision {
 	return predicate.Decision(sql.FieldNotIn(FieldStatus, vs...))
+}
+
+// SettledEQ applies the EQ predicate on the "settled" field.
+func SettledEQ(v bool) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldSettled, v))
+}
+
+// SettledNEQ applies the NEQ predicate on the "settled" field.
+func SettledNEQ(v bool) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldSettled, v))
 }
 
 // ReplacedByIDEQ applies the EQ predicate on the "replaced_by_id" field.
@@ -988,6 +1353,181 @@ func ReplacedAtIsNil() predicate.Decision {
 // ReplacedAtNotNil applies the NotNil predicate on the "replaced_at" field.
 func ReplacedAtNotNil() predicate.Decision {
 	return predicate.Decision(sql.FieldNotNull(FieldReplacedAt))
+}
+
+// WithdrawnAtEQ applies the EQ predicate on the "withdrawn_at" field.
+func WithdrawnAtEQ(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldWithdrawnAt, v))
+}
+
+// WithdrawnAtNEQ applies the NEQ predicate on the "withdrawn_at" field.
+func WithdrawnAtNEQ(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldWithdrawnAt, v))
+}
+
+// WithdrawnAtIn applies the In predicate on the "withdrawn_at" field.
+func WithdrawnAtIn(vs ...time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldIn(FieldWithdrawnAt, vs...))
+}
+
+// WithdrawnAtNotIn applies the NotIn predicate on the "withdrawn_at" field.
+func WithdrawnAtNotIn(vs ...time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldNotIn(FieldWithdrawnAt, vs...))
+}
+
+// WithdrawnAtGT applies the GT predicate on the "withdrawn_at" field.
+func WithdrawnAtGT(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldGT(FieldWithdrawnAt, v))
+}
+
+// WithdrawnAtGTE applies the GTE predicate on the "withdrawn_at" field.
+func WithdrawnAtGTE(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldGTE(FieldWithdrawnAt, v))
+}
+
+// WithdrawnAtLT applies the LT predicate on the "withdrawn_at" field.
+func WithdrawnAtLT(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldLT(FieldWithdrawnAt, v))
+}
+
+// WithdrawnAtLTE applies the LTE predicate on the "withdrawn_at" field.
+func WithdrawnAtLTE(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldLTE(FieldWithdrawnAt, v))
+}
+
+// WithdrawnAtIsNil applies the IsNil predicate on the "withdrawn_at" field.
+func WithdrawnAtIsNil() predicate.Decision {
+	return predicate.Decision(sql.FieldIsNull(FieldWithdrawnAt))
+}
+
+// WithdrawnAtNotNil applies the NotNil predicate on the "withdrawn_at" field.
+func WithdrawnAtNotNil() predicate.Decision {
+	return predicate.Decision(sql.FieldNotNull(FieldWithdrawnAt))
+}
+
+// WithdrawnReasonEQ applies the EQ predicate on the "withdrawn_reason" field.
+func WithdrawnReasonEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonNEQ applies the NEQ predicate on the "withdrawn_reason" field.
+func WithdrawnReasonNEQ(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonIn applies the In predicate on the "withdrawn_reason" field.
+func WithdrawnReasonIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldIn(FieldWithdrawnReason, vs...))
+}
+
+// WithdrawnReasonNotIn applies the NotIn predicate on the "withdrawn_reason" field.
+func WithdrawnReasonNotIn(vs ...string) predicate.Decision {
+	return predicate.Decision(sql.FieldNotIn(FieldWithdrawnReason, vs...))
+}
+
+// WithdrawnReasonGT applies the GT predicate on the "withdrawn_reason" field.
+func WithdrawnReasonGT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGT(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonGTE applies the GTE predicate on the "withdrawn_reason" field.
+func WithdrawnReasonGTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldGTE(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonLT applies the LT predicate on the "withdrawn_reason" field.
+func WithdrawnReasonLT(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLT(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonLTE applies the LTE predicate on the "withdrawn_reason" field.
+func WithdrawnReasonLTE(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldLTE(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonContains applies the Contains predicate on the "withdrawn_reason" field.
+func WithdrawnReasonContains(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContains(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonHasPrefix applies the HasPrefix predicate on the "withdrawn_reason" field.
+func WithdrawnReasonHasPrefix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasPrefix(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonHasSuffix applies the HasSuffix predicate on the "withdrawn_reason" field.
+func WithdrawnReasonHasSuffix(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldHasSuffix(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonIsNil applies the IsNil predicate on the "withdrawn_reason" field.
+func WithdrawnReasonIsNil() predicate.Decision {
+	return predicate.Decision(sql.FieldIsNull(FieldWithdrawnReason))
+}
+
+// WithdrawnReasonNotNil applies the NotNil predicate on the "withdrawn_reason" field.
+func WithdrawnReasonNotNil() predicate.Decision {
+	return predicate.Decision(sql.FieldNotNull(FieldWithdrawnReason))
+}
+
+// WithdrawnReasonEqualFold applies the EqualFold predicate on the "withdrawn_reason" field.
+func WithdrawnReasonEqualFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldEqualFold(FieldWithdrawnReason, v))
+}
+
+// WithdrawnReasonContainsFold applies the ContainsFold predicate on the "withdrawn_reason" field.
+func WithdrawnReasonContainsFold(v string) predicate.Decision {
+	return predicate.Decision(sql.FieldContainsFold(FieldWithdrawnReason, v))
+}
+
+// DismissedAtEQ applies the EQ predicate on the "dismissed_at" field.
+func DismissedAtEQ(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldEQ(FieldDismissedAt, v))
+}
+
+// DismissedAtNEQ applies the NEQ predicate on the "dismissed_at" field.
+func DismissedAtNEQ(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldNEQ(FieldDismissedAt, v))
+}
+
+// DismissedAtIn applies the In predicate on the "dismissed_at" field.
+func DismissedAtIn(vs ...time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldIn(FieldDismissedAt, vs...))
+}
+
+// DismissedAtNotIn applies the NotIn predicate on the "dismissed_at" field.
+func DismissedAtNotIn(vs ...time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldNotIn(FieldDismissedAt, vs...))
+}
+
+// DismissedAtGT applies the GT predicate on the "dismissed_at" field.
+func DismissedAtGT(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldGT(FieldDismissedAt, v))
+}
+
+// DismissedAtGTE applies the GTE predicate on the "dismissed_at" field.
+func DismissedAtGTE(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldGTE(FieldDismissedAt, v))
+}
+
+// DismissedAtLT applies the LT predicate on the "dismissed_at" field.
+func DismissedAtLT(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldLT(FieldDismissedAt, v))
+}
+
+// DismissedAtLTE applies the LTE predicate on the "dismissed_at" field.
+func DismissedAtLTE(v time.Time) predicate.Decision {
+	return predicate.Decision(sql.FieldLTE(FieldDismissedAt, v))
+}
+
+// DismissedAtIsNil applies the IsNil predicate on the "dismissed_at" field.
+func DismissedAtIsNil() predicate.Decision {
+	return predicate.Decision(sql.FieldIsNull(FieldDismissedAt))
+}
+
+// DismissedAtNotNil applies the NotNil predicate on the "dismissed_at" field.
+func DismissedAtNotNil() predicate.Decision {
+	return predicate.Decision(sql.FieldNotNull(FieldDismissedAt))
 }
 
 // And groups predicates with the AND operator between them.

@@ -116,15 +116,15 @@ describe('StateManager user-scoped chat subjects', () => {
     expect(detail.data).toEqual({ action: 'changed' });
   });
 
-  it('routes user.{id}.chat.choice.updated to choice-updated, never as a message', () => {
+  it('routes user.{id}.chat.decision.updated to decision-updated, never as a message', () => {
     const sm = new StateManager();
     const choice = vi.fn();
     const message = vi.fn();
-    sm.addEventListener('choice-updated', choice);
+    sm.addEventListener('decision-updated', choice);
     sm.addEventListener('chat-message-received', message);
 
     const data = { messageId: 'm1', threadId: 'dm:agent:a:user:b', decision: { rowId: 'r1' } };
-    emit(sm, 'user.b.chat.choice.updated', data);
+    emit(sm, 'user.b.chat.decision.updated', data);
 
     expect(message).not.toHaveBeenCalled();
     expect(choice).toHaveBeenCalledTimes(1);
@@ -132,15 +132,15 @@ describe('StateManager user-scoped chat subjects', () => {
     expect(detail.data).toEqual(data);
   });
 
-  it('routes project.{id}.chat.choice.updated to choice-updated with the project id', () => {
+  it('routes project.{id}.chat.decision.updated to decision-updated with the project id', () => {
     const sm = new StateManager();
     const choice = vi.fn();
     const message = vi.fn();
-    sm.addEventListener('choice-updated', choice);
+    sm.addEventListener('decision-updated', choice);
     sm.addEventListener('chat-message-received', message);
 
     const data = { messageId: 'm1', threadId: 'topic-1', decision: { rowId: 'r1' } };
-    emit(sm, 'project.p1.chat.choice.updated', data);
+    emit(sm, 'project.p1.chat.decision.updated', data);
 
     expect(message).not.toHaveBeenCalled();
     expect(choice).toHaveBeenCalledTimes(1);
@@ -192,14 +192,30 @@ describe('StateManager own chat subject', () => {
     expect(message).not.toHaveBeenCalled();
   });
 
-  it('still routes the unscoped notification subject to notification-created', () => {
+  it('routes the per-user inbox subject to inbox-changed only', () => {
+    const sm = new StateManager();
+    const inboxChanged = vi.fn();
+    const created = vi.fn();
+    sm.addEventListener('inbox-changed', inboxChanged);
+    sm.addEventListener('notification-created', created);
+
+    const data = { category: 'approvals' };
+    emit(sm, 'user.b.inbox', data);
+
+    expect(inboxChanged).toHaveBeenCalledTimes(1);
+    const detail = (inboxChanged.mock.calls[0]?.[0] as CustomEvent).detail as { data: unknown };
+    expect(detail.data).toEqual(data);
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it('ignores removed unscoped notification subjects', () => {
     const sm = new StateManager();
     const created = vi.fn();
     sm.addEventListener('notification-created', created);
 
     emit(sm, 'notification.created', { id: 'notif-2', status: 'COMPLETED' });
 
-    expect(created).toHaveBeenCalledTimes(1);
+    expect(created).not.toHaveBeenCalled();
   });
 
   it('raises no legacy user-message-created event for user-message subjects', () => {
@@ -222,15 +238,21 @@ describe('StateManager own chat subject', () => {
 
     sm.setCurrentUserId('me');
 
-    for (const scope of [
+    const scopes: Parameters<StateManager['setScope']>[0][] = [
       { type: 'dashboard' },
+      { type: 'profile' },
       { type: 'project', projectId: 'p1' },
       { type: 'agent-detail', projectId: 'p1', agentId: 'a1' },
       { type: 'brokers-list' },
-    ] as const) {
+      { type: 'broker-detail', brokerId: 'b1' },
+      { type: 'chat', spaceIds: ['p1'], userId: 'me' },
+    ];
+    for (const scope of scopes) {
       const subjects = subjectsFor(sm, scope);
       expect(subjects).toContain('user.me.chat.>');
       expect(subjects).toContain('user.me.notification');
+      expect(subjects).toContain('user.me.inbox');
+      expect(subjects).not.toContain('notification.>');
     }
   });
 
@@ -239,6 +261,71 @@ describe('StateManager own chat subject', () => {
     sm.setCurrentUserId('me');
     const subjects = subjectsFor(sm, { type: 'chat', spaceIds: ['p1'], userId: 'me' });
     expect(subjects.filter((s) => s === 'user.me.chat.>')).toHaveLength(1);
+  });
+});
+
+describe('StateManager profile scope', () => {
+  const subjectsFor = (
+    sm: StateManager,
+    scope: Parameters<StateManager['setScope']>[0]
+  ): string[] =>
+    (sm as unknown as { subjectsForScope(s: unknown): string[] }).subjectsForScope(scope);
+
+  it('subscribes to project.>, user.<id>.chat.>, and user.<id>.notification for profile scope', () => {
+    const sm = new StateManager();
+    expect(subjectsFor(sm, { type: 'profile', userId: 'u-1' })).toEqual([
+      'project.>',
+      'user.u-1.chat.>',
+      'user.u-1.notification',
+      'user.u-1.inbox',
+    ]);
+
+    sm.setCurrentUserId('u-1');
+    const deduped = subjectsFor(sm, { type: 'profile', userId: 'u-1' });
+    expect(deduped.filter((s) => s === 'user.u-1.chat.>')).toHaveLength(1);
+  });
+
+  it('adds user.<id>.chat.> and user.<id>.notification when setCurrentUserId arrives after setScope and dedupes identical scopes', () => {
+    const sm = new StateManager();
+    const connect = vi.fn();
+    (sm as unknown as { sseClient: { connect: (s: string[]) => void } }).sseClient.connect =
+      connect;
+
+    sm.setScope({ type: 'profile' });
+    expect(connect).toHaveBeenCalledTimes(1);
+    expect(connect).toHaveBeenLastCalledWith(['project.>']);
+
+    sm.setCurrentUserId('u-2');
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(connect).toHaveBeenLastCalledWith([
+      'project.>',
+      'user.u-2.chat.>',
+      'user.u-2.notification',
+      'user.u-2.inbox',
+    ]);
+
+    sm.setScope({ type: 'profile', userId: 'u-2' });
+    const gen = sm.scopeGeneration;
+    sm.setScope({ type: 'profile', userId: 'u-2' });
+    expect(sm.scopeGeneration).toBe(gen);
+  });
+
+  it('reconnects broker scopes with user.<id>.notification once currentUserId is set', () => {
+    const sm = new StateManager();
+    const connect = vi.fn();
+    (sm as unknown as { sseClient: { connect: (s: string[]) => void } }).sseClient.connect =
+      connect;
+
+    sm.setScope({ type: 'brokers-list' });
+    expect(connect).toHaveBeenLastCalledWith(['broker.>']);
+
+    sm.setCurrentUserId('u-3');
+    expect(connect).toHaveBeenLastCalledWith([
+      'broker.>',
+      'user.u-3.chat.>',
+      'user.u-3.notification',
+      'user.u-3.inbox',
+    ]);
   });
 });
 

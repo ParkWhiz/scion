@@ -293,6 +293,9 @@ func (s *Server) buildServerConfigDBResponse(ctx context.Context, ops *Operation
 	// Mask sensitive fields — same logic as file mode.
 	maskSensitiveFields(&resp.ServerConfigResponse)
 
+	// Attach default_user_role fallback warning and eligible custom roles.
+	s.populateDefaultUserRoleView(ctx, &resp.ServerConfigResponse)
+
 	return &resp, nil
 }
 
@@ -346,6 +349,9 @@ func applySnapshotToResponse(resp *ServerConfigResponse, snap Layer1Snapshot) {
 	b := snap.AutoSuspendStalled
 	resp.Server.Hub.AutoSuspendStalled = &b
 	resp.Server.Hub.StalledThreshold = snap.StalledThreshold
+	bIdle := snap.AutoSuspendIdle
+	resp.Server.Hub.AutoSuspendIdle = &bIdle
+	resp.Server.Hub.IdleSuspendAfter = snap.IdleSuspendAfter
 	resp.Server.Hub.SoftDeleteRetention = snap.SoftDeleteRetention
 	resp.Server.Hub.StartClaimLeaseTTL = snap.StartClaimLeaseTTL
 	resp.Server.Hub.StartMaxDuration = snap.StartMaxDuration
@@ -372,6 +378,9 @@ func applySnapshotToResponse(resp *ServerConfigResponse, snap Layer1Snapshot) {
 		}
 	}
 
+	// Branding: saved or bootstrap value; nil when unset.
+	resp.Server.Hub.Branding = snap.Branding.Clone()
+
 	// GitHub App
 	if resp.Server.GitHubApp == nil {
 		resp.Server.GitHubApp = &config.V1GitHubAppConfig{}
@@ -381,6 +390,8 @@ func applySnapshotToResponse(resp *ServerConfigResponse, snap Layer1Snapshot) {
 	resp.Server.GitHubApp.WebhooksEnabled = snap.GitHubWebhooksEnabled
 	resp.Server.GitHubApp.InstallationURL = snap.GitHubInstallationURL
 	resp.Server.GitHubApp.PrivateKeyPath = snap.GitHubPrivateKeyPath
+	resp.Server.GitHubApp.AppSlug = snap.GitHubAppSlug
+	resp.Server.GitHubApp.CommandMentionAliases = slices.Clone(snap.GitHubCommandMentionAliases)
 
 	// Notifications — always set from snapshot so an explicit empty DB
 	// value overrides file-loaded channels.
@@ -404,6 +415,13 @@ func applySnapshotToResponse(resp *ServerConfigResponse, snap Layer1Snapshot) {
 	if snap.AgentSecretsUserScopeOnly != nil {
 		resp.AgentSecrets = &config.AgentSecretsSettings{
 			UserScopeOnly: snap.AgentSecretsUserScopeOnly,
+		}
+	}
+
+	// Broker policy
+	if snap.BrokerPolicyAdminManagedOnly != nil {
+		resp.BrokerPolicy = &config.BrokerPolicySettings{
+			AdminManagedOnly: snap.BrokerPolicyAdminManagedOnly,
 		}
 	}
 
@@ -1447,22 +1465,37 @@ func (s *Server) handlePutServerConfigDB(w http.ResponseWriter, r *http.Request,
 		fp := sectionBodyPresence("access", rawBody)
 		domainsSent := fp.has("authorized_domains") && !echoedRunning[authorizedDomainsKey]
 		adminsSent := fp.has("admin_emails")
+		defaultRoleSent := fp.has("default_user_role")
 		pinned := slices.Contains(ops.EnvOverriddenKeys(), authorizedDomainsKey)
-		if adminsSent || domainsSent {
+		if adminsSent || domainsSent || defaultRoleSent {
 			var merged opsettings.AccessSettings
 			if err := json.Unmarshal(doc, &merged); err != nil {
 				slog.Error("PUT server-config: failed to decode access document", "error", err)
 				writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to build section documents", nil)
 				return
 			}
-			domains, admins := s.accessListsAfterDBSave(merged, false)
-			if s.rejectAuthorizedDomainsLockout(r.Context(), w, updatedBy, domains, admins) {
-				return
+			if defaultRoleSent {
+				storedRole := ops.Snapshot().DefaultUserRole
+				if row, err := ops.store.GetHubSetting(r.Context(), "access"); err == nil && len(bytes.TrimSpace(row.Value)) > 0 {
+					var existing opsettings.AccessSettings
+					if json.Unmarshal(row.Value, &existing) == nil {
+						storedRole = existing.DefaultUserRole
+					}
+				}
+				if !s.validateDefaultUserRoleSave(w, r, merged.DefaultUserRole, storedRole) {
+					return
+				}
 			}
-			if pinned && adminsSent {
-				domains, admins = s.accessListsAfterDBSave(merged, true)
+			if adminsSent || domainsSent {
+				domains, admins := s.accessListsAfterDBSave(merged, false)
 				if s.rejectAuthorizedDomainsLockout(r.Context(), w, updatedBy, domains, admins) {
 					return
+				}
+				if pinned && adminsSent {
+					domains, admins = s.accessListsAfterDBSave(merged, true)
+					if s.rejectAuthorizedDomainsLockout(r.Context(), w, updatedBy, domains, admins) {
+						return
+					}
 				}
 			}
 		}
@@ -1505,6 +1538,30 @@ func (s *Server) handlePutServerConfigDB(w http.ResponseWriter, r *http.Request,
 		mergedBaseRevs["profiles"] = rev
 		if sameAsFilteredBase(doc, base) {
 			noopRevs["profiles"] = rev
+		}
+	}
+
+	// broker_policy.admin_managed_only=true is refused while experiment
+	// hub.admin_managed_brokers is off (412 experiment_disabled; ptone/scion#7829).
+	// Echoing an already-stored true value or clearing it passes.
+	if doc, ok := sectionDocs["broker_policy"]; ok && !s.experimentEnabled(experiments.AdminManagedBrokers) {
+		var candidate opsettings.BrokerPolicySettings
+		if json.Unmarshal(doc, &candidate) == nil && candidate.AdminManagedOnly != nil && *candidate.AdminManagedOnly {
+			storedEnabled := ops.Snapshot().BrokerPolicyAdminManagedOnly != nil && *ops.Snapshot().BrokerPolicyAdminManagedOnly
+			if row, err := ops.store.GetHubSetting(r.Context(), "broker_policy"); err == nil && len(bytes.TrimSpace(row.Value)) > 0 {
+				var existing opsettings.BrokerPolicySettings
+				if json.Unmarshal(row.Value, &existing) == nil {
+					storedEnabled = existing.AdminManagedOnly != nil && *existing.AdminManagedOnly
+				}
+			} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+				slog.Error("PUT server-config: failed to read broker_policy section", "error", err)
+				writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to read existing settings", nil)
+				return
+			}
+			if !storedEnabled {
+				writeBrokerPolicyExperimentDisabled(w)
+				return
+			}
 		}
 	}
 
@@ -1819,6 +1876,17 @@ func (s *Server) handlePutServerConfigDB(w http.ResponseWriter, r *http.Request,
 	if len(allValidationErrors) > 0 {
 		writeSettingsValidation(w, "", sortedSectionValidationEntries(allValidationErrors), nil)
 		return
+	}
+
+	// harness_configs.<name>.args is honoured only by the "generic" harness;
+	// for other harnesses it is saved and ignored, with the same warning as
+	// config validate and settings load (ptone/scion#8532). Checked after
+	// section validation so a rejected save does not log a save warning.
+	if doc, ok := sectionDocs["harness_configs"]; ok {
+		var harnessConfigs opsettings.HarnessConfigsSettings
+		if err := json.Unmarshal(doc, &harnessConfigs); err == nil {
+			saveWarnings = append(saveWarnings, harnessArgsIgnoredSaveWarnings(harnessConfigs)...)
+		}
 	}
 
 	// Workstation: validate and prepare the settings.yaml part before any DB
@@ -2452,6 +2520,10 @@ func extractKoanfKeysFromRequest(req *ServerConfigUpdateRequest) []string {
 		keys = append(keys, "agent_secrets.user_scope_only")
 	}
 
+	if req.BrokerPolicy != nil {
+		keys = append(keys, "broker_policy.admin_managed_only")
+	}
+
 	if req.Telemetry != nil {
 		keys = append(keys, "telemetry.enabled")
 	}
@@ -2522,6 +2594,12 @@ func extractKoanfKeysFromRequest(req *ServerConfigUpdateRequest) []string {
 			if hub.StalledThreshold != "" {
 				keys = append(keys, "server.hub.stalled_threshold")
 			}
+			if hub.AutoSuspendIdle != nil {
+				keys = append(keys, "server.hub.auto_suspend_idle")
+			}
+			if hub.IdleSuspendAfter != "" {
+				keys = append(keys, "server.hub.idle_suspend_after")
+			}
 			if hub.SoftDeleteRetention != "" {
 				keys = append(keys, "server.hub.soft_delete_retention")
 			}
@@ -2581,6 +2659,12 @@ func extractKoanfKeysFromRequest(req *ServerConfigUpdateRequest) []string {
 			}
 			if hub.LaunchKeepaliveSeconds != nil {
 				keys = append(keys, "server.hub.launch_keepalive_seconds")
+			}
+			if hub.AuditRetentionDays != nil {
+				keys = append(keys, "server.hub.audit_retention_days")
+			}
+			if hub.Branding != nil && !hub.Branding.IsZero() {
+				keys = append(keys, config.BrandingSectionKey)
 			}
 		}
 		if srv.Auth != nil {
@@ -2908,6 +2992,10 @@ func buildSingleSectionDoc(req *ServerConfigUpdateRequest, secName string, fp *f
 			if req.Server.Hub.StalledThreshold != "" {
 				d.StalledThreshold = req.Server.Hub.StalledThreshold
 			}
+			d.AutoSuspendIdle = req.Server.Hub.AutoSuspendIdle
+			if req.Server.Hub.IdleSuspendAfter != "" {
+				d.IdleSuspendAfter = req.Server.Hub.IdleSuspendAfter
+			}
 			if req.Server.Hub.SoftDeleteRetention != "" {
 				d.SoftDeleteRetention = req.Server.Hub.SoftDeleteRetention
 			}
@@ -2994,6 +3082,10 @@ func buildSingleSectionDoc(req *ServerConfigUpdateRequest, secName string, fp *f
 			}
 			d.InstallationURL = ga.InstallationURL
 			d.PrivateKeyPath = ga.PrivateKeyPath
+			d.AppSlug = ga.AppSlug
+			if len(ga.CommandMentionAliases) > 0 {
+				d.CommandMentionAliases = slices.Clone(ga.CommandMentionAliases)
+			}
 		}
 		doc = d
 
@@ -3022,9 +3114,25 @@ func buildSingleSectionDoc(req *ServerConfigUpdateRequest, secName string, fp *f
 		}
 		doc = d
 
+	case opsettings.BrandingSectionName:
+		// handlePutServerConfigDB deep-merges this doc on the current row
+		// (bodyMergedSections + deepMergeSections).
+		d := &opsettings.BrandingSettings{}
+		if req.Server != nil && req.Server.Hub != nil && req.Server.Hub.Branding != nil {
+			d.BrandingConfig = req.Server.Hub.Branding.CloneValue()
+		}
+		doc = d
+
 	case "agent_secrets":
 		if req.AgentSecrets != nil {
 			doc = req.AgentSecrets
+		} else {
+			return nil, nil
+		}
+
+	case "broker_policy":
+		if req.BrokerPolicy != nil {
+			doc = req.BrokerPolicy
 		} else {
 			return nil, nil
 		}
@@ -3503,6 +3611,7 @@ var serverConfigTokenSections = map[string]settingsTokenClass{
 	"federation":        settingsTokenRefused,       // trusted external issuers
 	"github_app":        settingsTokenRefused,       // the hub's GitHub App credential
 	"agent_secrets":     settingsTokenRefused,       // which secret scopes agents may write
+	"broker_policy":     settingsTokenRefused,       // which Runtime Brokers may register and run agents
 	"auto_expose_ports": settingsTokenRefused,       // whether agent ports are reachable
 	"runtimes":          settingsTokenRefused,       // where and how agents run
 	"profiles":          settingsTokenRefused,       // runtime, image and environment agents run with
@@ -3517,6 +3626,7 @@ var serverConfigTokenSections = map[string]settingsTokenClass{
 	"telemetry":         settingsTokenConfiguration, // telemetry export
 	"quotas":            settingsTokenConfiguration, // broker quota enforcement switch
 	"hub_observability": settingsTokenRefused,       // where the hub's own metrics and traces go
+	"branding":          settingsTokenRefused,       // unauthenticated /login content, logos, icons and palette
 	"gcp_iam":           settingsTokenRefused,       // service account permission check
 	"notifications":     settingsTokenConfiguration, // notification channels
 	"project_defaults":  settingsTokenConfiguration, // see projectDefaultsTokenKeys

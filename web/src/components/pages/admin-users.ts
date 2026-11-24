@@ -34,10 +34,20 @@ import {
 import '../shared/status-badge.js';
 import '../shared/effective-role-provenance.js';
 import '../shared/effective-access-boundary-notice.js';
+import '../shared/effective-permissions-view.js';
+import type { ScionEffectivePermissionsView } from '../shared/effective-permissions-view.js';
 import '../shared/security-review-dialog.js';
+import { invitedStatusTagStyles } from '../shared/styles.js';
 import { formatRelative } from '../../utils/time.js';
 import { apiFetch, extractApiError, parseApiError } from '../../client/api.js';
-import { isFeatureEnabled, USER_DELETE_FORCE_CASCADE_FLAG } from '../../utils/feature-flags.js';
+import { loadAdminStatus } from '../../client/admin-status.js';
+import { stateManager } from '../../client/state.js';
+import { hasAnyPermission } from '../../lib/admin-permissions.js';
+import {
+  EFFECTIVE_PERMISSIONS_FLAG,
+  isFeatureEnabled,
+  USER_DELETE_FORCE_CASCADE_FLAG,
+} from '../../utils/feature-flags.js';
 import { copyToClipboard, showCopyFailedToast } from '../../utils/clipboard.js';
 
 type SortField = 'name' | 'created';
@@ -343,6 +353,16 @@ export class ScionPageAdminUsers extends LitElement {
   private currentUserId: string | null = null;
 
   @state()
+  private canReadRoleBindings = false;
+
+  /**
+   * Whether the signed-in viewer holds `user.invite` (from `/api/v1/auth/admin-status`).
+   * Gates user invite controls and the Invite Codes tab, failing closed until verified.
+   */
+  @state()
+  private canInviteUsers = false;
+
+  @state()
   private confirmAction: ConfirmAction | null = null;
 
   @state()
@@ -427,6 +447,10 @@ export class ScionPageAdminUsers extends LitElement {
   @state()
   private viewRolesUser: AdminUser | null = null;
 
+  /** Active tab inside the Roles dialog. */
+  @state()
+  private viewRolesActiveTab: 'roles' | 'permissions' = 'roles';
+
   // Security review dialog state
   @state()
   private securityReviewDetail: SecurityReviewDetail | null = null;
@@ -444,593 +468,598 @@ export class ScionPageAdminUsers extends LitElement {
   /** Counts deletion panel sessions: each open, close and page removal starts a new one. */
   private deletionPanelSession = 0;
 
-  static override styles = css`
-    :host {
-      display: block;
-    }
-
-    .header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 1.5rem;
-    }
-
-    .header h1 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      color: var(--scion-text, #1e293b);
-      margin: 0;
-    }
-
-    .user-count {
-      font-size: 0.875rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .table-container {
-      background: var(--scion-surface, #ffffff);
-      border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-      overflow: hidden;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    th {
-      text-align: left;
-      padding: 0.75rem 1rem;
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--scion-text-muted, #64748b);
-      background: var(--scion-bg-subtle, #f1f5f9);
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-    }
-
-    th.sortable {
-      cursor: pointer;
-      user-select: none;
-    }
-
-    th.sortable:hover {
-      color: var(--scion-text, #1e293b);
-    }
-
-    .sort-indicator {
-      display: inline-block;
-      margin-left: 0.25rem;
-      font-size: 0.625rem;
-      vertical-align: middle;
-      opacity: 0.4;
-    }
-
-    th.sorted .sort-indicator {
-      opacity: 1;
-    }
-
-    td {
-      padding: 0.75rem 1rem;
-      font-size: 0.875rem;
-      color: var(--scion-text, #1e293b);
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-      vertical-align: middle;
-    }
-
-    tr:last-child td {
-      border-bottom: none;
-    }
-
-    tr:hover td {
-      background: var(--scion-bg-subtle, #f1f5f9);
-    }
-
-    .user-identity {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-    }
-
-    .user-avatar {
-      width: 2rem;
-      height: 2rem;
-      border-radius: 50%;
-      background: var(--scion-primary, #3b82f6);
-      color: white;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 0.75rem;
-      font-weight: 600;
-      flex-shrink: 0;
-      overflow: hidden;
-    }
-
-    .user-avatar img {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }
-
-    .user-avatar.invited {
-      background: var(--sl-color-primary-200, #bfdbfe);
-      color: var(--sl-color-primary-700, #1d4ed8);
-    }
-
-    .user-info {
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
-    }
-
-    .user-name {
-      font-weight: 500;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .user-email {
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .user-invited-by {
-      font-size: 0.6875rem;
-      color: var(--scion-text-muted, #64748b);
-      font-style: italic;
-    }
-
-    .role-badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 500;
-    }
-
-    .role-badge.admin {
-      background: var(--sl-color-warning-100, #fef3c7);
-      color: var(--sl-color-warning-700, #a16207);
-    }
-
-    .role-badge.member {
-      background: var(--sl-color-primary-100, #dbeafe);
-      color: var(--sl-color-primary-700, #1d4ed8);
-    }
-
-    .role-badge.viewer {
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .status-badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 500;
-    }
-
-    .status-badge.active {
-      background: var(--sl-color-success-100, #dcfce7);
-      color: var(--sl-color-success-700, #15803d);
-    }
-
-    .status-badge.invited {
-      background: var(--sl-color-primary-100, #dbeafe);
-      color: var(--sl-color-primary-700, #1d4ed8);
-      border: 1px solid var(--sl-color-primary-200, #bfdbfe);
-    }
-
-    .status-badge.suspended {
-      background: var(--sl-color-danger-100, #fee2e2);
-      color: var(--sl-color-danger-700, #b91c1c);
-    }
-
-    .status-badge.deleting {
-      background: var(--sl-color-warning-100, #fef3c7);
-      color: var(--sl-color-warning-700, #b45309);
-    }
-
-    .deletion-summary {
-      margin: 0 0 0.75rem;
-    }
-
-    .deletion-agents {
-      margin: 0.25rem 0 0.75rem;
-      padding-left: 1.25rem;
-    }
-
-    .deletion-outcome,
-    .deletion-error {
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .deletion-outcome.failed,
-    .deletion-error.failed {
-      color: var(--sl-color-danger-700, #b91c1c);
-    }
-
-    .status-cell {
-      display: flex;
-      flex-direction: column;
-      gap: 0.125rem;
-    }
-
-    .status-dot {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.375rem;
-      font-size: 0.8125rem;
-    }
-
-    .status-dot::before {
-      content: '';
-      width: 0.5rem;
-      height: 0.5rem;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-
-    .status-dot.active::before {
-      background: var(--sl-color-success-500, #22c55e);
-    }
-
-    .status-dot.suspended::before {
-      background: var(--sl-color-danger-500, #ef4444);
-    }
-
-    .last-seen-text {
-      font-size: 0.6875rem;
-      color: var(--scion-text-muted, #64748b);
-      padding-left: 0.875rem;
-    }
-
-    .meta-text {
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .role-pending {
-      font-size: 0.75rem;
-      font-style: italic;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .invite-role-hint {
-      margin: 0;
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .id-text {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.75rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .empty-state {
-      text-align: center;
-      padding: 4rem 2rem;
-      background: var(--scion-surface, #ffffff);
-      border: 1px dashed var(--scion-border, #e2e8f0);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-    }
-
-    .empty-state > sl-icon {
-      font-size: 4rem;
-      color: var(--scion-text-muted, #64748b);
-      opacity: 0.5;
-      margin-bottom: 1rem;
-    }
-
-    .empty-state h2 {
-      font-size: 1.25rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.5rem 0;
-    }
-
-    .empty-state p {
-      color: var(--scion-text-muted, #64748b);
-      margin: 0;
-    }
-
-    .loading-state {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 4rem 2rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .loading-state sl-spinner {
-      font-size: 2rem;
-      margin-bottom: 1rem;
-    }
-
-    .error-state {
-      text-align: center;
-      padding: 3rem 2rem;
-      background: var(--scion-surface, #ffffff);
-      border: 1px solid var(--sl-color-danger-200, #fecaca);
-      border-radius: var(--scion-radius-lg, 0.75rem);
-    }
-
-    .error-state sl-icon {
-      font-size: 3rem;
-      color: var(--sl-color-danger-500, #ef4444);
-      margin-bottom: 1rem;
-    }
-
-    .error-state h2 {
-      font-size: 1.25rem;
-      font-weight: 600;
-      color: var(--scion-text, #1e293b);
-      margin: 0 0 0.5rem 0;
-    }
-
-    .error-state p {
-      color: var(--scion-text-muted, #64748b);
-      margin: 0 0 1rem 0;
-    }
-
-    .error-details {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.875rem;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      padding: 0.75rem 1rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      color: var(--sl-color-danger-700, #b91c1c);
-      margin-bottom: 1rem;
-    }
-
-    .pagination {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.75rem 1rem;
-      border-top: 1px solid var(--scion-border, #e2e8f0);
-      background: var(--scion-bg-subtle, #f1f5f9);
-    }
-
-    .pagination-info {
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .pagination-controls {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .pagination-controls sl-button::part(base) {
-      font-size: 0.8125rem;
-    }
-
-    .page-indicator {
-      font-size: 0.8125rem;
-      color: var(--scion-text-muted, #64748b);
-      padding: 0 0.5rem;
-    }
-
-    .actions-cell {
-      text-align: right;
-      width: 3rem;
-    }
-
-    sl-dropdown sl-button::part(base) {
-      padding: 0.25rem;
-      min-height: unset;
-    }
-
-    sl-menu-item::part(base) {
-      font-size: 0.8125rem;
-    }
-
-    sl-menu-item sl-icon {
-      font-size: 1rem;
-    }
-
-    .menu-item-danger::part(base) {
-      color: var(--sl-color-danger-600, #dc2626);
-    }
-
-    .menu-item-danger::part(base):hover {
-      background: var(--sl-color-danger-50, #fef2f2);
-    }
-
-    .confirm-body {
-      font-size: 0.875rem;
-      line-height: 1.5;
-      color: var(--scion-text, #1e293b);
-    }
-
-    .delete-blockers ul {
-      margin: 0.25rem 0 0.75rem;
-      padding-left: 1.25rem;
-    }
-
-    .delete-blockers-heading {
-      font-weight: 600;
-    }
-
-    .delete-blockers-state,
-    .delete-blockers-more {
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .confirm-user {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      padding: 0.75rem;
-      margin: 0.75rem 0;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      border-radius: var(--scion-radius, 0.5rem);
-    }
-
-    .feedback-alert {
-      margin-bottom: 1rem;
-    }
-
-    .tabs {
-      display: flex;
-      gap: 0;
-      border-bottom: 1px solid var(--scion-border, #e2e8f0);
-      margin-bottom: 1.5rem;
-    }
-
-    .tab-btn {
-      padding: 0.625rem 1.25rem;
-      font-size: 0.875rem;
-      font-weight: 500;
-      color: var(--scion-text-muted, #64748b);
-      background: none;
-      border: none;
-      border-bottom: 2px solid transparent;
-      cursor: pointer;
-      transition:
-        color 0.15s,
-        border-color 0.15s;
-    }
-
-    .tab-btn:hover {
-      color: var(--scion-text, #1e293b);
-    }
-
-    .tab-btn.active {
-      color: var(--scion-primary, #3b82f6);
-      border-bottom-color: var(--scion-primary, #3b82f6);
-    }
-
-    .users-toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 1rem;
-      flex-wrap: wrap;
-      gap: 0.5rem;
-    }
-
-    .users-toolbar-left {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .users-toolbar-right {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .invite-form {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-
-    .invite-status {
-      display: inline-flex;
-      align-items: center;
-      padding: 0.125rem 0.5rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 500;
-    }
-
-    .invite-status.active {
-      background: var(--sl-color-success-100, #dcfce7);
-      color: var(--sl-color-success-700, #15803d);
-    }
-
-    .invite-status.expired {
-      background: var(--scion-bg-subtle, #f1f5f9);
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    .invite-status.revoked {
-      background: var(--sl-color-danger-100, #fee2e2);
-      color: var(--sl-color-danger-700, #b91c1c);
-    }
-
-    .invite-status.exhausted {
-      background: var(--sl-color-warning-100, #fef3c7);
-      color: var(--sl-color-warning-700, #a16207);
-    }
-
-    .create-invite-form {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-
-    .reveal-code {
-      display: flex;
-      flex-direction: column;
-      gap: 1rem;
-    }
-
-    .reveal-code .code-display {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.8125rem;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      padding: 0.75rem 1rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      word-break: break-all;
-      user-select: all;
-    }
-
-    .reveal-code .link-display {
-      font-family: var(--scion-font-mono, monospace);
-      font-size: 0.75rem;
-      background: var(--scion-bg-subtle, #f1f5f9);
-      padding: 0.75rem 1rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      word-break: break-all;
-      user-select: all;
-    }
-
-    .reveal-warning {
-      font-size: 0.8125rem;
-      color: var(--sl-color-warning-700, #a16207);
-      background: var(--sl-color-warning-50, #fffbeb);
-      padding: 0.5rem 0.75rem;
-      border-radius: var(--scion-radius, 0.5rem);
-      border: 1px solid var(--sl-color-warning-200, #fde68a);
-    }
-
-    .invites-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 1rem;
-    }
-
-    .invites-header span {
-      font-size: 0.875rem;
-      color: var(--scion-text-muted, #64748b);
-    }
-
-    @media (max-width: 768px) {
-      .hide-mobile {
-        display: none;
+  static override styles = [
+    invitedStatusTagStyles,
+    css`
+      :host {
+        display: block;
       }
-    }
-  `;
+
+      .header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1.5rem;
+      }
+
+      .header h1 {
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: var(--scion-text, #1e293b);
+        margin: 0;
+      }
+
+      .user-count {
+        font-size: 0.875rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .table-container {
+        background: var(--scion-surface, #ffffff);
+        border: 1px solid var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+        overflow: hidden;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th {
+        text-align: left;
+        padding: 0.75rem 1rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--scion-text-muted, #64748b);
+        background: var(--scion-bg-subtle, #f1f5f9);
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      }
+
+      th.sortable {
+        cursor: pointer;
+        user-select: none;
+      }
+
+      th.sortable:hover {
+        color: var(--scion-text, #1e293b);
+      }
+
+      .sort-indicator {
+        display: inline-block;
+        margin-left: 0.25rem;
+        font-size: 0.625rem;
+        vertical-align: middle;
+        opacity: 0.4;
+      }
+
+      th.sorted .sort-indicator {
+        opacity: 1;
+      }
+
+      td {
+        padding: 0.75rem 1rem;
+        font-size: 0.875rem;
+        color: var(--scion-text, #1e293b);
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+        vertical-align: middle;
+      }
+
+      tr:last-child td {
+        border-bottom: none;
+      }
+
+      tr:hover td {
+        background: var(--scion-bg-subtle, #f1f5f9);
+      }
+
+      .user-identity {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+
+      .user-avatar {
+        width: 2rem;
+        height: 2rem;
+        border-radius: 50%;
+        background: var(--scion-primary, #3b82f6);
+        color: var(--scion-primary-text, #ffffff);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.75rem;
+        font-weight: 600;
+        flex-shrink: 0;
+        overflow: hidden;
+      }
+
+      .user-avatar img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .user-avatar.invited {
+        background: var(--sl-color-primary-200, #bfdbfe);
+        color: var(--sl-color-primary-700, #1d4ed8);
+      }
+
+      .user-info {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+
+      .user-name {
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .user-email {
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .user-invited-by {
+        font-size: 0.6875rem;
+        color: var(--scion-text-muted, #64748b);
+        font-style: italic;
+      }
+
+      .role-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .role-badge.admin {
+        background: var(--sl-color-warning-100, #fef3c7);
+        color: var(--sl-color-warning-700, #a16207);
+      }
+
+      .role-badge.member {
+        background: var(--sl-color-primary-100, #dbeafe);
+        color: var(--sl-color-primary-700, #1d4ed8);
+      }
+
+      .role-badge.viewer {
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .status-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .status-badge.active {
+        background: var(--sl-color-success-100, #dcfce7);
+        color: var(--sl-color-success-700, #15803d);
+      }
+
+      .status-badge.suspended {
+        background: var(--sl-color-danger-100, #fee2e2);
+        color: var(--sl-color-danger-700, #b91c1c);
+      }
+
+      .status-badge.deleting {
+        background: var(--sl-color-warning-100, #fef3c7);
+        color: var(--sl-color-warning-700, #b45309);
+      }
+
+      .deletion-summary {
+        margin: 0 0 0.75rem;
+      }
+
+      .deletion-agents {
+        margin: 0.25rem 0 0.75rem;
+        padding-left: 1.25rem;
+      }
+
+      .deletion-outcome,
+      .deletion-error {
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .deletion-outcome.failed,
+      .deletion-error.failed {
+        color: var(--sl-color-danger-700, #b91c1c);
+      }
+
+      .status-cell {
+        display: flex;
+        flex-direction: column;
+        gap: 0.125rem;
+      }
+
+      .status-dot {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+        font-size: 0.8125rem;
+      }
+
+      .status-dot::before {
+        content: '';
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+
+      .status-dot.active::before {
+        background: var(--sl-color-success-500, #22c55e);
+      }
+
+      .status-dot.suspended::before {
+        background: var(--sl-color-danger-500, #ef4444);
+      }
+
+      .last-seen-text {
+        font-size: 0.6875rem;
+        color: var(--scion-text-muted, #64748b);
+        padding-left: 0.875rem;
+      }
+
+      .meta-text {
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .role-pending {
+        font-size: 0.75rem;
+        font-style: italic;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .invite-role-hint {
+        margin: 0;
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .id-text {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .empty-state {
+        text-align: center;
+        padding: 4rem 2rem;
+        background: var(--scion-surface, #ffffff);
+        border: 1px dashed var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+      }
+
+      .empty-state > sl-icon {
+        font-size: 4rem;
+        color: var(--scion-text-muted, #64748b);
+        opacity: 0.5;
+        margin-bottom: 1rem;
+      }
+
+      .empty-state h2 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.5rem 0;
+      }
+
+      .empty-state p {
+        color: var(--scion-text-muted, #64748b);
+        margin: 0;
+      }
+
+      .loading-state {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 4rem 2rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .loading-state sl-spinner {
+        font-size: 2rem;
+        margin-bottom: 1rem;
+      }
+
+      .error-state {
+        text-align: center;
+        padding: 3rem 2rem;
+        background: var(--scion-surface, #ffffff);
+        border: 1px solid var(--sl-color-danger-200, #fecaca);
+        border-radius: var(--scion-radius-lg, 0.75rem);
+      }
+
+      .error-state sl-icon {
+        font-size: 3rem;
+        color: var(--sl-color-danger-500, #ef4444);
+        margin-bottom: 1rem;
+      }
+
+      .error-state h2 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: var(--scion-text, #1e293b);
+        margin: 0 0 0.5rem 0;
+      }
+
+      .error-state p {
+        color: var(--scion-text-muted, #64748b);
+        margin: 0 0 1rem 0;
+      }
+
+      .error-details {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.875rem;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        padding: 0.75rem 1rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        color: var(--sl-color-danger-700, #b91c1c);
+        margin-bottom: 1rem;
+      }
+
+      .pagination {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.75rem 1rem;
+        border-top: 1px solid var(--scion-border, #e2e8f0);
+        background: var(--scion-bg-subtle, #f1f5f9);
+      }
+
+      .pagination-info {
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .pagination-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .pagination-controls sl-button::part(base) {
+        font-size: 0.8125rem;
+      }
+
+      .page-indicator {
+        font-size: 0.8125rem;
+        color: var(--scion-text-muted, #64748b);
+        padding: 0 0.5rem;
+      }
+
+      .actions-cell {
+        text-align: right;
+        width: 3rem;
+      }
+
+      sl-dropdown sl-button::part(base) {
+        padding: 0.25rem;
+        min-height: unset;
+      }
+
+      sl-menu-item::part(base) {
+        font-size: 0.8125rem;
+      }
+
+      sl-menu-item sl-icon {
+        font-size: 1rem;
+      }
+
+      .menu-item-danger::part(base) {
+        color: var(--sl-color-danger-600, #dc2626);
+      }
+
+      .menu-item-danger::part(base):hover {
+        background: var(--sl-color-danger-50, #fef2f2);
+      }
+
+      .confirm-body {
+        font-size: 0.875rem;
+        line-height: 1.5;
+        color: var(--scion-text, #1e293b);
+      }
+
+      .delete-blockers ul {
+        margin: 0.25rem 0 0.75rem;
+        padding-left: 1.25rem;
+      }
+
+      .delete-blockers-heading {
+        font-weight: 600;
+      }
+
+      .delete-blockers-state,
+      .delete-blockers-more {
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .confirm-user {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem;
+        margin: 0.75rem 0;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        border-radius: var(--scion-radius, 0.5rem);
+      }
+
+      .feedback-alert {
+        margin-bottom: 1rem;
+      }
+
+      .tabs {
+        display: flex;
+        gap: 0;
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+        margin-bottom: 1.5rem;
+      }
+
+      .tab-btn {
+        padding: 0.625rem 1.25rem;
+        font-size: 0.875rem;
+        font-weight: 500;
+        color: var(--scion-text-muted, #64748b);
+        background: none;
+        border: none;
+        border-bottom: 2px solid transparent;
+        cursor: pointer;
+        transition:
+          color 0.15s,
+          border-color 0.15s;
+      }
+
+      .tab-btn:hover {
+        color: var(--scion-text, #1e293b);
+      }
+
+      .tab-btn.active {
+        color: var(--scion-primary, #3b82f6);
+        border-bottom-color: var(--scion-primary, #3b82f6);
+      }
+
+      .users-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1rem;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+
+      .users-toolbar-left {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .users-toolbar-right {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .invite-form {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .invite-status {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .invite-status.active {
+        background: var(--sl-color-success-100, #dcfce7);
+        color: var(--sl-color-success-700, #15803d);
+      }
+
+      .invite-status.expired {
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .invite-status.revoked {
+        background: var(--sl-color-danger-100, #fee2e2);
+        color: var(--sl-color-danger-700, #b91c1c);
+      }
+
+      .invite-status.exhausted {
+        background: var(--sl-color-warning-100, #fef3c7);
+        color: var(--sl-color-warning-700, #a16207);
+      }
+
+      .create-invite-form {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .reveal-code {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .reveal-code .code-display {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.8125rem;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        padding: 0.75rem 1rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        word-break: break-all;
+        user-select: all;
+      }
+
+      .reveal-code .link-display {
+        font-family: var(--scion-font-mono, monospace);
+        font-size: 0.75rem;
+        background: var(--scion-bg-subtle, #f1f5f9);
+        padding: 0.75rem 1rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        word-break: break-all;
+        user-select: all;
+      }
+
+      .reveal-warning {
+        font-size: 0.8125rem;
+        color: var(--sl-color-warning-700, #a16207);
+        background: var(--sl-color-warning-50, #fffbeb);
+        padding: 0.5rem 0.75rem;
+        border-radius: var(--scion-radius, 0.5rem);
+        border: 1px solid var(--sl-color-warning-200, #fde68a);
+      }
+
+      .invites-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1rem;
+      }
+
+      .invites-header span {
+        font-size: 0.875rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .roles-dialog sl-tab-group {
+        --indicator-color: var(--scion-primary, #3b82f6);
+      }
+
+      .roles-dialog sl-tab-group::part(body) {
+        padding-top: 1rem;
+      }
+
+      @media (max-width: 768px) {
+        .hide-mobile {
+          display: none;
+        }
+      }
+    `,
+  ];
 
   override connectedCallback(): void {
     super.connectedCallback();
@@ -1046,14 +1075,43 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private async loadCurrentUser(): Promise<void> {
+    const knownUserId = stateManager.getCurrentUserId();
+    if (knownUserId) {
+      this.currentUserId = knownUserId;
+      void this.loadInvitePermission(knownUserId);
+    }
     try {
       const res = await apiFetch('/auth/me');
       if (res.ok) {
         const data = (await res.json()) as { id?: string };
-        this.currentUserId = data.id || null;
+        const userId = data.id || null;
+        this.currentUserId = userId;
+        if (userId && userId !== knownUserId) {
+          void this.loadInvitePermission(userId);
+        } else if (!userId) {
+          this.canInviteUsers = false;
+          if (this.activeTab === 'invites') {
+            this.activeTab = 'users';
+          }
+        }
       }
     } catch {
       // Non-critical — actions will still work, just can't prevent self-actions
+    }
+    try {
+      const status = await loadAdminStatus(this.currentUserId || stateManager.getCurrentUserId());
+      this.canReadRoleBindings = hasAnyPermission(status, ['role_binding.read']);
+    } catch {
+      this.canReadRoleBindings = false;
+    }
+  }
+
+  private async loadInvitePermission(userId: string): Promise<void> {
+    const status = await loadAdminStatus(userId);
+    if (!this.isConnected || userId !== this.currentUserId) return;
+    this.canInviteUsers = hasAnyPermission(status, ['user.invite']);
+    if (!this.canInviteUsers && this.activeTab === 'invites') {
+      this.activeTab = 'users';
     }
   }
 
@@ -1374,6 +1432,11 @@ export class ScionPageAdminUsers extends LitElement {
   /** Whether the hub offers the forced delete (presentation only). */
   private forceDeleteEnabled(): boolean {
     return isFeatureEnabled(USER_DELETE_FORCE_CASCADE_FLAG);
+  }
+
+  /** Whether the hub offers the Effective permissions tab (presentation only). */
+  private effectivePermissionsEnabled(): boolean {
+    return isFeatureEnabled(EFFECTIVE_PERMISSIONS_FLAG);
   }
 
   /**
@@ -1934,6 +1997,7 @@ export class ScionPageAdminUsers extends LitElement {
   // ==================== Invite Codes Tab ====================
 
   private async loadInvites(): Promise<void> {
+    if (!this.canInviteUsers) return;
     this.invitesLoading = true;
     try {
       const response = await apiFetch('/api/v1/admin/invites');
@@ -2055,6 +2119,9 @@ export class ScionPageAdminUsers extends LitElement {
   // ==================== Render Methods ====================
 
   override render() {
+    const activeTab: AdminTab =
+      this.activeTab === 'invites' && this.canInviteUsers ? 'invites' : 'users';
+
     return html`
       <div class="header">
         <h1>Users</h1>
@@ -2065,30 +2132,34 @@ export class ScionPageAdminUsers extends LitElement {
       <div class="tabs" role="tablist">
         <button
           role="tab"
-          aria-selected=${this.activeTab === 'users'}
+          aria-selected=${activeTab === 'users'}
           aria-controls="panel-users"
-          class="tab-btn ${this.activeTab === 'users' ? 'active' : ''}"
+          class="tab-btn ${activeTab === 'users' ? 'active' : ''}"
           @click=${() => {
             this.activeTab = 'users';
           }}
         >
           Users ${!this.loading ? `(${this.tabCount})` : ''}
         </button>
-        <button
-          role="tab"
-          aria-selected=${this.activeTab === 'invites'}
-          aria-controls="panel-invites"
-          class="tab-btn ${this.activeTab === 'invites' ? 'active' : ''}"
-          @click=${() => {
-            this.activeTab = 'invites';
-            void this.loadInvites();
-          }}
-        >
-          Invite Codes ${this.invitesTotalCount > 0 ? `(${this.invitesTotalCount})` : ''}
-        </button>
+        ${this.canInviteUsers
+          ? html`
+              <button
+                role="tab"
+                aria-selected=${activeTab === 'invites'}
+                aria-controls="panel-invites"
+                class="tab-btn ${activeTab === 'invites' ? 'active' : ''}"
+                @click=${() => {
+                  this.activeTab = 'invites';
+                  void this.loadInvites();
+                }}
+              >
+                Invite Codes ${this.invitesTotalCount > 0 ? `(${this.invitesTotalCount})` : ''}
+              </button>
+            `
+          : nothing}
       </div>
 
-      ${this.activeTab === 'users'
+      ${activeTab === 'users'
         ? this.loading
           ? this.renderLoading()
           : this.error
@@ -2185,17 +2256,25 @@ export class ScionPageAdminUsers extends LitElement {
         <div class="empty-state">
           <sl-icon name="people"></sl-icon>
           <h2>No Users Found</h2>
-          <p>There are no users registered in the system. Invite users to get started.</p>
-          <sl-button
-            variant="primary"
-            style="margin-top: 1rem"
-            @click=${() => {
-              this.showInviteUserDialog = true;
-            }}
-          >
-            <sl-icon slot="prefix" name="person-plus"></sl-icon>
-            Invite User
-          </sl-button>
+          <p>
+            ${this.canInviteUsers
+              ? 'There are no users registered in the system. Invite users to get started.'
+              : 'There are no users registered in the system.'}
+          </p>
+          ${this.canInviteUsers
+            ? html`
+                <sl-button
+                  variant="primary"
+                  style="margin-top: 1rem"
+                  @click=${() => {
+                    this.showInviteUserDialog = true;
+                  }}
+                >
+                  <sl-icon slot="prefix" name="person-plus"></sl-icon>
+                  Invite User
+                </sl-button>
+              `
+            : nothing}
         </div>
       `;
     }
@@ -2208,28 +2287,32 @@ export class ScionPageAdminUsers extends LitElement {
           ${this.renderStatusFilter()} ${this.renderRoleFilter()}
           <span class="meta-text user-count">${this.displayedCount}</span>
         </div>
-        <div class="users-toolbar-right">
-          <sl-button
-            size="small"
-            variant="default"
-            @click=${() => {
-              this.showImportDialog = true;
-            }}
-          >
-            <sl-icon slot="prefix" name="upload"></sl-icon>
-            Import CSV
-          </sl-button>
-          <sl-button
-            size="small"
-            variant="primary"
-            @click=${() => {
-              this.showInviteUserDialog = true;
-            }}
-          >
-            <sl-icon slot="prefix" name="person-plus"></sl-icon>
-            Invite User
-          </sl-button>
-        </div>
+        ${this.canInviteUsers
+          ? html`
+              <div class="users-toolbar-right">
+                <sl-button
+                  size="small"
+                  variant="default"
+                  @click=${() => {
+                    this.showImportDialog = true;
+                  }}
+                >
+                  <sl-icon slot="prefix" name="upload"></sl-icon>
+                  Import CSV
+                </sl-button>
+                <sl-button
+                  size="small"
+                  variant="primary"
+                  @click=${() => {
+                    this.showInviteUserDialog = true;
+                  }}
+                >
+                  <sl-icon slot="prefix" name="person-plus"></sl-icon>
+                  Invite User
+                </sl-button>
+              </div>
+            `
+          : nothing}
       </div>
 
       ${this.users.length === 0
@@ -2371,66 +2454,104 @@ export class ScionPageAdminUsers extends LitElement {
         <td class="hide-mobile">
           <span class="meta-text">${this.formatRelativeTime(user.created)}</span>
         </td>
-        <td class="actions-cell">${self ? nothing : this.renderUserActions(user)}</td>
+        <td class="actions-cell">${this.renderUserActions(user, self)}</td>
       </tr>
     `;
   }
 
-  private renderUserActions(user: AdminUser) {
+  private renderRolesMenuItem(user: AdminUser) {
+    return html`
+      <sl-menu-item
+        @click=${() => {
+          this.viewRolesActiveTab = 'roles';
+          this.viewRolesUser = user;
+        }}
+      >
+        <sl-icon slot="prefix" name="shield"></sl-icon>
+        Roles
+      </sl-menu-item>
+    `;
+  }
+
+  private renderUserActions(user: AdminUser, self = false) {
+    const canViewRoles = this.canReadRoleBindings;
+
+    if (self) {
+      if (!canViewRoles) return nothing;
+      return html`
+        <sl-dropdown placement="bottom-end" hoist>
+          <sl-button slot="trigger" size="small" variant="text" caret>
+            <sl-icon name="three-dots-vertical"></sl-icon>
+          </sl-button>
+          <sl-menu> ${this.renderRolesMenuItem(user)} </sl-menu>
+        </sl-dropdown>
+      `;
+    }
+
     const caps = user._capabilities;
     const canPromote = can(caps, 'promote');
     const canSuspend = can(caps, 'suspend');
     const canDelete = can(caps, 'delete');
 
     if (user.status === 'invited') {
-      // Invited users: only Remove action (requires delete capability). No
-      // Change role: the role is assigned at first sign-in (PATCH role → 409).
-      if (!canDelete) return nothing;
+      // Invited users: Roles (when role_binding.read) and Remove (requires delete
+      // capability). No Change role: the role is assigned at first sign-in (PATCH role → 409).
+      if (!canViewRoles && !canDelete) return nothing;
       return html`
         <sl-dropdown placement="bottom-end" hoist>
           <sl-button slot="trigger" size="small" variant="text" caret>
             <sl-icon name="three-dots-vertical"></sl-icon>
           </sl-button>
           <sl-menu>
-            <sl-menu-item class="menu-item-danger" @click=${() => this.promptDelete(user)}>
-              <sl-icon slot="prefix" name="trash"></sl-icon>
-              Remove
-            </sl-menu-item>
+            ${canViewRoles ? this.renderRolesMenuItem(user) : nothing}
+            ${canViewRoles && canDelete ? html`<sl-divider></sl-divider>` : nothing}
+            ${canDelete
+              ? html`<sl-menu-item class="menu-item-danger" @click=${() => this.promptDelete(user)}>
+                  <sl-icon slot="prefix" name="trash"></sl-icon>
+                  Remove
+                </sl-menu-item>`
+              : nothing}
           </sl-menu>
         </sl-dropdown>
       `;
     }
 
     if (user.status === 'deleting') {
-      // A forced deletion is in progress: only its status (requires delete).
-      if (!canDelete) return nothing;
+      // A forced deletion is in progress: Roles (when role_binding.read) and deletion status (requires delete).
+      if (!canViewRoles && !canDelete) return nothing;
       return html`
         <sl-dropdown placement="bottom-end" hoist>
           <sl-button slot="trigger" size="small" variant="text" caret>
             <sl-icon name="three-dots-vertical"></sl-icon>
           </sl-button>
           <sl-menu>
-            <sl-menu-item
-              class="menu-item-deletion"
-              @click=${() => void this.openDeletionPanel(user)}
-            >
-              <sl-icon slot="prefix" name="hourglass-split"></sl-icon>
-              Deletion status
-            </sl-menu-item>
+            ${canViewRoles ? this.renderRolesMenuItem(user) : nothing}
+            ${canViewRoles && canDelete ? html`<sl-divider></sl-divider>` : nothing}
+            ${canDelete
+              ? html`<sl-menu-item
+                  class="menu-item-deletion"
+                  @click=${() => void this.openDeletionPanel(user)}
+                >
+                  <sl-icon slot="prefix" name="hourglass-split"></sl-icon>
+                  Deletion status
+                </sl-menu-item>`
+              : nothing}
           </sl-menu>
         </sl-dropdown>
       `;
     }
 
     if (user.status === 'suspended') {
-      // Suspended users: Reactivate (requires suspend), Delete (requires delete)
-      if (!canSuspend && !canDelete) return nothing;
+      // Suspended users: Roles (when role_binding.read), Reactivate (requires suspend), Delete (requires delete)
+      if (!canViewRoles && !canSuspend && !canDelete) return nothing;
       return html`
         <sl-dropdown placement="bottom-end" hoist>
           <sl-button slot="trigger" size="small" variant="text" caret>
             <sl-icon name="three-dots-vertical"></sl-icon>
           </sl-button>
           <sl-menu>
+            ${canViewRoles ? this.renderRolesMenuItem(user) : nothing}
+            ${canViewRoles && (canSuspend || canDelete) ? html`<sl-divider></sl-divider>` : nothing}
             ${canSuspend
               ? html`<sl-menu-item @click=${() => this.promptToggleSuspend(user)}>
                   <sl-icon slot="prefix" name="check-circle"></sl-icon>
@@ -2449,28 +2570,18 @@ export class ScionPageAdminUsers extends LitElement {
       `;
     }
 
-    // Active users: View Roles, Change role, Suspend, Delete
-    // — each action gated by its capability. View Roles requires at least
-    // one admin-level capability since the role-bindings endpoint requires
-    // admin access (R4-R1: don't show dead controls to regular members).
-    const canUpdate = can(caps, 'update');
-    const hasAnyAdminAction = canPromote || canSuspend || canDelete || canUpdate;
-    if (!hasAnyAdminAction) return nothing;
+    // Active users: Roles (gated on role_binding.read independently of user.*),
+    // Change role, Suspend, Delete — each gated by its capability.
+    const hasOtherActions = canPromote || canSuspend || canDelete;
+    if (!canViewRoles && !hasOtherActions) return nothing;
     return html`
       <sl-dropdown placement="bottom-end" hoist>
         <sl-button slot="trigger" size="small" variant="text" caret>
           <sl-icon name="three-dots-vertical"></sl-icon>
         </sl-button>
         <sl-menu>
-          <sl-menu-item
-            @click=${() => {
-              this.viewRolesUser = user;
-            }}
-          >
-            <sl-icon slot="prefix" name="shield"></sl-icon>
-            View Roles
-          </sl-menu-item>
-          ${canPromote || canSuspend || canDelete ? html`<sl-divider></sl-divider>` : nothing}
+          ${canViewRoles ? this.renderRolesMenuItem(user) : nothing}
+          ${canViewRoles && hasOtherActions ? html`<sl-divider></sl-divider>` : nothing}
           ${canPromote ? this.renderChangeRoleMenu(user) : nothing}
           ${canSuspend
             ? html`${canPromote ? html`<sl-divider></sl-divider>` : nothing}
@@ -2728,7 +2839,7 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private renderInviteUserDialog() {
-    if (!this.showInviteUserDialog) return nothing;
+    if (!this.showInviteUserDialog || !this.canInviteUsers) return nothing;
 
     return html`
       <sl-dialog
@@ -2793,7 +2904,7 @@ export class ScionPageAdminUsers extends LitElement {
   }
 
   private renderImportDialog() {
-    if (!this.showImportDialog) return nothing;
+    if (!this.showImportDialog || !this.canInviteUsers) return nothing;
     return html`
       <sl-dialog
         label="Import Users from CSV"
@@ -3040,29 +3151,99 @@ export class ScionPageAdminUsers extends LitElement {
   private renderViewRolesDialog() {
     if (!this.viewRolesUser) return nothing;
     const user = this.viewRolesUser;
+    const showEffectivePermissions = this.effectivePermissionsEnabled();
     return html`
       <sl-dialog
-        label="Effective Roles — ${user.displayName || user.email}"
+        class="roles-dialog"
+        label="Roles — ${user.displayName || user.email}"
         open
-        style="--width: 36rem;"
-        @sl-request-close=${() => {
+        style="--width: 48rem;"
+        @sl-request-close=${(e: Event) => {
+          if (e.target !== e.currentTarget) return;
           this.viewRolesUser = null;
+          this.viewRolesActiveTab = 'roles';
         }}
       >
-        <scion-effective-role-provenance
-          principalType="user"
-          principalId=${user.id}
-          sectionTitle="Effective Roles"
-        ></scion-effective-role-provenance>
-        <scion-effective-access-boundary-notice
-          contextType="user"
-          contextId=${user.id}
-        ></scion-effective-access-boundary-notice>
+        ${showEffectivePermissions
+          ? html`
+              <sl-tab-group
+                @sl-tab-show=${(e: CustomEvent<{ name: string }>) => {
+                  const name = e.detail?.name;
+                  if (name === 'roles' || name === 'permissions') {
+                    this.viewRolesActiveTab = name;
+                  }
+                }}
+              >
+                <sl-tab
+                  slot="nav"
+                  panel="roles"
+                  ?active=${this.viewRolesActiveTab === 'roles'}
+                  @click=${() => {
+                    this.viewRolesActiveTab = 'roles';
+                  }}
+                >
+                  Effective roles
+                </sl-tab>
+                <sl-tab
+                  slot="nav"
+                  panel="permissions"
+                  ?active=${this.viewRolesActiveTab === 'permissions'}
+                  @click=${() => {
+                    this.viewRolesActiveTab = 'permissions';
+                  }}
+                >
+                  Effective permissions
+                </sl-tab>
+
+                <sl-tab-panel name="roles" ?active=${this.viewRolesActiveTab === 'roles'}>
+                  <scion-effective-role-provenance
+                    principalType="user"
+                    principalId=${user.id}
+                    sectionTitle="Effective Roles"
+                    @role-bindings-changed=${(e: Event) => {
+                      if (e.target !== e.currentTarget) return;
+                      this.shadowRoot
+                        ?.querySelector<ScionEffectivePermissionsView>(
+                          'scion-effective-permissions-view'
+                        )
+                        ?.invalidate();
+                    }}
+                  ></scion-effective-role-provenance>
+                  <scion-effective-access-boundary-notice
+                    contextType="user"
+                    contextId=${user.id}
+                  ></scion-effective-access-boundary-notice>
+                </sl-tab-panel>
+
+                <sl-tab-panel
+                  name="permissions"
+                  ?active=${this.viewRolesActiveTab === 'permissions'}
+                >
+                  <scion-effective-permissions-view
+                    principalType="user"
+                    principalId=${user.id}
+                    ?active=${this.viewRolesActiveTab === 'permissions'}
+                  ></scion-effective-permissions-view>
+                </sl-tab-panel>
+              </sl-tab-group>
+            `
+          : html`
+              <scion-effective-role-provenance
+                principalType="user"
+                principalId=${user.id}
+                sectionTitle="Effective Roles"
+              ></scion-effective-role-provenance>
+              <scion-effective-access-boundary-notice
+                contextType="user"
+                contextId=${user.id}
+              ></scion-effective-access-boundary-notice>
+            `}
         <sl-button
           slot="footer"
           variant="default"
           @click=${() => {
             this.viewRolesUser = null;
+            this.viewRolesActiveTab = 'roles';
           }}
           >Close</sl-button
         >

@@ -30,6 +30,17 @@ import (
 )
 
 // SchemaVersion is the version of the JSON plan document.
+//
+// Schema evolution decision (ptone/scion#7627): adding Plan.HostMode
+// (`hostMode,omitempty`) stays within SchemaVersion 1 rather than bumping to 2:
+//   - Every existing field name, type, nullability, and meaning is unchanged,
+//     and standard JSON consumers ignore unknown optional fields.
+//   - Matches the package's established schema-version-1 additive convention
+//     for Report.HostMode and Journal co-located fields (see
+//     journal_colocated_fields_test.go), avoiding gratuitous breakage of
+//     existing schemaVersion == 1 readers and golden fixtures.
+//   - Hub-published api.ConversionPlanPresentation (Presentation) remains
+//     unchanged and never carries host-local daemon launch state.
 const SchemaVersion = 1
 
 // TipNote heads every plan: the plan proposes, it never applies, and it
@@ -89,8 +100,13 @@ type Input struct {
 // Plan is the plan document. Its JSON field names are part of the CLI
 // contract (schemaVersion 1).
 type Plan struct {
-	SchemaVersion  int           `json:"schemaVersion"`
-	TipNote        string        `json:"tipNote"`
+	SchemaVersion int    `json:"schemaVersion"`
+	TipNote       string `json:"tipNote"`
+	// HostMode is the detected host mode for `scion runtime-broker convert --plan`
+	// (HostModeColocated, HostModeRemote, or HostModeUnknown when --host-mode
+	// will be required on --apply/--rollback; omitted when BuildLocal runs
+	// without host detection). Additive under schemaVersion 1 (ptone/scion#7627).
+	HostMode       string        `json:"hostMode,omitempty"`
 	LegacyBrokerID string        `json:"legacyBrokerId,omitempty"`
 	LegacyBroker   *LegacyBroker `json:"legacyBroker,omitempty"`
 	// Instances are the proposed instances in their publishable form
@@ -381,6 +397,9 @@ func (p *Plan) summarize() {
 		} else {
 			s.NoticeFindings++
 		}
+		if f.Code == config.ConversionFlatTargetOperatorInputRequired {
+			s.DecisionRequired = true
+		}
 	}
 	if p.Agents != nil {
 		s.Agents = len(p.Agents.Items)
@@ -411,14 +430,16 @@ func nonNil(s []string) []string {
 // findingTexts are the fixed texts of the converter's finding codes. They
 // quote no settings value; the finding's key path and profiles say where.
 var findingTexts = map[string]string{
-	config.ConversionUnsupportedFlatTargetType:  "this runtime type has no flat Runtime Broker target; keep these profiles on the legacy Runtime Broker",
-	config.ConversionFlatTargetScopeViolation:   "this setting reaches beyond one target scope, which a flat Runtime Broker instance cannot hold",
-	config.ConversionProfileConflict:            "these profiles share a target but differ in one or more settings, so they keep separate instances; compare the proposed instances, then give the profiles the same values or add a field choice to merge them",
-	config.ConversionProfileConflictResolved:    "an operator choice consolidated this field on one profile's value; the other profiles' values are not carried over",
-	config.ConversionLegacyFieldNoEffect:        "this legacy setting has no effect on a flat Runtime Broker instance",
-	config.ConversionLegacyFieldRemoved:         "this setting was removed and is not converted",
-	config.ConversionUnknownSettingsKey:         "this key, profile or operator choice is not recognised or cannot be applied, so it is not converted",
-	config.ConversionFieldNotValidForTargetType: "this field is not valid for the instance's target type and is not converted",
+	config.ConversionUnsupportedFlatTargetType:       "this runtime type has no flat Runtime Broker target; keep these profiles on the legacy Runtime Broker",
+	config.ConversionFlatTargetScopeViolation:        "this setting reaches beyond one target scope, which a flat Runtime Broker instance cannot hold",
+	config.ConversionProfileConflict:                 "these profiles share a target but differ in one or more settings, so they keep separate instances; compare the proposed instances, then give the profiles the same values or add a field choice to merge them",
+	config.ConversionProfileConflictResolved:         "an operator choice consolidated this field on one profile's value; the other profiles' values are not carried over",
+	config.ConversionLegacyFieldNoEffect:             "this legacy setting has no effect on a flat Runtime Broker instance",
+	config.ConversionLegacyFieldRemoved:              "this setting was removed and is not converted",
+	config.ConversionUnknownSettingsKey:              "this key, profile or operator choice is not recognised or cannot be applied, so it is not converted",
+	config.ConversionFieldNotValidForTargetType:      "this field is not valid for the instance's target type and is not converted",
+	config.ConversionFlatTargetFieldRequired:         "this flat-target setting is missing or invalid in the legacy settings; set a valid value before converting these profiles",
+	config.ConversionFlatTargetOperatorInputRequired: "this field has no legacy settings source and is required on the flat Runtime Broker instance; set it in settings.yaml before starting the instance",
 }
 
 // FindingText is the fixed text for a finding code.

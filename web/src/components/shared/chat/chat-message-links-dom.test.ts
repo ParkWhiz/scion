@@ -36,11 +36,15 @@ declare global {
 const UUID = '123e4567-e89b-12d3-a456-426614174000';
 
 /** Mount an agent's message and wait for its markdown to render. */
-async function mount(body: string): Promise<HTMLElement> {
+async function mount(
+  body: string,
+  members: Array<{ name: string; email: string; kind: 'user' | 'agent' }> = []
+): Promise<HTMLElement> {
   const el = document.createElement('scion-chat-message') as ScionChatMessage;
   el.body = body;
   el.fromAgent = true;
   el.senderIsAgent = true;
+  el.members = members;
   document.body.appendChild(el);
   let content: HTMLElement | null = null;
   for (let i = 0; i < 50 && !content; i++) {
@@ -118,6 +122,49 @@ describe('scion-chat-message links inside markup', () => {
     expect(mentionSlugs(content)).toEqual(['alice']);
   });
 
+  it('keeps @ inside a gs:// object path as part of the link, not a mention', async () => {
+    const content = await mount(
+      'see gs://bkt/a:@b and gs://bkt/dir/a,@bob and gs://bkt/workspace/x=@carol.md and `gs://bkt/c:@dan` and @alice'
+    );
+
+    const gcsLinks = Array.from(content.querySelectorAll('.gcs-link'));
+    expect(gcsLinks.map((a) => a.getAttribute('data-gcs-uri'))).toEqual([
+      'gs://bkt/a:@b',
+      'gs://bkt/dir/a,@bob',
+      'gs://bkt/workspace/x=@carol.md',
+      'gs://bkt/c:@dan',
+    ]);
+    expect(gcsLinks.map((a) => a.textContent)).toEqual([
+      'gs://bkt/a:@b',
+      'gs://bkt/dir/a,@bob',
+      'gs://bkt/workspace/x=@carol.md',
+      'gs://bkt/c:@dan',
+    ]);
+    for (const link of gcsLinks) {
+      expect(link.querySelector('.mention')).toBeNull();
+    }
+    expect(content.querySelector('.path-link')).toBeNull();
+    expect(mentionSlugs(content)).toEqual(['alice']);
+  });
+
+  it('does not link entity tails inside a rejected gs:// URI', async () => {
+    const body = 'see gs://bkt/workspace/x.md?v=1 and gs://bkt/sess_abcd1234#x now';
+    const content = await mount(body);
+
+    expect(content.querySelectorAll('.gcs-link')).toHaveLength(0);
+    expect(content.querySelectorAll('.path-link')).toHaveLength(0);
+    expect(content.querySelector('a[href="/sessions/sess_abcd1234"]')).toBeNull();
+    expect(content.textContent?.trim()).toBe(body);
+  });
+
+  it('preserves original casing and whitespace before session and commit links', async () => {
+    const content = await mount(`Session   ${UUID} and Commit  abc1234`);
+
+    expect(content.querySelector(`a[href="/sessions/${UUID}"]`)?.textContent).toBe(UUID);
+    expect(content.querySelector('a[href="/commits/abc1234"]')?.textContent).toBe('abc1234');
+    expect(content.textContent?.trim()).toBe(`Session   ${UUID} and Commit  abc1234`);
+  });
+
   it('leaves a link title and an image alt that contain ">" and references as they are', async () => {
     const content = await mount(
       '[t](https://example.com "a>@bob sess_abcd1234") ' +
@@ -177,5 +224,79 @@ describe('scion-chat-message text that looks like HTML', () => {
 
     expect(content.querySelector('a[href="/commits/abc1234"]')?.textContent).toBe('abc1234');
     expect(content.querySelector(`a[href="/sessions/${UUID}"]`)?.textContent).toBe(UUID);
+    expect(content.textContent?.trim()).toBe(`commit\u00a0abc1234 and session\u00a0${UUID}`);
+  });
+});
+
+describe('scion-chat-message email mention resolution (ptone/scion#8133)', () => {
+  const roster = [
+    { name: 'Alice Smith', email: 'alice@example.com', kind: 'user' as const },
+    { name: '', email: 'grace@example.com', kind: 'user' as const },
+  ];
+
+  it('renders @<email> for a known Scion user as that user mention', async () => {
+    const content = await mount(
+      'Ask @alice@example.com or **@ALICE@EXAMPLE.COM** and @grace@example.com.',
+      roster
+    );
+
+    const spans = Array.from(content.querySelectorAll('.mention'));
+    expect(spans.map((s) => s.getAttribute('data-mention'))).toEqual([
+      'alice-smith',
+      'alice-smith',
+      'grace@example.com',
+    ]);
+    expect(spans.map((s) => s.textContent)).toEqual([
+      '@alice-smith',
+      '@alice-smith',
+      '@grace@example.com',
+    ]);
+    expect(content.querySelector('a[href^="mailto:"]')).toBeNull();
+    expect(content.textContent?.trim()).toBe(
+      'Ask @alice-smith or @alice-smith and @grace@example.com.'
+    );
+  });
+
+  it('leaves @<email> for an unknown address as plain text with no mention or mailto highlight', async () => {
+    const content = await mount(
+      'Reach @unknown@example.com or (@nobody+tag@sub.example.org) about this.',
+      roster
+    );
+
+    expect(content.querySelectorAll('.mention')).toHaveLength(0);
+    expect(content.querySelectorAll('a[href^="mailto:"]')).toHaveLength(0);
+    expect(content.textContent?.trim()).toBe(
+      'Reach @unknown@example.com or (@nobody+tag@sub.example.org) about this.'
+    );
+  });
+
+  it('leaves plain user@example.com in prose unaffected by mention conversion or highlighting', async () => {
+    const content = await mount(
+      'Send feedback to user@example.com or alice@example.com directly.',
+      roster
+    );
+
+    expect(content.querySelectorAll('.mention')).toHaveLength(0);
+    const mailtos = Array.from(content.querySelectorAll('a[href^="mailto:"]'));
+    expect(mailtos.map((a) => a.getAttribute('href'))).toEqual([
+      'mailto:user@example.com',
+      'mailto:alice@example.com',
+    ]);
+    expect(mailtos.map((a) => a.textContent)).toEqual(['user@example.com', 'alice@example.com']);
+  });
+
+  it('leaves email addresses inside inline code spans and fenced code blocks untouched', async () => {
+    const content = await mount(
+      'Use `@alice@example.com` or `@unknown@example.com`:\n\n```\n@alice@example.com\nuser@example.com\n```',
+      roster
+    );
+
+    expect(content.querySelectorAll('.mention')).toHaveLength(0);
+    expect(content.querySelectorAll('a[href^="mailto:"]')).toHaveLength(0);
+    const codes = Array.from(content.querySelectorAll('code')).filter((c) => !c.closest('pre'));
+    expect(codes.map((c) => c.textContent)).toEqual(['@alice@example.com', '@unknown@example.com']);
+    expect(content.querySelector('pre')?.textContent).toContain(
+      '@alice@example.com\nuser@example.com'
+    );
   });
 });

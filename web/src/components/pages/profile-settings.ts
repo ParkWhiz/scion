@@ -44,6 +44,8 @@ import {
 } from '../../client/view-mode-shortcuts.js';
 import { isMacPlatform } from '../../utils/platform.js';
 import { setPreferredTimeZone, browserTimeZone } from '../../utils/time.js';
+import { decisionsEnabled } from '../../utils/feature-flags.js';
+import { setPreselectRecommendedChoices } from '../../client/decision-preferences.js';
 import '../shared/subscription-manager.js';
 import '../shared/timezone-picker.js';
 import type { TimezoneChangeDetail } from '../shared/timezone-picker.js';
@@ -95,6 +97,17 @@ export class ScionPageProfileSettings extends LitElement {
   private _displayTimezoneSaved = false;
 
   /**
+   * `preferences.preselectRecommendedChoices` (ptone/scion#7842): whether
+   * multi-decision cards start with recommended choices selected.
+   * Shown only while web.decisions is on.
+   */
+  @state()
+  private _preselectRecommended = false;
+
+  @state()
+  private _preselectError: string | null = null;
+
+  /**
    * Bumped to force the picker to remount after a failed PATCH or the
    * no-user-id case (review R2-2, replacing R1-5's `@query`-ref approach).
    *
@@ -141,7 +154,7 @@ export class ScionPageProfileSettings extends LitElement {
     .settings-card {
       background: var(--scion-surface, #ffffff);
       border: 1px solid var(--scion-border, #e2e8f0);
-      border-radius: 0.75rem;
+      border-radius: var(--scion-radius-lg);
       padding: 1.5rem;
       margin-bottom: 1.5rem;
     }
@@ -197,7 +210,7 @@ export class ScionPageProfileSettings extends LitElement {
       gap: 0.5rem;
       margin-top: 0.75rem;
       padding: 0.5rem 0.75rem;
-      border-radius: 0.375rem;
+      border-radius: calc(var(--scion-radius) * 0.75);
       font-size: 0.8125rem;
     }
 
@@ -301,10 +314,11 @@ export class ScionPageProfileSettings extends LitElement {
       if (!res.ok) return;
       const data = (await res.json()) as {
         id?: string;
-        preferences?: { timezone?: string };
+        preferences?: { timezone?: string; preselectRecommendedChoices?: boolean };
       };
       this._userId = data.id ?? '';
       this._displayTimezone = data.preferences?.timezone ?? '';
+      this._preselectRecommended = data.preferences?.preselectRecommendedChoices === true;
     } catch {
       // Non-critical — the card still renders; saving just has nothing to
       // PATCH against until a reload succeeds.
@@ -396,6 +410,41 @@ export class ScionPageProfileSettings extends LitElement {
     const target = e.target as HTMLInputElement & { checked: boolean };
     setViewModeShortcutsEnabled(target.checked);
     this._viewModeShortcutsEnabled = areViewModeShortcutsEnabled();
+  }
+
+  /**
+   * Saves the decision-card preselect preference with a per-key
+   * `preferences` PATCH and applies it to open cards at once; reverts the
+   * switch when the PATCH fails.
+   */
+  private async _handlePreselectToggle(e: Event): Promise<void> {
+    const target = e.target as HTMLInputElement & { checked: boolean };
+    const enabled = target.checked;
+    this._preselectError = null;
+    const revert = (message: string): void => {
+      target.checked = !enabled;
+      this._preselectRecommended = !enabled;
+      this._preselectError = message;
+    };
+    if (!this._userId) {
+      revert('Failed to update the setting');
+      return;
+    }
+    this._preselectRecommended = enabled;
+    try {
+      const res = await apiFetch(`/api/v1/users/${encodeURIComponent(this._userId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preferences: { preselectRecommendedChoices: enabled } }),
+      });
+      if (!res.ok) {
+        revert(await extractApiError(res, 'Failed to update the setting'));
+        return;
+      }
+      setPreselectRecommendedChoices(enabled);
+    } catch {
+      revert('Failed to update the setting');
+    }
   }
 
   private async _handleADCToggle(e: Event): Promise<void> {
@@ -536,8 +585,9 @@ export class ScionPageProfileSettings extends LitElement {
             <p class="setting-description">
               Controls how times are displayed and how date/time inputs are interpreted in
               native chat and scheduling forms, and the rest of the UI follows over time. Choose
-              "Auto" to follow your browser's zone (currently ${browserTimeZone()}); this never
-              changes how agent containers are configured.
+              "Auto" to follow your browser's zone (currently ${browserTimeZone()}). Only a
+              pinned time zone is shared with agents you message; Auto is used for display only,
+              and neither changes how agent containers are configured.
             </p>
           </div>
           <div class="setting-control">
@@ -586,7 +636,7 @@ export class ScionPageProfileSettings extends LitElement {
           <div class="setting-info">
             <p class="setting-label">View mode shortcuts</p>
             <p class="setting-description">
-              Switch between Dashboard, Chat and Terminal with
+              Switch between Console, Chat and Terminals with
               ${isMacPlatform() ? '⌘1, ⌘2 and ⌘3' : 'Ctrl+1, Ctrl+2 and Ctrl+3'}. When off, these
               keys keep their usual browser behaviour.
             </p>
@@ -601,6 +651,44 @@ export class ScionPageProfileSettings extends LitElement {
         </div>
       </div>
 
+      ${decisionsEnabled()
+        ? html`
+            <div class="settings-card">
+              <h2 class="section-title">
+                <sl-icon name="list-check"></sl-icon>
+                Decisions
+              </h2>
+
+              <div class="setting-row">
+                <div class="setting-info">
+                  <p class="setting-label">Preselect recommended choices</p>
+                  <p class="setting-description">
+                    When a message asks several questions at once, start with each recommended
+                    choice selected. When off, recommended choices are only outlined and every
+                    question needs a click before you can submit.
+                  </p>
+                </div>
+                <div class="setting-control">
+                  <sl-switch
+                    class="preselect-recommended-switch"
+                    aria-label="Preselect recommended choices"
+                    ?checked=${this._preselectRecommended}
+                    @sl-change=${(e: Event): Promise<void> => this._handlePreselectToggle(e)}
+                  ></sl-switch>
+                </div>
+              </div>
+
+              ${this._preselectError
+                ? html`
+                    <div class="permission-status status-denied">
+                      <sl-icon name="exclamation-triangle"></sl-icon>
+                      ${this._preselectError}
+                    </div>
+                  `
+                : nothing}
+            </div>
+          `
+        : nothing}
       ${this._gcloudADCAvailable && this._isWorkstation
         ? html`
             <div class="settings-card">

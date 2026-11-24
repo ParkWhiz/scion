@@ -44,6 +44,8 @@ const (
 	FieldWorkspaceStorage = "workspace_storage"
 	// FieldHealth holds the string denoting the health field in the database.
 	FieldHealth = "health"
+	// FieldWorkloadIdentityTargets holds the string denoting the workload_identity_targets field in the database.
+	FieldWorkloadIdentityTargets = "workload_identity_targets"
 	// FieldLabels holds the string denoting the labels field in the database.
 	FieldLabels = "labels"
 	// FieldAnnotations holds the string denoting the annotations field in the database.
@@ -54,6 +56,8 @@ const (
 	FieldCreatedBy = "created_by"
 	// FieldAutoProvide holds the string denoting the auto_provide field in the database.
 	FieldAutoProvide = "auto_provide"
+	// FieldAdminManaged holds the string denoting the admin_managed field in the database.
+	FieldAdminManaged = "admin_managed"
 	// FieldGcpHostServiceAccountEmail holds the string denoting the gcp_host_service_account_email field in the database.
 	FieldGcpHostServiceAccountEmail = "gcp_host_service_account_email"
 	// FieldGcpHostProjectID holds the string denoting the gcp_host_project_id field in the database.
@@ -122,11 +126,13 @@ var Columns = []string{
 	FieldDefaultProfile,
 	FieldWorkspaceStorage,
 	FieldHealth,
+	FieldWorkloadIdentityTargets,
 	FieldLabels,
 	FieldAnnotations,
 	FieldEndpoint,
 	FieldCreatedBy,
 	FieldAutoProvide,
+	FieldAdminManaged,
 	FieldGcpHostServiceAccountEmail,
 	FieldGcpHostProjectID,
 	FieldGcpHostSource,
@@ -177,6 +183,8 @@ var (
 	DefaultConnectionState string
 	// DefaultAutoProvide holds the default value on creation for the "auto_provide" field.
 	DefaultAutoProvide bool
+	// DefaultAdminManaged holds the default value on creation for the "admin_managed" field.
+	DefaultAdminManaged bool
 	// DefaultGcpHostSource holds the default value on creation for the "gcp_host_source" field.
 	DefaultGcpHostSource string
 	// DefaultRuntimeTargetType holds the default value on creation for the "runtime_target_type" field.
@@ -276,6 +284,11 @@ func ByHealth(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldHealth, opts...).ToFunc()
 }
 
+// ByWorkloadIdentityTargets orders the results by the workload_identity_targets field.
+func ByWorkloadIdentityTargets(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldWorkloadIdentityTargets, opts...).ToFunc()
+}
+
 // ByEndpoint orders the results by the endpoint field.
 func ByEndpoint(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldEndpoint, opts...).ToFunc()
@@ -289,6 +302,11 @@ func ByCreatedBy(opts ...sql.OrderTermOption) OrderOption {
 // ByAutoProvide orders the results by the auto_provide field.
 func ByAutoProvide(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldAutoProvide, opts...).ToFunc()
+}
+
+// ByAdminManaged orders the results by the admin_managed field.
+func ByAdminManaged(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldAdminManaged, opts...).ToFunc()
 }
 
 // ByGcpHostServiceAccountEmail orders the results by the gcp_host_service_account_email field.

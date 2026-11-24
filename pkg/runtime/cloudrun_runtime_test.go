@@ -400,8 +400,7 @@ func TestGetRuntime_CloudRun_DirectProfileName(t *testing.T) {
 }
 
 // crTestSlug and crTestAgentID are an agent slug and hub agent ID: the
-// Cloud Run home and secrets are agents/<slug>/{home-,secrets-}<agentID>
-// (ptone/scion#5825).
+// Cloud Run home is agents/<slug>/home-<agentID> (ptone/scion#5825).
 const (
 	crTestSlug    = "dev"
 	crTestAgentID = "6f1c2b3a-4d5e-4f60-8a9b-0c1d2e3f4a5b"
@@ -420,9 +419,6 @@ func TestCloudRunNFSExportPaths(t *testing.T) {
 	}
 	if paths.homeExportPath != "/scion-workspaces/projects/proj-123/agents/dev/home-"+crTestAgentID {
 		t.Errorf("homeExportPath = %q", paths.homeExportPath)
-	}
-	if paths.secretsExportPath != "/scion-workspaces/projects/proj-123/agents/dev/secrets-"+crTestAgentID {
-		t.Errorf("secretsExportPath = %q", paths.secretsExportPath)
 	}
 }
 
@@ -484,9 +480,6 @@ func TestCloudRunNFSHostPaths(t *testing.T) {
 	}
 	if paths.homeHostPath != filepath.Join(wantHostBase, "projects", "proj-123", "agents", "dev", "home-"+crTestAgentID) {
 		t.Errorf("homeHostPath = %q", paths.homeHostPath)
-	}
-	if paths.secretsHostPath != filepath.Join(wantHostBase, "projects", "proj-123", "agents", "dev", "secrets-"+crTestAgentID) {
-		t.Errorf("secretsHostPath = %q", paths.secretsHostPath)
 	}
 }
 
@@ -550,8 +543,8 @@ func TestCloudRunNFSPathsHonourSubPathRoot(t *testing.T) {
 			if want := root + "/proj-123/workspace"; host.serverRelativePath != want {
 				t.Errorf("serverRelativePath = %q, want %q", host.serverRelativePath, want)
 			}
-			if want := filepath.Join(hostBase, filepath.FromSlash(root), "proj-123", "agents", "dev", "secrets-"+crTestAgentID); host.secretsHostPath != want {
-				t.Errorf("secretsHostPath = %q, want %q", host.secretsHostPath, want)
+			if want := filepath.Join(hostBase, filepath.FromSlash(root), "proj-123", "agents", "dev", "home-"+crTestAgentID); host.homeHostPath != want {
+				t.Errorf("homeHostPath = %q, want %q", host.homeHostPath, want)
 			}
 
 			// A host path laid out under the default root no longer matches.
@@ -644,7 +637,10 @@ func TestBuildCloudRunInstance_HarnessCommand(t *testing.T) {
 			},
 			Task: "do something",
 		}
-		inst := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+		inst, err := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+		if err != nil {
+			t.Fatalf("buildCloudRunInstance: %v", err)
+		}
 
 		if len(inst.Containers) != 1 {
 			t.Fatalf("expected 1 container, got %d", len(inst.Containers))
@@ -689,7 +685,10 @@ func TestBuildCloudRunInstance_HarnessCommand(t *testing.T) {
 			Labels:      map[string]string{"agent_id": "agent-2"},
 			CommandArgs: []string{"custom-binary", "--flag"},
 		}
-		inst := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+		inst, err := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+		if err != nil {
+			t.Fatalf("buildCloudRunInstance: %v", err)
+		}
 
 		c := inst.Containers[0]
 		if len(c.Command) != 0 {
@@ -705,7 +704,10 @@ func TestBuildCloudRunInstance_HarnessCommand(t *testing.T) {
 			Image:  "test-image:latest",
 			Labels: map[string]string{"agent_id": "agent-3"},
 		}
-		inst := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+		inst, err := rt.buildCloudRunInstance(cfg, 1000, 1000, nil)
+		if err != nil {
+			t.Fatalf("buildCloudRunInstance: %v", err)
+		}
 
 		c := inst.Containers[0]
 		if len(c.Command) != 0 {
@@ -715,6 +717,78 @@ func TestBuildCloudRunInstance_HarnessCommand(t *testing.T) {
 			t.Errorf("Container.Args should be nil/empty, got %v", c.Args)
 		}
 	})
+}
+
+func TestBuildCloudRunInstance_WorkingDir(t *testing.T) {
+	rt, err := NewCloudRunRuntime(&config.CloudRunConfig{
+		ProjectID: "test-project",
+		Location:  "us-central1",
+	})
+	if err != nil {
+		t.Fatalf("NewCloudRunRuntime: %v", err)
+	}
+
+	nfsPaths := &cloudRunNFSProvisionPaths{
+		server:              "10.0.0.2",
+		workspaceExportPath: "/share/projects/p1/agents/dev/workspace",
+		homeExportPath:      "/share/projects/p1/agents/dev/home-1",
+	}
+
+	tests := []struct {
+		name               string
+		containerWorkspace string
+		nfsPaths           *cloudRunNFSProvisionPaths
+		wantWorkingDir     string
+	}{
+		{
+			name:           "defaults to /workspace with harness and NFS",
+			nfsPaths:       nfsPaths,
+			wantWorkingDir: "/workspace",
+		},
+		{
+			name:               "uses custom ContainerWorkspace and matches workspace mount",
+			containerWorkspace: "/custom/workspace",
+			nfsPaths:           nfsPaths,
+			wantWorkingDir:     "/custom/workspace",
+		},
+		{
+			name:           "defaults to /workspace when nfsPaths is nil",
+			nfsPaths:       nil,
+			wantWorkingDir: "/workspace",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := RunConfig{
+				Image:              "test-image:latest",
+				ContainerWorkspace: tc.containerWorkspace,
+				Labels:             map[string]string{"agent_id": "agent-1"},
+				Harness: &mockHarness{
+					command: []string{"gemini"},
+				},
+			}
+			inst, err := rt.buildCloudRunInstance(cfg, 1000, 1000, tc.nfsPaths)
+			if err != nil {
+				t.Fatalf("buildCloudRunInstance: %v", err)
+			}
+			c := inst.Containers[0]
+			if c.WorkingDir != tc.wantWorkingDir {
+				t.Errorf("Container.WorkingDir = %q, want %q", c.WorkingDir, tc.wantWorkingDir)
+			}
+			if tc.nfsPaths != nil {
+				var wsMount string
+				for _, vm := range c.VolumeMounts {
+					if vm.Name == "workspace" {
+						wsMount = vm.MountPath
+					}
+				}
+				if wsMount != c.WorkingDir {
+					t.Errorf("workspace VolumeMount.MountPath = %q, want match with Container.WorkingDir %q", wsMount, c.WorkingDir)
+				}
+			}
+		})
+	}
 }
 
 func TestCloudRunShortInstanceID(t *testing.T) {
@@ -794,7 +868,7 @@ func TestCloudRunRuntime_IDRoundTrip(t *testing.T) {
 }
 
 // The Cloud Run instance must mount the NFS share the broker provisions on
-// (workspace_storage.nfs.shares[0]). See ptone/scion#2979.
+// (project_storage.nfs.shares[0]). See ptone/scion#2979.
 func TestResolveCloudRunNFSTarget(t *testing.T) {
 	tests := []struct {
 		name                      string
@@ -811,14 +885,14 @@ func TestResolveCloudRunNFSTarget(t *testing.T) {
 			wantServer: "10.0.0.2", wantExport: "/scion"},
 		{name: "mismatched server is refused", runtimeServer: "10.0.0.3", runtimeExp: "/scion",
 			shareServer: "10.0.0.2", shareExp: "/scion",
-			wantErr: []string{"cloudrun.nfs_server", `"10.0.0.3"`, "server.workspace_storage.nfs.shares[0].server", `"10.0.0.2"`}},
+			wantErr: []string{"cloudrun.nfs_server", `"10.0.0.3"`, "server.project_storage.nfs.shares[0].server", `"10.0.0.2"`}},
 		{name: "mismatched export is refused", runtimeServer: "10.0.0.2", runtimeExp: "/other",
 			shareServer: "10.0.0.2", shareExp: "/scion",
-			wantErr: []string{"cloudrun.nfs_export", `"/other"`, "server.workspace_storage.nfs.shares[0].export", `"/scion"`}},
+			wantErr: []string{"cloudrun.nfs_export", `"/other"`, "server.project_storage.nfs.shares[0].export", `"/scion"`}},
 		{name: "no server anywhere is refused",
-			wantErr: []string{"nfs_server must be non-empty"}},
+			wantErr: []string{"nfs_server must be non-empty", "cloudrun.nfs_server", "server.project_storage.nfs.shares[0].server"}},
 		{name: "no export anywhere is refused", runtimeServer: "10.0.0.2", shareServer: "10.0.0.2",
-			wantErr: []string{"nfs_export must be non-empty", "cloudrun.nfs_export", "server.workspace_storage.nfs.shares[0].export"}},
+			wantErr: []string{"nfs_export must be non-empty", "cloudrun.nfs_export", "server.project_storage.nfs.shares[0].export"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -831,6 +905,9 @@ func TestResolveCloudRunNFSTarget(t *testing.T) {
 					if !strings.Contains(err.Error(), want) {
 						t.Errorf("error %q does not contain %q", err, want)
 					}
+				}
+				if strings.Contains(err.Error(), "workspace_storage") {
+					t.Errorf("error %q still mentions deprecated workspace_storage key", err)
 				}
 				return
 			}
@@ -909,15 +986,17 @@ func TestBuildCloudRunInstanceMountsResolvedNFSServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inst := rt.buildCloudRunInstance(RunConfig{
+	inst, err := rt.buildCloudRunInstance(RunConfig{
 		Image:  "test-image:latest",
 		Labels: map[string]string{"agent_id": "agent-1"},
 	}, 1000, 1000, &cloudRunNFSProvisionPaths{
 		server:              "10.0.0.2",
 		workspaceExportPath: "/scion/projects/p/workspace",
 		homeExportPath:      "/scion/projects/p/agents/a/home",
-		secretsExportPath:   "/scion/projects/p/agents/a/secrets",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	var n int
 	for _, v := range inst.Volumes {
 		if nfs := v.GetNfs(); nfs != nil {
@@ -927,7 +1006,7 @@ func TestBuildCloudRunInstanceMountsResolvedNFSServer(t *testing.T) {
 			}
 		}
 	}
-	if n != 3 {
-		t.Fatalf("got %d NFS volumes, want 3", n)
+	if n != 2 {
+		t.Fatalf("got %d NFS volumes, want 2 (workspace and home)", n)
 	}
 }

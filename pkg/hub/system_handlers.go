@@ -21,12 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
@@ -61,12 +63,32 @@ func GatherDiagnostics(ctx context.Context, cfg *config.VersionedSettings) []Dia
 		results = append(results, DiagnosticResult{Name: "git", Status: "pass", Message: trimOutput(string(out))})
 	}
 
-	// Check runtime detection
-	detected, err := config.DetectLocalRuntime()
-	if err != nil {
-		results = append(results, DiagnosticResult{Name: "runtime", Status: "fail", Message: err.Error()})
+	// Check runtime detection and daemon reachability
+	availableRuntimes := config.DetectAllLocalRuntimes()
+	if len(availableRuntimes) == 0 {
+		if _, err := config.DetectLocalRuntime(); err != nil {
+			results = append(results, DiagnosticResult{Name: "runtime", Status: "fail", Message: err.Error()})
+		} else {
+			results = append(results, DiagnosticResult{Name: "runtime", Status: "fail", Message: config.ErrNoLocalRuntime.Error()})
+		}
 	} else {
-		results = append(results, DiagnosticResult{Name: "runtime", Status: "pass", Message: fmt.Sprintf("detected runtime: %s", detected)})
+		var reachable string
+		for _, rt := range availableRuntimes {
+			if err := config.CheckRuntimeDaemon(ctx, rt); err == nil {
+				reachable = rt
+				break
+			}
+		}
+		if reachable != "" {
+			results = append(results, DiagnosticResult{Name: "runtime", Status: "pass", Message: fmt.Sprintf("detected runtime: %s", reachable)})
+		} else {
+			first := availableRuntimes[0]
+			results = append(results, DiagnosticResult{
+				Name:    "runtime",
+				Status:  "fail",
+				Message: fmt.Sprintf("%s daemon is not running or not accessible — start the %s daemon and click Re-check", first, first),
+			})
+		}
 	}
 
 	// Check global dir exists
@@ -481,6 +503,10 @@ type OnboardingStatus struct {
 	// save: the saved hub value, else the settings-file value, never a node
 	// env (ptone/scion#3916).
 	ImageRegistrySaveable string `json:"imageRegistrySaveable,omitempty"`
+	// ImageTag is the effective hub-scope image tag applied to bundled
+	// scion-* images (for example a release version like v0.4.0-preview.3),
+	// or empty when images keep their default :latest tag.
+	ImageTag string `json:"imageTag,omitempty"`
 }
 
 // harnessesSeeded reports whether at least one active global harness config
@@ -524,6 +550,29 @@ func (s *Server) harnessesSeeded(ctx context.Context, globalDir string) bool {
 	return false
 }
 
+// hasUserWorkspace reports whether at least one user project exists in the
+// store, excluding the Hub's built-in global project (isGlobalHubProject).
+// Because project slugs are unique, at most one row can hold the global slug,
+// so a Limit of 2 always sees a non-global project when one exists.
+func (s *Server) hasUserWorkspace(ctx context.Context) bool {
+	if s.store == nil {
+		return false
+	}
+	page, err := s.store.ListProjectSummaries(ctx, store.ProjectFilter{}, store.ListOptions{
+		Limit:          2,
+		SkipTotalCount: true,
+	})
+	if err != nil || page == nil {
+		return false
+	}
+	for i := range page.Items {
+		if !isGlobalHubProject(page.Items[i].Slug) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 	var status OnboardingStatus
 
@@ -552,16 +601,12 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 
 	status.HarnessesSeeded = s.harnessesSeeded(ctx, globalDir)
 
-	// HasWorkspace: at least one project in the store
-	if s.store != nil {
-		result, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 1})
-		if err == nil && result != nil && len(result.Items) > 0 {
-			status.HasWorkspace = true
-		}
-	}
+	// HasWorkspace: at least one non-global project in the store
+	status.HasWorkspace = s.hasUserWorkspace(ctx)
 
-	// Complete: all required steps done
-	status.Complete = status.Initialized && status.IdentitySet && status.RuntimeOK && status.HarnessesSeeded
+	// Complete: core workstation setup is ready and either web identity is
+	// configured or a user project already exists (e.g. CLI-initialized).
+	status.Complete = status.Initialized && status.RuntimeOK && status.HarnessesSeeded && (status.IdentitySet || status.HasWorkspace)
 
 	status.EmbeddedBrokerID = s.GetEmbeddedBrokerID()
 
@@ -576,6 +621,7 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 	} else {
 		status.ImageRegistrySaveable = fileImageRegistryWithoutOps()
 	}
+	status.ImageTag = s.hubScopeImageTag()
 
 	// BuildAvailable: true only if the build script can be resolved
 	status.BuildAvailable = resolveBuildScript() != ""
@@ -962,6 +1008,41 @@ func resolveBuildScript() string {
 	return path
 }
 
+// bundledHarnessBuildImagesFromFS maps each bundled harness directory in hfs
+// that ships a Dockerfile to the image configured in its config.yaml.
+func bundledHarnessBuildImagesFromFS(hfs fs.FS) map[string]string {
+	entries, err := fs.ReadDir(hfs, ".")
+	if err != nil {
+		return nil
+	}
+	images := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if _, err := fs.Stat(hfs, name+"/Dockerfile"); err != nil {
+			continue
+		}
+		data, err := fs.ReadFile(hfs, name+"/config.yaml")
+		if err != nil {
+			continue
+		}
+		cfg, err := config.ParseHarnessConfigYAML(data)
+		if err != nil {
+			continue
+		}
+		if img := strings.TrimSpace(cfg.Image); img != "" {
+			images[name] = img
+		}
+	}
+	return images
+}
+
+var bundledHarnessBuildImages = sync.OnceValue(func() map[string]string {
+	return bundledHarnessBuildImagesFromFS(harness.HarnessesFS())
+})
+
 func (s *Server) handleSystemImagesBuild(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		MethodNotAllowed(w, http.MethodPost)
@@ -1009,9 +1090,9 @@ func (s *Server) handleSystemImagesBuild(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	allowed := map[string]bool{"claude": true, "gemini": true, "codex": true, "opencode": true}
+	allowed := bundledHarnessBuildImages()
 	for _, h := range req.Harnesses {
-		if !allowed[h] {
+		if _, ok := allowed[h]; !ok {
 			ValidationError(w, fmt.Sprintf("unknown harness %q", h), nil)
 			return
 		}
@@ -1067,14 +1148,22 @@ func (s *Server) runImageBuild(ctx context.Context, subject, buildScript string,
 	if err := cmd.Wait(); err != nil {
 		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build failed: " + err.Error()})
 	} else {
-		for _, h := range harnesses {
-			s.events.PublishRaw(subject, map[string]string{
-				"image":  "scion-" + h + ":latest",
-				"status": "done",
-			})
-		}
-		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build complete"})
+		s.publishImageBuildCompletion(subject, harnesses, bundledHarnessBuildImages())
 	}
+}
+
+func (s *Server) publishImageBuildCompletion(subject string, harnesses []string, images map[string]string) {
+	for _, h := range harnesses {
+		image := images[h]
+		if image == "" {
+			image = "scion-" + h + ":latest"
+		}
+		s.events.PublishRaw(subject, map[string]string{
+			"image":  image,
+			"status": "done",
+		})
+	}
+	s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build complete"})
 }
 
 // --- 5.2: Filesystem Endpoints ---

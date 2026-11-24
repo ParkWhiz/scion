@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
@@ -48,6 +49,9 @@ type EventPublisher interface {
 	PublishBrokerConnected(ctx context.Context, brokerID, brokerName string, projectIDs []string)
 	PublishBrokerDisconnected(ctx context.Context, brokerID string, projectIDs []string)
 	PublishBrokerStatus(ctx context.Context, brokerID, status string)
+	// PublishNotification emits a notification addressed to one user on
+	// user.<subscriberID>.notification. A notification with no SubscriberID
+	// is dropped.
 	PublishNotification(ctx context.Context, notif *store.Notification)
 	// PublishUserNotification emits a non-chat notification addressed to one
 	// user (for example SCHEDULE_BLOCKED) on user.<subscriberID>.notification
@@ -119,6 +123,10 @@ type EventPublisher interface {
 	// payload is a content-free invalidation ({"action":"changed"}):
 	// clients refetch current state. Only the owner is ever told.
 	PublishChatStarsChanged(ctx context.Context, userID string)
+	// PublishUserInboxHint publishes a content-free invalidation hint on
+	// user.<userID>.inbox when an inbox category changes. Only the owner is
+	// ever told.
+	PublishUserInboxHint(ctx context.Context, userID string, hint InboxHint)
 	// Subscribe returns a channel that receives events matching the given
 	// subject patterns, along with an unsubscribe function. Patterns use
 	// NATS-style wildcards: '*' matches a single token, '>' matches the
@@ -169,7 +177,8 @@ func (noopEventPublisher) Close()                                               
 
 func (noopEventPublisher) PublishChatScheduledEvent(_ context.Context, _ string, _ ChatScheduledEvent) {
 }
-func (noopEventPublisher) PublishChatStarsChanged(_ context.Context, _ string) {}
+func (noopEventPublisher) PublishChatStarsChanged(_ context.Context, _ string)           {}
+func (noopEventPublisher) PublishUserInboxHint(_ context.Context, _ string, _ InboxHint) {}
 
 // Subscribe on the no-op publisher returns a nil channel (which blocks forever
 // on receive) and a no-op unsubscribe. Callers that need real subscriptions
@@ -204,8 +213,9 @@ type AgentStatusEvent struct {
 	AgentID           string             `json:"agentId"`
 	ProjectID         string             `json:"projectId"`
 	Phase             string             `json:"phase,omitempty"`
-	Activity          string             `json:"activity,omitempty"`
-	Detail            *AgentDetail       `json:"detail"` // always sent, so a cleared Message reaches the web as "" (ptone/scion#4415)
+	Activity          string             `json:"activity"`      // always sent, so a cleared Activity reaches the web as ""
+	SuspendReason     string             `json:"suspendReason"` // always sent, so a resume clears a reason the web merged earlier (see state.SuspendReason)
+	Detail            *AgentDetail       `json:"detail"`        // always sent, so a cleared Message reaches the web as "" (ptone/scion#4415)
 	ContainerStatus   string             `json:"containerStatus,omitempty"`
 	LastActivityEvent string             `json:"lastActivityEvent,omitempty"`
 	Launch            *store.AgentLaunch `json:"launch,omitempty"` // design §3.2; a snapshot taken at publish time
@@ -368,17 +378,17 @@ type UserMessageEvent struct {
 	// see withChatArtifactRefs.
 	Metadata *UserMessageEventMetadata `json:"metadata,omitempty"`
 
-	// Decisions and ChoiceIntro are set on a choice-prompt row, and
-	// ChoiceResponse on a choice-response row, on the chat subjects only
-	// (design choices v4, 4.4); see withChatChoicePayload. Only the
-	// handlers of the web.chat_choices experiment set them.
-	Decisions      []DecisionView      `json:"decisions,omitempty"`
-	ChoiceIntro    string              `json:"choiceIntro,omitempty"`
-	ChoiceResponse *ChoiceResponseView `json:"choiceResponse,omitempty"`
-	// AnswerMode is set with Decisions, and ChoiceResponseSet on the
+	// Decisions and DecisionIntro are set on a decision-prompt row, and
+	// DecisionResponse on a decision-response row, on the chat subjects only
+	// (design choices v4, 4.4); see withChatDecisionPayload. Only the
+	// handlers of the web.decisions experiment set them.
+	Decisions        []DecisionView        `json:"decisions,omitempty"`
+	DecisionIntro    string                `json:"decisionIntro,omitempty"`
+	DecisionResponse *DecisionResponseView `json:"decisionResponse,omitempty"`
+	// AnswerMode is set with Decisions, and DecisionResponseSet on the
 	// response row of a set submit (design choices v5, 5.1 and 5.2).
-	AnswerMode        string                 `json:"answerMode,omitempty"`
-	ChoiceResponseSet *ChoiceResponseSetView `json:"choiceResponseSet,omitempty"`
+	AnswerMode          string                   `json:"answerMode,omitempty"`
+	DecisionResponseSet *DecisionResponseSetView `json:"decisionResponseSet,omitempty"`
 }
 
 // UserMessageEventMetadata is the message metadata a live chat event
@@ -401,15 +411,12 @@ type NotificationCreatedEvent struct {
 	CreatedAt string `json:"createdAt"`
 }
 
-// UserNotificationEvent is the payload for a non-chat notification addressed
-// to a single user (PublishUserNotification). SubscriberID is the client's
-// second gate; the subject already scopes delivery.
+// UserNotificationEvent is the payload for a notification addressed to a
+// single user (PublishUserNotification). SubscriberID is the client's second
+// gate; the subject already scopes delivery.
 //
-// Kind, ResourceType and ResourceID are fields of this event only, never of
-// the embedded NotificationCreatedEvent: that struct is also the payload of
-// the broadcast notification.created and project.<id>.notification
-// subjects, which reach other sessions. They are empty, and omitted, for a
-// notification that does not set them.
+// Kind, ResourceType, and ResourceID are optional fields on this event and
+// are omitted for notifications that do not set them.
 type UserNotificationEvent struct {
 	NotificationCreatedEvent
 	SubscriberID string `json:"subscriberId"`
@@ -420,6 +427,11 @@ type UserNotificationEvent struct {
 	// (store.Notification.Excerpt), on this event only for the same
 	// reason; empty and omitted for every kind but the review summary.
 	Excerpt string `json:"excerpt,omitempty"`
+	// Acknowledged is true when an in-place hub notice transitions to
+	// acknowledged (for example decisions_waiting clearing at N = 0 or
+	// updating quietly after Mark read). Omitted when false so existing
+	// unacknowledged event payloads stay byte-for-byte identical.
+	Acknowledged bool `json:"acknowledged,omitempty"`
 }
 
 // AllowListChangedEvent is published when the allow list is modified.
@@ -460,6 +472,31 @@ type eventBuilder struct {
 	// published counts scion.hub.events.published; the embedding
 	// publisher calls it once per event it publishes.
 	published eventstreams.PublishCounter
+	// inboxHintEnabled, when set, gates user.<ownerID>.inbox waiting hints
+	// emitted by PublishAgentStatus (design §5.2). Stored atomically so
+	// SetInboxHintEnabled is race-free with concurrent publishes.
+	inboxHintEnabled atomic.Pointer[func() bool]
+}
+
+// inboxHintEnabledSetter is implemented by event publishers backed by
+// eventBuilder so Server.SetEventPublisher can wire the inbox experiment gate.
+type inboxHintEnabledSetter interface {
+	SetInboxHintEnabled(fn func() bool)
+}
+
+// SetInboxHintEnabled sets the gate checked by PublishAgentStatus before
+// emitting a user.<ownerID>.inbox waiting hint. Passing nil disables hints.
+func (p *eventBuilder) SetInboxHintEnabled(fn func() bool) {
+	if fn == nil {
+		p.inboxHintEnabled.Store(nil)
+		return
+	}
+	p.inboxHintEnabled.Store(&fn)
+}
+
+func (p *eventBuilder) shouldEmitInboxHint() bool {
+	fn := p.inboxHintEnabled.Load()
+	return fn != nil && (*fn)()
 }
 
 // SetPublishMetrics wires the scion.hub.events.published counter
@@ -638,6 +675,7 @@ func agentStatusEvent(agent *store.Agent, now time.Time) AgentStatusEvent {
 		ProjectID:       agent.ProjectID,
 		Phase:           agent.Phase,
 		Activity:        agent.Activity,
+		SuspendReason:   agent.SuspendReason,
 		ContainerStatus: agent.ContainerStatus,
 		Launch:          store.ComputeAgentLaunch(agent, now),
 		// The generic view for every subscriber (ptone/scion#3122): the
@@ -698,6 +736,13 @@ func (p *eventBuilder) PublishAgentStatus(ctx context.Context, agent *store.Agen
 	sink("agent."+agent.ID+".status", evt)
 	if agent.ProjectID != "" {
 		sink("project."+agent.ProjectID+".agent.status", evt)
+	}
+	if agent.OwnerID != "" && p.shouldEmitInboxHint() {
+		p.PublishUserInboxHint(ctx, agent.OwnerID, InboxHint{
+			Category: InboxCategoryWaiting,
+			AgentID:  agent.ID,
+			Activity: agent.Activity,
+		})
 	}
 }
 
@@ -835,20 +880,10 @@ func (p *eventBuilder) PublishBrokerStatus(_ context.Context, brokerID, status s
 	p.sink("broker."+brokerID+".status", evt)
 }
 
-// PublishNotification publishes a user notification event.
-func (p *eventBuilder) PublishNotification(_ context.Context, notif *store.Notification) {
-	evt := NotificationCreatedEvent{
-		ID:        notif.ID,
-		AgentID:   notif.AgentID,
-		ProjectID: notif.ProjectID,
-		Status:    notif.Status,
-		Message:   notif.Message,
-		CreatedAt: notif.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-	}
-	p.sink("notification.created", evt)
-	if notif.ProjectID != "" {
-		p.sink("project."+notif.ProjectID+".notification", evt)
-	}
+// PublishNotification publishes a notification on user.<subscriberID>.notification.
+// Notifications without a SubscriberID are dropped.
+func (p *eventBuilder) PublishNotification(ctx context.Context, notif *store.Notification) {
+	p.PublishUserNotification(ctx, notif)
 }
 
 // PublishUserNotification publishes a non-chat notification addressed to one
@@ -874,6 +909,7 @@ func (p *eventBuilder) PublishUserNotification(_ context.Context, notif *store.N
 		ResourceType: notif.ResourceType,
 		ResourceID:   notif.ResourceID,
 		Excerpt:      notif.Excerpt,
+		Acknowledged: notif.Acknowledged,
 	}
 	p.sink("user."+notif.SubscriberID+".notification", evt)
 }
@@ -925,7 +961,7 @@ func (p *eventBuilder) PublishUserMessage(ctx context.Context, msg *store.Messag
 	// the hub's agent messages stream, which a user access token may open,
 	// reads agent.<id>.message (ptone/scion#4596).
 	evt := userMessageEvent(msg, legacyAttachmentRefs(attachments))
-	chatEvt := withChatChoicePayload(withChatArtifactRefs(userMessageEvent(msg, attachments), artifactRefs), chatEventOptionsOf(opts).choice)
+	chatEvt := withChatDecisionPayload(withChatArtifactRefs(userMessageEvent(msg, attachments), artifactRefs), chatEventOptionsOf(opts).decision)
 	// Only fan out to user-inbox and project-level subjects when the
 	// recipient is actually a human user. For user→agent messages the
 	// RecipientID is the agent UUID, so publishing to user.<agentID>
@@ -993,8 +1029,8 @@ func withChatArtifactRefs(evt UserMessageEvent, refs []artifacts.MessageRef) Use
 type ChatEventOption func(*chatEventOptions)
 
 type chatEventOptions struct {
-	// choice is a choice prompt's decisions or a choice response.
-	choice *choiceEventPayload
+	// decision is a decision prompt's decisions or a decision response.
+	decision *decisionEventPayload
 }
 
 // chatEventOptionsOf applies opts.
@@ -1008,20 +1044,20 @@ func chatEventOptionsOf(opts []ChatEventOption) chatEventOptions {
 	return o
 }
 
-// withChatChoicePayload returns evt carrying a choice prompt's decisions and
-// intro, or a choice response, for the chat subjects (the subjects whose
+// withChatDecisionPayload returns evt carrying a decision prompt's decisions and
+// intro, or a decision response, for the chat subjects (the subjects whose
 // history returns the same views to the same audience).
-func withChatChoicePayload(evt UserMessageEvent, p *choiceEventPayload) UserMessageEvent {
+func withChatDecisionPayload(evt UserMessageEvent, p *decisionEventPayload) UserMessageEvent {
 	if p == nil {
 		return evt
 	}
 	if p.Prompt != nil {
 		evt.Decisions = p.Prompt.Decisions
-		evt.ChoiceIntro = p.Prompt.Intro
+		evt.DecisionIntro = p.Prompt.Intro
 		evt.AnswerMode = p.Prompt.AnswerMode
 	}
-	evt.ChoiceResponse = p.Response
-	evt.ChoiceResponseSet = p.ResponseSet
+	evt.DecisionResponse = p.Response
+	evt.DecisionResponseSet = p.ResponseSet
 	return evt
 }
 
@@ -1069,7 +1105,7 @@ func (p *eventBuilder) PublishChatMemberMessage(ctx context.Context, msg *store.
 	if msg == nil || len(userIDs) == 0 {
 		return
 	}
-	evt := withChatChoicePayload(withChatArtifactRefs(userMessageEvent(msg, attachments), artifactRefs), chatEventOptionsOf(opts).choice)
+	evt := withChatDecisionPayload(withChatArtifactRefs(userMessageEvent(msg, attachments), artifactRefs), chatEventOptionsOf(opts).decision)
 	seen := make(map[string]bool, len(userIDs))
 	for _, id := range userIDs {
 		if id == "" || seen[id] {
@@ -1216,6 +1252,23 @@ func (p *eventBuilder) PublishChatStarsChanged(_ context.Context, userID string)
 		return
 	}
 	p.sink("user."+userID+".chat.stars", ChatStarsEvent{Action: "changed"})
+}
+
+// InboxHint is a content-free invalidation hint published on
+// user.<userID>.inbox when an inbox category changes.
+type InboxHint struct {
+	Category string `json:"category"`
+	AgentID  string `json:"agentId,omitempty"`
+	Activity string `json:"activity,omitempty"`
+}
+
+// PublishUserInboxHint publishes an inbox invalidation hint to its owner only,
+// on user.<userID>.inbox.
+func (p *eventBuilder) PublishUserInboxHint(_ context.Context, userID string, hint InboxHint) {
+	if userID == "" {
+		return
+	}
+	p.sink("user."+userID+".inbox", hint)
 }
 
 // PublishDispatchDone emits a slim completion event when a broker_dispatch row

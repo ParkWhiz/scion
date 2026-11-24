@@ -33,16 +33,20 @@ const (
 	projectSubRouteMessageLogs       projectSubRouteKind = "message-logs"
 	projectSubRouteBroadcast         projectSubRouteKind = "broadcast"
 	projectSubRouteSchedules         projectSubRouteKind = "schedules"
+	projectSubRouteTriggers          projectSubRouteKind = "triggers"
 	projectSubRouteMetrics           projectSubRouteKind = "metrics"
 	projectSubRoutePreStartHooks     projectSubRouteKind = "pre-start-hooks"
 	projectSubRouteSettings          projectSubRouteKind = "settings"
 	projectSubRouteMessagingPolicy   projectSubRouteKind = "messaging-policy"
+	projectSubRouteMessagePolicies   projectSubRouteKind = "message-policies"
 	projectSubRouteTemplate          projectSubRouteKind = "template"
 	projectSubRouteCatalogImport     projectSubRouteKind = "catalog-import"
 	projectSubRouteWorkspace         projectSubRouteKind = "workspace"
 	projectSubRouteGitHub            projectSubRouteKind = "github"
 	projectSubRouteVisitors          projectSubRouteKind = "visitors"
 	projectSubRouteLeave             projectSubRouteKind = "leave"
+	projectSubRouteDecisions         projectSubRouteKind = "decisions"
+	projectSubRouteTriggerSources    projectSubRouteKind = "trigger-sources"
 )
 
 // projectSubRouteTable lists every first path segment after
@@ -65,11 +69,15 @@ var projectSubRouteTable = map[string]projectSubRouteKind{
 	"broadcast":                projectSubRouteBroadcast,
 	"scheduled-events":         projectSubRouteSchedules,
 	"schedules":                projectSubRouteSchedules,
+	"triggers":                 projectSubRouteTriggers,
+	"trigger-events":           projectSubRouteTriggers,
+	"webhook-endpoints":        projectSubRouteTriggers,
 	"metrics-summary":          projectSubRouteMetrics,
 	"metrics":                  projectSubRouteMetrics,
 	"pre-start-hooks":          projectSubRoutePreStartHooks,
 	"settings":                 projectSubRouteSettings,
 	"messaging-policy":         projectSubRouteMessagingPolicy,
+	"message-policies":         projectSubRouteMessagePolicies,
 	"set-template":             projectSubRouteTemplate,
 	"clone":                    projectSubRouteTemplate,
 	"discover-templates":       projectSubRouteCatalogImport,
@@ -83,6 +91,8 @@ var projectSubRouteTable = map[string]projectSubRouteKind{
 	"git-identity":             projectSubRouteGitHub,
 	"visitors":                 projectSubRouteVisitors,
 	"leave":                    projectSubRouteLeave,
+	"decisions":                projectSubRouteDecisions,
+	"trigger-sources":          projectSubRouteTriggerSources,
 }
 
 // projectSubRouteListed reports whether subPath (the path after

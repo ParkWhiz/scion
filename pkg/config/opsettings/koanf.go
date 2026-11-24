@@ -68,6 +68,13 @@ var layer0Prefixes = []string{
 	"server.env",
 	"server.hub.hub_id",
 	"server.hub.gcp_project_id",
+	// Plugin hub_url (ptone/scion#555): read once at startup and handed to
+	// broker plugins; the server-config API refuses it in every mode.
+	"server.hub.internal_url",
+	// Hosted Hub import source allowlist (ptone/scion#8651): read once at
+	// startup from the settings file only (no env); the server-config API
+	// refuses it in every mode.
+	"server.hub.allowed_import_sources",
 	// Hub class (test admin tier gate input). Layer-0 so no DB section can
 	// hold it; the server-config API additionally refuses it in every mode,
 	// including workstation hubs where other Layer-0 keys are writable.
@@ -91,6 +98,8 @@ var layer0Prefixes = []string{
 	// ticker and the clamp on LaunchTimeout are both established at startup.
 	"server.hub.launch_timeout",
 	"server.hub.launch_keepalive_seconds",
+	// Audit record retention — read into ServerConfig at startup (ptone/scion#2232).
+	"server.hub.audit_retention_days",
 	// Request performance tracing — the middleware and the authorization
 	// store and audit-emitter decorators are installed at startup.
 	"server.hub.perf_trace",
@@ -115,6 +124,15 @@ var layer0Prefixes = []string{
 	// Web chat search limits (timeout, hub-wide cap) — read into
 	// ServerConfig at startup (ptone/scion#7586).
 	"server.hub.chat",
+	// System One rule evaluation ceiling (max_eval_time) and operator-only
+	// provider named-secret extras (secret_names) — read into ServerConfig at
+	// startup (ptone/scion#8044, ptone/scion#8414).
+	"server.hub.system_one",
+	config.SystemOneSecretNamesKey,
+	// Recurring schedule limits — read into ServerConfig at startup.
+	"server.hub.schedules",
+	// Default message mode of new agents — read into ServerConfig at startup.
+	"server.hub.default_message_mode",
 	// Separate relay process settings (scion server --role relay) — read
 	// at startup.
 	"server.relay",
@@ -145,6 +163,8 @@ var koanfPathToJSONField = map[string]map[string]string{
 	"lifecycle": {
 		"server.hub.auto_suspend_stalled":          "auto_suspend_stalled",
 		"server.hub.stalled_threshold":             "stalled_threshold",
+		"server.hub.auto_suspend_idle":             "auto_suspend_idle",
+		"server.hub.idle_suspend_after":            "idle_suspend_after",
 		"server.hub.soft_delete_retention":         "soft_delete_retention",
 		"server.hub.soft_delete_retain_files":      "soft_delete_retain_files",
 		"server.hub.start_claim_lease_ttl":         "start_claim_lease_ttl",
@@ -161,11 +181,13 @@ var koanfPathToJSONField = map[string]map[string]string{
 		"server.hub.monitoring_dashboard_url":    "monitoring_dashboard_url",
 	},
 	"github_app": {
-		"server.github_app.app_id":           "app_id",
-		"server.github_app.api_base_url":     "api_base_url",
-		"server.github_app.webhooks_enabled": "webhooks_enabled",
-		"server.github_app.installation_url": "installation_url",
-		"server.github_app.private_key_path": "private_key_path",
+		"server.github_app.app_id":                  "app_id",
+		"server.github_app.api_base_url":            "api_base_url",
+		"server.github_app.webhooks_enabled":        "webhooks_enabled",
+		"server.github_app.installation_url":        "installation_url",
+		"server.github_app.private_key_path":        "private_key_path",
+		"server.github_app.app_slug":                "app_slug",
+		"server.github_app.command_mention_aliases": "command_mention_aliases",
 	},
 	"auto_expose_ports": {
 		"auto_expose_ports.enabled": "enabled",
@@ -183,6 +205,9 @@ var koanfPathToJSONField = map[string]map[string]string{
 	},
 	"agent_secrets": {
 		"agent_secrets.user_scope_only": "user_scope_only",
+	},
+	"broker_policy": {
+		"broker_policy.admin_managed_only": "admin_managed_only",
 	},
 	"project_defaults": {
 		"project_defaults.default_scratchpad": "default_scratchpad",
@@ -211,6 +236,8 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 	"lifecycle": {
 		"auto_suspend_stalled":          "server.hub.auto_suspend_stalled",
 		"stalled_threshold":             "server.hub.stalled_threshold",
+		"auto_suspend_idle":             "server.hub.auto_suspend_idle",
+		"idle_suspend_after":            "server.hub.idle_suspend_after",
 		"soft_delete_retention":         "server.hub.soft_delete_retention",
 		"soft_delete_retain_files":      "server.hub.soft_delete_retain_files",
 		"start_claim_lease_ttl":         "server.hub.start_claim_lease_ttl",
@@ -227,11 +254,13 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 		"monitoring_dashboard_url":    "server.hub.monitoring_dashboard_url",
 	},
 	"github_app": {
-		"app_id":           "server.github_app.app_id",
-		"api_base_url":     "server.github_app.api_base_url",
-		"webhooks_enabled": "server.github_app.webhooks_enabled",
-		"installation_url": "server.github_app.installation_url",
-		"private_key_path": "server.github_app.private_key_path",
+		"app_id":                  "server.github_app.app_id",
+		"api_base_url":            "server.github_app.api_base_url",
+		"webhooks_enabled":        "server.github_app.webhooks_enabled",
+		"installation_url":        "server.github_app.installation_url",
+		"private_key_path":        "server.github_app.private_key_path",
+		"app_slug":                "server.github_app.app_slug",
+		"command_mention_aliases": "server.github_app.command_mention_aliases",
 	},
 	"auto_expose_ports": {
 		"enabled": "auto_expose_ports.enabled",
@@ -249,6 +278,9 @@ var jsonFieldToKoanfPaths = map[string]map[string]string{
 	},
 	"agent_secrets": {
 		"user_scope_only": "agent_secrets.user_scope_only",
+	},
+	"broker_policy": {
+		"admin_managed_only": "broker_policy.admin_managed_only",
 	},
 	"project_defaults": {
 		"default_scratchpad": "project_defaults.default_scratchpad",
@@ -281,6 +313,8 @@ func ExtractSectionFromKoanf(k *koanf.Koanf, sectionName string) (json.RawMessag
 	switch sectionName {
 	case "telemetry":
 		return extractSubtree(k, "telemetry")
+	case BrandingSectionName:
+		return extractSubtree(k, config.BrandingSectionKey)
 	case "runtimes":
 		return extractSubtree(k, "runtimes")
 	case "profiles":
@@ -372,6 +406,8 @@ func loadSectionIntoKoanf(k *koanf.Koanf, sectionName string, doc json.RawMessag
 	switch sectionName {
 	case "telemetry":
 		return loadPrefixed(k, "telemetry", raw)
+	case BrandingSectionName:
+		return loadPrefixed(k, config.BrandingSectionKey, raw)
 	case "runtimes":
 		return loadPrefixed(k, "runtimes", raw)
 	case "profiles":
@@ -405,7 +441,12 @@ func loadPrefixed(k *koanf.Koanf, prefix string, raw map[string]interface{}) err
 	if len(pruned) == 0 {
 		return nil
 	}
-	return k.Load(confmap.Provider(map[string]interface{}{prefix: pruned}, ""), nil)
+	wrapped := pruned
+	segs := strings.Split(prefix, ".")
+	for i := len(segs) - 1; i >= 0; i-- {
+		wrapped = map[string]interface{}{segs[i]: wrapped}
+	}
+	return k.Load(confmap.Provider(wrapped, ""), nil)
 }
 
 // withoutEmptyMaps returns a copy of m without nested maps that are empty,
@@ -528,10 +569,26 @@ func init() {
 	}
 }
 
+// subtreeSectionPrefixes maps subtree-extracted sections whose koanf prefix is
+// not "<section>." to their koanf root prefix.
+var subtreeSectionPrefixes = map[string]string{
+	BrandingSectionName: config.BrandingSectionKey,
+}
+
 // SectionKeyFromKoanfPath returns the JSON field name (section-level key) for a
 // given koanf path, or empty string if the path is not in the registry.
 func SectionKeyFromKoanfPath(koanfPath string) string {
-	return koanfPathToJSONKey[koanfPath]
+	if k := koanfPathToJSONKey[koanfPath]; k != "" {
+		return k
+	}
+	for secName, prefix := range subtreeSectionPrefixes {
+		if rest, ok := strings.CutPrefix(koanfPath, prefix+"."); ok && !strings.Contains(rest, ".") {
+			if OwningSection(koanfPath) == secName {
+				return rest
+			}
+		}
+	}
+	return ""
 }
 
 // KoanfPathFromSectionKey returns the full koanf path for a section-level JSON
@@ -539,6 +596,12 @@ func SectionKeyFromKoanfPath(koanfPath string) string {
 func KoanfPathFromSectionKey(sectionName, jsonKey string) string {
 	if mapping, ok := jsonFieldToKoanfPaths[sectionName]; ok {
 		return mapping[jsonKey]
+	}
+	if prefix, ok := subtreeSectionPrefixes[sectionName]; ok && jsonKey != "" && !strings.Contains(jsonKey, ".") {
+		kp := prefix + "." + jsonKey
+		if OwningSection(kp) == sectionName {
+			return kp
+		}
 	}
 	return ""
 }

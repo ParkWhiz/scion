@@ -165,7 +165,7 @@ func TestClassifyExistingAgent_ResumeMemory(t *testing.T) {
 		req  CreateAgentRequest
 		want existingAgentBranch
 	}{
-		{"suspended memory, plain start", memoryRow("suspended"), plain, existingBranchStart},
+		{"suspended memory, plain start", memoryRow("suspended"), plain, existingBranchNone},
 		{"suspended memory, resume", memoryRow("suspended"), resume, existingBranchStart},
 		{"created memory, plain start", memoryRow("created"), plain, existingBranchStart},
 		{"provisioning memory, plain start", memoryRow("provisioning"), plain, existingBranchStart},
@@ -178,7 +178,8 @@ func TestClassifyExistingAgent_ResumeMemory(t *testing.T) {
 		{"plain error row, force resume", memoryRow(""), CreateAgentRequest{Resume: true, ForceResume: true}, existingBranchStart},
 		// Memory is ignored while a launch is active.
 		{"active launch keeps the stored phase", &store.Agent{Phase: string(state.PhaseError), LaunchResumePhase: "suspended", LaunchState: store.LaunchStateActive}, plain, existingBranchNone},
-		{"suspended row", &store.Agent{Phase: string(state.PhaseSuspended)}, plain, existingBranchStart},
+		{"suspended row, plain start", &store.Agent{Phase: string(state.PhaseSuspended)}, plain, existingBranchNone},
+		{"suspended row, resume", &store.Agent{Phase: string(state.PhaseSuspended)}, resume, existingBranchStart},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -397,14 +398,22 @@ var asyncStartPhaseReadAllowlist = map[string]int{
 	"handlers_agent_lifecycle.go:guardAgentPhaseTransition: currentPhase := state.Phase(agent.Phase)":                                                                         1,
 	"handlers_agent_lifecycle.go:handleAgentLifecycle: fmt.Sprintf(\"Cannot suspend agent in phase %q. Only running agents can be suspended.\", agent.Phase), nil)":           1,
 	"handlers_agent_lifecycle.go:handleAgentLifecycle: forcedRecovery := agent.Phase == string(state.PhaseError) && rest == string(state.PhaseError) && startReq.ForceResume": 1,
-	"handlers_agent_lifecycle.go:handleAgentLifecycle: if agent.Phase != string(state.PhaseRunning) {":                                                                        1,
-	"handlers_agent_lifecycle.go:handleAgentLifecycle: if agent.Phase != string(state.PhaseSuspended) {":                                                                      1,
-	"handlers_agent_lifecycle.go:handleAgentLifecycle: isBrokerQuotaCountedPhase(agent.Phase) && agent.DeletedAt.IsZero() && !deletionActive(agent) {":                        1,
-	"handlers_agent_lifecycle.go:handleAgentLifecycle: newPhase = agent.Phase":                                                                                                2,
-	"handlers_agent_lifecycle.go:handleAgentLifecycle: startFromRest = !isBrokerQuotaCountedPhase(agent.Phase)":                                                               1,
-	"handlers_agent_lifecycle.go:handleStopAllAgents: if agent.Phase != string(state.PhaseRunning) {":                                                                         1,
-	"handlers_agent_lifecycle.go:handleStopAllAgents: if startInFlightPhase(agent.Phase) {":                                                                                   1,
-	"handlers_agent_lifecycle.go:updateAgentStatus: oldPhase := agent.Phase":                                                                                                  1,
+	// Suspend and stop-all gates (not start-branch selectors): allow
+	// overriding an in-flight idle auto-suspend claim even after the
+	// container reported stopping.
+	"handlers_agent_lifecycle.go:handleAgentLifecycle: if agent.Phase != string(state.PhaseRunning) && !idleSuspending {":                              1,
+	"handlers_agent_lifecycle.go:handleAgentLifecycle: if agent.Phase != string(state.PhaseSuspended) {":                                               1,
+	"handlers_agent_lifecycle.go:handleAgentLifecycle: isBrokerQuotaCountedPhase(agent.Phase) && agent.DeletedAt.IsZero() && !deletionActive(agent) {": 1,
+	"handlers_agent_lifecycle.go:handleAgentLifecycle: newPhase = agent.Phase":                                                                         2,
+	"handlers_agent_lifecycle.go:handleAgentLifecycle: startFromRest = !isBrokerQuotaCountedPhase(agent.Phase)":                                        1,
+	"handlers_agent_lifecycle.go:handleStopAllAgents: if agent.Phase != string(state.PhaseRunning) && !wasIdleSuspending {":                            1,
+	"handlers_agent_lifecycle.go:handleStopAllAgents: if startInFlightPhase(agent.Phase) {":                                                            1,
+	"handlers_agent_lifecycle.go:updateAgentStatus: oldPhase := agent.Phase":                                                                           1,
+	// Pre-action snapshots for third-party notice dedup (ptone/scion#8695);
+	// not start-path selectors.
+	"handlers_agent_lifecycle.go:handleAgentLifecycle: preActionPhase, preActionSuspendReason := agent.Phase, agent.SuspendReason": 1,
+	"handlers_agent_lifecycle.go:queueOfflineStop: preActionPhase, preActionSuspendReason := agent.Phase, agent.SuspendReason":     1,
+	"handlers_agent_lifecycle.go:suspendAgent: preActionPhase, preActionSuspendReason := agent.Phase, agent.SuspendReason":         1,
 	// A write guard, not a branch selector: the message reapply after a
 	// refined report writes only while the row is still in the phase it read.
 	"start_claim.go:reapplyStartLaunchFailureMessage: err := s.store.UpdateAgentStatus(wctx, a.ID, store.AgentStatusUpdate{Message: msg, IfPhase: a.Phase})": 1,

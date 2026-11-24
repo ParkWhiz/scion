@@ -18,6 +18,11 @@ _Avoid_: worker, bot, instance, process
 An agent spawned by another agent; "sub" only from the orchestrating user's view, since it is a full agent in capability.
 _Avoid_: helper, thread, worker thread
 
+**Execution container**:
+Any agent running the reserved built-in `shell` harness-config (no LLM harness). Users log into CLI tools inside it manually so credentials stay in the container's `$HOME` (never in `/workspace`) and are never exposed to LLM agents, and may register one in their user profile as their *default execution container* for approved commands.
+_Avoid_: shell agent, execution environment, exec profile
+_See also_: Agent, Harness-config, Agent home
+
 **Reincarnation**:
 Migrating an existing agent to a new *generation*: the Hub re-resolves its template, image, and harness-config, then starts it again with the same agent ID and slug and a handoff as its first task. Done with `scion reincarnate`. Distinct from *restart* (same config) and *resume* (same harness session).
 
@@ -102,7 +107,7 @@ A workspace sharing mode where one workspace directory is mounted into every age
 _Avoid_: shared mount, plain workspace
 
 **Worktree-per-agent**:
-A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history (with the shared `.git` root mounted read-only into each container). Supported on repositories linked to the local workstation Hub (registered with this mode automatically; the worktrees are of your own checkout) and on Hub-managed git projects created with `worktree-per-agent` (see "Linked git projects" in the docs); not supported on Kubernetes.
+A workspace sharing mode where each agent gets its own git worktree over a shared checkout, isolating working trees while sharing one clone's history (with the shared `.git` root mounted read-only into each container). Supported on repositories linked to the local workstation Hub (registered with this mode automatically; the worktrees are of your own checkout) and on Hub-managed git projects created with `worktree-per-agent` (see "Linked git projects" in the docs); not supported on Kubernetes or Cloud Run Instances (`cloudrun-sandbox` is unaffected).
 _Avoid_: worktree mode, shared checkout
 
 **Clone-per-agent**:
@@ -226,6 +231,11 @@ _Avoid_: service, module, role
 A server process running both the Hub and Runtime Broker components together (the default in workstation mode).
 _Avoid_: hub-broker, all-in-one, standalone, monolith
 
+**Console** (web UI mode):
+The management view in the web UI's three-way header mode switcher (**Console**, **Chat**, **Terminals**), holding the left-hand navigation and the overview, project, agent, Runtime Broker, and admin pages. Distinct from **Dashboard**, which is the overview landing page (`/`) inside Console's left-hand navigation.
+_Avoid_: Dashboard (when naming the mode-switcher option rather than the `/` overview page)
+_See also_: Native Web Chat
+
 **Secret**:
 A credential made available to an agent at runtime (e.g. API keys, tokens). A harness-config's `secrets` field *declares* which secrets an agent needs; the **Secret Backend** — a pluggable store (local SQLite for development, GCP Secret Manager in production, selected via `SCION_SERVER_SECRETS_BACKEND`) — *stores and resolves* them, scoped by user, project, runtime broker, or hub, and injects them into the container. Also holds the Hub's signing keys.
 _Avoid_: credential, vault, secret store, env secret
@@ -340,7 +350,7 @@ _Avoid_: group, set, group chat, room, thread
 _See also_: Group (different concept — hub users, not recipients), Thread Group (different concept — a project's threads, not recipients)
 
 **Message Mode**:
-A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of five values: **none**, **lineage**, **branch**, **project** (the default), or **hub**. Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
+A per-agent setting that controls which actors (users and agents) can send messages to that agent. One of five values: **none**, **lineage**, **branch**, **project** (the built-in default unless the operator sets `server.hub.default_message_mode`), or **hub**. Set by the agent's owner or a project admin via the `set_message_mode` action; changeable at any time with immediate effect. Stored on the agent record as `message_mode`.
 _Avoid_: messaging mode, communication mode, access mode
 _See also_: Ancestry chain, Piercing, Hub mode
 
@@ -367,16 +377,16 @@ A message mode that seals the agent from all messaging except system-plane notic
 _Avoid_: sealed, quarantined (informal usage acceptable in UI confirmation dialogs, not in technical docs)
 
 **Notification**:
-An event delivered when an agent reaches a tracked trigger activity (e.g. `completed`, `waiting_for_input`, `limits_exceeded`). Recipients register a **Subscription** — scoped to a single agent or to a whole project, naming which trigger activities fire it and whether an agent or a user receives it. Backs `scion notifications` and the `--notify` flag on `scion message`.
-_Avoid_: alert, event (for the notification), watch (for the subscription)
-_See also_: Activity (notifications fire on activity values)
+An event delivered when an agent reaches a tracked trigger activity (e.g. `completed`, `waiting_for_input`, `limits_exceeded`). Recipients register a **Subscription** — scoped to a single agent or to a whole project, naming which trigger activities fire it and whether an agent or a user receives it. Backs `scion notifications` and the `--notify` flag on `scion message`. Note that a notification's *trigger activity* is distinct from an event **Trigger** (under [Triggers](#triggers)).
+_Avoid_: alert, event (for the notification), watch (for the subscription), trigger (bare, when referring to a notification's trigger activity — write *trigger activity* or *notification trigger*)
+_See also_: Activity (notifications fire on activity values), Trigger (distinct concept, same word)
 
 **Piercing** (message authorization):
 The ability of a privileged user to bypass an agent's message mode restrictions. Super-admins pierce all modes including none. Project owners pierce lineage and branch modes. Piercing applies only to user identities — it is never inherited by an owner's agents.
 _Avoid_: override, bypass (too generic)
 
 **Project mode** (message mode):
-The default message mode. Any user with the `agent:message` permission in the project scope can message the agent, and any same-project agent in project or branch mode can message it. The most permissive mode.
+The built-in default message mode (unless the operator sets `server.hub.default_message_mode`). Any user with the `agent:message` permission in the project scope can message the agent, and any same-project agent in project or branch mode can message it. The most permissive mode.
 _Avoid_: open mode, public mode
 
 **Thread Group**:
@@ -384,29 +394,29 @@ A named set of a project's group conversations (threads), owned by the project a
 _Avoid_: group (bare), folder, channel, conversation group, thread folder
 _See also_: Group (hub users, not threads), Message Group (recipients of one send, not threads), Native Web Chat
 
-**Decision** (choices):
-One thing an agent needs a human to decide, posted in a choice prompt. It has a per-agent **key** (one the agent picks, such as `D234`, which has at least one non-digit, or a number the Hub assigns from a per-agent counter, such as `17`), **versions** (reposting the key with `--update` adds one), and a **status**: `pending`, `decided` or `replaced`. It is named across versions by `<asker-agent-uuid>/<key>`, and one version by `<asker-agent-uuid>/<key>@<version>`. The feature as a whole is called **choices** (the `web.chat_choices` experiment).
+**Decision** (decisions):
+One thing an agent needs a human to decide, posted in a decision prompt. It has a per-agent **key** (one the agent picks, such as `D234`, which has at least one non-digit, or a number the Hub assigns from a per-agent counter, such as `17`), **versions** (reposting the key with `--update` adds one), and a **status**: `pending`, `decided` or `replaced`. It is named across versions by `<asker-agent-uuid>/<key>`, and one version by `<asker-agent-uuid>/<key>@<version>`. The feature as a whole is called **Decisions** (the `web.decisions` experiment).
 _Avoid_: prompt (for the decision), poll, ticket, request
-_See also_: Question, Choice, Answer, Choice prompt
+_See also_: Question, Choice, Answer, Decision prompt
 
-**Question** (choices):
+**Question** (decisions):
 The text of a decision: a markdown field the agent writes.
 _Avoid_: prompt, title
 _See also_: Decision
 
-**Choice** (choices):
+**Choice** (decisions):
 One of the options offered for a decision: an id (agent-supplied or `1..N` by position), a plain-text label, and an optional description.
 _Avoid_: option, button (for the data; acceptable for the UI control)
 _See also_: Decision, Answer
 
-**Answer** (choices):
-The choice recorded for a decision. It is **direct** (a user's click) or **interpreted** (recorded by the asking agent from a user's free-text reply), and a direct answer may **confirm** or **override** an interpreted one. The answer comes back to the agent as a `choice-response` message.
+**Answer** (decisions):
+The choice recorded for a decision. It is **direct** (a user's click) or **interpreted** (recorded by the asking agent from a user's free-text reply), and a direct answer may **confirm** or **override** an interpreted one. The answer comes back to the agent as a `decision-response` message.
 _Avoid_: decision (for the answer), vote, selection, response (for the record)
 _See also_: Decision, Decision log
 
-**Choice prompt**:
-The message (type `choice-prompt`) that carries one or more decisions. Its text also holds a markdown copy of them, so surfaces that cannot show the cards still show the decisions.
-_Avoid_: choices message, poll, question message
+**Decision prompt**:
+The message (type `decision-prompt`) that carries one or more decisions. Its text also holds a markdown copy of them, so surfaces that cannot show the cards still show the decisions.
+_Avoid_: choice prompt, choices message, poll, question message
 _See also_: Decision, Answer
 
 **Decision log**:
@@ -430,9 +440,9 @@ _Avoid_: status, stage, lifecycle state
 _See also_: Activity (what the agent is *doing*, vs. its container stage)
 
 **Activity**:
-What a running agent is currently doing, such as `thinking`, `executing`, `waiting_for_input`, or `blocked`. Distinct from phase.
+What a running agent is currently doing, such as `thinking`, `executing`, `waiting_for_input`, `blocked`, or `harness_error`. Distinct from phase.
 _Avoid_: status, state, mode
-_See also_: Phase (the container stage), Blocked (a specific activity value)
+_See also_: Phase (the container stage), Blocked and Harness error (specific activity values)
 
 **Blocked**:
 The activity an agent assigns to itself when intentionally waiting for an expected event, so it is not mistaken for stalled.
@@ -440,12 +450,22 @@ _Avoid_: stalled, stuck, idle, waiting
 _See also_: Activity (Blocked is one of its values)
 
 **Stalled**:
-A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `waiting_for_input`, `completed`, `limits_exceeded` or `offline` are excluded. Distinct from `offline`, which means no heartbeat for over 2 minutes.
+A platform-set activity for a `running` agent whose heartbeat is still arriving (the process is alive) but that has produced no activity events within the stall threshold (`server.hub.stalled_threshold`, default 5 minutes; a value under 2 minutes falls back to the default). Indicates a hung agent. Agents whose activity is `blocked`, `idle`, `waiting_for_input`, `completed`, `limits_exceeded`, `harness_error` or `offline` are excluded, and so is an agent whose container reported live work within the threshold. A stalled agent whose container then reports live work gets its previous activity back. A tool call stops holding off the stall after 60 minutes, or after 10 minutes without progress, but its agent is still never auto-suspended. A stalled notification says how long the agent has had no activity. Distinct from `offline`, which means no heartbeat for over 2 minutes.
 _Avoid_: stuck, hung (as a state name), offline
-_See also_: Activity, Blocked, Auto-Suspend
+_See also_: Activity, Blocked, Harness error, Auto-Suspend, Live work
+
+**Harness error**:
+The `harness_error` activity of a `running` agent whose harness process is alive at its prompt but reported that a model, API or auth error ended its turn (for example a 400 from the model provider). The reason is in the agent's message, as `<source>: <text>` (for example `model API: APIError (status 400)`), redacted and at most 300 characters. Shown as `harness error` in `scion list` and the web UI; notifies the `HARNESS_ERROR` trigger, which is in the default triggers. Cleared by the harness's next turn-progress event (a new prompt, model call or tool call), so a new message to the agent retries. Excluded from stall detection; still marked `offline` when heartbeats stop. Distinct from the `error` phase, which means the harness process is dead, and from the `ERROR` trigger, which matches only that phase.
+_Avoid_: error (for a live agent), crashed, failed
+_See also_: Activity, Phase, Stalled
+
+**Live work**:
+Work in an agent's container that emits no activity events, such as a build, a test run or a background job the agent is waiting on. `sciontool init` samples `/proc` on each 30-second Hub heartbeat. It reports a tool call in flight: while the activity is `executing`, a process the harness started after the tool call began, whatever its CPU use. It also reports a process doing CPU work (at least 1% of one core since the previous sample). The tmux server, the pane shells, the harness's own process, sciontool and its services don't count. The Hub records it as `lastLiveWorkAt` and `lastLiveProcessAt`. An agent with live work is not marked `stalled` and is not auto-suspended. A tool call holds off the stall for at most 60 minutes, and for only 10 minutes when its processes make no progress (no change in their set, CPU time or I/O). Detection never sets an activity, except to restore the one a stall replaced. While live work runs, `sciontool init`'s API-error watchdog also holds off reporting a swallowed model API error as `harness_error`: the turn is not over.
+_Avoid_: busy (as a state name)
+_See also_: Stalled, Auto-Suspend
 
 **Auto-Suspend**:
-A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
+A Hub behavior, off by default (`server.hub.auto_suspend_stalled`), that suspends an agent when it is marked `stalled`, reclaiming its container. Agents whose harness does not support session resume are skipped, and so are agents whose container reported live work in the last 90 seconds. A message sent with wake (`scion message --wake`, or accepting the web UI's wake prompt) resumes the agent and then delivers it; a message without wake is not delivered (`scion message` gets `409 agent_not_running`).
 _Avoid_: idle timeout, auto-stop
 _See also_: Stalled, Phase
 
@@ -514,9 +534,40 @@ The Hub handing an agent lifecycle command to the appropriate runtime broker for
 _Avoid_: schedule, route, assign, delegate
 
 **Schedule**:
-A time-based trigger that fires an action — sending a message or dispatching (starting) an agent from a template — either once (a one-shot *scheduled event*, via `--at <time>` or `--in <duration>`) or repeatedly (a recurring *schedule* on a 5-field cron expression). Backs `scion schedule` and the `--at`/`--in` flags on `scion message`.
+A time-based schedule that fires an **Action** — sending a message, dispatching (starting) an agent from a template, or running a command (`exec`) — either once (a one-shot *scheduled event*, via `--at <time>` or `--in <duration>`) or repeatedly (a recurring *schedule* on a 5-field cron expression). Backs `scion schedule` and the `--at`/`--in` flags on `scion message`. Shares the Hub's fire core with **Trigger**.
 _Avoid_: cron job (recurring only), scheduled message (too narrow), reminder, timer
-_See also_: Dispatch
+_See also_: Dispatch, Trigger, Action, Fire
+
+## Triggers
+
+Event-driven automation gated by the `hub.triggers` experiment (`scion trigger`). An external **Source** delivers an **Event** into the Hub's durable inbox; matching **Trigger** definitions evaluate rules and execute an **Action**, recording each attempt as a **Fire**.
+
+> **Disambiguation rule:** "Trigger" is overloaded across three Scion concepts. In the event-automation system below, **Trigger** is the canonical project-scoped rule resource (`triggers` table, `scion trigger`). In **Notifications**, always qualify the activity that fires a subscription as a *trigger activity* (or *notification trigger*). In container/harness **Lifecycle Hooks** (such as **Pre-Start Hook** or harness hook events), say *hook point* or *lifecycle hook event*, never bare "trigger".
+
+**Source** (triggers):
+An origin that emits **Events** into a project's trigger inbox, identified by `(source_kind, source_id)`. In Stage 1, a source is a project-owned **Webhook endpoint** (`source_kind: "webhook"`, managed with `scion trigger webhook`, receiving signed `POST /api/v1/hooks/{id}` requests); Stage 3 adds GitHub App repository sources (`source_kind: "github"`). Deleting a webhook endpoint automatically pauses dependent triggers with `status_reason: "source_deleted"`.
+_Avoid_: producer, provider, webhook (when naming the abstract source concept rather than the `webhook` source kind)
+_See also_: Event, Trigger
+
+**Event** (triggers):
+An immutable durable inbox record (`trigger_events`) captured when a **Source** delivers a payload (for example, an HMAC-verified `POST /api/v1/hooks/{id}`). Carries a canonical `type` (such as `webhook.received` or `webhook.<name>`), a `subject`, a `dedup_key` for idempotent delivery, structured `attributes`, allow-listed `headers`, and a bounded JSON `payload`, and is processed asynchronously through the Hub's durable queue (`trigger.event`). Distinct from the internal **Event Bus** (live SSE change feed) and from a one-shot *scheduled event*.
+_Avoid_: message (for the inbound event), payload (when referring to the whole envelope/record), webhook call
+_See also_: Source, Trigger, Fire, Event Bus (distinct concept)
+
+**Trigger**:
+A project-scoped automation rule (`triggers`, managed with `scion trigger`) attached to a **Source** that matches incoming **Events** (by `match_types` and optional ordered rules) and executes an **Action** under the authoring principal's recorded authority. A trigger has a status (`active` or `paused`) and may be paused by the Hub with a structured `status_reason` (`creator_deleted`, `target_deleted`, or `source_deleted`). Distinct from a **Notification** *trigger activity* and from a **Pre-Start Hook** / lifecycle hook point.
+_Avoid_: webhook rule, automation, hook, listener
+_See also_: Source, Event, Action, Fire, Schedule, Notification (distinct — "trigger activity"), Pre-Start Hook (distinct — lifecycle hook point)
+
+**Action** (triggers / schedules):
+The Hub-executed operation a **Trigger** or **Schedule** performs when it fires, sharing one fire core and recorded-authority check. Built-in action types are `message` (deliver an event envelope to an agent, optionally waking or interrupting it), `dispatch_agent` (headless agent creation from a template), and `exec` (run a command over Conduit). Stage 1 triggers authorize `message` actions; `dispatch_agent` and `exec` are enabled for schedules and reserved for later trigger stages.
+_Avoid_: handler, job, step, task
+_See also_: Trigger, Fire, Schedule
+
+**Fire** (triggers / schedules):
+One execution attempt of a **Trigger** for a specific **Event** (stored as a `trigger_fires` row, unique per `(event_id, trigger_id)` for idempotency), or one execution of a **Schedule**. Moves from `firing` (with a leased horizon reaped on Hub restart) to a terminal status: `fired`, `skipped` (with a bounded reason such as rule evaluation failure or subject policy), `failed`, or `refused` (standing or authority check failed). Visible via `scion trigger history`.
+_Avoid_: run (for triggers; "run" is used for schedules and agent Run IDs), execution, invocation, delivery
+_See also_: Trigger, Event, Action, Run ID (distinct concept)
 
 ## Observability
 
@@ -556,5 +607,4 @@ Terms that recur in the codebase and may warrant canonical entries, but are **no
 - **Content Hash / Manifest** — SHA-based identity for template and harness-config content, used for cache validation and transfer between Hub and runtime brokers.
 - **Transfer** — the signed-URL mechanism that moves templates and harness-configs between the Hub and runtime brokers.
 - **Service Account** — a GCP identity an agent can assume for Google Cloud auth, registered with the Hub.
-- **Webhook / GitHub App** — external event triggers (e.g. GitHub webhooks) that can dispatch agents.
 - **OAuth provider** — a configurable identity provider (Google, GitHub) for CLI and web authentication.

@@ -511,8 +511,9 @@ func runDoctor() error {
 				opts.GKEMode = rtConfig.GKE
 			}
 			var srv *config.V1ServerConfig
-			if gs, _, gErr := config.LoadGlobalSettings(); gErr == nil && gs != nil {
+			if gs, _, gErr := config.LoadGlobalSettingsWithOverlay(); gErr == nil && gs != nil {
 				srv = gs.Server
+				opts.CreateServiceAccounts = doctorCreateServiceAccounts(vs, gs, profile)
 			}
 			opts.SharedDirStorageClass, opts.SharedDirStorageShared = doctorSharedDirStorage(vs, srv, profile)
 			opts.Server = srv
@@ -520,6 +521,23 @@ func runDoctor() error {
 	}
 	r.runtimeSection(rt.Name(), diag, opts)
 	return r.finish()
+}
+
+// doctorCreateServiceAccounts reports whether the active profile's runtime
+// entry sets create_service_accounts in the broker's global settings (with DB
+// overlay), never from a project's own settings.yaml.
+func doctorCreateServiceAccounts(vs, gs *config.VersionedSettings, profileName string) bool {
+	if vs == nil || gs == nil {
+		return false
+	}
+	if profileName == "" {
+		profileName = vs.ActiveProfile
+	}
+	p, ok := vs.Profiles[profileName]
+	if !ok || p.Runtime == "" {
+		return false
+	}
+	return gs.Runtimes[p.Runtime].CreateServiceAccounts
 }
 
 // hubChecks runs the Hub checks (D1-D4, D9) and reads the health summary
@@ -694,11 +712,24 @@ func (r *doctorReport) localSettingsChecks() {
 	if d14, ok := checkDoctorLegacyPlacementPreflightHere(); ok {
 		r.add(&r.HubChecks, d14)
 	}
+	// D15: flat Cloud Run instance diagnostics (local check, read-only):
+	// checks each flat cloudrun instance's credentials_file, API
+	// reachability, and iam.serviceAccounts.actAs across all configured
+	// agent service accounts using the instance's credentials.
+	var doctorServerCfg *config.V1ServerConfig
+	if nfsErr == nil && nfsSettings != nil {
+		doctorServerCfg = nfsSettings.Server
+	}
+	for _, c := range checkDoctorFlatCloudRunInstancesHere(doctorServerCfg) {
+		r.add(&r.HubChecks, c)
+	}
 
 	// D6: Telemetry Pipeline (local check)
 	r.add(&r.HubChecks, checkDoctorTelemetry())
 	// D7: Container Images (local check)
-	r.add(&r.HubChecks, checkDoctorContainerImages())
+	for _, c := range checkDoctorContainerImagesHere(nfsSettings) {
+		r.add(&r.HubChecks, c)
+	}
 	// D8: Credential Validity (local check)
 	r.add(&r.HubChecks, checkDoctorCredentialValidity())
 }
@@ -1308,74 +1339,6 @@ func checkDoctorTelemetry() scionruntime.CheckResult {
 		Name:    "telemetry",
 		Status:  "pass",
 		Message: fmt.Sprintf("Telemetry endpoint %s is reachable", endpoint),
-	}
-}
-
-// checkDoctorContainerImages performs D7: Container images check (local).
-// Note: This is a simplified check that scans for any images with "scion" in
-// the name. The design specifies checking per-configured-harness images, but
-// that requires loading the project's harness config which adds complexity.
-// A future enhancement could load harness configs and verify each image.
-func checkDoctorContainerImages() scionruntime.CheckResult {
-	// Find a container CLI (docker or podman)
-	var containerCLI string
-	for _, cli := range []string{"docker", "podman"} {
-		if _, err := exec.LookPath(cli); err == nil {
-			containerCLI = cli
-			break
-		}
-	}
-
-	if containerCLI == "" {
-		return scionruntime.CheckResult{
-			Name:    "container-images",
-			Status:  "skip",
-			Message: "No container runtime CLI found (docker/podman)",
-		}
-	}
-
-	imgCtx, imgCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer imgCancel()
-	out, err := exec.CommandContext(imgCtx, containerCLI, "images", "--format", "{{.Repository}}:{{.Tag}}").Output()
-	if err != nil {
-		return scionruntime.CheckResult{
-			Name:    "container-images",
-			Status:  "skip",
-			Message: fmt.Sprintf("Could not list %s images: %v", containerCLI, err),
-		}
-	}
-
-	imageOutput := strings.TrimSpace(string(out))
-	if imageOutput == "" {
-		return scionruntime.CheckResult{
-			Name:        "container-images",
-			Status:      "warn",
-			Message:     fmt.Sprintf("No scion container images found via %s", containerCLI),
-			Remediation: "Pull scion images or check image_registry configuration",
-		}
-	}
-
-	images := strings.Split(imageOutput, "\n")
-	scionImageCount := 0
-	for _, img := range images {
-		if strings.Contains(img, "scion") {
-			scionImageCount++
-		}
-	}
-
-	if scionImageCount == 0 {
-		return scionruntime.CheckResult{
-			Name:        "container-images",
-			Status:      "warn",
-			Message:     fmt.Sprintf("No scion container images found via %s", containerCLI),
-			Remediation: "Pull scion images or check image_registry configuration",
-		}
-	}
-
-	return scionruntime.CheckResult{
-		Name:    "container-images",
-		Status:  "pass",
-		Message: fmt.Sprintf("%d scion image(s) found via %s", scionImageCount, containerCLI),
 	}
 }
 

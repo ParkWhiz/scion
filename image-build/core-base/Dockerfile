@@ -44,8 +44,8 @@ ARG HELM_SHA256_ARM64=7944e3defd386c76fd92d9e6fec5c2d65a323f6fadc19bfb5e704e3eee
 # GO_VERSION is what gets installed when the base does not already meet the
 # floor. A base that ships something newer keeps it — these images serve many
 # consumers besides scion, so we do not downgrade one to suit the other.
-ARG GO_MIN_VERSION=1.26.1
-ARG GO_VERSION=1.26.1
+ARG GO_MIN_VERSION=1.26.11
+ARG GO_VERSION=1.26.11
 
 # Git is vendored from the Chainguard git image rather than compiled from
 # source. Chainguard tracks upstream closely (currently 2.55.0) and rebuilds on
@@ -186,9 +186,11 @@ ENV LC_ALL=C.UTF-8
 ENV EDITOR=nano
 ENV VISUAL=nano
 
-# Chrome DevTools MCP server and the playwright CLI, installed globally.
+# Chrome DevTools MCP server and the playwright CLI, installed globally, plus
+# Playwright's ffmpeg registry symlinks to system /usr/bin/ffmpeg.
 RUN --mount=type=secret,id=npmrc,target=/root/.npmrc,required=false \
-    /opt/scion-image-build/lib/install-core-toolchain.sh npm-tools
+    /opt/scion-image-build/lib/install-core-toolchain.sh npm-tools \
+    && /opt/scion-image-build/lib/install-core-toolchain.sh playwright-ffmpeg
 
 # Fail the build, not the agent, when this image does not satisfy what
 # scion-base needs from the layer beneath it. thick-prep ends with the exact

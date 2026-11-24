@@ -264,6 +264,10 @@ const (
 	// DeniedByTestAdminPolicy: the test-admin policy refuses the
 	// permission to an admin-kind test identity (decide step 0c).
 	DeniedByTestAdminPolicy DeniedBy = "test_admin_policy"
+
+	// DeniedByBrokerPolicy: the hub's admin-managed-only Runtime Broker
+	// policy (broker_policy.admin_managed_only) refuses the operation.
+	DeniedByBrokerPolicy DeniedBy = "broker_policy"
 )
 
 // Deny reasons of decide step 0c.
@@ -942,11 +946,11 @@ func (a *AuthzService) decide(ctx context.Context, request AuthzRequest) Decisio
 	}
 
 	// ── Step 5b2: Agent hub skill catalog (ptone/scion#1968) ──────────
-	// Agents may read the hub-wide (global/core) skill catalog. The
+	// Agents may read the hub-wide (global) skill catalog. The
 	// project-scoped JWT binding above cannot express that (a hub-scoped
 	// skill has no ProjectID, so scopeApplies rejects it), so add a
 	// synthetic system-scoped skill.read/skill.list binding. Step 5c strips
-	// it again for any skill that is not global/core, and the agent JWT
+	// it again for any skill that is not global, and the agent JWT
 	// restriction (7b) and delegation ceiling (10) still apply.
 	// A hub_delivery principal is skipped here too, before the AgentIdentity
 	// assertion: Step 0b already restricts it to ActionDeliver, so a
@@ -999,7 +1003,7 @@ func (a *AuthzService) decide(ctx context.Context, request AuthzRequest) Decisio
 	// #1916) ───────────────────────────────────────────────────────────
 	// The curated hub-member/hub-viewer roles carry skill/template/
 	// harness_config read/list at system scope purely so every hub member
-	// can browse the hub-wide (global/core) catalog. That grant must not
+	// can browse the hub-wide (global) catalog. That grant must not
 	// leak into user- or project-scoped records. applyHubWideScopeFilters
 	// (authz_boundary.go) is the single shared dispatcher for this rule —
 	// ptone/scion#2117's SystemAuthorityProof/MintTimeSystemGrant call the
@@ -1048,7 +1052,8 @@ func (a *AuthzService) decide(ctx context.Context, request AuthzRequest) Decisio
 	var constraintLoadFailed bool
 	acRestrictions, acErr := a.accessConstraintRestrictions(ctx, closure, resourceCtx)
 	if acErr != nil {
-		a.logger.Warn("failed to load access constraints (fail-closed)", "error", acErr)
+		logAuthzCheckFault(ctx, a.logger, "access_constraints",
+			"failed to load access constraints (fail-closed)", acErr)
 		acRestrictions = []Restriction{{
 			Kind:        "access_constraint_error",
 			Description: "constraint loading failed (fail-closed)",
@@ -1904,7 +1909,8 @@ func (a *AuthzService) loadAccessConstraintRestrictions(
 		// R-1 fix: deny (fail closed) when constraint loading errors.
 		// The design is explicit: "Store or group resolution errors fail
 		// closed." Returning a deny-all restriction ensures no over-grant.
-		a.logger.Warn("failed to load access constraints (fail-closed)", "error", err)
+		logAuthzCheckFault(ctx, a.logger, "access_constraints",
+			"failed to load access constraints (fail-closed)", err)
 		return []Restriction{{
 			Kind:        "access_constraint_error",
 			Description: "constraint loading failed (fail-closed)",
@@ -2829,8 +2835,9 @@ func (a *AuthzService) getEffectivePermissions(ctx context.Context, principalTyp
 		// Fail closed: group resolution failure means we cannot evaluate
 		// group_closure constraints correctly. Return empty permissions
 		// rather than silently skipping group constraints.
-		a.logger.Warn("failed to get effective groups for permission expansion (fail-closed)",
-			"principalType", principalType, "principalID", principalID, "error", err)
+		logAuthzCheckFault(ctx, a.logger, "effective_permissions_groups",
+			"failed to get effective groups for permission expansion (fail-closed)", err,
+			"principalType", principalType, "principalID", principalID)
 		return nil, fmt.Errorf("group resolution failed (fail-closed): %w", err)
 	}
 	for _, gid := range groupIDs {
@@ -2868,8 +2875,9 @@ func (a *AuthzService) getEffectivePermissions(ctx context.Context, principalTyp
 
 		rd, err := a.store.GetRoleDefinition(ctx, b.RoleDefinitionID)
 		if err != nil {
-			a.logger.Warn("failed to resolve role definition for binding",
-				"binding_id", b.ID, "role_definition_id", b.RoleDefinitionID, "error", err)
+			logAuthzCheckFault(ctx, a.logger, "effective_permissions_role_def",
+				"failed to resolve role definition for binding", err,
+				"binding_id", b.ID, "role_definition_id", b.RoleDefinitionID)
 			continue
 		}
 		for _, permID := range rd.Permissions {

@@ -47,11 +47,15 @@ import (
 type fakeGitHubForAssoc struct {
 	srv *httptest.Server
 
-	mu         sync.Mutex
-	access     map[string]map[string]githubapp.RepoAccess // token -> lower owner/repo -> access
-	repoStatus int                                        // when set, /repos answers this status
-	repoCalls  int
-	mints      []fakeMintRequest
+	mu             sync.Mutex
+	access         map[string]map[string]githubapp.RepoAccess // token -> lower owner/repo -> access
+	repoStatus     int                                        // when set, /repos answers this status
+	repoCalls      int
+	mints          []fakeMintRequest
+	appPermissions map[string]string
+	appStatus      int
+	appErrBody     string
+	appCalls       int
 }
 
 type fakeMintRequest struct {
@@ -62,8 +66,44 @@ type fakeMintRequest struct {
 
 func newFakeGitHubForAssoc(t *testing.T) *fakeGitHubForAssoc {
 	t.Helper()
-	f := &fakeGitHubForAssoc{access: map[string]map[string]githubapp.RepoAccess{}}
+	f := &fakeGitHubForAssoc{
+		access: map[string]map[string]githubapp.RepoAccess{},
+		appPermissions: map[string]string{
+			"contents":      "write",
+			"pull_requests": "write",
+			"issues":        "write",
+			"metadata":      "read",
+		},
+	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/app", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		f.mu.Lock()
+		f.appCalls++
+		status := f.appStatus
+		errBody := f.appErrBody
+		perms := make(map[string]string, len(f.appPermissions))
+		for k, v := range f.appPermissions {
+			perms[k] = v
+		}
+		f.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			if errBody != "" {
+				_, _ = w.Write([]byte(errBody))
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":          1,
+			"slug":        "fake-scion-app",
+			"permissions": perms,
+		})
+	})
 	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -117,6 +157,19 @@ func (f *fakeGitHubForAssoc) setRepoStatus(status int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.repoStatus = status
+}
+
+func (f *fakeGitHubForAssoc) setAppPermissions(perms map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.appPermissions = perms
+}
+
+func (f *fakeGitHubForAssoc) setAppStatus(status int, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.appStatus = status
+	f.appErrBody = body
 }
 
 func (f *fakeGitHubForAssoc) counts() (repoCalls int, mints []fakeMintRequest) {
@@ -750,7 +803,7 @@ func TestGitHubTokenSourceLabel_RequiresAuthorization(t *testing.T) {
 			dispatcher.SetGitHubAppMinter(minter)
 			env := map[string]string{}
 			var classes map[string]api.EnvKind
-			dispatcher.injectLifecycleGitHubToken(ctx, agent, env, &classes, "DispatchAgentStart")
+			dispatcher.deliverGitHubToken(ctx, agent, env, &classes, nil, nil, "DispatchAgentStart")
 
 			assert.Equal(t, []string{source.ID}, minter.authorized)
 			if tc.allow {
@@ -808,11 +861,10 @@ var allowedGitHubTokenPermissionFields = map[string]bool{
 	"metadata": true, "checks": true, "actions": true,
 }
 
-// A pull-only proof with an empty stored permission set ({} from PUT
-// github-permissions) still sends an explicit, read-only permissions map:
-// an access_tokens request without permissions would get every installation
-// permission. Revert check: before the fix the request had no permissions
-// key at all.
+// A pull-only proof with an empty stored permission set still sends an
+// explicit, read-only permissions map: an access_tokens request without
+// permissions would get every installation permission. Revert check: before
+// the fix the request had no permissions key at all.
 func TestGitHubAssociation_PullProofEmptyStoredPermissionsExplicitReadOnly(t *testing.T) {
 	srv, st := testServer(t)
 	ctx := context.Background()
@@ -824,8 +876,9 @@ func TestGitHubAssociation_PullProofEmptyStoredPermissionsExplicitReadOnly(t *te
 	gh.grant("ghp_puller", "acme/public", githubapp.RepoAccess{Pull: true})
 
 	p := createAssocProject(t, st, "perm-pull-empty", gh.remote("acme", "public"), "puller", ptrInt64(5901))
-	rec := doRequest(t, srv, http.MethodPut, "/api/v1/projects/"+p.ID+"/github-permissions", map[string]string{})
-	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	stored := reloadProject(t, st, p.ID)
+	stored.GitHubPermissions = &store.GitHubTokenPermissions{}
+	require.NoError(t, st.UpdateProject(ctx, stored))
 
 	_, _, err := srv.MintGitHubAppTokenForProject(ctx, reloadProject(t, st, p.ID))
 	require.NoError(t, err)
@@ -866,6 +919,313 @@ func TestGitHubAssociation_PushProofEmptyStoredPermissionsDefaultsOnly(t *testin
 	}, mints[0].Permissions)
 }
 
+// GET /api/v1/projects/{id}/github-permissions on a project with no explicit
+// permission grant reports the exact permission set that token minting requests
+// under a write-proven association, so displayed and minted defaults cannot drift.
+func TestProjectGitHubPermissions_DefaultDisplayedMatchesMinted(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+	gh := newFakeGitHubForAssoc(t)
+	configureFakeGitHubApp(t, srv, gh)
+
+	createAssocInstallation(t, st, 5903, "acme", "acme/widgets")
+	giveUserGitHubToken(t, srv, st, "pusher", "ghp_pusher")
+	gh.grant("ghp_pusher", "acme/widgets", githubapp.RepoAccess{Push: true, Pull: true})
+
+	p := createAssocProject(t, st, "perm-nil-default-match", gh.remote("acme", "widgets"), "pusher", ptrInt64(5903))
+	require.Nil(t, reloadProject(t, st, p.ID).GitHubPermissions)
+
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	var displayedMap map[string]string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayedMap))
+	var displayedStruct store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayedStruct))
+
+	_, _, err := srv.MintGitHubAppTokenForProject(ctx, reloadProject(t, st, p.ID))
+	require.NoError(t, err)
+	_, mints := gh.counts()
+	require.Len(t, mints, 1)
+
+	assert.Equal(t, store.GitHubTokenPermissions(githubapp.DefaultTokenPermissions()), displayedStruct)
+	assert.Equal(t, mints[0].Permissions, displayedMap, "displayed default permissions must match minted default permissions")
+}
+
+// A project row with a legacy stored empty permission set ({}) reads back the
+// same defaults from GET /github-permissions that token minting requests,
+// while leaving non-empty stored permission sets untouched.
+func TestProjectGitHubPermissions_LegacyEmptyRowMatchesMinted(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+	gh := newFakeGitHubForAssoc(t)
+	configureFakeGitHubApp(t, srv, gh)
+
+	createAssocInstallation(t, st, 5904, "acme", "acme/legacy")
+	giveUserGitHubToken(t, srv, st, "pusher", "ghp_pusher")
+	gh.grant("ghp_pusher", "acme/legacy", githubapp.RepoAccess{Push: true, Pull: true})
+
+	p := createAssocProject(t, st, "perm-legacy-empty", gh.remote("acme", "legacy"), "pusher", ptrInt64(5904))
+	stored := reloadProject(t, st, p.ID)
+	stored.GitHubPermissions = &store.GitHubTokenPermissions{}
+	require.NoError(t, st.UpdateProject(ctx, stored))
+
+	// Stored empty row reads back as unset from the store.
+	assert.Nil(t, reloadProject(t, st, p.ID).GitHubPermissions)
+
+	// GET github-permissions returns the defaults that minting uses.
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	var displayedMap map[string]string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayedMap))
+	var displayedStruct store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayedStruct))
+
+	_, _, err := srv.MintGitHubAppTokenForProject(ctx, reloadProject(t, st, p.ID))
+	require.NoError(t, err)
+	_, mints := gh.counts()
+	require.Len(t, mints, 1)
+
+	assert.Equal(t, store.GitHubTokenPermissions(githubapp.DefaultTokenPermissions()), displayedStruct)
+	assert.Equal(t, mints[0].Permissions, displayedMap, "displayed permissions for legacy empty row must match minted defaults")
+
+	// Direct handler defense-in-depth: an in-memory empty pointer also reads as defaults.
+	directRec := httptest.NewRecorder()
+	directReq := httptest.NewRequest(http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+	srv.handleProjectGitHubPermissions(directRec, directReq, &store.Project{
+		ID:                p.ID,
+		GitHubPermissions: &store.GitHubTokenPermissions{},
+	})
+	require.Equal(t, http.StatusOK, directRec.Code, "body: %s", directRec.Body.String())
+	var directDisplayed store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(directRec.Body.Bytes(), &directDisplayed))
+	assert.Equal(t, store.GitHubTokenPermissions(githubapp.DefaultTokenPermissions()), directDisplayed)
+
+	// Non-empty stored permission set is preserved untouched.
+	stored = reloadProject(t, st, p.ID)
+	stored.GitHubPermissions = &store.GitHubTokenPermissions{Contents: "read"}
+	require.NoError(t, st.UpdateProject(ctx, stored))
+
+	rec = doRequest(t, srv, http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var customDisplayed store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &customDisplayed))
+	assert.Equal(t, store.GitHubTokenPermissions{Contents: "read"}, customDisplayed)
+}
+
+func TestMintGitHubAppToken_NoStoredPerms_ReadOnlyApp(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+	gh := newFakeGitHubForAssoc(t)
+	gh.setAppPermissions(map[string]string{
+		"contents": "read",
+		"metadata": "read",
+	})
+	configureFakeGitHubApp(t, srv, gh)
+
+	createAssocInstallation(t, st, 5910, "acme", "acme/widgets")
+	giveUserGitHubToken(t, srv, st, "pusher", "ghp_pusher")
+	gh.grant("ghp_pusher", "acme/widgets", githubapp.RepoAccess{Push: true, Pull: true})
+
+	p := createAssocProject(t, st, "perm-ro-app", gh.remote("acme", "widgets"), "pusher", ptrInt64(5910))
+	require.Nil(t, reloadProject(t, st, p.ID).GitHubPermissions)
+
+	// GET github-permissions returns the capped defaults matching what minting requests.
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var displayed store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayed))
+	assert.Equal(t, store.GitHubTokenPermissions{Contents: "read", Metadata: "read"}, displayed)
+
+	tok, _, err := srv.MintGitHubAppTokenForProject(ctx, reloadProject(t, st, p.ID))
+	require.NoError(t, err)
+	assert.NotEmpty(t, tok)
+
+	_, mints := gh.counts()
+	require.Len(t, mints, 1)
+	assert.Equal(t, map[string]string{
+		"contents": "read",
+		"metadata": "read",
+	}, mints[0].Permissions, "must request exactly defaults intersected with read-only App grant")
+
+	updated := reloadProject(t, st, p.ID)
+	require.NotNil(t, updated.GitHubAppStatus)
+	assert.Equal(t, store.GitHubAppStateOK, updated.GitHubAppStatus.State, "non-empty capped defaults must be healthy")
+	assert.Empty(t, updated.GitHubAppStatus.ErrorCode)
+	assert.Empty(t, updated.GitHubAppStatus.ErrorMessage)
+	assert.NotNil(t, updated.GitHubAppStatus.LastTokenMint)
+}
+
+func TestMintGitHubAppToken_NoStoredPerms_GitOnlyAppNoIssues(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+	gh := newFakeGitHubForAssoc(t)
+	gh.setAppPermissions(map[string]string{
+		"contents":      "write",
+		"pull_requests": "write",
+		"metadata":      "read",
+	})
+	configureFakeGitHubApp(t, srv, gh)
+
+	createAssocInstallation(t, st, 5911, "acme", "acme/widgets")
+	giveUserGitHubToken(t, srv, st, "pusher", "ghp_pusher")
+	gh.grant("ghp_pusher", "acme/widgets", githubapp.RepoAccess{Push: true, Pull: true})
+
+	p := createAssocProject(t, st, "perm-git-only-app", gh.remote("acme", "widgets"), "pusher", ptrInt64(5911))
+
+	// GET github-permissions returns the capped defaults without issues.
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var displayed store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayed))
+	assert.Equal(t, store.GitHubTokenPermissions{
+		Contents:     "write",
+		PullRequests: "write",
+		Metadata:     "read",
+	}, displayed)
+
+	tok, _, err := srv.MintGitHubAppTokenForProject(ctx, reloadProject(t, st, p.ID))
+	require.NoError(t, err)
+	assert.NotEmpty(t, tok)
+
+	_, mints := gh.counts()
+	require.Len(t, mints, 1)
+	assert.Equal(t, map[string]string{
+		"contents":      "write",
+		"pull_requests": "write",
+		"metadata":      "read",
+	}, mints[0].Permissions, "git-only app without issues must omit issues from minted request")
+
+	updated := reloadProject(t, st, p.ID)
+	require.NotNil(t, updated.GitHubAppStatus)
+	assert.Equal(t, store.GitHubAppStateOK, updated.GitHubAppStatus.State, "git-only app with non-empty capped defaults must be healthy")
+	assert.Empty(t, updated.GitHubAppStatus.ErrorCode)
+	assert.Empty(t, updated.GitHubAppStatus.ErrorMessage)
+	assert.NotNil(t, updated.GitHubAppStatus.LastTokenMint)
+}
+
+func TestMintGitHubAppToken_StoredPermsUnchanged(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+	gh := newFakeGitHubForAssoc(t)
+	gh.setAppPermissions(map[string]string{
+		"contents": "read",
+		"metadata": "read",
+	})
+	configureFakeGitHubApp(t, srv, gh)
+
+	createAssocInstallation(t, st, 5912, "acme", "acme/widgets")
+	giveUserGitHubToken(t, srv, st, "pusher", "ghp_pusher")
+	gh.grant("ghp_pusher", "acme/widgets", githubapp.RepoAccess{Push: true, Pull: true})
+
+	p := createAssocProject(t, st, "perm-stored-unchanged", gh.remote("acme", "widgets"), "pusher", ptrInt64(5912))
+	stored := reloadProject(t, st, p.ID)
+	stored.GitHubPermissions = &store.GitHubTokenPermissions{Contents: "write", Metadata: "read"}
+	require.NoError(t, st.UpdateProject(ctx, stored))
+
+	// GET github-permissions returns explicit stored permissions unchanged (not capped).
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var displayed store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayed))
+	assert.Equal(t, store.GitHubTokenPermissions{Contents: "write", Metadata: "read"}, displayed)
+
+	_, _, err := srv.MintGitHubAppTokenForProject(ctx, reloadProject(t, st, p.ID))
+	require.NoError(t, err)
+
+	_, mints := gh.counts()
+	require.Len(t, mints, 1)
+	assert.Equal(t, map[string]string{
+		"contents": "write",
+		"metadata": "read",
+	}, mints[0].Permissions, "stored project permissions must be requested unchanged")
+}
+
+func TestMintGitHubAppToken_EmptyAppGrantFailsSafeAndVisibly(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		perms map[string]string
+	}{
+		{"empty map", map[string]string{}},
+		{"disjoint permissions", map[string]string{"actions": "write"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, st := testServer(t)
+			ctx := context.Background()
+			gh := newFakeGitHubForAssoc(t)
+			gh.setAppPermissions(tc.perms)
+			configureFakeGitHubApp(t, srv, gh)
+
+			createAssocInstallation(t, st, 5913, "acme", "acme/widgets")
+			giveUserGitHubToken(t, srv, st, "pusher", "ghp_pusher")
+			gh.grant("ghp_pusher", "acme/widgets", githubapp.RepoAccess{Push: true, Pull: true})
+
+			p := createAssocProject(t, st, "perm-empty-grant", gh.remote("acme", "widgets"), "pusher", ptrInt64(5913))
+
+			// GET github-permissions reflects the empty intersection.
+			rec := doRequest(t, srv, http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+			var displayed store.GitHubTokenPermissions
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayed))
+			assert.Equal(t, store.GitHubTokenPermissions{}, displayed)
+
+			tok, _, err := srv.MintGitHubAppTokenForProject(ctx, reloadProject(t, st, p.ID))
+			require.Error(t, err)
+			assert.Empty(t, tok)
+
+			var mintErr *githubapp.TokenMintError
+			require.ErrorAs(t, err, &mintErr)
+			assert.Equal(t, githubapp.ErrCodePermissionDenied, mintErr.ErrorCode)
+
+			_, mints := gh.counts()
+			assert.Empty(t, mints, "must never call /access_tokens with empty permissions")
+
+			updated := reloadProject(t, st, p.ID)
+			require.NotNil(t, updated.GitHubAppStatus)
+			assert.Equal(t, store.GitHubAppStateDegraded, updated.GitHubAppStatus.State)
+			assert.Equal(t, githubapp.ErrCodePermissionDenied, updated.GitHubAppStatus.ErrorCode)
+			assert.NotEmpty(t, updated.GitHubAppStatus.ErrorMessage)
+		})
+	}
+}
+
+func TestMintGitHubAppToken_MissingAppGrantFailsSafeAndVisibly(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+	gh := newFakeGitHubForAssoc(t)
+	gh.setAppStatus(http.StatusInternalServerError, `{"message":"TOP_SECRET_UPSTREAM_500_DETAIL"}`)
+	configureFakeGitHubApp(t, srv, gh)
+
+	createAssocInstallation(t, st, 5914, "acme", "acme/widgets")
+	giveUserGitHubToken(t, srv, st, "pusher", "ghp_pusher")
+	gh.grant("ghp_pusher", "acme/widgets", githubapp.RepoAccess{Push: true, Pull: true})
+
+	p := createAssocProject(t, st, "perm-missing-grant", gh.remote("acme", "widgets"), "pusher", ptrInt64(5914))
+
+	// When App identity is unavailable, GET github-permissions falls back to uncapped defaults.
+	rec := doRequest(t, srv, http.MethodGet, "/api/v1/projects/"+p.ID+"/github-permissions", nil)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var displayed store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &displayed))
+	assert.Equal(t, store.GitHubTokenPermissions(githubapp.DefaultTokenPermissions()), displayed)
+
+	tok, _, err := srv.MintGitHubAppTokenForProject(ctx, reloadProject(t, st, p.ID))
+	require.Error(t, err)
+	assert.Empty(t, tok)
+	assert.NotContains(t, err.Error(), "TOP_SECRET_UPSTREAM_500_DETAIL")
+
+	_, mints := gh.counts()
+	assert.Empty(t, mints, "must not mint when App grant cannot be fetched")
+
+	updated := reloadProject(t, st, p.ID)
+	require.NotNil(t, updated.GitHubAppStatus)
+	assert.Equal(t, store.GitHubAppStateError, updated.GitHubAppStatus.State)
+	assert.Equal(t, githubapp.ErrCodeTokenMintFailed, updated.GitHubAppStatus.ErrorCode)
+	assert.NotEmpty(t, updated.GitHubAppStatus.ErrorMessage)
+	assert.NotContains(t, updated.GitHubAppStatus.ErrorMessage, "TOP_SECRET_UPSTREAM_500_DETAIL")
+}
+
 // PUT github-permissions accepts only the known fields with "", "read" or
 // "write"; anything else is refused and nothing is stored. Revert check:
 // before the fix any body was stored.
@@ -895,40 +1255,144 @@ func TestProjectGitHubPermissions_PutValidated(t *testing.T) {
 	assert.Equal(t, "read", got.Contents)
 }
 
+// PUT github-permissions rejects empty bodies ({} and all-empty-string payloads)
+// with 400 validation_error directing callers to DELETE, leaving stored state
+// untouched while continuing to accept valid non-empty bodies.
+func TestProjectGitHubPermissions_PutEmptyRejected(t *testing.T) {
+	srv, st := testServer(t)
+	p := createAssocProject(t, st, "perm-put-empty", "https://github.com/acme/widgets", "nobody", nil)
+	path := "/api/v1/projects/" + p.ID + "/github-permissions"
+
+	emptyBodies := map[string]map[string]string{
+		"empty object":     {},
+		"single empty key": {"contents": ""},
+		"all empty keys": {
+			"contents":      "",
+			"pull_requests": "",
+			"issues":        "",
+			"metadata":      "",
+			"checks":        "",
+			"actions":       "",
+		},
+	}
+
+	assertRejected := func(t *testing.T, rec *httptest.ResponseRecorder) {
+		t.Helper()
+		require.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+		var errResp ErrorResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp))
+		assert.Equal(t, ErrCodeValidationError, errResp.Error.Code)
+		assert.Contains(t, errResp.Error.Message, "DELETE")
+	}
+
+	// Unset project: empty PUTs are rejected, storage remains nil, GET returns defaults.
+	for name, body := range emptyBodies {
+		t.Run("unset/"+name, func(t *testing.T) {
+			rec := doRequest(t, srv, http.MethodPut, path, body)
+			assertRejected(t, rec)
+			assert.Nil(t, reloadProject(t, st, p.ID).GitHubPermissions, "nothing stored")
+		})
+	}
+	getRec := doRequest(t, srv, http.MethodGet, path, nil)
+	require.Equal(t, http.StatusOK, getRec.Code, "body: %s", getRec.Body.String())
+	var displayed store.GitHubTokenPermissions
+	require.NoError(t, json.Unmarshal(getRec.Body.Bytes(), &displayed))
+	assert.Equal(t, store.GitHubTokenPermissions(githubapp.DefaultTokenPermissions()), displayed)
+
+	// Valid non-empty PUT succeeds and persists.
+	rec := doRequest(t, srv, http.MethodPut, path, map[string]string{"contents": "read", "metadata": "read"})
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	wantStored := store.GitHubTokenPermissions{Contents: "read", Metadata: "read"}
+	got := reloadProject(t, st, p.ID).GitHubPermissions
+	require.NotNil(t, got)
+	assert.Equal(t, wantStored, *got)
+
+	// Project with existing custom permissions: empty PUTs are rejected and preserve existing grant.
+	for name, body := range emptyBodies {
+		t.Run("existing/"+name, func(t *testing.T) {
+			rec := doRequest(t, srv, http.MethodPut, path, body)
+			assertRejected(t, rec)
+			got := reloadProject(t, st, p.ID).GitHubPermissions
+			require.NotNil(t, got)
+			assert.Equal(t, wantStored, *got)
+		})
+	}
+	getRec = doRequest(t, srv, http.MethodGet, path, nil)
+	require.Equal(t, http.StatusOK, getRec.Code, "body: %s", getRec.Body.String())
+	displayed = store.GitHubTokenPermissions{}
+	require.NoError(t, json.Unmarshal(getRec.Body.Bytes(), &displayed))
+	assert.Equal(t, wantStored, displayed)
+}
+
 // githubTokenPermissionsForGrant never adds a field the stored set does not
 // name (unless nothing usable is stored), never raises a field above the
-// proof, drops unknown levels, and never returns an empty set.
+// proof or the App grant, drops unknown levels, and fails closed when
+// defaults intersect to empty.
 func TestGitHubTokenPermissionsForGrant(t *testing.T) {
 	push := githubAssociationGrant{WriteAllowed: true}
 	pull := githubAssociationGrant{WriteAllowed: false}
+	fullApp := map[string]string{
+		"contents":      "write",
+		"pull_requests": "write",
+		"issues":        "write",
+		"metadata":      "read",
+	}
+	readOnlyApp := map[string]string{
+		"contents": "read",
+		"metadata": "read",
+	}
+	gitOnlyApp := map[string]string{
+		"contents":      "write",
+		"pull_requests": "write",
+		"metadata":      "read",
+	}
 	tests := []struct {
-		name   string
-		stored *store.GitHubTokenPermissions
-		grant  githubAssociationGrant
-		want   githubapp.TokenPermissions
+		name             string
+		stored           *store.GitHubTokenPermissions
+		grant            githubAssociationGrant
+		appPerms         map[string]string
+		want             githubapp.TokenPermissions
+		wantUsedDefaults bool
+		wantOK           bool
 	}{
-		{"push nil -> defaults", nil, push, githubapp.DefaultTokenPermissions()},
-		{"push empty -> defaults", &store.GitHubTokenPermissions{}, push, githubapp.DefaultTokenPermissions()},
-		{"pull nil -> defaults lowered", nil, pull,
-			githubapp.TokenPermissions{Contents: "read", PullRequests: "read", Issues: "read", Metadata: "read"}},
-		{"pull empty -> defaults lowered", &store.GitHubTokenPermissions{}, pull,
-			githubapp.TokenPermissions{Contents: "read", PullRequests: "read", Issues: "read", Metadata: "read"}},
-		{"push keeps stored write", &store.GitHubTokenPermissions{Contents: "write", Actions: "write"}, push,
-			githubapp.TokenPermissions{Contents: "write", Actions: "write"}},
-		{"pull lowers stored write", &store.GitHubTokenPermissions{Contents: "write", Actions: "write"}, pull,
-			githubapp.TokenPermissions{Contents: "read", Actions: "read"}},
-		{"stored read stays read under push", &store.GitHubTokenPermissions{Contents: "read"}, push,
-			githubapp.TokenPermissions{Contents: "read"}},
-		{"unknown level dropped", &store.GitHubTokenPermissions{Contents: "read", Checks: "admin"}, push,
-			githubapp.TokenPermissions{Contents: "read"}},
-		{"only unknown levels -> defaults scoped", &store.GitHubTokenPermissions{Checks: "admin"}, pull,
-			githubapp.TokenPermissions{Contents: "read", PullRequests: "read", Issues: "read", Metadata: "read"}},
+		{"push nil full app -> defaults", nil, push, fullApp, githubapp.DefaultTokenPermissions(), true, true},
+		{"push empty full app -> defaults", &store.GitHubTokenPermissions{}, push, fullApp, githubapp.DefaultTokenPermissions(), true, true},
+		{"pull nil full app -> defaults lowered", nil, pull, fullApp,
+			githubapp.TokenPermissions{Contents: "read", PullRequests: "read", Issues: "read", Metadata: "read"}, true, true},
+		{"pull empty full app -> defaults lowered", &store.GitHubTokenPermissions{}, pull, fullApp,
+			githubapp.TokenPermissions{Contents: "read", PullRequests: "read", Issues: "read", Metadata: "read"}, true, true},
+		{"push nil read-only app -> intersected", nil, push, readOnlyApp,
+			githubapp.TokenPermissions{Contents: "read", Metadata: "read"}, true, true},
+		{"pull nil read-only app -> intersected", nil, pull, readOnlyApp,
+			githubapp.TokenPermissions{Contents: "read", Metadata: "read"}, true, true},
+		{"push nil git-only app -> omits issues", nil, push, gitOnlyApp,
+			githubapp.TokenPermissions{Contents: "write", PullRequests: "write", Metadata: "read"}, true, true},
+		{"push nil cannot widen above defaults", nil, push, map[string]string{
+			"contents": "admin", "metadata": "write", "actions": "write", "administration": "admin",
+		}, githubapp.TokenPermissions{Contents: "write", Metadata: "read"}, true, true},
+		{"push nil empty app grant -> fail closed", nil, push, map[string]string{}, githubapp.TokenPermissions{}, true, false},
+		{"push nil missing app grant -> fail closed", nil, push, nil, githubapp.TokenPermissions{}, true, false},
+		{"push nil disjoint app grant -> fail closed", nil, push, map[string]string{"actions": "write"}, githubapp.TokenPermissions{}, true, false},
+		{"push keeps stored write regardless of app grant", &store.GitHubTokenPermissions{Contents: "write", Actions: "write"}, push, readOnlyApp,
+			githubapp.TokenPermissions{Contents: "write", Actions: "write"}, false, true},
+		{"pull lowers stored write", &store.GitHubTokenPermissions{Contents: "write", Actions: "write"}, pull, nil,
+			githubapp.TokenPermissions{Contents: "read", Actions: "read"}, false, true},
+		{"stored read stays read under push", &store.GitHubTokenPermissions{Contents: "read"}, push, nil,
+			githubapp.TokenPermissions{Contents: "read"}, false, true},
+		{"unknown level dropped", &store.GitHubTokenPermissions{Contents: "read", Checks: "admin"}, push, nil,
+			githubapp.TokenPermissions{Contents: "read"}, false, true},
+		{"only unknown levels -> defaults intersected and scoped", &store.GitHubTokenPermissions{Checks: "admin"}, pull, fullApp,
+			githubapp.TokenPermissions{Contents: "read", PullRequests: "read", Issues: "read", Metadata: "read"}, true, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := githubTokenPermissionsForGrant(tt.stored, tt.grant)
+			got, usedDefaults, ok := githubTokenPermissionsForGrant(tt.stored, tt.grant, tt.appPerms)
 			assert.Equal(t, tt.want, got)
-			assert.NotEqual(t, githubapp.TokenPermissions{}, got, "never empty")
+			assert.Equal(t, tt.wantUsedDefaults, usedDefaults)
+			assert.Equal(t, tt.wantOK, ok)
+			if ok {
+				assert.NotEqual(t, githubapp.TokenPermissions{}, got, "ok result must never be empty")
+			}
 		})
 	}
 }
@@ -1064,9 +1528,8 @@ func TestGitHubTokenRefresh_ResolvesSourceLikeCreate(t *testing.T) {
 		Labels:    map[string]string{githubTokenSourceProjectLabel: source.ID},
 	}
 	require.NoError(t, st.CreateAgent(ctx, agent))
-	token, err := srv.agentTokenService.GenerateAgentToken(agent.ID, target.ID,
+	token := srv.generateRecordedAgentToken(t, agent.ID, target.ID,
 		[]AgentTokenScope{ScopeAgentTokenRefresh}, nil)
-	require.NoError(t, err)
 
 	// refreshAndCreate runs the refresh endpoint and the create-time
 	// start/restart token step for agent and reports both outcomes and the
@@ -1089,7 +1552,7 @@ func TestGitHubTokenRefresh_ResolvesSourceLikeCreate(t *testing.T) {
 		var classes map[string]api.EnvKind
 		stored, err := st.GetAgent(ctx, agent.ID)
 		require.NoError(t, err)
-		dispatcher.injectLifecycleGitHubToken(ctx, stored, env, &classes, "DispatchAgentStart")
+		dispatcher.deliverGitHubToken(ctx, stored, env, &classes, nil, nil, "DispatchAgentStart")
 		return rec.Code, refreshToken, env["GITHUB_TOKEN"], len(after) - len(before)
 	}
 	useSourceUser := func(t *testing.T, u *store.User) {
@@ -1401,10 +1864,9 @@ func TestGitHubInstallationBind_HubBearerBoundaryOnly(t *testing.T) {
 	require.NotNil(t, m.srv.agentTokenService, "the test server issues agent tokens")
 	agent, err := m.store.GetAgent(ctx, m.ids.agent)
 	require.NoError(t, err)
-	agentToken, err := m.srv.agentTokenService.GenerateAgentToken(agent.ID, agent.ProjectID, []AgentTokenScope{
+	agentToken := m.srv.generateRecordedAgentToken(t, agent.ID, agent.ProjectID, []AgentTokenScope{
 		ScopeProjectRead, ScopeAgentCreate, ScopeAgentLifecycle, ScopeProjectTemplateWrite, ScopeAgentTokenRefresh,
 	}, nil)
-	require.NoError(t, err)
 	rec = doRequestWithAgentToken(t, m.srv, http.MethodPut, "/api/v1/projects/"+agent.ProjectID+"/github-installation", body, agentToken)
 	assert.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, rec.Code, "agent credential: %s", rec.Body.String())
 	requireNotBound(t, m, agent.ProjectID)

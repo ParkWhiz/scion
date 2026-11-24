@@ -116,7 +116,7 @@ export class ScionMaximumPermissionSelector extends LitElement {
         font-weight: 500;
         border: none;
         background: none;
-        border-radius: calc(var(--scion-radius, 0.5rem) - 0.125rem);
+        border-radius: calc(var(--scion-radius, 0.5rem) * 0.75);
         cursor: pointer;
         color: var(--scion-text-muted, #64748b);
         transition: all 0.15s ease;
@@ -266,7 +266,7 @@ export class ScionMaximumPermissionSelector extends LitElement {
         gap: 0.75rem;
         padding: 0.5rem 1rem;
         min-height: 44px;
-        border-bottom: 1px solid var(--scion-border-light, #f1f5f9);
+        border-bottom: 1px solid var(--scion-border-subtle, #f1f5f9);
         transition: background-color 0.1s ease;
       }
 

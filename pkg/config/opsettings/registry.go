@@ -152,9 +152,9 @@ func init() {
 		},
 		{
 			Name:       "lifecycle",
-			KoanfPaths: []string{"server.hub.auto_suspend_stalled", "server.hub.stalled_threshold", "server.hub.soft_delete_retention", "server.hub.soft_delete_retain_files", "server.hub.start_claim_lease_ttl", "server.hub.start_max_duration", "server.hub.start_unconfirmed_hold", "server.hub.start_create_unconfirmed_hold"},
+			KoanfPaths: []string{"server.hub.auto_suspend_stalled", "server.hub.stalled_threshold", "server.hub.auto_suspend_idle", "server.hub.idle_suspend_after", "server.hub.soft_delete_retention", "server.hub.soft_delete_retain_files", "server.hub.start_claim_lease_ttl", "server.hub.start_max_duration", "server.hub.start_unconfirmed_hold", "server.hub.start_create_unconfirmed_hold"},
 			New:        func() any { return &LifecycleSettings{} },
-			Durations:  []string{"server.hub.stalled_threshold", "server.hub.soft_delete_retention", "server.hub.start_claim_lease_ttl", "server.hub.start_max_duration", "server.hub.start_unconfirmed_hold", "server.hub.start_create_unconfirmed_hold"},
+			Durations:  []string{"server.hub.stalled_threshold", "server.hub.idle_suspend_after", "server.hub.soft_delete_retention", "server.hub.start_claim_lease_ttl", "server.hub.start_max_duration", "server.hub.start_unconfirmed_hold", "server.hub.start_create_unconfirmed_hold"},
 		},
 		{
 			// maintenance is durable via DB but has no settings.yaml representation.
@@ -227,11 +227,25 @@ func init() {
 			RestartRequired: []string{config.HubMetricsEnabledKey, config.HubTracingEnabledKey},
 		},
 		{
+			// branding holds Hub-wide UI branding settings (server.hub.branding),
+			// applied live across replicas via OperationalSettings.
+			Name:       BrandingSectionName,
+			KoanfPaths: BrandingKoanfPaths,
+			New:        func() any { return &BrandingSettings{} },
+		},
+		{
 			Name: "agent_secrets",
 			KoanfPaths: []string{
 				"agent_secrets.user_scope_only",
 			},
 			New: func() any { return &AgentSecretsSettings{} },
+		},
+		{
+			Name: "broker_policy",
+			KoanfPaths: []string{
+				"broker_policy.admin_managed_only",
+			},
+			New: func() any { return &BrokerPolicySettings{} },
 		},
 		{
 			Name: "agent_defaults",
@@ -261,7 +275,8 @@ func init() {
 			KoanfPaths: []string{
 				"server.github_app", "server.github_app.app_id", "server.github_app.api_base_url",
 				"server.github_app.webhooks_enabled", "server.github_app.installation_url",
-				"server.github_app.private_key_path",
+				"server.github_app.private_key_path", "server.github_app.app_slug",
+				"server.github_app.command_mention_aliases",
 			},
 			New: func() any { return &GitHubAppSettings{} },
 			// The agent dispatcher sets up its GitHub App token minter at
@@ -524,6 +539,8 @@ func compileSchemas() {
 			"properties": map[string]interface{}{
 				"auto_suspend_stalled":          getSchemaProperty(root, "server", "hub", "auto_suspend_stalled"),
 				"stalled_threshold":             getSchemaProperty(root, "server", "hub", "stalled_threshold"),
+				"auto_suspend_idle":             getSchemaProperty(root, "server", "hub", "auto_suspend_idle"),
+				"idle_suspend_after":            getSchemaProperty(root, "server", "hub", "idle_suspend_after"),
 				"soft_delete_retention":         getSchemaProperty(root, "server", "hub", "soft_delete_retention"),
 				"soft_delete_retain_files":      getSchemaProperty(root, "server", "hub", "soft_delete_retain_files"),
 				"start_claim_lease_ttl":         getSchemaProperty(root, "server", "hub", "start_claim_lease_ttl"),
@@ -571,8 +588,11 @@ func compileSchemas() {
 		// hub_observability is derived from settings-v1.schema.json
 		// (server.hub.observability) like the sections above.
 		"hub_observability": schemaObject(getSchemaProperty(root, "server", "hub", "observability")),
+		// branding is derived from settings-v1.schema.json (server.hub.branding).
+		BrandingSectionName: schemaObject(getSchemaProperty(root, "server", "hub", "branding")),
 		"quotas":            schemaObject(getSchemaProperty(root, "quotas")),
 		"agent_secrets":     schemaObject(getSchemaProperty(root, "agent_secrets")),
+		"broker_policy":     schemaObject(getSchemaProperty(root, "broker_policy")),
 		// gcp_iam schema is hand-written -- the keys have no definition in
 		// settings-v1.schema.json. An empty string is not a valid value:
 		// clearing a key is done by resetting the section.
@@ -724,6 +744,15 @@ func compileSchemas() {
 					"tolerations":                      map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
 					"runtime_class_name":               map[string]interface{}{"type": "string"},
 					"kubernetes_block_service_account": map[string]interface{}{"type": "string"},
+
+					// Workload Identity pool reported to the hub for binding
+					// at mint (ptone/scion#3329 phase 5). Value rule:
+					// config.ValidateWorkloadIdentityPool.
+					"workload_identity_pool": map[string]interface{}{"type": "string", "pattern": config.WorkloadIdentityPoolPattern},
+
+					// Opt-in broker creation of conventional Kubernetes
+					// ServiceAccounts for Hub-minted GSAs (ptone/scion#7966).
+					"create_service_accounts": map[string]interface{}{"type": "boolean"},
 				},
 			},
 		},
@@ -1072,9 +1101,10 @@ func buildNotificationsSchema() map[string]interface{} {
 	}
 }
 
-// Validate validates a section document (JSON) against the section's schema.
-// Returns nil if valid, or a list of ValidationErrors on failure.
-func Validate(section string, doc json.RawMessage) []config.ValidationError {
+// ValidateSchema validates a section document (JSON) against the section's
+// JSON schema only, without cross-field semantic rules. Used when checking
+// carried-forward keys individually during partial deep-merge updates.
+func ValidateSchema(section string, doc json.RawMessage) []config.ValidationError {
 	if schemaCompileErr != nil {
 		return []config.ValidationError{{Message: schemaCompileErr.Error()}}
 	}
@@ -1096,23 +1126,50 @@ func Validate(section string, doc json.RawMessage) []config.ValidationError {
 	if err != nil {
 		return extractValidationErrors(err)
 	}
+	return nil
+}
+
+// Validate validates a section document (JSON) against the section's schema
+// and any cross-field semantic rules. Returns nil if valid, or a list of
+// ValidationErrors on failure.
+func Validate(section string, doc json.RawMessage) []config.ValidationError {
+	if errs := ValidateSchema(section, doc); len(errs) > 0 {
+		return errs
+	}
 	return validateCrossField(section, doc)
 }
 
 // validateCrossField applies the rules a JSON schema cannot express, so a
 // write that would leave a section unusable is refused instead of stored.
 func validateCrossField(section string, doc json.RawMessage) []config.ValidationError {
-	if section != "artifacts" {
+	switch section {
+	case "artifacts":
+		cfg, err := ParseArtifactsDoc(doc)
+		if err != nil {
+			return []config.ValidationError{{Message: err.Error()}}
+		}
+		if cfg.RemoteImagesInvalid != "" {
+			return []config.ValidationError{{Message: "artifacts settings: " + cfg.RemoteImagesInvalid}}
+		}
+		return nil
+	case BrandingSectionName:
+		var cfg config.BrandingConfig
+		if err := json.Unmarshal(doc, &cfg); err != nil {
+			return []config.ValidationError{{Message: fmt.Sprintf("invalid branding JSON: %v", err)}}
+		}
+		errs := config.ValidateBranding(&cfg)
+		prefix := config.BrandingSectionKey + "."
+		for i := range errs {
+			if errs[i].Path == config.BrandingSectionKey {
+				errs[i].Path = ""
+			} else {
+				errs[i].Path = strings.TrimPrefix(errs[i].Path, prefix)
+			}
+		}
+		return errs
+	default:
 		return nil
 	}
-	cfg, err := ParseArtifactsDoc(doc)
-	if err != nil {
-		return []config.ValidationError{{Message: err.Error()}}
-	}
-	if cfg.RemoteImagesInvalid != "" {
-		return []config.ValidationError{{Message: "artifacts settings: " + cfg.RemoteImagesInvalid}}
-	}
-	return nil
 }
 
 func extractValidationErrors(err error) []config.ValidationError {

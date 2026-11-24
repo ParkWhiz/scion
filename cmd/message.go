@@ -32,60 +32,52 @@ import (
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
-	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
 	"github.com/GoogleCloudPlatform/scion/pkg/messaging"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectfs"
 	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
 
 var msgInterrupt bool
-var msgIn string
-var msgAt string
-var msgPlain bool
 var msgAttach []string
-var msgNotify bool
 var msgWake bool
-var msgChannel string
-var msgThreadID string
-var msgCC []string
 var msgBodyFile string
 
 // errRawFlagRemoved is returned for any use of the removed --raw flag.
 var errRawFlagRemoved = fmt.Errorf("--raw has been removed from 'scion message': raw keystroke delivery through messages is no longer supported; " +
 	"send keystrokes with 'scion keys <agent-name> <keystrokes>' instead (see 'scion keys --help')")
 
-// emitDeprecationWarning prints a deprecation notice to stderr.
-func emitDeprecationWarning(flag, replacement string) {
-	fmt.Fprintf(os.Stderr, "Warning: --%s is deprecated: %s\n", flag, replacement)
-}
-
-// deprecationReplacements maps deprecated message-command flags to their
-// replacement guidance. Tests assert that every replacement mentioning a
-// conversation-reference form (@<, conv:, #<) is documented in Long.
-var deprecationReplacements = []struct {
+// removedFlagErrors maps retired message-command flags to their replacement
+// guidance. Each flag remains registered (hidden) so invoking it fails with
+// an actionable usage error instead of Cobra's "unknown flag". Tests assert
+// that every replacement mentioning a 'scion ...' command resolves against
+// rootCmd and every conversation-reference form (@<, conv:, #<) is documented
+// in messageCmd.Long.
+var removedFlagErrors = []struct {
 	Flag    string
 	Message string
 }{
-	{"plain", "--plain is deprecated and will be removed"},
+	{"plain", "plain-text delivery is no longer supported on 'scion message'; plain delivery remains available for triggers ('scion trigger create --plain')"},
 	{"notify", "use 'scion notifications subscribe' instead"},
 	{"in", "use 'scion schedule create --in' instead"},
 	{"at", "use 'scion schedule create --at' instead"},
-	{"channel", "address the conversation with conv:<uuid> (see 'scion conversation list'), or use @<name> to message an agent directly"},
-	{"thread-id", "address the conversation with conv:<uuid> (see 'scion conversation list'); for user: recipients on the web channel, the Hub rejects a thread ID that does not match an existing conversation"},
-	{"cc", "--cc is deprecated and will be removed"},
+	{"channel", "address the conversation with conv:<uuid> (see 'scion conversation list'), or use @<agent-name> to message an agent directly"},
+	{"thread-id", "address the conversation with conv:<uuid> (see 'scion conversation list')"},
+	{"cc", "use group[...] addressing or body @mentions instead"},
 }
 
-// emitDeprecationWarnings checks all deprecated flags and emits warnings
-// for any that were explicitly set.
-func emitDeprecationWarnings(cmd *cobra.Command) {
-	for _, d := range deprecationReplacements {
-		if cmd.Flags().Changed(d.Flag) {
-			emitDeprecationWarning(d.Flag, d.Message)
+// checkRemovedMessageFlags returns an actionable usage error if any retired
+// flag was passed on cmd.
+func checkRemovedMessageFlags(cmd *cobra.Command) error {
+	for _, r := range removedFlagErrors {
+		if cmd.Flags().Changed(r.Flag) {
+			return newUsageError("--%s has been removed from 'scion message'; %s", r.Flag, r.Message)
 		}
 	}
+	return nil
 }
 
 // messageCmd represents the message command
@@ -94,6 +86,10 @@ var messageCmd = &cobra.Command{
 	Aliases: []string{"msg"},
 	Short:   "Send a message to an agent or user",
 	Long: `Sends a message to a running agent's harness or to a user's inbox.
+
+Agents: read the scion-messaging skill before sending. It covers what this
+help does not: choosing between a conversation and a direct message, who an
+@-mention notifies, where to send replies, and how to format messages for users.
 
 Recipients:
   <agent-name>       Send to an agent (default, same as agent:<name>)
@@ -135,10 +131,24 @@ the recipient argument (agent:x or user:x for one, group[...] for several).
 In the JSON, an accepted recipient has status "delivered" and is counted
 under "delivered".
 
-Choice prompts (--choices or --choices-file, from an agent to a user or a
+Decision prompts (--decisions or --decisions-file, from an agent to a user or a
 conversation) print one line per decision with its key and version. With
 --format json the output is the Hub's full send result: message_id and
-decisions, plus every other field of an ordinary send.
+decisions, plus every other field of an ordinary send. Keep questions to one
+short sentence and choice labels to a few words, putting background details,
+links, and caveats in the message body; questions over 200 characters or choice
+labels over 40 characters print a soft warning on stderr without blocking the
+send. With --update, only keys included in the new payload are replaced; to
+revise an unanswered multi-decision set on a single card, resend all
+still-pending keys of that set together.
+To retire a decision without a replacement, use scion decisions withdraw.
+
+Secret requests (--secret-request or --secret-request-file, from an agent to a
+user or a conversation) ask a human to supply one or more agent-scoped secrets
+through the Hub (never in chat). They print one line per key with its version
+(and replaced version when --update replaces a pending request). With --format
+json the output is the Hub's full send result. Use scion secret request list
+and scion secret request withdraw to inspect or retire open requests.
 
 Exit codes:
   0  Sent. For a group, every recipient was accepted or deferred.
@@ -156,17 +166,21 @@ Examples:
   scion message my-agent --body-file /path/to/message.txt
   echo "message with backticks" | scion message my-agent -`,
 	Args: func(cmd *cobra.Command, args []string) error {
-		// --raw is removed. Reject it here, in argument validation, so the
-		// command fails before any hook, project resolution or network call
-		// runs: a --raw invocation never reaches the wire.
+		// Removed flags: reject here, in argument validation, so the command
+		// fails before any hook, project resolution or network call runs.
 		if cmd.Flags().Changed("raw") {
 			return errRawFlagRemoved
 		}
+		if err := checkRemovedMessageFlags(cmd); err != nil {
+			return err
+		}
 		// --body-file provides the message, so we only need recipient.
-		// With choices the body (the intro above the decisions) is optional.
+		// With decisions or secret requests the body (the intro above the card) is optional.
 		bodyFile, _ := cmd.Flags().GetString("body-file")
-		withChoices := cmd.Flags().Changed("choices") || cmd.Flags().Changed("choices-file")
-		if bodyFile != "" || withChoices {
+		withDecisions := cmd.Flags().Changed("decisions") || cmd.Flags().Changed("decisions-file") ||
+			cmd.Flags().Changed("choices") || cmd.Flags().Changed("choices-file")
+		withSecretRequests := cmd.Flags().Changed("secret-request") || cmd.Flags().Changed("secret-request-file")
+		if bodyFile != "" || withDecisions || withSecretRequests {
 			if len(args) < 1 {
 				return fmt.Errorf("recipient is required")
 			}
@@ -198,10 +212,10 @@ Examples:
 			}
 			return newUsageError("--all has been removed from 'scion message'; use 'scion broadcast --all' instead")
 		}
-
-		// Emit deprecation warnings for any deprecated flags in use.
-		// Deprecated flags still work — they warn AND succeed.
-		emitDeprecationWarnings(cmd)
+		// Guard direct RunE invocations (Cobra runs Args first).
+		if err := checkRemovedMessageFlags(cmd); err != nil {
+			return err
+		}
 
 		var agentName string
 		var userRecipient string
@@ -233,20 +247,34 @@ Examples:
 			return newUsageError("--body-file and positional message arguments are mutually exclusive")
 		}
 
-		// Choice prompts (--choices, --choices-file, --update): checked and
-		// read before the body, so --choices-file - owns stdin. The JSON is
-		// parsed only for early errors; the hub is the authority.
-		msgChoicesPayload = nil
+		// Decision prompts (--decisions, --decisions-file, --update, plus legacy
+		// --choices* aliases) and secret requests (--secret-request,
+		// --secret-description, --secret-request-file, --update): checked and read
+		// before the body, so -file - owns stdin. The JSON is parsed only for early
+		// errors; the hub is the authority.
+		msgDecisionsPayload = nil
+		msgSecretRequestsPayload = nil
 		agentTarget := agentName != "" || (convRef != nil && convRef.Kind == messaging.RefAgent)
-		if err := validateChoiceFlags(agentTarget, len(groupRecipients) > 0); err != nil {
+		if err := validateDecisionFlags(agentTarget, len(groupRecipients) > 0); err != nil {
 			return err
 		}
-		if choicesRequested() {
-			payload, err := loadChoicesPayload()
+		if err := validateSecretRequestFlags(agentTarget, len(groupRecipients) > 0); err != nil {
+			return err
+		}
+		if decisionsRequested() {
+			payload, err := loadDecisionsPayload()
 			if err != nil {
 				return err
 			}
-			msgChoicesPayload = payload
+			msgDecisionsPayload = payload
+			warnDecisionLengths(os.Stderr, payload)
+		}
+		if secretRequestsRequested() {
+			payload, err := loadSecretRequestsPayload()
+			if err != nil {
+				return err
+			}
+			msgSecretRequestsPayload = payload
 		}
 
 		// Resolve body from --body-file or stdin
@@ -261,56 +289,13 @@ Examples:
 		// the slug. Code spans and quoted lines are left unchanged.
 		message = messages.RewriteAgentMentions(message)
 
-		// Ensure we have a message body (optional with choices)
-		if message == "" && len(msgArtifacts) == 0 && msgChoicesPayload == nil {
+		// Ensure we have a message body (optional with decisions or secret requests)
+		if message == "" && len(msgArtifacts) == 0 && msgDecisionsPayload == nil && msgSecretRequestsPayload == nil {
 			return fmt.Errorf("message body is empty; provide a message via positional args, --body-file, or pipe to stdin with '-'")
-		}
-
-		// Validate scheduling flags
-		if msgIn != "" && msgAt != "" {
-			return newUsageError("--in and --at are mutually exclusive")
-		}
-
-		// Validate --thread-id requires --channel
-		if msgThreadID != "" && msgChannel == "" {
-			return newUsageError("--thread-id requires --channel to be set")
-		}
-
-		// Validate --cc restrictions: parse first so empty-string values
-		// (e.g. --cc "") are handled correctly instead of triggering
-		// false-positive validation errors.
-		parsedCC := parseCCFlag(msgCC)
-		if len(parsedCC) > 0 {
-			if msgIn != "" || msgAt != "" {
-				return newUsageError("--cc cannot be combined with --in or --at")
-			}
-			if userRecipient != "" {
-				return newUsageError("--cc cannot be used with user recipients")
-			}
-		}
-
-		// Validate user-recipient restrictions
-		if userRecipient != "" {
-			if msgIn != "" || msgAt != "" {
-				return newUsageError("--in/--at cannot be used with user recipients")
-			}
-		}
-
-		// Validate group recipient restrictions
-		if len(groupRecipients) > 0 {
-			if msgIn != "" || msgAt != "" {
-				return newUsageError("--in/--at cannot be used with group[] recipients")
-			}
-			if msgNotify {
-				return newUsageError("--notify cannot be used with group[] recipients")
-			}
 		}
 
 		// Validate --wake restrictions
 		if msgWake {
-			if msgIn != "" || msgAt != "" {
-				return newUsageError("--wake cannot be combined with --in or --at")
-			}
 			if userRecipient != "" {
 				return newUsageError("--wake cannot be used with user recipients")
 			}
@@ -319,9 +304,6 @@ Examples:
 		// Validate attachments
 		if len(msgAttach) > messages.MaxAttachments {
 			return newUsageError("too many attachments: %d (max %d)", len(msgAttach), messages.MaxAttachments)
-		}
-		if len(msgAttach) > 0 && (msgIn != "" || msgAt != "") {
-			return newUsageError("--attach cannot be combined with --in or --at")
 		}
 
 		// Validate artifact references (ptone/scion#3223). They are carried
@@ -332,9 +314,6 @@ Examples:
 		}
 		msgArtifactRefs = artifactRefs
 		if len(artifactRefs) > 0 {
-			if msgIn != "" || msgAt != "" {
-				return newUsageError("--artifact cannot be combined with --in or --at")
-			}
 			if len(groupRecipients) > 0 {
 				return newUsageError("--artifact cannot be used with group[] recipients")
 			}
@@ -387,10 +366,7 @@ Examples:
 			return err
 		}
 
-		// Handle scheduled messages
-		if msgIn != "" || msgAt != "" {
-			return scheduleMessageViaHub(hubCtx, agentName, message, msgInterrupt, msgPlain)
-		}
+		warnInvalidBodyConvRefs(message)
 
 		// Attachments: ask the hub where uploads go first (ptone/scion#4596).
 		// With "artifact", the files are checked and uploaded for each
@@ -444,7 +420,7 @@ Examples:
 			return sendOutboundMessageViaHub(hubCtx, userRecipient, message, msgInterrupt)
 		}
 
-		return sendMessageViaHub(hubCtx, agentName, message, msgInterrupt, msgNotify, msgWake)
+		return sendMessageViaHub(hubCtx, agentName, message, msgInterrupt, msgWake)
 	},
 }
 
@@ -476,18 +452,12 @@ func resolveSenderIdentity(hubCtx *HubContext) string {
 }
 
 // buildStructuredMessage constructs a StructuredMessage from CLI parameters.
-// plain and urgent are passed explicitly rather than read from the
-// message-command flag globals; channel and thread ID still come from the
-// deprecated --channel/--thread-id globals.
-func buildStructuredMessage(sender, recipient, message string, attachments []string, plain, urgent bool) *messages.StructuredMessage {
+func buildStructuredMessage(sender, recipient, message string, attachments []string, urgent bool) *messages.StructuredMessage {
 	msg := messages.NewInstruction(sender, recipient, message)
-	msg.Plain = plain
 	msg.Urgent = urgent
 	if len(attachments) > 0 {
 		msg.Attachments = attachments
 	}
-	msg.Channel = msgChannel
-	msg.ThreadID = msgThreadID
 	msg.Metadata = artifactRefsMetadata(msgArtifactRefs)
 	return msg
 }
@@ -589,20 +559,13 @@ func agentMessageSendError(agentName string, err error) error {
 	return wrapHubError(fmt.Errorf("failed to send message to agent '%s' via Hub: %w", agentName, err))
 }
 
-func sendMessageViaHub(hubCtx *HubContext, agentName string, message string, interrupt bool, notify bool, wake bool) error {
+func sendMessageViaHub(hubCtx *HubContext, agentName string, message string, interrupt bool, wake bool) error {
 	if !isJSONOutput() {
 		PrintUsingHub(hubCtx.Endpoint)
 	}
 
 	// Resolve sender identity for structured messages
 	sender := resolveSenderIdentity(hubCtx)
-
-	// Validate --channel against registered channels
-	if msgChannel != "" {
-		if err := validateChannel(hubCtx, msgChannel); err != nil {
-			return err
-		}
-	}
 
 	// Single agent: direct message
 	projectID, err := GetProjectID(hubCtx)
@@ -615,7 +578,7 @@ func sendMessageViaHub(hubCtx *HubContext, agentName string, message string, int
 		fmt.Printf("Sending message to agent '%s'...\n", agentName)
 	}
 
-	msg := buildStructuredMessage(sender, "agent:"+agentName, message, msgAttach, msgPlain, interrupt)
+	msg := buildStructuredMessage(sender, "agent:"+agentName, message, msgAttach, interrupt)
 	// Validate through the new envelope choke point (Phase 7, AC-8).
 	if err := messaging.ValidateLegacyMessage(msg); err != nil {
 		return fmt.Errorf("message validation failed: %w", err)
@@ -623,12 +586,11 @@ func sendMessageViaHub(hubCtx *HubContext, agentName string, message string, int
 
 	// Server-side @mention fan-out: the hub parses the body itself and
 	// delivers each mention, so the CLI sends a single request. It still
-	// sends an explicit mentions list — unioned with --cc — so a hub that
-	// only fans out from the explicit field still delivers it. Filtering
-	// self and the primary here matters because such a hub does not
-	// exclude the sender.
+	// sends an explicit mentions list so a hub that only fans out from the
+	// explicit field still delivers it. Filtering self and the primary here
+	// matters because such a hub does not exclude the sender.
 	mentions := filterMentionNames(
-		messages.DedupMentionNames(extractMentions(message), parseCCFlag(msgCC)),
+		messages.DedupMentionNames(extractMentions(message)),
 		strings.TrimPrefix(sender, "agent:"), agentName)
 
 	attachmentIDs, sendCtx, sendCancel, err := uploadThenSendContext(context.Background())
@@ -638,7 +600,6 @@ func sendMessageViaHub(hubCtx *HubContext, agentName string, message string, int
 	defer sendCancel()
 	resp, err := agentSvc.SendStructuredMessageWithOptions(sendCtx, agentName, msg, hubclient.SendMessageOptions{
 		Interrupt:     interrupt,
-		Notify:        notify,
 		Wake:          wake,
 		Mentions:      mentions,
 		AttachmentIDs: attachmentIDs,
@@ -660,9 +621,6 @@ func sendMessageViaHub(hubCtx *HubContext, agentName string, message string, int
 		printArtifactWarning(resp.ArtifactWarning)
 	}
 	printAgentSendConfirmation(agentName, fmt.Sprintf("'%s'", agentName), resp)
-	if notify {
-		fmt.Printf("Subscribed to notifications for agent '%s'.\n", agentName)
-	}
 	if resp != nil {
 		printAttachmentWarnings(resp.AttachmentWarnings)
 	}
@@ -697,7 +655,7 @@ func sendCrossProjectMessage(hubCtx *HubContext, targetProject, agentSlug, messa
 
 	// Step 2: Build the structured message with the sender's identity.
 	sender := resolveSenderIdentity(hubCtx)
-	msg := buildStructuredMessage(sender, "agent:"+agentSlug, message, attachments, msgPlain, interrupt)
+	msg := buildStructuredMessage(sender, "agent:"+agentSlug, message, attachments, interrupt)
 	if err := messaging.ValidateLegacyMessage(msg); err != nil {
 		return fmt.Errorf("message validation failed: %w", err)
 	}
@@ -781,7 +739,7 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		// and the orphan rows.
 		if ref.Kind == messaging.RefAgent {
 			sender := "agent:" + senderAgent
-			agentMsg := buildStructuredMessage(sender, "agent:"+ref.Value, message, attachments, msgPlain, interrupt)
+			agentMsg := buildStructuredMessage(sender, "agent:"+ref.Value, message, attachments, interrupt)
 			if err := messaging.ValidateLegacyMessage(agentMsg); err != nil {
 				return fmt.Errorf("message validation failed: %w", err)
 			}
@@ -834,7 +792,8 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		if ref.Kind == messaging.RefEmail {
 			outMsg.Recipient = "user:" + ref.Value
 		}
-		applyChoicesToOutbound(outMsg)
+		applyDecisionsToOutbound(outMsg)
+		applySecretRequestsToOutbound(outMsg)
 
 		// DEF-51 principle: the validated probe must match the sent envelope
 		// by construction. Fields the outbound path does not send (Channel,
@@ -850,9 +809,9 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		if ref.Kind == messaging.RefEmail {
 			probe.Recipient = outMsg.Recipient
 		}
-		// A choice prompt's type and body are the hub's to set (the body
-		// may be empty), so only an ordinary message is probed.
-		if msgChoicesPayload == nil {
+		// A decision or secret-request prompt's type and body are the hub's to
+		// set (the body may be empty), so only an ordinary message is probed.
+		if msgDecisionsPayload == nil && msgSecretRequestsPayload == nil {
 			if err := messaging.ValidateLegacyMessage(probe); err != nil {
 				return fmt.Errorf("message validation failed: %w", err)
 			}
@@ -866,10 +825,10 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		outMsg.AttachmentIDs = ids
 		result, err := agentSvc.SendOutboundMessage(sendCtx, senderAgent, outMsg)
 		if err != nil {
-			return wrapHubError(fmt.Errorf("failed to send message to %s: %w", ref.Raw, err))
+			return formatSecretRequestSendError(ref.Raw, err)
 		}
 		// The hub stored the prompt: mark the agent waiting for input.
-		defer afterChoicesSent()
+		defer afterDecisionsSent()
 		if isJSONOutput() {
 			// JSON output with full result (MentionResults included, if any).
 			// outputJSON encodes a nil *OutboundMessageResult as JSON null,
@@ -898,8 +857,9 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 		default:
 			fmt.Printf("Message dispatched to %s%s (status: %s).\n", ref.Raw, receiptSuffix(result.MessageID, result.ConversationID), result.Status)
 		}
-		// A choice prompt's decisions, whatever the status.
-		printChoiceDecisions(result)
+		// A decision or secret-request prompt's items, whatever the status.
+		printSentDecisions(result)
+		printSentSecretRequests(result)
 		printAttachmentWarnings(result.AttachmentWarnings)
 		return nil
 	}
@@ -918,7 +878,7 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 	// message endpoint. The server derives the conversation from the
 	// sender/recipient principals (DEF-138 Rule 3).
 	sender := resolveSenderIdentity(hubCtx)
-	agentMsg := buildStructuredMessage(sender, "agent:"+ref.Value, message, attachments, msgPlain, interrupt)
+	agentMsg := buildStructuredMessage(sender, "agent:"+ref.Value, message, attachments, interrupt)
 	if err := messaging.ValidateLegacyMessage(agentMsg); err != nil {
 		return fmt.Errorf("message validation failed: %w", err)
 	}
@@ -937,14 +897,16 @@ func sendMessageViaConversation(hubCtx *HubContext, ref *messaging.Reference, me
 	if err != nil {
 		return agentMessageSendError(ref.Value, err)
 	}
-	// This path prints no JSON body, so the warning goes to stderr in
-	// either output mode.
+	if isJSONOutput() {
+		if humanResp != nil {
+			return outputJSON(humanResp)
+		}
+		return nil
+	}
 	if humanResp != nil {
 		printArtifactWarning(humanResp.ArtifactWarning)
 	}
-	if !isJSONOutput() {
-		printAgentSendConfirmation(ref.Value, fmt.Sprintf("'%s'", ref.Value), humanResp)
-	}
+	printAgentSendConfirmation(ref.Value, fmt.Sprintf("'%s'", ref.Value), humanResp)
 	return nil
 }
 
@@ -986,13 +948,6 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 		PrintUsingHub(hubCtx.Endpoint)
 	}
 
-	// Validate --channel against registered channels
-	if msgChannel != "" {
-		if err := validateChannel(hubCtx, msgChannel); err != nil {
-			return err
-		}
-	}
-
 	// Determine the sending agent's name. User-targeted messages require an
 	// agent identity so the server can attribute and route the message.
 	senderAgent := os.Getenv("SCION_AGENT_NAME")
@@ -1012,11 +967,10 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 		Type:        "instruction",
 		Urgent:      urgent,
 		Attachments: msgAttach,
-		Channel:     msgChannel,
-		ThreadID:    msgThreadID,
 		Metadata:    artifactRefsMetadata(msgArtifactRefs),
 	}
-	applyChoicesToOutbound(outMsg)
+	applyDecisionsToOutbound(outMsg)
+	applySecretRequestsToOutbound(outMsg)
 
 	attachmentIDs, sendCtx, sendCancel, err := uploadThenSendContext(context.Background())
 	if err != nil {
@@ -1026,10 +980,10 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 	outMsg.AttachmentIDs = attachmentIDs
 	result, err := agentSvc.SendOutboundMessage(sendCtx, senderAgent, outMsg)
 	if err != nil {
-		return wrapHubError(fmt.Errorf("failed to send message to %s: %w", userRecipient, err))
+		return formatSecretRequestSendError(userRecipient, err)
 	}
 	// The hub stored the prompt: mark the agent waiting for input.
-	defer afterChoicesSent()
+	defer afterDecisionsSent()
 
 	if isJSONOutput() {
 		if result != nil {
@@ -1048,7 +1002,8 @@ func sendOutboundMessageViaHub(hubCtx *HubContext, userRecipient string, message
 	// reports its ID.
 	if result != nil {
 		fmt.Printf("Message sent to %s via Hub%s.\n", userRecipient, receiptSuffix(result.MessageID, result.ConversationID))
-		printChoiceDecisions(result)
+		printSentDecisions(result)
+		printSentSecretRequests(result)
 	} else {
 		fmt.Printf("Message sent to %s via Hub.\n", userRecipient)
 	}
@@ -1356,7 +1311,7 @@ func sendGroupMessageViaHubCtx(hubCtx *HubContext, recipients []messages.GroupRe
 		switch recip.Kind {
 		case messages.RecipientAgent:
 			slug := api.Slugify(recip.Name)
-			msg := buildStructuredMessage(sender, "agent:"+slug, message, msgAttach, msgPlain, interrupt)
+			msg := buildStructuredMessage(sender, "agent:"+slug, message, msgAttach, interrupt)
 			msg.Type = messages.TypeGroupSet
 			msg.Recipients = recipientsStr
 			msg.Metadata = map[string]string{"group_id": groupID}
@@ -1404,8 +1359,6 @@ func sendGroupMessageViaHubCtx(hubCtx *HubContext, recipients []messages.GroupRe
 				Type:        messages.TypeGroupSet,
 				Urgent:      interrupt,
 				Attachments: msgAttach,
-				Channel:     msgChannel,
-				ThreadID:    msgThreadID,
 				Metadata:    map[string]string{"recipients": recipientsStr, "group_id": groupID},
 			}
 			ids, sendCtx, sendCancel, err := uploadThenSendContext(fanCtx)
@@ -1475,15 +1428,13 @@ func sendGroupMessageViaHubCtx(hubCtx *HubContext, recipients []messages.GroupRe
 		}
 	}
 
-	// @mention and --cc fan-out for group messages: mentioned agents that are
+	// @mention fan-out for group messages: mentioned agents that are
 	// not already group recipients receive a TypeMention notification.
 	// This runs regardless of partial delivery — mention recipients are
 	// independent of the group — but not after an interrupt was received.
-	var mentionNames []string
-	mentionNames = append(mentionNames, extractMentions(message)...)
-	mentionNames = append(mentionNames, parseCCFlag(msgCC)...)
+	mentionNames := extractMentions(message)
 	if len(mentionNames) > 0 && signalled {
-		fmt.Fprintln(os.Stderr, "Interrupted: @mention and --cc notifications were not sent.")
+		fmt.Fprintln(os.Stderr, "Interrupted: @mention notifications were not sent.")
 	}
 	if len(mentionNames) > 0 && !signalled {
 		// Build a mention source that reflects the group
@@ -1632,45 +1583,6 @@ func printGroupSendSummary(s groupSendResult, interrupted bool) {
 	}
 }
 
-func scheduleMessageViaHub(hubCtx *HubContext, agentName string, message string, interrupt bool, plain bool) error {
-	if !isJSONOutput() {
-		PrintUsingHub(hubCtx.Endpoint)
-	}
-
-	projectID, err := GetProjectID(hubCtx)
-	if err != nil {
-		return wrapHubError(err)
-	}
-
-	req := &hubclient.CreateScheduledEventRequest{
-		EventType: "message",
-		AgentName: agentName,
-		Message:   message,
-		Interrupt: interrupt,
-		Plain:     plain,
-	}
-
-	if msgIn != "" {
-		req.FireIn = msgIn
-	} else {
-		req.FireAt = msgAt
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	evt, err := hubCtx.Client.ScheduledEvents(projectID).Create(ctx, req)
-	if err != nil {
-		return wrapHubError(fmt.Errorf("failed to schedule message: %w", err))
-	}
-
-	if !isJSONOutput() {
-		fmt.Printf("Message to agent '%s' scheduled for %s\n", agentName, clitime.Format(evt.FireAt, clitime.Full))
-	}
-
-	return nil
-}
-
 var messageChannelsCmd = &cobra.Command{
 	Use:   "channels",
 	Short: "List available message channels",
@@ -1715,33 +1627,6 @@ var messageChannelsCmd = &cobra.Command{
 	},
 }
 
-// validateChannel checks that the given channel name is registered with the Hub.
-func validateChannel(hubCtx *HubContext, channel string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	channels, err := hubCtx.Client.Messages().ListChannels(ctx)
-	if err != nil {
-		return wrapHubError(fmt.Errorf("failed to list channels: %w", err))
-	}
-
-	for _, ch := range channels {
-		if ch.Name == channel {
-			return nil
-		}
-	}
-
-	available := make([]string, len(channels))
-	for i, ch := range channels {
-		available[i] = ch.Name
-	}
-
-	if len(available) == 0 {
-		return fmt.Errorf("channel %q is not registered; no channels are currently available", channel)
-	}
-	return fmt.Errorf("channel %q is not registered; available channels: %s", channel, strings.Join(available, ", "))
-}
-
 // extractMentions delegates to the shared messages.ExtractProseMentions, so
 // an @-mention inside a fenced code block, an inline backtick span, or a
 // quoted '>' line is not treated as an address. Agent bodies pasting logs or
@@ -1749,12 +1634,6 @@ func validateChannel(hubCtx *HubContext, channel string) error {
 // explicit-mentions list, same as it does for the server's body parsing.
 func extractMentions(text string) []string {
 	return messages.ExtractProseMentions(text)
-}
-
-// parseCCFlag delegates to the shared messages.ParseCCFlags. The --cc flag is
-// repeatable and each occurrence may itself be a comma-separated list.
-func parseCCFlag(cc []string) []string {
-	return messages.ParseCCFlags(cc)
 }
 
 // maxMentionRecipients is an alias for the shared constant.
@@ -1788,14 +1667,118 @@ func printNoAgentWoken(result *hubclient.OutboundMessageResult) {
 		return
 	}
 	if d := result.DefaultAgentResult; d != nil {
+		reason := defaultAgentNotWokenReason(d)
 		if d.Slug == "" {
-			fmt.Fprintf(os.Stderr, "No agent was woken: the default agent could not be reached (%s).\n", d.Status)
+			fmt.Fprintf(os.Stderr, "No agent was woken: the default agent could not be reached (%s).\n", reason)
 		} else {
-			fmt.Fprintf(os.Stderr, "No agent was woken: default agent @%s was not reached (%s).\n", d.Slug, d.Status)
+			fmt.Fprintf(os.Stderr, "No agent was woken: default agent @%s was not reached (%s).\n", d.Slug, reason)
 		}
 		return
 	}
 	fmt.Fprintln(os.Stderr, "No agent was woken by this post.")
+}
+
+func defaultAgentNotWokenReason(d *messages.MentionResult) string {
+	var stateDesc string
+	if d.AgentPhase != "" {
+		stateDesc = "state: " + suspendedPhaseLabel(d.AgentPhase, d.SuspendReason)
+	}
+
+	switch {
+	case stateDesc != "" && d.Error != "":
+		if d.Status != "" && d.Status != "error" {
+			return fmt.Sprintf("%s; %s: %s", stateDesc, d.Status, d.Error)
+		}
+		return fmt.Sprintf("%s; %s", stateDesc, d.Error)
+	case stateDesc != "":
+		if d.Status != "" && d.Status != "error" {
+			return fmt.Sprintf("%s; %s", d.Status, stateDesc)
+		}
+		return stateDesc
+	case d.Error != "":
+		if d.Status != "" {
+			return fmt.Sprintf("%s: %s", d.Status, d.Error)
+		}
+		return d.Error
+	default:
+		return d.Status
+	}
+}
+
+// warnInvalidBodyConvRefs emits a stderr warning at send time when the message
+// body contains a truncated or malformed conv:<id> reference (for example
+// conv:69e36cbf or conv:69e36cbf... in a brief), so the sender sees the mistake
+// before the recipient fails to resolve it (ptone/scion#8469).
+func warnInvalidBodyConvRefs(text string) {
+	if isJSONOutput() {
+		return
+	}
+	for _, bad := range findInvalidBodyConvRefs(text) {
+		fmt.Fprintf(os.Stderr, "Warning: message body contains truncated or invalid conversation reference %q; use a full 36-character UUID (conv:<uuid>) so recipients can resolve it.\n", bad)
+	}
+}
+
+func findInvalidBodyConvRefs(text string) []string {
+	const prefix = "conv:"
+	var out []string
+	seen := make(map[string]bool)
+	offset := 0
+	for offset < len(text) {
+		rel := strings.Index(text[offset:], prefix)
+		if rel < 0 {
+			break
+		}
+		idx := offset + rel
+		if idx > 0 {
+			prev := text[idx-1]
+			if (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+				(prev >= '0' && prev <= '9') || prev == '/' || prev == ':' ||
+				prev == '_' || prev == '-' || prev == '.' {
+				offset = idx + len(prefix)
+				continue
+			}
+		}
+		after := text[idx+len(prefix):]
+		end := 0
+		hexCount := 0
+		for end < len(after) {
+			c := after[end]
+			if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+				hexCount++
+				end++
+				continue
+			}
+			if c == '-' {
+				end++
+				continue
+			}
+			break
+		}
+		offset = idx + len(prefix) + end
+		if end == 0 || hexCount < 4 {
+			continue
+		}
+		// Ignore hex prefixes of non-hex words such as "conv:default".
+		if end < len(after) {
+			next := after[end]
+			if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') ||
+				(next >= '0' && next <= '9') || next == '_' {
+				continue
+			}
+		}
+		tok := after[:end]
+		if len(tok) == 36 {
+			if _, err := uuid.Parse(tok); err == nil {
+				continue
+			}
+		}
+		candidate := prefix + tok
+		if !seen[candidate] {
+			seen[candidate] = true
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 // printMentionResults prints one line per mention result to stderr,
@@ -1998,27 +1981,33 @@ func init() {
 	messageCmd.Flags().StringArrayVar(&msgArtifacts, "artifact", nil, "Reference a published artifact (work product to review, version or find later; use --attach for a file that is part of this message) (scion://artifact/<id>[@<seq>]), repeatable, at most 10. The reference is added to the message text and the recipient is shown how to fetch it; the hub attaches only artifacts you can read.")
 	messageCmd.Flags().StringArrayVar(&msgAttach, "attach", nil, "Attach a file as part of this message, repeatable (use --artifact for work product to review, version or find later). When the hub stores attachments as artifacts, the file is uploaded and an agent recipient gets it in ~/.scion/inbox/<message-id>/; HTML and SVG are refused. Otherwise use paths under /workspace or /scion-volumes (bare relative paths resolve to /workspace); attachments the hub cannot read are reported as warnings after an agent's send.")
 	messageCmd.Flags().StringVar(&msgBodyFile, "body-file", "", "Read message body from a file instead of positional args ('-' reads stdin; trailing CR/LF characters are trimmed)")
-	messageCmd.Flags().StringVar(&msgChoices, "choices", "", "Send a choice prompt: a JSON array of decisions for a user or conversation to answer (agents only; needs the web.chat_choices experiment). The body becomes the optional intro")
-	messageCmd.Flags().StringVar(&msgChoicesFile, "choices-file", "", "Read the --choices JSON from a file ('-' reads stdin, which then excludes --body-file -)")
-	messageCmd.Flags().BoolVar(&msgChoicesUpdate, "update", false, "With choices: replace decisions whose ids already exist (a new version each); without it, reusing an id is refused")
+	messageCmd.Flags().StringVar(&msgDecisions, "decisions", "", "Send a decision prompt: a JSON array of decisions for a user or conversation to answer (agents only; needs the web.decisions experiment). The body becomes the optional intro")
+	messageCmd.Flags().StringVar(&msgDecisionsFile, "decisions-file", "", "Read the --decisions JSON from a file ('-' reads stdin, which then excludes --body-file -)")
+	messageCmd.Flags().StringArrayVar(&msgSecretRequests, "secret-request", nil, "Request an agent-scoped secret key from a user or conversation (repeatable; agents only; needs the hub.agent_secrets experiment). The body becomes the optional intro")
+	messageCmd.Flags().StringVar(&msgSecretDescription, "secret-description", "", "With a single --secret-request: description explaining what the secret is for")
+	messageCmd.Flags().StringVar(&msgSecretRequestFile, "secret-request-file", "", "Read secret request entries (JSON array of {key, description, type, target}) from a file ('-' reads stdin, which then excludes --body-file -)")
+	messageCmd.Flags().BoolVar(&msgDecisionsUpdate, "update", false, "With --decisions/--decisions-file or --secret-request/--secret-request-file: replace items whose keys already exist (a new version each); without it, reusing an id or pending key is refused. To revise an unanswered set on one card, resend all still-pending keys of that set. To retire without a replacement, use 'scion decisions withdraw' or 'scion secret request withdraw'")
 
-	// Deprecated flags — still functional, emit warnings when used.
-	// These flags are hidden from help output to guide users toward
-	// the new subcommands, but they continue to work identically.
+	// legacy choices fallback: remove in ptone/scion#8249
+	messageCmd.Flags().StringVar(&msgLegacyChoices, "choices", "", "Deprecated alias of --decisions")
+	messageCmd.Flags().StringVar(&msgLegacyChoicesFile, "choices-file", "", "Deprecated alias of --decisions-file")
+	_ = messageCmd.Flags().MarkDeprecated("choices", "use --decisions")
+	_ = messageCmd.Flags().MarkDeprecated("choices-file", "use --decisions-file")
+
+	// Removed flags — kept (hidden) only so their use gets actionable
+	// guidance instead of an unknown-flag error. See Args and RunE.
 	messageCmd.Flags().BoolP("broadcast", "b", false, "Removed: use 'scion broadcast' instead")
 	messageCmd.Flags().BoolP("all", "a", false, "Removed: use 'scion broadcast --all' instead")
-	messageCmd.Flags().StringVar(&msgIn, "in", "", "Deprecated: use 'scion schedule create --in' instead")
-	messageCmd.Flags().StringVar(&msgAt, "at", "", "Deprecated: use 'scion schedule create --at' instead")
-	messageCmd.Flags().BoolVar(&msgPlain, "plain", false, "Deprecated: --plain is deprecated and will be removed")
-	// --raw is removed; the flag is kept (hidden) only so its use gets
-	// actionable guidance instead of an unknown-flag error. See Args.
+	messageCmd.Flags().String("in", "", "Removed: use 'scion schedule create --in' instead")
+	messageCmd.Flags().String("at", "", "Removed: use 'scion schedule create --at' instead")
+	messageCmd.Flags().Bool("plain", false, "Removed: plain-text delivery is no longer supported on 'scion message'")
 	messageCmd.Flags().Bool("raw", false, "Removed: use 'scion keys' instead")
-	messageCmd.Flags().BoolVar(&msgNotify, "notify", false, "Deprecated: use 'scion notifications subscribe' instead")
-	messageCmd.Flags().StringVar(&msgChannel, "channel", "", "Deprecated: use conversation references instead")
-	messageCmd.Flags().StringVar(&msgThreadID, "thread-id", "", "Deprecated: use conversation references instead")
-	messageCmd.Flags().StringArrayVar(&msgCC, "cc", nil, "Deprecated: --cc is deprecated and will be removed")
+	messageCmd.Flags().Bool("notify", false, "Removed: use 'scion notifications subscribe' instead")
+	messageCmd.Flags().String("channel", "", "Removed: address conversations with conv:<uuid> or @<agent-name> instead")
+	messageCmd.Flags().String("thread-id", "", "Removed: address conversations with conv:<uuid> instead")
+	messageCmd.Flags().StringArray("cc", nil, "Removed: use group[...] addressing or body @mentions instead")
 
-	// Hide deprecated flags from help
+	// Hide removed flags from help
 	_ = messageCmd.Flags().MarkHidden("broadcast")
 	_ = messageCmd.Flags().MarkHidden("all")
 	_ = messageCmd.Flags().MarkHidden("in")

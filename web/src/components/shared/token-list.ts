@@ -25,7 +25,7 @@
  */
 
 import { LitElement, html, css, nothing } from 'lit';
-import { customElement, state } from 'lit/decorators.js';
+import { customElement, property, state } from 'lit/decorators.js';
 
 import type { Project } from '../../shared/types.js';
 import { apiFetch, extractApiError, parseApiError } from '../../client/api.js';
@@ -201,6 +201,7 @@ const RESOURCE_TYPE_LABELS: Record<string, string> = {
   artifact: 'Artifact',
   broker: 'Broker',
   gcp_service_account: 'GCP Service Account',
+  github_trigger: 'GitHub Trigger',
   group: 'Group',
   harness_config: 'Harness Config',
   hub: 'Hub',
@@ -210,7 +211,9 @@ const RESOURCE_TYPE_LABELS: Record<string, string> = {
   skill: 'Skill',
   template: 'Template',
   test_identity: 'Test Identity',
+  trigger: 'Trigger',
   user: 'User',
+  webhook_endpoint: 'Webhook Endpoint',
 };
 
 /**
@@ -416,6 +419,20 @@ const FALLBACK_SCOPES: ScopeOption[] = [
     label: 'gcp_service_account:verify',
     description: 'Verify GCP service accounts',
     resource: 'gcp_service_account',
+    isAlias: false,
+  },
+  {
+    value: 'github_trigger:comment',
+    label: 'github_trigger:comment',
+    description: 'Post comments on GitHub as the GitHub App through project triggers',
+    resource: 'github_trigger',
+    isAlias: false,
+  },
+  {
+    value: 'github_trigger:configure',
+    label: 'github_trigger:configure',
+    description: 'Configure GitHub trigger source settings for a project',
+    resource: 'github_trigger',
     isAlias: false,
   },
   {
@@ -835,6 +852,21 @@ const FALLBACK_SCOPES: ScopeOption[] = [
     isAlias: false,
   },
   {
+    value: 'project:manage_message_policies',
+    label: 'project:manage_message_policies',
+    description:
+      "Create, update, delete, dry-run test, and inspect decisions for a project's message policies (project owner/admin or hub admin)",
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'project:read_message_policies',
+    label: 'project:read_message_policies',
+    description: "List and read a project's message policies and surface coverage",
+    resource: 'project',
+    isAlias: false,
+  },
+  {
     value: 'quota:create',
     label: 'quota:create',
     description: 'Create limit definitions and entitlement bindings',
@@ -919,6 +951,13 @@ const FALLBACK_SCOPES: ScopeOption[] = [
     isAlias: false,
   },
   {
+    value: 'skill:delete_global',
+    label: 'skill:delete_global',
+    description: 'Delete skills from the global (hub) catalog',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
     value: 'skill:list',
     label: 'skill:list',
     description: 'List skills',
@@ -962,6 +1001,13 @@ const FALLBACK_SCOPES: ScopeOption[] = [
     isAlias: false,
   },
   {
+    value: 'skill:update_global',
+    label: 'skill:update_global',
+    description: 'Update skills in the global (hub) catalog',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
     value: 'template:create',
     label: 'template:create',
     description: 'Create templates',
@@ -969,9 +1015,23 @@ const FALLBACK_SCOPES: ScopeOption[] = [
     isAlias: false,
   },
   {
+    value: 'template:create_global',
+    label: 'template:create_global',
+    description: 'Create templates in the global (hub) catalog',
+    resource: 'template',
+    isAlias: false,
+  },
+  {
     value: 'template:delete',
     label: 'template:delete',
     description: 'Delete templates',
+    resource: 'template',
+    isAlias: false,
+  },
+  {
+    value: 'template:delete_global',
+    label: 'template:delete_global',
+    description: 'Delete templates from the global (hub) catalog',
     resource: 'template',
     isAlias: false,
   },
@@ -1008,6 +1068,48 @@ const FALLBACK_SCOPES: ScopeOption[] = [
     label: 'template:update',
     description: 'Update templates',
     resource: 'template',
+    isAlias: false,
+  },
+  {
+    value: 'template:update_global',
+    label: 'template:update_global',
+    description: 'Update templates in the global (hub) catalog',
+    resource: 'template',
+    isAlias: false,
+  },
+  {
+    value: 'trigger:create',
+    label: 'trigger:create',
+    description: 'Create triggers',
+    resource: 'trigger',
+    isAlias: false,
+  },
+  {
+    value: 'trigger:delete',
+    label: 'trigger:delete',
+    description: 'Delete triggers',
+    resource: 'trigger',
+    isAlias: false,
+  },
+  {
+    value: 'trigger:list',
+    label: 'trigger:list',
+    description: 'List triggers and trigger events',
+    resource: 'trigger',
+    isAlias: false,
+  },
+  {
+    value: 'trigger:read',
+    label: 'trigger:read',
+    description: 'Read triggers, trigger history and trigger events',
+    resource: 'trigger',
+    isAlias: false,
+  },
+  {
+    value: 'trigger:update',
+    label: 'trigger:update',
+    description: 'Update, pause and resume triggers',
+    resource: 'trigger',
     isAlias: false,
   },
   {
@@ -1066,6 +1168,34 @@ const FALLBACK_SCOPES: ScopeOption[] = [
     resource: 'user_skill_injection',
     isAlias: false,
   },
+  {
+    value: 'webhook_endpoint:create',
+    label: 'webhook_endpoint:create',
+    description: 'Create webhook endpoints',
+    resource: 'webhook_endpoint',
+    isAlias: false,
+  },
+  {
+    value: 'webhook_endpoint:delete',
+    label: 'webhook_endpoint:delete',
+    description: 'Delete webhook endpoints',
+    resource: 'webhook_endpoint',
+    isAlias: false,
+  },
+  {
+    value: 'webhook_endpoint:list',
+    label: 'webhook_endpoint:list',
+    description: 'List webhook endpoints',
+    resource: 'webhook_endpoint',
+    isAlias: false,
+  },
+  {
+    value: 'webhook_endpoint:read',
+    label: 'webhook_endpoint:read',
+    description: 'Read webhook endpoints',
+    resource: 'webhook_endpoint',
+    isAlias: false,
+  },
 ];
 
 /** Groups scope options by resource type, preserving order. Returns [resourceType, scopes][] */
@@ -1106,6 +1236,10 @@ function filterScopesForBoundary(scopes: ScopeOption[], kind: TokenBoundaryKind)
 export class ScionTokenList extends LitElement {
   /** Re-renders absolute times when the display timezone changes. */
   readonly _zone = new DisplayZoneController(this);
+
+  /** True when the current browser session is in "View as member" mode. */
+  @property({ type: Boolean })
+  viewAsMember = false;
 
   @state() private loading = true;
   @state() private tokens: AccessToken[] = [];
@@ -1325,7 +1459,7 @@ export class ScionTokenList extends LitElement {
         align-items: flex-start;
         gap: 0.375rem;
         padding: 0.25rem 0.25rem;
-        border-radius: 0.25rem;
+        border-radius: var(--scion-radius-sm);
       }
 
       .scope-checkbox-item:hover {
@@ -1351,7 +1485,7 @@ export class ScionTokenList extends LitElement {
       .scope-alias-item {
         background: var(--sl-color-primary-50, #eff6ff);
         border: 1px solid var(--sl-color-primary-200, #bfdbfe);
-        border-radius: 0.375rem;
+        border-radius: calc(var(--scion-radius) * 0.75);
         margin: 0.25rem 0.5rem;
         padding: 0.375rem 0.5rem;
       }
@@ -1443,7 +1577,7 @@ export class ScionTokenList extends LitElement {
         display: inline-flex;
         align-items: center;
         padding: 0 0.375rem;
-        border-radius: 0.25rem;
+        border-radius: var(--scion-radius-sm);
         font-size: 0.6875rem;
         font-family: var(--scion-font-mono, monospace);
         background: var(--scion-bg-subtle, #f1f5f9);
@@ -2089,6 +2223,20 @@ export class ScionTokenList extends LitElement {
         @sl-request-close=${this.closeCreateDialog}
       >
         <form class="dialog-form" @submit=${this.handleCreate}>
+          ${this.viewAsMember
+            ? html`
+                <sl-alert
+                  variant="primary"
+                  open
+                  class="view-as-member-token-note"
+                  data-testid="view-as-member-token-note"
+                >
+                  <sl-icon slot="icon" name="info-circle"></sl-icon>
+                  Viewing as member: tokens created in this mode are frozen at member permissions
+                  for their lifetime.
+                </sl-alert>
+              `
+            : nothing}
           <sl-input
             label="Name"
             placeholder="e.g. github-actions, ci-deploy"

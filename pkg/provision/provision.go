@@ -2352,6 +2352,12 @@ var ErrCommondirPresent = errors.New("refusing git operation: base .git/commondi
 // GIT_CONFIG_COUNT/KEY_0/VALUE_0 credential-helper technique) must append to
 // cmd.Env rather than replace it, or the pin is lost.
 func SafeGitCommand(ctx context.Context, dir string, args ...string) (*util.HostGitCmd, error) {
+	return safeGitCommand(ctx, dir, nil, args...)
+}
+
+// safeGitCommand is SafeGitCommand with extra key=value settings passed as
+// -c (util.HostGitOptions.Config), never written to the repository config.
+func safeGitCommand(ctx context.Context, dir string, config []string, args ...string) (*util.HostGitCmd, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("SafeGitCommand: dir is required")
 	}
@@ -2366,7 +2372,7 @@ func SafeGitCommand(ctx context.Context, dir string, args ...string) (*util.Host
 	// Managed base: a worktree add checks out files, but agents fetch LFS
 	// objects in-container, so skip the host-side LFS smudge rather than let
 	// git-lfs read a tracked .lfsconfig for its endpoint.
-	return util.HostGitCommand(ctx, dir, util.HostGitOptions{Env: env, SkipLFSSmudge: true}, args...)
+	return util.HostGitCommand(ctx, dir, util.HostGitOptions{Config: config, Env: env, SkipLFSSmudge: true}, args...)
 }
 
 // markedWorkspaceNeedsClone reports whether a shared-plain git workspace that
@@ -2946,7 +2952,9 @@ func runGitClone(ctx context.Context, in ProvisionInput) error {
 		// last -c wins), so file:// transport is fully denied on that path.
 		args = append(args, util.HostGitArgs()...)
 	}
-	args = append(args, "clone")
+	// Parallel checkout workers for the clone's work-tree checkout; on NFS
+	// shares a sequential checkout is bound by per-file round trips.
+	args = append(args, "-c", checkoutWorkersConfig(), "clone")
 
 	// Depth: nil/omitted = shallow depth 1, 0 = full clone (no --depth), >0 = that depth.
 	depth := 1
@@ -3046,12 +3054,21 @@ func cloneError(rawURL, output string, runErr error, withToken bool, token strin
 	if token != "" {
 		detail = strings.ReplaceAll(detail, token, redactedCredential)
 	}
-	kind := util.ClassifyGitError(detail).Kind
+	classified := util.ClassifyGitErrorForURL(detail, rawURL)
+	kind := classified.Kind
+	host := classified.RemoteHost
 	if withToken {
 		switch kind {
 		case util.GitErrAuth:
+			if host != "" && !util.IsGitHubHost(host) {
+				return fmt.Errorf("git clone %s: the repository on %s did not accept the project's git credential: %s", safeURL, host, detail)
+			}
 			return fmt.Errorf("git clone %s: the repository did not accept the project's git credential (GITHUB_TOKEN): %s", safeURL, detail)
 		case util.GitErrNotFound:
+			if host != "" && !util.IsGitHubHost(host) {
+				return fmt.Errorf("git clone %s: repository or branch not found on %s, "+
+					"or the project's git credential has no access to it: %s", safeURL, host, detail)
+			}
 			return fmt.Errorf("git clone %s: repository or branch not found, "+
 				"or the project's git credential (GITHUB_TOKEN) has no access to it: %s", safeURL, detail)
 		default:
@@ -3386,16 +3403,11 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 	// Derive a branch name from the agent name or ID. For MountedWorktree
 	// the branch is used exactly as given, as on the local runtimes, and
 	// must be a valid branch name.
-	branchName := in.AgentID
+	branchName := WorktreeBranchName(in)
 	if in.MountedWorktree {
-		if in.AgentName != "" {
-			branchName = in.AgentName
-		}
 		if err := checkBranchName(ctx, base, branchName); err != nil {
 			return worktreeOutcome{}, err
 		}
-	} else if in.AgentName != "" {
-		branchName = sanitizeBranchName(in.AgentName)
 	}
 	registered := func(path string) (worktreeOutcome, error) {
 		o := worktreeOutcome{branch: branchName}
@@ -3594,7 +3606,10 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 
 	// git worktree add --relative-paths -b <branch> <path>
 	// --relative-paths is mandatory for container path-identity (design §6).
-	cmd, err := SafeGitCommand(ctx, base, "worktree", "add", "--relative-paths", "-b", branchName, worktreePath)
+	// checkout.workers: parallel checkout of the new work tree (see
+	// DefaultGitCheckoutWorkers).
+	workers := []string{checkoutWorkersConfig()}
+	cmd, err := safeGitCommand(ctx, base, workers, "worktree", "add", "--relative-paths", "-b", branchName, worktreePath)
 	if err != nil {
 		return worktreeOutcome{}, fmt.Errorf("ProvisionShared: %w", err)
 	}
@@ -3628,7 +3643,7 @@ func ensureWorktree(ctx context.Context, in ProvisionInput) (worktreeOutcome, er
 
 		// If branch already exists (but not checked out), try without -b.
 		if strings.Contains(outputStr, "already exists") {
-			cmd, err = SafeGitCommand(ctx, base, "worktree", "add", "--relative-paths", worktreePath, branchName)
+			cmd, err = safeGitCommand(ctx, base, workers, "worktree", "add", "--relative-paths", worktreePath, branchName)
 			if err != nil {
 				return worktreeOutcome{}, fmt.Errorf("ProvisionShared: %w", err)
 			}
@@ -4305,6 +4320,22 @@ func appendGitExclude(hostPath, pattern string) error {
 	}
 	_, err = f.WriteString(pattern + "\n")
 	return err
+}
+
+// WorktreeBranchName returns the git branch and sharer-registry key
+// ProvisionShared uses for in. For MountedWorktree a non-empty AgentName is
+// used as given; otherwise a non-empty AgentName is sanitized with
+// sanitizeBranchName, falling back to AgentID when AgentName is empty.
+func WorktreeBranchName(in ProvisionInput) string {
+	branchName := in.AgentID
+	if in.MountedWorktree {
+		if in.AgentName != "" {
+			branchName = in.AgentName
+		}
+	} else if in.AgentName != "" {
+		branchName = sanitizeBranchName(in.AgentName)
+	}
+	return branchName
 }
 
 // sanitizeBranchName produces a git-safe branch name from an agent name.

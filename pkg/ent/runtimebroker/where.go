@@ -130,6 +130,11 @@ func Health(v string) predicate.RuntimeBroker {
 	return predicate.RuntimeBroker(sql.FieldEQ(FieldHealth, v))
 }
 
+// WorkloadIdentityTargets applies equality check predicate on the "workload_identity_targets" field. It's identical to WorkloadIdentityTargetsEQ.
+func WorkloadIdentityTargets(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldEQ(FieldWorkloadIdentityTargets, v))
+}
+
 // Endpoint applies equality check predicate on the "endpoint" field. It's identical to EndpointEQ.
 func Endpoint(v string) predicate.RuntimeBroker {
 	return predicate.RuntimeBroker(sql.FieldEQ(FieldEndpoint, v))
@@ -143,6 +148,11 @@ func CreatedBy(v string) predicate.RuntimeBroker {
 // AutoProvide applies equality check predicate on the "auto_provide" field. It's identical to AutoProvideEQ.
 func AutoProvide(v bool) predicate.RuntimeBroker {
 	return predicate.RuntimeBroker(sql.FieldEQ(FieldAutoProvide, v))
+}
+
+// AdminManaged applies equality check predicate on the "admin_managed" field. It's identical to AdminManagedEQ.
+func AdminManaged(v bool) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldEQ(FieldAdminManaged, v))
 }
 
 // GcpHostServiceAccountEmail applies equality check predicate on the "gcp_host_service_account_email" field. It's identical to GcpHostServiceAccountEmailEQ.
@@ -1275,6 +1285,81 @@ func HealthContainsFold(v string) predicate.RuntimeBroker {
 	return predicate.RuntimeBroker(sql.FieldContainsFold(FieldHealth, v))
 }
 
+// WorkloadIdentityTargetsEQ applies the EQ predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsEQ(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldEQ(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsNEQ applies the NEQ predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsNEQ(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldNEQ(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsIn applies the In predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsIn(vs ...string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldIn(FieldWorkloadIdentityTargets, vs...))
+}
+
+// WorkloadIdentityTargetsNotIn applies the NotIn predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsNotIn(vs ...string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldNotIn(FieldWorkloadIdentityTargets, vs...))
+}
+
+// WorkloadIdentityTargetsGT applies the GT predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsGT(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldGT(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsGTE applies the GTE predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsGTE(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldGTE(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsLT applies the LT predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsLT(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldLT(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsLTE applies the LTE predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsLTE(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldLTE(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsContains applies the Contains predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsContains(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldContains(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsHasPrefix applies the HasPrefix predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsHasPrefix(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldHasPrefix(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsHasSuffix applies the HasSuffix predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsHasSuffix(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldHasSuffix(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsIsNil applies the IsNil predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsIsNil() predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldIsNull(FieldWorkloadIdentityTargets))
+}
+
+// WorkloadIdentityTargetsNotNil applies the NotNil predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsNotNil() predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldNotNull(FieldWorkloadIdentityTargets))
+}
+
+// WorkloadIdentityTargetsEqualFold applies the EqualFold predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsEqualFold(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldEqualFold(FieldWorkloadIdentityTargets, v))
+}
+
+// WorkloadIdentityTargetsContainsFold applies the ContainsFold predicate on the "workload_identity_targets" field.
+func WorkloadIdentityTargetsContainsFold(v string) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldContainsFold(FieldWorkloadIdentityTargets, v))
+}
+
 // LabelsIsNil applies the IsNil predicate on the "labels" field.
 func LabelsIsNil() predicate.RuntimeBroker {
 	return predicate.RuntimeBroker(sql.FieldIsNull(FieldLabels))
@@ -1453,6 +1538,16 @@ func AutoProvideEQ(v bool) predicate.RuntimeBroker {
 // AutoProvideNEQ applies the NEQ predicate on the "auto_provide" field.
 func AutoProvideNEQ(v bool) predicate.RuntimeBroker {
 	return predicate.RuntimeBroker(sql.FieldNEQ(FieldAutoProvide, v))
+}
+
+// AdminManagedEQ applies the EQ predicate on the "admin_managed" field.
+func AdminManagedEQ(v bool) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldEQ(FieldAdminManaged, v))
+}
+
+// AdminManagedNEQ applies the NEQ predicate on the "admin_managed" field.
+func AdminManagedNEQ(v bool) predicate.RuntimeBroker {
+	return predicate.RuntimeBroker(sql.FieldNEQ(FieldAdminManaged, v))
 }
 
 // GcpHostServiceAccountEmailEQ applies the EQ predicate on the "gcp_host_service_account_email" field.

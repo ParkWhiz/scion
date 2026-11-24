@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"sort"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
@@ -180,12 +181,29 @@ func dropTopLevelMember(rawBody []byte, key string) []byte {
 }
 
 // brokerForDisplay returns b with the reported node image registry redacted
-// for display (config.RedactImageRegistry). The capabilities are copied, so
-// the stored broker and the value dispatch resolves with are unchanged.
-// The version is bounded (brokerVersionToken), which also covers rows
-// stored before the bound existed.
+// for display (config.RedactImageRegistry) and, for flat Cloud Run rows, the
+// private GCP host pair cleared (fail-closed for viewers without broker.update;
+// callers with capabilities use brokerForDisplayWithCap or
+// brokerForDisplayWithDetail). The capabilities are copied, so the stored
+// broker and the value dispatch resolves with are unchanged. The version is
+// bounded (brokerVersionToken), which also covers rows stored before the bound
+// existed.
 func brokerForDisplay(b store.RuntimeBroker) store.RuntimeBroker {
+	return redactFlatCloudRunGCPHost(brokerForDisplayBase(b), false)
+}
+
+func brokerForDisplayBase(b store.RuntimeBroker) store.RuntimeBroker {
 	b.Version = brokerVersionToken(b.Version)
+	if b.Status != store.BrokerStatusOnline {
+		if b.Status == store.BrokerStatusOffline {
+			b.ConnectionState = "disconnected"
+		}
+		if b.Health != nil && b.Health.Status == api.BrokerHealthHealthy {
+			h := *b.Health
+			h.Status = api.BrokerHealthUnhealthy
+			b.Health = &h
+		}
+	}
 	if b.Capabilities == nil || b.Capabilities.NodeImageRegistry == "" {
 		return b
 	}

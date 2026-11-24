@@ -35,6 +35,12 @@ export interface UserPreferences {
    * browser's zone). See `web/src/utils/time.ts`'s `effectiveTimeZone`.
    */
   timezone?: string | undefined;
+  /**
+   * Whether multi-decision cards start with each recommended choice
+   * selected (ptone/scion#7842). Absent means off: recommended choices are
+   * only outlined. See `web/src/client/decision-preferences.ts`.
+   */
+  preselectRecommendedChoices?: boolean | undefined;
 }
 
 /**
@@ -49,6 +55,8 @@ export interface User {
   preferences?: UserPreferences | undefined;
   /** Set only for a test identity web session (GET /auth/me). */
   testIdentity?: TestIdentitySessionInfo | undefined;
+  /** True while a hub admin's browser session is in "View as member" mode (ptone/scion#8648). */
+  viewAsMember?: boolean | undefined;
 }
 
 /** The testIdentity member of GET /auth/me for a test identity web session. */
@@ -72,6 +80,7 @@ export interface AuthMeResponse {
   role?: UserRole;
   preferences?: UserPreferences;
   testIdentity?: TestIdentitySessionInfo;
+  viewAsMember?: boolean;
 }
 
 /**
@@ -150,6 +159,52 @@ export interface PageData {
    * the session user (ptone/scion#2489); present only for a signed-in shell
    */
   experiments?: Record<string, boolean> | undefined;
+  /**
+   * Hub-wide UI branding payload; present on both authenticated and anonymous
+   * (/login, /invite) shells when server.hub.branding is customized.
+   */
+  branding?: PublicBranding | undefined;
+}
+
+/**
+ * Resolved semantic color tokens (#RRGGBB) for one theme mode.
+ */
+export interface BrandingSemanticMode {
+  bg?: string;
+  bg_subtle?: string;
+  surface?: string;
+  surface_raised?: string;
+  text?: string;
+  text_secondary?: string;
+  text_muted?: string;
+  border?: string;
+  primary?: string;
+  primary_hover?: string;
+  primary_active?: string;
+  primary_text?: string;
+}
+
+/**
+ * Public Hub branding payload delivered via __SCION_DATA__.branding and
+ * GET /api/v1/settings/public. Contains zero boolean fields.
+ */
+export interface PublicBranding {
+  name: string;
+  shortName: string;
+  subtitle?: string;
+  attribution: 'shown' | 'hidden';
+  corners?: 'default' | 'square' | 'rounded';
+  fontSans?: string;
+  logoLight?: string;
+  logoDark?: string;
+  faviconUrl?: string;
+  appleTouchIconUrl?: string;
+  notificationIconUrl?: string;
+  themeColor: string;
+  cssText?: string;
+  light?: BrandingSemanticMode;
+  dark?: BrandingSemanticMode;
+  scales?: Record<string, Record<string, string>>;
 }
 
 /**
@@ -423,10 +478,26 @@ export type AgentActivity =
   | 'executing'
   | 'waiting_for_input'
   | 'blocked'
+  | 'idle'
   | 'completed'
   | 'limits_exceeded'
+  | 'harness_error'
   | 'stalled'
   | 'offline';
+
+/**
+ * Why a suspended agent was suspended (Go `state.SuspendReason`): `user` (a
+ * user or caller suspended it; only an explicit resume brings it back),
+ * `idle` (the hub's idle policy) or `stalled` (the hub's
+ * auto_suspend_stalled policy). The hub may wake an agent it suspended
+ * (idle or stalled) when new work arrives for it.
+ */
+export type AgentSuspendReason = 'user' | 'idle' | 'stalled';
+
+/** Whether `reason` is a suspend reason this client knows. */
+export function isKnownSuspendReason(reason: string | undefined): reason is AgentSuspendReason {
+  return reason === 'user' || reason === 'idle' || reason === 'stalled';
+}
 
 /**
  * Contextual metadata for the current agent state
@@ -451,6 +522,25 @@ export function isTerminalAvailable(agent: {
 }): boolean {
   if (agent.activity === 'offline') return false;
   return agent.phase === 'running' || agent.phase === 'stopping';
+}
+
+/**
+ * Whether an activity is retained across a transition to `phase === 'suspended'`
+ * so UI surfaces can display e.g. `"suspended · completed"`. Mirrors Go
+ * `state.Activity.IsRetainedOnSuspend`.
+ */
+export function isRetainedSuspendActivity(activity: string | undefined): boolean {
+  const lower = activity?.toLowerCase();
+  return lower === 'idle' || lower === 'completed' || lower === 'harness_error';
+}
+
+/**
+ * Whether an activity represents a terminal stop outcome that remains valid on
+ * `phase === 'stopped'`. Mirrors Go `state.Activity.IsTerminal`.
+ */
+export function isTerminalActivity(activity: string | undefined): boolean {
+  const lower = activity?.toLowerCase();
+  return lower === 'crashed' || lower === 'limits_exceeded';
 }
 
 /**
@@ -835,6 +925,8 @@ export interface AgentAppliedConfig {
   gitClone?: Record<string, unknown>;
   templateId?: string;
   templateHash?: string;
+  templateSourceUrl?: string;
+  templateSourceCommit?: string;
   harnessConfigId?: string;
   harnessConfigHash?: string;
   harnessConfigSource?: string;
@@ -974,6 +1066,12 @@ export interface Agent {
   template: string;
   phase: AgentPhase;
   activity?: AgentActivity;
+  /**
+   * Why a suspended agent was suspended; absent when none is recorded (an
+   * agent that is not suspended, or one suspended before reasons were
+   * recorded). Unknown future values are possible.
+   */
+  suspendReason?: string;
   detail?: AgentDetail;
   taskSummary?: string;
   message?: string;
@@ -1086,6 +1184,7 @@ export type DeletionState = 'deleting' | 'failed';
 export type DeletionCode =
   | 'runtime_error'
   | 'conflict'
+  | 'placement_conflict'
   | 'in_doubt'
   | 'abandoned'
   | 'revoke_failed'
@@ -1153,6 +1252,8 @@ export interface Template {
   contentHash?: string;
   /** URL the template was imported from, when it was imported. */
   sourceUrl?: string;
+  /** Full 40-char git commit SHA the template files were imported from. */
+  sourceCommit?: string;
   files?: TemplateFileInfo[];
   /** Read-only snapshot of the template's own scion-agent.yaml; see TemplateAgentConfig. */
   agentConfig?: TemplateAgentConfig;
@@ -1214,7 +1315,7 @@ export interface HarnessConfig {
 /**
  * Scope for environment variables and secrets
  */
-export type ResourceScope = 'user' | 'project' | 'runtime_broker' | 'hub';
+export type ResourceScope = 'user' | 'project' | 'runtime_broker' | 'hub' | 'agent';
 
 /**
  * Injection mode for environment variables
@@ -1265,6 +1366,20 @@ export interface Secret {
   updated: string;
   createdBy?: string;
   updatedBy?: string;
+}
+
+/**
+ * Agent-scoped secret supplied at agent creation time (behind hub.agent_secrets).
+ * Mirrors hub.AgentSecretInput in pkg/hub/agent_create_secrets.go.
+ */
+export interface AgentSecretInput {
+  key: string;
+  value: string;
+  encoding?: 'raw' | 'base64';
+  type?: SecretType;
+  target?: string;
+  injectionMode?: InjectionMode;
+  description?: string;
 }
 
 /**
@@ -1330,6 +1445,7 @@ export interface PresentedTarget {
   type: string;
   displayName?: string;
   namespace?: string;
+  region?: string;
   gke?: boolean;
   priorityClassName?: string;
   sharedDirStorageClass?: string;
@@ -1450,6 +1566,10 @@ export interface RuntimeBroker {
    */
   versionStatus?: 'match' | 'mismatch' | 'unknown';
   autoProvide: boolean;
+  /** Whether a hub administrator explicitly registered or approved this broker as admin-managed (ptone/scion#7829). */
+  adminManaged?: boolean;
+  /** Whether this broker is eligible for placement and attachment under broker_policy.admin_managed_only (true when the policy is off). */
+  policyEligible?: boolean;
   endpoint?: string;
   labels?: Record<string, string>;
   createdBy?: string;
@@ -1641,6 +1761,8 @@ export interface Message {
   recipient: string;
   recipientId: string;
   msg: string;
+  /** True when `msg` is a server-truncated preview (e.g. `/interagent` list mode). */
+  msgTruncated?: boolean;
   type: string;
   urgent?: boolean;
   broadcasted?: boolean;
@@ -1682,26 +1804,26 @@ export interface Message {
   /** The delegation grant of a message sent with an agent delegated credential. */
   delegationGrantId?: string;
   /**
-   * Choice prompt decisions (messageType "choice-prompt"). Present only while
-   * the web.chat_choices experiment is on: from the history side map
+   * Decision prompt decisions (messageType "decision-prompt"). Present only while
+   * the web.decisions experiment is on: from the history side map
    * messageDecisions or inline on the live chat.message event.
    */
   decisions?: DecisionView[];
   /** The prompt's intro without the hub's markdown fallback. */
-  choiceIntro?: string;
+  decisionIntro?: string;
   /** "single" for one decision, "set" for 2 or more (one submit answers all). */
-  answerMode?: ChoiceAnswerMode;
-  /** One-click answer carried by a "choice-response" message. */
-  choiceResponse?: ChoiceResponseView;
-  /** Set submit carried by a "choice-response" message. */
-  choiceResponseSet?: ChoiceResponseSetView;
+  answerMode?: DecisionAnswerMode;
+  /** One-click answer carried by a "decision-response" message. */
+  decisionResponse?: DecisionResponseView;
+  /** Set submit carried by a "decision-response" message. */
+  decisionResponseSet?: DecisionResponseSetView;
 }
 
 // ---------------------------------------------------------------------------
-// Choices (mirror of pkg/hub/choices_view.go)
+// Decisions (mirror of pkg/hub/decisions_view.go)
 // ---------------------------------------------------------------------------
 
-export type ChoiceAnswerMode = 'single' | 'set';
+export type DecisionAnswerMode = 'single' | 'set';
 
 /** One option of a decision (pkg/messages Choice). */
 export interface ChoiceOption {
@@ -1709,6 +1831,14 @@ export interface ChoiceOption {
   label: string;
   /** Inline markdown. */
   description?: string;
+}
+
+/** Optional free-form Other option of a decision (pkg/messages OtherOption). */
+export interface OtherOption {
+  label: string;
+  /** Inline markdown. */
+  description?: string;
+  placeholder?: string;
 }
 
 /** The version that replaced a decision. */
@@ -1719,25 +1849,48 @@ export interface DecisionReplacedBy {
   at: string;
 }
 
+/** When, why, and by which agent a decision was withdrawn (DecisionWithdrawn). */
+export interface DecisionWithdrawn {
+  at: string;
+  reason?: string;
+  byName: string;
+}
+
+/** When, why, and by which user a decision was dismissed (DecisionDismissed). */
+export interface DecisionDismissed {
+  at: string;
+  byUserId?: string;
+  byName: string;
+  reason?: string;
+  surface: string;
+  responseMessageId: string;
+}
+
 /** An answer as clients see it (AnswerView). */
 export interface AnswerView {
   choiceId: string;
   label: string;
+  otherText?: string;
   answeredByUserId?: string;
   answeredByName?: string;
   answeredByEmail?: string;
   /** "direct" or "agent_interpreted". */
   provenance: string;
-  /** "answer", "confirm" or "override". */
+  /** "answer", "confirm", "override", or "dismiss". */
   outcome?: string;
+  dismissReason?: string;
   interpretedByAgentId?: string;
   sourceMessageId?: string;
   surface: string;
   responseMessageId: string;
   batchId?: string;
   matchedDefault?: boolean;
+  previousChoiceLabel?: string;
+  previousOtherText?: string;
   at: string;
 }
+
+export type DecisionAnswerView = AnswerView;
 
 /** One version of a decision as clients see it (DecisionView). */
 export interface DecisionView {
@@ -1746,21 +1899,26 @@ export interface DecisionView {
   key: string;
   ref: string;
   version: number;
-  /** "pending", "decided" or "replaced". */
-  status: 'pending' | 'decided' | 'replaced' | (string & {});
+  /** "pending", "decided", "replaced", "withdrawn", or "dismissed". */
+  status: 'pending' | 'decided' | 'replaced' | 'withdrawn' | 'dismissed' | (string & {});
   askerAgentId: string;
   askerAgentName: string;
   /** Markdown. */
   question: string;
   defaultChoiceId?: string;
   choices: ChoiceOption[];
+  other?: OtherOption;
   replacedBy?: DecisionReplacedBy;
-  /** The effective answer; absent while pending. */
+  withdrawn?: DecisionWithdrawn;
+  dismissed?: DecisionDismissed;
+  /** Hub-computed RFC3339 timestamp when this decision reaches the dismiss minimum age. */
+  dismissAvailableAt?: string;
+  /** The effective answer; absent while pending, withdrawn, or dismissed. */
   decision?: AnswerView;
 }
 
-/** What a choice-response row of a one-click answer carries. */
-export interface ChoiceResponseView {
+/** What a decision-response row of a one-click answer carries. */
+export interface DecisionResponseView {
   rowId: string;
   ref: string;
   key: string;
@@ -1768,13 +1926,22 @@ export interface ChoiceResponseView {
   question: string;
   choiceId: string;
   label: string;
+  otherText?: string;
   provenance: string;
+  /** "answer", "confirm", "override", or "dismiss". */
+  outcome?: string;
+  dismissReason?: string;
+  answeredByUserId?: string;
+  answeredByName?: string;
+  interpretedByAgentId?: string;
   promptMessageId: string;
   sourceMessageId?: string;
+  previousChoiceLabel?: string;
+  previousOtherText?: string;
 }
 
-/** One answer of a ChoiceResponseSetView. */
-export interface ChoiceResponseSetAnswer {
+/** One answer of a DecisionResponseSetView. */
+export interface DecisionResponseSetAnswer {
   rowId: string;
   ref: string;
   key: string;
@@ -1782,20 +1949,29 @@ export interface ChoiceResponseSetAnswer {
   question: string;
   choiceId: string;
   label: string;
+  otherText?: string;
   provenance: string;
   outcome: string;
+  dismissReason?: string;
   matchedDefault: boolean;
+  answeredByUserId?: string;
+  answeredByName?: string;
+  interpretedByAgentId?: string;
+  sourceMessageId?: string;
+  promptMessageId?: string;
+  previousChoiceLabel?: string;
+  previousOtherText?: string;
 }
 
-/** What the choice-response row of a set submit carries, in position order. */
-export interface ChoiceResponseSetView {
-  promptMessageId: string;
+/** What the decision-response row of a set submit carries, in position order. */
+export interface DecisionResponseSetView {
+  promptMessageId?: string;
   batchId: string;
-  answers: ChoiceResponseSetAnswer[];
+  answers: DecisionResponseSetAnswer[];
 }
 
-/** Payload of the chat.choice.updated SSE event. */
-export interface ChoiceUpdatedEvent {
+/** Payload of the chat.decision.updated SSE event. */
+export interface DecisionUpdatedEvent {
   decision: DecisionView;
   messageId: string;
   threadId: string;
@@ -1944,6 +2120,8 @@ export interface ProjectMemberGroup {
   principalType: string;
   principalId: string;
   principalDisplayName?: string;
+  /** User account status ('active', 'invited', 'suspended') for user principals. */
+  principalStatus?: string;
   /** The built-in membership role name, or '' when the principal holds none. */
   builtInRoleName: string;
   /** Built-in binding first, then custom bindings by role name. */
@@ -2060,10 +2238,42 @@ export interface GCPServiceAccount {
    * not asked for, and from hubs that predate it.
    */
   assignStatus?: GCPServiceAccountAssignStatus;
+  /** Advisory messages attached by the Hub on create, mint, or verify. */
+  warnings?: string[];
+  /**
+   * On a mint response while hub.k8s_workload_identity_setup is on: the
+   * roles/iam.workloadIdentityUser grants the Hub made or skipped on the new
+   * account (pkg/api/workload_identity_binding.go).
+   */
+  workloadIdentityBindings?: WorkloadIdentityBinding[];
+}
+
+export type WorkloadIdentityBindingState = 'bound' | 'skipped' | 'failed';
+
+/**
+ * One entry of a GCP service account mint response's workloadIdentityBindings
+ * (mirrors api.WorkloadIdentityBinding).
+ */
+export interface WorkloadIdentityBinding {
+  pool?: string;
+  namespace?: string;
+  ksa?: string;
+  member?: string;
+  profiles?: string[];
+  /** One of WorkloadIdentityBindingState; a newer hub may send others. */
+  state: string;
+  reason?: string;
+  detail?: string;
+  manualStep?: string;
 }
 
 /** Mapping state of a GCP service account on one broker profile (mirrors hub GCPServiceAccountAssignStatus). */
-export type GCPServiceAccountAssignState = 'mapped' | 'not_mapped' | 'not_required' | 'unknown';
+export type GCPServiceAccountAssignState =
+  | 'mapped'
+  | 'creatable'
+  | 'not_mapped'
+  | 'not_required'
+  | 'unknown';
 
 export interface GCPServiceAccountAssignStatus {
   /** One of GCPServiceAccountAssignState; a newer hub may send others. */
@@ -2084,7 +2294,31 @@ export interface GCPServiceAccountAssignStatus {
  * 'not_mapped' need a complete, current report; otherwise the state is
  * 'unknown' with `unknownReason`. 'not_reported' means no report at all.
  */
-export type GCPSAMappingState = 'mapped' | 'not_mapped' | 'unknown' | 'not_reported';
+export type GCPSAMappingState = 'mapped' | 'creatable' | 'not_mapped' | 'unknown' | 'not_reported';
+
+export interface GCPServiceAccountProfileBinding {
+  state: string;
+  reason?: string;
+  pool?: string;
+  member?: string;
+  manualStep?: string;
+  stale?: boolean;
+  staleReason?: string;
+}
+
+export interface GCPServiceAccountBindingTarget {
+  pool?: string;
+  namespace?: string;
+  ksa?: string;
+  member?: string;
+  profiles?: string[];
+  state: string;
+  reason?: string;
+  manualStep?: string;
+  lastHeartbeat?: string;
+  stale?: boolean;
+  staleReason?: string;
+}
 
 /**
  * One Kubernetes broker profile's mapping for an account, from the status
@@ -2097,7 +2331,7 @@ export interface GCPServiceAccountProfileMapping {
   state: GCPSAMappingState;
   kubernetesServiceAccount?: string;
   namespace?: string;
-  /** 'mapped' (explicit mapping) or 'discovered' (annotation discovery). */
+  /** 'mapped' (explicit mapping), 'discovered' (annotation discovery), or 'created' (opt-in KSA creation). */
   source?: string;
   /** When the hub last stored or confirmed the profile's report. */
   reportedAt?: string;
@@ -2110,6 +2344,8 @@ export interface GCPServiceAccountProfileMapping {
    * 'ambiguous_mapping' (with `ambiguous` set).
    */
   unknownReason?: string;
+  /** Present when hub.k8s_workload_identity_setup is enabled on the hub. */
+  workloadIdentityBinding?: GCPServiceAccountProfileBinding;
 }
 
 /**
@@ -2125,13 +2361,17 @@ export interface GCPServiceAccountStatus {
     error?: string;
   };
   mappings: GCPServiceAccountProfileMapping[];
-  /** 'bound' | 'not_bound' | 'unknown'; only 'unknown' is produced today. */
-  workloadIdentityBinding: { state: string; reason?: string };
+  /** 'bound' | 'not_bound' | 'unknown'. */
+  workloadIdentityBinding: {
+    state: string;
+    reason?: string;
+    targets?: GCPServiceAccountBindingTarget[];
+  };
   /** kind is 'project', 'profile' (with profile set) or 'hub'. */
   defaultFor: Array<{ kind: string; profile?: string }>;
   /** Already limited to agents the caller may see; names may be truncated. */
   agents: { count: number; names: string[] };
-  /** code is 'not_verified', 'not_mapped' or 'none'. */
+  /** code is 'not_verified', 'not_mapped', 'not_bound' or 'none'. */
   nextStep: { code: string; brokerName?: string; profile?: string; message: string };
 }
 
@@ -2184,7 +2424,7 @@ export interface PolicyConditions {
 // Skills
 // ---------------------------------------------------------------------------
 
-export type SkillScope = 'core' | 'global' | 'project' | 'user';
+export type SkillScope = 'global' | 'project' | 'user';
 export type SkillVersionStatus = 'draft' | 'published' | 'deprecated' | 'archived';
 
 export interface Skill {
@@ -2394,4 +2634,17 @@ export interface ProjectSessionMetricsSummary {
   activeAgents: number;
   mostUsedTools: ToolUsageSummary[];
   mostUsedModels: ModelUsageSummary[];
+}
+
+/**
+ * Last terminal screen captured just before an agent was suspended (ptone/scion#8530).
+ * Response from GET /api/v1/agents/{id}/screen and
+ * GET /api/v1/projects/{projectId}/agents/{id}/screen.
+ */
+export interface AgentSuspendScreen {
+  agentId: string;
+  content: string;
+  capturedAt: string;
+  truncated: boolean;
+  phase: string;
 }

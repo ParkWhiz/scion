@@ -805,7 +805,7 @@ func TestAsyncStart_CreateEndpointAccepted(t *testing.T) {
 		resume     bool
 		wantResume bool
 	}{
-		{"suspended (Branch 1)", state.PhaseSuspended, false, false, true},
+		{"suspended (Branch 1)", state.PhaseSuspended, false, true, true},
 		{"stopped resume in place (Branch 2)", state.PhaseStopped, false, true, false},
 		{"created memory (Branch 4)", state.PhaseCreated, true, false, false},
 	}
@@ -855,7 +855,7 @@ func TestAsyncStart_DeleteWonDuringAcceptedStart(t *testing.T) {
 			return rec.Code, rec.Body.String()
 		}},
 		{"create endpoint resume", state.PhaseSuspended, func(t *testing.T, f *reconcileFixture, a *store.Agent) (int, string) {
-			rec := doRequest(t, f.srv, http.MethodPost, "/api/v1/agents", CreateAgentRequest{Name: a.Slug, ProjectID: f.projectID, AcceptAsyncLaunch: true})
+			rec := doRequest(t, f.srv, http.MethodPost, "/api/v1/agents", CreateAgentRequest{Name: a.Slug, ProjectID: f.projectID, Resume: true, AcceptAsyncLaunch: true})
 			return rec.Code, rec.Body.String()
 		}},
 	}
@@ -1494,8 +1494,9 @@ func postAgentStatusAsAgentRun(t *testing.T, srv *Server, agent *store.Agent, ru
 	t.Helper()
 	tokenSvc := srv.GetAgentTokenService()
 	require.NotNil(t, tokenSvc)
-	token, _, err := tokenSvc.SignAgentToken(AgentTokenGrant{AgentID: agent.ID, ProjectID: agent.ProjectID, Scopes: []AgentTokenScope{ScopeAgentStatusUpdate}}, runID)
+	token, cred, err := tokenSvc.SignAgentToken(AgentTokenGrant{AgentID: agent.ID, ProjectID: agent.ProjectID, Scopes: []AgentTokenScope{ScopeAgentStatusUpdate}}, runID)
 	require.NoError(t, err)
+	require.NoError(t, srv.store.CreateAgentCredential(context.Background(), cred))
 	req, err := http.NewRequest(http.MethodPost, "/api/v1/agents/"+agent.ID+"/status", strings.NewReader(body))
 	require.NoError(t, err)
 	req.Header.Set("X-Scion-Agent-Token", token)

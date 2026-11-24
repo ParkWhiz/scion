@@ -185,10 +185,21 @@ func (s *Server) agentWritePendingUserSecret(w http.ResponseWriter, r *http.Requ
 	existing, err := s.secretBackend.GetMeta(ctx, key, store.ScopeUser, ownerID)
 	switch {
 	case err == nil:
+		if existing.SecretType == store.SecretTypeInternal {
+			writeError(w, http.StatusConflict, ErrCodeInternalSecret,
+				"internal secrets cannot be modified or deleted through the secrets API", nil)
+			return
+		}
 		replacesID, replacesVersion = existing.ID, existing.Version
 	case errors.Is(err, store.ErrNotFound):
+		if s.refuseInternalSecretMutation(w, ctx, key, store.ScopeUser, ownerID) {
+			return
+		}
 	default:
 		writeErrorFromErr(w, err, "")
+		return
+	}
+	if rejectWebhookEndpointReservedSecretWrite(w, key) {
 		return
 	}
 
@@ -558,6 +569,12 @@ func (s *Server) approvePendingSecret(w http.ResponseWriter, r *http.Request, ow
 	if !ok {
 		return
 	}
+	if s.refuseInternalSecretMutation(w, ctx, p.Key, store.ScopeUser, ownerID) {
+		return
+	}
+	if rejectWebhookEndpointReservedSecretWrite(w, p.Key) {
+		return
+	}
 
 	allowProgeny := p.AllowProgeny
 	if req.AllowProgeny != nil {
@@ -637,6 +654,7 @@ func (s *Server) approvePendingSecret(w http.ResponseWriter, r *http.Request, ow
 	approved := *claimed
 	approved.AllowProgeny = allowProgeny
 	s.auditPendingSecret(ctx, PendingSecretEventApprove, &approved, PendingSecretActorUser, ownerID, "")
+	s.publishInboxHint(ctx, ownerID, InboxHint{Category: InboxCategoryApprovals})
 
 	writeJSON(w, http.StatusOK, PendingSecretDecisionResponse{
 		ID:    claimed.ID,
@@ -680,6 +698,7 @@ func (s *Server) rejectPendingSecret(w http.ResponseWriter, r *http.Request, own
 	}
 	s.dropPendingValues(ctx, []string{p.ValueRef})
 	s.auditPendingSecret(ctx, PendingSecretEventReject, p, PendingSecretActorUser, ownerID, "")
+	s.publishInboxHint(ctx, ownerID, InboxHint{Category: InboxCategoryApprovals})
 	writeJSON(w, http.StatusOK, PendingSecretDecisionResponse{
 		ID:    p.ID,
 		Key:   p.Key,

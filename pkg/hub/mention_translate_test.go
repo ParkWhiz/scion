@@ -14,7 +14,11 @@
 
 package hub
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+)
 
 func TestReplaceMention(t *testing.T) {
 	tests := []struct {
@@ -196,6 +200,21 @@ func TestTranslateMentionsOutbound(t *testing.T) {
 			want:    "@john@example.com asked @code-reviewer to review",
 		},
 		{
+			name:    "blockquote mention still translated for agents",
+			content: "> @john-smith said hi",
+			want:    "> @john@example.com said hi",
+		},
+		{
+			name:    "markdown bold wrapped mention unchanged on outbound",
+			content: "Ping **@john-smith** please",
+			want:    "Ping **@john-smith** please",
+		},
+		{
+			name:    "punctuation and non-ASCII boundaries preserved on outbound",
+			content: "x.@john-smith and café@alice-bob",
+			want:    "x.@john@example.com and café@alice@example.com",
+		},
+		{
 			name:    "no mentions",
 			content: "Just a regular message",
 			want:    "Just a regular message",
@@ -240,6 +259,21 @@ func TestTranslateMentionsInbound(t *testing.T) {
 			want:    "Hey @unknown@example.com check this",
 		},
 		{
+			name:    "plain email in prose not translated",
+			content: "Mail john@example.com or user@example.com directly",
+			want:    "Mail john@example.com or user@example.com directly",
+		},
+		{
+			name:    "markdown wrapped known email translated while code, fences and blockquotes left alone",
+			content: "> @john@example.com said hi\nPing **@john@example.com** or _@alice@example.com_, keep `@john@example.com`:\n```\n@alice@example.com\n```",
+			want:    "> @john@example.com said hi\nPing **@john-smith** or _@alice-bob_, keep `@john@example.com`:\n```\n@alice@example.com\n```",
+		},
+		{
+			name:    "longer email domain suffix not partially matched",
+			content: "Hey @john@example.com.au and @john@example.com.",
+			want:    "Hey @john@example.com.au and @john-smith.",
+		},
+		{
 			name:    "no mentions",
 			content: "Just a regular message",
 			want:    "Just a regular message",
@@ -269,5 +303,20 @@ func TestTranslateMentionsSkipsMissingFields(t *testing.T) {
 	want := "@john-smith and @alice and @valid@example.com"
 	if got != want {
 		t.Errorf("translateMentionsOutbound with missing fields = %q, want %q", got, want)
+	}
+}
+
+func TestTranslateMentionsInboundWithOptions_CodeSpanMentions(t *testing.T) {
+	members := []chatMemberEntry{
+		{Kind: "user", DisplayName: "John Smith", Email: "john@example.com"},
+	}
+
+	content := "Ask `@john@example.com` and `` `@john@example.com` ``"
+	if got := translateMentionsInboundWithOptions(content, members, messages.MentionOptions{CodeSpanMentions: false}); got != content {
+		t.Errorf("CodeSpanMentions=false: got %q, want unchanged %q", got, content)
+	}
+	wantOn := "Ask `@john-smith` and `` `@john@example.com` ``"
+	if got := translateMentionsInboundWithOptions(content, members, messages.MentionOptions{CodeSpanMentions: true}); got != wantOn {
+		t.Errorf("CodeSpanMentions=true: got %q, want %q", got, wantOn)
 	}
 }

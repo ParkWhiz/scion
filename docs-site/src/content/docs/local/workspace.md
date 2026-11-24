@@ -141,10 +141,11 @@ Each agent gets its own branch named `scion/<agent-name>`. This prevents conflic
 
 By default, git projects use a shallow clone with `depth=1` for fast startup. 
 
-- **Full Clones on Startup:** If an agent needs full git history for operations like `git log` or `git blame` from the very start, you can configure `depth: 0` (or set `SCION_GIT_DEPTH=0`). The `GitCloneConfig` API treats a depth of `0` as an explicit instruction to perform a complete, non-shallow clone.
-- **Unshallowing Later:** Alternatively, an agent with a shallow clone (`depth=1`) can unshallow itself later inside its session by running:
+- **Full or Deeper Clones on Startup:** If an agent needs git history for operations like `git diff main...HEAD`, `git merge-base`, `git log`, or `git blame` from the start, set `clone_depth: full` (or an integer `N`) on the agent's template or [profile](/scion/reference/orchestrator-settings/#profiles-profiles) (see [Agent Configuration](/scion/reference/agent-config/)). At the API/env level, `GitCloneConfig` (`depth: 0`) and `SCION_GIT_DEPTH=0` represent a full, non-shallow clone.
+- **Deepening Later:** Every per-agent clone container receives `SCION_GIT_DEPTH` (`1` by default, `N` for depth `N`, or `0` for full) and is oriented at startup that per-agent clones default to shallow depth 1. An agent with a shallow clone can deepen on demand inside its session:
   ```bash
-  git fetch --unshallow
+  git fetch --deepen=50 origin main   # reach a merge base incrementally
+  git fetch --unshallow               # fetch complete history
   ```
 
 #### Environment Variables
@@ -154,7 +155,7 @@ By default, git projects use a shallow clone with `depth=1` for fast startup.
 | `SCION_GIT_CLONE_URL` | URL of the repository to clone. Set by the broker from the project's clone settings only; a value in agent, settings or harness-config env is ignored | *(set by the broker)* |
 | `SCION_GIT_BRANCH` | Branch to clone | `main` |
 | `SCION_GIT_DEPTH` | Clone depth (set to `0` for full clone, omission defaults to shallow depth `1`) | `1` |
-| `SCION_GIT_CHECKOUT_WORKERS` | Parallel worker count passed to `git -c checkout.workers=<N>` during `sciontool init` workspace checkout (`0` uses the CPU count `git` detects, which in containers may be the host's rather than the container's limit; `1` forces sequential checkout; `2`–`64` sets an explicit worker count) | `16` |
+| `SCION_GIT_CHECKOUT_WORKERS` | Parallel worker count passed to `git -c checkout.workers=<N>` by commands that write a work tree. The `sciontool init` workspace checkout reads it from the agent environment. The broker's host-side shared-workspace clone and `git worktree add` read it from the broker process's own environment. The Kubernetes NFS provisioning init container is not passed it and always uses the default `16`. Values: `0` uses the CPU count `git` detects, which in containers may be the host's rather than the container's limit; `1` forces sequential checkout; `2`–`64` sets an explicit worker count | `16` |
 | `SCION_GIT_TOKEN_REMOTE` | The project's git remote, as the Hub recorded it. Set by the broker only | *(none)* |
 
 Authentication is handled via the `GITHUB_TOKEN` environment variable, injected from the project's secrets, a GitHub App installation, or your personal environment through the env-gather flow. The clone uses the token only when the clone URL is HTTPS and names the project's git remote (the same host and owner/repository as `SCION_GIT_TOKEN_REMOTE`). A personal token (a user-scoped `GITHUB_TOKEN`, an agent or storage environment variable, a token collected through env-gather, or a broker/hub-scoped secret) is offered only when the project's recorded remote is on the GitHub host (`github.com`, or the host of `github_app.api_base_url` for GitHub Enterprise), whereas a project-bound credential (the project's GitHub App installation token or a project-scoped `GITHUB_TOKEN` secret) applies to the project's recorded remote on any host. A clone URL that names another host or repository, for example through a `scion.dev/clone-url` label, is cloned without the token, and no credential helper is configured for it. On every start of an existing clone-per-agent workspace, `sciontool init` reconciles `~/.gitconfig` to remove any unscoped `credential.helper` and any stale host-scoped helper when no token is offered, and agent-start clones run without host credential helpers, extra HTTP headers, or askpass. The same rule applies to the Kubernetes workspace-provisioning init container.
@@ -179,7 +180,7 @@ this git repository is not a scion project yet; run 'scion init' here first (or 
 A `.scion`-less repository inside another scion project is not refused: it links that parent
 project, so run `scion init` in the repository itself.
 
-`scion init` adds an untracked `.scion/` to your checkout and, unless it is already ignored, appends `.scion/agents/` to your `.gitignore`.
+`scion init` adds an untracked `.scion/` to your checkout and, unless it is already ignored, appends `.scion/agents/` to your `.gitignore`. When a remote Hub is selected, `scion init` skips local container-runtime detection and does not require `scion init --machine` first.
 
 #### On the local workstation Hub: a worktree of your checkout
 
@@ -277,11 +278,15 @@ project, whichever broker an agent lands on.
   Using hub, cloning repo https://github.com/org/repo.git
   ```
 - **The agent works from the remote's state**, not from your checkout, and its branch reaches you only after it pushes. Merge agent work via git push and pull request.
+- **Clones are shallow (`depth=1`) by default.** The Runtime Broker sets `SCION_GIT_DEPTH` (`1` by default, `N`, or `0` for full) in the container. Agents whose work needs history from the start (such as reviewers or investigators) can either deepen on demand (`git fetch --deepen=<N>` or `git fetch --unshallow`) or use `clone_depth: full` (or `N`) on their template or [profile](/scion/reference/orchestrator-settings/#profiles-profiles).
 
 To give agents on a remote Hub git worktrees instead of separate clones, create the project with the
 `worktree-per-agent` [workspace sharing mode](/scion/local/workspaces-and-sharing/): the broker then
 makes a worktree per agent of its own shared clone. The mode is set when the project is created on
-the Hub and cannot be changed later.
+the Hub and cannot be changed later. `worktree-per-agent` is not supported on shared (`nfs`) project
+storage for Docker, Podman, or Apple `container` runtimes (agent create, start, and restart are
+refused with `412 unsupported_capability`): use `clone-per-agent` on NFS, or run the project on a
+Runtime Broker using local `project_storage`.
 
 #### Git that Scion runs on the host
 
@@ -314,9 +319,14 @@ the agent start or workspace pull rather than being ignored.
 - **Refused on both** (so an agent cannot make the broker's or your own git run a command): any
   `credential.*`, `url.*.insteadOf`, `http.*`, `gpg.*` program/signing-file keys, any `*.program`,
   `alias.*`, `core.sshCommand`/`editor`, a remote's `uploadpack`/`receivepack`/`proxy`, diff/merge
-  command or textconv drivers, non-standard `filter.*` drivers, and any key not on the list. If a
-  command is refused, the error names the key; remove it from the repository's `.git/config` (or
-  `config.worktree`).
+  command or textconv drivers, non-standard `filter.*` drivers, and any key not on the list.
+  Host-side git (including `git worktree add` and branch lookups during agent creation on a linked
+  checkout) always refuses command keys outside the four pinned keys above (`core.hooksPath`,
+  `core.fsmonitor`, `core.pager`, `submodule.recurse`). If a command is refused, the error names
+  the offending key; remove it from the repository's `.git/config` (or `config.worktree`), and
+  instead set personal git preferences in your global git config (`~/.gitconfig` /
+  `git config --global`) or pass them per command with `git -c <key>=<val>` (for example,
+  `git -c core.editor=vim ...`).
 - **Partial clones:** a partial clone made by current git (`git clone --filter=...`, which records
   `remote.<name>.promisor` and `remote.<name>.partialclonefilter`) is allowed; git then fetches
   missing objects from that remote's own URL. `extensions.partialClone` (written by older git) and
@@ -488,7 +498,11 @@ init` lists `.scion/agents/` in `.gitignore`) and start the agent again.
 
 On Kubernetes, git projects that share one repository across agents (worktree-per-agent or
 shared-workspace on NFS) are not supported: use a clone-per-agent workspace, where each agent gets
-its own clone of the repository, or run the project on a local or Docker Runtime Broker.
+its own clone of the repository, or run the project on a local or Docker, Podman, or Apple Runtime
+Broker. On shared (`nfs`) project storage, Docker, Podman, and Apple `container` also refuse
+`worktree-per-agent` at create, start, and restart (`412 unsupported_capability`); use
+`clone-per-agent` on NFS, or run `worktree-per-agent` on a Runtime Broker using local
+`project_storage`.
 
 ---
 

@@ -78,13 +78,17 @@ func TestBypassCensus(t *testing.T) {
 		{file: "authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin", description: "comment reference"},
 
 		// ─── AdminModeMiddleware bypass (infrastructure, KEEP) ───────────
-		{file: "admin_mode.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "AdminModeMiddleware admin bypass (infrastructure, KEEP)"},
-		{file: "agent_pending_config_authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "held-edit fold mirrors AdminModeMiddleware: an admin saver's keys are not deferred during maintenance (infrastructure, KEEP)"},
+		{file: "admin_mode.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(unclampedUserForMaintenance(user))", description: "AdminModeMiddleware admin bypass (infrastructure, KEEP; D4 RealByDesign checks real unclamped admin)"},
+		{file: "agent_pending_config_authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(unclampedUserForMaintenance(user))", description: "held-edit fold mirrors AdminModeMiddleware: an admin saver's keys are not deferred during maintenance (infrastructure, KEEP; D4 RealByDesign checks real unclamped admin)"},
+
+		// ─── View as member toggle entry (ptone/scion#8648, design §4.3) ──
+		{file: "view_as_member.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(realUser)", description: "AuthorizeViewAsMemberChange: entering view-as-member requires the real, unclamped admin predicate (same as admin-status isAdmin, design §4.3)"},
 
 		// ─── Messaging authorization engine (permanent, D6/D7) ─────────────
 		{file: "authorize_message.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "authorizeAgentMessage super-admin bypass (D6, KEEP)"},
 		{file: "handlers_agent_message_mode.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "handleSetMessageMode project-admin exclusion (D7, KEEP — super-admins must not be blocked by the project-admin deny gate)"},
 		{file: "project_messaging_policy.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "Messaging policy admin bypass (owner-or-admin check)"},
+		{file: "handlers_message_policies.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "Message policy owner-or-admin governance rule (runs after Decide checks project.manage_message_policies)"},
 
 		// ─── Auth/identity infrastructure (non-bypass references) ────────
 		{file: "handlers_auth.go", lineSubstr: "IsUnscopedLocalPlatformAdmin", description: "admin reconciliation comment reference"},

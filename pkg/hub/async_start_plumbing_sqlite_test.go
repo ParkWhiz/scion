@@ -233,9 +233,10 @@ func TestAsyncStartGuard0f_RunlessSelfReportDuringStartLaunch(t *testing.T) {
 	// row's run applies. (The token is signed for the row's run: a run-less
 	// agent token against a row with a minted run is dropped, case below.)
 	plain := mk("g0f-plain", string(state.PhaseStarting))
-	runTok, _, err := srv.GetAgentTokenService().SignAgentToken(AgentTokenGrant{AgentID: plain.ID, ProjectID: plain.ProjectID,
+	runTok, cred, err := srv.GetAgentTokenService().SignAgentToken(AgentTokenGrant{AgentID: plain.ID, ProjectID: plain.ProjectID,
 		Scopes: []AgentTokenScope{ScopeAgentStatusUpdate}}, "run-new")
 	require.NoError(t, err)
+	require.NoError(t, s.CreateAgentCredential(ctx, cred))
 	req, err := http.NewRequest(http.MethodPost, "/api/v1/agents/"+plain.ID+"/status", strings.NewReader(report))
 	require.NoError(t, err)
 	req.Header.Set("X-Scion-Agent-Token", runTok)
@@ -263,8 +264,13 @@ func TestAsyncStartMemory_CreateEndpointBranches(t *testing.T) {
 
 	susp := seedResumeMemory(t, f.s, f.addAgent("mem-susp", "suspended", ""), "suspended")
 	rec := doRequest(t, f.srv, http.MethodPost, "/api/v1/agents", CreateAgentRequest{Name: susp.Slug, ProjectID: f.projectID})
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), ErrCodeAgentExistsResumable)
+	assert.Empty(t, d.starts(), "a suspended memory is refused without Resume (ptone/scion#8584)")
+
+	rec = doRequest(t, f.srv, http.MethodPost, "/api/v1/agents", CreateAgentRequest{Name: susp.Slug, ProjectID: f.projectID, Resume: true})
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	require.Equal(t, []bool{true}, d.starts(), "a suspended memory resumes its session even on a plain start")
+	require.Equal(t, []bool{true}, d.starts(), "a suspended memory resumes its session with Resume=true")
 	got := getAgent(t, f.s, susp.ID)
 	assert.Equal(t, string(state.PhaseRunning), got.Phase)
 	assert.Empty(t, got.LaunchResumePhase, "the running write ends the memory")
