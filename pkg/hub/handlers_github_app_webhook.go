@@ -1194,14 +1194,6 @@ func (s *Server) mintGitHubAppTokenInternal(
 		return "", "", nil, err
 	}
 
-	installationID = *project.GitHubInstallationID
-
-	// Never request more than the stored permissions and the association's
-	// proof allow (a pull-only proof gets read-only permissions), and never
-	// an empty set, which GitHub would treat as every installation
-	// permission.
-	perms, _, _ = githubTokenPermissionsForGrant(project.GitHubPermissions, grant, nil)
-
 	// Pass nil for repos so GitHub grants the token access to all repositories
 	// permitted by this installation (allowing access to shared skill repos in the org).
 	token, err := client.MintInstallationToken(ctx, installationID, nil, perms)
